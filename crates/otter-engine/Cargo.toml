@@ -1,0 +1,8 @@
+[package]
+name = "otter-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Otter JavaScript engine"
+license = "MIT"
+
+[dependencies]

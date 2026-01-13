@@ -1,0 +1,8 @@
+[package]
+name = "otter-node"
+version = "0.1.0"
+edition = "2021"
+description = "Node.js API layer for Otter"
+license = "MIT"
+
+[dependencies]

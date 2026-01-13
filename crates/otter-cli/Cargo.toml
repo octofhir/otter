@@ -1,0 +1,13 @@
+[package]
+name = "otter-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Otter CLI"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+otter-runtime = { path = "../otter-runtime" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

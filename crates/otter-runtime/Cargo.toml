@@ -1,0 +1,45 @@
+[package]
+name = "otter-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "JavaScriptCore runtime for otter"
+license = "MIT"
+
+[dependencies]
+thiserror = "1"
+anyhow = "1"
+
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
+num_cpus = "1.16"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+parking_lot = "0.12"
+crossbeam-utils = "0.8"
+crossbeam-channel = "0.5"
+
+swc_common = { version = "18", features = ["sourcemap"] }
+swc_ecma_ast = "19"
+swc_ecma_parser = "32"
+swc_ecma_codegen = "21"
+swc_ecma_transforms_base = "35"
+swc_ecma_transforms_typescript = "35"
+swc_ecma_visit = "19"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "jsc_bench"
+harness = false
+
+[features]
+default = []
+system-jsc = []
+build-jsc = []

@@ -5,6 +5,10 @@ edition = "2021"
 description = "Otter CLI"
 license = "MIT"
 
+[[bin]]
+name = "otter"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

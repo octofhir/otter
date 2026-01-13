@@ -1122,6 +1122,7 @@ dependencies = [
  "parking_lot",
  "pkg-config",
  "reqwest",
+ "scopeguard",
  "serde",
  "serde_json",
  "swc_common",

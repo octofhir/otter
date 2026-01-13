@@ -1,5 +1,7 @@
 # Otter
 
+![Otter Logo](./otter-logo.png)
+
 Otter is a Rust-first JavaScriptCore runtime with an embeddable event loop, async ops, and a Bun/Deno-style CLI.
 
 ## Quick start

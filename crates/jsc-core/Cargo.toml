@@ -1,0 +1,12 @@
+[package]
+name = "jsc-core"
+version = "0.1.0"
+edition = "2024"
+description = "Safe Rust wrappers for JavaScriptCore"
+license = "MIT"
+
+[dependencies]
+jsc-sys = { path = "../jsc-sys" }
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,11 +1,13 @@
 [package]
 name = "otter-runtime"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "JavaScriptCore runtime for otter"
 license = "MIT"
 
 [dependencies]
+jsc-sys = { path = "../jsc-sys" }
+jsc-core = { path = "../jsc-core" }
 thiserror = "1"
 anyhow = "1"
 
@@ -27,10 +29,6 @@ swc_ecma_codegen = "21"
 swc_ecma_transforms_base = "35"
 swc_ecma_transforms_typescript = "35"
 swc_ecma_visit = "19"
-
-[build-dependencies]
-cc = "1"
-pkg-config = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

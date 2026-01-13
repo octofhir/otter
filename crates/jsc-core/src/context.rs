@@ -1,57 +1,44 @@
-//! Runtime Context wrapper with event loop and extension support
-//!
-//! Wraps jsc-core::JscContext and adds runtime-specific features
-//! like event loop, timers, and extension registry.
+//! Core JSC Context wrapper with safe evaluation and object management
 
-use crate::bindings::*;
-use crate::error::{JscError, JscResult};
-use crate::event_loop::{register_context_event_loop, unregister_context_event_loop, EventLoop};
-use crate::extension::{
-    register_context_registry, unregister_context_registry, Extension, ExtensionRegistry,
-};
-use crate::value::JscValue;
-use jsc_core::extract_exception;
-use std::collections::HashMap;
+use jsc_sys::*;
 use std::ffi::CString;
+use std::marker::PhantomData;
 use std::ptr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-/// A JavaScript execution context with runtime features
+use crate::error::{JscError, JscResult};
+use crate::value::{extract_exception, JscValue};
+
+/// A JavaScript execution context
 ///
-/// Wraps jsc-core::JscContext and adds event loop, timers, and extension support.
-/// For basic JSC operations without runtime features, use jsc-core::JscContext directly.
+/// Wraps a JSGlobalContext and provides safe methods for script evaluation
+/// and object manipulation. This is the core context without event loop
+/// or extension support - use otter-runtime for those features.
+///
+/// # Thread Safety
+///
+/// This type is `!Send` and `!Sync` because JavaScriptCore contexts are not
+/// thread-safe. Accessing a context from multiple threads causes undefined behavior.
 pub struct JscContext {
     ctx: JSGlobalContextRef,
-    #[allow(dead_code)]
-    registered_functions: HashMap<String, Box<dyn Fn(Vec<JscValue>) -> JscResult<JscValue>>>,
-    extension_registry: Arc<ExtensionRegistry>,
-    event_loop: Arc<EventLoop>,
+    /// Marker to make this type !Send + !Sync
+    _not_send: PhantomData<*mut ()>,
 }
 
 impl JscContext {
-    /// Create a new JavaScript context with event loop support
+    /// Create a new JavaScript context
     pub fn new() -> JscResult<Self> {
         // SAFETY: JSGlobalContextCreate with null creates a default context
         unsafe {
             let ctx = JSGlobalContextCreate(ptr::null_mut());
             if ctx.is_null() {
-                return Err(JscError::context_creation(
-                    "JSGlobalContextCreate returned null",
-                ));
+                return Err(JscError::ContextCreation {
+                    message: "JSGlobalContextCreate returned null".to_string(),
+                });
             }
-
-            let registry = Arc::new(ExtensionRegistry::new());
-            register_context_registry(ctx as JSContextRef, registry.clone());
-
-            let event_loop = Arc::new(EventLoop::new(ctx as JSContextRef));
-            register_context_event_loop(ctx as JSContextRef, event_loop.clone());
 
             Ok(Self {
                 ctx,
-                registered_functions: HashMap::new(),
-                extension_registry: registry,
-                event_loop,
+                _not_send: PhantomData,
             })
         }
     }
@@ -61,62 +48,15 @@ impl JscContext {
         self.ctx as JSContextRef
     }
 
+    /// Get the raw global context pointer
+    pub fn raw_global(&self) -> JSGlobalContextRef {
+        self.ctx
+    }
+
     /// Get the global object
     pub fn global_object(&self) -> JSObjectRef {
         // SAFETY: self.ctx is valid
         unsafe { JSContextGetGlobalObject(self.ctx as JSContextRef) }
-    }
-
-    /// Register a safe extension on this context
-    pub fn register_extension(&self, extension: Extension) -> JscResult<()> {
-        self.extension_registry
-            .register_extension(extension, self.ctx as JSContextRef)
-    }
-
-    /// Poll pending async ops and resolve Promises
-    pub fn poll_promises(&self) -> JscResult<usize> {
-        self.extension_registry
-            .poll_promises(self.ctx as JSContextRef)
-    }
-
-    /// Run the full event loop tick (microtasks + timers + async ops)
-    pub fn poll_event_loop(&self) -> JscResult<usize> {
-        let mut handled = 0;
-        handled += self.poll_promises()?;
-        handled += self.event_loop.poll()?;
-        Ok(handled)
-    }
-
-    pub fn has_pending_tasks(&self) -> bool {
-        self.extension_registry.has_pending_async_ops() || self.event_loop.has_pending_tasks()
-    }
-
-    pub fn next_wake_delay(&self) -> Duration {
-        if let Some(deadline) = self.event_loop.next_timer_deadline() {
-            let now = Instant::now();
-            if deadline > now {
-                return deadline - now;
-            }
-        }
-        Duration::from_millis(1)
-    }
-
-    /// Run the event loop until idle or timeout
-    pub fn run_event_loop_until_idle(&self, timeout: Duration) -> JscResult<()> {
-        let start = Instant::now();
-        loop {
-            let handled = self.poll_event_loop()?;
-            if handled == 0 && !self.has_pending_tasks() {
-                return Ok(());
-            }
-
-            if timeout != Duration::ZERO && start.elapsed() >= timeout {
-                return Err(JscError::Timeout(timeout.as_millis() as u64));
-            }
-
-            let sleep_for = self.next_wake_delay();
-            std::thread::sleep(sleep_for);
-        }
     }
 
     /// Evaluate a JavaScript script and return the result
@@ -127,9 +67,9 @@ impl JscContext {
     /// Evaluate a JavaScript script with source URL (for better error messages)
     pub fn eval_with_source(&self, script: &str, source_url: &str) -> JscResult<JscValue> {
         let script_cstr = CString::new(script)
-            .map_err(|e| JscError::internal(format!("Invalid script: {}", e)))?;
+            .map_err(|e| JscError::Internal(format!("Invalid script: {}", e)))?;
         let source_cstr = CString::new(source_url)
-            .map_err(|e| JscError::internal(format!("Invalid source URL: {}", e)))?;
+            .map_err(|e| JscError::Internal(format!("Invalid source URL: {}", e)))?;
 
         // SAFETY: CStrings are valid null-terminated, ctx is valid
         unsafe {
@@ -150,7 +90,7 @@ impl JscContext {
             JSStringRelease(source_ref);
 
             if !exception.is_null() {
-                return Err(extract_exception(self.ctx as JSContextRef, exception).into());
+                return Err(extract_exception(self.ctx as JSContextRef, exception));
             }
 
             Ok(JscValue::new(self.ctx as JSContextRef, result))
@@ -160,7 +100,7 @@ impl JscContext {
     /// Set a property on the global object
     pub fn set_global(&self, name: &str, value: &JscValue) -> JscResult<()> {
         let name_cstr =
-            CString::new(name).map_err(|e| JscError::internal(format!("Invalid name: {}", e)))?;
+            CString::new(name).map_err(|e| JscError::Internal(format!("Invalid name: {}", e)))?;
 
         // SAFETY: CString is valid, ctx is valid
         unsafe {
@@ -179,7 +119,7 @@ impl JscContext {
             JSStringRelease(name_ref);
 
             if !exception.is_null() {
-                return Err(extract_exception(self.ctx as JSContextRef, exception).into());
+                return Err(extract_exception(self.ctx as JSContextRef, exception));
             }
 
             Ok(())
@@ -189,7 +129,7 @@ impl JscContext {
     /// Get a property from the global object
     pub fn get_global(&self, name: &str) -> JscResult<JscValue> {
         let name_cstr =
-            CString::new(name).map_err(|e| JscError::internal(format!("Invalid name: {}", e)))?;
+            CString::new(name).map_err(|e| JscError::Internal(format!("Invalid name: {}", e)))?;
 
         // SAFETY: CString is valid, ctx is valid
         unsafe {
@@ -206,7 +146,7 @@ impl JscContext {
             JSStringRelease(name_ref);
 
             if !exception.is_null() {
-                return Err(extract_exception(self.ctx as JSContextRef, exception).into());
+                return Err(extract_exception(self.ctx as JSContextRef, exception));
             }
 
             Ok(JscValue::new(self.ctx as JSContextRef, value))
@@ -225,7 +165,7 @@ impl JscContext {
     /// Set a property on an object
     pub fn set_property(&self, object: JSObjectRef, name: &str, value: &JscValue) -> JscResult<()> {
         let name_cstr =
-            CString::new(name).map_err(|e| JscError::internal(format!("Invalid name: {}", e)))?;
+            CString::new(name).map_err(|e| JscError::Internal(format!("Invalid name: {}", e)))?;
 
         // SAFETY: CString is valid, ctx and object are valid
         unsafe {
@@ -244,7 +184,7 @@ impl JscContext {
             JSStringRelease(name_ref);
 
             if !exception.is_null() {
-                return Err(extract_exception(self.ctx as JSContextRef, exception).into());
+                return Err(extract_exception(self.ctx as JSContextRef, exception));
             }
 
             Ok(())
@@ -260,7 +200,7 @@ impl JscContext {
         callback: JSObjectCallAsFunctionCallback,
     ) -> JscResult<()> {
         let name_cstr =
-            CString::new(name).map_err(|e| JscError::internal(format!("Invalid name: {}", e)))?;
+            CString::new(name).map_err(|e| JscError::Internal(format!("Invalid name: {}", e)))?;
 
         // SAFETY: CString is valid, ctx is valid
         unsafe {
@@ -281,7 +221,7 @@ impl JscContext {
             JSStringRelease(name_ref);
 
             if !exception.is_null() {
-                return Err(extract_exception(self.ctx as JSContextRef, exception).into());
+                return Err(extract_exception(self.ctx as JSContextRef, exception));
             }
 
             Ok(())
@@ -304,7 +244,7 @@ impl JscContext {
 
     /// Create a string value
     pub fn string(&self, s: &str) -> JscResult<JscValue> {
-        Ok(JscValue::string(self.ctx as JSContextRef, s)?)
+        JscValue::string(self.ctx as JSContextRef, s)
     }
 
     /// Create a number value
@@ -330,8 +270,6 @@ impl JscContext {
 
 impl Drop for JscContext {
     fn drop(&mut self) {
-        unregister_context_event_loop(self.ctx as JSContextRef);
-        unregister_context_registry(self.ctx as JSContextRef);
         // SAFETY: ctx was created by JSGlobalContextCreate
         unsafe {
             JSGlobalContextRelease(self.ctx);
@@ -344,23 +282,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_create_context() {
+    fn test_context_creation() {
         let ctx = JscContext::new().unwrap();
         drop(ctx);
     }
 
     #[test]
-    fn test_eval_simple() {
+    fn test_eval_number() {
         let ctx = JscContext::new().unwrap();
-        let result = ctx.eval("2 + 2").unwrap();
-        assert_eq!(result.to_number().unwrap(), 4.0);
+        let result = ctx.eval("1 + 1").unwrap();
+        assert_eq!(result.to_number().unwrap(), 2.0);
     }
 
     #[test]
     fn test_eval_string() {
         let ctx = JscContext::new().unwrap();
-        let result = ctx.eval("'hello' + ' ' + 'world'").unwrap();
-        assert_eq!(result.to_string().unwrap(), "hello world");
+        let result = ctx.eval("'hello'").unwrap();
+        assert_eq!(result.to_string().unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_eval_error() {
+        let ctx = JscContext::new().unwrap();
+        let result = ctx.eval("throw new Error('oops')");
+        assert!(result.is_err());
     }
 
     #[test]
@@ -384,14 +329,5 @@ mod tests {
 
         let value = ctx.eval("config.value").unwrap();
         assert_eq!(value.to_number().unwrap(), 123.0);
-    }
-
-    #[test]
-    fn test_eval_error() {
-        let ctx = JscContext::new().unwrap();
-        let result = ctx.eval("throw new Error('test error')");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("test error"));
     }
 }

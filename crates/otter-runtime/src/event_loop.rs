@@ -74,10 +74,7 @@ impl EventLoop {
         args: Vec<JSValueRef>,
     ) -> JscResult<u64> {
         if unsafe { !JSObjectIsFunction(self.ctx, callback) } {
-            return Err(JscError::TypeError {
-                expected: "function".to_string(),
-                actual: "non-function".to_string(),
-            });
+            return Err(JscError::type_error("function", "non-function"));
         }
 
         // HTML5 spec: Apply nested timer clamping
@@ -152,10 +149,7 @@ impl EventLoop {
 
     pub fn queue_microtask(&self, callback: JSObjectRef) -> JscResult<()> {
         if unsafe { !JSObjectIsFunction(self.ctx, callback) } {
-            return Err(JscError::TypeError {
-                expected: "function".to_string(),
-                actual: "non-function".to_string(),
-            });
+            return Err(JscError::type_error("function", "non-function"));
         }
 
         unsafe {
@@ -331,7 +325,7 @@ impl EventLoop {
             );
 
             if !exception.is_null() || result.is_null() {
-                return Err(extract_exception(self.ctx, exception));
+                return Err(extract_exception(self.ctx, exception).into());
             }
         }
 
@@ -376,10 +370,7 @@ pub(crate) fn get_function_arg(
     argument_count: usize,
 ) -> JscResult<JSObjectRef> {
     if index >= argument_count {
-        return Err(JscError::TypeError {
-            expected: "function".to_string(),
-            actual: "missing".to_string(),
-        });
+        return Err(JscError::type_error("function", "missing"));
     }
 
     unsafe {
@@ -387,16 +378,10 @@ pub(crate) fn get_function_arg(
         let mut exception: JSValueRef = std::ptr::null_mut();
         let object = JSValueToObject(ctx, value, &mut exception);
         if !exception.is_null() || object.is_null() {
-            return Err(JscError::TypeError {
-                expected: "function".to_string(),
-                actual: "non-object".to_string(),
-            });
+            return Err(JscError::type_error("function", "non-object"));
         }
         if !JSObjectIsFunction(ctx, object) {
-            return Err(JscError::TypeError {
-                expected: "function".to_string(),
-                actual: "non-function".to_string(),
-            });
+            return Err(JscError::type_error("function", "non-function"));
         }
         Ok(object)
     }
@@ -417,7 +402,7 @@ pub(crate) fn get_delay_arg(
         let mut exception: JSValueRef = std::ptr::null_mut();
         let delay = JSValueToNumber(ctx, value, &mut exception);
         if !exception.is_null() {
-            return Err(extract_exception(ctx, exception));
+            return Err(extract_exception(ctx, exception).into());
         }
         Ok(Duration::from_millis(delay.max(0.0) as u64))
     }
@@ -434,10 +419,7 @@ pub(crate) fn parse_id_arg(
     argument_count: usize,
 ) -> JscResult<u64> {
     if index >= argument_count {
-        return Err(JscError::TypeError {
-            expected: "timer id".to_string(),
-            actual: "missing".to_string(),
-        });
+        return Err(JscError::type_error("timer id", "missing"));
     }
 
     unsafe {
@@ -445,7 +427,7 @@ pub(crate) fn parse_id_arg(
         let mut exception: JSValueRef = std::ptr::null_mut();
         let id = JSValueToNumber(ctx, value, &mut exception);
         if !exception.is_null() {
-            return Err(extract_exception(ctx, exception));
+            return Err(extract_exception(ctx, exception).into());
         }
         Ok(id as u64)
     }

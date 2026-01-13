@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/jsc-sys",
+    "crates/jsc-core",
     "crates/otter-runtime",
     "crates/otter-engine",
     "crates/otter-node",

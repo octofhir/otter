@@ -1,0 +1,13 @@
+[package]
+name = "jsc-sys"
+version = "0.1.0"
+edition = "2024"
+description = "Raw FFI bindings to JavaScriptCore"
+license = "MIT"
+links = "JavaScriptCore"
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[features]
+default = []

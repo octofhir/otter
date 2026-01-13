@@ -99,7 +99,7 @@ pub fn register_http_api(ctx: JSContextRef) -> JscResult<()> {
         JSStringRelease(source_ref);
 
         if !shim_exception.is_null() {
-            return Err(crate::value::extract_exception(ctx, shim_exception));
+            return Err(crate::value::extract_exception(ctx, shim_exception).into());
         }
     }
 

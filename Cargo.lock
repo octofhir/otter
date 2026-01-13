@@ -941,6 +941,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsc-core"
+version = "0.1.0"
+dependencies = [
+ "jsc-sys",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "jsc-sys"
+version = "0.1.0"
+dependencies = [
+ "pkg-config",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1114,13 +1131,13 @@ name = "otter-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cc",
  "criterion",
  "crossbeam-channel",
  "crossbeam-utils",
+ "jsc-core",
+ "jsc-sys",
  "num_cpus",
  "parking_lot",
- "pkg-config",
  "reqwest",
  "scopeguard",
  "serde",

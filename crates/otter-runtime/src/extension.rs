@@ -245,7 +245,7 @@ impl ExtensionRegistry {
             unsafe { JSObjectMakeDeferredPromise(ctx, &mut resolve, &mut reject, &mut exception) };
 
         if !exception.is_null() || promise.is_null() || resolve.is_null() || reject.is_null() {
-            return Err(JscError::Internal(
+            return Err(JscError::internal(
                 "Failed to create deferred promise".to_string(),
             ));
         }
@@ -265,7 +265,7 @@ impl ExtensionRegistry {
     fn register_op(&self, op: OpDecl, ctx: JSContextRef) -> JscResult<()> {
         let mut ops = self.ops.lock();
         if ops.contains_key(op.name()) {
-            return Err(JscError::Internal(format!(
+            return Err(JscError::internal(format!(
                 "Op already registered: {}",
                 op.name()
             )));
@@ -308,7 +308,7 @@ where
     F: Future<Output = OpResult> + Send + 'static,
 {
     let registry = registry_for_context(ctx)
-        .ok_or_else(|| JscError::Internal("Extension registry not found".to_string()))?;
+        .ok_or_else(|| JscError::internal("Extension registry not found".to_string()))?;
 
     let (promise, promise_id) = registry.create_deferred_promise(ctx)?;
     let queue = registry.async_queue.clone();
@@ -324,7 +324,7 @@ where
         Err(_) => {
             queue.queue_result(
                 promise_id,
-                Err(JscError::Internal(
+                Err(JscError::internal(
                     "Async task executed without Tokio runtime".to_string(),
                 )),
             );
@@ -335,7 +335,7 @@ where
 }
 
 fn register_js_op(ctx: JSContextRef, name: &str) -> JscResult<()> {
-    let name_cstr = CString::new(name).map_err(|e| JscError::Internal(e.to_string()))?;
+    let name_cstr = CString::new(name).map_err(|e| JscError::internal(e.to_string()))?;
 
     unsafe {
         let name_ref = JSStringCreateWithUTF8CString(name_cstr.as_ptr());
@@ -354,7 +354,7 @@ fn register_js_op(ctx: JSContextRef, name: &str) -> JscResult<()> {
         JSStringRelease(name_ref);
 
         if !exception.is_null() {
-            return Err(JscError::script_error("Failed to register op"));
+            return Err(JscError::script_error("Error", "Failed to register op"));
         }
     }
 
@@ -438,7 +438,7 @@ unsafe extern "C" fn js_op_dispatch(
                 Err(_) => {
                     queue.queue_result(
                         promise_id,
-                        Err(JscError::Internal(
+                        Err(JscError::internal(
                             "Async op executed without Tokio runtime".to_string(),
                         )),
                     );
@@ -486,7 +486,7 @@ unsafe fn call_promise_handler(
     );
 
     if !exception.is_null() || result.is_null() {
-        return Err(JscError::Internal(
+        return Err(JscError::internal(
             "Promise handler call failed".to_string(),
         ));
     }
@@ -495,19 +495,19 @@ unsafe fn call_promise_handler(
 }
 
 unsafe fn function_name(ctx: JSContextRef, function: JSObjectRef) -> JscResult<String> {
-    let name_key = CString::new("name").map_err(|e| JscError::Internal(e.to_string()))?;
+    let name_key = CString::new("name").map_err(|e| JscError::internal(e.to_string()))?;
     let name_ref = JSStringCreateWithUTF8CString(name_key.as_ptr());
     let mut exception: JSValueRef = std::ptr::null_mut();
     let value = JSObjectGetProperty(ctx, function, name_ref, &mut exception);
     JSStringRelease(name_ref);
 
     if !exception.is_null() || value.is_null() {
-        return Err(JscError::Internal("Failed to read op name".to_string()));
+        return Err(JscError::internal("Failed to read op name".to_string()));
     }
 
     let js_str = JSValueToStringCopy(ctx, value, &mut exception);
     if !exception.is_null() || js_str.is_null() {
-        return Err(JscError::Internal("Failed to read op name".to_string()));
+        return Err(JscError::internal("Failed to read op name".to_string()));
     }
 
     let name = js_string_to_rust(js_str);
@@ -523,13 +523,13 @@ unsafe fn js_value_to_json(ctx: JSContextRef, value: JSValueRef) -> JscResult<se
     let mut exception: JSValueRef = std::ptr::null_mut();
     let js_str = JSValueCreateJSONString(ctx, value, 0, &mut exception);
     if !exception.is_null() || js_str.is_null() {
-        return Err(JscError::script_error("Argument is not JSON serializable"));
+        return Err(JscError::script_error("Error", "Argument is not JSON serializable"));
     }
 
     let json_str = js_string_to_rust(js_str);
     JSStringRelease(js_str);
 
-    serde_json::from_str(&json_str).map_err(JscError::JsonError)
+    serde_json::from_str(&json_str).map_err(Into::into)
 }
 
 unsafe fn make_exception(ctx: JSContextRef, message: &str) -> JSValueRef {

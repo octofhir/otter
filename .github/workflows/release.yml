@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - 'otterjs-v*'
   workflow_dispatch:
     inputs:
       tag:

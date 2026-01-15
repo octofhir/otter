@@ -272,6 +272,10 @@ impl Drop for JscContext {
     fn drop(&mut self) {
         // SAFETY: ctx was created by JSGlobalContextCreate
         unsafe {
+            // Force synchronous GC before releasing context.
+            // This is especially important on Windows where background GC threads
+            // can cause access violations if they run after context is released.
+            JSGarbageCollect(self.ctx as JSContextRef);
             JSGlobalContextRelease(self.ctx);
         }
     }

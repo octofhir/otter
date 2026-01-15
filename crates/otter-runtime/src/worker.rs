@@ -46,11 +46,20 @@ pub(crate) enum Job {
 /// This function creates a JSC context on the current thread and processes
 /// jobs until shutdown is signaled. Panics during job execution are caught
 /// and converted to errors.
+///
+/// # Arguments
+///
+/// * `job_rx` - Channel receiver for incoming jobs
+/// * `extensions` - Extensions to register in the worker context
+/// * `shutdown` - Shared flag to signal worker shutdown
+/// * `stats` - Shared statistics counter
+/// * `tokio_handle` - Tokio runtime handle for async operations (required)
 pub(crate) fn run_worker(
     job_rx: Receiver<Job>,
     extensions: Vec<Extension>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<EngineStats>,
+    tokio_handle: &tokio::runtime::Handle,
 ) {
     let thread_name = std::thread::current()
         .name()
@@ -59,6 +68,9 @@ pub(crate) fn run_worker(
 
     let _span = info_span!("worker", name = %thread_name).entered();
     debug!("Worker starting");
+
+    // Store Tokio handle in thread-local for async operations
+    crate::extension::set_tokio_handle(tokio_handle.clone());
 
     // Create JSC context for this worker
     let context = match JscContext::new() {

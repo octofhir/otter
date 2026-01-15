@@ -1,31 +1,24 @@
-# otter-cli
+# otterjs
 
 A fast TypeScript/JavaScript runtime CLI.
-
-## Overview
-
-`otter-cli` provides the `otter` command-line tool for executing TypeScript and JavaScript files with the Otter runtime.
 
 ## Installation
 
 ```bash
-cargo install otter-cli
+cargo install otterjs
 ```
 
 ## Usage
 
 ```bash
-# Run a TypeScript file
+# Run a script directly
+otter script.ts
+otter script.js
+
+# Or with the run command
 otter run script.ts
-
-# Run a JavaScript file
-otter run script.js
-
-# Install dependencies
-otter install
-
-# Initialize a new project
-otter init
+otter run script.ts --watch
+otter run script.ts --timeout 5000
 ```
 
 ## Commands
@@ -33,8 +26,36 @@ otter init
 | Command | Description |
 |---------|-------------|
 | `run <file>` | Execute a TypeScript or JavaScript file |
-| `install` | Install npm dependencies |
-| `init` | Initialize a new otter project |
+| `check <file>` | Type check TypeScript files |
+| `test` | Run tests |
+| `repl` | Start interactive REPL |
+| `install` | Install dependencies from package.json |
+| `add <package>` | Add a dependency |
+| `remove <package>` | Remove a dependency |
+| `init` | Initialize a new project |
+| `info` | Show runtime information |
+
+## Examples
+
+```bash
+# Run with watch mode
+otter run src/index.ts --watch
+
+# Type check
+otter check src/**/*.ts
+
+# Run tests
+otter test
+
+# Start REPL
+otter repl
+
+# Package management
+otter init
+otter add lodash
+otter install
+otter remove lodash
+```
 
 ## License
 

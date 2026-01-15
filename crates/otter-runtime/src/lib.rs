@@ -92,6 +92,7 @@ pub use engine::{Engine, EngineBuilder, EngineHandle, EngineStats, EngineStatsSn
 pub use error::{JscError, JscResult};
 pub use extension::{
     Extension, ExtensionState, OpContext, OpDecl, OpHandler, OpResult, op_async, op_sync,
+    set_tokio_handle,
 };
 pub use modules::{bundle_modules, entry_execution, transform_module, wrap_module};
 pub use runtime::{JscConfig, JscRuntime, JscRuntimePool, PromiseDriver};
@@ -127,6 +128,7 @@ pub mod prelude {
     pub use crate::error::{JscError, JscResult};
     pub use crate::extension::{
         Extension, ExtensionState, OpContext, OpDecl, OpHandler, OpResult, op_async, op_sync,
+        set_tokio_handle,
     };
     pub use crate::modules::{bundle_modules, entry_execution, transform_module, wrap_module};
     pub use crate::runtime::{JscConfig, JscRuntime, JscRuntimePool, PromiseDriver};

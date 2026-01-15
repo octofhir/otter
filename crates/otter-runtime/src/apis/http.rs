@@ -27,7 +27,6 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::ptr;
 use std::str::FromStr;
-use std::sync::RwLock;
 use std::time::Duration;
 use tracing::{debug, warn};
 use url::Url;
@@ -37,15 +36,17 @@ use url::Url;
 /// Takes a host string and returns true if access is allowed.
 pub type NetPermissionChecker = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
-// Thread-local storage for network permission checker
-thread_local! {
-    static NET_PERMISSION_CHECKER: RwLock<Option<NetPermissionChecker>> = const { RwLock::new(None) };
-}
+use std::sync::OnceLock;
 
-/// Set the network permission checker for the current thread.
+// Global (process-wide) storage for network permission checker.
+// This allows the permission checker to be set once and used by all worker threads.
+static NET_PERMISSION_CHECKER: OnceLock<NetPermissionChecker> = OnceLock::new();
+
+/// Set the network permission checker globally (process-wide).
 ///
-/// This should be called before executing scripts that may use fetch().
-/// The checker function takes a host string and returns true if access is allowed.
+/// This should be called once before starting the engine. The checker function
+/// takes a host string and returns true if access is allowed. Once set, the
+/// checker applies to all worker threads.
 ///
 /// # Example
 ///
@@ -60,17 +61,20 @@ thread_local! {
 ///     host == "api.example.com" || host.ends_with(".example.com")
 /// }));
 /// ```
+///
+/// # Note
+///
+/// This function can only be called once. Subsequent calls will be ignored.
 pub fn set_net_permission_checker(checker: NetPermissionChecker) {
-    NET_PERMISSION_CHECKER.with(|c| {
-        *c.write().unwrap() = Some(checker);
-    });
+    let _ = NET_PERMISSION_CHECKER.set(checker);
 }
 
-/// Clear the network permission checker for the current thread.
+/// Clear the network permission checker.
+///
+/// Note: This is a no-op since OnceLock cannot be reset. The checker persists
+/// for the lifetime of the process.
 pub fn clear_net_permission_checker() {
-    NET_PERMISSION_CHECKER.with(|c| {
-        *c.write().unwrap() = None;
-    });
+    // No-op: OnceLock cannot be reset
 }
 
 /// Check if network access is allowed for a URL.
@@ -83,15 +87,13 @@ fn check_net_permission(url: &str) -> Result<(), JscError> {
         .ok_or_else(|| JscError::HttpError("URL has no host".to_string()))?;
 
     // Check with the permission checker
-    let allowed = NET_PERMISSION_CHECKER.with(|c| {
-        match c.read().unwrap().as_ref() {
-            Some(checker) => checker(host),
-            None => {
-                // No checker set - deny by default (secure default)
-                false
-            }
+    let allowed = match NET_PERMISSION_CHECKER.get() {
+        Some(checker) => checker(host),
+        None => {
+            // No checker set - deny by default (secure default)
+            false
         }
-    });
+    };
 
     if !allowed {
         return Err(JscError::PermissionDenied(format!(
@@ -115,6 +117,7 @@ struct FetchOptions {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct FetchResponse {
     status: u16,
     status_text: String,

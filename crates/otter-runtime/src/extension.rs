@@ -374,6 +374,25 @@ impl ExtensionRegistry {
 thread_local! {
     static REGISTRY_MAP: RefCell<HashMap<usize, Arc<ExtensionRegistry>>> =
         RefCell::new(HashMap::new());
+
+    /// Thread-local Tokio runtime handle for async operations in worker threads.
+    static TOKIO_HANDLE: RefCell<Option<tokio::runtime::Handle>> = const { RefCell::new(None) };
+}
+
+/// Set the Tokio runtime handle for the current worker thread.
+/// This should be called at worker startup to enable async operations.
+pub fn set_tokio_handle(handle: tokio::runtime::Handle) {
+    TOKIO_HANDLE.with(|h| {
+        *h.borrow_mut() = Some(handle);
+    });
+}
+
+/// Get the Tokio runtime handle for the current thread.
+/// Returns the thread-local handle if set, otherwise tries `Handle::try_current()`.
+fn get_tokio_handle() -> Option<tokio::runtime::Handle> {
+    TOKIO_HANDLE
+        .with(|h| h.borrow().clone())
+        .or_else(|| tokio::runtime::Handle::try_current().ok())
 }
 
 pub(crate) fn register_context_registry(ctx: JSContextRef, registry: Arc<ExtensionRegistry>) {
@@ -403,14 +422,14 @@ where
     let queue = registry.async_queue.clone();
     queue.inflight_ops.fetch_add(1, Ordering::Relaxed);
 
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
+    match get_tokio_handle() {
+        Some(handle) => {
             handle.spawn(async move {
                 let result = fut.await;
                 queue.queue_result(promise_id, result);
             });
         }
-        Err(_) => {
+        None => {
             queue.queue_result(
                 promise_id,
                 Err(JscError::internal(
@@ -517,14 +536,14 @@ unsafe extern "C" fn js_op_dispatch(
 
             let queue = registry.async_queue.clone();
             queue.inflight_ops.fetch_add(1, Ordering::Relaxed);
-            match tokio::runtime::Handle::try_current() {
-                Ok(handle) => {
+            match get_tokio_handle() {
+                Some(handle) => {
                     handle.spawn(async move {
                         let result = handler(op_context, args).await;
                         queue.queue_result(promise_id, result);
                     });
                 }
-                Err(_) => {
+                None => {
                     queue.queue_result(
                         promise_id,
                         Err(JscError::internal(

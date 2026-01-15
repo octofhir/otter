@@ -339,3 +339,34 @@ async fn test_handle_stats() {
 
     engine.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_custom_tokio_handle() {
+    // Get current tokio handle and pass it explicitly
+    let tokio_handle = tokio::runtime::Handle::current();
+
+    let engine = Engine::builder()
+        .pool_size(1)
+        .tokio_handle(tokio_handle)
+        .build()
+        .unwrap();
+
+    let handle = engine.handle();
+    let result = handle.eval("42").await.unwrap();
+    assert_eq!(result, json!(42));
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_tokio_handle_captured_automatically() {
+    // Engine::new() should automatically capture the current tokio handle
+    let engine = Engine::new().unwrap();
+    let handle = engine.handle();
+
+    // Basic eval should work
+    let result = handle.eval("1 + 1").await.unwrap();
+    assert_eq!(result, json!(2));
+
+    engine.shutdown().await;
+}

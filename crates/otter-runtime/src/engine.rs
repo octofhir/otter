@@ -91,14 +91,19 @@ pub struct EngineBuilder {
     pool_size: usize,
     queue_capacity: usize,
     extensions: Vec<Extension>,
+    tokio_handle: tokio::runtime::Handle,
 }
 
 impl Default for EngineBuilder {
     fn default() -> Self {
+        // Get current Tokio handle - panics if not in a Tokio context
+        let tokio_handle = tokio::runtime::Handle::current();
+
         Self {
             pool_size: num_cpus::get().max(1),
             queue_capacity: 1024,
             extensions: Vec::new(),
+            tokio_handle,
         }
     }
 }
@@ -124,6 +129,16 @@ impl EngineBuilder {
     /// Register an extension to be available in all contexts
     pub fn extension(mut self, ext: Extension) -> Self {
         self.extensions.push(ext);
+        self
+    }
+
+    /// Set the Tokio runtime handle for async operations in workers
+    ///
+    /// By default, the builder captures the current Tokio handle via `Handle::current()`.
+    /// Use this method to override with a different handle if needed.
+    /// The handle is required for async operations like fetch() to work in worker threads.
+    pub fn tokio_handle(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.tokio_handle = handle;
         self
     }
 
@@ -167,11 +182,12 @@ impl Engine {
             let extensions = config.extensions.clone();
             let shutdown_flag = shutdown.clone();
             let worker_stats = stats.clone();
+            let tokio_handle = config.tokio_handle.clone();
 
             let handle = std::thread::Builder::new()
                 .name(format!("otter-worker-{}", i))
                 .spawn(move || {
-                    run_worker(rx, extensions, shutdown_flag, worker_stats);
+                    run_worker(rx, extensions, shutdown_flag, worker_stats, &tokio_handle);
                 })
                 .map_err(|e| JscError::internal(format!("Failed to spawn worker: {}", e)))?;
 

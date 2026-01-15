@@ -105,11 +105,11 @@ impl Capabilities {
             Some(allowed) if allowed.is_empty() => true,
             Some(allowed) => {
                 // Canonicalize path for comparison if possible
-                let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+                // Use dunce to avoid Windows extended-length path prefix (\\?\)
+                let path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
                 allowed.iter().any(|allowed_path| {
-                    let allowed = allowed_path
-                        .canonicalize()
-                        .unwrap_or_else(|_| allowed_path.clone());
+                    let allowed =
+                        dunce::canonicalize(allowed_path).unwrap_or_else(|_| allowed_path.clone());
                     path.starts_with(&allowed)
                 })
             }

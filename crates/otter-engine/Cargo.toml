@@ -19,6 +19,7 @@ dirs = "5.0"
 md5 = "0.7"
 regex = "1"
 thiserror = "1"
+dunce = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

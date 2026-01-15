@@ -1,6 +1,6 @@
 [package]
 name = "otter-runtime"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "JavaScriptCore runtime for otter - TypeScript/JavaScript execution engine"
 license = "MIT"
@@ -12,7 +12,7 @@ readme = "README.md"
 
 [dependencies]
 otter-jsc-sys = { path = "../otter-jsc-sys", version = "0.1.1" }
-otter-jsc-core = { path = "../otter-jsc-core", version = "0.1.1" }
+otter-jsc-core = { path = "../otter-jsc-core", version = "0.1.2" }
 thiserror = "1"
 anyhow = "1"
 url = "2"

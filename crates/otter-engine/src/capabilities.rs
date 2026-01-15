@@ -1,8 +1,7 @@
 //! Capability-based security model
 //!
 //! This module implements a deny-by-default security model where scripts
-//! have no permissions unless explicitly granted. This is similar to Deno's
-//! permission system.
+//! have no permissions unless explicitly granted. 
 //!
 //! # Example
 //!

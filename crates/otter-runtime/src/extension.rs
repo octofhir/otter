@@ -246,7 +246,10 @@ impl ExtensionRegistry {
             self.execute_js(ctx, js_code, &format!("<{}>", extension.name()))?;
         }
 
-        debug!(extension = extension.name(), "Extension registered successfully");
+        debug!(
+            extension = extension.name(),
+            "Extension registered successfully"
+        );
         Ok(())
     }
 

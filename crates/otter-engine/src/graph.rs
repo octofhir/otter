@@ -154,9 +154,10 @@ impl ModuleGraph {
             for dep in &node.dependencies {
                 // Resolve the dependency to its canonical URL
                 if let Ok(resolved) = self.loader.resolve(dep, Some(specifier))
-                    && let Some(key) = self.nodes.keys().find(|k| **k == resolved) {
-                        self.visit_for_order(key, visited, order);
-                    }
+                    && let Some(key) = self.nodes.keys().find(|k| **k == resolved)
+                {
+                    self.visit_for_order(key, visited, order);
+                }
             }
         }
 

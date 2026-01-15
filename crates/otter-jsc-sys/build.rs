@@ -176,7 +176,10 @@ fn link_bun_webkit(webkit_path: &PathBuf, os: &str) {
         println!("cargo:rustc-link-lib=static=sicuuc");
         // sicuio/sicutu are present but not always required; avoid overlinking
     } else {
-        println!("cargo:warning=ICU libraries not found in {}", lib_dir.display());
+        println!(
+            "cargo:warning=ICU libraries not found in {}",
+            lib_dir.display()
+        );
     }
 
     // C++ runtime and system libraries (required by JSC)
@@ -224,8 +227,8 @@ fn lib_exists(lib_dir: &PathBuf, lib_name: &str) -> bool {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                let is_match = name.starts_with(lib_name)
-                    && (name.ends_with(".lib") || name.ends_with(".a"));
+                let is_match =
+                    name.starts_with(lib_name) && (name.ends_with(".lib") || name.ends_with(".a"));
                 if is_match {
                     return true;
                 }

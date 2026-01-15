@@ -33,6 +33,10 @@ pub enum JscError {
     /// Module loading/resolution error
     #[error("Module error: {0}")]
     ModuleError(String),
+
+    /// Permission denied error
+    #[error("PermissionDenied: {0}")]
+    PermissionDenied(String),
 }
 
 impl JscError {

@@ -2,18 +2,26 @@
 
 use anyhow::Result;
 use clap::Args;
-use otter_engine::{Capabilities, CapabilitiesBuilder, LoaderConfig};
+use otter_engine::{
+    Capabilities, CapabilitiesBuilder, LoaderConfig, ModuleGraph, ModuleLoader, parse_imports,
+};
 use otter_node::{
     create_buffer_extension, create_fs_extension, create_path_extension, create_test_extension,
 };
 use otter_runtime::{
-    JscConfig, JscRuntime, needs_transpilation, transpile_typescript,
+    JscConfig, JscRuntime, bundle_modules, needs_transpilation, set_net_permission_checker,
+    transpile_typescript,
     tsgo::{TypeCheckConfig, check_types, format_diagnostics, has_errors},
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{Config, ModulesConfig};
+use crate::watch::{
+    FileWatcher, WatchConfig, WatchEvent, clear_console, hmr_runtime_code, print_reload_message,
+};
 
 #[derive(Args)]
 pub struct RunCommand {
@@ -63,8 +71,69 @@ pub struct RunCommand {
 
 impl RunCommand {
     pub async fn run(&self, config: &Config) -> Result<()> {
+        if self.watch {
+            self.run_watch_mode(config).await
+        } else {
+            self.run_once(config).await
+        }
+    }
+
+    async fn run_watch_mode(&self, config: &Config) -> Result<()> {
+        println!("\x1b[36m[HMR]\x1b[0m Watching for file changes...");
+
+        let watch_config = WatchConfig::default();
+        let mut watcher = FileWatcher::new(watch_config.clone());
+
+        // Watch the directory containing the entry file
+        let watch_dir = self
+            .entry
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+
+        watcher
+            .watch(&watch_dir)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        // Initial run
+        clear_console(watch_config.clear_console);
+        let result = self.run_once(config).await;
+        if let Err(e) = result {
+            eprintln!("\x1b[31m[Error]\x1b[0m {}", e);
+        }
+
+        // Watch loop
+        loop {
+            match watcher.wait_for_change() {
+                Some(WatchEvent::FilesChanged(files)) => {
+                    print_reload_message(&files);
+                    clear_console(watch_config.clear_console);
+
+                    let result = self.run_once(config).await;
+                    if let Err(e) = result {
+                        eprintln!("\x1b[31m[Error]\x1b[0m {}", e);
+                    }
+                }
+                Some(WatchEvent::Error(e)) => {
+                    eprintln!("\x1b[33m[Watch Error]\x1b[0m {}", e);
+                }
+                None => {
+                    // Channel closed, exit
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_once(&self, config: &Config) -> Result<()> {
         // Build capabilities from CLI flags + config
         let caps = self.build_capabilities(config);
+
+        // Set network permission checker for fetch() API using capabilities
+        let caps_for_net = Arc::new(caps.clone());
+        set_net_permission_checker(Box::new(move |host| caps_for_net.can_net(host)));
 
         // Type check if needed and file is TypeScript
         let is_typescript = needs_transpilation(&self.entry.to_string_lossy());
@@ -75,16 +144,7 @@ impl RunCommand {
         // Read source
         let source = std::fs::read_to_string(&self.entry)?;
 
-        // Transpile TypeScript if needed
-        let code = if is_typescript {
-            let result = transpile_typescript(&source)
-                .map_err(|e| anyhow::anyhow!("Transpilation error: {}", e))?;
-            result.code
-        } else {
-            source
-        };
-
-        // Build module loader config from CLI config (prepared for ESM integration)
+        // Build module loader config from CLI config
         let loader_config = build_loader_config(&self.entry, &config.modules);
         tracing::debug!(
             base_dir = %loader_config.base_dir.display(),
@@ -92,6 +152,54 @@ impl RunCommand {
             import_map_count = loader_config.import_map.len(),
             "Module loader config"
         );
+
+        // Check if file has imports - if so, use module bundler
+        let imports = parse_imports(&source);
+        let code = if !imports.is_empty() {
+            tracing::debug!(imports_count = imports.len(), "Loading module dependencies");
+
+            // Create module loader and graph
+            let loader = Arc::new(ModuleLoader::new(loader_config));
+            let mut graph = ModuleGraph::new(loader.clone());
+
+            // Load entry file as file:// URL
+            let entry_url = format!("file://{}", self.entry.canonicalize()?.display());
+            graph.load(&entry_url).await?;
+
+            // Bundle all modules in topological order
+            let execution_order = graph.execution_order();
+            let mut modules_for_bundle: Vec<(&str, &str, HashMap<String, String>)> = Vec::new();
+
+            for url in &execution_order {
+                if let Some(node) = graph.get(url) {
+                    // Build dependency map for this module
+                    let mut deps = HashMap::new();
+                    for dep_specifier in &node.dependencies {
+                        if let Ok(resolved) = loader.resolve(dep_specifier, Some(url)) {
+                            deps.insert(dep_specifier.clone(), resolved);
+                        }
+                    }
+                    modules_for_bundle.push((url, node.executable_source(), deps));
+                }
+            }
+
+            // Convert to borrowed refs for bundle_modules
+            let modules_refs: Vec<(&str, &str, &HashMap<String, String>)> = modules_for_bundle
+                .iter()
+                .map(|(url, src, deps)| (*url, *src, deps))
+                .collect();
+
+            bundle_modules(modules_refs)
+        } else {
+            // No imports - just transpile if needed
+            if is_typescript {
+                let result = transpile_typescript(&source)
+                    .map_err(|e| anyhow::anyhow!("Transpilation error: {}", e))?;
+                result.code
+            } else {
+                source
+            }
+        };
 
         // Create runtime with capabilities
         let runtime = JscRuntime::new(JscConfig::default())?;
@@ -104,8 +212,10 @@ impl RunCommand {
 
         // Set up Otter global namespace with args and capabilities
         let args_json = serde_json::to_string(&self.args)?;
+        let hmr_code = if self.watch { hmr_runtime_code() } else { "" };
         let setup = format!(
-            "globalThis.Otter = globalThis.Otter || {{}};\n\
+            "{hmr_code}\n\
+             globalThis.Otter = globalThis.Otter || {{}};\n\
              globalThis.Otter.args = {};\n\
              globalThis.Otter.capabilities = {};\n",
             args_json,
@@ -207,7 +317,6 @@ impl RunCommand {
     }
 
     async fn type_check(&self) -> Result<()> {
-        // Auto-discover tsconfig from entry file's directory (Bun-style)
         let tsconfig = crate::config::find_tsconfig_for_file(&self.entry);
 
         let config = TypeCheckConfig {

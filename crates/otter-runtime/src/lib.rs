@@ -74,6 +74,7 @@ pub mod engine;
 pub mod error;
 pub mod event_loop;
 pub mod extension;
+pub mod modules;
 pub mod runtime;
 pub mod transpiler;
 pub mod tsconfig;
@@ -83,6 +84,7 @@ pub mod value;
 mod worker;
 
 pub use apis::console::{ConsoleLevel, set_console_handler};
+pub use apis::{NetPermissionChecker, clear_net_permission_checker, set_net_permission_checker};
 pub use apis::{register_all_apis, register_apis_with_config};
 pub use config::TypeScriptConfig;
 pub use context::JscContext;
@@ -91,6 +93,7 @@ pub use error::{JscError, JscResult};
 pub use extension::{
     Extension, ExtensionState, OpContext, OpDecl, OpHandler, OpResult, op_async, op_sync,
 };
+pub use modules::{bundle_modules, entry_execution, transform_module, wrap_module};
 pub use runtime::{JscConfig, JscRuntime, JscRuntimePool, PromiseDriver};
 pub use transpiler::{
     TranspileError, TranspileOptions, TranspileResult, is_typescript, needs_transpilation,
@@ -112,6 +115,9 @@ pub use value::JscValue;
 
 pub mod prelude {
     pub use crate::apis::console::{ConsoleLevel, set_console_handler};
+    pub use crate::apis::{
+        NetPermissionChecker, clear_net_permission_checker, set_net_permission_checker,
+    };
     pub use crate::apis::{register_all_apis, register_apis_with_config};
     pub use crate::config::TypeScriptConfig;
     pub use crate::context::JscContext;
@@ -122,6 +128,7 @@ pub mod prelude {
     pub use crate::extension::{
         Extension, ExtensionState, OpContext, OpDecl, OpHandler, OpResult, op_async, op_sync,
     };
+    pub use crate::modules::{bundle_modules, entry_execution, transform_module, wrap_module};
     pub use crate::runtime::{JscConfig, JscRuntime, JscRuntimePool, PromiseDriver};
     pub use crate::transpiler::{
         TranspileError, TranspileOptions, TranspileResult, is_typescript, needs_transpilation,

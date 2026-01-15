@@ -476,11 +476,10 @@ fn strip_json_comments(input: &str) -> String {
                     // Multi-line comment - skip until */
                     chars.next();
                     while let Some(nc) = chars.next() {
-                        if nc == '*'
-                            && chars.peek() == Some(&'/') {
-                                chars.next();
-                                break;
-                            }
+                        if nc == '*' && chars.peek() == Some(&'/') {
+                            chars.next();
+                            break;
+                        }
                     }
                 }
                 _ => result.push(c),

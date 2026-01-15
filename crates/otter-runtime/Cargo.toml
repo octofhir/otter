@@ -15,6 +15,7 @@ otter-jsc-sys = { path = "../otter-jsc-sys", version = "0.1.0" }
 otter-jsc-core = { path = "../otter-jsc-core", version = "0.1.0" }
 thiserror = "1"
 anyhow = "1"
+url = "2"
 
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
@@ -26,6 +27,7 @@ parking_lot = "0.12"
 crossbeam-utils = "0.8"
 crossbeam-channel = "0.5"
 scopeguard = "1.2"
+regex = "1.11"
 
 swc_common = { version = "18", features = ["sourcemap"] }
 swc_ecma_ast = "19"

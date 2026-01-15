@@ -2,11 +2,15 @@
 //!
 //! This module provides Rust implementations of APIs that are exposed to JavaScript:
 //! - `console.*` - Logging (routed to tracing)
-//! - `http.fetch` - HTTP client (via reqwest)
+//! - `fetch()` - Web standard HTTP client (via reqwest, with capabilities checking)
+//! - Timers - setTimeout, setInterval
 
 pub mod console;
 pub mod http;
 pub mod timers;
+
+// Re-export permission checker for fetch
+pub use http::{NetPermissionChecker, clear_net_permission_checker, set_net_permission_checker};
 
 use crate::bindings::*;
 use crate::error::JscResult;

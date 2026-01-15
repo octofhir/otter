@@ -8,6 +8,7 @@ use tracing_subscriber::filter::EnvFilter;
 
 mod commands;
 mod config;
+mod watch;
 
 #[derive(Parser)]
 #[command(

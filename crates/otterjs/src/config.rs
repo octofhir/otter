@@ -122,7 +122,6 @@ fn find_config_file() -> Option<PathBuf> {
 }
 
 /// Find tsconfig.json by walking up from a file's directory.
-/// Follows Bun's approach: checks for tsconfig.json first, then jsconfig.json.
 pub fn find_tsconfig_for_file(file_path: &Path) -> Option<PathBuf> {
     let start_dir = file_path.parent()?;
     find_tsconfig_in_ancestors(start_dir)

@@ -1,7 +1,21 @@
-//! HTTP API implementation
+//! HTTP API implementation (fetch)
 //!
-//! Provides `fetch(url, options)` for making HTTP requests from scripts.
+//! Provides the Web standard `fetch(url, options)` for making HTTP requests from scripts.
 //! Uses reqwest under the hood with async calls.
+//!
+//! # Security
+//!
+//! Network access is controlled by a permission checker that can be configured via
+//! `set_net_permission_checker`. By default, all network access is denied unless
+//! a checker is set and approves the request.
+//!
+//! # Example
+//!
+//! ```typescript
+//! // Requires: --allow-net=api.example.com
+//! const response = await fetch("https://api.example.com/data");
+//! const json = await response.json();
+//! ```
 
 use crate::apis::{get_arg_as_json, get_arg_as_string, make_exception};
 use crate::bindings::*;
@@ -13,8 +27,81 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::ptr;
 use std::str::FromStr;
+use std::sync::RwLock;
 use std::time::Duration;
 use tracing::{debug, warn};
+use url::Url;
+
+/// Type for network permission checker function.
+///
+/// Takes a host string and returns true if access is allowed.
+pub type NetPermissionChecker = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
+// Thread-local storage for network permission checker
+thread_local! {
+    static NET_PERMISSION_CHECKER: RwLock<Option<NetPermissionChecker>> = const { RwLock::new(None) };
+}
+
+/// Set the network permission checker for the current thread.
+///
+/// This should be called before executing scripts that may use fetch().
+/// The checker function takes a host string and returns true if access is allowed.
+///
+/// # Example
+///
+/// ```ignore
+/// use otter_runtime::set_net_permission_checker;
+///
+/// // Allow all network access
+/// set_net_permission_checker(Box::new(|_host| true));
+///
+/// // Allow only specific hosts
+/// set_net_permission_checker(Box::new(|host| {
+///     host == "api.example.com" || host.ends_with(".example.com")
+/// }));
+/// ```
+pub fn set_net_permission_checker(checker: NetPermissionChecker) {
+    NET_PERMISSION_CHECKER.with(|c| {
+        *c.write().unwrap() = Some(checker);
+    });
+}
+
+/// Clear the network permission checker for the current thread.
+pub fn clear_net_permission_checker() {
+    NET_PERMISSION_CHECKER.with(|c| {
+        *c.write().unwrap() = None;
+    });
+}
+
+/// Check if network access is allowed for a URL.
+fn check_net_permission(url: &str) -> Result<(), JscError> {
+    // Parse URL to extract host
+    let parsed = Url::parse(url).map_err(|e| JscError::HttpError(format!("Invalid URL: {}", e)))?;
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| JscError::HttpError("URL has no host".to_string()))?;
+
+    // Check with the permission checker
+    let allowed = NET_PERMISSION_CHECKER.with(|c| {
+        match c.read().unwrap().as_ref() {
+            Some(checker) => checker(host),
+            None => {
+                // No checker set - deny by default (secure default)
+                false
+            }
+        }
+    });
+
+    if !allowed {
+        return Err(JscError::PermissionDenied(format!(
+            "Network access denied for '{}'. Use --allow-net={} to grant access.",
+            url, host
+        )));
+    }
+
+    Ok(())
+}
 
 const FETCH_SHIM: &str = include_str!("fetch_shim.js");
 
@@ -145,6 +232,9 @@ unsafe extern "C" fn js_http_fetch(
 }
 
 async fn execute_fetch(url: &str, options: FetchOptions) -> JscResult<serde_json::Value> {
+    // Check network permissions before making the request
+    check_net_permission(url)?;
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(options.timeout.unwrap_or(30000)))
         .build()

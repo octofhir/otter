@@ -35,30 +35,34 @@ impl RemoveCommand {
             // Check in dependencies
             if let Some(deps) = pkg.get_mut("dependencies")
                 && let Some(obj) = deps.as_object_mut()
-                    && obj.remove(package).is_some() {
-                        found = true;
-                    }
+                && obj.remove(package).is_some()
+            {
+                found = true;
+            }
 
             // Check in devDependencies
             if let Some(deps) = pkg.get_mut("devDependencies")
                 && let Some(obj) = deps.as_object_mut()
-                    && obj.remove(package).is_some() {
-                        found = true;
-                    }
+                && obj.remove(package).is_some()
+            {
+                found = true;
+            }
 
             // Check in peerDependencies
             if let Some(deps) = pkg.get_mut("peerDependencies")
                 && let Some(obj) = deps.as_object_mut()
-                    && obj.remove(package).is_some() {
-                        found = true;
-                    }
+                && obj.remove(package).is_some()
+            {
+                found = true;
+            }
 
             // Check in optionalDependencies
             if let Some(deps) = pkg.get_mut("optionalDependencies")
                 && let Some(obj) = deps.as_object_mut()
-                    && obj.remove(package).is_some() {
-                        found = true;
-                    }
+                && obj.remove(package).is_some()
+            {
+                found = true;
+            }
 
             if found {
                 removed.push(package.as_str());

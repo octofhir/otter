@@ -59,9 +59,10 @@ pub fn basename(path: &str, suffix: Option<&str>) -> String {
         .unwrap_or_default();
 
     if let Some(suffix) = suffix
-        && base.ends_with(suffix) {
-            base = base[..base.len() - suffix.len()].to_string();
-        }
+        && base.ends_with(suffix)
+    {
+        base = base[..base.len() - suffix.len()].to_string();
+    }
 
     base
 }

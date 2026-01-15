@@ -38,7 +38,6 @@ impl CheckCommand {
             .project
             .clone()
             .or_else(|| {
-                // Auto-discover from first file's directory (Bun-style)
                 self.files
                     .first()
                     .and_then(|f| crate::config::find_tsconfig_for_file(f))

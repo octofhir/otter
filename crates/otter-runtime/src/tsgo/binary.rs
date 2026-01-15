@@ -143,8 +143,6 @@ pub fn find_tsgo_blocking() -> JscResult<PathBuf> {
     download_tsgo_blocking()
 }
 
-/// Download tsgo binary from Deno's typescript-go fork.
-///
 /// Downloads the platform-specific binary from GitHub releases,
 /// extracts it from the zip archive, and caches it for future use.
 pub async fn download_tsgo() -> JscResult<PathBuf> {
@@ -297,11 +295,12 @@ fn extract_zip(bytes: &[u8], dest: &std::path::Path) -> JscResult<()> {
             })?;
         } else {
             if let Some(p) = outpath.parent()
-                && !p.exists() {
-                    std::fs::create_dir_all(p).map_err(|e| {
-                        JscError::internal(format!("Failed to create directory {:?}: {}", p, e))
-                    })?;
-                }
+                && !p.exists()
+            {
+                std::fs::create_dir_all(p).map_err(|e| {
+                    JscError::internal(format!("Failed to create directory {:?}: {}", p, e))
+                })?;
+            }
             let mut outfile = std::fs::File::create(&outpath).map_err(|e| {
                 JscError::internal(format!("Failed to create file {:?}: {}", outpath, e))
             })?;

@@ -244,7 +244,9 @@ pub async fn rename(caps: &Capabilities, old_path: &str, new_path: &str) -> Resu
     }
 
     if !caps.can_write(&old_path_buf) || !caps.can_write(&new_path_buf) {
-        return Err(FsError::PermissionDenied("write access for rename. Use --allow-write to grant permission.".to_string()));
+        return Err(FsError::PermissionDenied(
+            "write access for rename. Use --allow-write to grant permission.".to_string(),
+        ));
     }
 
     fs::rename(&old_path_buf, &new_path_buf).await?;

@@ -77,6 +77,7 @@ fn configure_windows(target_arch: &str) {
     println!("cargo:rustc-link-lib=ole32");
     println!("cargo:rustc-link-lib=oleaut32");
     println!("cargo:rustc-link-lib=uuid");
+    println!("cargo:rustc-link-lib=shell32");
 
     // MSVC C++ runtime (required for JSC on Windows)
     // Use static linking to avoid runtime dependencies

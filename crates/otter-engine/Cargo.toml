@@ -4,9 +4,14 @@ version = "0.1.0"
 edition = "2024"
 description = "Otter JavaScript engine"
 license = "MIT"
+repository = "https://github.com/octofhir/otter"
+homepage = "https://github.com/octofhir/otter"
+keywords = ["typescript", "javascript", "runtime", "engine", "jsc"]
+categories = ["development-tools", "compilers"]
+readme = "README.md"
 
 [dependencies]
-otter-runtime = { path = "../otter-runtime" }
+otter-runtime = { path = "../otter-runtime", version = "0.1.0" }
 tokio = { version = "1", features = ["rt", "sync", "fs"] }
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
 oxc_resolver = "11"

@@ -131,3 +131,13 @@ pub fn register_all_apis(ctx: JSContextRef) -> JscResult<()> {
     timers::register_timers_api(ctx)?;
     Ok(())
 }
+
+/// Register APIs with selective console registration based on config
+pub fn register_apis_with_config(ctx: JSContextRef, enable_console: bool) -> JscResult<()> {
+    if enable_console {
+        console::register_console_api(ctx)?;
+    }
+    http::register_http_api(ctx)?;
+    timers::register_timers_api(ctx)?;
+    Ok(())
+}

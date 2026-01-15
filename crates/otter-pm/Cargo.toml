@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "NPM-compatible package manager for Otter"
 license = "MIT"
+repository = "https://github.com/octofhir/otter"
+homepage = "https://github.com/octofhir/otter"
+keywords = ["npm", "package-manager", "javascript", "typescript", "otter"]
+categories = ["development-tools", "command-line-utilities"]
+readme = "README.md"
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json"] }

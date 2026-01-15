@@ -74,6 +74,11 @@ fn configure_windows(target_arch: &str) {
     println!("cargo:rustc-link-lib=ole32");
     println!("cargo:rustc-link-lib=oleaut32");
     println!("cargo:rustc-link-lib=uuid");
+
+    // MSVC C++ runtime (required for JSC on Windows)
+    // Use static linking to avoid runtime dependencies
+    println!("cargo:rustc-link-arg=/NODEFAULTLIB:libcmt");
+    println!("cargo:rustc-link-lib=msvcrt");
 }
 
 fn download_bun_webkit(os: &str, arch: &str) -> PathBuf {
@@ -136,11 +141,27 @@ fn link_bun_webkit(webkit_path: &PathBuf, os: &str) {
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
 
+    // Print available libraries for debugging
+    if let Ok(entries) = fs::read_dir(&lib_dir) {
+        println!("cargo:warning=Libraries found in {}:", lib_dir.display());
+        for entry in entries.flatten() {
+            println!("cargo:warning=  - {}", entry.path().display());
+        }
+    }
+
     // Link JavaScriptCore and WTF statically
     if os == "windows" {
         println!("cargo:rustc-link-lib=static=JavaScriptCore");
         println!("cargo:rustc-link-lib=static=WTF");
-        println!("cargo:rustc-link-lib=static=bmalloc");
+
+        // bmalloc may be bundled into WTF on Windows, check if it exists
+        let bmalloc_lib = lib_dir.join("bmalloc.lib");
+        let bmalloc_a = lib_dir.join("libbmalloc.a");
+        if bmalloc_lib.exists() || bmalloc_a.exists() {
+            println!("cargo:rustc-link-lib=static=bmalloc");
+        } else {
+            println!("cargo:warning=bmalloc library not found, assuming bundled in WTF");
+        }
     } else {
         // Linux
         println!("cargo:rustc-link-lib=static=JavaScriptCore");

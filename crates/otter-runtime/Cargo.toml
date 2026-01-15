@@ -11,8 +11,8 @@ categories = ["development-tools", "compilers"]
 readme = "README.md"
 
 [dependencies]
-jsc-sys = { path = "../jsc-sys" }
-jsc-core = { path = "../jsc-core" }
+jsc-sys = { path = "../jsc-sys", version = "0.1.0" }
+jsc-core = { path = "../jsc-core", version = "0.1.0" }
 thiserror = "1"
 anyhow = "1"
 

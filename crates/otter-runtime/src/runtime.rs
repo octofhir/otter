@@ -3,7 +3,7 @@
 //! JSC contexts are not thread-safe, so we use a pool of contexts
 //! and round-robin selection to support concurrent execution.
 
-use crate::apis::register_all_apis;
+use crate::apis::register_apis_with_config;
 use crate::context::JscContext;
 use crate::error::{JscError, JscResult};
 use crate::extension::Extension;
@@ -52,8 +52,8 @@ impl JscRuntime {
     pub fn new(config: JscConfig) -> JscResult<Self> {
         let context = JscContext::new()?;
 
-        // Register default native APIs (console, http)
-        register_all_apis(context.raw())?;
+        // Register native APIs (conditionally enabling console based on config)
+        register_apis_with_config(context.raw(), config.enable_console)?;
 
         Ok(Self { context, config })
     }

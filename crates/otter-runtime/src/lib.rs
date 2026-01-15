@@ -83,7 +83,7 @@ pub mod value;
 mod worker;
 
 pub use apis::console::{ConsoleLevel, set_console_handler};
-pub use apis::register_all_apis;
+pub use apis::{register_all_apis, register_apis_with_config};
 pub use config::TypeScriptConfig;
 pub use context::JscContext;
 pub use engine::{Engine, EngineBuilder, EngineHandle, EngineStats, EngineStatsSnapshot};
@@ -112,7 +112,7 @@ pub use value::JscValue;
 
 pub mod prelude {
     pub use crate::apis::console::{ConsoleLevel, set_console_handler};
-    pub use crate::apis::register_all_apis;
+    pub use crate::apis::{register_all_apis, register_apis_with_config};
     pub use crate::config::TypeScriptConfig;
     pub use crate::context::JscContext;
     pub use crate::engine::{

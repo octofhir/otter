@@ -14,6 +14,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::debug;
 
 pub type OpResult = JscResult<serde_json::Value>;
 pub type OpFuture = Pin<Box<dyn Future<Output = OpResult> + Send + 'static>>;
@@ -104,7 +105,6 @@ where
 
 #[derive(Clone)]
 pub struct Extension {
-    #[allow(dead_code)]
     name: String,
     ops: Vec<OpDecl>,
     init: Option<ExtensionInitFn>,
@@ -121,6 +121,11 @@ impl Extension {
             init: None,
             js_code: None,
         }
+    }
+
+    /// Get the name of this extension
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn with_ops(mut self, ops: Vec<OpDecl>) -> Self {
@@ -222,6 +227,12 @@ impl ExtensionRegistry {
     }
 
     pub fn register_extension(&self, extension: Extension, ctx: JSContextRef) -> JscResult<()> {
+        debug!(
+            extension = extension.name(),
+            ops_count = extension.ops.len(),
+            "Registering extension"
+        );
+
         if let Some(init) = extension.init.as_ref() {
             init(&self.state);
         }
@@ -232,9 +243,10 @@ impl ExtensionRegistry {
 
         // Execute JavaScript code if provided
         if let Some(js_code) = extension.js_code() {
-            self.execute_js(ctx, js_code, &format!("<{}>", extension.name))?;
+            self.execute_js(ctx, js_code, &format!("<{}>", extension.name()))?;
         }
 
+        debug!(extension = extension.name(), "Extension registered successfully");
         Ok(())
     }
 

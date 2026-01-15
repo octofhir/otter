@@ -1722,7 +1722,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "otter-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dirs 5.0.1",
  "dunce",
@@ -1738,7 +1738,7 @@ dependencies = [
 
 [[package]]
 name = "otter-jsc-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "otter-jsc-sys",
  "serde",
@@ -1749,7 +1749,7 @@ dependencies = [
 
 [[package]]
 name = "otter-jsc-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "flate2",
  "tar",
@@ -1758,7 +1758,7 @@ dependencies = [
 
 [[package]]
 name = "otter-node"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "bytes",
@@ -1801,7 +1801,7 @@ dependencies = [
 
 [[package]]
 name = "otter-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "criterion",

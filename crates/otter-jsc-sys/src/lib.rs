@@ -204,6 +204,7 @@ unsafe extern "C" {
 
 // Linux FFI - statically linked bun-webkit
 #[cfg(target_os = "linux")]
+#[allow(clippy::duplicated_attributes)]
 #[link(name = "JavaScriptCore", kind = "static")]
 #[link(name = "WTF", kind = "static")]
 #[link(name = "bmalloc", kind = "static")]
@@ -363,6 +364,7 @@ unsafe extern "C" {
 
 // Windows FFI - statically linked bun-webkit
 #[cfg(target_os = "windows")]
+#[allow(clippy::duplicated_attributes)]
 #[link(name = "JavaScriptCore", kind = "static")]
 #[link(name = "WTF", kind = "static")]
 #[cfg_attr(has_bmalloc, link(name = "bmalloc", kind = "static"))]

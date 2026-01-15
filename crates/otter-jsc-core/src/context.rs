@@ -280,14 +280,17 @@ impl Drop for JscContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_context_creation() {
         let ctx = JscContext::new().unwrap();
         drop(ctx);
     }
 
     #[test]
+    #[serial]
     fn test_eval_number() {
         let ctx = JscContext::new().unwrap();
         let result = ctx.eval("1 + 1").unwrap();
@@ -295,6 +298,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_eval_string() {
         let ctx = JscContext::new().unwrap();
         let result = ctx.eval("'hello'").unwrap();
@@ -302,6 +306,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_eval_error() {
         let ctx = JscContext::new().unwrap();
         let result = ctx.eval("throw new Error('oops')");
@@ -309,6 +314,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_set_get_global() {
         let ctx = JscContext::new().unwrap();
         let value = ctx.number(42.0);
@@ -319,6 +325,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_inject_json() {
         let ctx = JscContext::new().unwrap();
         ctx.inject_json("config", r#"{"name": "test", "value": 123}"#)

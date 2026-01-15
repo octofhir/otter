@@ -204,6 +204,12 @@ unsafe extern "C" {
 
 // Linux FFI - statically linked bun-webkit
 #[cfg(target_os = "linux")]
+#[link(name = "JavaScriptCore", kind = "static")]
+#[link(name = "WTF", kind = "static")]
+#[link(name = "bmalloc", kind = "static")]
+#[link(name = "icuuc", kind = "static")]
+#[link(name = "icui18n", kind = "static")]
+#[link(name = "icudata", kind = "static")]
 unsafe extern "C" {
     // Context functions
     pub fn JSGlobalContextCreate(global_object_class: JSClassRef) -> JSGlobalContextRef;

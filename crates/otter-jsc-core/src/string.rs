@@ -101,8 +101,10 @@ pub unsafe fn js_string_to_rust(js_str: JSStringRef) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_string_creation() {
         let s = JscString::new("hello").unwrap();
         assert_eq!(s.to_string(), "hello");
@@ -110,6 +112,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_empty_string() {
         let s = JscString::new("").unwrap();
         assert!(s.is_empty());
@@ -117,6 +120,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_unicode_string() {
         let s = JscString::new("hello").unwrap();
         assert_eq!(s.to_string(), "hello");

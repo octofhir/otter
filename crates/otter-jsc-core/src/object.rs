@@ -257,8 +257,10 @@ impl std::fmt::Debug for JscObject {
 mod tests {
     use super::*;
     use crate::JscContext;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_empty_object() {
         let ctx = JscContext::new().unwrap();
         let obj = JscObject::empty(ctx.raw());
@@ -267,6 +269,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_property_access() {
         let ctx = JscContext::new().unwrap();
         let obj = JscObject::empty(ctx.raw());
@@ -282,6 +285,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_delete_property() {
         let ctx = JscContext::new().unwrap();
         let obj = JscObject::empty(ctx.raw());
@@ -295,6 +299,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_array_access() {
         let ctx = JscContext::new().unwrap();
         let result = ctx.eval("[1, 2, 3]").unwrap();
@@ -310,6 +315,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_function_call() {
         let ctx = JscContext::new().unwrap();
         let result = ctx.eval("(function(a, b) { return a + b; })").unwrap();

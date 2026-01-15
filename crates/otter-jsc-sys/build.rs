@@ -153,9 +153,10 @@ fn link_bun_webkit(webkit_path: &PathBuf, os: &str) {
         }
     }
 
-    // Link JavaScriptCore and WTF statically
-    println!("cargo:rustc-link-lib=static=JavaScriptCore");
+    // Link order matters! WTF -> JSC -> bmalloc -> ICU
+    // Libraries that depend on others must come first (Unix ld resolves left-to-right)
     println!("cargo:rustc-link-lib=static=WTF");
+    println!("cargo:rustc-link-lib=static=JavaScriptCore");
 
     // bmalloc may be bundled into WTF on some Windows builds
     if lib_exists(&lib_dir, "bmalloc") {
@@ -167,14 +168,15 @@ fn link_bun_webkit(webkit_path: &PathBuf, os: &str) {
 
     // ICU libraries (statically linked in bun-webkit)
     // Windows bun-webkit uses "sicu*" names instead of "icu*"
+    // Order: icui18n depends on icuuc, icuuc depends on icudata
     if lib_exists(&lib_dir, "icudata") {
-        println!("cargo:rustc-link-lib=static=icudata");
         println!("cargo:rustc-link-lib=static=icui18n");
         println!("cargo:rustc-link-lib=static=icuuc");
+        println!("cargo:rustc-link-lib=static=icudata");
     } else if lib_exists(&lib_dir, "sicudt") {
-        println!("cargo:rustc-link-lib=static=sicudt");
         println!("cargo:rustc-link-lib=static=sicuin");
         println!("cargo:rustc-link-lib=static=sicuuc");
+        println!("cargo:rustc-link-lib=static=sicudt");
         // sicuio/sicutu are present but not always required; avoid overlinking
     } else {
         println!(

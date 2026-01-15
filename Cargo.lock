@@ -1301,25 +1301,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jsc-core"
-version = "0.1.0"
-dependencies = [
- "jsc-sys",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "jsc-sys"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "tar",
- "ureq",
-]
-
-[[package]]
 name = "json-strip-comments"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1614,23 +1595,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
-name = "otter-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "dirs 5.0.1",
- "otter-engine",
- "otter-pm",
- "otter-runtime",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "otter-engine"
 version = "0.1.0"
 dependencies = [
@@ -1643,6 +1607,25 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "otter-jsc-core"
+version = "0.1.0"
+dependencies = [
+ "otter-jsc-sys",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "otter-jsc-sys"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "tar",
+ "ureq",
 ]
 
 [[package]]
@@ -1687,9 +1670,9 @@ dependencies = [
  "crossbeam-utils",
  "dirs 5.0.1",
  "flate2",
- "jsc-core",
- "jsc-sys",
  "num_cpus",
+ "otter-jsc-core",
+ "otter-jsc-sys",
  "parking_lot",
  "reqwest",
  "rmp",
@@ -1710,6 +1693,25 @@ dependencies = [
  "tracing",
  "which",
  "zip",
+]
+
+[[package]]
+name = "otterjs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs 5.0.1",
+ "otter-engine",
+ "otter-node",
+ "otter-pm",
+ "otter-runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -7,6 +7,9 @@ use std::path::PathBuf;
 const BUN_WEBKIT_VERSION: &str = "aaf3f80b1cc701b412f8abfb7c7f413644a229ff";
 
 fn main() {
+    // Avoid "unexpected_cfgs" warnings for cfg(has_bmalloc)
+    println!("cargo:rustc-check-cfg=cfg(has_bmalloc)");
+
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
 
@@ -150,29 +153,31 @@ fn link_bun_webkit(webkit_path: &PathBuf, os: &str) {
     }
 
     // Link JavaScriptCore and WTF statically
-    if os == "windows" {
-        println!("cargo:rustc-link-lib=static=JavaScriptCore");
-        println!("cargo:rustc-link-lib=static=WTF");
+    println!("cargo:rustc-link-lib=static=JavaScriptCore");
+    println!("cargo:rustc-link-lib=static=WTF");
 
-        // bmalloc may be bundled into WTF on Windows, check if it exists
-        let bmalloc_lib = lib_dir.join("bmalloc.lib");
-        let bmalloc_a = lib_dir.join("libbmalloc.a");
-        if bmalloc_lib.exists() || bmalloc_a.exists() {
-            println!("cargo:rustc-link-lib=static=bmalloc");
-        } else {
-            println!("cargo:warning=bmalloc library not found, assuming bundled in WTF");
-        }
-    } else {
-        // Linux
-        println!("cargo:rustc-link-lib=static=JavaScriptCore");
-        println!("cargo:rustc-link-lib=static=WTF");
+    // bmalloc may be bundled into WTF on some Windows builds
+    if lib_exists(&lib_dir, "bmalloc") {
         println!("cargo:rustc-link-lib=static=bmalloc");
+        println!("cargo:rustc-cfg=has_bmalloc");
+    } else {
+        println!("cargo:warning=bmalloc library not found, assuming bundled in WTF");
     }
 
     // ICU libraries (statically linked in bun-webkit)
-    println!("cargo:rustc-link-lib=static=icudata");
-    println!("cargo:rustc-link-lib=static=icui18n");
-    println!("cargo:rustc-link-lib=static=icuuc");
+    // Windows bun-webkit uses "sicu*" names instead of "icu*"
+    if lib_exists(&lib_dir, "icudata") {
+        println!("cargo:rustc-link-lib=static=icudata");
+        println!("cargo:rustc-link-lib=static=icui18n");
+        println!("cargo:rustc-link-lib=static=icuuc");
+    } else if lib_exists(&lib_dir, "sicudt") {
+        println!("cargo:rustc-link-lib=static=sicudt");
+        println!("cargo:rustc-link-lib=static=sicuin");
+        println!("cargo:rustc-link-lib=static=sicuuc");
+        // sicuio/sicutu are present but not always required; avoid overlinking
+    } else {
+        println!("cargo:warning=ICU libraries not found in {}", lib_dir.display());
+    }
 
     // C++ runtime and system libraries (required by JSC)
     if os == "linux" {
@@ -212,6 +217,22 @@ fn find_lib_dir(webkit_path: &PathBuf) -> PathBuf {
 
     // Fallback to webkit_path itself
     webkit_path.clone()
+}
+
+fn lib_exists(lib_dir: &PathBuf, lib_name: &str) -> bool {
+    if let Ok(entries) = fs::read_dir(lib_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                let is_match = name.starts_with(lib_name)
+                    && (name.ends_with(".lib") || name.ends_with(".a"));
+                if is_match {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn get_cache_dir() -> PathBuf {

@@ -1,4 +1,4 @@
-# jsc-sys
+# otter-jsc-sys
 
 Raw FFI bindings to JavaScriptCore C API.
 
@@ -12,10 +12,10 @@ This crate provides low-level unsafe bindings to JavaScriptCore (JSC), the JavaS
 
 ## Usage
 
-This crate is intended for use by higher-level wrappers. For safe Rust APIs, use the `jsc-core` or `otter-runtime` crates instead.
+This crate is intended for use by higher-level wrappers. For safe Rust APIs, use the `otter-jsc-core` or `otter-runtime` crates instead.
 
 ```rust
-use jsc_sys::*;
+use otter_jsc_sys::*;
 
 unsafe {
     let ctx = JSGlobalContextCreate(std::ptr::null_mut());

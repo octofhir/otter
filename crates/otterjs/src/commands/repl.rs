@@ -2,6 +2,10 @@
 
 use anyhow::Result;
 use clap::Args;
+use otter_engine::Capabilities;
+use otter_node::{
+    create_buffer_extension, create_fs_extension, create_path_extension, create_test_extension,
+};
 use otter_runtime::{JscConfig, JscRuntime, transpile_typescript};
 use std::io::{self, BufRead, Write};
 
@@ -29,6 +33,17 @@ impl ReplCommand {
         println!("Type .help for help, .exit to exit\n");
 
         let runtime = JscRuntime::new(JscConfig::default())?;
+
+        // Register Node.js compatibility extensions
+        let caps = if self.allow_all {
+            Capabilities::all()
+        } else {
+            Capabilities::none()
+        };
+        runtime.register_extension(create_path_extension())?;
+        runtime.register_extension(create_buffer_extension())?;
+        runtime.register_extension(create_fs_extension(caps))?;
+        runtime.register_extension(create_test_extension())?;
 
         let stdin = io::stdin();
         let mut stdout = io::stdout();
@@ -121,6 +136,17 @@ impl ReplCommand {
 
     fn eval_and_exit(&self, code: &str) -> Result<()> {
         let runtime = JscRuntime::new(JscConfig::default())?;
+
+        // Register Node.js compatibility extensions
+        let caps = if self.allow_all {
+            Capabilities::all()
+        } else {
+            Capabilities::none()
+        };
+        runtime.register_extension(create_path_extension())?;
+        runtime.register_extension(create_buffer_extension())?;
+        runtime.register_extension(create_fs_extension(caps))?;
+        runtime.register_extension(create_test_extension())?;
 
         // Try to transpile as TypeScript
         let js_code = match transpile_typescript(code) {

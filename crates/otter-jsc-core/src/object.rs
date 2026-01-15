@@ -1,6 +1,6 @@
 //! Safe wrapper for JSC objects with property access and function support
 
-use jsc_sys::*;
+use otter_jsc_sys::*;
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::ptr;

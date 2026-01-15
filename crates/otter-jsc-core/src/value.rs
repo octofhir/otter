@@ -1,6 +1,6 @@
 //! Safe wrapper around JSC values with automatic GC protection
 
-use jsc_sys::*;
+use otter_jsc_sys::*;
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::ptr;

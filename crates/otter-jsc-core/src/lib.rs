@@ -10,7 +10,7 @@
 //! # Example
 //!
 //! ```
-//! use jsc_core::JscContext;
+//! use otter_jsc_core::JscContext;
 //!
 //! let ctx = JscContext::new().unwrap();
 //! let result = ctx.eval("1 + 1").unwrap();
@@ -30,7 +30,7 @@
 //! ## Example: Wrong (won't compile)
 //!
 //! ```compile_fail
-//! use jsc_core::JscContext;
+//! use otter_jsc_core::JscContext;
 //! use std::thread;
 //!
 //! let ctx = JscContext::new().unwrap();
@@ -63,4 +63,4 @@ pub use string::{JscString, js_string_to_rust};
 pub use value::{JscValue, extract_exception};
 
 // Re-export jsc-sys for direct FFI access when needed
-pub use jsc_sys;
+pub use otter_jsc_sys;

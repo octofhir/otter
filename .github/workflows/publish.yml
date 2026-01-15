@@ -24,7 +24,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/cache/bun-webkit
-          key: bun-webkit-linux-amd64-${{ hashFiles('crates/jsc-sys/build.rs') }}
+          key: bun-webkit-linux-amd64-${{ hashFiles('crates/otter-jsc-sys/build.rs') }}
 
       - name: Publish otter-runtime
         env:

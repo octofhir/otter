@@ -15,7 +15,7 @@ use crate::extension::{
     Extension, ExtensionRegistry, register_context_registry, unregister_context_registry,
 };
 use crate::value::JscValue;
-use jsc_core::extract_exception;
+use otter_jsc_core::extract_exception;
 use parking_lot::Mutex;
 use std::ffi::CString;
 use std::ptr;

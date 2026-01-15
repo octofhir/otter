@@ -359,7 +359,7 @@ unsafe extern "C" {
 #[cfg(target_os = "windows")]
 #[link(name = "JavaScriptCore", kind = "static")]
 #[link(name = "WTF", kind = "static")]
-#[link(name = "bmalloc", kind = "static")]
+#[cfg_attr(has_bmalloc, link(name = "bmalloc", kind = "static"))]
 unsafe extern "C" {
     // Context functions
     pub fn JSGlobalContextCreate(global_object_class: JSClassRef) -> JSGlobalContextRef;

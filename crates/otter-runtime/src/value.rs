@@ -2,5 +2,5 @@
 //!
 //! Re-exports from jsc-core for compatibility.
 
-pub use jsc_core::string::js_string_to_rust;
-pub use jsc_core::{JscValue, extract_exception};
+pub use otter_jsc_core::string::js_string_to_rust;
+pub use otter_jsc_core::{JscValue, extract_exception};

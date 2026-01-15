@@ -11,8 +11,8 @@ categories = ["development-tools", "compilers"]
 readme = "README.md"
 
 [dependencies]
-jsc-sys = { path = "../jsc-sys", version = "0.1.0" }
-jsc-core = { path = "../jsc-core", version = "0.1.0" }
+otter-jsc-sys = { path = "../otter-jsc-sys", version = "0.1.0" }
+otter-jsc-core = { path = "../otter-jsc-core", version = "0.1.0" }
 thiserror = "1"
 anyhow = "1"
 

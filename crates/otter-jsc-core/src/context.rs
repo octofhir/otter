@@ -1,6 +1,6 @@
 //! Core JSC Context wrapper with safe evaluation and object management
 
-use jsc_sys::*;
+use otter_jsc_sys::*;
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::ptr;

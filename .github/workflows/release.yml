@@ -49,11 +49,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/cache/bun-webkit
-          key: bun-webkit-${{ runner.os }}-${{ hashFiles('crates/jsc-sys/build.rs') }}
+          key: bun-webkit-${{ runner.os }}-${{ hashFiles('crates/otter-jsc-sys/build.rs') }}
 
       # Build
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p otter-cli
+        run: cargo build --release --target ${{ matrix.target }} -p otterjs
 
       # Package (Unix)
       - name: Package (Unix)

@@ -2,6 +2,10 @@
 
 use anyhow::Result;
 use clap::Args;
+use otter_engine::Capabilities;
+use otter_node::{
+    create_buffer_extension, create_fs_extension, create_path_extension, create_test_extension,
+};
 use otter_runtime::{JscConfig, JscRuntime, needs_transpilation, transpile_typescript};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -143,6 +147,17 @@ impl TestCommand {
         };
 
         let runtime = JscRuntime::new(JscConfig::default())?;
+
+        // Register Node.js compatibility extensions (tests get all permissions)
+        let caps = if self.allow_all {
+            Capabilities::all()
+        } else {
+            Capabilities::none()
+        };
+        runtime.register_extension(create_path_extension())?;
+        runtime.register_extension(create_buffer_extension())?;
+        runtime.register_extension(create_fs_extension(caps))?;
+        runtime.register_extension(create_test_extension())?;
 
         // Inject test framework
         let filter_json = match &self.filter {

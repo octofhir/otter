@@ -13,7 +13,6 @@ pub struct Config {
 
     /// Module resolution settings
     #[serde(default)]
-    #[allow(dead_code)]
     pub modules: ModulesConfig,
 
     /// Default permissions
@@ -48,7 +47,6 @@ impl Default for TypeScriptConfig {
 
 /// Module resolution configuration.
 #[derive(Debug, Default, Deserialize)]
-#[allow(dead_code)]
 pub struct ModulesConfig {
     /// Allowed remote module URLs (glob patterns)
     #[serde(default)]

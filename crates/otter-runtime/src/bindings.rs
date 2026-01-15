@@ -2,4 +2,4 @@
 //!
 //! Re-exported from the `jsc-sys` crate. Use the safe wrappers in other modules.
 
-pub use jsc_sys::*;
+pub use otter_jsc_sys::*;

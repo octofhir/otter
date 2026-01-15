@@ -1,10 +1,10 @@
-# jsc-core
+# otter-jsc-core
 
 Safe Rust wrappers for JavaScriptCore.
 
 ## Overview
 
-This crate provides safe, ergonomic Rust bindings to JavaScriptCore (JSC). It wraps the low-level FFI bindings from `jsc-sys` with proper memory management and error handling.
+This crate provides safe, ergonomic Rust bindings to JavaScriptCore (JSC). It wraps the low-level FFI bindings from `otter-jsc-sys` with proper memory management and error handling.
 
 ## Features
 
@@ -17,9 +17,9 @@ This crate provides safe, ergonomic Rust bindings to JavaScriptCore (JSC). It wr
 ## Usage
 
 ```rust
-use jsc_core::{JscContext, JscValue};
+use otter_jsc_core::{JscContext, JscValue};
 
-fn main() -> Result<(), jsc_core::JscError> {
+fn main() -> Result<(), otter_jsc_core::JscError> {
     let ctx = JscContext::new()?;
 
     // Evaluate JavaScript
@@ -36,7 +36,7 @@ fn main() -> Result<(), jsc_core::JscError> {
 
 ## Platform Support
 
-See `jsc-sys` for platform support details.
+See `otter-jsc-sys` for platform support details.
 
 ## License
 

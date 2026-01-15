@@ -5,7 +5,7 @@
 use thiserror::Error;
 
 // Re-export core error types
-pub use jsc_core::{JscError as CoreError, JscResult as CoreResult};
+pub use otter_jsc_core::{JscError as CoreError, JscResult as CoreResult};
 
 /// Errors that can occur during runtime operations
 #[derive(Error, Debug)]

@@ -2,15 +2,18 @@
 
 use anyhow::Result;
 use clap::Args;
-use otter_engine::{Capabilities, CapabilitiesBuilder};
+use otter_engine::{Capabilities, CapabilitiesBuilder, LoaderConfig};
+use otter_node::{
+    create_buffer_extension, create_fs_extension, create_path_extension, create_test_extension,
+};
 use otter_runtime::{
     JscConfig, JscRuntime, needs_transpilation, transpile_typescript,
     tsgo::{TypeCheckConfig, check_types, format_diagnostics, has_errors},
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::config::Config;
+use crate::config::{Config, ModulesConfig};
 
 #[derive(Args)]
 pub struct RunCommand {
@@ -81,8 +84,23 @@ impl RunCommand {
             source
         };
 
+        // Build module loader config from CLI config (prepared for ESM integration)
+        let loader_config = build_loader_config(&self.entry, &config.modules);
+        tracing::debug!(
+            base_dir = %loader_config.base_dir.display(),
+            remote_allowlist_count = loader_config.remote_allowlist.len(),
+            import_map_count = loader_config.import_map.len(),
+            "Module loader config"
+        );
+
         // Create runtime with capabilities
         let runtime = JscRuntime::new(JscConfig::default())?;
+
+        // Register Node.js compatibility extensions
+        runtime.register_extension(create_path_extension())?;
+        runtime.register_extension(create_buffer_extension())?;
+        runtime.register_extension(create_fs_extension(caps.clone()))?;
+        runtime.register_extension(create_test_extension())?;
 
         // Set up Otter global namespace with args and capabilities
         let args_json = serde_json::to_string(&self.args)?;
@@ -226,4 +244,29 @@ fn caps_to_json(caps: &Capabilities) -> serde_json::Value {
         "ffi": caps.ffi,
         "hrtime": caps.hrtime,
     })
+}
+
+/// Build LoaderConfig from CLI entry file and ModulesConfig
+///
+/// This wires the CLI configuration to the module loader.
+fn build_loader_config(entry: &Path, modules: &ModulesConfig) -> LoaderConfig {
+    let base_dir = entry
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let default = LoaderConfig::default();
+
+    LoaderConfig {
+        base_dir,
+        remote_allowlist: if modules.remote_allowlist.is_empty() {
+            default.remote_allowlist
+        } else {
+            modules.remote_allowlist.clone()
+        },
+        cache_dir: modules.cache_dir.clone().unwrap_or(default.cache_dir),
+        import_map: modules.import_map.clone(),
+        extensions: default.extensions,
+        condition_names: default.condition_names,
+    }
 }

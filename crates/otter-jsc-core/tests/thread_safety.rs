@@ -5,7 +5,7 @@
 //! to another thread results in a compilation error.
 
 /// ```compile_fail
-/// use jsc_core::JscContext;
+/// use otter_jsc_core::JscContext;
 /// use std::thread;
 ///
 /// let ctx = JscContext::new().unwrap();
@@ -17,7 +17,7 @@
 fn _context_not_send() {}
 
 /// ```compile_fail
-/// use jsc_core::JscContext;
+/// use otter_jsc_core::JscContext;
 /// use std::sync::Arc;
 ///
 /// let ctx = Arc::new(JscContext::new().unwrap());
@@ -30,7 +30,7 @@ fn _context_not_send() {}
 fn _context_not_sync() {}
 
 /// ```compile_fail
-/// use jsc_core::JscContext;
+/// use otter_jsc_core::JscContext;
 /// use std::thread;
 ///
 /// let ctx = JscContext::new().unwrap();
@@ -43,7 +43,7 @@ fn _context_not_sync() {}
 fn _value_not_send() {}
 
 /// ```compile_fail
-/// use jsc_core::JscString;
+/// use otter_jsc_core::JscString;
 /// use std::thread;
 ///
 /// let s = JscString::new("hello").unwrap();
@@ -55,7 +55,7 @@ fn _value_not_send() {}
 fn _string_not_send() {}
 
 /// ```compile_fail
-/// use jsc_core::{JscContext, JscObject};
+/// use otter_jsc_core::{JscContext, JscObject};
 /// use std::thread;
 ///
 /// let ctx = JscContext::new().unwrap();

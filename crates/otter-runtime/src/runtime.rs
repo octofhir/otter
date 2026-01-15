@@ -43,7 +43,6 @@ impl Default for JscConfig {
 /// A single JSC runtime instance
 pub struct JscRuntime {
     context: JscContext,
-    #[allow(dead_code)]
     config: JscConfig,
 }
 
@@ -122,6 +121,30 @@ impl JscRuntime {
     /// Force garbage collection
     pub fn gc(&self) {
         self.context.gc();
+    }
+
+    /// Get the runtime configuration
+    pub fn config(&self) -> &JscConfig {
+        &self.config
+    }
+
+    /// Get the configured timeout as Duration
+    ///
+    /// Returns Duration::ZERO if timeout_ms is 0 (no timeout).
+    pub fn timeout(&self) -> Duration {
+        if self.config.timeout_ms == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(self.config.timeout_ms)
+        }
+    }
+
+    /// Run the event loop using the configured timeout
+    ///
+    /// This is a convenience method that uses `config.timeout_ms`.
+    /// For custom timeouts, use `run_event_loop_until_idle` directly.
+    pub fn run_event_loop(&self) -> JscResult<()> {
+        self.run_event_loop_until_idle(self.timeout())
     }
 }
 

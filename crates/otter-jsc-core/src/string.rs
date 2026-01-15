@@ -1,6 +1,6 @@
 //! RAII wrapper for JSC strings
 
-use jsc_sys::*;
+use otter_jsc_sys::*;
 use std::ffi::{CString, c_char};
 use std::fmt;
 use std::marker::PhantomData;

@@ -404,7 +404,7 @@ impl EngineHandle {
             })
             .map_err(|e| match e {
                 crossbeam_channel::TrySendError::Full(_) => {
-                    JscError::Core(jsc_core::JscError::ResourceLimit("Job queue full".into()))
+                    JscError::Core(otter_jsc_core::JscError::ResourceLimit("Job queue full".into()))
                 }
                 crossbeam_channel::TrySendError::Disconnected(_) => {
                     JscError::internal("Engine shut down")

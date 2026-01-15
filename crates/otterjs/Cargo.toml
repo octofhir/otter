@@ -1,5 +1,5 @@
 [package]
-name = "otter-cli"
+name = "otterjs"
 version = "0.1.0"
 edition = "2024"
 description = "Otter CLI - A fast TypeScript/JavaScript runtime"
@@ -19,10 +19,12 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
 otter-engine = { path = "../otter-engine", version = "0.1.0" }
+otter-node = { path = "../otter-node", version = "0.1.0" }
 otter-pm = { path = "../otter-pm", version = "0.1.0" }
 otter-runtime = { path = "../otter-runtime", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 toml = "0.8"
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,5 +1,5 @@
 [package]
-name = "jsc-core"
+name = "otter-jsc-core"
 version = "0.1.0"
 edition = "2024"
 description = "Safe Rust wrappers for JavaScriptCore"
@@ -11,7 +11,7 @@ categories = ["development-tools", "wasm"]
 readme = "README.md"
 
 [dependencies]
-jsc-sys = { path = "../jsc-sys", version = "0.1.0" }
+otter-jsc-sys = { path = "../otter-jsc-sys", version = "0.1.0" }
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

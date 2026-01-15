@@ -84,7 +84,7 @@ fn collect_type_files(base: &Path, dir: &Path, entries: &mut Vec<(String, String
                 .strip_prefix(base)
                 .unwrap_or(&path)
                 .to_string_lossy()
-                .to_string();
+                .replace('\\', "/");
 
             entries.push((relative, contents));
         }

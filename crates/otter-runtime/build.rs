@@ -16,7 +16,8 @@ fn embed_type_definitions() {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
     let dest_path = Path::new(&out_dir).join("embedded_types.rs");
 
-    let types_dir = Path::new("types");
+    // Types are stored in otter-pm/src/types/ (the canonical source)
+    let types_dir = Path::new("../otter-pm/src/types");
     let mut entries = Vec::new();
 
     if types_dir.exists() {
@@ -63,7 +64,7 @@ fn embed_type_definitions() {
     fs::write(&dest_path, code).expect("Failed to write embedded_types.rs");
 
     // Tell Cargo to rerun if any type definition files change
-    println!("cargo:rerun-if-changed=types/");
+    println!("cargo:rerun-if-changed=../otter-pm/src/types/");
 }
 
 /// Recursively collect all .d.ts files from a directory.

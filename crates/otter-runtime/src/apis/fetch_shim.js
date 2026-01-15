@@ -474,6 +474,56 @@
     });
   }
 
+  // TextEncoder - Web standard API for encoding strings to UTF-8
+  class TextEncoder {
+    constructor() {
+      this.encoding = "utf-8";
+    }
+
+    encode(input = "") {
+      return encodeUtf8(String(input));
+    }
+
+    encodeInto(source, destination) {
+      const encoded = encodeUtf8(String(source));
+      const len = Math.min(encoded.length, destination.length);
+      for (let i = 0; i < len; i++) {
+        destination[i] = encoded[i];
+      }
+      return { read: source.length, written: len };
+    }
+  }
+
+  // TextDecoder - Web standard API for decoding UTF-8 to strings
+  class TextDecoder {
+    constructor(label = "utf-8", options = {}) {
+      const normalizedLabel = String(label).toLowerCase().trim();
+      if (normalizedLabel !== "utf-8" && normalizedLabel !== "utf8") {
+        throw new RangeError(`TextDecoder: '${label}' encoding is not supported`);
+      }
+      this.encoding = "utf-8";
+      this.fatal = Boolean(options.fatal);
+      this.ignoreBOM = Boolean(options.ignoreBOM);
+    }
+
+    decode(input, _options = {}) {
+      if (input === undefined || input === null) {
+        return "";
+      }
+      let bytes;
+      if (input instanceof Uint8Array) {
+        bytes = input;
+      } else if (input instanceof ArrayBuffer) {
+        bytes = new Uint8Array(input);
+      } else if (ArrayBuffer.isView(input)) {
+        bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+      } else {
+        throw new TypeError("TextDecoder.decode: input must be a BufferSource");
+      }
+      return decodeUtf8(bytes);
+    }
+  }
+
   global.Headers = Headers;
   global.Request = Request;
   global.Response = Response;
@@ -481,4 +531,6 @@
   global.FormData = FormData;
   global.URLSearchParams = URLSearchParams;
   global.fetch = fetch;
+  global.TextEncoder = TextEncoder;
+  global.TextDecoder = TextDecoder;
 })(globalThis);

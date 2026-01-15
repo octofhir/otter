@@ -227,8 +227,10 @@ fn lib_exists(lib_dir: &PathBuf, lib_name: &str) -> bool {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                let is_match =
-                    name.starts_with(lib_name) && (name.ends_with(".lib") || name.ends_with(".a"));
+                // Check for both Windows (bmalloc.lib) and Unix (libbmalloc.a) naming
+                let lib_prefix = format!("lib{}", lib_name);
+                let is_match = (name.starts_with(lib_name) || name.starts_with(&lib_prefix))
+                    && (name.ends_with(".lib") || name.ends_with(".a"));
                 if is_match {
                     return true;
                 }

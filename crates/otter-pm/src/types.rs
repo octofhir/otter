@@ -7,19 +7,19 @@ use std::fs;
 use std::path::Path;
 
 /// Otter global API types (console, timers, fetch, etc.)
-const OTTER_TYPES: &str = include_str!("../../otter-runtime/types/otter.d.ts");
+const OTTER_TYPES: &str = include_str!("types/otter.d.ts");
 
 /// Node.js Buffer types
-const NODE_BUFFER_TYPES: &str = include_str!("../../otter-runtime/types/node/buffer.d.ts");
+const NODE_BUFFER_TYPES: &str = include_str!("types/node/buffer.d.ts");
 
 /// Node.js fs types
-const NODE_FS_TYPES: &str = include_str!("../../otter-runtime/types/node/fs.d.ts");
+const NODE_FS_TYPES: &str = include_str!("types/node/fs.d.ts");
 
 /// Node.js path types
-const NODE_PATH_TYPES: &str = include_str!("../../otter-runtime/types/node/path.d.ts");
+const NODE_PATH_TYPES: &str = include_str!("types/node/path.d.ts");
 
 /// Node.js test types
-const NODE_TEST_TYPES: &str = include_str!("../../otter-runtime/types/node/test.d.ts");
+const NODE_TEST_TYPES: &str = include_str!("types/node/test.d.ts");
 
 /// Install bundled type definitions to node_modules
 pub fn install_bundled_types(node_modules: &Path) -> Result<(), TypesError> {

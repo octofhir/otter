@@ -1,7 +1,8 @@
 //! RAII wrapper for JSC strings
 
 use jsc_sys::*;
-use std::ffi::CString;
+use std::ffi::{CString, c_char};
+use std::fmt;
 use std::marker::PhantomData;
 
 use crate::error::{JscError, JscResult};
@@ -39,7 +40,7 @@ impl JscString {
     }
 
     /// Convert to Rust String
-    pub fn to_string(&self) -> String {
+    fn to_rust_string(&self) -> String {
         // SAFETY: self.raw is valid (checked in new())
         unsafe { js_string_to_rust(self.raw) }
     }
@@ -65,6 +66,12 @@ impl Drop for JscString {
     }
 }
 
+impl fmt::Display for JscString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_rust_string())
+    }
+}
+
 /// Convert JSStringRef to Rust String
 ///
 /// # Safety
@@ -78,7 +85,8 @@ pub unsafe fn js_string_to_rust(js_str: JSStringRef) -> String {
     unsafe {
         let max_size = JSStringGetMaximumUTF8CStringSize(js_str);
         let mut buffer = vec![0u8; max_size];
-        let actual_size = JSStringGetUTF8CString(js_str, buffer.as_mut_ptr() as *mut i8, max_size);
+        let actual_size =
+            JSStringGetUTF8CString(js_str, buffer.as_mut_ptr() as *mut c_char, max_size);
 
         if actual_size > 0 {
             // actual_size includes null terminator

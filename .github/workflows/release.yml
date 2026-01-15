@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: otter-macos-x64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: otter-macos-arm64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: otter-linux-x64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: otter-windows-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Cache bun-webkit (Linux/Windows only)
+      - name: Cache bun-webkit
+        if: runner.os != 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/cache/bun-webkit
+          key: bun-webkit-${{ runner.os }}-${{ hashFiles('crates/jsc-sys/build.rs') }}
+
+      # Build
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p otter-cli
+
+      # Package (Unix)
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/otter dist/
+          cd dist
+          tar -czf ${{ matrix.name }}.tar.gz otter
+          shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
+
+      # Package (Windows)
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+          Copy-Item target/${{ matrix.target }}/release/otter.exe dist/
+          Compress-Archive -Path dist/otter.exe -DestinationPath dist/${{ matrix.name }}.zip
+          Get-FileHash dist/${{ matrix.name }}.zip -Algorithm SHA256 |
+            Select-Object -ExpandProperty Hash > dist/${{ matrix.name }}.zip.sha256
+
+      # Upload
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.name }}.*
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: artifacts/**/*
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') }}
+          generate_release_notes: true

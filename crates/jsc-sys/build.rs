@@ -1,16 +1,27 @@
 use std::env;
+use std::fs;
+use std::path::PathBuf;
+
+// bun-webkit version from oven-sh/WebKit releases
+// Update this when a new version is needed
+const BUN_WEBKIT_VERSION: &str = "aaf3f80b1cc701b412f8abfb7c7f413644a229ff";
 
 fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+
+    println!("cargo:rerun-if-env-changed=BUN_WEBKIT_VERSION");
 
     match target_os.as_str() {
         "macos" => configure_macos(),
-        "linux" => configure_linux(),
+        "linux" => configure_linux(&target_arch),
+        "windows" => configure_windows(&target_arch),
         _ => panic!("Unsupported OS for JSC: {}", target_os),
     }
 }
 
 fn configure_macos() {
+    // macOS uses system JavaScriptCore framework
     println!("cargo:rustc-link-lib=framework=JavaScriptCore");
 
     if let Ok(sdk_path) = std::process::Command::new("xcrun")
@@ -26,29 +37,182 @@ fn configure_macos() {
     }
 }
 
-fn configure_linux() {
-    let jsc_pkg = if pkg_config::probe_library("javascriptcoregtk-4.1").is_ok() {
-        "javascriptcoregtk-4.1"
-    } else if pkg_config::probe_library("javascriptcoregtk-4.0").is_ok() {
-        "javascriptcoregtk-4.0"
-    } else {
-        panic!(
-            "JavaScriptCore not found on Linux. Install with:\n\
-             Ubuntu/Debian: sudo apt-get install libjavascriptcoregtk-4.1-dev\n\
-             Fedora: sudo dnf install webkit2gtk4.1-devel\n\
-             Or build from WebKit sources."
-        );
+fn configure_linux(target_arch: &str) {
+    // Always use statically linked bun-webkit for Linux
+    let arch = match target_arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        _ => panic!("Unsupported architecture for bun-webkit: {}", target_arch),
     };
 
-    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
-    println!("cargo:rustc-cfg=jsc_gtk");
+    let webkit_path = download_bun_webkit("linux", arch);
+    link_bun_webkit(&webkit_path, "linux");
+}
 
-    let lib = pkg_config::Config::new()
-        .atleast_version("2.30")
-        .probe(jsc_pkg)
-        .expect("Failed to configure JSC via pkg-config");
+fn configure_windows(target_arch: &str) {
+    let arch = match target_arch {
+        "x86_64" => "amd64",
+        _ => panic!(
+            "Unsupported architecture for Windows bun-webkit: {}",
+            target_arch
+        ),
+    };
 
-    for path in lib.include_paths {
-        println!("cargo:include={}", path.display());
+    let webkit_path = download_bun_webkit("windows", arch);
+    link_bun_webkit(&webkit_path, "windows");
+
+    // Windows-specific system libraries
+    println!("cargo:rustc-link-lib=winmm");
+    println!("cargo:rustc-link-lib=bcrypt");
+    println!("cargo:rustc-link-lib=ntdll");
+    println!("cargo:rustc-link-lib=userenv");
+    println!("cargo:rustc-link-lib=dbghelp");
+    println!("cargo:rustc-link-lib=crypt32");
+    println!("cargo:rustc-link-lib=wsock32");
+    println!("cargo:rustc-link-lib=ws2_32");
+    println!("cargo:rustc-link-lib=advapi32");
+    println!("cargo:rustc-link-lib=ole32");
+    println!("cargo:rustc-link-lib=oleaut32");
+    println!("cargo:rustc-link-lib=uuid");
+}
+
+fn download_bun_webkit(os: &str, arch: &str) -> PathBuf {
+    let version = env::var("BUN_WEBKIT_VERSION").unwrap_or_else(|_| BUN_WEBKIT_VERSION.to_string());
+
+    // Cache directory
+    let cache_dir = get_cache_dir();
+    let webkit_dir = cache_dir.join(&version).join(format!("{}-{}", os, arch));
+
+    // Check if already downloaded
+    let marker = webkit_dir.join(".downloaded");
+    if marker.exists() {
+        println!(
+            "cargo:warning=Using cached bun-webkit from {}",
+            webkit_dir.display()
+        );
+        return webkit_dir;
     }
+
+    // Download URL from oven-sh/WebKit
+    let artifact_name = format!("bun-webkit-{}-{}.tar.gz", os, arch);
+    let url = format!(
+        "https://github.com/oven-sh/WebKit/releases/download/autobuild-{}/{}",
+        version, artifact_name
+    );
+
+    println!("cargo:warning=Downloading bun-webkit from {}", url);
+
+    // Create cache directory
+    fs::create_dir_all(&webkit_dir).expect("Failed to create cache directory");
+
+    // Download using ureq - stream directly to decoder to avoid memory limits
+    let response = ureq::get(&url)
+        .call()
+        .unwrap_or_else(|e| panic!("Failed to download bun-webkit: {}. URL: {}", e, url));
+
+    // Stream directly to tar decoder without loading entire file into memory
+    let reader = response.into_body().into_reader();
+    let tar_gz = flate2::read::GzDecoder::new(reader);
+    let mut archive = tar::Archive::new(tar_gz);
+
+    archive
+        .unpack(&webkit_dir)
+        .expect("Failed to extract bun-webkit archive");
+
+    // Create marker file
+    fs::write(&marker, "").expect("Failed to create marker file");
+
+    println!(
+        "cargo:warning=bun-webkit extracted to {}",
+        webkit_dir.display()
+    );
+
+    webkit_dir
+}
+
+fn link_bun_webkit(webkit_path: &PathBuf, os: &str) {
+    // Find the lib directory - bun-webkit extracts to a subdirectory
+    let lib_dir = find_lib_dir(webkit_path);
+
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+
+    // Link JavaScriptCore and WTF statically
+    if os == "windows" {
+        println!("cargo:rustc-link-lib=static=JavaScriptCore");
+        println!("cargo:rustc-link-lib=static=WTF");
+        println!("cargo:rustc-link-lib=static=bmalloc");
+    } else {
+        // Linux
+        println!("cargo:rustc-link-lib=static=JavaScriptCore");
+        println!("cargo:rustc-link-lib=static=WTF");
+        println!("cargo:rustc-link-lib=static=bmalloc");
+    }
+
+    // ICU libraries (statically linked in bun-webkit)
+    println!("cargo:rustc-link-lib=static=icudata");
+    println!("cargo:rustc-link-lib=static=icui18n");
+    println!("cargo:rustc-link-lib=static=icuuc");
+
+    // C++ runtime and system libraries (required by JSC)
+    if os == "linux" {
+        println!("cargo:rustc-link-lib=stdc++");
+        println!("cargo:rustc-link-lib=atomic");
+        println!("cargo:rustc-link-lib=dl");
+        println!("cargo:rustc-link-lib=pthread");
+        println!("cargo:rustc-link-lib=m");
+    }
+
+    // Set include path for headers
+    let include_dir = webkit_path.join("include");
+    if include_dir.exists() {
+        println!("cargo:include={}", include_dir.display());
+    }
+}
+
+fn find_lib_dir(webkit_path: &PathBuf) -> PathBuf {
+    // bun-webkit may extract to a subdirectory
+    let direct_lib = webkit_path.join("lib");
+    if direct_lib.exists() {
+        return direct_lib;
+    }
+
+    // Look for extracted subdirectory
+    if let Ok(entries) = fs::read_dir(webkit_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let lib_in_subdir = path.join("lib");
+                if lib_in_subdir.exists() {
+                    return lib_in_subdir;
+                }
+            }
+        }
+    }
+
+    // Fallback to webkit_path itself
+    webkit_path.clone()
+}
+
+fn get_cache_dir() -> PathBuf {
+    // Try CARGO_HOME first, then fallback to home directory
+    if let Ok(cargo_home) = env::var("CARGO_HOME") {
+        return PathBuf::from(cargo_home).join("cache").join("bun-webkit");
+    }
+
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".cargo")
+            .join("cache")
+            .join("bun-webkit");
+    }
+
+    if let Ok(userprofile) = env::var("USERPROFILE") {
+        return PathBuf::from(userprofile)
+            .join(".cargo")
+            .join("cache")
+            .join("bun-webkit");
+    }
+
+    // Fallback to OUT_DIR
+    PathBuf::from(env::var("OUT_DIR").unwrap()).join("bun-webkit-cache")
 }

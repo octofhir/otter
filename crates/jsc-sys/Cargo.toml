@@ -4,10 +4,18 @@ version = "0.1.0"
 edition = "2024"
 description = "Raw FFI bindings to JavaScriptCore"
 license = "MIT"
+repository = "https://github.com/octofhir/otter"
+homepage = "https://github.com/octofhir/otter"
+keywords = ["javascript", "javascriptcore", "jsc", "ffi", "webkit"]
+categories = ["external-ffi-bindings", "development-tools"]
+readme = "README.md"
 links = "JavaScriptCore"
 
 [build-dependencies]
-pkg-config = "0.3"
+# Dependencies for downloading bun-webkit on Linux/Windows
+ureq = "3"
+flate2 = "1"
+tar = "0.4"
 
 [features]
 default = []

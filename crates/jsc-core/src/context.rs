@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use std::ptr;
 
 use crate::error::{JscError, JscResult};
-use crate::value::{extract_exception, JscValue};
+use crate::value::{JscValue, extract_exception};
 
 /// A JavaScript execution context
 ///

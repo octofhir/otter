@@ -1,3 +1,7 @@
+// Allow raw pointer dereference in public functions - this is an FFI wrapper
+// where the caller is responsible for providing valid JSContextRef pointers.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 //! Safe wrappers for JavaScriptCore.
 //!
 //! This crate provides memory-safe, RAII-based wrappers around
@@ -55,8 +59,8 @@ mod value;
 pub use context::JscContext;
 pub use error::{JscError, JscResult};
 pub use object::JscObject;
-pub use string::{js_string_to_rust, JscString};
-pub use value::{extract_exception, JscValue};
+pub use string::{JscString, js_string_to_rust};
+pub use value::{JscValue, extract_exception};
 
 // Re-export jsc-sys for direct FFI access when needed
 pub use jsc_sys;

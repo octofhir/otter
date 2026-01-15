@@ -15,6 +15,10 @@ use std::ffi::CString;
 use std::ptr;
 
 /// Helper to get argument as string
+///
+/// # Safety
+/// - `ctx` must be a valid JSContextRef
+/// - `arguments` must point to a valid array of at least `argument_count` JSValueRefs
 pub unsafe fn get_arg_as_string(
     ctx: JSContextRef,
     arguments: *const JSValueRef,
@@ -42,6 +46,10 @@ pub unsafe fn get_arg_as_string(
 }
 
 /// Helper to get argument as JSON object
+///
+/// # Safety
+/// - `ctx` must be a valid JSContextRef
+/// - `arguments` must point to a valid array of at least `argument_count` JSValueRefs
 pub unsafe fn get_arg_as_json(
     ctx: JSContextRef,
     arguments: *const JSValueRef,
@@ -70,6 +78,9 @@ pub unsafe fn get_arg_as_json(
 }
 
 /// Helper to create a JS exception from an error message
+///
+/// # Safety
+/// - `ctx` must be a valid JSContextRef
 pub unsafe fn make_exception(ctx: JSContextRef, message: &str) -> JSValueRef {
     let script = format!("new Error({})", serde_json::to_string(message).unwrap());
     let script_cstr = CString::new(script).unwrap();
@@ -96,6 +107,9 @@ pub unsafe fn make_exception(ctx: JSContextRef, message: &str) -> JSValueRef {
 }
 
 /// Helper to create a JS value from JSON
+///
+/// # Safety
+/// - `ctx` must be a valid JSContextRef
 pub unsafe fn json_to_js_value(ctx: JSContextRef, json: &serde_json::Value) -> JSValueRef {
     let json_str = serde_json::to_string(json).unwrap_or_else(|_| "null".to_string());
     let json_cstr = CString::new(json_str).unwrap();

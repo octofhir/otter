@@ -3,19 +3,28 @@
 //! Wraps jsc-core::JscContext and adds runtime-specific features
 //! like event loop, timers, and extension registry.
 
+// Arc is used intentionally here for shared ownership with global registries.
+// The types aren't Send+Sync because JSC contexts are thread-bound, but Arc is
+// still appropriate for reference counting within a single thread's context.
+#![allow(clippy::arc_with_non_send_sync)]
+
 use crate::bindings::*;
 use crate::error::{JscError, JscResult};
-use crate::event_loop::{register_context_event_loop, unregister_context_event_loop, EventLoop};
+use crate::event_loop::{EventLoop, register_context_event_loop, unregister_context_event_loop};
 use crate::extension::{
-    register_context_registry, unregister_context_registry, Extension, ExtensionRegistry,
+    Extension, ExtensionRegistry, register_context_registry, unregister_context_registry,
 };
 use crate::value::JscValue;
 use jsc_core::extract_exception;
-use std::collections::HashMap;
+use parking_lot::Mutex;
 use std::ffi::CString;
 use std::ptr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Global lock for JSC context creation.
+/// JSC's initialization is not fully thread-safe, so we serialize context creation.
+static CONTEXT_CREATION_LOCK: Mutex<()> = Mutex::new(());
 
 /// A JavaScript execution context with runtime features
 ///
@@ -23,15 +32,19 @@ use std::time::{Duration, Instant};
 /// For basic JSC operations without runtime features, use jsc-core::JscContext directly.
 pub struct JscContext {
     ctx: JSGlobalContextRef,
-    #[allow(dead_code)]
-    registered_functions: HashMap<String, Box<dyn Fn(Vec<JscValue>) -> JscResult<JscValue>>>,
     extension_registry: Arc<ExtensionRegistry>,
     event_loop: Arc<EventLoop>,
 }
 
 impl JscContext {
     /// Create a new JavaScript context with event loop support
+    ///
+    /// This function is thread-safe - context creation is serialized
+    /// to avoid race conditions in JSC's initialization.
     pub fn new() -> JscResult<Self> {
+        // Serialize context creation to avoid JSC initialization race conditions
+        let _guard = CONTEXT_CREATION_LOCK.lock();
+
         // SAFETY: JSGlobalContextCreate with null creates a default context
         unsafe {
             let ctx = JSGlobalContextCreate(ptr::null_mut());
@@ -49,7 +62,6 @@ impl JscContext {
 
             Ok(Self {
                 ctx,
-                registered_functions: HashMap::new(),
                 extension_registry: registry,
                 event_loop,
             })

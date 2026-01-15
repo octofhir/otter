@@ -17,10 +17,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type OpResult = JscResult<serde_json::Value>;
 pub type OpFuture = Pin<Box<dyn Future<Output = OpResult> + Send + 'static>>;
+/// Type alias for extension initialization functions.
+pub type ExtensionInitFn = Arc<dyn Fn(&ExtensionState) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct ExtensionState {
     inner: Arc<Mutex<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>>,
+}
+
+impl Default for ExtensionState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ExtensionState {
@@ -99,7 +107,10 @@ pub struct Extension {
     #[allow(dead_code)]
     name: String,
     ops: Vec<OpDecl>,
-    init: Option<Arc<dyn Fn(&ExtensionState) + Send + Sync>>,
+    init: Option<ExtensionInitFn>,
+    /// JavaScript code to execute after registering ops.
+    /// This is useful for setting up wrapper functions that use the ops.
+    js_code: Option<String>,
 }
 
 impl Extension {
@@ -108,6 +119,7 @@ impl Extension {
             name: name.to_string(),
             ops: Vec::new(),
             init: None,
+            js_code: None,
         }
     }
 
@@ -122,6 +134,18 @@ impl Extension {
     {
         self.init = Some(Arc::new(init));
         self
+    }
+
+    /// Add JavaScript code to be executed after ops are registered.
+    /// This code has access to all registered ops as global functions.
+    pub fn with_js(mut self, js_code: &str) -> Self {
+        self.js_code = Some(js_code.to_string());
+        self
+    }
+
+    /// Get the JavaScript code for this extension.
+    pub fn js_code(&self) -> Option<&str> {
+        self.js_code.as_deref()
     }
 }
 
@@ -174,6 +198,12 @@ impl AsyncQueue {
     }
 }
 
+impl Default for ExtensionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ExtensionRegistry {
     pub fn new() -> Self {
         let (pending_tx, pending_rx) = unbounded();
@@ -196,8 +226,52 @@ impl ExtensionRegistry {
             init(&self.state);
         }
 
-        for op in extension.ops {
+        for op in extension.ops.clone() {
             self.register_op(op, ctx)?;
+        }
+
+        // Execute JavaScript code if provided
+        if let Some(js_code) = extension.js_code() {
+            self.execute_js(ctx, js_code, &format!("<{}>", extension.name))?;
+        }
+
+        Ok(())
+    }
+
+    fn execute_js(&self, ctx: JSContextRef, code: &str, source: &str) -> JscResult<()> {
+        let code_cstr = CString::new(code).map_err(|e| JscError::internal(e.to_string()))?;
+        let source_cstr = CString::new(source).map_err(|e| JscError::internal(e.to_string()))?;
+
+        unsafe {
+            let code_ref = JSStringCreateWithUTF8CString(code_cstr.as_ptr());
+            let source_ref = JSStringCreateWithUTF8CString(source_cstr.as_ptr());
+            let mut exception: JSValueRef = std::ptr::null_mut();
+
+            let _result = JSEvaluateScript(
+                ctx,
+                code_ref,
+                std::ptr::null_mut(),
+                source_ref,
+                1,
+                &mut exception,
+            );
+
+            JSStringRelease(code_ref);
+            JSStringRelease(source_ref);
+
+            if !exception.is_null() {
+                // Try to get error message
+                let exc_str = JSValueToStringCopy(ctx, exception, std::ptr::null_mut());
+                if !exc_str.is_null() {
+                    let msg = js_string_to_rust(exc_str);
+                    JSStringRelease(exc_str);
+                    return Err(JscError::internal(format!(
+                        "Extension JS init failed: {}",
+                        msg
+                    )));
+                }
+                return Err(JscError::internal("Extension JS init failed".to_string()));
+            }
         }
 
         Ok(())
@@ -523,7 +597,10 @@ unsafe fn js_value_to_json(ctx: JSContextRef, value: JSValueRef) -> JscResult<se
     let mut exception: JSValueRef = std::ptr::null_mut();
     let js_str = JSValueCreateJSONString(ctx, value, 0, &mut exception);
     if !exception.is_null() || js_str.is_null() {
-        return Err(JscError::script_error("Error", "Argument is not JSON serializable"));
+        return Err(JscError::script_error(
+            "Error",
+            "Argument is not JSON serializable",
+        ));
     }
 
     let json_str = js_string_to_rust(js_str);

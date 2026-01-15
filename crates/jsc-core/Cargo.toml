@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Safe Rust wrappers for JavaScriptCore"
 license = "MIT"
+repository = "https://github.com/octofhir/otter"
+homepage = "https://github.com/octofhir/otter"
+keywords = ["javascript", "javascriptcore", "jsc", "runtime"]
+categories = ["development-tools", "wasm"]
+readme = "README.md"
 
 [dependencies]
 jsc-sys = { path = "../jsc-sys" }

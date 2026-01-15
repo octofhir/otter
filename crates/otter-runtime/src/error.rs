@@ -29,6 +29,10 @@ pub enum JscError {
     /// Runtime pool exhausted
     #[error("All runtime instances are busy")]
     PoolExhausted,
+
+    /// Module loading/resolution error
+    #[error("Module error: {0}")]
+    ModuleError(String),
 }
 
 impl JscError {

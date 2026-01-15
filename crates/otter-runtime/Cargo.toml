@@ -2,8 +2,13 @@
 name = "otter-runtime"
 version = "0.1.0"
 edition = "2024"
-description = "JavaScriptCore runtime for otter"
+description = "JavaScriptCore runtime for otter - TypeScript/JavaScript execution engine"
 license = "MIT"
+repository = "https://github.com/octofhir/otter"
+homepage = "https://github.com/octofhir/otter"
+keywords = ["typescript", "javascript", "runtime", "jsc", "engine"]
+categories = ["development-tools", "compilers"]
+readme = "README.md"
 
 [dependencies]
 jsc-sys = { path = "../jsc-sys" }
@@ -29,6 +34,15 @@ swc_ecma_codegen = "21"
 swc_ecma_transforms_base = "35"
 swc_ecma_transforms_typescript = "35"
 swc_ecma_visit = "19"
+
+# tsgo integration
+flate2 = "1.0"
+tar = "0.4"
+dirs = "5.0"
+which = "7.0"
+zip = "2.2"
+rmp = "0.8"
+tempfile = "3.14"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

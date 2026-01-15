@@ -2,7 +2,7 @@
 name = "otter-cli"
 version = "0.1.0"
 edition = "2024"
-description = "Otter CLI"
+description = "Otter CLI - A fast TypeScript/JavaScript runtime"
 license = "MIT"
 
 [[bin]]
@@ -12,6 +12,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+dirs = "5"
+otter-engine = { path = "../otter-engine" }
+otter-pm = { path = "../otter-pm" }
 otter-runtime = { path = "../otter-runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+toml = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -175,9 +175,7 @@ impl EventLoop {
         }
         // Only count non-cancelled timers
         let timers = self.timers.lock();
-        timers
-            .iter()
-            .any(|t| !t.cancelled.load(Ordering::Relaxed))
+        timers.iter().any(|t| !t.cancelled.load(Ordering::Relaxed))
     }
 
     pub fn next_timer_deadline(&self) -> Option<Instant> {

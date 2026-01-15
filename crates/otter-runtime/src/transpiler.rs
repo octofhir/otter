@@ -70,7 +70,7 @@ pub fn transpile_typescript_with_options(
     );
 
     let syntax = Syntax::Typescript(TsSyntax {
-        tsx: false,
+        tsx: true, // Enable TSX/JSX support
         decorators: true,
         dts: false,
         no_early_errors: false,
@@ -158,6 +158,16 @@ pub fn transpile_typescript_with_options(
     };
 
     Ok(TranspileResult { code, source_map })
+}
+
+/// Check if a file path indicates it needs TypeScript transpilation.
+///
+/// Returns `true` for `.ts`, `.tsx`, and `.mts` file extensions.
+pub fn needs_transpilation(path: &str) -> bool {
+    path.ends_with(".ts")
+        || path.ends_with(".tsx")
+        || path.ends_with(".mts")
+        || path.ends_with(".cts")
 }
 
 /// Check if code appears to be TypeScript (has type annotations).
@@ -285,5 +295,57 @@ mod tests {
 
         let result = transpile_typescript(invalid_ts);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_needs_transpilation() {
+        // TypeScript files
+        assert!(super::needs_transpilation("script.ts"));
+        assert!(super::needs_transpilation("component.tsx"));
+        assert!(super::needs_transpilation("module.mts"));
+        assert!(super::needs_transpilation("module.cts"));
+        assert!(super::needs_transpilation("/path/to/file.ts"));
+
+        // JavaScript files (no transpilation needed)
+        assert!(!super::needs_transpilation("script.js"));
+        assert!(!super::needs_transpilation("component.jsx"));
+        assert!(!super::needs_transpilation("module.mjs"));
+        assert!(!super::needs_transpilation("module.cjs"));
+        assert!(!super::needs_transpilation("README.md"));
+    }
+
+    #[test]
+    fn test_transpile_tsx() {
+        let tsx_code = r#"
+            interface Props {
+                name: string;
+            }
+            const Greeting = (props: Props) => <div>Hello {props.name}</div>;
+        "#;
+
+        let result = transpile_typescript(tsx_code).expect("TSX transpile failed");
+
+        // Type annotations should be removed
+        assert!(!result.code.contains("interface Props"));
+        assert!(!result.code.contains(": Props"));
+        // JSX should be preserved (SWC transforms to React.createElement by default)
+        assert!(result.code.contains("div") || result.code.contains("createElement"));
+    }
+
+    #[test]
+    fn test_transpile_decorators() {
+        let ts_code = r#"
+            function log(target: any) { return target; }
+
+            @log
+            class MyClass {
+                name: string = "test";
+            }
+        "#;
+
+        let result = transpile_typescript(ts_code).expect("Decorator transpile failed");
+
+        // Should compile without errors (decorator support enabled)
+        assert!(result.code.contains("MyClass") || result.code.contains("class"));
     }
 }

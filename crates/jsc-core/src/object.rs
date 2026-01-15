@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use std::ptr;
 
 use crate::error::{JscError, JscResult};
-use crate::value::{extract_exception, JscValue};
+use crate::value::{JscValue, extract_exception};
 
 /// A JavaScript object with automatic GC protection
 ///
@@ -153,8 +153,7 @@ impl JscObject {
             let name_ref = JSStringCreateWithUTF8CString(name_cstr.as_ptr());
             let mut exception: JSValueRef = ptr::null_mut();
 
-            let deleted =
-                JSObjectDeleteProperty(self.ctx, self.object, name_ref, &mut exception);
+            let deleted = JSObjectDeleteProperty(self.ctx, self.object, name_ref, &mut exception);
 
             JSStringRelease(name_ref);
 
@@ -171,8 +170,7 @@ impl JscObject {
         // SAFETY: ctx and object are valid
         unsafe {
             let mut exception: JSValueRef = ptr::null_mut();
-            let value =
-                JSObjectGetPropertyAtIndex(self.ctx, self.object, index, &mut exception);
+            let value = JSObjectGetPropertyAtIndex(self.ctx, self.object, index, &mut exception);
 
             if !exception.is_null() {
                 return Err(extract_exception(self.ctx, exception));
@@ -187,13 +185,7 @@ impl JscObject {
         // SAFETY: ctx and object are valid
         unsafe {
             let mut exception: JSValueRef = ptr::null_mut();
-            JSObjectSetPropertyAtIndex(
-                self.ctx,
-                self.object,
-                index,
-                value.raw(),
-                &mut exception,
-            );
+            JSObjectSetPropertyAtIndex(self.ctx, self.object, index, value.raw(), &mut exception);
 
             if !exception.is_null() {
                 return Err(extract_exception(self.ctx, exception));

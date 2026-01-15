@@ -87,11 +87,17 @@ unsafe extern "C" {
     pub fn JSValueIsString(ctx: JSContextRef, value: JSValueRef) -> bool;
     pub fn JSValueIsObject(ctx: JSContextRef, value: JSValueRef) -> bool;
     pub fn JSValueIsArray(ctx: JSContextRef, value: JSValueRef) -> bool;
+    pub fn JSValueIsInstanceOfConstructor(
+        ctx: JSContextRef,
+        value: JSValueRef,
+        constructor: JSObjectRef,
+        exception: *mut JSValueRef,
+    ) -> bool;
 
     // Value conversion
     pub fn JSValueToBoolean(ctx: JSContextRef, value: JSValueRef) -> bool;
     pub fn JSValueToNumber(ctx: JSContextRef, value: JSValueRef, exception: *mut JSValueRef)
-        -> f64;
+    -> f64;
     pub fn JSValueToStringCopy(
         ctx: JSContextRef,
         value: JSValueRef,
@@ -196,6 +202,7 @@ unsafe extern "C" {
     pub fn JSGarbageCollect(ctx: JSContextRef);
 }
 
+// Linux FFI - statically linked bun-webkit
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
     // Context functions
@@ -233,11 +240,173 @@ unsafe extern "C" {
     pub fn JSValueIsString(ctx: JSContextRef, value: JSValueRef) -> bool;
     pub fn JSValueIsObject(ctx: JSContextRef, value: JSValueRef) -> bool;
     pub fn JSValueIsArray(ctx: JSContextRef, value: JSValueRef) -> bool;
+    pub fn JSValueIsInstanceOfConstructor(
+        ctx: JSContextRef,
+        value: JSValueRef,
+        constructor: JSObjectRef,
+        exception: *mut JSValueRef,
+    ) -> bool;
 
     // Value conversion
     pub fn JSValueToBoolean(ctx: JSContextRef, value: JSValueRef) -> bool;
     pub fn JSValueToNumber(ctx: JSContextRef, value: JSValueRef, exception: *mut JSValueRef)
-        -> f64;
+    -> f64;
+    pub fn JSValueToStringCopy(
+        ctx: JSContextRef,
+        value: JSValueRef,
+        exception: *mut JSValueRef,
+    ) -> JSStringRef;
+    pub fn JSValueToObject(
+        ctx: JSContextRef,
+        value: JSValueRef,
+        exception: *mut JSValueRef,
+    ) -> JSObjectRef;
+    pub fn JSValueCreateJSONString(
+        ctx: JSContextRef,
+        value: JSValueRef,
+        indent: c_uint,
+        exception: *mut JSValueRef,
+    ) -> JSStringRef;
+
+    // Value memory management
+    pub fn JSValueProtect(ctx: JSContextRef, value: JSValueRef);
+    pub fn JSValueUnprotect(ctx: JSContextRef, value: JSValueRef);
+
+    // Object creation
+    pub fn JSObjectMake(ctx: JSContextRef, js_class: JSClassRef, data: *mut c_void) -> JSObjectRef;
+    pub fn JSObjectMakeFunctionWithCallback(
+        ctx: JSContextRef,
+        name: JSStringRef,
+        callback: JSObjectCallAsFunctionCallback,
+    ) -> JSObjectRef;
+    pub fn JSObjectMakeArray(
+        ctx: JSContextRef,
+        argument_count: usize,
+        arguments: *const JSValueRef,
+        exception: *mut JSValueRef,
+    ) -> JSObjectRef;
+    pub fn JSObjectCallAsFunction(
+        ctx: JSContextRef,
+        object: JSObjectRef,
+        this_object: JSObjectRef,
+        argument_count: usize,
+        arguments: *const JSValueRef,
+        exception: *mut JSValueRef,
+    ) -> JSValueRef;
+    pub fn JSObjectIsFunction(ctx: JSContextRef, object: JSObjectRef) -> bool;
+    pub fn JSObjectMakeDeferredPromise(
+        ctx: JSContextRef,
+        resolve: *mut JSObjectRef,
+        reject: *mut JSObjectRef,
+        exception: *mut JSValueRef,
+    ) -> JSObjectRef;
+
+    // Object properties
+    pub fn JSObjectGetProperty(
+        ctx: JSContextRef,
+        object: JSObjectRef,
+        property_name: JSStringRef,
+        exception: *mut JSValueRef,
+    ) -> JSValueRef;
+    pub fn JSObjectSetProperty(
+        ctx: JSContextRef,
+        object: JSObjectRef,
+        property_name: JSStringRef,
+        value: JSValueRef,
+        attributes: JSPropertyAttributes,
+        exception: *mut JSValueRef,
+    );
+    pub fn JSObjectHasProperty(
+        ctx: JSContextRef,
+        object: JSObjectRef,
+        property_name: JSStringRef,
+    ) -> bool;
+    pub fn JSObjectDeleteProperty(
+        ctx: JSContextRef,
+        object: JSObjectRef,
+        property_name: JSStringRef,
+        exception: *mut JSValueRef,
+    ) -> bool;
+    pub fn JSObjectGetPropertyAtIndex(
+        ctx: JSContextRef,
+        object: JSObjectRef,
+        property_index: c_uint,
+        exception: *mut JSValueRef,
+    ) -> JSValueRef;
+    pub fn JSObjectSetPropertyAtIndex(
+        ctx: JSContextRef,
+        object: JSObjectRef,
+        property_index: c_uint,
+        value: JSValueRef,
+        exception: *mut JSValueRef,
+    );
+
+    // Script evaluation
+    pub fn JSEvaluateScript(
+        ctx: JSContextRef,
+        script: JSStringRef,
+        this_object: JSObjectRef,
+        source_url: JSStringRef,
+        starting_line_number: c_int,
+        exception: *mut JSValueRef,
+    ) -> JSValueRef;
+
+    // Garbage collection
+    pub fn JSGarbageCollect(ctx: JSContextRef);
+}
+
+// Windows FFI - statically linked bun-webkit
+#[cfg(target_os = "windows")]
+#[link(name = "JavaScriptCore", kind = "static")]
+#[link(name = "WTF", kind = "static")]
+#[link(name = "bmalloc", kind = "static")]
+unsafe extern "C" {
+    // Context functions
+    pub fn JSGlobalContextCreate(global_object_class: JSClassRef) -> JSGlobalContextRef;
+    pub fn JSGlobalContextRetain(ctx: JSGlobalContextRef) -> JSGlobalContextRef;
+    pub fn JSGlobalContextRelease(ctx: JSGlobalContextRef);
+    pub fn JSContextGetGlobalObject(ctx: JSContextRef) -> JSObjectRef;
+
+    // String functions
+    pub fn JSStringCreateWithUTF8CString(string: *const c_char) -> JSStringRef;
+    pub fn JSStringGetLength(string: JSStringRef) -> usize;
+    pub fn JSStringGetMaximumUTF8CStringSize(string: JSStringRef) -> usize;
+    pub fn JSStringGetUTF8CString(
+        string: JSStringRef,
+        buffer: *mut c_char,
+        buffer_size: usize,
+    ) -> usize;
+    pub fn JSStringRelease(string: JSStringRef);
+    pub fn JSStringIsEqual(a: JSStringRef, b: JSStringRef) -> bool;
+
+    // Value creation
+    pub fn JSValueMakeUndefined(ctx: JSContextRef) -> JSValueRef;
+    pub fn JSValueMakeNull(ctx: JSContextRef) -> JSValueRef;
+    pub fn JSValueMakeBoolean(ctx: JSContextRef, boolean: bool) -> JSValueRef;
+    pub fn JSValueMakeNumber(ctx: JSContextRef, number: f64) -> JSValueRef;
+    pub fn JSValueMakeString(ctx: JSContextRef, string: JSStringRef) -> JSValueRef;
+    pub fn JSValueMakeFromJSONString(ctx: JSContextRef, string: JSStringRef) -> JSValueRef;
+
+    // Value type checking
+    pub fn JSValueGetType(ctx: JSContextRef, value: JSValueRef) -> JSType;
+    pub fn JSValueIsUndefined(ctx: JSContextRef, value: JSValueRef) -> bool;
+    pub fn JSValueIsNull(ctx: JSContextRef, value: JSValueRef) -> bool;
+    pub fn JSValueIsBoolean(ctx: JSContextRef, value: JSValueRef) -> bool;
+    pub fn JSValueIsNumber(ctx: JSContextRef, value: JSValueRef) -> bool;
+    pub fn JSValueIsString(ctx: JSContextRef, value: JSValueRef) -> bool;
+    pub fn JSValueIsObject(ctx: JSContextRef, value: JSValueRef) -> bool;
+    pub fn JSValueIsArray(ctx: JSContextRef, value: JSValueRef) -> bool;
+    pub fn JSValueIsInstanceOfConstructor(
+        ctx: JSContextRef,
+        value: JSValueRef,
+        constructor: JSObjectRef,
+        exception: *mut JSValueRef,
+    ) -> bool;
+
+    // Value conversion
+    pub fn JSValueToBoolean(ctx: JSContextRef, value: JSValueRef) -> bool;
+    pub fn JSValueToNumber(ctx: JSContextRef, value: JSValueRef, exception: *mut JSValueRef)
+    -> f64;
     pub fn JSValueToStringCopy(
         ctx: JSContextRef,
         value: JSValueRef,

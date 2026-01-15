@@ -1,0 +1,23 @@
+# Build artifacts
+target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+
+# Documentation
+*.md
+!README.md
+
+# Local config
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db

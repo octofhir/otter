@@ -169,6 +169,43 @@ impl JscValue {
         unsafe { JSValueIsArray(self.ctx, self.value) }
     }
 
+    /// Check if the value is a Promise
+    ///
+    /// Checks if the object is an instance of the Promise constructor.
+    pub fn is_promise(&self) -> bool {
+        if !self.is_object() {
+            return false;
+        }
+
+        // SAFETY: self.ctx and self.value are valid
+        unsafe {
+            // Get the Promise constructor
+            let promise_name = CString::new("Promise").unwrap();
+            let promise_str = JSStringCreateWithUTF8CString(promise_name.as_ptr());
+
+            let global = JSContextGetGlobalObject(self.ctx);
+            let mut exception: JSValueRef = ptr::null_mut();
+            let promise_ctor = JSObjectGetProperty(self.ctx, global, promise_str, &mut exception);
+            JSStringRelease(promise_str);
+
+            if exception.is_null()
+                && !promise_ctor.is_null()
+                && JSValueIsObject(self.ctx, promise_ctor)
+            {
+                let mut check_exception: JSValueRef = ptr::null_mut();
+                let is_instance = JSValueIsInstanceOfConstructor(
+                    self.ctx,
+                    self.value,
+                    promise_ctor as JSObjectRef,
+                    &mut check_exception,
+                );
+                return check_exception.is_null() && is_instance;
+            }
+
+            false
+        }
+    }
+
     /// Convert to boolean
     pub fn to_bool(&self) -> bool {
         // SAFETY: self.ctx and self.value are valid
@@ -264,8 +301,8 @@ pub unsafe fn extract_exception(ctx: JSContextRef, exception: JSValueRef) -> Jsc
             extract_error_object(ctx, exception)
         } else {
             // Primitive exception (throw "string" or throw 42)
-            let message = value_to_string(ctx, exception)
-                .unwrap_or_else(|| "Unknown error".to_string());
+            let message =
+                value_to_string(ctx, exception).unwrap_or_else(|| "Unknown error".to_string());
             JscError::script_error("Error", message)
         }
     }
@@ -279,8 +316,8 @@ unsafe fn extract_error_object(ctx: JSContextRef, exception: JSValueRef) -> JscE
         let obj = exception as JSObjectRef;
 
         // Extract error type (constructor name)
-        let error_type = get_string_property(ctx, obj, "name")
-            .unwrap_or_else(|| "Error".to_string());
+        let error_type =
+            get_string_property(ctx, obj, "name").unwrap_or_else(|| "Error".to_string());
 
         // Extract message
         let message = get_string_property(ctx, obj, "message").unwrap_or_else(|| {

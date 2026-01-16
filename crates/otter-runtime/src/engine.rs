@@ -445,24 +445,24 @@ impl EngineHandle {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_engine_builder_defaults() {
+    #[tokio::test]
+    async fn test_engine_builder_defaults() {
         let builder = EngineBuilder::default();
         assert!(builder.pool_size >= 1);
         assert_eq!(builder.queue_capacity, 1024);
         assert!(builder.extensions.is_empty());
     }
 
-    #[test]
-    fn test_engine_builder_config() {
+    #[tokio::test]
+    async fn test_engine_builder_config() {
         let builder = EngineBuilder::default().pool_size(2).queue_capacity(100);
 
         assert_eq!(builder.pool_size, 2);
         assert_eq!(builder.queue_capacity, 100);
     }
 
-    #[test]
-    fn test_engine_builder_min_values() {
+    #[tokio::test]
+    async fn test_engine_builder_min_values() {
         let builder = EngineBuilder::default().pool_size(0).queue_capacity(0);
 
         assert_eq!(builder.pool_size, 1);

@@ -1,6 +1,6 @@
 [package]
 name = "otter-runtime"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "JavaScriptCore runtime for otter - TypeScript/JavaScript execution engine"
 license = "MIT"

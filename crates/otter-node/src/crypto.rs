@@ -143,7 +143,7 @@ impl Hmac {
 /// Generate cryptographically secure random bytes.
 pub fn random_bytes(size: usize) -> Result<Vec<u8>, CryptoError> {
     let mut buf = vec![0u8; size];
-    getrandom::getrandom(&mut buf).map_err(|e| CryptoError::RandomError(e.to_string()))?;
+    getrandom::fill(&mut buf).map_err(|e| CryptoError::RandomError(e.to_string()))?;
     Ok(buf)
 }
 

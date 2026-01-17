@@ -13,13 +13,13 @@ readme = "README.md"
 [dependencies]
 otter-jsc-sys = { path = "../otter-jsc-sys", version = "0.1.1" }
 otter-jsc-core = { path = "../otter-jsc-core", version = "0.1.2" }
-thiserror = "1"
+thiserror = "2"
 anyhow = "1"
 url = "2"
 
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
-num_cpus = "1.16"
+reqwest = { version = "0.13", features = ["json", "rustls", "blocking"], default-features = false }
+num_cpus = "1.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
@@ -29,24 +29,24 @@ dashmap = "6"
 crossbeam-utils = "0.8"
 crossbeam-channel = "0.5"
 scopeguard = "1.2"
-regex = "1.11"
+regex = "1.12"
 
 swc_common = { version = "18", features = ["sourcemap"] }
-swc_ecma_ast = "19"
-swc_ecma_parser = "32"
-swc_ecma_codegen = "21"
-swc_ecma_transforms_base = "35"
-swc_ecma_transforms_typescript = "35"
-swc_ecma_visit = "19"
+swc_ecma_ast = "20"
+swc_ecma_parser = "33"
+swc_ecma_codegen = "22"
+swc_ecma_transforms_base = "36"
+swc_ecma_transforms_typescript = "39"
+swc_ecma_visit = "20"
 
 # tsgo integration
-flate2 = "1.0"
+flate2 = "1.1"
 tar = "0.4"
-dirs = "5.0"
-which = "7.0"
-zip = "2.2"
+dirs = "6.0"
+which = "8.0"
+zip = "7.1"
 rmp = "0.8"
-tempfile = "3.14"
+tempfile = "3.24"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

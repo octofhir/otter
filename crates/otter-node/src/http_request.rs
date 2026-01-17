@@ -295,7 +295,7 @@ mod tests {
 
         let meta = get_basic_metadata(id).unwrap();
         assert_eq!(meta.method, "POST");
-        assert_eq!(meta.url, "/api/test");
+        assert_eq!(meta.url, "http://localhost/api/test");
 
         remove_request(id);
     }

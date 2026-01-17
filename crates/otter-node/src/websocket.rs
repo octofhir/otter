@@ -303,10 +303,16 @@ async fn run_websocket(
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        let _ = event_tx.send((id, WebSocketEvent::Message(WebSocketMessage::Text(text))));
+                        let _ = event_tx.send((
+                            id,
+                            WebSocketEvent::Message(WebSocketMessage::Text(text.to_string())),
+                        ));
                     }
                     Some(Ok(Message::Binary(data))) => {
-                        let _ = event_tx.send((id, WebSocketEvent::Message(WebSocketMessage::Binary(data))));
+                        let _ = event_tx.send((
+                            id,
+                            WebSocketEvent::Message(WebSocketMessage::Binary(data.to_vec())),
+                        ));
                     }
                     Some(Ok(Message::Close(frame))) => {
                         let (code, reason) = frame
@@ -354,12 +360,12 @@ async fn run_websocket(
             cmd = command_rx.recv() => {
                 match cmd {
                     Some(WebSocketCommand::Send(WebSocketMessage::Text(text))) => {
-                        if let Err(e) = write.send(Message::Text(text)).await {
+                        if let Err(e) = write.send(Message::Text(text.into())).await {
                             let _ = event_tx.send((id, WebSocketEvent::Error(e.to_string())));
                         }
                     }
                     Some(WebSocketCommand::Send(WebSocketMessage::Binary(data))) => {
-                        if let Err(e) = write.send(Message::Binary(data)).await {
+                        if let Err(e) = write.send(Message::Binary(data.into())).await {
                             let _ = event_tx.send((id, WebSocketEvent::Error(e.to_string())));
                         }
                     }

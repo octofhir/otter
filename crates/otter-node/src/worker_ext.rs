@@ -11,8 +11,8 @@
 //! Note: This module uses shared state (WorkerManager) which doesn't fit the #[dive]
 //! pattern, so we use traditional op_sync with closures.
 
-use otter_runtime::extension::{op_sync, OpDecl};
 use otter_runtime::Extension;
+use otter_runtime::extension::{OpDecl, op_sync};
 use serde_json::json;
 use std::sync::Arc;
 

@@ -373,7 +373,9 @@ unsafe extern "C" fn js_clear_marks(
     match name {
         Some(n) => {
             state.marks.remove(&n);
-            state.entries.retain(|e| !(e.entry_type == "mark" && e.name == n));
+            state
+                .entries
+                .retain(|e| !(e.entry_type == "mark" && e.name == n));
         }
         None => {
             state.marks.clear();

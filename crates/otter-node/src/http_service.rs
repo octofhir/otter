@@ -4,12 +4,12 @@
 //! and sends events to the worker thread for JavaScript handler invocation.
 
 use crate::http_request::{HttpRequest, insert_request, remove_request};
-use otter_runtime::HttpEvent;
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
+use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::service::Service;
 use hyper::{Request, Response, StatusCode};
+use otter_runtime::HttpEvent;
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
@@ -51,7 +51,10 @@ pub struct OtterHttpService {
 impl OtterHttpService {
     /// Create a new service instance.
     pub fn new(server_id: u64, event_tx: UnboundedSender<HttpEvent>) -> Self {
-        Self { server_id, event_tx }
+        Self {
+            server_id,
+            event_tx,
+        }
     }
 }
 

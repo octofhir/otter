@@ -1,7 +1,7 @@
 /**
  * Otter.serve() JavaScript shim
  *
- * High-performance HTTP server with Bun-compatible API.
+ * High-performance HTTP server .
  * Supports HTTP/1.1, HTTP/2, and HTTPS.
  */
 (function (global) {
@@ -10,39 +10,14 @@
   // Map of server ID -> server options (fetch handler, error handler)
   const servers = new Map();
 
-  // Base64 encoding for binary data transfer (much faster than JSON array)
-  const BASE64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  function base64Encode(bytes) {
+  // Helper to convert Uint8Array to base64 using built-in btoa
+  function uint8ToBase64(bytes) {
     if (bytes.length === 0) return "";
-    let result = "";
-    const len = bytes.length;
-    const remainder = len % 3;
-    const mainLen = len - remainder;
-
-    // Process 3 bytes at a time
-    for (let i = 0; i < mainLen; i += 3) {
-      const n = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
-      result += BASE64_CHARS[(n >> 18) & 63];
-      result += BASE64_CHARS[(n >> 12) & 63];
-      result += BASE64_CHARS[(n >> 6) & 63];
-      result += BASE64_CHARS[n & 63];
+    let binaryString = "";
+    for (let i = 0; i < bytes.length; i++) {
+      binaryString += String.fromCharCode(bytes[i]);
     }
-
-    // Handle remainder
-    if (remainder === 1) {
-      const n = bytes[mainLen] << 16;
-      result += BASE64_CHARS[(n >> 18) & 63];
-      result += BASE64_CHARS[(n >> 12) & 63];
-      result += "==";
-    } else if (remainder === 2) {
-      const n = (bytes[mainLen] << 16) | (bytes[mainLen + 1] << 8);
-      result += BASE64_CHARS[(n >> 18) & 63];
-      result += BASE64_CHARS[(n >> 12) & 63];
-      result += BASE64_CHARS[(n >> 6) & 63];
-      result += "=";
-    }
-
-    return result;
+    return btoa(binaryString);
   }
 
   /**
@@ -146,7 +121,7 @@
       }
 
       // Use base64 encoding for binary data transfer
-      const bodyBase64 = base64Encode(bodyBytes);
+      const bodyBase64 = uint8ToBase64(bodyBytes);
 
       // Send to Rust with base64-encoded body
       __otter_http_respond(requestId, status, headers, { type: "base64", data: bodyBase64 });

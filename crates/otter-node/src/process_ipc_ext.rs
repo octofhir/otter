@@ -8,8 +8,8 @@
 //! - `process_ipc_ext.rs` - Extension creation with ops
 //! - `process_ipc.js` - JavaScript wrapper for process.send/recv
 
-use otter_runtime::extension::{op_async, op_sync, OpDecl};
 use otter_runtime::Extension;
+use otter_runtime::extension::{OpDecl, op_async, op_sync};
 use serde_json::json;
 
 /// Create the process IPC extension.
@@ -49,10 +49,7 @@ pub fn extension(ipc_channel: crate::ipc::IpcChannel) -> Extension {
     // __otter_process_ipc_send(message) -> boolean
     ops.push(op_async("__otter_process_ipc_send", move |_ctx, args| {
         let channel = channel_send.clone();
-        let msg = args
-            .first()
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
+        let msg = args.first().cloned().unwrap_or(serde_json::Value::Null);
 
         Box::pin(async move {
             let mut ch = channel.lock().await;
@@ -80,7 +77,9 @@ pub fn extension(ipc_channel: crate::ipc::IpcChannel) -> Extension {
     ops.push(op_sync(
         "__otter_process_ipc_connected",
         move |_ctx, _args| {
-            Ok(json!(connected_check.load(std::sync::atomic::Ordering::Relaxed)))
+            Ok(json!(
+                connected_check.load(std::sync::atomic::Ordering::Relaxed)
+            ))
         },
     ));
 

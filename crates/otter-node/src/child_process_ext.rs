@@ -11,8 +11,8 @@
 //! Note: This module uses shared state (ChildProcessManager) which doesn't fit the #[dive]
 //! pattern, so we use traditional op_sync with closures.
 
-use otter_runtime::extension::{op_sync, OpDecl};
 use otter_runtime::Extension;
+use otter_runtime::extension::{OpDecl, op_sync};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -86,11 +86,10 @@ pub fn extension() -> Extension {
 
     // cpWriteStdin(id: number, data: Buffer) -> null
     ops.push(op_sync("cpWriteStdin", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("cpWriteStdin requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("cpWriteStdin requires id")
+            })? as u32;
 
         let data = extract_buffer_data(args.get(1))?;
 
@@ -103,11 +102,10 @@ pub fn extension() -> Extension {
 
     // cpCloseStdin(id: number) -> null
     ops.push(op_sync("cpCloseStdin", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("cpCloseStdin requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("cpCloseStdin requires id")
+            })? as u32;
 
         mgr_close
             .close_stdin(id)
@@ -157,22 +155,20 @@ pub fn extension() -> Extension {
 
     // cpSignalCode(id: number) -> string | null
     ops.push(op_sync("cpSignalCode", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("cpSignalCode requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("cpSignalCode requires id")
+            })? as u32;
 
         Ok(json!(mgr_signal.signal_code(id)))
     }));
 
     // cpIsRunning(id: number) -> boolean
     ops.push(op_sync("cpIsRunning", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("cpIsRunning requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("cpIsRunning requires id")
+            })? as u32;
 
         Ok(json!(mgr_running.is_running(id)))
     }));

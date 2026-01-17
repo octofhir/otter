@@ -73,8 +73,8 @@ impl IpcChannel {
 
     /// Send a JSON message through the IPC channel.
     pub async fn send(&mut self, msg: &serde_json::Value) -> io::Result<()> {
-        let payload = serde_json::to_vec(msg)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let payload =
+            serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // Write length prefix (4 bytes, little-endian)
         let len = (payload.len() as u32).to_le_bytes();
@@ -172,9 +172,7 @@ pub fn has_ipc() -> bool {
 /// Returns `None` if not running as a forked child.
 #[cfg(unix)]
 pub fn get_ipc_fd() -> Option<RawFd> {
-    std::env::var(IPC_FD_ENV)
-        .ok()
-        .and_then(|s| s.parse().ok())
+    std::env::var(IPC_FD_ENV).ok().and_then(|s| s.parse().ok())
 }
 
 /// Connect to the parent process IPC channel.

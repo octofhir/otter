@@ -49,8 +49,8 @@
 
 use dashmap::DashMap;
 use std::any::Any;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use thiserror::Error;
 
 /// A paw grip on a native resource - the ID used to reference it from JavaScript.
@@ -188,10 +188,7 @@ impl Holt {
     /// assert_eq!(*data, vec![1, 2, 3]);
     /// ```
     pub fn catch<T: Any + Send + Sync + 'static>(&self, paw: Paw) -> HoltResult<Arc<T>> {
-        let entry = self
-            .stash
-            .get(&paw)
-            .ok_or(HoltError::SlippedAway(paw))?;
+        let entry = self.stash.get(&paw).ok_or(HoltError::SlippedAway(paw))?;
 
         entry
             .value()
@@ -259,10 +256,7 @@ impl Holt {
     /// - [`HoltError::SlippedAway`] - The paw doesn't exist
     /// - [`HoltError::WrongCatch`] - Type mismatch
     pub fn release_as<T: Any + Send + Sync + 'static>(&self, paw: Paw) -> HoltResult<Arc<T>> {
-        let removed = self
-            .stash
-            .remove(&paw)
-            .ok_or(HoltError::SlippedAway(paw))?;
+        let removed = self.stash.remove(&paw).ok_or(HoltError::SlippedAway(paw))?;
 
         removed
             .1

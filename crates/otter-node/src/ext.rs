@@ -106,6 +106,34 @@ pub fn test() -> Extension {
     crate::test_ext::extension()
 }
 
+/// Create the assert extension for assertion utilities.
+///
+/// Provides Node.js-compatible assert API (node:assert).
+pub fn assert() -> Extension {
+    crate::assert_ext::extension()
+}
+
+/// Create the querystring extension for query string parsing.
+///
+/// Provides Node.js-compatible querystring API (node:querystring).
+pub fn querystring() -> Extension {
+    crate::querystring_ext::extension()
+}
+
+/// Create the dns extension for DNS resolution.
+///
+/// Provides Node.js-compatible dns API (node:dns).
+pub fn dns() -> Extension {
+    crate::dns_ext::extension()
+}
+
+/// Create the dgram extension for UDP sockets.
+///
+/// Provides Node.js-compatible dgram API (node:dgram).
+pub fn dgram() -> Extension {
+    crate::dgram_ext::extension()
+}
+
 // ============================================================================
 // IO Extensions (may require capabilities)
 // ============================================================================
@@ -122,6 +150,13 @@ pub fn buffer() -> Extension {
 /// Provides hash, hmac, random bytes, and other crypto functions.
 pub fn crypto() -> Extension {
     crate::crypto_ext::extension()
+}
+
+/// Create the zlib extension for compression/decompression.
+///
+/// Provides gzip, deflate, and brotli compression algorithms.
+pub fn zlib() -> Extension {
+    crate::zlib_ext::extension()
 }
 
 /// Create the process extension for process information.
@@ -226,14 +261,7 @@ pub use otter_runtime::{ExtensionKind, ExtensionPreset};
 /// }
 /// ```
 pub fn for_embedded() -> Vec<Extension> {
-    vec![
-        path(),
-        buffer(),
-        util(),
-        events(),
-        url(),
-        crypto(),
-    ]
+    vec![path(), buffer(), util(), events(), url(), crypto(), zlib()]
 }
 
 /// Get extensions for a specific preset.
@@ -329,6 +357,11 @@ pub fn for_node_compat(config: ExtensionConfig) -> ExtensionsWithState {
         events(),
         url(),
         crypto(),
+        zlib(),
+        assert(),
+        querystring(),
+        dns(),
+        dgram(),
         os(),
         // IO
         fs(config.capabilities.clone()),
@@ -428,6 +461,41 @@ mod tests {
     }
 
     #[test]
+    fn test_zlib_extension() {
+        let ext = zlib();
+        assert_eq!(ext.name(), "zlib");
+        assert!(ext.js_code().is_some());
+    }
+
+    #[test]
+    fn test_assert_extension() {
+        let ext = assert();
+        assert_eq!(ext.name(), "assert");
+        assert!(ext.js_code().is_some());
+    }
+
+    #[test]
+    fn test_querystring_extension() {
+        let ext = querystring();
+        assert_eq!(ext.name(), "querystring");
+        assert!(ext.js_code().is_some());
+    }
+
+    #[test]
+    fn test_dns_extension() {
+        let ext = dns();
+        assert_eq!(ext.name(), "dns");
+        assert!(ext.js_code().is_some());
+    }
+
+    #[test]
+    fn test_dgram_extension() {
+        let ext = dgram();
+        assert_eq!(ext.name(), "dgram");
+        assert!(ext.js_code().is_some());
+    }
+
+    #[test]
     fn test_http_extension() {
         let ext = http();
         assert_eq!(ext.name(), "http");
@@ -483,8 +551,8 @@ mod tests {
     #[test]
     fn test_for_embedded() {
         let extensions = for_embedded();
-        // Should have 6 extensions: path, buffer, util, events, url, crypto
-        assert_eq!(extensions.len(), 6);
+        // Should have 7 extensions: path, buffer, util, events, url, crypto, zlib
+        assert_eq!(extensions.len(), 7);
 
         let names: Vec<&str> = extensions.iter().map(|e| e.name()).collect();
         assert!(names.contains(&"path"));
@@ -493,6 +561,7 @@ mod tests {
         assert!(names.contains(&"events"));
         assert!(names.contains(&"url"));
         assert!(names.contains(&"crypto"));
+        assert!(names.contains(&"zlib"));
 
         // Should NOT have IO/network extensions
         assert!(!names.contains(&"fs"));
@@ -503,7 +572,7 @@ mod tests {
     #[test]
     fn test_for_preset_embedded() {
         let extensions = for_preset(ExtensionPreset::Embedded);
-        assert_eq!(extensions.len(), 6);
+        assert_eq!(extensions.len(), 7);
     }
 
     #[test]
@@ -534,8 +603,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions();
         let result = for_node_compat(config);
 
-        // Should have 14 extensions (no http_server since no tx provided)
-        assert_eq!(result.extensions.len(), 14);
+        // Should have 19 extensions (no http_server since no tx provided)
+        assert_eq!(result.extensions.len(), 19);
         assert!(result.http_server_count.is_none());
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
@@ -545,6 +614,11 @@ mod tests {
         assert!(names.contains(&"http"));
         assert!(names.contains(&"WebSocket"));
         assert!(names.contains(&"Worker"));
+        assert!(names.contains(&"zlib"));
+        assert!(names.contains(&"assert"));
+        assert!(names.contains(&"querystring"));
+        assert!(names.contains(&"dns"));
+        assert!(names.contains(&"dgram"));
         // No http_server without tx
         assert!(!names.contains(&"http_server"));
     }
@@ -555,8 +629,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions().http_event_tx(tx);
         let result = for_node_compat(config);
 
-        // Should have 15 extensions (including http_server)
-        assert_eq!(result.extensions.len(), 15);
+        // Should have 20 extensions (including http_server)
+        assert_eq!(result.extensions.len(), 20);
         assert!(result.http_server_count.is_some());
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
@@ -568,8 +642,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions();
         let result = for_full(config);
 
-        // Should have 15 extensions (node_compat 14 + test)
-        assert_eq!(result.extensions.len(), 15);
+        // Should have 20 extensions (node_compat 19 + test)
+        assert_eq!(result.extensions.len(), 20);
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
         assert!(names.contains(&"test"));
@@ -581,8 +655,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions().http_event_tx(tx);
         let result = for_full(config);
 
-        // Should have 16 extensions (all)
-        assert_eq!(result.extensions.len(), 16);
+        // Should have 21 extensions (all)
+        assert_eq!(result.extensions.len(), 21);
         assert!(result.http_server_count.is_some());
     }
 }

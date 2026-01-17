@@ -68,7 +68,14 @@ fn try_copyfile_clone_recursive(src: &Path, dst: &Path) -> io::Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
     let flags = COPYFILE_DATA | COPYFILE_RECURSIVE | COPYFILE_CLONE;
-    let result = unsafe { copyfile(src_cstr.as_ptr(), dst_cstr.as_ptr(), std::ptr::null_mut(), flags) };
+    let result = unsafe {
+        copyfile(
+            src_cstr.as_ptr(),
+            dst_cstr.as_ptr(),
+            std::ptr::null_mut(),
+            flags,
+        )
+    };
     if result == 0 {
         Ok(())
     } else {
@@ -139,7 +146,11 @@ impl ContentStore {
     pub fn get_package_index(&self, name: &str, version: &str) -> Option<PackageIndex> {
         let path = self.index_path(name, version);
         let data = fs::read(&path).ok()?;
-        serde_json::from_slice(&data).ok()
+        let index: PackageIndex = serde_json::from_slice(&data).ok()?;
+        if !index.files.iter().any(|f| f.path == "package.json") {
+            return None;
+        }
+        Some(index)
     }
 
     fn package_store_path(&self, name: &str, version: &str) -> PathBuf {
@@ -160,7 +171,10 @@ impl ContentStore {
         // Create parent directory (first 2 chars of hash)
         if let Some(parent) = store_path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
-                io::Error::new(e.kind(), format!("Failed to create store dir {:?}: {}", parent, e))
+                io::Error::new(
+                    e.kind(),
+                    format!("Failed to create store dir {:?}: {}", parent, e),
+                )
             })?;
         }
 
@@ -175,7 +189,10 @@ impl ContentStore {
         ));
 
         fs::write(&temp_path, content).map_err(|e| {
-            io::Error::new(e.kind(), format!("Failed to write temp file {:?}: {}", temp_path, e))
+            io::Error::new(
+                e.kind(),
+                format!("Failed to write temp file {:?}: {}", temp_path, e),
+            )
         })?;
 
         // Rename is atomic on same filesystem; if target exists, another thread won
@@ -189,7 +206,10 @@ impl ContentStore {
                 let _ = fs::remove_file(&temp_path);
                 return Err(io::Error::new(
                     e.kind(),
-                    format!("Failed to rename {:?} to {:?}: {}", temp_path, store_path, e),
+                    format!(
+                        "Failed to rename {:?} to {:?}: {}",
+                        temp_path, store_path, e
+                    ),
                 ));
             }
         }
@@ -211,14 +231,20 @@ impl ContentStore {
         // Create parent directories
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| {
-                io::Error::new(e.kind(), format!("Failed to create dest parent {:?}: {}", parent, e))
+                io::Error::new(
+                    e.kind(),
+                    format!("Failed to create dest parent {:?}: {}", parent, e),
+                )
             })?;
         }
 
         // Remove existing file if any
         if dest.exists() {
             fs::remove_file(dest).map_err(|e| {
-                io::Error::new(e.kind(), format!("Failed to remove existing file {:?}: {}", dest, e))
+                io::Error::new(
+                    e.kind(),
+                    format!("Failed to remove existing file {:?}: {}", dest, e),
+                )
             })?;
         }
 
@@ -231,7 +257,10 @@ impl ContentStore {
         } else {
             // Hardlink failed (cross-device?), copy instead
             fs::copy(&store_path, dest).map_err(|e| {
-                io::Error::new(e.kind(), format!("Failed to copy {:?} to {:?}: {}", store_path, dest, e))
+                io::Error::new(
+                    e.kind(),
+                    format!("Failed to copy {:?} to {:?}: {}", store_path, dest, e),
+                )
             })?;
             true
         };
@@ -242,7 +271,10 @@ impl ContentStore {
             use std::os::unix::fs::PermissionsExt;
             let perms = fs::Permissions::from_mode(mode);
             fs::set_permissions(dest, perms).map_err(|e| {
-                io::Error::new(e.kind(), format!("Failed to set permissions on {:?}: {}", dest, e))
+                io::Error::new(
+                    e.kind(),
+                    format!("Failed to set permissions on {:?}: {}", dest, e),
+                )
             })?;
         }
 
@@ -257,20 +289,15 @@ impl ContentStore {
             fs::create_dir_all(parent)?;
         }
 
-        let json = serde_json::to_vec(index)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let json =
+            serde_json::to_vec(index).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         fs::write(&path, json)?;
 
         Ok(())
     }
 
     /// Install package from store using clonefile/hardlinks (parallel with rayon)
-    pub fn install_from_store(
-        &self,
-        name: &str,
-        version: &str,
-        dest: &Path,
-    ) -> io::Result<bool> {
+    pub fn install_from_store(&self, name: &str, version: &str, dest: &Path) -> io::Result<bool> {
         let Some(index) = self.get_package_index(name, version) else {
             return Ok(false);
         };
@@ -282,13 +309,19 @@ impl ContentStore {
     pub fn install_from_index(&self, index: &PackageIndex, dest: &Path) -> io::Result<()> {
         #[cfg(target_os = "macos")]
         {
-            if self.install_from_existing_package_store(index, dest).is_ok() {
+            if self
+                .install_from_existing_package_store(index, dest)
+                .is_ok()
+            {
                 return Ok(());
             }
 
             // If the assembled tree is missing but we have the CAS index, build it once and retry.
             if self.maybe_build_package_store_from_index(index).is_ok() {
-                if self.install_from_existing_package_store(index, dest).is_ok() {
+                if self
+                    .install_from_existing_package_store(index, dest)
+                    .is_ok()
+                {
                     return Ok(());
                 }
             }
@@ -300,7 +333,11 @@ impl ContentStore {
     }
 
     #[cfg(target_os = "macos")]
-    fn validate_installed_tree_against_index(&self, index: &PackageIndex, root: &Path) -> io::Result<()> {
+    fn validate_installed_tree_against_index(
+        &self,
+        index: &PackageIndex,
+        root: &Path,
+    ) -> io::Result<()> {
         let mut candidates: Vec<(&str, u32)> = Vec::new();
 
         for file in &index.files {
@@ -345,10 +382,17 @@ impl ContentStore {
     }
 
     #[cfg(target_os = "macos")]
-    fn install_from_existing_package_store(&self, index: &PackageIndex, dest: &Path) -> io::Result<()> {
+    fn install_from_existing_package_store(
+        &self,
+        index: &PackageIndex,
+        dest: &Path,
+    ) -> io::Result<()> {
         let pkg_dir = self.package_store_path(&index.name, &index.version);
         if !pkg_dir.exists() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "Package store dir missing"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Package store dir missing",
+            ));
         }
 
         if dest.exists() {
@@ -465,7 +509,10 @@ impl ContentStore {
                     false // hardlink shares inode, same permissions
                 } else {
                     fs::copy(&store_path, &file_dest).map_err(|e| {
-                        io::Error::new(e.kind(), format!("Content not in store: {} ({:?})", hash, store_path))
+                        io::Error::new(
+                            e.kind(),
+                            format!("Content not in store: {} ({:?})", hash, store_path),
+                        )
                     })?;
                     true // copy may not preserve permissions
                 };
@@ -514,12 +561,10 @@ impl ContentStore {
                 continue;
             }
 
-            // Strip "package/" prefix
-            let rel_path = path
-                .strip_prefix("package")
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .to_string();
+            // npm tarballs contain a single top-level directory (often "package/", but not always).
+            // Strip the first path component so files install into the package root.
+            let rel_path: PathBuf = path.iter().skip(1).collect();
+            let rel_path = rel_path.to_string_lossy().to_string();
 
             if rel_path.is_empty() {
                 continue;
@@ -572,7 +617,8 @@ impl ContentStore {
     /// Get index path for a package
     fn index_path(&self, name: &str, version: &str) -> PathBuf {
         let safe_name = name.replace('/', "-").replace('@', "");
-        self.index_dir.join(format!("{}-{}.json", safe_name, version))
+        self.index_dir
+            .join(format!("{}-{}.json", safe_name, version))
     }
 
     /// Get store statistics
@@ -595,7 +641,12 @@ impl ContentStore {
         let mut package_count = 0u64;
         if self.index_dir.exists() {
             for entry in fs::read_dir(&self.index_dir)? {
-                if entry?.path().extension().map(|e| e == "json").unwrap_or(false) {
+                if entry?
+                    .path()
+                    .extension()
+                    .map(|e| e == "json")
+                    .unwrap_or(false)
+                {
                     package_count += 1;
                 }
             }
@@ -626,6 +677,10 @@ pub struct StoreStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    use tar::Builder;
 
     #[test]
     fn test_hash_content() {
@@ -672,5 +727,50 @@ mod tests {
         let _ = fs::remove_dir_all("/tmp/otter-test-index");
         let _ = fs::remove_dir_all("/tmp/otter-test-pkgs");
         let _ = fs::remove_file("/tmp/otter-test-link");
+    }
+
+    #[test]
+    fn test_store_package_strips_top_level_dir() {
+        fn make_tgz(top_level: &str) -> Vec<u8> {
+            let mut tar_buf = Vec::new();
+            {
+                let gz = GzEncoder::new(&mut tar_buf, Compression::default());
+                let mut tar = Builder::new(gz);
+
+                let mut header = tar::Header::new_gnu();
+                let contents = br#"{ "name": "x", "version": "1.0.0" }"#;
+                header.set_size(contents.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar.append_data(
+                    &mut header,
+                    format!("{}/package.json", top_level),
+                    &contents[..],
+                )
+                .unwrap();
+                tar.finish().unwrap();
+            }
+            tar_buf
+        }
+
+        let store_root = PathBuf::from(format!("/tmp/otter-test-store-{}", std::process::id()));
+        let store = ContentStore {
+            store_dir: store_root.join("store"),
+            index_dir: store_root.join("index"),
+            package_dir: store_root.join("pkgs"),
+        };
+
+        let _ = fs::remove_dir_all(&store_root);
+
+        let tgz = make_tgz("package");
+        let index = store.store_package_from_tarball("x", "1.0.0", &tgz).unwrap();
+        assert!(index.files.iter().any(|f| f.path == "package.json"));
+
+        let tgz = make_tgz("node");
+        let index = store.store_package_from_tarball("y", "1.0.0", &tgz).unwrap();
+        assert!(index.files.iter().any(|f| f.path == "package.json"));
+        assert!(!index.files.iter().any(|f| f.path == "node/package.json"));
+
+        let _ = fs::remove_dir_all(&store_root);
     }
 }

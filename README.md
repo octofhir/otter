@@ -49,9 +49,23 @@ fn main() -> anyhow::Result<()> {
 - Native TypeScript support (no separate compilation step)
 - Async/await with built-in event loop
 - `fetch` API with Headers, Request, Response, Blob, FormData
+- HTTP/HTTPS server with HTTP/1.1 + HTTP/2 support
+- Built-in SQLite & PostgreSQL with tagged template queries
+- Key-value store (redb)
 - Console API with customizable output handlers
 - Timeout control for script execution
 - Cross-platform: macOS, Linux, Windows
+
+## Performance
+
+| Runtime | Cold Start | Warm Start |
+|---------|------------|------------|
+| **Otter** | ~0.03s | **0.01s** |
+| Bun | 0.01s | 0.01s |
+| Node.js | 0.06s | 0.03s |
+
+Key optimizations: event loop idle detection, lazy extension loading, LTO builds.
+Binary size: 38MB.
 
 ## API Compatibility
 
@@ -76,20 +90,24 @@ fn main() -> anyhow::Result<()> {
 
 | Module | Status | Implemented APIs |
 |--------|--------|------------------|
+| `assert` | ✅ Full | `AssertionError`, `ok`, `equal`, `deepEqual`, `strictEqual`, `throws`, `rejects` |
 | `buffer` | ✅ Full | `Buffer.alloc`, `from`, `concat`, `slice`, `toString`, `isBuffer`, `byteLength` |
 | `child_process` | ✅ Full | `spawn`, `spawnSync`, `exec`, `execSync`, `execFile`, `execFileSync`, `fork` |
 | `crypto` | ⚠️ Partial | `randomBytes`, `randomUUID`, `createHash`, `createHmac`, `hash` |
+| `dgram` | ✅ Full | `createSocket`, `bind`, `send`, `close` (UDP sockets) |
+| `dns` | ✅ Full | `lookup`, `resolve`, `resolve4`, `resolve6` (hickory-resolver) |
 | `events` | ✅ Full | `EventEmitter` with full API (on, once, emit, off, etc.) |
 | `fs` | ✅ Full | `readFile`, `writeFile`, `readdir`, `stat`, `mkdir`, `rm`, `exists`, `rename`, `copyFile` + sync + promises |
 | `os` | ✅ Full | `arch`, `platform`, `hostname`, `homedir`, `tmpdir`, `cpus`, `totalmem`, `freemem`, `userInfo`, etc. |
 | `path` | ✅ Full | `join`, `resolve`, `dirname`, `basename`, `extname`, `normalize`, `isAbsolute`, `relative` |
 | `process` | ✅ Full | `env`, `argv`, `cwd`, `exit`, `memoryUsage`, `platform`, `arch` |
+| `querystring` | ✅ Full | `parse`, `stringify`, `encode`, `decode` |
 | `test` | ✅ Full | `describe`, `it`, `test`, `run` (node:test compatible) |
+| `url` | ✅ Full | WHATWG URL + legacy `parse`, `format`, `resolve` |
 | `util` | ⚠️ Partial | `promisify`, `inspect`, `format` |
-| `dns` | ❌ | Not yet implemented |
+| `zlib` | ✅ Full | `gzip`, `gunzip`, `deflate`, `inflate`, `brotliCompress`, `brotliDecompress` + sync |
 | `http`/`https` | ❌ | Use `fetch` or `Otter.serve()` instead |
-| `net` | ❌ | TCP/UDP sockets not yet implemented |
-| `zlib` | ❌ | Not yet implemented |
+| `net` | ⚠️ Partial | TCP partial, use `dgram` for UDP |
 
 ### Otter-specific APIs
 
@@ -98,6 +116,39 @@ fn main() -> anyhow::Result<()> {
 | `Otter.serve()` | HTTP/HTTPS server (HTTP/1.1 + HTTP/2 with ALPN, Bun-compatible) |
 | `Otter.spawn()` | Async subprocess with ReadableStream stdout/stderr |
 | `Otter.spawnSync()` | Synchronous subprocess execution |
+
+### Database & Storage
+
+| API | Status | Description |
+|-----|--------|-------------|
+| `SQL` | ✅ Full | SQLite + PostgreSQL with tagged template queries |
+| `sql` | ✅ Full | Bun-compatible tagged template literal for queries |
+| `kv()` | ✅ Full | Key-value store (redb, pure Rust) |
+
+```typescript
+import { sql, SQL } from "otter";
+
+// SQLite (default)
+const db = new SQL(":memory:");
+await db`CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)`;
+await db`INSERT INTO users (name) VALUES (${"Alice"})`;
+const users = await db`SELECT * FROM users`;
+
+// PostgreSQL with COPY (bulk import/export)
+const pg = new SQL("postgres://user:pass@localhost/db");
+await pg.copyFrom("users", {
+  columns: ["name", "email"],
+  format: "csv",
+  source: new Blob(["Alice,alice@example.com\nBob,bob@example.com"]),
+});
+// 108,529 rows/sec - 144x faster than single INSERTs
+
+// KV Store
+import { kv } from "otter";
+const store = kv(":memory:");
+store.set("user:1", { name: "Alice" });
+console.log(store.get("user:1")); // { name: "Alice" }
+```
 
 ### Module System
 

@@ -6,9 +6,15 @@ use otter_engine::{
     Capabilities, CapabilitiesBuilder, EnvStoreBuilder, IsolatedEnvStore, LoaderConfig,
     ModuleGraph, ModuleLoader, parse_env_file, parse_imports,
 };
+use otter_jsc_sys::{
+    JSContextGetGlobalObject, JSContextRef, JSObjectCallAsFunction, JSObjectGetProperty,
+    JSObjectIsFunction, JSObjectRef, JSStringCreateWithUTF8CString, JSStringRelease,
+    JSValueMakeNumber, JSValueProtect, JSValueRef,
+};
+use otter_kv::kv_extension;
 use otter_node::{
-    ActiveNetServerCount, ActiveServerCount, ProcessInfo, ext, has_ipc, init_net_manager,
-    IpcChannel, NetEvent,
+    ActiveNetServerCount, ActiveServerCount, IpcChannel, NetEvent, ProcessInfo, ext, has_ipc,
+    init_net_manager,
 };
 use otter_runtime::HttpEvent;
 use otter_runtime::{
@@ -16,18 +22,14 @@ use otter_runtime::{
     set_tokio_handle, transpile_typescript,
     tsgo::{TypeCheckConfig, check_types, format_diagnostics, has_errors},
 };
-use otter_jsc_sys::{
-    JSContextGetGlobalObject, JSContextRef, JSObjectCallAsFunction, JSObjectGetProperty,
-    JSObjectIsFunction, JSObjectRef, JSStringCreateWithUTF8CString, JSStringRelease,
-    JSValueMakeNumber, JSValueProtect, JSValueRef,
-};
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use otter_sql::sql_extension;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 /// Cached HTTP dispatch function for fast handler invocation
 struct CachedDispatchFn {
@@ -222,6 +224,11 @@ impl RunCommand {
             let mut modules_for_bundle: Vec<(&str, &str, HashMap<String, String>)> = Vec::new();
 
             for url in &execution_order {
+                // Skip built-in modules (node: and otter:) - they have no source
+                // and are resolved via __otter_node_builtins
+                if url.starts_with("node:") || url.starts_with("otter:") {
+                    continue;
+                }
                 if let Some(node) = graph.get(url) {
                     // Build dependency map for this module
                     let mut deps = HashMap::new();
@@ -307,6 +314,14 @@ impl RunCommand {
         runtime.register_extension(ext::http())?;
         timing!("ext_http");
 
+        // Register SQL extension for "otter" module (sql, SQL)
+        runtime.register_extension(sql_extension())?;
+        timing!("ext_sql");
+
+        // Register KV extension for "otter" module (kv)
+        runtime.register_extension(kv_extension())?;
+        timing!("ext_kv");
+
         // Check for IPC channel (forked child process)
         #[cfg(unix)]
         if has_ipc() {
@@ -375,7 +390,8 @@ impl RunCommand {
             active_http_server_count,
             active_net_server_count,
             timeout,
-        ).await?;
+        )
+        .await?;
         timing!("event_loop_done");
 
         // Check for script errors
@@ -464,10 +480,12 @@ impl RunCommand {
 
         // Load from env files first (lowest priority of explicit vars)
         for env_file in &self.env_files {
-            let content = std::fs::read_to_string(env_file)
-                .map_err(|e| anyhow::anyhow!("Failed to read env file '{}': {}", env_file.display(), e))?;
-            let vars = parse_env_file(&content)
-                .map_err(|e| anyhow::anyhow!("Failed to parse env file '{}': {}", env_file.display(), e))?;
+            let content = std::fs::read_to_string(env_file).map_err(|e| {
+                anyhow::anyhow!("Failed to read env file '{}': {}", env_file.display(), e)
+            })?;
+            let vars = parse_env_file(&content).map_err(|e| {
+                anyhow::anyhow!("Failed to parse env file '{}': {}", env_file.display(), e)
+            })?;
             builder = builder.explicit_vars(vars);
         }
 
@@ -500,7 +518,9 @@ impl RunCommand {
                 builder = builder.passthrough(&all_vars);
             }
         } else if !config.permissions.allow_env.is_empty() {
-            let all_vars: Vec<&str> = config.permissions.allow_env
+            let all_vars: Vec<&str> = config
+                .permissions
+                .allow_env
                 .iter()
                 .flat_map(|s| s.split(','))
                 .map(|s| s.trim())

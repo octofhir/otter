@@ -1,5 +1,5 @@
-use crate::bindings::*;
 use crate::JscResult;
+use crate::bindings::*;
 use std::ffi::CString;
 use std::ptr;
 
@@ -14,7 +14,14 @@ pub fn register_bootstrap(ctx: JSContextRef) -> JscResult<()> {
         let source_ref = JSStringCreateWithUTF8CString(source_cstr.as_ptr());
 
         let mut exception: JSValueRef = ptr::null_mut();
-        JSEvaluateScript(ctx, script_ref, ptr::null_mut(), source_ref, 1, &mut exception);
+        JSEvaluateScript(
+            ctx,
+            script_ref,
+            ptr::null_mut(),
+            source_ref,
+            1,
+            &mut exception,
+        );
 
         JSStringRelease(script_ref);
         JSStringRelease(source_ref);
@@ -26,4 +33,3 @@ pub fn register_bootstrap(ctx: JSContextRef) -> JscResult<()> {
 
     Ok(())
 }
-

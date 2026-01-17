@@ -95,6 +95,7 @@ pub use apis::console::{ConsoleLevel, set_console_handler};
 pub use apis::{NetPermissionChecker, clear_net_permission_checker, set_net_permission_checker};
 pub use apis::{register_all_apis, register_apis_with_config};
 pub use bootstrap::register_bootstrap;
+pub use commonjs::{register_commonjs_runtime, require_module, wrap_commonjs_module};
 pub use config::TypeScriptConfig;
 pub use context::JscContext;
 pub use engine::{Engine, EngineBuilder, EngineHandle, EngineStats, EngineStatsSnapshot};
@@ -105,7 +106,6 @@ pub use extension::{
 };
 pub use holt::{Holt, HoltError, HoltResult, Paw};
 pub use memory::{JscHeapStats, jsc_heap_stats};
-pub use commonjs::{register_commonjs_runtime, require_module, wrap_commonjs_module};
 pub use modules::{
     ModuleFormat, ModuleInfo, bundle_modules, bundle_modules_mixed, entry_execution,
     entry_execution_mixed, transform_module, wrap_module,
@@ -136,19 +136,18 @@ pub mod prelude {
     };
     pub use crate::apis::{register_all_apis, register_apis_with_config};
     pub use crate::bootstrap::register_bootstrap;
+    pub use crate::commonjs::{register_commonjs_runtime, require_module, wrap_commonjs_module};
     pub use crate::config::TypeScriptConfig;
     pub use crate::context::JscContext;
     pub use crate::engine::{
         Engine, EngineBuilder, EngineHandle, EngineStats, EngineStatsSnapshot,
     };
-    pub use crate::worker::HttpEvent;
     pub use crate::error::{JscError, JscResult};
     pub use crate::extension::{
         Extension, ExtensionState, OpContext, OpDecl, OpHandler, OpResult, op_async, op_sync,
         set_tokio_handle,
     };
     pub use crate::holt::{Holt, HoltError, HoltResult, Paw};
-    pub use crate::commonjs::{register_commonjs_runtime, require_module, wrap_commonjs_module};
     pub use crate::modules::{
         ModuleFormat, ModuleInfo, bundle_modules, bundle_modules_mixed, entry_execution,
         entry_execution_mixed, transform_module, wrap_module,
@@ -171,4 +170,5 @@ pub mod prelude {
     };
     pub use crate::types::{EMBEDDED_TYPES, get_embedded_type, list_embedded_types};
     pub use crate::value::JscValue;
+    pub use crate::worker::HttpEvent;
 }

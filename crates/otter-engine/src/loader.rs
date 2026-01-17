@@ -164,6 +164,14 @@ impl ModuleLoader {
             return self.resolve(mapped, referrer);
         }
 
+        // Otter built-in modules
+        if specifier.starts_with("otter:") {
+            return Ok(specifier.to_string());
+        }
+        if is_otter_builtin(specifier) {
+            return Ok(format!("otter:{}", specifier));
+        }
+
         // Node.js built-in modules
         if specifier.starts_with("node:") {
             return Ok(specifier.to_string());
@@ -220,6 +228,11 @@ impl ModuleLoader {
 
     /// Load module from URL
     async fn load_url(&self, url: &str) -> JscResult<ResolvedModule> {
+        // Otter built-in modules (e.g., "otter")
+        if let Some(builtin) = url.strip_prefix("otter:") {
+            return self.load_otter_builtin(builtin);
+        }
+
         if let Some(builtin) = url.strip_prefix("node:") {
             return self.load_node_builtin(builtin);
         }
@@ -320,6 +333,17 @@ impl ModuleLoader {
         })
     }
 
+    /// Load an Otter built-in module (e.g., "otter")
+    fn load_otter_builtin(&self, name: &str) -> JscResult<ResolvedModule> {
+        Ok(ResolvedModule {
+            specifier: format!("otter:{}", name),
+            url: format!("otter:{}", name),
+            source: String::new(),
+            source_type: SourceType::JavaScript,
+            module_type: ModuleType::ESM, // Otter builtins are exposed as ESM
+        })
+    }
+
     /// Get cache path for a URL
     fn get_cache_path(&self, url: &str) -> PathBuf {
         let hash = format!("{:x}", md5::compute(url));
@@ -369,21 +393,17 @@ impl ModuleLoader {
         &self.config
     }
 
-    /// Detect module type for a given file path
     pub fn detect_module_type(&self, path: &Path) -> ModuleType {
-        // 1. Check extension first - explicit extensions take priority
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             if let Some(module_type) = ModuleType::from_extension(Some(ext)) {
                 return module_type;
             }
 
-            // TypeScript files default to ESM (import/export is native TS syntax)
             if matches!(ext, "ts" | "tsx" | "mts") {
                 return ModuleType::ESM;
             }
         }
 
-        // 2. Check nearest package.json "type" field
         if let Some(pkg_type) = self.find_package_type(path) {
             if pkg_type == "module" {
                 return ModuleType::ESM;
@@ -392,8 +412,7 @@ impl ModuleLoader {
             }
         }
 
-        // 3. Default to CommonJS (Node.js behavior for .js files)
-        ModuleType::CommonJS
+        ModuleType::ESM
     }
 
     /// Find the nearest package.json and return its "type" field value
@@ -440,6 +459,11 @@ fn is_supported_node_builtin(specifier: &str) -> bool {
             | "test"
             | "util"
     )
+}
+
+/// Check if a specifier is an Otter built-in module
+fn is_otter_builtin(specifier: &str) -> bool {
+    matches!(specifier, "otter")
 }
 
 /// Simple glob matching for URL patterns
@@ -647,13 +671,12 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_module_type_default_commonjs() {
+    fn test_detect_module_type_default_esm() {
         let loader = ModuleLoader::new(LoaderConfig::default());
 
-        // .js without package.json defaults to CommonJS
         assert_eq!(
             loader.detect_module_type(Path::new("/nonexistent/path/file.js")),
-            ModuleType::CommonJS
+            ModuleType::ESM
         );
     }
 }

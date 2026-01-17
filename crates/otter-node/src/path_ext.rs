@@ -190,7 +190,11 @@ mod tests {
 
     #[test]
     fn test_path_join() {
-        let result = path_join(vec!["foo".to_string(), "bar".to_string(), "baz.txt".to_string()]);
+        let result = path_join(vec![
+            "foo".to_string(),
+            "bar".to_string(),
+            "baz.txt".to_string(),
+        ]);
         assert_eq!(result, "foo/bar/baz.txt");
     }
 
@@ -201,7 +205,10 @@ mod tests {
 
     #[test]
     fn test_path_basename() {
-        assert_eq!(path_basename("/foo/bar/baz.txt".to_string(), None), "baz.txt");
+        assert_eq!(
+            path_basename("/foo/bar/baz.txt".to_string(), None),
+            "baz.txt"
+        );
         assert_eq!(
             path_basename("/foo/bar/baz.txt".to_string(), Some(".txt".to_string())),
             "baz"

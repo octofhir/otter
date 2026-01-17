@@ -11,8 +11,8 @@
 //! Note: This module uses shared state (StreamManager) which doesn't fit the #[dive]
 //! pattern, so we use traditional op_sync with closures.
 
-use otter_runtime::extension::{op_sync, OpDecl};
 use otter_runtime::Extension;
+use otter_runtime::extension::{OpDecl, op_sync};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -62,11 +62,10 @@ pub fn extension() -> Extension {
     // readableRead(id) -> { value, done }
     let mgr_read = manager.clone();
     ops.push(op_sync("readableRead", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("readableRead requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("readableRead requires id")
+            })? as u32;
 
         match mgr_read.read(id) {
             Ok(Some(chunk)) => Ok(json!({
@@ -88,11 +87,10 @@ pub fn extension() -> Extension {
     // readableClose(id) -> null
     let mgr_close_readable = manager.clone();
     ops.push(op_sync("readableClose", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("readableClose requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("readableClose requires id")
+            })? as u32;
 
         mgr_close_readable
             .close_readable(id)
@@ -104,11 +102,10 @@ pub fn extension() -> Extension {
     // readableError(id, message) -> null
     let mgr_error_readable = manager.clone();
     ops.push(op_sync("readableError", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("readableError requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("readableError requires id")
+            })? as u32;
 
         let message = args
             .get(1)
@@ -126,11 +123,10 @@ pub fn extension() -> Extension {
     // readableLock(id) -> null
     let mgr_lock_readable = manager.clone();
     ops.push(op_sync("readableLock", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("readableLock requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("readableLock requires id")
+            })? as u32;
 
         mgr_lock_readable
             .lock_readable(id)
@@ -142,11 +138,10 @@ pub fn extension() -> Extension {
     // readableUnlock(id) -> null
     let mgr_unlock_readable = manager.clone();
     ops.push(op_sync("readableUnlock", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("readableUnlock requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("readableUnlock requires id")
+            })? as u32;
 
         mgr_unlock_readable
             .unlock_readable(id)
@@ -168,11 +163,10 @@ pub fn extension() -> Extension {
     // writableWrite(id, chunk) -> null
     let mgr_write = manager.clone();
     ops.push(op_sync("writableWrite", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("writableWrite requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("writableWrite requires id")
+            })? as u32;
 
         let chunk_value = args.get(1).cloned().unwrap_or(json!(null));
         let chunk = StreamChunk::from_json(chunk_value);
@@ -187,11 +181,10 @@ pub fn extension() -> Extension {
     // writableClose(id) -> null
     let mgr_close_writable = manager.clone();
     ops.push(op_sync("writableClose", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("writableClose requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("writableClose requires id")
+            })? as u32;
 
         mgr_close_writable
             .close_writable(id)
@@ -203,11 +196,10 @@ pub fn extension() -> Extension {
     // writableError(id, message) -> null
     let mgr_error_writable = manager.clone();
     ops.push(op_sync("writableError", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("writableError requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("writableError requires id")
+            })? as u32;
 
         let message = args
             .get(1)
@@ -225,11 +217,10 @@ pub fn extension() -> Extension {
     // writableLock(id) -> null
     let mgr_lock_writable = manager.clone();
     ops.push(op_sync("writableLock", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("writableLock requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("writableLock requires id")
+            })? as u32;
 
         mgr_lock_writable
             .lock_writable(id)
@@ -241,11 +232,10 @@ pub fn extension() -> Extension {
     // writableUnlock(id) -> null
     let mgr_unlock_writable = manager.clone();
     ops.push(op_sync("writableUnlock", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("writableUnlock requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("writableUnlock requires id")
+            })? as u32;
 
         mgr_unlock_writable
             .unlock_writable(id)

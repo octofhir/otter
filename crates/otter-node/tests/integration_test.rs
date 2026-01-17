@@ -9,8 +9,8 @@
 use otter_engine::CapabilitiesBuilder;
 use otter_node::ext;
 use otter_runtime::{Engine, transform_module, wrap_module};
-use tempfile::TempDir;
 use std::collections::HashMap;
+use tempfile::TempDir;
 
 /// Test path module via JavaScript execution.
 mod path_tests {
@@ -46,7 +46,10 @@ mod path_tests {
 
         let handle = engine.handle();
 
-        let result = handle.eval(r#"path_dirname("/foo/bar/baz.txt")"#).await.unwrap();
+        let result = handle
+            .eval(r#"path_dirname("/foo/bar/baz.txt")"#)
+            .await
+            .unwrap();
         assert_eq!(result, serde_json::json!("/foo/bar"));
 
         let result = handle.eval(r#"path_dirname("baz.txt")"#).await.unwrap();
@@ -109,7 +112,10 @@ mod path_tests {
 
         let handle = engine.handle();
 
-        let result = handle.eval(r#"path_is_absolute("/foo/bar")"#).await.unwrap();
+        let result = handle
+            .eval(r#"path_is_absolute("/foo/bar")"#)
+            .await
+            .unwrap();
         assert_eq!(result, serde_json::json!(true));
 
         let result = handle.eval(r#"path_is_absolute("foo/bar")"#).await.unwrap();
@@ -763,7 +769,8 @@ mod node_builtin_import_tests {
 
         let transformed = transform_module(source, "file:///test/main.js", &deps);
         let wrapped = wrap_module("file:///test/main.js", &transformed);
-        let bundle = format!("globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{wrapped}");
+        let bundle =
+            format!("globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{wrapped}");
 
         handle.eval(&bundle).await.unwrap();
         let result = handle
@@ -806,7 +813,8 @@ mod node_builtin_import_tests {
 
         let transformed = transform_module(source, "file:///test/main.js", &deps);
         let wrapped = wrap_module("file:///test/main.js", &transformed);
-        let bundle = format!("globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{wrapped}");
+        let bundle =
+            format!("globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{wrapped}");
 
         handle.eval(&bundle).await.unwrap();
         let result = handle
@@ -838,7 +846,8 @@ mod node_builtin_import_tests {
 
         let transformed = transform_module(source, "file:///test/main.js", &deps);
         let wrapped = wrap_module("file:///test/main.js", &transformed);
-        let bundle = format!("globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{wrapped}");
+        let bundle =
+            format!("globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{wrapped}");
 
         handle.eval(&bundle).await.unwrap();
         let result = handle
@@ -873,7 +882,8 @@ mod node_builtin_import_tests {
 
         let transformed = transform_module(source, "file:///test/main.js", &deps);
         let wrapped = wrap_module("file:///test/main.js", &transformed);
-        let bundle = format!("globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{wrapped}");
+        let bundle =
+            format!("globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{wrapped}");
 
         handle.eval(&bundle).await.unwrap();
         let result = handle
@@ -909,7 +919,8 @@ mod node_builtin_import_tests {
 
         let transformed = transform_module(source, "file:///test/main.js", &deps);
         let wrapped = wrap_module("file:///test/main.js", &transformed);
-        let bundle = format!("globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{wrapped}");
+        let bundle =
+            format!("globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{wrapped}");
 
         handle.eval(&bundle).await.unwrap();
         let result = handle

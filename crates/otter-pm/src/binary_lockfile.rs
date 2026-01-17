@@ -119,24 +119,56 @@ impl BinaryLockfile {
 
         for i in 0..pkg_count {
             let entry_offset = entries_start + i * std::mem::size_of::<PackageEntry>();
-            let entry_bytes = &data[entry_offset..entry_offset + std::mem::size_of::<PackageEntry>()];
+            let entry_bytes =
+                &data[entry_offset..entry_offset + std::mem::size_of::<PackageEntry>()];
 
             // Parse entry fields manually (packed struct)
-            let name_offset = u32::from_le_bytes([entry_bytes[0], entry_bytes[1], entry_bytes[2], entry_bytes[3]]) as usize;
+            let name_offset = u32::from_le_bytes([
+                entry_bytes[0],
+                entry_bytes[1],
+                entry_bytes[2],
+                entry_bytes[3],
+            ]) as usize;
             let name_len = u16::from_le_bytes([entry_bytes[4], entry_bytes[5]]) as usize;
-            let version_offset = u32::from_le_bytes([entry_bytes[6], entry_bytes[7], entry_bytes[8], entry_bytes[9]]) as usize;
+            let version_offset = u32::from_le_bytes([
+                entry_bytes[6],
+                entry_bytes[7],
+                entry_bytes[8],
+                entry_bytes[9],
+            ]) as usize;
             let version_len = u16::from_le_bytes([entry_bytes[10], entry_bytes[11]]) as usize;
-            let resolved_offset = u32::from_le_bytes([entry_bytes[12], entry_bytes[13], entry_bytes[14], entry_bytes[15]]) as usize;
+            let resolved_offset = u32::from_le_bytes([
+                entry_bytes[12],
+                entry_bytes[13],
+                entry_bytes[14],
+                entry_bytes[15],
+            ]) as usize;
             let resolved_len = u16::from_le_bytes([entry_bytes[16], entry_bytes[17]]) as usize;
-            let integrity_offset = u32::from_le_bytes([entry_bytes[18], entry_bytes[19], entry_bytes[20], entry_bytes[21]]) as usize;
+            let integrity_offset = u32::from_le_bytes([
+                entry_bytes[18],
+                entry_bytes[19],
+                entry_bytes[20],
+                entry_bytes[21],
+            ]) as usize;
             let integrity_len = u16::from_le_bytes([entry_bytes[22], entry_bytes[23]]) as usize;
 
             // Extract strings
-            let name = String::from_utf8_lossy(&strings_buf[name_offset..name_offset + name_len]).to_string();
-            let version = String::from_utf8_lossy(&strings_buf[version_offset..version_offset + version_len]).to_string();
-            let resolved = String::from_utf8_lossy(&strings_buf[resolved_offset..resolved_offset + resolved_len]).to_string();
+            let name = String::from_utf8_lossy(&strings_buf[name_offset..name_offset + name_len])
+                .to_string();
+            let version =
+                String::from_utf8_lossy(&strings_buf[version_offset..version_offset + version_len])
+                    .to_string();
+            let resolved = String::from_utf8_lossy(
+                &strings_buf[resolved_offset..resolved_offset + resolved_len],
+            )
+            .to_string();
             let integrity = if integrity_len > 0 {
-                Some(String::from_utf8_lossy(&strings_buf[integrity_offset..integrity_offset + integrity_len]).to_string())
+                Some(
+                    String::from_utf8_lossy(
+                        &strings_buf[integrity_offset..integrity_offset + integrity_len],
+                    )
+                    .to_string(),
+                )
             } else {
                 None
             };

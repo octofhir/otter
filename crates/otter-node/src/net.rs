@@ -32,8 +32,8 @@ use otter_macros::dive;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -84,18 +84,11 @@ pub enum NetEvent {
         remote_port: u16,
     },
     /// Server closed
-    ServerClose {
-        server_id: Paw,
-    },
+    ServerClose { server_id: Paw },
     /// Server error
-    ServerError {
-        server_id: Paw,
-        error: String,
-    },
+    ServerError { server_id: Paw, error: String },
     /// Socket connected (for client sockets)
-    SocketConnect {
-        socket_id: Paw,
-    },
+    SocketConnect { socket_id: Paw },
     /// Data received on socket
     SocketData {
         socket_id: Paw,
@@ -103,29 +96,19 @@ pub enum NetEvent {
         data: Vec<u8>,
     },
     /// Remote end closed write side
-    SocketEnd {
-        socket_id: Paw,
-    },
+    SocketEnd { socket_id: Paw },
     /// Socket fully closed
-    SocketClose {
-        socket_id: Paw,
-        had_error: bool,
-    },
+    SocketClose { socket_id: Paw, had_error: bool },
     /// Socket error
-    SocketError {
-        socket_id: Paw,
-        error: String,
-    },
+    SocketError { socket_id: Paw, error: String },
     /// Socket write buffer drained
-    SocketDrain {
-        socket_id: Paw,
-    },
+    SocketDrain { socket_id: Paw },
 }
 
 /// Base64 serialization for binary data
 mod base64_bytes {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    use serde::{Serializer, Serialize};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use serde::{Serialize, Serializer};
 
     pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -242,7 +225,16 @@ impl NetManager {
         let active_count = self.active_count.clone();
 
         tokio::spawn(async move {
-            Self::accept_loop(server_id, listener, shutdown_rx, event_tx, sockets, next_id, active_count).await;
+            Self::accept_loop(
+                server_id,
+                listener,
+                shutdown_rx,
+                event_tx,
+                sockets,
+                next_id,
+                active_count,
+            )
+            .await;
         });
 
         Ok(server_id)
@@ -374,7 +366,10 @@ impl NetManager {
 
         // Cleanup
         sockets.remove(&socket_id);
-        let _ = event_tx.send(NetEvent::SocketClose { socket_id, had_error });
+        let _ = event_tx.send(NetEvent::SocketClose {
+            socket_id,
+            had_error,
+        });
     }
 
     /// Connect to a remote server
@@ -414,11 +409,15 @@ impl NetManager {
 
     /// Write data to a socket
     pub fn socket_write(&self, socket_id: Paw, data: Vec<u8>) -> NetResult<()> {
-        let socket = self.sockets.get(&socket_id)
+        let socket = self
+            .sockets
+            .get(&socket_id)
             .ok_or(NetError::NotFound(socket_id))?;
 
         let (tx, _rx) = oneshot::channel();
-        socket.command_tx.send(SocketCommand::Write(data, tx))
+        socket
+            .command_tx
+            .send(SocketCommand::Write(data, tx))
             .map_err(|_| NetError::SocketClosed)?;
 
         // Note: In async context, we'd await _rx. For sync dive, we fire-and-forget.
@@ -428,17 +427,23 @@ impl NetManager {
 
     /// End a socket (half-close write side)
     pub fn socket_end(&self, socket_id: Paw) -> NetResult<()> {
-        let socket = self.sockets.get(&socket_id)
+        let socket = self
+            .sockets
+            .get(&socket_id)
             .ok_or(NetError::NotFound(socket_id))?;
 
-        socket.command_tx.send(SocketCommand::End)
+        socket
+            .command_tx
+            .send(SocketCommand::End)
             .map_err(|_| NetError::SocketClosed)?;
         Ok(())
     }
 
     /// Destroy a socket immediately
     pub fn socket_destroy(&self, socket_id: Paw) -> NetResult<()> {
-        let socket = self.sockets.get(&socket_id)
+        let socket = self
+            .sockets
+            .get(&socket_id)
             .ok_or(NetError::NotFound(socket_id))?;
 
         let _ = socket.command_tx.send(SocketCommand::Destroy);
@@ -448,7 +453,9 @@ impl NetManager {
 
     /// Close a server
     pub fn server_close(&self, server_id: Paw) -> NetResult<()> {
-        let mut server = self.servers.get_mut(&server_id)
+        let mut server = self
+            .servers
+            .get_mut(&server_id)
             .ok_or(NetError::NotFound(server_id))?;
 
         if let Some(shutdown_tx) = Arc::get_mut(&mut server).and_then(|s| s.shutdown_tx.take()) {
@@ -461,7 +468,9 @@ impl NetManager {
 
     /// Get socket info
     pub fn socket_info(&self, socket_id: Paw) -> NetResult<SocketInfo> {
-        let socket = self.sockets.get(&socket_id)
+        let socket = self
+            .sockets
+            .get(&socket_id)
             .ok_or(NetError::NotFound(socket_id))?;
 
         Ok(SocketInfo {
@@ -476,7 +485,9 @@ impl NetManager {
 
     /// Get server info
     pub fn server_info(&self, server_id: Paw) -> NetResult<ServerInfo> {
-        let server = self.servers.get(&server_id)
+        let server = self
+            .servers
+            .get(&server_id)
             .ok_or(NetError::NotFound(server_id))?;
 
         Ok(ServerInfo {
@@ -543,9 +554,9 @@ pub fn init_net_manager(event_tx: mpsc::UnboundedSender<NetEvent>) -> ActiveNetS
 /// Get the net manager for this thread
 fn get_manager() -> NetResult<Arc<NetManager>> {
     NET_MANAGER.with(|m| {
-        m.borrow().clone().ok_or_else(|| {
-            NetError::Channel("Net manager not initialized".to_string())
-        })
+        m.borrow()
+            .clone()
+            .ok_or_else(|| NetError::Channel("Net manager not initialized".to_string()))
     })
 }
 
@@ -704,7 +715,15 @@ mod tests {
         };
 
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"type\":\"listening\""), "Missing type field, got: {}", json);
-        assert!(json.contains("\"server_id\":1") || json.contains("\"serverId\":1"), "Missing server_id, got: {}", json);
+        assert!(
+            json.contains("\"type\":\"listening\""),
+            "Missing type field, got: {}",
+            json
+        );
+        assert!(
+            json.contains("\"server_id\":1") || json.contains("\"serverId\":1"),
+            "Missing server_id, got: {}",
+            json
+        );
     }
 }

@@ -1,7 +1,7 @@
 //! npm registry client
 
 use crate::manifest_cache::{CachedManifest, ManifestCache};
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::collections::HashMap;
@@ -203,14 +203,12 @@ impl NpmRegistry {
 
         for attempt in 0..MAX_RETRIES {
             match self.client.get(url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    match resp.bytes().await {
-                        Ok(bytes) => return Ok(bytes.to_vec()),
-                        Err(e) => {
-                            last_error = Some(RegistryError::Network(e.to_string()));
-                        }
+                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                    Ok(bytes) => return Ok(bytes.to_vec()),
+                    Err(e) => {
+                        last_error = Some(RegistryError::Network(e.to_string()));
                     }
-                }
+                },
                 Ok(resp) => {
                     last_error = Some(RegistryError::Http(resp.status().as_u16()));
                 }
@@ -265,10 +263,7 @@ impl NpmRegistry {
         let mut last_error = None;
 
         for attempt in 0..MAX_RETRIES {
-            let mut request = self
-                .client
-                .get(url)
-                .header("Accept", "application/json");
+            let mut request = self.client.get(url).header("Accept", "application/json");
 
             if let Some(etag) = etag {
                 request = request.header("If-None-Match", etag);
@@ -304,11 +299,7 @@ impl NpmRegistry {
     }
 
     /// Get version info for a specific package version (from cache)
-    pub async fn get_version_info(
-        &self,
-        name: &str,
-        version: &str,
-    ) -> Option<VersionInfo> {
+    pub async fn get_version_info(&self, name: &str, version: &str) -> Option<VersionInfo> {
         let cache = self.cache.read().await;
         cache
             .get(name)

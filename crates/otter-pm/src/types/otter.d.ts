@@ -104,6 +104,41 @@ declare global {
         forEach(callback: (value: string, name: string, parent: Headers) => void): void;
     }
 
+    interface BlobPropertyBag {
+        type?: string;
+        endings?: "transparent" | "native";
+    }
+
+    /**
+     * A file-like object of immutable, raw data.
+     */
+    class Blob {
+        constructor(blobParts?: BlobPart[], options?: BlobPropertyBag);
+        readonly size: number;
+        readonly type: string;
+        arrayBuffer(): Promise<ArrayBuffer>;
+        slice(start?: number, end?: number, contentType?: string): Blob;
+        stream(): ReadableStream<Uint8Array>;
+        text(): Promise<string>;
+    }
+
+    type BlobPart = Blob | ArrayBuffer | ArrayBufferView | string;
+
+    /**
+     * Provides a way to easily construct a set of key/value pairs representing form fields.
+     */
+    interface FormData {
+        append(name: string, value: string | Blob, fileName?: string): void;
+        delete(name: string): void;
+        get(name: string): FormDataEntryValue | null;
+        getAll(name: string): FormDataEntryValue[];
+        has(name: string): boolean;
+        set(name: string, value: string | Blob, fileName?: string): void;
+        forEach(callback: (value: FormDataEntryValue, key: string, parent: FormData) => void): void;
+    }
+
+    type FormDataEntryValue = string | Blob;
+
     /**
      * Fetch a resource from the network.
      * @param input URL or Request object

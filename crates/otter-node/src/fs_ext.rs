@@ -11,13 +11,13 @@
 //! Note: This module requires capabilities for security and doesn't fit the #[dive]
 //! pattern, so we use traditional op_sync/op_async with closures.
 
-use otter_runtime::extension::{op_async, op_sync, OpDecl};
 use otter_runtime::Extension;
+use otter_runtime::extension::{OpDecl, op_async, op_sync};
 use serde_json::json;
 use std::sync::Arc;
 
-use crate::fs;
 use crate::Capabilities;
+use crate::fs;
 
 /// Create the fs extension.
 ///

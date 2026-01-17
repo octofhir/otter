@@ -30,6 +30,16 @@ fn node_builtin_expr(resolved: &str) -> Option<String> {
     Some(format!("globalThis.__otter_node_builtins[\"{}\"]", name))
 }
 
+fn otter_builtin_expr(resolved: &str) -> Option<String> {
+    let name = resolved.strip_prefix("otter:")?;
+    Some(format!("globalThis.__otter_node_builtins[\"{}\"]", name))
+}
+
+/// Check if resolved URL is any built-in (node: or otter:) and return the expr
+fn builtin_expr(resolved: &str) -> Option<String> {
+    node_builtin_expr(resolved).or_else(|| otter_builtin_expr(resolved))
+}
+
 /// Transform import/export statements in module source.
 ///
 /// Converts ESM syntax to use the `__otter_modules` registry.
@@ -78,7 +88,7 @@ pub fn transform_module(
         let named = &caps[3];
         let specifier = &caps[4];
         let resolved = resolve(specifier);
-        if let Some(expr) = node_builtin_expr(&resolved) {
+        if let Some(expr) = builtin_expr(&resolved) {
             return format!(
                 "{}const {} = {};\n{}const {{{}}} = {};",
                 indent, default_name, expr, indent, named, expr
@@ -97,7 +107,7 @@ pub fn transform_module(
             let name = &caps[2];
             let specifier = &caps[3];
             let resolved = resolve(specifier);
-            if let Some(expr) = node_builtin_expr(&resolved) {
+            if let Some(expr) = builtin_expr(&resolved) {
                 return format!("{}const {} = {};", indent, name, expr);
             }
             format!(
@@ -114,7 +124,7 @@ pub fn transform_module(
             let names = &caps[2];
             let specifier = &caps[3];
             let resolved = resolve(specifier);
-            if let Some(expr) = node_builtin_expr(&resolved) {
+            if let Some(expr) = builtin_expr(&resolved) {
                 return format!("{}const {{{}}} = {};", indent, names, expr);
             }
             format!(
@@ -131,7 +141,7 @@ pub fn transform_module(
             let name = &caps[2];
             let specifier = &caps[3];
             let resolved = resolve(specifier);
-            if let Some(expr) = node_builtin_expr(&resolved) {
+            if let Some(expr) = builtin_expr(&resolved) {
                 return format!("{}const {} = {};", indent, name, expr);
             }
             format!(
@@ -147,7 +157,7 @@ pub fn transform_module(
             let indent = &caps[1];
             let specifier = &caps[2];
             let resolved = resolve(specifier);
-            if let Some(expr) = node_builtin_expr(&resolved) {
+            if let Some(expr) = builtin_expr(&resolved) {
                 return format!("{}{};", indent, expr);
             }
             format!("{}__otter_modules[\"{}\"];", indent, resolved)
@@ -162,7 +172,7 @@ pub fn transform_module(
         .replace_all(&result, |caps: &Captures| {
             let specifier = &caps[1];
             let resolved = resolve(specifier);
-            if let Some(expr) = node_builtin_expr(&resolved) {
+            if let Some(expr) = builtin_expr(&resolved) {
                 return format!("Promise.resolve({})", expr);
             }
             format!("Promise.resolve(__otter_modules[\"{}\"])", resolved)
@@ -240,7 +250,15 @@ pub fn transform_module(
     result = export_named_re
         .replace_all(&result, |caps: &Captures| {
             let indent = &caps[1];
-            let names: Vec<&str> = caps[2].split(',').map(|s| s.trim()).collect();
+            let names: Vec<&str> = caps[2]
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty()) // Filter out empty names (handles `export { }`)
+                .collect();
+            if names.is_empty() {
+                // Empty export (e.g., `export { }`) - just remove it
+                return String::new();
+            }
             names
                 .iter()
                 .map(|name| {
@@ -268,7 +286,7 @@ pub fn transform_module(
             let names: Vec<&str> = caps[2].split(',').map(|s| s.trim()).collect();
             let specifier = &caps[3];
             let resolved = resolve(specifier);
-            let module_expr = node_builtin_expr(&resolved)
+            let module_expr = builtin_expr(&resolved)
                 .unwrap_or_else(|| format!("__otter_modules[\"{}\"]", resolved));
             names
                 .iter()
@@ -299,7 +317,7 @@ pub fn transform_module(
             let indent = &caps[1];
             let specifier = &caps[2];
             let resolved = resolve(specifier);
-            let module_expr = node_builtin_expr(&resolved)
+            let module_expr = builtin_expr(&resolved)
                 .unwrap_or_else(|| format!("__otter_modules[\"{}\"]", resolved));
             format!(
                 "{}Object.assign(__otter_exports, {} || {{}});",
@@ -322,7 +340,7 @@ pub fn transform_module(
     result
 }
 
-/// Wrap a module in a factory function.
+/// Wrap a module in a sync factory function (for tests and simple cases).
 pub fn wrap_module(url: &str, transformed_source: &str) -> String {
     format!(
         r#"__otter_modules["{}"] = (function() {{
@@ -335,22 +353,42 @@ pub fn wrap_module(url: &str, transformed_source: &str) -> String {
     )
 }
 
+/// Wrap a module in an async factory function.
+/// Uses async IIFE to support top-level await in modules.
+fn wrap_module_async(url: &str, transformed_source: &str) -> String {
+    format!(
+        r#"__otter_modules["{}"] = await (async function() {{
+    const __otter_exports = {{}};
+    {}
+    return __otter_exports;
+}})();
+"#,
+        url, transformed_source
+    )
+}
+
 /// Bundle multiple modules into a single executable script.
 ///
 /// Modules must be provided in topological order (dependencies first).
+/// The entire bundle is wrapped in an async IIFE to support top-level await.
 pub fn bundle_modules(modules: Vec<(&str, &str, &HashMap<String, String>)>) -> String {
     let mut result = String::new();
+
+    // Wrap everything in an async IIFE to support top-level await
+    result.push_str("(async () => {\n");
 
     // Initialize the module registry
     result.push_str("globalThis.__otter_modules = globalThis.__otter_modules || {};\n\n");
 
-    // Add each module in order
+    // Add each module in order (await ensures sequential loading)
     for (url, source, deps) in modules {
         let transformed = transform_module(source, url, deps);
-        let wrapped = wrap_module(url, &transformed);
+        let wrapped = wrap_module_async(url, &transformed);
         result.push_str(&wrapped);
         result.push('\n');
     }
+
+    result.push_str("})();\n");
 
     result
 }
@@ -378,8 +416,12 @@ pub struct ModuleInfo<'a> {
 ///
 /// Modules must be provided in topological order (dependencies first).
 /// This function handles interoperability between ESM and CommonJS modules.
+/// The entire bundle is wrapped in an async IIFE to support top-level await.
 pub fn bundle_modules_mixed(modules: Vec<ModuleInfo<'_>>) -> String {
     let mut result = String::new();
+
+    // Wrap everything in an async IIFE to support top-level await
+    result.push_str("(async () => {\n");
 
     // Initialize both module registries
     result.push_str("globalThis.__otter_modules = globalThis.__otter_modules || {};\n");
@@ -390,7 +432,7 @@ pub fn bundle_modules_mixed(modules: Vec<ModuleInfo<'_>>) -> String {
         match module.format {
             ModuleFormat::ESM => {
                 let transformed = transform_module(module.source, module.url, module.dependencies);
-                let wrapped = wrap_module(module.url, &transformed);
+                let wrapped = wrap_module_async(module.url, &transformed);
                 result.push_str(&wrapped);
             }
             ModuleFormat::CommonJS => {
@@ -414,6 +456,8 @@ pub fn bundle_modules_mixed(modules: Vec<ModuleInfo<'_>>) -> String {
         }
         result.push('\n');
     }
+
+    result.push_str("})();\n");
 
     result
 }
@@ -730,9 +774,9 @@ mod tests {
         // ESM interop wrapper
         assert!(bundle.contains("__toESM(__otter_cjs_modules[\"file:///project/lib.cjs\"]())"));
         // ESM module using the CJS import
-        assert!(bundle.contains(
-            r#"const lib = __otter_modules["file:///project/lib.cjs"].default;"#
-        ));
+        assert!(
+            bundle.contains(r#"const lib = __otter_modules["file:///project/lib.cjs"].default;"#)
+        );
     }
 
     #[test]

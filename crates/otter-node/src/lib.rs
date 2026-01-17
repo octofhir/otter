@@ -29,12 +29,17 @@
 //! assert_eq!(buf.to_string("base64", 0, buf.len()), "aGVsbG8=");
 //! ```
 
+pub mod assert_ext;
 pub mod buffer;
 pub mod buffer_ext;
 pub mod child_process;
 pub mod child_process_ext;
 pub mod crypto;
 pub mod crypto_ext;
+pub mod dgram;
+pub mod dgram_ext;
+pub mod dns;
+pub mod dns_ext;
 pub mod events;
 pub mod events_ext;
 pub mod ext;
@@ -54,6 +59,7 @@ pub mod path_ext;
 pub mod process;
 pub mod process_ext;
 pub mod process_ipc_ext;
+pub mod querystring_ext;
 pub mod stream;
 pub mod streams_ext;
 pub mod test;
@@ -66,6 +72,8 @@ pub mod websocket;
 pub mod websocket_ext;
 pub mod worker;
 pub mod worker_ext;
+pub mod zlib;
+pub mod zlib_ext;
 
 pub use buffer::{Buffer, BufferError};
 pub use child_process::{
@@ -73,12 +81,14 @@ pub use child_process::{
     StdioConfig,
 };
 pub use crypto::{CryptoError, Hash, HashAlgorithm, Hmac};
-pub use events::{event_emitter_js, EventEmitter, Listener, DEFAULT_MAX_LISTENERS};
-pub use ipc::{has_ipc, IpcChannel, IpcMessage, IPC_FD_ENV};
-pub use os::{os_module_js, CpuInfo, CpuTimes, NetworkInterface, OsType, UserInfo};
-pub use net::{init_net_manager, ActiveNetServerCount, NetError, NetEvent, NetManager};
-pub use http_server::{ActiveServerCount, HttpEvent, HttpServer, HttpServerError, HttpServerManager, TlsConfig};
+pub use events::{DEFAULT_MAX_LISTENERS, EventEmitter, Listener, event_emitter_js};
 pub use fs::{FsError, ReadResult, Stats};
+pub use http_server::{
+    ActiveServerCount, HttpEvent, HttpServer, HttpServerError, HttpServerManager, TlsConfig,
+};
+pub use ipc::{IPC_FD_ENV, IpcChannel, IpcMessage, has_ipc};
+pub use net::{ActiveNetServerCount, NetError, NetEvent, NetManager, init_net_manager};
+pub use os::{CpuInfo, CpuTimes, NetworkInterface, OsType, UserInfo, os_module_js};
 pub use path::ParsedPath;
 pub use process::ProcessInfo;
 pub use stream::{StreamChunk, StreamError, StreamManager, StreamState};

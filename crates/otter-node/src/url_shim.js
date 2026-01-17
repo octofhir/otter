@@ -1,7 +1,8 @@
 /**
- * URL and URLSearchParams Web API implementation for Otter.
+ * URL and URLSearchParams Web API + Node.js url module implementation for Otter.
  *
- * WHATWG URL Standard compliant implementation using native Rust ops.
+ * WHATWG URL Standard compliant implementation using native Rust ops,
+ * plus Node.js legacy url.parse/format/resolve APIs.
  */
 (function (global) {
   "use strict";
@@ -403,7 +404,407 @@
     }
   }
 
+  // ==========================================================================
+  // Node.js Legacy URL API (url.parse, url.format, url.resolve)
+  // ==========================================================================
+
+  /**
+   * Url class - the result of url.parse() (legacy API).
+   * Matches Node.js url.Url structure.
+   */
+  class Url {
+    constructor() {
+      this.protocol = null;
+      this.slashes = null;
+      this.auth = null;
+      this.host = null;
+      this.port = null;
+      this.hostname = null;
+      this.hash = null;
+      this.search = null;
+      this.query = null;
+      this.pathname = null;
+      this.path = null;
+      this.href = null;
+    }
+  }
+
+  /**
+   * Parse a URL string into an object (legacy Node.js API).
+   *
+   * @param {string} urlString - The URL string to parse
+   * @param {boolean} [parseQueryString=false] - If true, parse query string into object
+   * @param {boolean} [slashesDenoteHost=false] - If true, treat //foo as host
+   * @returns {Url} Parsed URL object
+   */
+  function parse(urlString, parseQueryString = false, slashesDenoteHost = false) {
+    const result = new Url();
+
+    if (typeof urlString !== "string") {
+      urlString = String(urlString);
+    }
+
+    // Trim whitespace
+    urlString = urlString.trim();
+    result.href = urlString;
+
+    // Handle protocol-relative URLs
+    let rest = urlString;
+    let proto = null;
+
+    // Extract protocol
+    const protoMatch = rest.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):(.*)$/);
+    if (protoMatch) {
+      proto = protoMatch[1].toLowerCase();
+      result.protocol = proto + ":";
+      rest = protoMatch[2];
+    }
+
+    // Check for slashes
+    let slashes = false;
+    if (rest.startsWith("//")) {
+      slashes = true;
+      rest = rest.slice(2);
+      result.slashes = true;
+    } else if (slashesDenoteHost && !proto) {
+      // For protocol-relative URLs like //example.com
+      slashes = true;
+      result.slashes = true;
+    }
+
+    // If we have slashes, parse host
+    if (slashes || (proto && rest && !rest.startsWith("/"))) {
+      // Extract auth@host:port
+      let hostEnd = rest.length;
+
+      // Find where host ends (at /, ?, or #)
+      for (let i = 0; i < rest.length; i++) {
+        const c = rest[i];
+        if (c === "/" || c === "?" || c === "#") {
+          hostEnd = i;
+          break;
+        }
+      }
+
+      let hostPart = rest.slice(0, hostEnd);
+      rest = rest.slice(hostEnd);
+
+      // Parse auth
+      const atIndex = hostPart.lastIndexOf("@");
+      if (atIndex !== -1) {
+        result.auth = decodeURIComponent(hostPart.slice(0, atIndex));
+        hostPart = hostPart.slice(atIndex + 1);
+      }
+
+      // Parse host and port
+      result.host = hostPart;
+
+      // Handle IPv6
+      if (hostPart.startsWith("[")) {
+        const bracketEnd = hostPart.indexOf("]");
+        if (bracketEnd !== -1) {
+          result.hostname = hostPart.slice(0, bracketEnd + 1);
+          const afterBracket = hostPart.slice(bracketEnd + 1);
+          if (afterBracket.startsWith(":")) {
+            result.port = afterBracket.slice(1);
+          }
+        }
+      } else {
+        const colonIndex = hostPart.lastIndexOf(":");
+        if (colonIndex !== -1) {
+          result.hostname = hostPart.slice(0, colonIndex);
+          result.port = hostPart.slice(colonIndex + 1);
+        } else {
+          result.hostname = hostPart;
+        }
+      }
+
+      // Lowercase hostname
+      if (result.hostname) {
+        result.hostname = result.hostname.toLowerCase();
+      }
+    }
+
+    // Parse hash
+    const hashIndex = rest.indexOf("#");
+    if (hashIndex !== -1) {
+      result.hash = rest.slice(hashIndex);
+      rest = rest.slice(0, hashIndex);
+    }
+
+    // Parse search/query
+    const searchIndex = rest.indexOf("?");
+    if (searchIndex !== -1) {
+      result.search = rest.slice(searchIndex);
+      rest = rest.slice(0, searchIndex);
+
+      if (parseQueryString) {
+        // Parse query string into object
+        const queryStr = result.search.slice(1);
+        const query = {};
+        for (const pair of queryStr.split("&")) {
+          if (!pair) continue;
+          const eqIndex = pair.indexOf("=");
+          let key, value;
+          if (eqIndex === -1) {
+            key = decodeURIComponent(pair);
+            value = "";
+          } else {
+            key = decodeURIComponent(pair.slice(0, eqIndex));
+            value = decodeURIComponent(pair.slice(eqIndex + 1));
+          }
+          if (Object.prototype.hasOwnProperty.call(query, key)) {
+            if (Array.isArray(query[key])) {
+              query[key].push(value);
+            } else {
+              query[key] = [query[key], value];
+            }
+          } else {
+            query[key] = value;
+          }
+        }
+        result.query = query;
+      } else {
+        result.query = result.search.slice(1);
+      }
+    }
+
+    // Pathname
+    result.pathname = rest || null;
+
+    // Path = pathname + search
+    if (result.pathname || result.search) {
+      result.path = (result.pathname || "") + (result.search || "");
+    }
+
+    return result;
+  }
+
+  /**
+   * Format a URL object into a string (legacy Node.js API).
+   *
+   * @param {Url|URL|Object} urlObject - URL object to format
+   * @returns {string} Formatted URL string
+   */
+  function format(urlObject) {
+    // Handle WHATWG URL
+    if (urlObject instanceof URL) {
+      return urlObject.href;
+    }
+
+    let result = "";
+
+    // Protocol
+    if (urlObject.protocol) {
+      result += urlObject.protocol;
+      if (!urlObject.protocol.endsWith(":")) {
+        result += ":";
+      }
+    }
+
+    // Slashes
+    if (urlObject.slashes || urlObject.protocol === "http:" || urlObject.protocol === "https:") {
+      result += "//";
+    }
+
+    // Auth
+    if (urlObject.auth) {
+      result += encodeURIComponent(urlObject.auth) + "@";
+    }
+
+    // Host/hostname
+    if (urlObject.host) {
+      result += urlObject.host;
+    } else if (urlObject.hostname) {
+      result += urlObject.hostname;
+      if (urlObject.port) {
+        result += ":" + urlObject.port;
+      }
+    }
+
+    // Pathname
+    if (urlObject.pathname) {
+      result += urlObject.pathname;
+    }
+
+    // Search/query
+    if (urlObject.search) {
+      result += urlObject.search;
+    } else if (urlObject.query) {
+      if (typeof urlObject.query === "object") {
+        const pairs = [];
+        for (const [key, value] of Object.entries(urlObject.query)) {
+          if (Array.isArray(value)) {
+            for (const v of value) {
+              pairs.push(encodeURIComponent(key) + "=" + encodeURIComponent(v));
+            }
+          } else if (value !== undefined && value !== null) {
+            pairs.push(encodeURIComponent(key) + "=" + encodeURIComponent(value));
+          }
+        }
+        if (pairs.length > 0) {
+          result += "?" + pairs.join("&");
+        }
+      } else if (urlObject.query) {
+        result += "?" + urlObject.query;
+      }
+    }
+
+    // Hash
+    if (urlObject.hash) {
+      result += urlObject.hash;
+    }
+
+    return result;
+  }
+
+  /**
+   * Resolve a target URL relative to a base URL (legacy Node.js API).
+   *
+   * @param {string} from - Base URL
+   * @param {string} to - Target URL (relative or absolute)
+   * @returns {string} Resolved URL
+   */
+  function resolve(from, to) {
+    // Use WHATWG URL for resolution
+    try {
+      return new URL(to, from).href;
+    } catch {
+      // Fallback for invalid URLs
+      return to;
+    }
+  }
+
+  // ==========================================================================
+  // File URL utilities
+  // ==========================================================================
+
+  /**
+   * Convert a file:// URL to a filesystem path.
+   *
+   * @param {string|URL} url - file:// URL
+   * @returns {string} Filesystem path
+   */
+  function fileURLToPath(url) {
+    if (typeof url === "string") {
+      url = new URL(url);
+    }
+
+    if (url.protocol !== "file:") {
+      throw new TypeError("The URL must be of scheme file");
+    }
+
+    // Get pathname and decode
+    let pathname = decodeURIComponent(url.pathname);
+
+    // Handle Windows paths (e.g., file:///C:/path)
+    const isWindows = typeof process !== "undefined" && process.platform === "win32";
+    if (isWindows && pathname.match(/^\/[A-Za-z]:\//)) {
+      pathname = pathname.slice(1); // Remove leading slash
+      pathname = pathname.replace(/\//g, "\\"); // Convert to backslashes
+    }
+
+    return pathname;
+  }
+
+  /**
+   * Convert a filesystem path to a file:// URL.
+   *
+   * @param {string} path - Filesystem path
+   * @returns {URL} file:// URL
+   */
+  function pathToFileURL(path) {
+    if (typeof path !== "string") {
+      throw new TypeError("The path argument must be of type string");
+    }
+
+    // Handle Windows paths
+    const isWindows = typeof process !== "undefined" && process.platform === "win32";
+
+    let pathname = path;
+    if (isWindows) {
+      pathname = pathname.replace(/\\/g, "/");
+      // Add leading slash for absolute paths
+      if (pathname.match(/^[A-Za-z]:\//)) {
+        pathname = "/" + pathname;
+      }
+    }
+
+    // Make sure it starts with /
+    if (!pathname.startsWith("/")) {
+      pathname = "/" + pathname;
+    }
+
+    // Encode special characters (but not /)
+    pathname = pathname
+      .split("/")
+      .map((segment) => encodeURIComponent(segment))
+      .join("/");
+
+    return new URL("file://" + pathname);
+  }
+
+  /**
+   * Convert domain to ASCII (punycode).
+   * Simple implementation - for full punycode, would need punycode library.
+   *
+   * @param {string} domain - Domain name
+   * @returns {string} ASCII domain
+   */
+  function domainToASCII(domain) {
+    try {
+      const url = new URL("http://" + domain);
+      return url.hostname;
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * Convert domain from ASCII (punycode) to Unicode.
+   * Simple implementation.
+   *
+   * @param {string} domain - ASCII domain
+   * @returns {string} Unicode domain
+   */
+  function domainToUnicode(domain) {
+    // For now, just return as-is (proper implementation would need punycode)
+    return domain;
+  }
+
+  // ==========================================================================
+  // Module exports
+  // ==========================================================================
+
+  const urlModule = {
+    // WHATWG URL API
+    URL,
+    URLSearchParams,
+
+    // Legacy API
+    Url,
+    parse,
+    format,
+    resolve,
+
+    // File URL utilities
+    fileURLToPath,
+    pathToFileURL,
+
+    // Domain utilities
+    domainToASCII,
+    domainToUnicode,
+  };
+
+  // Register as node:url module
+  if (typeof __registerModule === "function") {
+    __registerModule("url", urlModule);
+  }
+
   // Export to global
   global.URL = URL;
   global.URLSearchParams = URLSearchParams;
+
+  // Also expose module for direct access
+  global.__otter_url = urlModule;
 })(globalThis);

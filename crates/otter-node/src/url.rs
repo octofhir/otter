@@ -26,13 +26,12 @@ impl UrlComponents {
     /// Parse a URL string, optionally with a base URL.
     pub fn parse(url_string: &str, base: Option<&str>) -> Result<Self, String> {
         let parsed = if let Some(base_str) = base {
-            let base_url = Url::parse(base_str)
-                .map_err(|e| format!("Invalid base URL: {}", e))?;
-            base_url.join(url_string)
+            let base_url = Url::parse(base_str).map_err(|e| format!("Invalid base URL: {}", e))?;
+            base_url
+                .join(url_string)
                 .map_err(|e| format!("Invalid URL: {}", e))?
         } else {
-            Url::parse(url_string)
-                .map_err(|e| format!("Invalid URL: {}", e))?
+            Url::parse(url_string).map_err(|e| format!("Invalid URL: {}", e))?
         };
 
         Ok(Self::from_url(&parsed))
@@ -46,7 +45,8 @@ impl UrlComponents {
         let protocol = format!("{}:", url.scheme());
 
         // Host includes port if non-default
-        let host = url.host_str()
+        let host = url
+            .host_str()
             .map(|h| {
                 if let Some(port) = url.port() {
                     format!("{}:{}", h, port)
@@ -72,12 +72,11 @@ impl UrlComponents {
         };
 
         // Search includes leading "?" if present
-        let search = url.query()
-            .map(|q| format!("?{}", q))
-            .unwrap_or_default();
+        let search = url.query().map(|q| format!("?{}", q)).unwrap_or_default();
 
         // Hash includes leading "#" if present
-        let hash = url.fragment()
+        let hash = url
+            .fragment()
             .map(|f| format!("#{}", f))
             .unwrap_or_default();
 
@@ -98,8 +97,7 @@ impl UrlComponents {
 
     /// Set a URL component and return updated components.
     pub fn set_component(&self, name: &str, value: &str) -> Result<Self, String> {
-        let mut url = Url::parse(&self.href)
-            .map_err(|e| format!("Invalid URL: {}", e))?;
+        let mut url = Url::parse(&self.href).map_err(|e| format!("Invalid URL: {}", e))?;
 
         match name {
             "href" => {
@@ -108,12 +106,10 @@ impl UrlComponents {
             "protocol" => {
                 // Remove trailing colon if present
                 let scheme = value.trim_end_matches(':');
-                url.set_scheme(scheme)
-                    .map_err(|_| "Invalid protocol")?;
+                url.set_scheme(scheme).map_err(|_| "Invalid protocol")?;
             }
             "username" => {
-                url.set_username(value)
-                    .map_err(|_| "Cannot set username")?;
+                url.set_username(value).map_err(|_| "Cannot set username")?;
             }
             "password" => {
                 url.set_password(if value.is_empty() { None } else { Some(value) })
@@ -126,8 +122,7 @@ impl UrlComponents {
                     url.set_host(Some(host_part))
                         .map_err(|e| format!("Invalid host: {}", e))?;
                     if let Ok(port) = port_part[1..].parse::<u16>() {
-                        url.set_port(Some(port))
-                            .map_err(|_| "Cannot set port")?;
+                        url.set_port(Some(port)).map_err(|_| "Cannot set port")?;
                     }
                 } else {
                     url.set_host(Some(value))
@@ -142,11 +137,9 @@ impl UrlComponents {
                 let port = if value.is_empty() {
                     None
                 } else {
-                    Some(value.parse::<u16>()
-                        .map_err(|_| "Invalid port number")?)
+                    Some(value.parse::<u16>().map_err(|_| "Invalid port number")?)
                 };
-                url.set_port(port)
-                    .map_err(|_| "Cannot set port")?;
+                url.set_port(port).map_err(|_| "Cannot set port")?;
             }
             "pathname" => {
                 url.set_path(value);
@@ -159,7 +152,11 @@ impl UrlComponents {
             "hash" => {
                 // Remove leading "#" if present
                 let fragment = value.strip_prefix('#').unwrap_or(value);
-                url.set_fragment(if fragment.is_empty() { None } else { Some(fragment) });
+                url.set_fragment(if fragment.is_empty() {
+                    None
+                } else {
+                    Some(fragment)
+                });
             }
             _ => return Err(format!("Unknown URL component: {}", name)),
         }
@@ -201,14 +198,16 @@ impl SearchParams {
 
     /// Get the first value for a key.
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.params.iter()
+        self.params
+            .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
     }
 
     /// Get all values for a key.
     pub fn get_all(&self, key: &str) -> Vec<&str> {
-        self.params.iter()
+        self.params
+            .iter()
             .filter(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
             .collect()
@@ -269,7 +268,9 @@ mod tests {
 
     #[test]
     fn test_url_parse_full() {
-        let url = UrlComponents::parse("https://user:pass@example.com:8080/path?query=1#hash", None).unwrap();
+        let url =
+            UrlComponents::parse("https://user:pass@example.com:8080/path?query=1#hash", None)
+                .unwrap();
         assert_eq!(url.protocol, "https:");
         assert_eq!(url.username, "user");
         assert_eq!(url.password, "pass");

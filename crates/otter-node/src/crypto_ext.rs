@@ -11,9 +11,9 @@
 //! Note: This module uses shared state for hash/hmac contexts which doesn't fit
 //! the #[dive] pattern, so we use traditional op_sync with closures.
 
-use parking_lot::Mutex;
-use otter_runtime::extension::{op_sync, OpDecl};
 use otter_runtime::Extension;
+use otter_runtime::extension::{OpDecl, op_sync};
+use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;

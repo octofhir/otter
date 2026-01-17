@@ -17,12 +17,12 @@ use crate::bindings::{
 };
 use crate::bootstrap::register_bootstrap;
 use crate::context::JscContext;
-use std::cell::RefCell;
 use crate::engine::EngineStats;
 use crate::error::{JscError, JscResult};
 use crate::extension::Extension;
 use crate::transpiler::transpile_typescript;
 use crossbeam_channel::{Receiver, Select};
+use std::cell::RefCell;
 use std::ffi::CString;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;

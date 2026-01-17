@@ -9,6 +9,7 @@
 #   ./benchmarks/bench.sh startup
 #   ./benchmarks/bench.sh cpu
 #   ./benchmarks/bench.sh memory
+#   ./benchmarks/bench.sh sql      # PostgreSQL benchmark (requires running DB)
 
 set -e
 
@@ -164,6 +165,14 @@ main() {
             for f in "$SCRIPT_DIR"/memory/*.ts; do
                 [ -f "$f" ] && compare_benchmark "$f"
             done
+            ;;
+        sql)
+            # SQL benchmark has its own runner (requires PostgreSQL)
+            if [ -f "$SCRIPT_DIR/sql/bench-sql.sh" ]; then
+                "$SCRIPT_DIR/sql/bench-sql.sh"
+            else
+                echo -e "${RED}SQL benchmark not found${NC}"
+            fi
             ;;
         *)
             # Assume it's a specific file

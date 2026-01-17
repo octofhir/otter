@@ -50,7 +50,14 @@ pub fn register_abort_api(ctx: JSContextRef) -> JscResult<()> {
         let source_ref = JSStringCreateWithUTF8CString(source_cstr.as_ptr());
 
         let mut exception: JSValueRef = ptr::null_mut();
-        JSEvaluateScript(ctx, shim_ref, ptr::null_mut(), source_ref, 1, &mut exception);
+        JSEvaluateScript(
+            ctx,
+            shim_ref,
+            ptr::null_mut(),
+            source_ref,
+            1,
+            &mut exception,
+        );
 
         JSStringRelease(shim_ref);
         JSStringRelease(source_ref);

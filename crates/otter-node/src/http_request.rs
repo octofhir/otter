@@ -6,13 +6,13 @@
 //! Uses DashMap for fine-grained locking - each request entry is locked
 //! independently, minimizing contention under high load.
 
-use crate::http_service::{full_body, OtterBody};
+use crate::http_service::{OtterBody, full_body};
 use bytes::Bytes;
 use dashmap::DashMap;
 use http::{HeaderMap, Method, Uri};
 use http_body_util::BodyExt;
-use hyper::body::Incoming;
 use hyper::Response;
+use hyper::body::Incoming;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::oneshot;

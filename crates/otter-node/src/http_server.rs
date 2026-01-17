@@ -1,21 +1,21 @@
 //! HTTP/HTTPS server implementation for Otter.serve()
 //!
-//! High-performance, event-driven HTTP server with Bun-compatible API.
+//! High-performance, event-driven HTTP server.
 
 use crate::http_service::OtterHttpService;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as HttpBuilder;
-use tokio::sync::mpsc::UnboundedSender;
 use parking_lot::Mutex;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashMap;
 use std::io::BufReader;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 
@@ -64,7 +64,9 @@ impl TlsConfig {
         let certs: Vec<CertificateDer<'static>> =
             rustls_pemfile::certs(&mut BufReader::new(cert_pem))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| HttpServerError::Tls(format!("Failed to parse certificates: {}", e)))?;
+                .map_err(|e| {
+                    HttpServerError::Tls(format!("Failed to parse certificates: {}", e))
+                })?;
 
         if certs.is_empty() {
             return Err(HttpServerError::Tls("No certificates found in PEM".into()));
@@ -74,7 +76,10 @@ impl TlsConfig {
             .map_err(|e| HttpServerError::Tls(format!("Failed to parse private key: {}", e)))?
             .ok_or_else(|| HttpServerError::Tls("No private key found in PEM".into()))?;
 
-        Ok(Self { cert_chain: certs, key })
+        Ok(Self {
+            cert_chain: certs,
+            key,
+        })
     }
 
     /// Build rustls ServerConfig from this TLS configuration.

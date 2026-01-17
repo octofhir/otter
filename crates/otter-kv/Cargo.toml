@@ -1,0 +1,28 @@
+[package]
+name = "otter-kv"
+version = "0.1.0"
+edition = "2021"
+description = "Key-value store for Otter runtime"
+license = "MIT"
+authors = ["Otter Authors"]
+
+[dependencies]
+otter-runtime = { path = "../otter-runtime", version = "0.1.3" }
+
+# KV store backend
+redb = "2.4"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["sync"] }
+
+# Utilities
+parking_lot = "0.12"
+once_cell = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

@@ -370,7 +370,9 @@ pub(crate) fn event_loop_for_context(ctx: JSContextRef) -> Option<Arc<EventLoop>
     let global_key = unsafe { JSContextGetGlobalObject(ctx) as usize };
     EVENT_LOOP_MAP.with(|map| {
         let map = map.borrow();
-        map.get(&ctx_key).cloned().or_else(|| map.get(&global_key).cloned())
+        map.get(&ctx_key)
+            .cloned()
+            .or_else(|| map.get(&global_key).cloned())
     })
 }
 

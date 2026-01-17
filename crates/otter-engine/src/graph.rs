@@ -105,8 +105,8 @@ impl ModuleGraph {
         // Load the module
         let module = self.loader.load(specifier, referrer).await?;
 
-        // Skip parsing dependencies for node: built-ins (they have no source)
-        let dependencies = if module.url.starts_with("node:") {
+        // Skip parsing dependencies for built-ins (they have no source)
+        let dependencies = if module.url.starts_with("node:") || module.url.starts_with("otter:") {
             Vec::new()
         } else {
             // Parse dependencies based on module type (ESM or CommonJS)

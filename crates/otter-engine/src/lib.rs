@@ -43,8 +43,8 @@ pub mod loader;
 
 pub use capabilities::{Capabilities, CapabilitiesBuilder, PermissionDenied};
 pub use env_store::{
-    parse_env_file, EnvFileError, EnvStoreBuilder, EnvWriteError, IsolatedEnvStore,
-    DEFAULT_DENY_PATTERNS,
+    DEFAULT_DENY_PATTERNS, EnvFileError, EnvStoreBuilder, EnvWriteError, IsolatedEnvStore,
+    parse_env_file,
 };
 pub use graph::{ModuleGraph, ModuleNode, parse_imports};
 pub use loader::{LoaderConfig, ModuleLoader, ResolvedModule, SourceType};

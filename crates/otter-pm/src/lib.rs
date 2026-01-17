@@ -21,4 +21,4 @@ pub use manifest_cache::{CachedManifest, ManifestCache};
 pub use progress::InstallProgress;
 pub use registry::{DistInfo, NpmRegistry, PackageMetadata, RegistryError, VersionInfo};
 pub use resolver::{ResolvedPackage, Resolver, ResolverError};
-pub use types::{install_bundled_types, TypesError};
+pub use types::{TypesError, install_bundled_types};

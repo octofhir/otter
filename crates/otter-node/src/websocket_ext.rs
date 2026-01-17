@@ -11,8 +11,8 @@
 //! Note: This module uses shared state (WebSocketManager) which doesn't fit the #[dive]
 //! pattern, so we use traditional op_sync with closures.
 
-use otter_runtime::extension::{op_sync, OpDecl};
 use otter_runtime::Extension;
+use otter_runtime::extension::{OpDecl, op_sync};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -106,10 +106,8 @@ pub fn extension() -> Extension {
     // wsReadyState(id) -> number
     let mgr_state = manager.clone();
     ops.push(op_sync("wsReadyState", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
                 otter_runtime::error::JscError::internal("wsReadyState requires id")
             })? as u32;
 

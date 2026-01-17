@@ -67,20 +67,15 @@ mod tests {
 
     #[test]
     fn test_url_parse_op() {
-        let result = __otter_url_parse(
-            "https://example.com/path".to_string(),
-            None,
-        );
+        let result = __otter_url_parse("https://example.com/path".to_string(), None);
         assert!(result.get("href").is_some());
         assert_eq!(result["protocol"], "https:");
     }
 
     #[test]
     fn test_url_parse_with_base() {
-        let result = __otter_url_parse(
-            "/path".to_string(),
-            Some("https://example.com".to_string()),
-        );
+        let result =
+            __otter_url_parse("/path".to_string(), Some("https://example.com".to_string()));
         assert_eq!(result["href"], "https://example.com/path");
     }
 

@@ -8,8 +8,8 @@
 //! - `buffer_ext.rs` - Extension creation with ops
 //! - `buffer.js` - JavaScript Buffer class wrapper
 
-use otter_runtime::extension::op_sync;
 use otter_runtime::Extension;
+use otter_runtime::extension::op_sync;
 use serde_json::json;
 
 use crate::buffer;

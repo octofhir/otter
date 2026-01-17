@@ -7,9 +7,9 @@
 //! - `process.rs` - Rust process info implementation
 //! - `process_ext.rs` - Extension creation with ops
 
-use otter_runtime::extension::{op_sync, RuntimeContextHandle};
-use otter_runtime::memory::jsc_heap_stats;
 use otter_runtime::Extension;
+use otter_runtime::extension::{RuntimeContextHandle, op_sync};
+use otter_runtime::memory::jsc_heap_stats;
 use serde_json::json;
 
 #[derive(Default)]
@@ -27,8 +27,14 @@ fn memory_usage() -> MemoryUsage {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
     if let Some(contents) = statm {
         let mut parts = contents.split_whitespace();
-        let size = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-        let rss = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let size = parts
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let rss = parts
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
         let rss_bytes = rss * page_size;
         let size_bytes = size * page_size;
         return MemoryUsage {

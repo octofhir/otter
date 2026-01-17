@@ -7,6 +7,8 @@ members = [
     "crates/otter-runtime",
     "crates/otter-engine",
     "crates/otter-node",
+    "crates/otter-sql",
+    "crates/otter-kv",
     "crates/otter-pm",
     "crates/otterjs",
 ]

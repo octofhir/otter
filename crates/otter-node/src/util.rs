@@ -171,4 +171,3 @@ pub fn util_module_js() -> &'static str {
 })();
 "#
 }
-

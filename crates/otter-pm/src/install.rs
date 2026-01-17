@@ -84,13 +84,8 @@ impl Installer {
                 .map(|mut d| d.next().is_none())
                 .unwrap_or(true);
 
-        // Check if all locked packages are in CAS
         let mut packages_to_install: Vec<(String, PackageIndex)> = Vec::new();
         for (name, entry) in &binary_lock.packages {
-            let Some(index) = self.content_store.get_package_index(name, &entry.version) else {
-                return Ok(None); // Package not in CAS, need download
-            };
-
             if !node_modules_empty {
                 // Check if already installed with correct version
                 let pkg_json = self.node_modules.join(name).join("package.json");
@@ -105,6 +100,9 @@ impl Installer {
                 }
             }
 
+            let Some(index) = self.content_store.get_package_index(name, &entry.version) else {
+                return Ok(None); // Need install, but package not in CAS
+            };
             packages_to_install.push((name.clone(), index));
         }
 
@@ -174,13 +172,8 @@ impl Installer {
                 .map(|mut d| d.next().is_none())
                 .unwrap_or(true);
 
-        // Check if all locked packages are in CAS
         let mut packages_to_install: Vec<(String, PackageIndex)> = Vec::new();
         for (name, entry) in &lockfile.packages {
-            let Some(index) = self.content_store.get_package_index(name, &entry.version) else {
-                return Ok(None); // Package not in CAS, need download
-            };
-
             if !node_modules_empty {
                 // Check if already installed with correct version
                 let pkg_json = self.node_modules.join(name).join("package.json");
@@ -195,6 +188,9 @@ impl Installer {
                 }
             }
 
+            let Some(index) = self.content_store.get_package_index(name, &entry.version) else {
+                return Ok(None); // Need install, but package not in CAS
+            };
             packages_to_install.push((name.clone(), index));
         }
 
@@ -301,7 +297,10 @@ impl Installer {
         let mut need_download: Vec<ResolvedPackage> = Vec::new();
 
         for pkg in packages_to_install {
-            if let Some(index) = self.content_store.get_package_index(&pkg.name, &pkg.version) {
+            if let Some(index) = self
+                .content_store
+                .get_package_index(&pkg.name, &pkg.version)
+            {
                 in_store.push((pkg, index));
             } else {
                 need_download.push(pkg);
@@ -357,8 +356,11 @@ impl Installer {
                 store_tasks.push(tokio::spawn(async move {
                     tokio::task::spawn_blocking(move || {
                         // Store in CAS
-                        let index =
-                            store.store_package_from_tarball(&pkg_clone.name, &pkg_clone.version, &tarball)?;
+                        let index = store.store_package_from_tarball(
+                            &pkg_clone.name,
+                            &pkg_clone.version,
+                            &tarball,
+                        )?;
                         // Install via hardlinks
                         store.install_from_index(&index, &dest)?;
                         Ok::<_, std::io::Error>(pkg_clone)
@@ -370,8 +372,7 @@ impl Installer {
             }
 
             while let Some(result) = store_tasks.next().await {
-                let pkg = result
-                    .map_err(|e| InstallError::Io(e.to_string()))??;
+                let pkg = result.map_err(|e| InstallError::Io(e.to_string()))??;
 
                 self.progress.tick_install(&pkg.name);
 
@@ -564,6 +565,7 @@ pub enum InstallError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_installer_new() {
@@ -602,5 +604,50 @@ mod tests {
         assert_eq!(pkg.name, Some("test-project".to_string()));
         assert!(pkg.dependencies.is_some());
         assert!(pkg.dev_dependencies.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_install_uses_lockfile_without_cas_or_network() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("otter-install-lockfile-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let package_json_path = temp_dir.join("package.json");
+        fs::write(
+            &package_json_path,
+            r#"{
+  "name": "test-project",
+  "version": "1.0.0",
+  "dependencies": { "fake-package": "1.0.0" }
+}"#,
+        )
+        .unwrap();
+
+        fs::create_dir_all(temp_dir.join("node_modules/fake-package")).unwrap();
+        fs::write(
+            temp_dir.join("node_modules/fake-package/package.json"),
+            r#"{ "name": "fake-package", "version": "1.0.0" }"#,
+        )
+        .unwrap();
+
+        let lockfile = r#"{
+  "version": 1,
+  "packages": {
+    "fake-package": {
+      "version": "1.0.0",
+      "resolved": "https://example.invalid/fake-package.tgz"
+    }
+  }
+}"#;
+
+        let mut file = fs::File::create(temp_dir.join("otter.lock")).unwrap();
+        file.write_all(lockfile.as_bytes()).unwrap();
+
+        let mut installer = Installer::new_silent(&temp_dir);
+        let result = installer.install(&package_json_path).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

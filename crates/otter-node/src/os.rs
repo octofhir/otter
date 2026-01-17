@@ -216,12 +216,7 @@ pub fn release() -> String {
 #[cfg(target_os = "linux")]
 pub fn release() -> String {
     std::fs::read_to_string("/proc/version")
-        .map(|v| {
-            v.split_whitespace()
-                .nth(2)
-                .unwrap_or("unknown")
-                .to_string()
-        })
+        .map(|v| v.split_whitespace().nth(2).unwrap_or("unknown").to_string())
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
@@ -278,9 +273,7 @@ pub fn hostname() -> String {
         // SAFETY: gethostname is a standard POSIX function
         unsafe {
             if libc::gethostname(buf.as_mut_ptr(), buf.len()) == 0 {
-                CStr::from_ptr(buf.as_ptr())
-                    .to_string_lossy()
-                    .into_owned()
+                CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
             } else {
                 "localhost".to_string()
             }
@@ -349,9 +342,7 @@ pub fn totalmem() -> u64 {
 pub fn totalmem() -> u64 {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
-        .and_then(|content| {
-            content.lines().find(|line| line.starts_with("MemTotal:"))
-        })
+        .and_then(|content| content.lines().find(|line| line.starts_with("MemTotal:")))
         .and_then(|line| {
             line.split_whitespace()
                 .nth(1)
@@ -437,9 +428,7 @@ pub fn cpus() -> Vec<CpuInfo> {
                 std::ptr::null_mut(),
                 0,
             );
-            CStr::from_ptr(buf.as_ptr())
-                .to_string_lossy()
-                .into_owned()
+            CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
         }
     };
 
@@ -684,9 +673,7 @@ pub fn machine() -> String {
             std::ptr::null_mut(),
             0,
         );
-        CStr::from_ptr(buf.as_ptr())
-            .to_string_lossy()
-            .into_owned()
+        CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
     }
 }
 
@@ -825,7 +812,15 @@ mod tests {
     #[test]
     fn test_os_type() {
         let t = os_type();
-        assert!([OsType::Darwin, OsType::Linux, OsType::Windows, OsType::Unknown].contains(&t));
+        assert!(
+            [
+                OsType::Darwin,
+                OsType::Linux,
+                OsType::Windows,
+                OsType::Unknown
+            ]
+            .contains(&t)
+        );
     }
 
     #[test]

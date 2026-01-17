@@ -11,11 +11,11 @@
 //! Note: This module uses shared state (TestRunner) which doesn't fit the #[dive]
 //! pattern, so we use traditional op_sync with closures.
 
-use otter_runtime::extension::{op_sync, OpDecl};
 use otter_runtime::Extension;
+use otter_runtime::extension::{OpDecl, op_sync};
 use serde_json::json;
 
-use crate::test::{create_test_runner, TestSummary};
+use crate::test::{TestSummary, create_test_runner};
 
 /// Create the test extension.
 ///
@@ -185,7 +185,9 @@ pub fn extension() -> Extension {
         }
     }));
 
-    Extension::new("test").with_ops(ops).with_js(include_str!("test.js"))
+    Extension::new("test")
+        .with_ops(ops)
+        .with_js(include_str!("test.js"))
 }
 
 #[cfg(test)]

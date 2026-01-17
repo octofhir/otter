@@ -178,7 +178,9 @@ impl IsolatedEnvStore {
         let mut keys: Vec<_> = self.explicit.keys().cloned().collect();
 
         for key in &self.passthrough {
-            if !self.is_denied(key) && std::env::var(key).is_ok() && !self.explicit.contains_key(key)
+            if !self.is_denied(key)
+                && std::env::var(key).is_ok()
+                && !self.explicit.contains_key(key)
             {
                 keys.push(key.clone());
             }
@@ -495,9 +497,7 @@ fn parse_env_value(
 /// Check if a string is a valid environment variable key.
 fn is_valid_env_key(key: &str) -> bool {
     !key.is_empty()
-        && key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !key.chars().next().unwrap().is_ascii_digit()
 }
 
@@ -542,10 +542,19 @@ impl std::fmt::Display for EnvFileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io { path, source } => {
-                write!(f, "Failed to read env file '{}': {}", path.display(), source)
+                write!(
+                    f,
+                    "Failed to read env file '{}': {}",
+                    path.display(),
+                    source
+                )
             }
             Self::InvalidKey { key, line } => {
-                write!(f, "Invalid environment variable key '{}' at line {}", key, line)
+                write!(
+                    f,
+                    "Invalid environment variable key '{}' at line {}",
+                    key, line
+                )
             }
             Self::UnterminatedString { line } => {
                 write!(f, "Unterminated quoted string starting at line {}", line)

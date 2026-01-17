@@ -14,8 +14,8 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Default maximum number of listeners per event.
 pub const DEFAULT_MAX_LISTENERS: usize = 10;

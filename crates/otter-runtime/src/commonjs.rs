@@ -6,8 +6,8 @@
 //! - `__toCommonJS` - Convert ESM module to CJS format
 //! - `__createRequire` - Create a require function for a module context
 
-use crate::bindings::*;
 use crate::JscResult;
+use crate::bindings::*;
 use std::ffi::CString;
 use std::ptr;
 
@@ -19,14 +19,22 @@ const COMMONJS_RUNTIME: &str = include_str!("commonjs_runtime.js");
 /// This must be called before any CommonJS module loading.
 pub fn register_commonjs_runtime(ctx: JSContextRef) -> JscResult<()> {
     unsafe {
-        let script_cstr = CString::new(COMMONJS_RUNTIME).expect("COMMONJS_RUNTIME contains null byte");
+        let script_cstr =
+            CString::new(COMMONJS_RUNTIME).expect("COMMONJS_RUNTIME contains null byte");
         let script_ref = JSStringCreateWithUTF8CString(script_cstr.as_ptr());
 
         let source_cstr = CString::new("<otter_commonjs_runtime>").unwrap();
         let source_ref = JSStringCreateWithUTF8CString(source_cstr.as_ptr());
 
         let mut exception: JSValueRef = ptr::null_mut();
-        JSEvaluateScript(ctx, script_ref, ptr::null_mut(), source_ref, 1, &mut exception);
+        JSEvaluateScript(
+            ctx,
+            script_ref,
+            ptr::null_mut(),
+            source_ref,
+            1,
+            &mut exception,
+        );
 
         JSStringRelease(script_ref);
         JSStringRelease(source_ref);
@@ -54,7 +62,12 @@ pub fn register_commonjs_runtime(ctx: JSContextRef) -> JscResult<()> {
 ///     module.exports = { foo: 1 };
 /// });
 /// ```
-pub fn wrap_commonjs_module(module_id: &str, source: &str, dirname: &str, filename: &str) -> String {
+pub fn wrap_commonjs_module(
+    module_id: &str,
+    source: &str,
+    dirname: &str,
+    filename: &str,
+) -> String {
     format!(
         r#"globalThis.__otter_cjs_modules["{module_id}"] = __commonJS(function(exports, module) {{
     var __dirname = "{dirname}";

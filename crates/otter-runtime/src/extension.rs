@@ -601,7 +601,10 @@ fn registry_key(ctx: JSContextRef) -> usize {
     unsafe { JSContextGetGlobalObject(ctx) as usize }
 }
 
-unsafe fn registry_ptr_from_function(ctx: JSContextRef, function: JSObjectRef) -> Option<*const ExtensionRegistry> {
+unsafe fn registry_ptr_from_function(
+    ctx: JSContextRef,
+    function: JSObjectRef,
+) -> Option<*const ExtensionRegistry> {
     let key_name_cstr = CString::new("__otter_registry_ptr").ok()?;
     let key_name_ref = JSStringCreateWithUTF8CString(key_name_cstr.as_ptr());
 
@@ -666,7 +669,9 @@ fn registry_for_context(ctx: JSContextRef) -> Option<Arc<ExtensionRegistry>> {
 
     REGISTRY_MAP.with(|map| {
         let map = map.borrow();
-        map.get(&ctx_key).cloned().or_else(|| map.get(&global_key).cloned())
+        map.get(&ctx_key)
+            .cloned()
+            .or_else(|| map.get(&global_key).cloned())
     })
 }
 

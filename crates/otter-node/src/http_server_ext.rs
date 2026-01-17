@@ -12,8 +12,8 @@
 //! Note: This module uses shared state (HttpServerManager) and event channels,
 //! which doesn't fit the #[dive] pattern.
 
-use otter_runtime::extension::{op_async, op_sync};
 use otter_runtime::Extension;
+use otter_runtime::extension::{op_async, op_sync};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,9 +28,7 @@ use crate::http_server::{self, ActiveServerCount, HttpEvent};
 ///
 /// Returns a tuple of (Extension, ActiveServerCount) so the runtime can track
 /// when all servers have stopped.
-pub fn extension(
-    event_tx: UnboundedSender<HttpEvent>,
-) -> (Extension, ActiveServerCount) {
+pub fn extension(event_tx: UnboundedSender<HttpEvent>) -> (Extension, ActiveServerCount) {
     let manager = Arc::new(http_server::HttpServerManager::new());
     let active_count = manager.active_count();
 
@@ -48,15 +46,9 @@ pub fn extension(
                 let tx = event_tx_create.clone();
 
                 async move {
-                    let port = args
-                        .first()
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(3000) as u16;
+                    let port = args.first().and_then(|v| v.as_u64()).unwrap_or(3000) as u16;
 
-                    let hostname = args
-                        .get(1)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0.0.0.0");
+                    let hostname = args.get(1).and_then(|v| v.as_str()).unwrap_or("0.0.0.0");
 
                     // Parse TLS config if provided
                     let tls = if let Some(tls_obj) = args.get(2).and_then(|v| v.as_object()) {
@@ -187,9 +179,7 @@ pub fn extension(
                                     obj.get("data")
                                         .and_then(|d| d.as_str())
                                         .and_then(|s| {
-                                            base64::engine::general_purpose::STANDARD
-                                                .decode(s)
-                                                .ok()
+                                            base64::engine::general_purpose::STANDARD.decode(s).ok()
                                         })
                                         .unwrap_or_default()
                                 }

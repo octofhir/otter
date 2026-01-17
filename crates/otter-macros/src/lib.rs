@@ -75,8 +75,9 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
+    FnArg, Ident, ItemFn, LitStr, Pat, ReturnType, Token, Type,
     parse::{Parse, ParseStream},
-    parse_macro_input, FnArg, Ident, ItemFn, LitStr, Pat, ReturnType, Token, Type,
+    parse_macro_input,
 };
 
 /// Dive mode - how the function behaves
@@ -139,7 +140,7 @@ impl Parse for DiveArgs {
                             "Unknown dive mode '{}'. Expected 'swift' (sync) or 'deep' (async).",
                             other
                         ),
-                    ))
+                    ));
                 }
             };
         }

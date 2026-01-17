@@ -25,8 +25,8 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use thiserror::Error;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -481,7 +481,9 @@ impl ChildProcessManager {
     /// Close a process's stdin.
     pub fn close_stdin(&self, id: u32) -> Result<(), ChildProcessError> {
         let mut processes = self.processes.lock();
-        let handle = processes.get_mut(&id).ok_or(ChildProcessError::NotFound(id))?;
+        let handle = processes
+            .get_mut(&id)
+            .ok_or(ChildProcessError::NotFound(id))?;
 
         // Drop the sender to close stdin
         handle.stdin_tx = None;
@@ -576,9 +578,10 @@ impl ChildProcessManager {
 
     /// Check if there are any ref'd running processes.
     pub fn has_active_refs(&self) -> bool {
-        self.processes.lock().values().any(|h| {
-            h.running.load(Ordering::SeqCst) && h.ref_count.load(Ordering::SeqCst)
-        })
+        self.processes
+            .lock()
+            .values()
+            .any(|h| h.running.load(Ordering::SeqCst) && h.ref_count.load(Ordering::SeqCst))
     }
 
     /// Poll for process events.
@@ -649,7 +652,10 @@ mod tests {
     async fn test_spawn_echo() {
         let manager = ChildProcessManager::new();
         let id = manager
-            .spawn(&["echo".to_string(), "hello".to_string()], SpawnOptions::default())
+            .spawn(
+                &["echo".to_string(), "hello".to_string()],
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         assert!(id > 0);
@@ -661,7 +667,11 @@ mod tests {
         assert!(!events.is_empty());
 
         // Should have Spawn event
-        assert!(events.iter().any(|(_, e)| matches!(e, ChildProcessEvent::Spawn)));
+        assert!(
+            events
+                .iter()
+                .any(|(_, e)| matches!(e, ChildProcessEvent::Spawn))
+        );
     }
 
     #[tokio::test]
@@ -698,7 +708,10 @@ mod tests {
     async fn test_kill_process() {
         let manager = ChildProcessManager::new();
         let id = manager
-            .spawn(&["sleep".to_string(), "10".to_string()], SpawnOptions::default())
+            .spawn(
+                &["sleep".to_string(), "10".to_string()],
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         assert!(manager.is_running(id));

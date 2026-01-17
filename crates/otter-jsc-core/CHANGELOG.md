@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-01-17
+
+### Miscellaneous Tasks
+
+- Deps update
+
+
+
 ## [0.1.2] - 2026-01-15
 
 ### Miscellaneous Tasks

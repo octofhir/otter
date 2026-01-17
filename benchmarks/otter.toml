@@ -1,0 +1,27 @@
+# Otter configuration
+
+[typescript]
+check = false
+strict = true
+
+[modules]
+# Allowed remote module sources
+remote_allowlist = [
+    "https://esm.sh/*",
+    "https://cdn.skypack.dev/*",
+    "https://unpkg.com/*",
+]
+
+# Module cache directory
+# cache_dir = ".otter/cache"
+
+# Import map aliases
+# [modules.import_map]
+# "@/" = "./src/"
+
+[permissions]
+# Default permissions (can be overridden with CLI flags)
+# allow_read = ["."]
+# allow_write = []
+# allow_net = []
+# allow_env = []

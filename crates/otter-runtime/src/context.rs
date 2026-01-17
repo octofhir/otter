@@ -31,6 +31,7 @@ static CONTEXT_CREATION_LOCK: Mutex<()> = Mutex::new(());
 /// Wraps jsc-core::JscContext and adds event loop, timers, and extension support.
 /// For basic JSC operations without runtime features, use jsc-core::JscContext directly.
 pub struct JscContext {
+    group: JSContextGroupRef,
     ctx: JSGlobalContextRef,
     extension_registry: Arc<ExtensionRegistry>,
     event_loop: Arc<EventLoop>,
@@ -47,10 +48,18 @@ impl JscContext {
 
         // SAFETY: JSGlobalContextCreate with null creates a default context
         unsafe {
-            let ctx = JSGlobalContextCreate(ptr::null_mut());
-            if ctx.is_null() {
+            let group = JSContextGroupCreate();
+            if group.is_null() {
                 return Err(JscError::context_creation(
-                    "JSGlobalContextCreate returned null",
+                    "JSContextGroupCreate returned null",
+                ));
+            }
+
+            let ctx = JSGlobalContextCreateInGroup(group, ptr::null_mut());
+            if ctx.is_null() {
+                JSContextGroupRelease(group);
+                return Err(JscError::context_creation(
+                    "JSGlobalContextCreateInGroup returned null",
                 ));
             }
 
@@ -61,6 +70,7 @@ impl JscContext {
             register_context_event_loop(ctx as JSContextRef, event_loop.clone());
 
             Ok(Self {
+                group,
                 ctx,
                 extension_registry: registry,
                 event_loop,
@@ -347,6 +357,7 @@ impl Drop for JscContext {
         // SAFETY: ctx was created by JSGlobalContextCreate
         unsafe {
             JSGlobalContextRelease(self.ctx);
+            JSContextGroupRelease(self.group);
         }
     }
 }

@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Otter cache
+.otter/
+
+# Build output
+dist/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

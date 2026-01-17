@@ -2,8 +2,10 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use otter_runtime::{ConsoleLevel, set_console_handler};
+use otter_node::create_url_extension;
+use otter_runtime::{ConsoleLevel, JscConfig, JscRuntime, set_console_handler};
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing_subscriber::filter::EnvFilter;
 
 mod commands;
@@ -17,12 +19,21 @@ mod watch;
     about = "A fast TypeScript/JavaScript runtime",
     long_about = "Otter is a secure, fast TypeScript/JavaScript runtime built on JavaScriptCore.\n\n\
                   Run a script:  otter run script.ts\n\
-                  Or directly:   otter script.ts",
+                  Or directly:   otter script.ts\n\
+                  Or eval code:  otter -e 'console.log(1+1)'",
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Evaluate argument as a script
+    #[arg(short = 'e', long = "eval")]
+    eval: Option<String>,
+
+    /// Evaluate and print the result
+    #[arg(short = 'p', long = "print")]
+    print: Option<String>,
 
     /// Verbose output
     #[arg(short, long, global = true)]
@@ -129,9 +140,11 @@ async fn main() -> Result<()> {
             allow_write: None,
             allow_net: None,
             allow_env: None,
+            env_files: vec![],
+            env_vars: vec![],
             allow_run: false,
             allow_all: false,
-            no_check: false,
+            check: false,
             timeout: 30000,
             watch: false,
         };
@@ -141,6 +154,16 @@ async fn main() -> Result<()> {
     // Standard subcommand parsing
     let cli = Cli::parse();
     let config = config::load_config(cli.config.as_deref())?;
+
+    // Handle --eval / -e flag
+    if let Some(code) = cli.eval {
+        return run_eval(&code, false).await;
+    }
+
+    // Handle --print / -p flag
+    if let Some(code) = cli.print {
+        return run_eval(&code, true).await;
+    }
 
     match cli.command {
         Some(Commands::Run(cmd)) => cmd.run(&config).await,
@@ -160,4 +183,28 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Run code from --eval / -e or --print / -p flag
+async fn run_eval(code: &str, print_result: bool) -> Result<()> {
+    let runtime = JscRuntime::new(JscConfig::default())?;
+
+    // Register Web API extensions
+    runtime.register_extension(create_url_extension())?;
+
+    let wrapped = if print_result {
+        // --print: evaluate and print the result
+        format!(
+            "globalThis.__eval_result = (function() {{ return ({code}); }})();\n\
+             console.log(__eval_result);"
+        )
+    } else {
+        // --eval: just evaluate
+        code.to_string()
+    };
+
+    runtime.eval(&wrapped)?;
+    runtime.run_event_loop_until_idle(Duration::from_millis(30000))?;
+
+    Ok(())
 }

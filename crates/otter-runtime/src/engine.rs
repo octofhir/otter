@@ -23,8 +23,8 @@
 
 use crate::error::{JscError, JscResult};
 use crate::extension::Extension;
-use crate::worker::{Job, run_worker};
-use crossbeam_channel::{Sender, bounded};
+use crate::worker::{HttpEvent, Job, NetEvent, run_worker_with_events};
+use crossbeam_channel::{Sender, bounded, unbounded};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -92,6 +92,8 @@ pub struct EngineBuilder {
     queue_capacity: usize,
     extensions: Vec<Extension>,
     tokio_handle: tokio::runtime::Handle,
+    /// Enable HTTP event handling with a dedicated channel
+    enable_http_events: bool,
 }
 
 impl Default for EngineBuilder {
@@ -104,6 +106,7 @@ impl Default for EngineBuilder {
             queue_capacity: 1024,
             extensions: Vec::new(),
             tokio_handle,
+            enable_http_events: false,
         }
     }
 }
@@ -142,6 +145,18 @@ impl EngineBuilder {
         self
     }
 
+    /// Enable HTTP event handling for event-driven HTTP server dispatch
+    ///
+    /// When enabled, the engine creates an HTTP event channel that workers
+    /// listen to using crossbeam Select. This enables instant dispatch of
+    /// HTTP requests without polling.
+    ///
+    /// After building, use `Engine::http_event_sender()` to get the sender.
+    pub fn enable_http_events(mut self) -> Self {
+        self.enable_http_events = true;
+        self
+    }
+
     /// Build the engine and start worker threads
     pub fn build(self) -> JscResult<Engine> {
         Engine::new_with_config(self)
@@ -157,6 +172,10 @@ pub struct Engine {
     workers: Vec<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<EngineStats>,
+    /// HTTP event sender for event-driven HTTP server dispatch
+    http_event_tx: Option<Sender<HttpEvent>>,
+    /// Net event sender for TCP server/socket events
+    net_event_tx: Option<Sender<NetEvent>>,
 }
 
 impl Engine {
@@ -175,10 +194,26 @@ impl Engine {
         let shutdown = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(EngineStats::new());
 
+        // Create HTTP event channel if enabled
+        let (http_event_tx, http_event_rx) = if config.enable_http_events {
+            let (tx, rx) = unbounded::<HttpEvent>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        // Always create net event channel (for node:net support)
+        let (net_event_tx, net_event_rx) = {
+            let (tx, rx) = unbounded::<NetEvent>();
+            (Some(tx), Some(rx))
+        };
+
         let mut workers = Vec::with_capacity(config.pool_size);
 
         for i in 0..config.pool_size {
             let rx = job_rx.clone();
+            let http_rx = http_event_rx.clone();
+            let net_rx = net_event_rx.clone();
             let extensions = config.extensions.clone();
             let shutdown_flag = shutdown.clone();
             let worker_stats = stats.clone();
@@ -187,7 +222,15 @@ impl Engine {
             let handle = std::thread::Builder::new()
                 .name(format!("otter-worker-{}", i))
                 .spawn(move || {
-                    run_worker(rx, extensions, shutdown_flag, worker_stats, &tokio_handle);
+                    run_worker_with_events(
+                        rx,
+                        http_rx,
+                        net_rx,
+                        extensions,
+                        shutdown_flag,
+                        worker_stats,
+                        &tokio_handle,
+                    );
                 })
                 .map_err(|e| JscError::internal(format!("Failed to spawn worker: {}", e)))?;
 
@@ -199,6 +242,8 @@ impl Engine {
             workers,
             shutdown,
             stats,
+            http_event_tx,
+            net_event_tx,
         })
     }
 
@@ -215,6 +260,22 @@ impl Engine {
     /// Get the engine statistics
     pub fn stats(&self) -> &EngineStats {
         &self.stats
+    }
+
+    /// Get the HTTP event sender for event-driven HTTP server dispatch
+    ///
+    /// Returns `None` if HTTP events were not enabled via `enable_http_events()`.
+    /// Clone the sender to share it with HTTP server components.
+    pub fn http_event_sender(&self) -> Option<Sender<HttpEvent>> {
+        self.http_event_tx.clone()
+    }
+
+    /// Get the Net event sender for TCP server/socket dispatch
+    ///
+    /// Always available - net events are always enabled.
+    /// Clone the sender to share it with net module components.
+    pub fn net_event_sender(&self) -> Option<Sender<NetEvent>> {
+        self.net_event_tx.clone()
     }
 
     /// Shutdown the engine and wait for all workers to finish

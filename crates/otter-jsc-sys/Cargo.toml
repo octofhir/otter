@@ -13,9 +13,12 @@ links = "JavaScriptCore"
 
 [build-dependencies]
 # Dependencies for downloading bun-webkit on Linux/Windows
+cc = "1"
 ureq = "3"
 flate2 = "1"
 tar = "0.4"
 
 [features]
 default = []
+# Enable bun-webkit integration (includes WTFTimer implementation)
+bun-webkit = []

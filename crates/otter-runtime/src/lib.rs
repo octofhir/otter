@@ -68,12 +68,17 @@
 
 pub mod apis;
 pub mod bindings;
+pub mod bootstrap;
+pub mod commonjs;
 pub mod config;
 pub mod context;
+pub mod den;
 pub mod engine;
 pub mod error;
 pub mod event_loop;
 pub mod extension;
+pub mod holt;
+pub mod memory;
 pub mod modules;
 pub mod runtime;
 pub mod transpiler;
@@ -83,18 +88,28 @@ pub mod types;
 pub mod value;
 mod worker;
 
+// Re-export worker types for event-driven dispatch
+pub use worker::{HttpEvent, NetEvent};
+
 pub use apis::console::{ConsoleLevel, set_console_handler};
 pub use apis::{NetPermissionChecker, clear_net_permission_checker, set_net_permission_checker};
 pub use apis::{register_all_apis, register_apis_with_config};
+pub use bootstrap::register_bootstrap;
 pub use config::TypeScriptConfig;
 pub use context::JscContext;
 pub use engine::{Engine, EngineBuilder, EngineHandle, EngineStats, EngineStatsSnapshot};
 pub use error::{JscError, JscResult};
 pub use extension::{
-    Extension, ExtensionState, OpContext, OpDecl, OpHandler, OpResult, op_async, op_sync,
-    set_tokio_handle,
+    Extension, ExtensionState, OpContext, OpDecl, OpHandler, OpResult, RuntimeContextHandle,
+    op_async, op_sync, set_tokio_handle,
 };
-pub use modules::{bundle_modules, entry_execution, transform_module, wrap_module};
+pub use holt::{Holt, HoltError, HoltResult, Paw};
+pub use memory::{JscHeapStats, jsc_heap_stats};
+pub use commonjs::{register_commonjs_runtime, require_module, wrap_commonjs_module};
+pub use modules::{
+    ModuleFormat, ModuleInfo, bundle_modules, bundle_modules_mixed, entry_execution,
+    entry_execution_mixed, transform_module, wrap_module,
+};
 pub use runtime::{JscConfig, JscRuntime, JscRuntimePool, PromiseDriver};
 pub use transpiler::{
     TranspileError, TranspileOptions, TranspileResult, is_typescript, needs_transpilation,
@@ -120,17 +135,24 @@ pub mod prelude {
         NetPermissionChecker, clear_net_permission_checker, set_net_permission_checker,
     };
     pub use crate::apis::{register_all_apis, register_apis_with_config};
+    pub use crate::bootstrap::register_bootstrap;
     pub use crate::config::TypeScriptConfig;
     pub use crate::context::JscContext;
     pub use crate::engine::{
         Engine, EngineBuilder, EngineHandle, EngineStats, EngineStatsSnapshot,
     };
+    pub use crate::worker::HttpEvent;
     pub use crate::error::{JscError, JscResult};
     pub use crate::extension::{
         Extension, ExtensionState, OpContext, OpDecl, OpHandler, OpResult, op_async, op_sync,
         set_tokio_handle,
     };
-    pub use crate::modules::{bundle_modules, entry_execution, transform_module, wrap_module};
+    pub use crate::holt::{Holt, HoltError, HoltResult, Paw};
+    pub use crate::commonjs::{register_commonjs_runtime, require_module, wrap_commonjs_module};
+    pub use crate::modules::{
+        ModuleFormat, ModuleInfo, bundle_modules, bundle_modules_mixed, entry_execution,
+        entry_execution_mixed, transform_module, wrap_module,
+    };
     pub use crate::runtime::{JscConfig, JscRuntime, JscRuntimePool, PromiseDriver};
     pub use crate::transpiler::{
         TranspileError, TranspileOptions, TranspileResult, is_typescript, needs_transpilation,

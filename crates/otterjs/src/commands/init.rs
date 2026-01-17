@@ -78,7 +78,7 @@ impl InitCommand {
         let otter_toml = r#"# Otter configuration
 
 [typescript]
-check = true
+check = false
 strict = true
 
 [modules]

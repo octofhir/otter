@@ -24,6 +24,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 parking_lot = "0.12"
+paste = "1"
+dashmap = "6"
 crossbeam-utils = "0.8"
 crossbeam-channel = "0.5"
 scopeguard = "1.2"

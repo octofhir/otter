@@ -1,7 +1,8 @@
-//! Dependency resolution
+//! Dependency resolution with parallel fetching
 
 use crate::registry::{NpmRegistry, RegistryError};
-use std::collections::{HashMap, HashSet};
+use futures::stream::{FuturesUnordered, StreamExt};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Resolved package with version and dependencies
 #[derive(Debug, Clone)]
@@ -13,11 +14,10 @@ pub struct ResolvedPackage {
     pub dependencies: HashMap<String, String>,
 }
 
-/// Dependency resolver
+/// Dependency resolver with parallel fetching
 pub struct Resolver {
     registry: NpmRegistry,
     resolved: HashMap<String, ResolvedPackage>,
-    in_progress: HashSet<String>,
 }
 
 impl Resolver {
@@ -25,88 +25,80 @@ impl Resolver {
         Self {
             registry,
             resolved: HashMap::new(),
-            in_progress: HashSet::new(),
         }
     }
 
-    /// Resolve all dependencies for a package.json
+    /// Resolve all dependencies in parallel using BFS
     pub async fn resolve(
         &mut self,
         dependencies: &HashMap<String, String>,
     ) -> Result<Vec<ResolvedPackage>, ResolverError> {
-        for (name, version_req) in dependencies {
-            self.resolve_package(name, version_req).await?;
+        // Queue of packages to resolve: (name, version_req)
+        let mut queue: VecDeque<(String, String)> = dependencies
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        // Track what we've seen to avoid duplicates
+        let mut seen: HashSet<String> = HashSet::new();
+
+        while !queue.is_empty() {
+            // Collect current batch (all packages not yet resolved)
+            let mut batch: Vec<(String, String)> = Vec::new();
+            while let Some((name, version_req)) = queue.pop_front() {
+                if !seen.contains(&name) && !self.resolved.contains_key(&name) {
+                    seen.insert(name.clone());
+                    batch.push((name, version_req));
+                }
+            }
+
+            if batch.is_empty() {
+                break;
+            }
+
+            // Resolve batch in parallel
+            let results = self.resolve_batch(&batch).await?;
+
+            // Collect transitive dependencies for next batch
+            for pkg in results {
+                for (dep_name, dep_version) in &pkg.dependencies {
+                    if !seen.contains(dep_name) && !self.resolved.contains_key(dep_name) {
+                        queue.push_back((dep_name.clone(), dep_version.clone()));
+                    }
+                }
+                self.resolved.insert(pkg.name.clone(), pkg);
+            }
         }
 
         Ok(self.resolved.values().cloned().collect())
     }
 
-    /// Resolve a single package and its transitive dependencies
-    pub async fn resolve_package(
-        &mut self,
-        name: &str,
-        version_req: &str,
-    ) -> Result<(), ResolverError> {
-        // Check if already resolved
-        if self.resolved.contains_key(name) {
-            return Ok(());
+    /// Resolve a batch of packages in parallel
+    async fn resolve_batch(
+        &self,
+        packages: &[(String, String)],
+    ) -> Result<Vec<ResolvedPackage>, ResolverError> {
+        let mut tasks = FuturesUnordered::new();
+
+        for (name, version_req) in packages {
+            let registry = self.registry.clone();
+            let name = name.clone();
+            let version_req = version_req.clone();
+
+            tasks.push(tokio::spawn(async move {
+                resolve_single(&registry, &name, &version_req).await
+            }));
         }
 
-        // Check for circular dependency
-        if self.in_progress.contains(name) {
-            return Err(ResolverError::CircularDependency(name.to_string()));
+        let mut results = Vec::new();
+        while let Some(result) = tasks.next().await {
+            let pkg = result
+                .map_err(|e| ResolverError::Registry(RegistryError::Network(e.to_string())))?
+                .map_err(ResolverError::Registry)?;
+            results.push(pkg);
         }
 
-        self.in_progress.insert(name.to_string());
-
-        // Resolve version
-        let version = self
-            .registry
-            .resolve_version(name, version_req)
-            .await
-            .map_err(ResolverError::Registry)?;
-
-        // Get package metadata (should be cached after resolve_version)
-        let metadata = self
-            .registry
-            .get_package(name)
-            .await
-            .map_err(ResolverError::Registry)?;
-
-        let version_info =
-            metadata
-                .versions
-                .get(&version)
-                .ok_or_else(|| ResolverError::VersionNotFound {
-                    name: name.to_string(),
-                    version: version.clone(),
-                })?;
-
-        // Store dependencies before recursive resolution
-        let deps = version_info.dependencies.clone().unwrap_or_default();
-        let tarball_url = version_info.dist.tarball.clone();
-        let integrity = version_info.dist.integrity.clone();
-
-        // Resolve transitive dependencies
-        for (dep_name, dep_version) in &deps {
-            // Use Box::pin for recursive async
-            Box::pin(self.resolve_package(dep_name, dep_version)).await?;
-        }
-
-        // Add to resolved
-        self.resolved.insert(
-            name.to_string(),
-            ResolvedPackage {
-                name: name.to_string(),
-                version,
-                tarball_url,
-                integrity,
-                dependencies: deps,
-            },
-        );
-
-        self.in_progress.remove(name);
-        Ok(())
+        Ok(results)
     }
 
     /// Get resolved packages
@@ -122,13 +114,45 @@ impl Resolver {
     /// Clear resolved packages (for re-resolution)
     pub fn clear(&mut self) {
         self.resolved.clear();
-        self.in_progress.clear();
+    }
+
+    /// Get the registry (for subsequent downloads)
+    pub fn registry(&self) -> &NpmRegistry {
+        &self.registry
     }
 
     /// Consume resolver and return the registry (with cached metadata)
     pub fn into_registry(self) -> NpmRegistry {
         self.registry
     }
+}
+
+/// Resolve a single package (called in parallel)
+async fn resolve_single(
+    registry: &NpmRegistry,
+    name: &str,
+    version_req: &str,
+) -> Result<ResolvedPackage, RegistryError> {
+    // Resolve version
+    let version = registry.resolve_version(name, version_req).await?;
+
+    // Get package metadata (should be cached after resolve_version)
+    let metadata = registry.get_package(name).await?;
+
+    let version_info = metadata
+        .versions
+        .get(&version)
+        .ok_or_else(|| RegistryError::NotFound(format!("{}@{}", name, version)))?;
+
+    let deps = version_info.dependencies.clone().unwrap_or_default();
+
+    Ok(ResolvedPackage {
+        name: name.to_string(),
+        version,
+        tarball_url: version_info.dist.tarball.clone(),
+        integrity: version_info.dist.integrity.clone(),
+        dependencies: deps,
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -152,7 +176,6 @@ mod tests {
         let registry = NpmRegistry::new();
         let resolver = Resolver::new(registry);
         assert!(resolver.resolved.is_empty());
-        assert!(resolver.in_progress.is_empty());
     }
 
     #[tokio::test]
@@ -167,7 +190,6 @@ mod tests {
         let result = resolver.resolve(&deps).await;
         if let Ok(packages) = result {
             assert!(!packages.is_empty());
-            // is-odd depends on is-number, so we should have both
             let names: Vec<_> = packages.iter().map(|p| p.name.as_str()).collect();
             assert!(names.contains(&"is-odd"));
         }
@@ -179,13 +201,11 @@ mod tests {
         let registry = NpmRegistry::new();
         let mut resolver = Resolver::new(registry);
 
-        // chalk has several transitive dependencies
         let mut deps = HashMap::new();
         deps.insert("chalk".to_string(), "^4.0.0".to_string());
 
         let result = resolver.resolve(&deps).await;
         if let Ok(packages) = result {
-            // Should have chalk and its dependencies
             assert!(packages.len() > 1);
             let names: Vec<_> = packages.iter().map(|p| p.name.as_str()).collect();
             assert!(names.contains(&"chalk"));

@@ -1,15 +1,26 @@
 //! npm registry client
 
-use base64::{Engine as _, engine::general_purpose};
+use crate::manifest_cache::{CachedManifest, ManifestCache};
+use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
 
-/// npm registry client
+/// Maximum number of retries for network requests
+const MAX_RETRIES: u32 = 3;
+/// Base delay for exponential backoff (ms)
+const RETRY_BASE_DELAY_MS: u64 = 100;
+
+/// npm registry client (thread-safe, cloneable)
+#[derive(Clone)]
 pub struct NpmRegistry {
     registry_url: String,
     client: reqwest::Client,
-    cache: HashMap<String, PackageMetadata>,
+    cache: Arc<RwLock<HashMap<String, PackageMetadata>>>,
+    manifest_cache: Arc<ManifestCache>,
 }
 
 impl NpmRegistry {
@@ -18,29 +29,59 @@ impl NpmRegistry {
     }
 
     pub fn with_registry(url: &str) -> Self {
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(50) // More connections for parallel downloads
+            .pool_idle_timeout(Duration::from_secs(90))
+            .http2_adaptive_window(true) // HTTP/2 flow control optimization
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_nodelay(true) // Disable Nagle's algorithm for lower latency
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
         Self {
             registry_url: url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
-            cache: HashMap::new(),
+            client,
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            manifest_cache: Arc::new(ManifestCache::new()),
         }
     }
 
-    /// Fetch package metadata from registry
-    pub async fn get_package(&mut self, name: &str) -> Result<PackageMetadata, RegistryError> {
-        // Check cache first
-        if let Some(pkg) = self.cache.get(name) {
-            return Ok(pkg.clone());
+    /// Fetch package metadata from registry (with ETag caching)
+    pub async fn get_package(&self, name: &str) -> Result<PackageMetadata, RegistryError> {
+        // 1. Check memory cache first
+        {
+            let cache = self.cache.read().await;
+            if let Some(pkg) = cache.get(name) {
+                return Ok(pkg.clone());
+            }
         }
+
+        // 2. Check disk cache for ETag
+        let disk_cached = self.manifest_cache.get(name);
+        let (etag, cached_data) = match &disk_cached {
+            Some(cached) => (cached.etag.clone(), Some(cached.data.clone())),
+            None => (None, None),
+        };
 
         let url = format!("{}/{}", self.registry_url, encode_package_name(name));
 
+        // 3. Send request with conditional ETag header
         let response = self
-            .client
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
+            .request_with_etag(&url, etag.as_deref())
             .await
             .map_err(|e| RegistryError::Network(e.to_string()))?;
+
+        // 5. Handle 304 Not Modified - use cached data
+        if response.status() == 304 {
+            if let Some(data) = cached_data {
+                // Update memory cache
+                let mut cache = self.cache.write().await;
+                cache.insert(name.to_string(), data.clone());
+                return Ok(data);
+            }
+            // Shouldn't happen - 304 without cached data
+        }
 
         if response.status() == 404 {
             return Err(RegistryError::NotFound(name.to_string()));
@@ -50,18 +91,42 @@ impl NpmRegistry {
             return Err(RegistryError::Http(response.status().as_u16()));
         }
 
+        // 6. Extract new ETag from response
+        let new_etag = response
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
         let metadata: PackageMetadata = response
             .json()
             .await
             .map_err(|e| RegistryError::Parse(e.to_string()))?;
 
-        self.cache.insert(name.to_string(), metadata.clone());
+        // 7. Save to disk cache
+        self.manifest_cache
+            .set(
+                name,
+                &CachedManifest {
+                    etag: new_etag,
+                    last_modified: None,
+                    data: metadata.clone(),
+                },
+            )
+            .ok(); // Ignore disk cache errors
+
+        // 8. Update memory cache
+        {
+            let mut cache = self.cache.write().await;
+            cache.insert(name.to_string(), metadata.clone());
+        }
+
         Ok(metadata)
     }
 
     /// Resolve a package version to a specific version string
     pub async fn resolve_version(
-        &mut self,
+        &self,
         name: &str,
         version_req: &str,
     ) -> Result<String, RegistryError> {
@@ -72,8 +137,11 @@ impl NpmRegistry {
             return Ok(resolved.clone());
         }
 
+        // Normalize npm version requirement to semver format
+        let normalized = normalize_version_req(version_req);
+
         // Parse version requirement
-        let req = semver::VersionReq::parse(version_req)
+        let req = semver::VersionReq::parse(&normalized)
             .map_err(|e| RegistryError::InvalidVersion(e.to_string()))?;
 
         // Find best matching version
@@ -96,56 +164,155 @@ impl NpmRegistry {
             })
     }
 
-    /// Download package tarball
+    /// Download package tarball with retry
     pub async fn download_tarball(
         &self,
         name: &str,
         version: &str,
     ) -> Result<Vec<u8>, RegistryError> {
-        let metadata = self
-            .cache
-            .get(name)
-            .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
+        let (tarball_url, integrity) = {
+            let cache = self.cache.read().await;
+            let metadata = cache
+                .get(name)
+                .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
 
-        let version_info = metadata
-            .versions
-            .get(version)
-            .ok_or_else(|| RegistryError::NotFound(format!("{}@{}", name, version)))?;
+            let version_info = metadata
+                .versions
+                .get(version)
+                .ok_or_else(|| RegistryError::NotFound(format!("{}@{}", name, version)))?;
 
-        let tarball_url = &version_info.dist.tarball;
+            (
+                version_info.dist.tarball.clone(),
+                version_info.dist.integrity.clone(),
+            )
+        };
 
-        let response = self
-            .client
-            .get(tarball_url)
-            .send()
-            .await
-            .map_err(|e| RegistryError::Network(e.to_string()))?;
-
-        if !response.status().is_success() {
-            return Err(RegistryError::Http(response.status().as_u16()));
-        }
-
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| RegistryError::Network(e.to_string()))?;
+        let bytes = self.download_with_retry(&tarball_url).await?;
 
         // Verify integrity if available
-        if let Some(integrity) = &version_info.dist.integrity {
+        if let Some(integrity) = &integrity {
             verify_integrity(&bytes, integrity)?;
         }
 
-        Ok(bytes.to_vec())
+        Ok(bytes)
+    }
+
+    /// Download raw bytes with retry
+    pub async fn download_with_retry(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
+        let mut last_error = None;
+
+        for attempt in 0..MAX_RETRIES {
+            match self.client.get(url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.bytes().await {
+                        Ok(bytes) => return Ok(bytes.to_vec()),
+                        Err(e) => {
+                            last_error = Some(RegistryError::Network(e.to_string()));
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    last_error = Some(RegistryError::Http(resp.status().as_u16()));
+                }
+                Err(e) => {
+                    last_error = Some(RegistryError::Network(e.to_string()));
+                }
+            }
+
+            // Exponential backoff
+            if attempt < MAX_RETRIES - 1 {
+                let delay = Duration::from_millis(RETRY_BASE_DELAY_MS * 2u64.pow(attempt));
+                tokio::time::sleep(delay).await;
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| RegistryError::Network("Unknown error".to_string())))
+    }
+
+    /// Make HTTP request with retry (kept for potential future use)
+    #[allow(dead_code)]
+    async fn request_with_retry(
+        &self,
+        url: &str,
+        accept: &str,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let mut last_error = None;
+
+        for attempt in 0..MAX_RETRIES {
+            match self.client.get(url).header("Accept", accept).send().await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    last_error = Some(e);
+                }
+            }
+
+            // Exponential backoff
+            if attempt < MAX_RETRIES - 1 {
+                let delay = Duration::from_millis(RETRY_BASE_DELAY_MS * 2u64.pow(attempt));
+                tokio::time::sleep(delay).await;
+            }
+        }
+
+        Err(last_error.expect("Should have at least one error"))
+    }
+
+    /// Make HTTP request with ETag conditional header and retry
+    async fn request_with_etag(
+        &self,
+        url: &str,
+        etag: Option<&str>,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let mut last_error = None;
+
+        for attempt in 0..MAX_RETRIES {
+            let mut request = self
+                .client
+                .get(url)
+                .header("Accept", "application/json");
+
+            if let Some(etag) = etag {
+                request = request.header("If-None-Match", etag);
+            }
+
+            match request.send().await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    last_error = Some(e);
+                }
+            }
+
+            // Exponential backoff
+            if attempt < MAX_RETRIES - 1 {
+                let delay = Duration::from_millis(RETRY_BASE_DELAY_MS * 2u64.pow(attempt));
+                tokio::time::sleep(delay).await;
+            }
+        }
+
+        Err(last_error.expect("Should have at least one error"))
     }
 
     /// Get cached package metadata (without network request)
-    pub fn get_cached(&self, name: &str) -> Option<&PackageMetadata> {
-        self.cache.get(name)
+    pub async fn get_cached(&self, name: &str) -> Option<PackageMetadata> {
+        let cache = self.cache.read().await;
+        cache.get(name).cloned()
     }
 
     /// Clear the package cache
-    pub fn clear_cache(&mut self) {
-        self.cache.clear();
+    pub async fn clear_cache(&self) {
+        let mut cache = self.cache.write().await;
+        cache.clear();
+    }
+
+    /// Get version info for a specific package version (from cache)
+    pub async fn get_version_info(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Option<VersionInfo> {
+        let cache = self.cache.read().await;
+        cache
+            .get(name)
+            .and_then(|m| m.versions.get(version).cloned())
     }
 }
 
@@ -225,6 +392,57 @@ fn encode_package_name(name: &str) -> String {
     }
 }
 
+/// Normalize npm version requirement to semver format
+///
+/// npm allows various formats that semver crate doesn't understand:
+/// - `>= 2.1.2 < 3` (space between comparators) -> `>=2.1.2, <3`
+/// - `1.x` -> `1.*`
+/// - `*` stays as `*`
+fn normalize_version_req(req: &str) -> String {
+    let req = req.trim();
+
+    // Handle empty or wildcard
+    if req.is_empty() || req == "*" || req == "latest" {
+        return "*".to_string();
+    }
+
+    // Handle x-ranges: 1.x, 1.2.x -> use wildcards
+    let req = req.replace(".x", ".*");
+
+    // Handle space-separated comparators like ">= 2.1.2 < 3"
+    // Need to convert to comma-separated for semver crate
+    let mut result = String::new();
+    let mut chars = req.chars().peekable();
+    let mut last_was_version = false;
+
+    while let Some(c) = chars.next() {
+        if c == ' ' {
+            // Check if next char starts a new comparator
+            if let Some(&next) = chars.peek() {
+                if next == '<' || next == '>' || next == '=' || next == '^' || next == '~' {
+                    // This space separates comparators, use comma
+                    if last_was_version {
+                        result.push_str(", ");
+                        last_was_version = false;
+                    }
+                    continue;
+                }
+            }
+            // Regular space, skip if after operator
+            if !last_was_version {
+                continue;
+            }
+            result.push(c);
+        } else {
+            result.push(c);
+            // Track if we just added a version character (digit or dot)
+            last_was_version = c.is_ascii_digit() || c == '.';
+        }
+    }
+
+    result
+}
+
 /// Verify package integrity using SHA-512
 fn verify_integrity(data: &[u8], integrity: &str) -> Result<(), RegistryError> {
     // Format: sha512-base64hash
@@ -260,6 +478,29 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_version_req() {
+        // Basic versions
+        assert_eq!(normalize_version_req("^1.0.0"), "^1.0.0");
+        assert_eq!(normalize_version_req("~1.0.0"), "~1.0.0");
+        assert_eq!(normalize_version_req("1.0.0"), "1.0.0");
+
+        // Wildcards
+        assert_eq!(normalize_version_req("*"), "*");
+        assert_eq!(normalize_version_req(""), "*");
+        assert_eq!(normalize_version_req("1.x"), "1.*");
+        assert_eq!(normalize_version_req("1.2.x"), "1.2.*");
+
+        // Space-separated comparators (npm style)
+        assert_eq!(normalize_version_req(">= 2.1.2 < 3"), ">=2.1.2, <3");
+        assert_eq!(normalize_version_req(">=1.0.0 <2.0.0"), ">=1.0.0, <2.0.0");
+        assert_eq!(normalize_version_req(">= 1.0.0 < 2.0.0"), ">=1.0.0, <2.0.0");
+
+        // Already comma-separated (comma is preserved, spacing may vary)
+        let result = normalize_version_req(">=1.0.0, <2.0.0");
+        assert!(result.contains(">=1.0.0") && result.contains("<2.0.0"));
+    }
+
+    #[test]
     fn test_registry_default() {
         let registry = NpmRegistry::default();
         assert_eq!(registry.registry_url, "https://registry.npmjs.org");
@@ -271,10 +512,17 @@ mod tests {
         assert_eq!(registry.registry_url, "https://npm.pkg.github.com");
     }
 
+    #[test]
+    fn test_registry_clone() {
+        let registry = NpmRegistry::new();
+        let cloned = registry.clone();
+        assert_eq!(registry.registry_url, cloned.registry_url);
+    }
+
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_get_package() {
-        let mut registry = NpmRegistry::new();
+        let registry = NpmRegistry::new();
         let result = registry.get_package("lodash").await;
         if let Ok(pkg) = result {
             assert_eq!(pkg.name, "lodash");
@@ -286,7 +534,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_resolve_version() {
-        let mut registry = NpmRegistry::new();
+        let registry = NpmRegistry::new();
         // First fetch the package
         let _ = registry.get_package("lodash").await;
         // Then resolve a version
@@ -299,7 +547,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_resolve_latest_tag() {
-        let mut registry = NpmRegistry::new();
+        let registry = NpmRegistry::new();
         let result = registry.resolve_version("lodash", "latest").await;
         assert!(result.is_ok());
     }
@@ -307,7 +555,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_scoped_package() {
-        let mut registry = NpmRegistry::new();
+        let registry = NpmRegistry::new();
         let result = registry.get_package("@types/node").await;
         if let Ok(pkg) = result {
             assert_eq!(pkg.name, "@types/node");

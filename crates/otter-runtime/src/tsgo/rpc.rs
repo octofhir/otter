@@ -9,10 +9,12 @@
 //! - Name and payload are binary arrays
 
 use crate::error::{JscError, JscResult};
+use regex::Regex;
 use serde::de::DeserializeOwned;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::OnceLock;
 
 /// Find TypeScript lib file in various locations.
 ///
@@ -63,6 +65,89 @@ fn find_typescript_lib_file(lib_name: &str, search_root: Option<&Path>) -> Optio
     }
 
     None
+}
+
+fn should_rewrite_node_prefix(file_path: &Path) -> bool {
+    if file_path.to_string_lossy().contains("node_modules") {
+        return false;
+    }
+
+    let file_name = match file_path.file_name().and_then(|n| n.to_str()) {
+        Some(name) => name,
+        None => return false,
+    };
+
+    if file_name.ends_with(".d.ts") {
+        return false;
+    }
+
+    matches!(
+        file_path.extension().and_then(|ext| ext.to_str()),
+        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs")
+    )
+}
+
+fn rewrite_node_prefix(contents: &str) -> Option<String> {
+    static REWRITE_PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+
+    let patterns = REWRITE_PATTERNS.get_or_init(|| {
+        vec![
+            Regex::new(r#"(\bfrom\s+)(['"])node:"#).expect("valid regex"),
+            Regex::new(r#"(\bimport\s+)(['"])node:"#).expect("valid regex"),
+            Regex::new(r#"(\bimport\s*\(\s*)(['"])node:"#).expect("valid regex"),
+            Regex::new(r#"(\brequire\s*\(\s*)(['"])node:"#).expect("valid regex"),
+        ]
+    });
+
+    let mut out = contents.to_string();
+    let mut changed = false;
+
+    for pattern in patterns {
+        if pattern.is_match(&out) {
+            out = pattern.replace_all(&out, "$1$2").to_string();
+            changed = true;
+        }
+    }
+
+    if changed { Some(out) } else { None }
+}
+
+fn find_node_types_index(start_dir: &Path) -> Option<PathBuf> {
+    let mut current = start_dir;
+
+    loop {
+        let candidate = current.join("node_modules/@types/node/index.d.ts");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+
+        current = current.parent()?;
+    }
+}
+
+fn maybe_prepend_node_types(contents: String, file_path: &Path, had_node_prefix: bool) -> String {
+    if !had_node_prefix {
+        return contents;
+    }
+
+    let dir = match file_path.parent() {
+        Some(dir) => dir,
+        None => return contents,
+    };
+
+    let index_path = match find_node_types_index(dir) {
+        Some(path) => path,
+        None => return contents,
+    };
+
+    let reference_path = index_path.to_string_lossy().replace('\\', "/");
+    let reference_line = format!("/// <reference path=\"{}\" />\n", reference_path);
+
+    if contents.starts_with(&reference_line) {
+        contents
+    } else {
+        format!("{}{}", reference_line, contents)
+    }
 }
 
 /// Message types for the RPC protocol.
@@ -261,8 +346,18 @@ impl TsgoChannel {
                 };
 
                 // Try to read the file
-                match actual_path.and_then(|p| std::fs::read_to_string(&p).ok()) {
-                    Some(contents) => {
+                match actual_path.and_then(|p| std::fs::read_to_string(&p).ok().map(|c| (p, c))) {
+                    Some((path, contents)) => {
+                        // tsgo does not resolve `node:` specifiers reliably, so strip the prefix
+                        // from import/export specifiers for user source files during type checks.
+                        let contents = if should_rewrite_node_prefix(&path) {
+                            let had_node_prefix = contents.contains("node:");
+                            let contents = rewrite_node_prefix(&contents).unwrap_or(contents);
+                            maybe_prepend_node_types(contents, &path, had_node_prefix)
+                        } else {
+                            contents
+                        };
+
                         Ok(serde_json::to_string(&contents).unwrap_or_else(|_| "null".to_string()))
                     }
                     None => {

@@ -105,6 +105,40 @@ fn test_default_export() {
     assert_eq!(result.to_string().unwrap(), "Hello, World!");
 }
 
+/// Test that `node:` built-ins can be imported in bundled modules.
+#[test]
+fn test_node_builtin_import_executes() {
+    let runtime = JscRuntime::new(JscConfig::default()).unwrap();
+
+    // Register a synthetic node:util module (the real one is provided by otter-node).
+    runtime
+        .eval(r#"__registerModule('util', { format: (s) => 'ok:' + s });"#)
+        .unwrap();
+
+    let mut deps = HashMap::new();
+    deps.insert("node:util".to_string(), "node:util".to_string());
+
+    let source = r#"
+        import { format } from 'node:util';
+        export const out = format('hi');
+    "#;
+
+    let transformed = transform_module(source, "file:///test/mod.js", &deps);
+    let wrapped = wrap_module("file:///test/mod.js", &transformed);
+
+    let bundle = format!(
+        "globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{}",
+        wrapped
+    );
+
+    runtime.eval(&bundle).unwrap();
+
+    let result = runtime
+        .eval(r#"__otter_modules["file:///test/mod.js"].out"#)
+        .unwrap();
+    assert_eq!(result.to_string().unwrap(), "ok:hi");
+}
+
 /// Test class exports
 #[test]
 fn test_class_export() {

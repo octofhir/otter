@@ -5,6 +5,7 @@ use clap::Args;
 use otter_engine::Capabilities;
 use otter_node::{
     create_buffer_extension, create_fs_extension, create_path_extension, create_test_extension,
+    create_url_extension,
 };
 use otter_runtime::{JscConfig, JscRuntime, needs_transpilation, transpile_typescript};
 use std::path::{Path, PathBuf};
@@ -26,9 +27,9 @@ pub struct TestCommand {
     #[arg(long = "allow-all", short = 'A')]
     pub allow_all: bool,
 
-    /// Skip type checking
-    #[arg(long = "no-check")]
-    pub no_check: bool,
+    /// Enable type checking
+    #[arg(long = "check")]
+    pub check: bool,
 
     /// Timeout per test in milliseconds
     #[arg(long, default_value_t = 30000)]
@@ -154,6 +155,7 @@ impl TestCommand {
         } else {
             Capabilities::none()
         };
+        runtime.register_extension(create_url_extension())?;
         runtime.register_extension(create_path_extension())?;
         runtime.register_extension(create_buffer_extension())?;
         runtime.register_extension(create_fs_extension(caps))?;

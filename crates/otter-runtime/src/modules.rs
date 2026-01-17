@@ -25,6 +25,11 @@
 use regex::{Captures, Regex};
 use std::collections::HashMap;
 
+fn node_builtin_expr(resolved: &str) -> Option<String> {
+    let name = resolved.strip_prefix("node:")?;
+    Some(format!("globalThis.__otter_node_builtins[\"{}\"]", name))
+}
+
 /// Transform import/export statements in module source.
 ///
 /// Converts ESM syntax to use the `__otter_modules` registry.
@@ -73,6 +78,12 @@ pub fn transform_module(
         let named = &caps[3];
         let specifier = &caps[4];
         let resolved = resolve(specifier);
+        if let Some(expr) = node_builtin_expr(&resolved) {
+            return format!(
+                "{}const {} = {};\n{}const {{{}}} = {};",
+                indent, default_name, expr, indent, named, expr
+            );
+        }
         format!(
             "{}const {} = __otter_modules[\"{}\"].default;\n{}const {{{}}} = __otter_modules[\"{}\"];",
             indent, default_name, resolved, indent, named, resolved
@@ -86,6 +97,9 @@ pub fn transform_module(
             let name = &caps[2];
             let specifier = &caps[3];
             let resolved = resolve(specifier);
+            if let Some(expr) = node_builtin_expr(&resolved) {
+                return format!("{}const {} = {};", indent, name, expr);
+            }
             format!(
                 "{}const {} = __otter_modules[\"{}\"].default;",
                 indent, name, resolved
@@ -100,6 +114,9 @@ pub fn transform_module(
             let names = &caps[2];
             let specifier = &caps[3];
             let resolved = resolve(specifier);
+            if let Some(expr) = node_builtin_expr(&resolved) {
+                return format!("{}const {{{}}} = {};", indent, names, expr);
+            }
             format!(
                 "{}const {{{}}} = __otter_modules[\"{}\"];",
                 indent, names, resolved
@@ -114,6 +131,9 @@ pub fn transform_module(
             let name = &caps[2];
             let specifier = &caps[3];
             let resolved = resolve(specifier);
+            if let Some(expr) = node_builtin_expr(&resolved) {
+                return format!("{}const {} = {};", indent, name, expr);
+            }
             format!(
                 "{}const {} = __otter_modules[\"{}\"];",
                 indent, name, resolved
@@ -127,6 +147,9 @@ pub fn transform_module(
             let indent = &caps[1];
             let specifier = &caps[2];
             let resolved = resolve(specifier);
+            if let Some(expr) = node_builtin_expr(&resolved) {
+                return format!("{}{};", indent, expr);
+            }
             format!("{}__otter_modules[\"{}\"];", indent, resolved)
         })
         .to_string();
@@ -139,6 +162,9 @@ pub fn transform_module(
         .replace_all(&result, |caps: &Captures| {
             let specifier = &caps[1];
             let resolved = resolve(specifier);
+            if let Some(expr) = node_builtin_expr(&resolved) {
+                return format!("Promise.resolve({})", expr);
+            }
             format!("Promise.resolve(__otter_modules[\"{}\"])", resolved)
         })
         .to_string();
@@ -242,21 +268,23 @@ pub fn transform_module(
             let names: Vec<&str> = caps[2].split(',').map(|s| s.trim()).collect();
             let specifier = &caps[3];
             let resolved = resolve(specifier);
+            let module_expr = node_builtin_expr(&resolved)
+                .unwrap_or_else(|| format!("__otter_modules[\"{}\"]", resolved));
             names
                 .iter()
                 .map(|name| {
                     if let Some((original, alias)) = name.split_once(" as ") {
                         format!(
-                            "{}__otter_exports.{} = __otter_modules[\"{}\"].{};",
+                            "{}__otter_exports.{} = {}.{};",
                             indent,
                             alias.trim(),
-                            resolved,
+                            module_expr,
                             original.trim()
                         )
                     } else {
                         format!(
-                            "{}__otter_exports.{} = __otter_modules[\"{}\"].{};",
-                            indent, name, resolved, name
+                            "{}__otter_exports.{} = {}.{};",
+                            indent, name, module_expr, name
                         )
                     }
                 })
@@ -271,9 +299,11 @@ pub fn transform_module(
             let indent = &caps[1];
             let specifier = &caps[2];
             let resolved = resolve(specifier);
+            let module_expr = node_builtin_expr(&resolved)
+                .unwrap_or_else(|| format!("__otter_modules[\"{}\"]", resolved));
             format!(
-                "{}Object.assign(__otter_exports, __otter_modules[\"{}\"] || {{}});",
-                indent, resolved
+                "{}Object.assign(__otter_exports, {} || {{}});",
+                indent, module_expr
             )
         })
         .to_string();
@@ -323,6 +353,89 @@ pub fn bundle_modules(modules: Vec<(&str, &str, &HashMap<String, String>)>) -> S
     }
 
     result
+}
+
+/// Module format for bundling
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleFormat {
+    /// ES Modules (import/export)
+    ESM,
+    /// CommonJS (require/module.exports)
+    CommonJS,
+}
+
+/// Information about a module for bundling
+pub struct ModuleInfo<'a> {
+    pub url: &'a str,
+    pub source: &'a str,
+    pub dependencies: &'a HashMap<String, String>,
+    pub format: ModuleFormat,
+    pub dirname: Option<&'a str>,
+    pub filename: Option<&'a str>,
+}
+
+/// Bundle multiple modules with mixed formats (ESM and CommonJS).
+///
+/// Modules must be provided in topological order (dependencies first).
+/// This function handles interoperability between ESM and CommonJS modules.
+pub fn bundle_modules_mixed(modules: Vec<ModuleInfo<'_>>) -> String {
+    let mut result = String::new();
+
+    // Initialize both module registries
+    result.push_str("globalThis.__otter_modules = globalThis.__otter_modules || {};\n");
+    result.push_str("globalThis.__otter_cjs_modules = globalThis.__otter_cjs_modules || {};\n\n");
+
+    // Add each module in order
+    for module in modules {
+        match module.format {
+            ModuleFormat::ESM => {
+                let transformed = transform_module(module.source, module.url, module.dependencies);
+                let wrapped = wrap_module(module.url, &transformed);
+                result.push_str(&wrapped);
+            }
+            ModuleFormat::CommonJS => {
+                let dirname = module.dirname.unwrap_or("");
+                let filename = module.filename.unwrap_or(module.url);
+                let wrapped = crate::commonjs::wrap_commonjs_module(
+                    module.url,
+                    module.source,
+                    dirname,
+                    filename,
+                );
+                result.push_str(&wrapped);
+
+                // Also register in ESM registry with __toESM wrapper for interop
+                result.push_str(&format!(
+                    r#"__otter_modules["{}"] = __toESM(__otter_cjs_modules["{}"]());
+"#,
+                    module.url, module.url
+                ));
+            }
+        }
+        result.push('\n');
+    }
+
+    result
+}
+
+/// Generate code to execute the entry module (supports both ESM and CJS).
+pub fn entry_execution_mixed(entry_url: &str, format: ModuleFormat) -> String {
+    match format {
+        ModuleFormat::ESM => entry_execution(entry_url),
+        ModuleFormat::CommonJS => format!(
+            r#"// Execute CommonJS entry module
+(function() {{
+    var mod = globalThis.__otter_cjs_modules["{}"];
+    if (mod) {{
+        mod();
+    }} else {{
+        throw new Error("Entry module not found: {}");
+    }}
+}})();
+"#,
+            entry_url, entry_url
+        ),
+    }
 }
 
 /// Generate code to execute the entry module.
@@ -478,6 +591,26 @@ mod tests {
     }
 
     #[test]
+    fn test_transform_node_builtin_import_named() {
+        let source = "import { format } from 'node:util';";
+        let mut deps = HashMap::new();
+        deps.insert("node:util".to_string(), "node:util".to_string());
+
+        let result = transform_module(source, "file:///project/main.js", &deps);
+        assert!(result.contains(r#"const { format } = globalThis.__otter_node_builtins["util"];"#));
+    }
+
+    #[test]
+    fn test_transform_node_builtin_dynamic_import() {
+        let source = "const mod = await import('node:util');";
+        let mut deps = HashMap::new();
+        deps.insert("node:util".to_string(), "node:util".to_string());
+
+        let result = transform_module(source, "file:///project/main.js", &deps);
+        assert!(result.contains(r#"Promise.resolve(globalThis.__otter_node_builtins["util"])"#));
+    }
+
+    #[test]
     fn test_transform_export_function() {
         let source = "export function greet(name) { return `Hello, ${name}`; }";
         let deps = HashMap::new();
@@ -522,5 +655,95 @@ mod tests {
         assert!(result.contains(
             r#"Object.assign(__otter_exports, __otter_modules["file:///project/utils.js"]"#
         ));
+    }
+
+    #[test]
+    fn test_bundle_modules_mixed_esm_only() {
+        let empty_deps = HashMap::new();
+
+        let modules = vec![ModuleInfo {
+            url: "file:///project/main.js",
+            source: "export const x = 1;",
+            dependencies: &empty_deps,
+            format: ModuleFormat::ESM,
+            dirname: None,
+            filename: None,
+        }];
+
+        let bundle = bundle_modules_mixed(modules);
+        assert!(bundle.contains("globalThis.__otter_modules"));
+        assert!(bundle.contains("globalThis.__otter_cjs_modules"));
+        assert!(bundle.contains(r#"__otter_modules["file:///project/main.js"]"#));
+    }
+
+    #[test]
+    fn test_bundle_modules_mixed_cjs_only() {
+        let empty_deps = HashMap::new();
+
+        let modules = vec![ModuleInfo {
+            url: "file:///project/lib.cjs",
+            source: "module.exports = { foo: 1 };",
+            dependencies: &empty_deps,
+            format: ModuleFormat::CommonJS,
+            dirname: Some("/project"),
+            filename: Some("/project/lib.cjs"),
+        }];
+
+        let bundle = bundle_modules_mixed(modules);
+        assert!(bundle.contains("__otter_cjs_modules[\"file:///project/lib.cjs\"]"));
+        // Should also register in ESM registry for interop
+        assert!(bundle.contains("__otter_modules[\"file:///project/lib.cjs\"]"));
+        assert!(bundle.contains("__toESM"));
+    }
+
+    #[test]
+    fn test_bundle_modules_mixed_interop() {
+        let mut esm_deps = HashMap::new();
+        esm_deps.insert(
+            "./lib.cjs".to_string(),
+            "file:///project/lib.cjs".to_string(),
+        );
+        let empty_deps = HashMap::new();
+
+        let modules = vec![
+            ModuleInfo {
+                url: "file:///project/lib.cjs",
+                source: "module.exports = { helper: () => 42 };",
+                dependencies: &empty_deps,
+                format: ModuleFormat::CommonJS,
+                dirname: Some("/project"),
+                filename: Some("/project/lib.cjs"),
+            },
+            ModuleInfo {
+                url: "file:///project/main.js",
+                source: "import lib from './lib.cjs';\nconsole.log(lib.helper());",
+                dependencies: &esm_deps,
+                format: ModuleFormat::ESM,
+                dirname: None,
+                filename: None,
+            },
+        ];
+
+        let bundle = bundle_modules_mixed(modules);
+        // CJS module registered
+        assert!(bundle.contains("__otter_cjs_modules[\"file:///project/lib.cjs\"]"));
+        // ESM interop wrapper
+        assert!(bundle.contains("__toESM(__otter_cjs_modules[\"file:///project/lib.cjs\"]())"));
+        // ESM module using the CJS import
+        assert!(bundle.contains(
+            r#"const lib = __otter_modules["file:///project/lib.cjs"].default;"#
+        ));
+    }
+
+    #[test]
+    fn test_entry_execution_mixed_esm() {
+        let code = entry_execution_mixed("file:///main.js", ModuleFormat::ESM);
+        assert!(code.contains("__otter_modules[\"file:///main.js\"]"));
+    }
+
+    #[test]
+    fn test_entry_execution_mixed_cjs() {
+        let code = entry_execution_mixed("file:///main.cjs", ModuleFormat::CommonJS);
+        assert!(code.contains("__otter_cjs_modules[\"file:///main.cjs\"]"));
     }
 }

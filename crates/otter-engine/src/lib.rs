@@ -37,10 +37,15 @@
 //! ```
 
 pub mod capabilities;
+pub mod env_store;
 pub mod graph;
 pub mod loader;
 
 pub use capabilities::{Capabilities, CapabilitiesBuilder, PermissionDenied};
+pub use env_store::{
+    parse_env_file, EnvFileError, EnvStoreBuilder, EnvWriteError, IsolatedEnvStore,
+    DEFAULT_DENY_PATTERNS,
+};
 pub use graph::{ModuleGraph, ModuleNode, parse_imports};
 pub use loader::{LoaderConfig, ModuleLoader, ResolvedModule, SourceType};
 

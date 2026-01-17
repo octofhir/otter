@@ -1,0 +1,16 @@
+{
+  "name": "benchmarks",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "otter run src/index.ts",
+    "dev": "otter run --watch src/index.ts",
+    "test": "otter test",
+    "check": "otter check src/**/*.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

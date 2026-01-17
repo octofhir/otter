@@ -3,7 +3,7 @@
 //! Provides topological sorting for correct module execution order
 //! and detects circular dependencies.
 
-use crate::loader::{ModuleLoader, ResolvedModule, SourceType};
+use crate::loader::{ModuleLoader, ModuleType, ResolvedModule, SourceType};
 use otter_runtime::{JscError, JscResult, transpile_typescript};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -16,6 +16,34 @@ pub struct ModuleNode {
     pub dependencies: Vec<String>,
     /// Compiled JavaScript (if source was TypeScript)
     pub compiled: Option<String>,
+}
+
+impl ModuleNode {
+    /// Get the module type (ESM or CommonJS)
+    pub fn module_type(&self) -> ModuleType {
+        self.module.module_type
+    }
+
+    /// Check if this is a CommonJS module
+    pub fn is_commonjs(&self) -> bool {
+        self.module.module_type.is_commonjs()
+    }
+
+    /// Check if this is an ESM module
+    pub fn is_esm(&self) -> bool {
+        self.module.module_type.is_esm()
+    }
+
+    /// Get the dirname for CommonJS __dirname
+    pub fn dirname(&self) -> Option<&str> {
+        let path = self.module.url.strip_prefix("file://")?;
+        std::path::Path::new(path).parent()?.to_str()
+    }
+
+    /// Get the filename for CommonJS __filename
+    pub fn filename(&self) -> Option<&str> {
+        self.module.url.strip_prefix("file://")
+    }
 }
 
 impl ModuleNode {
@@ -81,7 +109,8 @@ impl ModuleGraph {
         let dependencies = if module.url.starts_with("node:") {
             Vec::new()
         } else {
-            parse_imports(&module.source)
+            // Parse dependencies based on module type (ESM or CommonJS)
+            parse_dependencies(&module.source, module.module_type)
         };
 
         // Recursively load dependencies
@@ -181,7 +210,7 @@ impl ModuleGraph {
     }
 }
 
-/// Parse import statements from source
+/// Parse import statements from source (ESM)
 ///
 /// Extracts both static and dynamic imports.
 pub fn parse_imports(source: &str) -> Vec<String> {
@@ -219,6 +248,38 @@ pub fn parse_imports(source: &str) -> Vec<String> {
     }
 
     imports
+}
+
+/// Parse require statements from source (CommonJS)
+///
+/// Extracts static require() calls.
+pub fn parse_requires(source: &str) -> Vec<String> {
+    let mut requires = Vec::new();
+
+    // require('...') or require("...")
+    // Matches: require('module'), require("module")
+    // Does NOT match: require(variable), require(`template`)
+    let require_re = Regex::new(r#"require\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap();
+
+    for cap in require_re.captures_iter(source) {
+        let specifier = cap[1].to_string();
+        if !requires.contains(&specifier) {
+            requires.push(specifier);
+        }
+    }
+
+    requires
+}
+
+/// Parse dependencies from source based on module type
+///
+/// For ESM modules, parses import/export statements.
+/// For CommonJS modules, parses require() calls.
+pub fn parse_dependencies(source: &str, module_type: ModuleType) -> Vec<String> {
+    match module_type {
+        ModuleType::ESM => parse_imports(source),
+        ModuleType::CommonJS => parse_requires(source),
+    }
 }
 
 #[cfg(test)]
@@ -307,5 +368,75 @@ mod tests {
         assert!(imports.contains(&"https://esm.sh/bar".to_string()));
         assert!(imports.contains(&"./dynamic.js".to_string()));
         assert!(imports.contains(&"./baz.js".to_string()));
+    }
+
+    #[test]
+    fn test_parse_requires_basic() {
+        let source = r#"
+            const fs = require('fs');
+            const path = require("path");
+            const lib = require('./lib.cjs');
+        "#;
+
+        let requires = parse_requires(source);
+        assert_eq!(requires.len(), 3);
+        assert!(requires.contains(&"fs".to_string()));
+        assert!(requires.contains(&"path".to_string()));
+        assert!(requires.contains(&"./lib.cjs".to_string()));
+    }
+
+    #[test]
+    fn test_parse_requires_inline() {
+        let source = r#"
+            console.log(require('./config.json').version);
+            const { helper } = require('./utils');
+        "#;
+
+        let requires = parse_requires(source);
+        assert_eq!(requires.len(), 2);
+        assert!(requires.contains(&"./config.json".to_string()));
+        assert!(requires.contains(&"./utils".to_string()));
+    }
+
+    #[test]
+    fn test_parse_requires_no_duplicates() {
+        let source = r#"
+            const fs1 = require('fs');
+            const fs2 = require('fs');
+            require('fs');
+        "#;
+
+        let requires = parse_requires(source);
+        assert_eq!(requires.len(), 1);
+        assert!(requires.contains(&"fs".to_string()));
+    }
+
+    #[test]
+    fn test_parse_requires_scoped_packages() {
+        let source = r#"
+            const pkg = require('@scope/package');
+            const sub = require('@org/lib/subpath');
+        "#;
+
+        let requires = parse_requires(source);
+        assert_eq!(requires.len(), 2);
+        assert!(requires.contains(&"@scope/package".to_string()));
+        assert!(requires.contains(&"@org/lib/subpath".to_string()));
+    }
+
+    #[test]
+    fn test_parse_dependencies_esm() {
+        let source = "import foo from './foo.js';";
+        let deps = parse_dependencies(source, ModuleType::ESM);
+        assert_eq!(deps.len(), 1);
+        assert!(deps.contains(&"./foo.js".to_string()));
+    }
+
+    #[test]
+    fn test_parse_dependencies_commonjs() {
+        let source = "const foo = require('./foo.cjs');";
+        let deps = parse_dependencies(source, ModuleType::CommonJS);
+        assert_eq!(deps.len(), 1);
+        assert!(deps.contains(&"./foo.cjs".to_string()));
     }
 }

@@ -68,6 +68,7 @@ pub struct ResolvedModule {
     pub url: String,
     pub source: String,
     pub source_type: SourceType,
+    pub module_type: ModuleType,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +76,37 @@ pub enum SourceType {
     JavaScript,
     TypeScript,
     Json,
+}
+
+/// Module format type (ESM vs CommonJS)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModuleType {
+    /// ES Modules (import/export)
+    #[default]
+    ESM,
+    /// CommonJS (require/module.exports)
+    CommonJS,
+}
+
+impl ModuleType {
+    /// Detect module type from file extension
+    pub fn from_extension(ext: Option<&str>) -> Option<Self> {
+        match ext {
+            Some("cjs" | "cts") => Some(ModuleType::CommonJS),
+            Some("mjs" | "mts") => Some(ModuleType::ESM),
+            _ => None, // Need to check package.json
+        }
+    }
+
+    /// Check if this is CommonJS
+    pub fn is_commonjs(&self) -> bool {
+        matches!(self, ModuleType::CommonJS)
+    }
+
+    /// Check if this is ESM
+    pub fn is_esm(&self) -> bool {
+        matches!(self, ModuleType::ESM)
+    }
 }
 
 /// Module loader with caching and oxc-resolver integration
@@ -135,6 +167,9 @@ impl ModuleLoader {
         // Node.js built-in modules
         if specifier.starts_with("node:") {
             return Ok(specifier.to_string());
+        }
+        if is_supported_node_builtin(specifier) {
+            return Ok(format!("node:{}", specifier));
         }
 
         // Absolute URLs (https://, http://)
@@ -212,12 +247,14 @@ impl ModuleLoader {
         })?;
 
         let source_type = Self::source_type_from_path(&path);
+        let module_type = self.detect_module_type(&path);
 
         Ok(ResolvedModule {
             specifier: path.display().to_string(),
             url: format!("file://{}", path.display()),
             source,
             source_type,
+            module_type,
         })
     }
 
@@ -235,6 +272,7 @@ impl ModuleLoader {
                 url: url.to_string(),
                 source,
                 source_type: Self::source_type_from_url(url),
+                module_type: Self::module_type_from_url(url),
             });
         }
 
@@ -267,6 +305,7 @@ impl ModuleLoader {
             url: url.to_string(),
             source,
             source_type: Self::source_type_from_url(url),
+            module_type: Self::module_type_from_url(url),
         })
     }
 
@@ -277,6 +316,7 @@ impl ModuleLoader {
             url: format!("node:{}", name),
             source: String::new(),
             source_type: SourceType::JavaScript,
+            module_type: ModuleType::ESM, // Node builtins are exposed as ESM
         })
     }
 
@@ -306,6 +346,18 @@ impl ModuleLoader {
         }
     }
 
+    /// Determine module type from URL
+    fn module_type_from_url(url: &str) -> ModuleType {
+        if url.ends_with(".cjs") || url.ends_with(".cts") {
+            ModuleType::CommonJS
+        } else if url.ends_with(".mjs") || url.ends_with(".mts") {
+            ModuleType::ESM
+        } else {
+            // Remote modules are assumed to be ESM (e.g., esm.sh, skypack)
+            ModuleType::ESM
+        }
+    }
+
     /// Clear the in-memory cache
     pub async fn clear_cache(&self) {
         let mut cache = self.cache.write().await;
@@ -316,6 +368,71 @@ impl ModuleLoader {
     pub fn config(&self) -> &LoaderConfig {
         &self.config
     }
+
+    /// Detect module type for a given file path
+    pub fn detect_module_type(&self, path: &Path) -> ModuleType {
+        // 1. Check extension first - explicit extensions take priority
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if let Some(module_type) = ModuleType::from_extension(Some(ext)) {
+                return module_type;
+            }
+        }
+
+        // 2. Check nearest package.json "type" field
+        if let Some(pkg_type) = self.find_package_type(path) {
+            if pkg_type == "module" {
+                return ModuleType::ESM;
+            } else if pkg_type == "commonjs" {
+                return ModuleType::CommonJS;
+            }
+        }
+
+        // 3. Default to CommonJS (Node.js behavior for .js files)
+        ModuleType::CommonJS
+    }
+
+    /// Find the nearest package.json and return its "type" field value
+    fn find_package_type(&self, path: &Path) -> Option<String> {
+        let mut current = path.parent()?;
+
+        loop {
+            let pkg_path = current.join("package.json");
+            if pkg_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&pkg_path) {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(type_field) = json.get("type").and_then(|v| v.as_str()) {
+                            return Some(type_field.to_string());
+                        }
+                    }
+                }
+                // Found package.json but no "type" field - stop searching
+                return None;
+            }
+
+            match current.parent() {
+                Some(parent) if parent != current => current = parent,
+                _ => break,
+            }
+        }
+
+        None
+    }
+}
+
+fn is_supported_node_builtin(specifier: &str) -> bool {
+    matches!(
+        specifier,
+        "buffer"
+            | "child_process"
+            | "crypto"
+            | "events"
+            | "fs"
+            | "os"
+            | "path"
+            | "process"
+            | "test"
+            | "util"
+    )
 }
 
 /// Simple glob matching for URL patterns
@@ -345,6 +462,13 @@ mod tests {
         let loader = ModuleLoader::new(LoaderConfig::default());
         let result = loader.resolve("node:path", None).unwrap();
         assert_eq!(result, "node:path");
+    }
+
+    #[test]
+    fn test_resolve_supported_node_builtin_bare() {
+        let loader = ModuleLoader::new(LoaderConfig::default());
+        let result = loader.resolve("util", None).unwrap();
+        assert_eq!(result, "node:util");
     }
 
     #[test]
@@ -452,6 +576,77 @@ mod tests {
         assert_eq!(
             ModuleLoader::source_type_from_url("https://example.com/file.js"),
             SourceType::JavaScript
+        );
+    }
+
+    #[test]
+    fn test_module_type_from_extension() {
+        assert_eq!(
+            ModuleType::from_extension(Some("cjs")),
+            Some(ModuleType::CommonJS)
+        );
+        assert_eq!(
+            ModuleType::from_extension(Some("cts")),
+            Some(ModuleType::CommonJS)
+        );
+        assert_eq!(
+            ModuleType::from_extension(Some("mjs")),
+            Some(ModuleType::ESM)
+        );
+        assert_eq!(
+            ModuleType::from_extension(Some("mts")),
+            Some(ModuleType::ESM)
+        );
+        assert_eq!(ModuleType::from_extension(Some("js")), None);
+        assert_eq!(ModuleType::from_extension(Some("ts")), None);
+    }
+
+    #[test]
+    fn test_module_type_from_url() {
+        assert_eq!(
+            ModuleLoader::module_type_from_url("https://example.com/file.cjs"),
+            ModuleType::CommonJS
+        );
+        assert_eq!(
+            ModuleLoader::module_type_from_url("https://example.com/file.mjs"),
+            ModuleType::ESM
+        );
+        assert_eq!(
+            ModuleLoader::module_type_from_url("https://esm.sh/lodash"),
+            ModuleType::ESM
+        );
+    }
+
+    #[test]
+    fn test_detect_module_type_explicit_extension() {
+        let loader = ModuleLoader::new(LoaderConfig::default());
+
+        assert_eq!(
+            loader.detect_module_type(Path::new("/foo/bar.cjs")),
+            ModuleType::CommonJS
+        );
+        assert_eq!(
+            loader.detect_module_type(Path::new("/foo/bar.mjs")),
+            ModuleType::ESM
+        );
+        assert_eq!(
+            loader.detect_module_type(Path::new("/foo/bar.cts")),
+            ModuleType::CommonJS
+        );
+        assert_eq!(
+            loader.detect_module_type(Path::new("/foo/bar.mts")),
+            ModuleType::ESM
+        );
+    }
+
+    #[test]
+    fn test_detect_module_type_default_commonjs() {
+        let loader = ModuleLoader::new(LoaderConfig::default());
+
+        // .js without package.json defaults to CommonJS
+        assert_eq!(
+            loader.detect_module_type(Path::new("/nonexistent/path/file.js")),
+            ModuleType::CommonJS
         );
     }
 }

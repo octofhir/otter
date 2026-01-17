@@ -346,19 +346,32 @@ thread_local! {
 }
 
 pub(crate) fn register_context_event_loop(ctx: JSContextRef, event_loop: Arc<EventLoop>) {
+    let ctx_key = ctx as usize;
+    let global_key = unsafe { JSContextGetGlobalObject(ctx) as usize };
     EVENT_LOOP_MAP.with(|map| {
-        map.borrow_mut().insert(ctx as usize, event_loop);
+        let mut map = map.borrow_mut();
+        map.insert(ctx_key, event_loop.clone());
+        map.insert(global_key, event_loop);
     });
 }
 
 pub(crate) fn unregister_context_event_loop(ctx: JSContextRef) {
+    let ctx_key = ctx as usize;
+    let global_key = unsafe { JSContextGetGlobalObject(ctx) as usize };
     EVENT_LOOP_MAP.with(|map| {
-        map.borrow_mut().remove(&(ctx as usize));
+        let mut map = map.borrow_mut();
+        map.remove(&ctx_key);
+        map.remove(&global_key);
     });
 }
 
 pub(crate) fn event_loop_for_context(ctx: JSContextRef) -> Option<Arc<EventLoop>> {
-    EVENT_LOOP_MAP.with(|map| map.borrow().get(&(ctx as usize)).cloned())
+    let ctx_key = ctx as usize;
+    let global_key = unsafe { JSContextGetGlobalObject(ctx) as usize };
+    EVENT_LOOP_MAP.with(|map| {
+        let map = map.borrow();
+        map.get(&ctx_key).cloned().or_else(|| map.get(&global_key).cloned())
+    })
 }
 
 pub(crate) fn get_function_arg(

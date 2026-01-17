@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/otter-jsc-sys",
     "crates/otter-jsc-core",
+    "crates/otter-macros",
     "crates/otter-runtime",
     "crates/otter-engine",
     "crates/otter-node",

@@ -9,6 +9,9 @@
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int, c_uint};
 
+// WTF Timer implementation for bun-webkit integration
+pub mod wtf_timer;
+
 // Type aliases for JSC opaque pointers
 pub type JSContextGroupRef = *mut c_void;
 pub type JSContextRef = *mut c_void;
@@ -18,6 +21,15 @@ pub type JSClassRef = *mut c_void;
 pub type JSValueRef = *mut c_void;
 pub type JSObjectRef = *mut c_void;
 pub type JSPropertyNameArrayRef = *mut c_void;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OtterJscHeapStats {
+    pub heap_size: usize,
+    pub heap_capacity: usize,
+    pub extra_memory: usize,
+    pub array_buffer: usize,
+}
 
 // Property attributes
 pub type JSPropertyAttributes = c_uint;
@@ -48,12 +60,23 @@ pub type JSObjectCallAsFunctionCallback = Option<
     ) -> JSValueRef,
 >;
 
+unsafe extern "C" {
+    pub fn otter_jsc_heap_stats(ctx: JSContextRef, out: *mut OtterJscHeapStats) -> bool;
+}
+
 // FFI declarations - linking is handled by build.rs
 #[cfg(target_os = "macos")]
 #[link(name = "JavaScriptCore", kind = "framework")]
 unsafe extern "C" {
     // Context functions
+    pub fn JSContextGroupCreate() -> JSContextGroupRef;
+    pub fn JSContextGroupRelease(group: JSContextGroupRef);
+
     pub fn JSGlobalContextCreate(global_object_class: JSClassRef) -> JSGlobalContextRef;
+    pub fn JSGlobalContextCreateInGroup(
+        group: JSContextGroupRef,
+        global_object_class: JSClassRef,
+    ) -> JSGlobalContextRef;
     pub fn JSGlobalContextRetain(ctx: JSGlobalContextRef) -> JSGlobalContextRef;
     pub fn JSGlobalContextRelease(ctx: JSGlobalContextRef);
     pub fn JSContextGetGlobalObject(ctx: JSContextRef) -> JSObjectRef;

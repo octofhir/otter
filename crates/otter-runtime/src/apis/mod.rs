@@ -4,9 +4,12 @@
 //! - `console.*` - Logging (routed to tracing)
 //! - `fetch()` - Web standard HTTP client (via reqwest, with capabilities checking)
 //! - Timers - setTimeout, setInterval
+//! - AbortController/AbortSignal - Cancellation API
 
+pub mod abort;
 pub mod console;
 pub mod http;
+pub mod performance;
 pub mod timers;
 
 // Re-export permission checker for fetch
@@ -133,6 +136,8 @@ pub fn register_all_apis(ctx: JSContextRef) -> JscResult<()> {
     console::register_console_api(ctx)?;
     http::register_http_api(ctx)?;
     timers::register_timers_api(ctx)?;
+    performance::register_performance_api(ctx)?;
+    abort::register_abort_api(ctx)?;
     Ok(())
 }
 
@@ -143,5 +148,7 @@ pub fn register_apis_with_config(ctx: JSContextRef, enable_console: bool) -> Jsc
     }
     http::register_http_api(ctx)?;
     timers::register_timers_api(ctx)?;
+    performance::register_performance_api(ctx)?;
+    abort::register_abort_api(ctx)?;
     Ok(())
 }

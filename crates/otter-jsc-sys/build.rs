@@ -1,3 +1,4 @@
+use cc::Build;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -14,6 +15,8 @@ fn main() {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
 
     println!("cargo:rerun-if-env-changed=BUN_WEBKIT_VERSION");
+    println!("cargo:rerun-if-changed=src/heap_stats.cpp");
+    println!("cargo:rerun-if-changed=src/heap_stats_stub.c");
 
     match target_os.as_str() {
         "macos" => configure_macos(),
@@ -24,19 +27,44 @@ fn main() {
 }
 
 fn configure_macos() {
-    // macOS uses system JavaScriptCore framework
-    println!("cargo:rustc-link-lib=framework=JavaScriptCore");
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
 
-    if let Ok(sdk_path) = std::process::Command::new("xcrun")
-        .args(["--show-sdk-path"])
-        .output()
-    {
-        let sdk_path = String::from_utf8_lossy(&sdk_path.stdout);
-        let sdk_path = sdk_path.trim();
-        println!(
-            "cargo:rustc-link-search=framework={}/System/Library/Frameworks",
-            sdk_path
-        );
+    // Check if we should use system framework (for quick dev builds, no JIT)
+    // or bun-webkit (for production builds with JIT enabled)
+    let use_system_jsc = env::var("OTTER_USE_SYSTEM_JSC").is_ok();
+
+    if use_system_jsc {
+        // System JavaScriptCore - fast build, but NO JIT (interpreter only)
+        println!("cargo:warning=Using system JavaScriptCore (no JIT - slower runtime)");
+        println!("cargo:rustc-link-lib=framework=JavaScriptCore");
+
+        if let Ok(sdk_path) = std::process::Command::new("xcrun")
+            .args(["--show-sdk-path"])
+            .output()
+        {
+            let sdk_path = String::from_utf8_lossy(&sdk_path.stdout);
+            let sdk_path = sdk_path.trim();
+            println!(
+                "cargo:rustc-link-search=framework={}/System/Library/Frameworks",
+                sdk_path
+            );
+        }
+        compile_heap_stats_stub();
+    } else {
+        // bun-webkit with JIT enabled - slower build, but fast runtime
+        let arch = match target_arch.as_str() {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            _ => panic!("Unsupported architecture for bun-webkit: {}", target_arch),
+        };
+
+        let webkit_path = download_bun_webkit("macos", arch);
+        let include_dir = link_bun_webkit(&webkit_path, "macos");
+        if let Some(include_dir) = include_dir {
+            compile_heap_stats_cpp(&include_dir, "macos");
+        } else {
+            compile_heap_stats_stub();
+        }
     }
 }
 
@@ -49,7 +77,12 @@ fn configure_linux(target_arch: &str) {
     };
 
     let webkit_path = download_bun_webkit("linux", arch);
-    link_bun_webkit(&webkit_path, "linux");
+    let include_dir = link_bun_webkit(&webkit_path, "linux");
+    if let Some(include_dir) = include_dir {
+        compile_heap_stats_cpp(&include_dir, "linux");
+    } else {
+        compile_heap_stats_stub();
+    }
 }
 
 fn configure_windows(target_arch: &str) {
@@ -62,7 +95,12 @@ fn configure_windows(target_arch: &str) {
     };
 
     let webkit_path = download_bun_webkit("windows", arch);
-    link_bun_webkit(&webkit_path, "windows");
+    let include_dir = link_bun_webkit(&webkit_path, "windows");
+    if let Some(include_dir) = include_dir {
+        compile_heap_stats_cpp(&include_dir, "windows");
+    } else {
+        compile_heap_stats_stub();
+    }
 
     // Windows-specific system libraries
     println!("cargo:rustc-link-lib=winmm");
@@ -139,7 +177,7 @@ fn download_bun_webkit(os: &str, arch: &str) -> PathBuf {
     webkit_dir
 }
 
-fn link_bun_webkit(webkit_path: &PathBuf, os: &str) {
+fn link_bun_webkit(webkit_path: &PathBuf, os: &str) -> Option<PathBuf> {
     // Find the lib directory - bun-webkit extracts to a subdirectory
     let lib_dir = find_lib_dir(webkit_path);
 
@@ -192,13 +230,48 @@ fn link_bun_webkit(webkit_path: &PathBuf, os: &str) {
         println!("cargo:rustc-link-lib=dl");
         println!("cargo:rustc-link-lib=pthread");
         println!("cargo:rustc-link-lib=m");
+    } else if os == "macos" {
+        // macOS system frameworks and libraries required by bun-webkit
+        println!("cargo:rustc-link-lib=c++");
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=Security");
+        println!("cargo:rustc-link-lib=framework=SystemConfiguration");
+
+        // ICU libraries - use system ICU on macOS
+        // macOS 10.14+ has ICU in /usr/lib
+        println!("cargo:rustc-link-lib=icucore");
     }
 
     // Set include path for headers
     let include_dir = webkit_path.join("include");
     if include_dir.exists() {
         println!("cargo:include={}", include_dir.display());
+        return Some(include_dir);
     }
+
+    None
+}
+
+fn compile_heap_stats_cpp(include_dir: &PathBuf, os: &str) {
+    let mut build = Build::new();
+    build
+        .cpp(true)
+        .file("src/heap_stats.cpp")
+        .include(include_dir)
+        .flag_if_supported("-std=c++17");
+
+    if os == "macos" {
+        build.flag_if_supported("-stdlib=libc++");
+    }
+
+    build.compile("otter_jsc_heap_stats");
+}
+
+fn compile_heap_stats_stub() {
+    Build::new()
+        .file("src/heap_stats_stub.c")
+        .compile("otter_jsc_heap_stats");
 }
 
 fn find_lib_dir(webkit_path: &PathBuf) -> PathBuf {

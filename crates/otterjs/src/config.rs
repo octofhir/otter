@@ -24,7 +24,7 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 pub struct TypeScriptConfig {
     /// Enable type checking before running
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub check: bool,
 
     /// Enable strict mode
@@ -38,7 +38,7 @@ pub struct TypeScriptConfig {
 impl Default for TypeScriptConfig {
     fn default() -> Self {
         Self {
-            check: true,
+            check: false,
             strict: true,
             tsconfig: None,
         }
@@ -78,6 +78,10 @@ pub struct PermissionsConfig {
     /// Allowed environment variables
     #[serde(default)]
     pub allow_env: Vec<String>,
+}
+
+fn default_false() -> bool {
+    false
 }
 
 fn default_true() -> bool {
@@ -131,7 +135,7 @@ pub fn find_tsconfig_for_file(file_path: &Path) -> Option<PathBuf> {
 fn find_tsconfig_in_ancestors(start: &Path) -> Option<PathBuf> {
     let mut current = start.to_path_buf();
     loop {
-        // Check tsconfig.json first, then jsconfig.json (like Bun)
+        // Check tsconfig.json first, then jsconfig.json
         for name in &["tsconfig.json", "jsconfig.json"] {
             let config_path = current.join(name);
             if config_path.exists() {
@@ -154,7 +158,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert!(config.typescript.check);
+        assert!(!config.typescript.check);
         assert!(config.typescript.strict);
         assert!(config.permissions.allow_read.is_empty());
     }

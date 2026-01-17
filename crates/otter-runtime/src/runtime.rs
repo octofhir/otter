@@ -4,6 +4,7 @@
 //! and round-robin selection to support concurrent execution.
 
 use crate::apis::register_apis_with_config;
+use crate::bootstrap::register_bootstrap;
 use crate::context::JscContext;
 use crate::error::{JscError, JscResult};
 use crate::extension::Extension;
@@ -53,6 +54,9 @@ impl JscRuntime {
 
         // Register native APIs (conditionally enabling console based on config)
         register_apis_with_config(context.raw(), config.enable_console)?;
+
+        // Register runtime bootstrap (module registry helpers, etc.)
+        register_bootstrap(context.raw())?;
 
         Ok(Self { context, config })
     }

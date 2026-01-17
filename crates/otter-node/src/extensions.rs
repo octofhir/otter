@@ -2,106 +2,118 @@
 //!
 //! These extensions expose the Rust implementations to JavaScript.
 
-use crate::{buffer, crypto, fs, path, websocket};
+use crate::{buffer, crypto, fs, http_request, http_server, url, util, websocket};
 use otter_engine::Capabilities;
+use tokio::sync::mpsc::UnboundedSender;
 use otter_runtime::extension::{Extension, OpDecl, op_async, op_sync};
+use otter_runtime::memory::jsc_heap_stats;
+use otter_runtime::RuntimeContextHandle;
 use parking_lot::Mutex;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Create the node:path extension.
-///
-/// This module provides path manipulation utilities compatible with Node.js.
-pub fn create_path_extension() -> Extension {
-    Extension::new("path").with_ops(vec![
-        op_sync("join", |_ctx, args| {
-            let paths: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
-            Ok(json!(path::join(&paths)))
-        }),
-        op_sync("resolve", |_ctx, args| {
-            let paths: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
-            Ok(json!(path::resolve(&paths)))
-        }),
-        op_sync("dirname", |_ctx, args| {
-            let p = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            Ok(json!(path::dirname(p)))
-        }),
-        op_sync("basename", |_ctx, args| {
-            let p = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let suffix = args.get(1).and_then(|v| v.as_str());
-            Ok(json!(path::basename(p, suffix)))
-        }),
-        op_sync("extname", |_ctx, args| {
-            let p = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            Ok(json!(path::extname(p)))
-        }),
-        op_sync("isAbsolute", |_ctx, args| {
-            let p = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            Ok(json!(path::is_absolute(p)))
-        }),
-        op_sync("normalize", |_ctx, args| {
-            let p = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            Ok(json!(path::normalize(p)))
-        }),
-        op_sync("relative", |_ctx, args| {
-            let from = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let to = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            Ok(json!(path::relative(from, to)))
-        }),
-        op_sync("parse", |_ctx, args| {
-            let p = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let parsed = path::parse(p);
-            Ok(json!({
-                "root": parsed.root,
-                "dir": parsed.dir,
-                "base": parsed.base,
-                "ext": parsed.ext,
-                "name": parsed.name,
-            }))
-        }),
-        op_sync("format", |_ctx, args| {
-            let default = json!({});
-            let obj = args.first().unwrap_or(&default);
-            let parsed = path::ParsedPath {
-                root: obj
-                    .get("root")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                dir: obj
-                    .get("dir")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                base: obj
-                    .get("base")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                ext: obj
-                    .get("ext")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                name: obj
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            };
-            Ok(json!(path::format(&parsed)))
-        }),
-        op_sync("sep", |_ctx, _args| Ok(json!(path::sep().to_string()))),
-        op_sync("delimiter", |_ctx, _args| {
-            Ok(json!(path::delimiter().to_string()))
-        }),
-    ])
-}
+// NOTE: create_path_extension has been migrated to path_ext.rs using #[dive] macros
+// See path_ext.rs for the new implementation with cleaner architecture
 
 /// Create the node:buffer extension.
 ///
 /// This module provides Buffer class for binary data manipulation.
 pub fn create_buffer_extension() -> Extension {
+    let js_wrapper = r#"
+(function() {
+    'use strict';
+
+    // Buffer is represented as: { type: 'Buffer', data: number[] }
+    // This wrapper exposes a Node-like Buffer class and registers node:buffer.
+    class Buffer {
+        constructor(value) {
+            if (value && value.type === 'Buffer' && Array.isArray(value.data)) {
+                this.type = 'Buffer';
+                this.data = value.data;
+                return;
+            }
+            if (Array.isArray(value)) {
+                this.type = 'Buffer';
+                this.data = value.map((n) => n & 0xff);
+                return;
+            }
+            const empty = alloc(0, 0);
+            this.type = 'Buffer';
+            this.data = empty.data;
+        }
+
+        static alloc(size, fill) {
+            return new Buffer(alloc(size, fill ?? 0));
+        }
+
+        static from(data, encoding) {
+            if (data && data.type === 'Buffer' && Array.isArray(data.data)) {
+                return new Buffer(data);
+            }
+            if (data && data.data && Array.isArray(data.data)) {
+                return new Buffer({ type: 'Buffer', data: data.data });
+            }
+            return new Buffer(from(data, encoding || 'utf8'));
+        }
+
+        static concat(list, totalLength) {
+            const normalized = (list || []).map((v) => {
+                if (v && v.type === 'Buffer') return v;
+                if (v && v.data && Array.isArray(v.data)) return { type: 'Buffer', data: v.data };
+                return Buffer.from(v);
+            });
+            return new Buffer(concat(normalized, totalLength));
+        }
+
+        static isBuffer(value) {
+            return value && value.type === 'Buffer' && Array.isArray(value.data);
+        }
+
+        static byteLength(value, encoding) {
+            return byteLength(value, encoding || 'utf8');
+        }
+
+        toString(encoding, start, end) {
+            const len = this.data.length;
+            const s = start ?? 0;
+            const e = end ?? len;
+            return toString(this, encoding || 'utf8', s, e);
+        }
+
+        slice(start, end) {
+            return new Buffer(slice(this, start, end));
+        }
+
+        equals(other) {
+            return equals(this, other);
+        }
+
+        compare(other) {
+            return compare(this, other);
+        }
+
+        get length() {
+            return this.data.length;
+        }
+
+        [Symbol.iterator]() {
+            return this.data[Symbol.iterator]();
+        }
+    }
+
+    globalThis.Buffer = Buffer;
+
+    const bufferModule = { Buffer };
+    bufferModule.default = bufferModule;
+
+    if (globalThis.__registerModule) {
+        globalThis.__registerModule('buffer', bufferModule);
+        globalThis.__registerModule('node:buffer', bufferModule);
+    }
+})();
+"#;
+
     Extension::new("Buffer").with_ops(vec![
         op_sync("alloc", |_ctx, args| {
             let size = args.first().and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -308,6 +320,7 @@ pub fn create_buffer_extension() -> Extension {
             Ok(json!(buf1.compare(&buf2)))
         }),
     ])
+    .with_js(js_wrapper)
 }
 
 /// Create the node:fs extension with capability-based security.
@@ -822,7 +835,71 @@ pub fn create_fs_extension(capabilities: Capabilities) -> Extension {
         }
     }));
 
-    Extension::new("fs").with_ops(ops)
+    let js_wrapper = r#"
+(function() {
+    'use strict';
+
+    function callbackify(promiseFn) {
+        return function(...args) {
+            const cb = args.length && typeof args[args.length - 1] === 'function'
+                ? args.pop()
+                : null;
+
+            if (!cb) return promiseFn(...args);
+
+            promiseFn(...args).then(
+                (value) => cb(null, value),
+                (err) => cb(err)
+            );
+        };
+    }
+
+    const fsPromises = {
+        readFile: (...args) => readFile(...args),
+        writeFile: (...args) => writeFile(...args),
+        readdir: (...args) => readdir(...args),
+        stat: (...args) => stat(...args),
+        mkdir: (...args) => mkdir(...args),
+        rm: (...args) => rm(...args),
+        exists: (...args) => exists(...args),
+        rename: (...args) => rename(...args),
+        copyFile: (...args) => copyFile(...args),
+    };
+    fsPromises.default = fsPromises;
+
+    const fsModule = {
+        readFileSync: (...args) => readFileSync(...args),
+        writeFileSync: (...args) => writeFileSync(...args),
+        readdirSync: (...args) => readdirSync(...args),
+        statSync: (...args) => statSync(...args),
+        mkdirSync: (...args) => mkdirSync(...args),
+        rmSync: (...args) => rmSync(...args),
+        existsSync: (...args) => existsSync(...args),
+        copyFileSync: (...args) => copyFileSync(...args),
+
+        readFile: callbackify(readFile),
+        writeFile: callbackify(writeFile),
+        readdir: callbackify(readdir),
+        stat: callbackify(stat),
+        mkdir: callbackify(mkdir),
+        rm: callbackify(rm),
+        exists: callbackify(exists),
+        rename: callbackify(rename),
+        copyFile: callbackify(copyFile),
+
+        promises: fsPromises,
+    };
+    fsModule.default = fsModule;
+
+    if (globalThis.__registerModule) {
+        globalThis.__registerModule('fs', fsModule);
+        globalThis.__registerModule('node:fs', fsModule);
+        globalThis.__registerModule('node:fs/promises', fsPromises);
+    }
+})();
+"#;
+
+    Extension::new("fs").with_ops(ops).with_js(js_wrapper)
 }
 
 /// Create the node:test extension for test running.
@@ -1362,6 +1439,20 @@ pub fn create_test_extension() -> Extension {
             }
         }
     };
+
+    const testModule = {
+        describe: globalThis.describe,
+        it: globalThis.it,
+        test: globalThis.test,
+        run: globalThis.run,
+        assert: globalThis.assert,
+    };
+    testModule.default = testModule;
+
+    if (globalThis.__registerModule) {
+        globalThis.__registerModule('test', testModule);
+        globalThis.__registerModule('node:test', testModule);
+    }
 })();
 "#;
 
@@ -1736,6 +1827,21 @@ pub fn create_crypto_extension() -> Extension {
     // Aliases for compatibility
     globalThis.randomBytes = globalThis.crypto.randomBytes;
     globalThis.randomUUID = globalThis.crypto.randomUUID;
+
+    const cryptoModule = {
+        randomBytes: globalThis.crypto.randomBytes,
+        randomUUID: globalThis.crypto.randomUUID,
+        getRandomValues: globalThis.crypto.getRandomValues,
+        createHash: globalThis.crypto.createHash,
+        createHmac: globalThis.crypto.createHmac,
+        hash: globalThis.crypto.hash,
+    };
+    cryptoModule.default = cryptoModule;
+
+    if (globalThis.__registerModule) {
+        globalThis.__registerModule('crypto', cryptoModule);
+        globalThis.__registerModule('node:crypto', cryptoModule);
+    }
 })();
 "#;
 
@@ -2700,9 +2806,1448 @@ pub fn create_streams_extension() -> Extension {
     Extension::new("Streams").with_ops(ops).with_js(js_wrapper)
 }
 
+/// Create the events extension (EventEmitter).
+///
+/// This module provides Node.js-compatible EventEmitter class.
+pub fn create_events_extension() -> Extension {
+    use crate::events;
+
+    Extension::new("events").with_js(events::event_emitter_js())
+}
+
+/// Create the node:util extension.
+///
+/// Provides `util.promisify`, `util.inspect`, `util.format` (subset).
+pub fn create_util_extension() -> Extension {
+    Extension::new("util").with_js(util::util_module_js())
+}
+
+#[derive(Default)]
+struct MemoryUsage {
+    rss: u64,
+    heap_total: u64,
+    heap_used: u64,
+    external: u64,
+    array_buffers: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn memory_usage() -> MemoryUsage {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok();
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    if let Some(contents) = statm {
+        let mut parts = contents.split_whitespace();
+        let size = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let rss = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let rss_bytes = rss * page_size;
+        let size_bytes = size * page_size;
+        return MemoryUsage {
+            rss: rss_bytes,
+            heap_total: size_bytes,
+            heap_used: rss_bytes,
+            external: 0,
+            array_buffers: 0,
+        };
+    }
+    MemoryUsage::default()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn memory_usage() -> MemoryUsage {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    if result == 0 {
+        let rss = usage.ru_maxrss as u64;
+        return MemoryUsage {
+            rss,
+            heap_total: rss,
+            heap_used: rss,
+            external: 0,
+            array_buffers: 0,
+        };
+    }
+    MemoryUsage::default()
+}
+
+#[cfg(not(unix))]
+fn memory_usage() -> MemoryUsage {
+    MemoryUsage::default()
+}
+
+fn memory_usage_json(ctx: Option<RuntimeContextHandle>) -> serde_json::Value {
+    let mut usage = memory_usage();
+    if let Some(handle) = ctx {
+        if let Some(stats) = jsc_heap_stats(handle.ctx()) {
+            usage.heap_total = stats.heap_capacity;
+            usage.heap_used = stats.heap_size;
+            usage.external = stats.extra_memory;
+            usage.array_buffers = stats.array_buffer;
+        }
+    }
+    json!({
+        "rss": usage.rss,
+        "heapTotal": usage.heap_total,
+        "heapUsed": usage.heap_used,
+        "external": usage.external,
+        "arrayBuffers": usage.array_buffers,
+    })
+}
+
+/// Create the process extension.
+///
+/// This module exposes process-related helpers via ops.
+pub fn create_process_extension() -> Extension {
+    Extension::new("process").with_ops(vec![op_sync(
+        "__otter_process_memory_usage",
+        |ctx, _args| {
+            let handle = ctx
+                .state()
+                .get::<RuntimeContextHandle>()
+                .map(|h| *h);
+            Ok(memory_usage_json(handle))
+        },
+    )])
+}
+
+/// Create the os extension.
+///
+/// This module provides Node.js-compatible operating system utilities.
+pub fn create_os_extension() -> Extension {
+    use crate::os;
+
+    // Collect static OS info
+    let platform = os::platform();
+    let arch = os::arch();
+    let os_type = os::os_type().as_str();
+    let hostname = os::hostname();
+    let homedir = os::homedir();
+    let tmpdir = os::tmpdir();
+    let endianness = os::endianness();
+    let release = os::release();
+    let version = os::version();
+    let totalmem = os::totalmem();
+    let freemem = os::freemem();
+    let uptime = os::uptime();
+    let cpus = os::cpus();
+    let loadavg = os::loadavg();
+    let userinfo = os::userinfo();
+    let machine = os::machine();
+    let eol = os::eol();
+
+    // Create JSON for cpus
+    let cpus_json = serde_json::to_string(&cpus).unwrap_or_else(|_| "[]".to_string());
+    let userinfo_json = serde_json::to_string(&userinfo).unwrap_or_else(|_| "{}".to_string());
+
+    let devnull = if cfg!(windows) {
+        "\\\\.\\nul"
+    } else {
+        "/dev/null"
+    };
+
+    // Setup code to inject OS values
+    let setup_js = format!(
+        r#"
+globalThis.__os_platform = {platform:?};
+globalThis.__os_arch = {arch:?};
+globalThis.__os_type = {os_type:?};
+globalThis.__os_hostname = {hostname:?};
+globalThis.__os_homedir = {homedir:?};
+globalThis.__os_tmpdir = {tmpdir:?};
+globalThis.__os_endianness = {endianness:?};
+globalThis.__os_release = {release:?};
+globalThis.__os_version = {version:?};
+globalThis.__os_totalmem = {totalmem};
+globalThis.__os_freemem = {freemem};
+globalThis.__os_uptime = {uptime};
+globalThis.__os_cpus = {cpus_json};
+globalThis.__os_loadavg = [{loadavg_0}, {loadavg_1}, {loadavg_2}];
+globalThis.__os_userinfo = {userinfo_json};
+globalThis.__os_machine = {machine:?};
+globalThis.__os_eol = {eol:?};
+globalThis.__os_devnull = {devnull:?};
+"#,
+        platform = platform,
+        arch = arch,
+        os_type = os_type,
+        hostname = hostname,
+        homedir = homedir,
+        tmpdir = tmpdir,
+        endianness = endianness,
+        release = release,
+        version = version,
+        totalmem = totalmem,
+        freemem = freemem,
+        uptime = uptime,
+        cpus_json = cpus_json,
+        loadavg_0 = loadavg[0],
+        loadavg_1 = loadavg[1],
+        loadavg_2 = loadavg[2],
+        userinfo_json = userinfo_json,
+        machine = machine,
+        eol = eol,
+        devnull = devnull,
+    );
+
+    // Combine setup with module code
+    let full_js = format!("{}\n{}", setup_js, os::os_module_js());
+
+    Extension::new("os").with_js(&full_js)
+}
+
+/// Create the node:child_process extension.
+///
+/// This module provides process spawning and IPC capabilities.
+pub fn create_child_process_extension() -> Extension {
+    use crate::child_process::ChildProcessManager;
+
+    let manager = Arc::new(ChildProcessManager::new());
+
+    let mgr_spawn = manager.clone();
+    let mgr_spawn_sync = manager.clone();
+    let mgr_write = manager.clone();
+    let mgr_close = manager.clone();
+    let mgr_kill = manager.clone();
+    let mgr_pid = manager.clone();
+    let mgr_exit = manager.clone();
+    let mgr_signal = manager.clone();
+    let mgr_running = manager.clone();
+    let mgr_killed = manager.clone();
+    let mgr_ref = manager.clone();
+    let mgr_unref = manager.clone();
+    let mgr_poll = manager.clone();
+
+    let mut ops: Vec<OpDecl> = Vec::new();
+
+    // cpSpawn(command: string[], options?: object) -> id
+    ops.push(op_sync("cpSpawn", move |_ctx, args| {
+        let cmd_arr = args
+            .first()
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| otter_runtime::error::JscError::internal("cpSpawn requires command array"))?;
+
+        let command: Vec<String> = cmd_arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+
+        let options = parse_spawn_options(args.get(1));
+
+        let id = mgr_spawn
+            .spawn(&command, options)
+            .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+
+        Ok(json!(id))
+    }));
+
+    // cpSpawnSync(command: string[], options?: object) -> result
+    ops.push(op_sync("cpSpawnSync", move |_ctx, args| {
+        let cmd_arr = args
+            .first()
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| otter_runtime::error::JscError::internal("cpSpawnSync requires command array"))?;
+
+        let command: Vec<String> = cmd_arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+
+        let options = parse_spawn_options(args.get(1));
+        let result = mgr_spawn_sync.spawn_sync(&command, options);
+
+        Ok(json!({
+            "pid": result.pid,
+            "stdout": { "type": "Buffer", "data": result.stdout },
+            "stderr": { "type": "Buffer", "data": result.stderr },
+            "status": result.status,
+            "signal": result.signal,
+            "error": result.error,
+        }))
+    }));
+
+    // cpWriteStdin(id: number, data: Buffer) -> null
+    ops.push(op_sync("cpWriteStdin", move |_ctx, args| {
+        let id = args
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| otter_runtime::error::JscError::internal("cpWriteStdin requires id"))? as u32;
+
+        let data = extract_buffer_data(args.get(1))?;
+
+        mgr_write
+            .write_stdin(id, data)
+            .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+
+        Ok(json!(null))
+    }));
+
+    // cpCloseStdin(id: number) -> null
+    ops.push(op_sync("cpCloseStdin", move |_ctx, args| {
+        let id = args
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| otter_runtime::error::JscError::internal("cpCloseStdin requires id"))? as u32;
+
+        mgr_close
+            .close_stdin(id)
+            .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+
+        Ok(json!(null))
+    }));
+
+    // cpKill(id: number, signal?: string) -> boolean
+    ops.push(op_sync("cpKill", move |_ctx, args| {
+        let id = args
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| otter_runtime::error::JscError::internal("cpKill requires id"))? as u32;
+
+        let signal = args.get(1).and_then(|v| v.as_str());
+
+        let result = mgr_kill
+            .kill(id, signal)
+            .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+
+        Ok(json!(result))
+    }));
+
+    // cpPid(id: number) -> number | null
+    ops.push(op_sync("cpPid", move |_ctx, args| {
+        let id = args
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| otter_runtime::error::JscError::internal("cpPid requires id"))? as u32;
+
+        Ok(json!(mgr_pid.pid(id)))
+    }));
+
+    // cpExitCode(id: number) -> number | null
+    ops.push(op_sync("cpExitCode", move |_ctx, args| {
+        let id = args
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| otter_runtime::error::JscError::internal("cpExitCode requires id"))? as u32;
+
+        Ok(json!(mgr_exit.exit_code(id)))
+    }));
+
+    // cpSignalCode(id: number) -> string | null
+    ops.push(op_sync("cpSignalCode", move |_ctx, args| {
+        let id = args
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| otter_runtime::error::JscError::internal("cpSignalCode requires id"))? as u32;
+
+        Ok(json!(mgr_signal.signal_code(id)))
+    }));
+
+    // cpIsRunning(id: number) -> boolean
+    ops.push(op_sync("cpIsRunning", move |_ctx, args| {
+        let id = args
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| otter_runtime::error::JscError::internal("cpIsRunning requires id"))? as u32;
+
+        Ok(json!(mgr_running.is_running(id)))
+    }));
+
+    // cpIsKilled(id: number) -> boolean
+    ops.push(op_sync("cpIsKilled", move |_ctx, args| {
+        let id = args
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| otter_runtime::error::JscError::internal("cpIsKilled requires id"))? as u32;
+
+        Ok(json!(mgr_killed.is_killed(id)))
+    }));
+
+    // cpRef(id: number) -> null
+    ops.push(op_sync("cpRef", move |_ctx, args| {
+        let id = args
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| otter_runtime::error::JscError::internal("cpRef requires id"))? as u32;
+
+        mgr_ref.ref_process(id);
+        Ok(json!(null))
+    }));
+
+    // cpUnref(id: number) -> null
+    ops.push(op_sync("cpUnref", move |_ctx, args| {
+        let id = args
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| otter_runtime::error::JscError::internal("cpUnref requires id"))? as u32;
+
+        mgr_unref.unref_process(id);
+        Ok(json!(null))
+    }));
+
+    // cpPollEvents() -> array
+    ops.push(op_sync("cpPollEvents", move |_ctx, _args| {
+        let events = mgr_poll.poll_events();
+        let json_events: Vec<serde_json::Value> = events
+            .into_iter()
+            .map(|(id, event)| {
+                match event {
+                    crate::child_process::ChildProcessEvent::Spawn => {
+                        json!({"id": id, "type": "spawn"})
+                    }
+                    crate::child_process::ChildProcessEvent::Stdout(data) => {
+                        json!({"id": id, "type": "stdout", "data": {"type": "Buffer", "data": data}})
+                    }
+                    crate::child_process::ChildProcessEvent::Stderr(data) => {
+                        json!({"id": id, "type": "stderr", "data": {"type": "Buffer", "data": data}})
+                    }
+                    crate::child_process::ChildProcessEvent::Exit { code, signal } => {
+                        json!({"id": id, "type": "exit", "code": code, "signal": signal})
+                    }
+                    crate::child_process::ChildProcessEvent::Close { code, signal } => {
+                        json!({"id": id, "type": "close", "code": code, "signal": signal})
+                    }
+                    crate::child_process::ChildProcessEvent::Error(msg) => {
+                        json!({"id": id, "type": "error", "message": msg})
+                    }
+                    crate::child_process::ChildProcessEvent::Message(data) => {
+                        json!({"id": id, "type": "message", "data": data})
+                    }
+                }
+            })
+            .collect();
+
+        Ok(json!(json_events))
+    }));
+
+    // JavaScript wrapper code
+    let js_code = child_process_js();
+
+    Extension::new("child_process").with_ops(ops).with_js(&js_code)
+}
+
+/// Parse spawn options from JSON value
+fn parse_spawn_options(value: Option<&serde_json::Value>) -> crate::child_process::SpawnOptions {
+    use crate::child_process::{SpawnOptions, StdioConfig};
+
+    let Some(obj) = value.and_then(|v| v.as_object()) else {
+        return SpawnOptions::default();
+    };
+
+    let parse_stdio = |v: &serde_json::Value| -> StdioConfig {
+        match v.as_str() {
+            Some("pipe") => StdioConfig::Pipe,
+            Some("ignore") => StdioConfig::Ignore,
+            Some("inherit") => StdioConfig::Inherit,
+            _ => StdioConfig::Pipe,
+        }
+    };
+
+    SpawnOptions {
+        cwd: obj.get("cwd").and_then(|v| v.as_str()).map(String::from),
+        env: obj.get("env").and_then(|v| v.as_object()).map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        }),
+        stdin: obj.get("stdin").map(parse_stdio).unwrap_or(StdioConfig::Pipe),
+        stdout: obj.get("stdout").map(parse_stdio).unwrap_or(StdioConfig::Pipe),
+        stderr: obj.get("stderr").map(parse_stdio).unwrap_or(StdioConfig::Pipe),
+        shell: obj.get("shell").and_then(|v| {
+            if v.as_bool() == Some(true) {
+                Some("/bin/sh".to_string())
+            } else {
+                v.as_str().map(String::from)
+            }
+        }),
+        timeout: obj.get("timeout").and_then(|v| v.as_u64()),
+        detached: obj.get("detached").and_then(|v| v.as_bool()).unwrap_or(false),
+        ipc: obj.get("ipc").and_then(|v| v.as_bool()).unwrap_or(false),
+    }
+}
+
+/// Extract buffer data from JSON value
+fn extract_buffer_data(value: Option<&serde_json::Value>) -> Result<Vec<u8>, otter_runtime::error::JscError> {
+    let Some(v) = value else {
+        return Ok(Vec::new());
+    };
+
+    // Handle Buffer object: { type: "Buffer", data: [...] }
+    if let Some(obj) = v.as_object() {
+        if obj.get("type").and_then(|t| t.as_str()) == Some("Buffer") {
+            if let Some(data) = obj.get("data").and_then(|d| d.as_array()) {
+                return Ok(data.iter().filter_map(|b| b.as_u64().map(|n| n as u8)).collect());
+            }
+        }
+    }
+
+    // Handle string
+    if let Some(s) = v.as_str() {
+        return Ok(s.as_bytes().to_vec());
+    }
+
+    // Handle array of bytes
+    if let Some(arr) = v.as_array() {
+        return Ok(arr.iter().filter_map(|b| b.as_u64().map(|n| n as u8)).collect());
+    }
+
+    Ok(Vec::new())
+}
+
+/// JavaScript code for child_process module
+fn child_process_js() -> String {
+    r#"
+(function() {
+    'use strict';
+
+    const EventEmitter = globalThis.__EventEmitter || class EventEmitter {
+        constructor() { this._events = new Map(); }
+        on(event, listener) {
+            if (!this._events.has(event)) this._events.set(event, []);
+            this._events.get(event).push(listener);
+            return this;
+        }
+        emit(event, ...args) {
+            const listeners = this._events.get(event) || [];
+            listeners.forEach(fn => fn(...args));
+            return listeners.length > 0;
+        }
+        removeListener(event, listener) {
+            const listeners = this._events.get(event) || [];
+            const idx = listeners.indexOf(listener);
+            if (idx !== -1) listeners.splice(idx, 1);
+            return this;
+        }
+    };
+
+    // Track all processes for polling
+    const processes = new Map();
+
+    // === Subprocess class (Otter-native) ===
+    class Subprocess {
+        constructor(id, options = {}) {
+            this._id = id;
+            this._pid = cpPid(id);
+            this._exitCode = null;
+            this._signalCode = null;
+            this._exited = false;
+            this._onExit = options.onExit;
+
+            // Create exited promise
+            this._exitedPromise = new Promise((resolve, reject) => {
+                this._resolveExited = resolve;
+                this._rejectExited = reject;
+            });
+
+            // stdout as ReadableStream (if piped)
+            if (options.stdout !== 'ignore' && options.stdout !== 'inherit') {
+                this._stdoutChunks = [];
+                this.stdout = new ReadableStream({
+                    start: (controller) => {
+                        this._stdoutController = controller;
+                    }
+                });
+                // Add text() helper
+                this.stdout.text = async () => {
+                    const reader = this.stdout.getReader();
+                    const chunks = [];
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        chunks.push(value);
+                    }
+                    const decoder = new TextDecoder();
+                    return chunks.map(c => decoder.decode(c)).join('');
+                };
+            } else {
+                this.stdout = null;
+            }
+
+            // stderr as ReadableStream (if piped)
+            if (options.stderr !== 'ignore' && options.stderr !== 'inherit') {
+                this.stderr = new ReadableStream({
+                    start: (controller) => {
+                        this._stderrController = controller;
+                    }
+                });
+                this.stderr.text = async () => {
+                    const reader = this.stderr.getReader();
+                    const chunks = [];
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        chunks.push(value);
+                    }
+                    const decoder = new TextDecoder();
+                    return chunks.map(c => decoder.decode(c)).join('');
+                };
+            } else {
+                this.stderr = null;
+            }
+
+            // stdin as WritableStream (if piped)
+            if (options.stdin !== 'ignore' && options.stdin !== 'inherit') {
+                const id = this._id;
+                this.stdin = new WritableStream({
+                    write(chunk) {
+                        let data;
+                        if (typeof chunk === 'string') {
+                            data = new TextEncoder().encode(chunk);
+                        } else {
+                            data = chunk;
+                        }
+                        cpWriteStdin(id, Array.from(data));
+                    },
+                    close() {
+                        cpCloseStdin(id);
+                    }
+                });
+            } else {
+                this.stdin = null;
+            }
+
+            processes.set(id, this);
+        }
+
+        get pid() { return this._pid; }
+        get exited() { return this._exitedPromise; }
+        get exitCode() { return this._exitCode; }
+        get signalCode() { return this._signalCode; }
+
+        kill(signal) {
+            return cpKill(this._id, signal);
+        }
+
+        ref() {
+            cpRef(this._id);
+            return this;
+        }
+
+        unref() {
+            cpUnref(this._id);
+            return this;
+        }
+
+        _handleEvent(event) {
+            switch (event.type) {
+                case 'stdout':
+                    if (this._stdoutController) {
+                        const data = event.data.data || event.data;
+                        this._stdoutController.enqueue(new Uint8Array(data));
+                    }
+                    break;
+                case 'stderr':
+                    if (this._stderrController) {
+                        const data = event.data.data || event.data;
+                        this._stderrController.enqueue(new Uint8Array(data));
+                    }
+                    break;
+                case 'exit':
+                    this._exitCode = event.code;
+                    this._signalCode = event.signal;
+                    break;
+                case 'close':
+                    this._exited = true;
+                    if (this._stdoutController) {
+                        try { this._stdoutController.close(); } catch {}
+                    }
+                    if (this._stderrController) {
+                        try { this._stderrController.close(); } catch {}
+                    }
+                    if (this._onExit) {
+                        this._onExit(this, this._exitCode, this._signalCode, null);
+                    }
+                    this._resolveExited(this._exitCode ?? 0);
+                    processes.delete(this._id);
+                    break;
+                case 'error':
+                    if (this._onExit) {
+                        this._onExit(this, null, null, new Error(event.message));
+                    }
+                    this._rejectExited(new Error(event.message));
+                    processes.delete(this._id);
+                    break;
+            }
+        }
+    }
+
+    // === ChildProcess class (Node.js-style) ===
+    class ChildProcess extends EventEmitter {
+        constructor(id) {
+            super();
+            this._id = id;
+            this._pid = cpPid(id);
+            this._exitCode = null;
+            this._signalCode = null;
+            this._killed = false;
+
+            // Create stream-like objects
+            this.stdin = new ChildStdin(id);
+            this.stdout = new ChildReadable(id, 'stdout');
+            this.stderr = new ChildReadable(id, 'stderr');
+
+            processes.set(id, this);
+        }
+
+        get pid() { return this._pid; }
+        get exitCode() { return this._exitCode; }
+        get signalCode() { return this._signalCode; }
+        get killed() { return this._killed; }
+
+        kill(signal) {
+            const result = cpKill(this._id, signal);
+            if (result) this._killed = true;
+            return result;
+        }
+
+        ref() {
+            cpRef(this._id);
+            return this;
+        }
+
+        unref() {
+            cpUnref(this._id);
+            return this;
+        }
+
+        _handleEvent(event) {
+            switch (event.type) {
+                case 'spawn':
+                    this.emit('spawn');
+                    break;
+                case 'stdout':
+                    const stdoutData = event.data.data || event.data;
+                    this.stdout._push(Buffer.from(stdoutData));
+                    break;
+                case 'stderr':
+                    const stderrData = event.data.data || event.data;
+                    this.stderr._push(Buffer.from(stderrData));
+                    break;
+                case 'exit':
+                    this._exitCode = event.code;
+                    this._signalCode = event.signal;
+                    this.emit('exit', event.code, event.signal);
+                    break;
+                case 'close':
+                    this.emit('close', event.code, event.signal);
+                    processes.delete(this._id);
+                    break;
+                case 'error':
+                    this.emit('error', new Error(event.message));
+                    processes.delete(this._id);
+                    break;
+                case 'message':
+                    this.emit('message', event.data);
+                    break;
+            }
+        }
+
+        send(message) {
+            // IPC send - to be implemented
+            return true;
+        }
+    }
+
+    // Stdin stream for ChildProcess
+    class ChildStdin extends EventEmitter {
+        constructor(id) {
+            super();
+            this._id = id;
+            this._ended = false;
+        }
+
+        write(data, encoding, callback) {
+            if (this._ended) throw new Error('write after end');
+            let buffer;
+            if (typeof data === 'string') {
+                buffer = Buffer.from(data, encoding || 'utf8');
+            } else {
+                buffer = data;
+            }
+            cpWriteStdin(this._id, Array.from(buffer));
+            if (callback) queueMicrotask(callback);
+            return true;
+        }
+
+        end(data, encoding, callback) {
+            if (data) this.write(data, encoding);
+            this._ended = true;
+            cpCloseStdin(this._id);
+            if (callback) queueMicrotask(callback);
+        }
+    }
+
+    // Readable stream for stdout/stderr
+    class ChildReadable extends EventEmitter {
+        constructor(id, type) {
+            super();
+            this._id = id;
+            this._type = type;
+        }
+
+        _push(data) {
+            this.emit('data', data);
+        }
+    }
+
+    // === Public API ===
+
+    // Otter.spawn (Otter-native)
+    function otterSpawn(cmd, options = {}) {
+        const id = cpSpawn(cmd, options);
+        return new Subprocess(id, options);
+    }
+
+    // Otter.spawnSync (Otter-native)
+    function otterSpawnSync(cmd, options = {}) {
+        const result = cpSpawnSync(cmd, options);
+        return {
+            pid: result.pid,
+            stdout: result.stdout.data ? Buffer.from(result.stdout.data) : Buffer.from([]),
+            stderr: result.stderr.data ? Buffer.from(result.stderr.data) : Buffer.from([]),
+            status: result.status,
+            signal: result.signal,
+            error: result.error ? new Error(result.error) : null,
+        };
+    }
+
+    // Node.js spawn
+    function spawn(command, args, options) {
+        if (Array.isArray(args)) {
+            // spawn(command, args, options)
+        } else if (args && typeof args === 'object') {
+            options = args;
+            args = [];
+        } else {
+            args = [];
+            options = {};
+        }
+
+        const cmd = [command, ...(args || [])];
+        const id = cpSpawn(cmd, options || {});
+        return new ChildProcess(id);
+    }
+
+    // Node.js exec
+    function exec(command, options, callback) {
+        if (typeof options === 'function') {
+            callback = options;
+            options = {};
+        }
+        options = options || {};
+
+        const child = spawn(command, [], {
+            ...options,
+            shell: options.shell !== false ? (typeof options.shell === 'string' ? options.shell : '/bin/sh') : null,
+        });
+
+        let stdout = [];
+        let stderr = [];
+
+        child.stdout.on('data', (data) => stdout.push(data));
+        child.stderr.on('data', (data) => stderr.push(data));
+
+        child.on('close', (code, signal) => {
+            const stdoutBuf = Buffer.concat(stdout);
+            const stderrBuf = Buffer.concat(stderr);
+            if (callback) {
+                const err = code !== 0
+                    ? Object.assign(new Error(`Command failed: ${command}`), { code, signal })
+                    : null;
+                callback(err, stdoutBuf, stderrBuf);
+            }
+        });
+
+        child.on('error', (err) => {
+            if (callback) callback(err, '', '');
+        });
+
+        return child;
+    }
+
+    // Node.js execSync
+    function execSync(command, options) {
+        options = options || {};
+        const shell = options.shell !== false
+            ? (typeof options.shell === 'string' ? options.shell : '/bin/sh')
+            : null;
+
+        const result = cpSpawnSync([command], { ...options, shell });
+
+        if (result.error) {
+            throw new Error(result.error);
+        }
+
+        if (result.status !== 0) {
+            const err = new Error(`Command failed: ${command}`);
+            err.status = result.status;
+            err.signal = result.signal;
+            err.stderr = result.stderr.data ? Buffer.from(result.stderr.data) : Buffer.from([]);
+            throw err;
+        }
+
+        const stdout = result.stdout.data ? Buffer.from(result.stdout.data) : Buffer.from([]);
+        if (options.encoding === 'utf8' || options.encoding === 'utf-8') {
+            return stdout.toString('utf8');
+        }
+        return stdout;
+    }
+
+    // Node.js spawnSync
+    function spawnSync(command, args, options) {
+        if (Array.isArray(args)) {
+            // spawnSync(command, args, options)
+        } else if (args && typeof args === 'object') {
+            options = args;
+            args = [];
+        } else {
+            args = [];
+            options = {};
+        }
+
+        const cmd = [command, ...(args || [])];
+        return otterSpawnSync(cmd, options || {});
+    }
+
+    // Node.js execFile
+    function execFile(file, args, options, callback) {
+        if (typeof args === 'function') {
+            callback = args;
+            args = [];
+            options = {};
+        } else if (typeof options === 'function') {
+            callback = options;
+            options = {};
+        }
+
+        const child = spawn(file, args, options);
+
+        let stdout = [];
+        let stderr = [];
+
+        child.stdout.on('data', (data) => stdout.push(data));
+        child.stderr.on('data', (data) => stderr.push(data));
+
+        child.on('close', (code, signal) => {
+            const stdoutBuf = Buffer.concat(stdout);
+            const stderrBuf = Buffer.concat(stderr);
+            if (callback) {
+                const err = code !== 0
+                    ? Object.assign(new Error(`Command failed: ${file}`), { code, signal })
+                    : null;
+                callback(err, stdoutBuf, stderrBuf);
+            }
+        });
+
+        return child;
+    }
+
+    // Node.js execFileSync
+    function execFileSync(file, args, options) {
+        if (!Array.isArray(args)) {
+            options = args;
+            args = [];
+        }
+
+        const cmd = [file, ...(args || [])];
+        const result = cpSpawnSync(cmd, options || {});
+
+        if (result.error) {
+            throw new Error(result.error);
+        }
+
+        if (result.status !== 0) {
+            const err = new Error(`Command failed: ${file}`);
+            err.status = result.status;
+            err.signal = result.signal;
+            throw err;
+        }
+
+        return result.stdout.data ? Buffer.from(result.stdout.data) : Buffer.from([]);
+    }
+
+    // Node.js fork
+    function fork(modulePath, args, options) {
+        if (!Array.isArray(args)) {
+            options = args;
+            args = [];
+        }
+        options = options || {};
+
+        // fork is spawn with ipc: true and running otter
+        const execPath = options.execPath || 'otter';
+        const execArgs = options.execArgv || [];
+
+        const cmd = [execPath, ...execArgs, 'run', modulePath, ...(args || [])];
+        const id = cpSpawn(cmd, { ...options, ipc: true });
+        return new ChildProcess(id);
+    }
+
+    // Event loop polling
+    globalThis.__otter_cp_poll = function() {
+        const events = cpPollEvents();
+        for (const event of events) {
+            const proc = processes.get(event.id);
+            if (proc) {
+                proc._handleEvent(event);
+            }
+        }
+        return events.length;
+    };
+
+    // Register Otter.spawn
+    if (!globalThis.Otter) globalThis.Otter = {};
+    globalThis.Otter.spawn = otterSpawn;
+    globalThis.Otter.spawnSync = otterSpawnSync;
+
+    // Export child_process module
+    const childProcessModule = {
+        spawn,
+        spawnSync,
+        exec,
+        execSync,
+        execFile,
+        execFileSync,
+        fork,
+        ChildProcess,
+    };
+
+    // Register module
+    if (globalThis.__registerModule) {
+        globalThis.__registerModule('child_process', childProcessModule);
+        globalThis.__registerModule('node:child_process', childProcessModule);
+    }
+})();
+"#.to_string()
+}
+
+/// Create process IPC extension for child processes.
+///
+/// This extension provides the actual IPC functionality when running as a forked child.
+/// It enables `process.send()` and `process.on('message', ...)`.
+///
+/// # Arguments
+///
+/// * `ipc_channel` - The IPC channel connected to the parent process
+///
+/// # Example
+///
+/// ```no_run
+/// use otter_node::ipc::IpcChannel;
+/// use otter_node::create_process_ipc_extension;
+///
+/// // In child process, after detecting OTTER_IPC_FD
+/// let fd = std::env::var("OTTER_IPC_FD").unwrap().parse().unwrap();
+/// let channel = unsafe { IpcChannel::from_raw_fd(fd).unwrap() };
+/// let ext = create_process_ipc_extension(channel);
+/// ```
+#[cfg(unix)]
+pub fn create_process_ipc_extension(ipc_channel: crate::ipc::IpcChannel) -> Extension {
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let channel = Arc::new(Mutex::new(ipc_channel));
+    let channel_send = channel.clone();
+    let channel_recv = channel.clone();
+    let connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let connected_check = connected.clone();
+    let connected_disconnect = connected.clone();
+
+    let mut ops: Vec<OpDecl> = Vec::new();
+
+    // __otter_process_ipc_send(message) -> boolean
+    ops.push(op_async(
+        "__otter_process_ipc_send",
+        move |_ctx, args| {
+            let channel = channel_send.clone();
+            let msg = args
+                .first()
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+
+            Box::pin(async move {
+                let mut ch = channel.lock().await;
+                match ch.send(&msg).await {
+                    Ok(_) => Ok(json!(true)),
+                    Err(_) => Ok(json!(false)),
+                }
+            })
+        },
+    ));
+
+    // __otter_process_ipc_recv() -> message | null
+    ops.push(op_async(
+        "__otter_process_ipc_recv",
+        move |_ctx, _args| {
+            let channel = channel_recv.clone();
+
+            Box::pin(async move {
+                let mut ch = channel.lock().await;
+                match ch.recv().await {
+                    Ok(Some(msg)) => Ok(msg),
+                    Ok(None) | Err(_) => Ok(json!(null)),
+                }
+            })
+        },
+    ));
+
+    // __otter_process_ipc_connected() -> boolean
+    ops.push(op_sync("__otter_process_ipc_connected", move |_ctx, _args| {
+        Ok(json!(connected_check.load(std::sync::atomic::Ordering::Relaxed)))
+    }));
+
+    // __otter_process_ipc_disconnect() -> null
+    ops.push(op_sync("__otter_process_ipc_disconnect", move |_ctx, _args| {
+        connected_disconnect.store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(json!(null))
+    }));
+
+    // JavaScript to set up process.send and message polling
+    let js_code = r#"
+(function() {
+    'use strict';
+
+    if (!globalThis.process) return;
+
+    // Mark process as connected
+    process.connected = true;
+
+    // Override send to use IPC
+    process.send = function(message, _handle, _options, callback) {
+        if (typeof callback !== 'function' && typeof _handle === 'function') {
+            callback = _handle;
+        }
+        if (typeof callback !== 'function' && typeof _options === 'function') {
+            callback = _options;
+        }
+
+        return __otter_process_ipc_send(message)
+            .then((result) => {
+                if (callback) callback(null);
+                return result;
+            })
+            .catch((err) => {
+                if (callback) callback(err);
+                return false;
+            });
+    };
+
+    // Override disconnect
+    process.disconnect = function() {
+        __otter_process_ipc_disconnect();
+        process.connected = false;
+        process.emit('disconnect');
+    };
+
+    // Set up message polling
+    let pollInterval = null;
+    const pollMessages = async () => {
+        if (!process.connected) {
+            if (pollInterval) clearInterval(pollInterval);
+            return;
+        }
+
+        try {
+            const msg = await __otter_process_ipc_recv();
+            if (msg !== null) {
+                process.emit('message', msg);
+            }
+        } catch (e) {
+            console.error('IPC poll error:', e);
+        }
+    };
+
+    // Start polling when there are message listeners
+    const origOn = process.on.bind(process);
+    process.on = function(event, handler) {
+        if (event === 'message' && !pollInterval) {
+            pollInterval = setInterval(pollMessages, 10);
+        }
+        return origOn(event, handler);
+    };
+})();
+"#;
+
+    Extension::new("process_ipc")
+        .with_ops(ops)
+        .with_js(js_code)
+}
+
+/// Stub for non-Unix platforms
+#[cfg(not(unix))]
+pub fn create_process_ipc_extension(_ipc_channel: ()) -> Extension {
+    Extension::new("process_ipc")
+}
+
+/// Create the URL Web API extension.
+///
+/// This extension provides WHATWG URL Standard compliant URL and URLSearchParams
+/// classes using native Rust parsing via the `url` crate.
+pub fn create_url_extension() -> Extension {
+    let js_shim = url::url_module_js();
+
+    Extension::new("url")
+        .with_ops(vec![
+            // Parse a URL with optional base
+            op_sync("__otter_url_parse", |_ctx, args| {
+                let url_string = args.first().and_then(|v| v.as_str()).unwrap_or("");
+                let base = args.get(1).and_then(|v| v.as_str());
+
+                match url::UrlComponents::parse(url_string, base) {
+                    Ok(components) => Ok(serde_json::to_value(components).unwrap()),
+                    Err(e) => Ok(json!({ "error": e })),
+                }
+            }),
+            // Set a URL component
+            op_sync("__otter_url_set_component", |_ctx, args| {
+                let href = args.first().and_then(|v| v.as_str()).unwrap_or("");
+                let component_name = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                let value = args.get(2).and_then(|v| v.as_str()).unwrap_or("");
+
+                // Parse the current URL
+                let components = match url::UrlComponents::parse(href, None) {
+                    Ok(c) => c,
+                    Err(e) => return Ok(json!({ "error": e })),
+                };
+
+                // Set the component
+                match components.set_component(component_name, value) {
+                    Ok(updated) => Ok(serde_json::to_value(updated).unwrap()),
+                    Err(e) => Ok(json!({ "error": e })),
+                }
+            }),
+        ])
+        .with_js(js_shim)
+}
+
+/// Create the HTTP server extension for Otter.serve().
+///
+/// This extension provides a high-performance HTTP/HTTPS server with Bun-compatible API.
+/// Supports HTTP/1.1 and HTTP/2 with ALPN negotiation for TLS connections.
+///
+/// # Arguments
+///
+/// * `event_tx` - Channel sender for HTTP events to the worker thread
+///
+/// # Returns
+///
+/// A tuple of (Extension, ActiveServerCount) where ActiveServerCount can be used
+/// in the event loop to check if any HTTP servers are active.
+pub fn create_http_server_extension(event_tx: UnboundedSender<http_server::HttpEvent>) -> (Extension, http_server::ActiveServerCount) {
+    let manager = Arc::new(http_server::HttpServerManager::new());
+    let active_count = manager.active_count();
+
+    let manager_create = manager.clone();
+    let manager_info = manager.clone();
+    let manager_stop = manager.clone();
+
+    let event_tx_create = event_tx.clone();
+
+    let js_shim = include_str!("serve_shim.js");
+
+    let extension = Extension::new("http_server")
+        .with_ops(vec![
+            // Create a new HTTP server
+            op_async("__otter_http_server_create", move |_ctx, args| {
+                let mgr = manager_create.clone();
+                let tx = event_tx_create.clone();
+
+                async move {
+                    let port = args
+                        .first()
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(3000) as u16;
+
+                    let hostname = args
+                        .get(1)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0.0.0.0");
+
+                    // Parse TLS config if provided
+                    let tls = if let Some(tls_obj) = args.get(2).and_then(|v| v.as_object()) {
+                        let cert = tls_obj
+                            .get("cert")
+                            .and_then(|v| {
+                                if let Some(s) = v.as_str() {
+                                    Some(s.as_bytes().to_vec())
+                                } else if let Some(arr) = v.as_array() {
+                                    Some(arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                                } else {
+                                    None
+                                }
+                            });
+
+                        let key = tls_obj
+                            .get("key")
+                            .and_then(|v| {
+                                if let Some(s) = v.as_str() {
+                                    Some(s.as_bytes().to_vec())
+                                } else if let Some(arr) = v.as_array() {
+                                    Some(arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                                } else {
+                                    None
+                                }
+                            });
+
+                        if let (Some(cert), Some(key)) = (cert, key) {
+                            match http_server::TlsConfig::from_pem(&cert, &key) {
+                                Ok(config) => Some(config),
+                                Err(e) => {
+                                    return Ok(json!({ "error": e.to_string() }));
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    match mgr.create(port, hostname, tls, tx).await {
+                        Ok(id) => {
+                            let info = mgr.info(id).unwrap();
+                            Ok(json!({
+                                "id": id,
+                                "port": info.port,
+                                "hostname": info.hostname,
+                                "tls": info.is_tls
+                            }))
+                        }
+                        Err(e) => Ok(json!({ "error": e.to_string() })),
+                    }
+                }
+            }),
+            // Get request method
+            op_sync("__otter_http_req_method", |_ctx, args| {
+                let request_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
+                let method = http_request::get_request_method(request_id).unwrap_or_default();
+                Ok(json!(method))
+            }),
+            // Get request URL
+            op_sync("__otter_http_req_url", |_ctx, args| {
+                let request_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
+                let url = http_request::get_request_url(request_id).unwrap_or_default();
+                Ok(json!(url))
+            }),
+            // Get all request headers
+            op_sync("__otter_http_req_headers", |_ctx, args| {
+                let request_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
+                let headers = http_request::get_request_headers(request_id).unwrap_or_default();
+                Ok(json!(headers))
+            }),
+            // Get all request metadata in single lock (batch optimization)
+            op_sync("__otter_http_req_metadata", |_ctx, args| {
+                let request_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
+                match http_request::get_request_metadata(request_id) {
+                    Some(meta) => Ok(serde_json::to_value(meta).unwrap()),
+                    None => Ok(json!(null)),
+                }
+            }),
+            // Get basic metadata (method + url only) - for lazy headers optimization
+            op_sync("__otter_http_req_basic", |_ctx, args| {
+                let request_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
+                match http_request::get_basic_metadata(request_id) {
+                    Some(meta) => Ok(serde_json::to_value(meta).unwrap()),
+                    None => Ok(json!(null)),
+                }
+            }),
+            // Read request body (async)
+            op_async("__otter_http_req_body", |_ctx, args| {
+                async move {
+                    let request_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
+                    match http_request::read_request_body(request_id).await {
+                        Some(body) => Ok(json!({ "data": body })),
+                        None => Ok(json!({ "data": [] })),
+                    }
+                }
+            }),
+            // Send response
+            op_sync("__otter_http_respond", |_ctx, args| {
+                let request_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
+                let status = args.get(1).and_then(|v| v.as_u64()).unwrap_or(200) as u16;
+
+                let headers: HashMap<String, String> = args
+                    .get(2)
+                    .and_then(|v| v.as_object())
+                    .map(|obj| {
+                        obj.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let body: Vec<u8> = args
+                    .get(3)
+                    .map(|v| {
+                        if let Some(s) = v.as_str() {
+                            // Plain string body
+                            s.as_bytes().to_vec()
+                        } else if let Some(obj) = v.as_object() {
+                            // Check for base64-encoded body (optimized path)
+                            match obj.get("type").and_then(|t| t.as_str()) {
+                                Some("base64") => {
+                                    use base64::Engine;
+                                    obj.get("data")
+                                        .and_then(|d| d.as_str())
+                                        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+                                        .unwrap_or_default()
+                                }
+                                _ => {
+                                    // Legacy: Handle { data: [...] } format from Uint8Array
+                                    obj.get("data")
+                                        .and_then(|d| d.as_array())
+                                        .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                                        .unwrap_or_default()
+                                }
+                            }
+                        } else if let Some(arr) = v.as_array() {
+                            // Legacy: array of numbers
+                            arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect()
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .unwrap_or_default();
+
+                let success = http_request::send_response(request_id, status, headers, body);
+                Ok(json!({ "success": success }))
+            }),
+            // Send text response (fast path - avoids body serialization)
+            op_sync("__otter_http_respond_text", |_ctx, args| {
+                let request_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
+                let status = args.get(1).and_then(|v| v.as_u64()).unwrap_or(200) as u16;
+                let body = args.get(2).and_then(|v| v.as_str()).unwrap_or("");
+
+                let success = http_request::send_text_response(request_id, status, body);
+                Ok(json!({ "success": success }))
+            }),
+            // Get server info
+            op_sync("__otter_http_server_info", move |_ctx, args| {
+                let server_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
+                match manager_info.info(server_id) {
+                    Ok(info) => Ok(json!({
+                        "port": info.port,
+                        "hostname": info.hostname,
+                        "tls": info.is_tls
+                    })),
+                    Err(e) => Ok(json!({ "error": e.to_string() })),
+                }
+            }),
+            // Stop server
+            op_sync("__otter_http_server_stop", move |_ctx, args| {
+                let server_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
+                match manager_stop.stop(server_id) {
+                    Ok(()) => Ok(json!({ "success": true })),
+                    Err(e) => Ok(json!({ "error": e.to_string() })),
+                }
+            }),
+        ])
+        .with_js(js_shim);
+
+    (extension, active_count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::path_ext::create_path_extension;
 
     #[test]
     fn test_path_extension_created() {
@@ -2750,6 +4295,18 @@ mod tests {
     #[test]
     fn test_streams_extension_created() {
         let _ext = create_streams_extension();
+        // Extension created successfully
+    }
+
+    #[test]
+    fn test_events_extension_created() {
+        let _ext = create_events_extension();
+        // Extension created successfully
+    }
+
+    #[test]
+    fn test_os_extension_created() {
+        let _ext = create_os_extension();
         // Extension created successfully
     }
 }

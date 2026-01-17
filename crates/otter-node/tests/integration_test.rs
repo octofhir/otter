@@ -3,16 +3,17 @@
 //! These tests verify that the Node module extensions work correctly when executed
 //! via the Otter runtime engine.
 //!
-//! Note: Currently ops are registered as global functions (e.g., `join`, `dirname`),
-//! not as namespace objects (e.g., `path.join`). This is due to the current extension
-//! system design. Proper module namespacing will be added in the future.
+//! Native functions are registered with `path_` prefix (e.g., `path_join`, `path_dirname`).
+//! The JS wrapper in path.js provides the proper Node.js-compatible API via require('path').
 
 use otter_engine::CapabilitiesBuilder;
 use otter_node::{
-    create_buffer_extension, create_fs_extension, create_path_extension, create_test_extension,
+    create_buffer_extension, create_crypto_extension, create_fs_extension, create_path_extension,
+    create_test_extension,
 };
-use otter_runtime::Engine;
+use otter_runtime::{Engine, transform_module, wrap_module};
 use tempfile::TempDir;
+use std::collections::HashMap;
 
 /// Test path module via JavaScript execution.
 mod path_tests {
@@ -28,9 +29,9 @@ mod path_tests {
 
         let handle = engine.handle();
 
-        // Test join operation (called as global function)
+        // Test join operation (native function with path_ prefix, takes array)
         let result = handle
-            .eval(r#"join("foo", "bar", "baz.txt")"#)
+            .eval(r#"path_join(["foo", "bar", "baz.txt"])"#)
             .await
             .unwrap();
         assert_eq!(result, serde_json::json!("foo/bar/baz.txt"));
@@ -48,10 +49,10 @@ mod path_tests {
 
         let handle = engine.handle();
 
-        let result = handle.eval(r#"dirname("/foo/bar/baz.txt")"#).await.unwrap();
+        let result = handle.eval(r#"path_dirname("/foo/bar/baz.txt")"#).await.unwrap();
         assert_eq!(result, serde_json::json!("/foo/bar"));
 
-        let result = handle.eval(r#"dirname("baz.txt")"#).await.unwrap();
+        let result = handle.eval(r#"path_dirname("baz.txt")"#).await.unwrap();
         assert_eq!(result, serde_json::json!("."));
 
         engine.shutdown().await;
@@ -68,13 +69,13 @@ mod path_tests {
         let handle = engine.handle();
 
         let result = handle
-            .eval(r#"basename("/foo/bar/baz.txt")"#)
+            .eval(r#"path_basename("/foo/bar/baz.txt", null)"#)
             .await
             .unwrap();
         assert_eq!(result, serde_json::json!("baz.txt"));
 
         let result = handle
-            .eval(r#"basename("/foo/bar/baz.txt", ".txt")"#)
+            .eval(r#"path_basename("/foo/bar/baz.txt", ".txt")"#)
             .await
             .unwrap();
         assert_eq!(result, serde_json::json!("baz"));
@@ -92,10 +93,10 @@ mod path_tests {
 
         let handle = engine.handle();
 
-        let result = handle.eval(r#"extname("file.txt")"#).await.unwrap();
+        let result = handle.eval(r#"path_extname("file.txt")"#).await.unwrap();
         assert_eq!(result, serde_json::json!(".txt"));
 
-        let result = handle.eval(r#"extname("file")"#).await.unwrap();
+        let result = handle.eval(r#"path_extname("file")"#).await.unwrap();
         assert_eq!(result, serde_json::json!(""));
 
         engine.shutdown().await;
@@ -111,10 +112,10 @@ mod path_tests {
 
         let handle = engine.handle();
 
-        let result = handle.eval(r#"isAbsolute("/foo/bar")"#).await.unwrap();
+        let result = handle.eval(r#"path_is_absolute("/foo/bar")"#).await.unwrap();
         assert_eq!(result, serde_json::json!(true));
 
-        let result = handle.eval(r#"isAbsolute("foo/bar")"#).await.unwrap();
+        let result = handle.eval(r#"path_is_absolute("foo/bar")"#).await.unwrap();
         assert_eq!(result, serde_json::json!(false));
 
         engine.shutdown().await;
@@ -131,7 +132,7 @@ mod path_tests {
         let handle = engine.handle();
 
         let result = handle
-            .eval(r#"normalize("/foo/bar/../baz")"#)
+            .eval(r#"path_normalize("/foo/bar/../baz")"#)
             .await
             .unwrap();
         assert_eq!(result, serde_json::json!("/foo/baz"));
@@ -150,7 +151,7 @@ mod path_tests {
         let handle = engine.handle();
 
         let result = handle
-            .eval(r#"JSON.stringify(parse("/home/user/file.txt"))"#)
+            .eval(r#"JSON.stringify(path_parse("/home/user/file.txt"))"#)
             .await
             .unwrap();
 
@@ -174,7 +175,7 @@ mod path_tests {
 
         let handle = engine.handle();
 
-        let result = handle.eval(r#"sep()"#).await.unwrap();
+        let result = handle.eval(r#"path_sep()"#).await.unwrap();
         // Should be "/" on Unix, "\" on Windows
         assert!(result == serde_json::json!("/") || result == serde_json::json!("\\"));
 
@@ -192,7 +193,7 @@ mod path_tests {
         let handle = engine.handle();
 
         let result = handle
-            .eval(r#"relative("/foo/bar", "/foo/baz")"#)
+            .eval(r#"path_relative("/foo/bar", "/foo/baz")"#)
             .await
             .unwrap();
         assert_eq!(result, serde_json::json!("../baz"));
@@ -736,6 +737,189 @@ mod fs_tests {
 
         assert!(dest.exists());
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "hello world");
+
+        engine.shutdown().await;
+    }
+}
+
+/// Verify that node:* builtins can be imported from bundled modules.
+mod node_builtin_import_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_import_node_path() {
+        let engine = Engine::builder()
+            .pool_size(1)
+            .extension(create_path_extension())
+            .build()
+            .unwrap();
+
+        let handle = engine.handle();
+
+        let mut deps = HashMap::new();
+        deps.insert("node:path".to_string(), "node:path".to_string());
+
+        let source = r#"
+            import { join } from 'node:path';
+            export const out = join('a', 'b', 'c.txt');
+        "#;
+
+        let transformed = transform_module(source, "file:///test/main.js", &deps);
+        let wrapped = wrap_module("file:///test/main.js", &transformed);
+        let bundle = format!("globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{wrapped}");
+
+        handle.eval(&bundle).await.unwrap();
+        let result = handle
+            .eval(r#"__otter_modules["file:///test/main.js"].out"#)
+            .await
+            .unwrap();
+        assert_eq!(result, serde_json::json!("a/b/c.txt"));
+
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_import_node_fs_shape() {
+        let temp = TempDir::new().unwrap();
+        let temp_path = temp.path().to_path_buf();
+
+        let caps = CapabilitiesBuilder::new()
+            .allow_read(vec![temp_path.clone()])
+            .allow_write(vec![temp_path.clone()])
+            .build();
+
+        let engine = Engine::builder()
+            .pool_size(1)
+            .extension(create_fs_extension(caps))
+            .build()
+            .unwrap();
+
+        let handle = engine.handle();
+
+        let mut deps = HashMap::new();
+        deps.insert("node:fs".to_string(), "node:fs".to_string());
+
+        let source = r#"
+            import fs from 'node:fs';
+            export const ok =
+                typeof fs.readFileSync === 'function' &&
+                typeof fs.writeFileSync === 'function' &&
+                fs.promises && typeof fs.promises.readFile === 'function';
+        "#;
+
+        let transformed = transform_module(source, "file:///test/main.js", &deps);
+        let wrapped = wrap_module("file:///test/main.js", &transformed);
+        let bundle = format!("globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{wrapped}");
+
+        handle.eval(&bundle).await.unwrap();
+        let result = handle
+            .eval(r#"__otter_modules["file:///test/main.js"].ok"#)
+            .await
+            .unwrap();
+        assert_eq!(result, serde_json::json!(true));
+
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_import_node_buffer() {
+        let engine = Engine::builder()
+            .pool_size(1)
+            .extension(create_buffer_extension())
+            .build()
+            .unwrap();
+
+        let handle = engine.handle();
+
+        let mut deps = HashMap::new();
+        deps.insert("node:buffer".to_string(), "node:buffer".to_string());
+
+        let source = r#"
+            import { Buffer } from 'node:buffer';
+            export const out = Buffer.from('hello', 'utf8').toString('utf8', 0, 5);
+        "#;
+
+        let transformed = transform_module(source, "file:///test/main.js", &deps);
+        let wrapped = wrap_module("file:///test/main.js", &transformed);
+        let bundle = format!("globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{wrapped}");
+
+        handle.eval(&bundle).await.unwrap();
+        let result = handle
+            .eval(r#"__otter_modules["file:///test/main.js"].out"#)
+            .await
+            .unwrap();
+        assert_eq!(result, serde_json::json!("hello"));
+
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_import_node_crypto_shape() {
+        let engine = Engine::builder()
+            .pool_size(1)
+            .extension(create_crypto_extension())
+            .build()
+            .unwrap();
+
+        let handle = engine.handle();
+
+        let mut deps = HashMap::new();
+        deps.insert("node:crypto".to_string(), "node:crypto".to_string());
+
+        let source = r#"
+            import crypto from 'node:crypto';
+            export const ok =
+                typeof crypto.randomUUID === 'function' &&
+                typeof crypto.createHash === 'function' &&
+                typeof crypto.createHmac === 'function';
+        "#;
+
+        let transformed = transform_module(source, "file:///test/main.js", &deps);
+        let wrapped = wrap_module("file:///test/main.js", &transformed);
+        let bundle = format!("globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{wrapped}");
+
+        handle.eval(&bundle).await.unwrap();
+        let result = handle
+            .eval(r#"__otter_modules["file:///test/main.js"].ok"#)
+            .await
+            .unwrap();
+        assert_eq!(result, serde_json::json!(true));
+
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_import_node_test_shape() {
+        let engine = Engine::builder()
+            .pool_size(1)
+            .extension(create_test_extension())
+            .build()
+            .unwrap();
+
+        let handle = engine.handle();
+
+        let mut deps = HashMap::new();
+        deps.insert("node:test".to_string(), "node:test".to_string());
+
+        let source = r#"
+            import test from 'node:test';
+            export const ok =
+                typeof test.describe === 'function' &&
+                typeof test.it === 'function' &&
+                typeof test.run === 'function' &&
+                test.assert && typeof test.assert.equal === 'function';
+        "#;
+
+        let transformed = transform_module(source, "file:///test/main.js", &deps);
+        let wrapped = wrap_module("file:///test/main.js", &transformed);
+        let bundle = format!("globalThis.__otter_modules = globalThis.__otter_modules || {{}};\n{wrapped}");
+
+        handle.eval(&bundle).await.unwrap();
+        let result = handle
+            .eval(r#"__otter_modules["file:///test/main.js"].ok"#)
+            .await
+            .unwrap();
+        assert_eq!(result, serde_json::json!(true));
 
         engine.shutdown().await;
     }

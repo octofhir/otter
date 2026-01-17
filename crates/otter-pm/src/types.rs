@@ -6,6 +6,17 @@
 use std::fs;
 use std::path::Path;
 
+fn write_if_changed(path: &Path, contents: &str) -> Result<(), TypesError> {
+    if let Ok(existing) = fs::read(path) {
+        if existing == contents.as_bytes() {
+            return Ok(());
+        }
+    }
+
+    fs::write(path, contents).map_err(|e| TypesError::Io(e.to_string()))?;
+    Ok(())
+}
+
 /// Otter global API types (console, timers, fetch, etc.)
 const OTTER_TYPES: &str = include_str!("types/otter.d.ts");
 
@@ -17,6 +28,9 @@ const NODE_FS_TYPES: &str = include_str!("types/node/fs.d.ts");
 
 /// Node.js path types
 const NODE_PATH_TYPES: &str = include_str!("types/node/path.d.ts");
+
+/// Node.js process types
+const NODE_PROCESS_TYPES: &str = include_str!("types/node/process.d.ts");
 
 /// Node.js test types
 const NODE_TEST_TYPES: &str = include_str!("types/node/test.d.ts");
@@ -38,8 +52,7 @@ fn install_otter_types(node_modules: &Path) -> Result<(), TypesError> {
     fs::create_dir_all(&types_dir).map_err(|e| TypesError::Io(e.to_string()))?;
 
     // Write index.d.ts
-    fs::write(types_dir.join("index.d.ts"), OTTER_TYPES)
-        .map_err(|e| TypesError::Io(e.to_string()))?;
+    write_if_changed(&types_dir.join("index.d.ts"), OTTER_TYPES)?;
 
     // Write package.json
     let package_json = r#"{
@@ -49,8 +62,7 @@ fn install_otter_types(node_modules: &Path) -> Result<(), TypesError> {
   "types": "index.d.ts",
   "license": "MIT"
 }"#;
-    fs::write(types_dir.join("package.json"), package_json)
-        .map_err(|e| TypesError::Io(e.to_string()))?;
+    write_if_changed(&types_dir.join("package.json"), package_json)?;
 
     Ok(())
 }
@@ -61,32 +73,20 @@ fn install_node_types(node_modules: &Path) -> Result<(), TypesError> {
     fs::create_dir_all(&types_dir).map_err(|e| TypesError::Io(e.to_string()))?;
 
     // Write individual module types
-    fs::write(types_dir.join("buffer.d.ts"), NODE_BUFFER_TYPES)
-        .map_err(|e| TypesError::Io(e.to_string()))?;
-
-    fs::write(types_dir.join("fs.d.ts"), NODE_FS_TYPES)
-        .map_err(|e| TypesError::Io(e.to_string()))?;
-
-    fs::write(types_dir.join("path.d.ts"), NODE_PATH_TYPES)
-        .map_err(|e| TypesError::Io(e.to_string()))?;
-
-    fs::write(types_dir.join("test.d.ts"), NODE_TEST_TYPES)
-        .map_err(|e| TypesError::Io(e.to_string()))?;
+    write_if_changed(&types_dir.join("buffer.d.ts"), NODE_BUFFER_TYPES)?;
+    write_if_changed(&types_dir.join("fs.d.ts"), NODE_FS_TYPES)?;
+    write_if_changed(&types_dir.join("path.d.ts"), NODE_PATH_TYPES)?;
+    write_if_changed(&types_dir.join("process.d.ts"), NODE_PROCESS_TYPES)?;
+    write_if_changed(&types_dir.join("test.d.ts"), NODE_TEST_TYPES)?;
 
     // Write index.d.ts that re-exports all modules
-    let index_dts = r#"/// <reference path="buffer.d.ts" />
+let index_dts = r#"/// <reference path="buffer.d.ts" />
 /// <reference path="fs.d.ts" />
 /// <reference path="path.d.ts" />
+/// <reference path="process.d.ts" />
 /// <reference path="test.d.ts" />
-
-// Re-export modules for direct imports
-export * from "node:buffer";
-export * from "node:fs";
-export * from "node:path";
-export * from "node:test";
 "#;
-    fs::write(types_dir.join("index.d.ts"), index_dts)
-        .map_err(|e| TypesError::Io(e.to_string()))?;
+    write_if_changed(&types_dir.join("index.d.ts"), index_dts)?;
 
     // Write package.json
     let package_json = r#"{
@@ -96,8 +96,7 @@ export * from "node:test";
   "types": "index.d.ts",
   "license": "MIT"
 }"#;
-    fs::write(types_dir.join("package.json"), package_json)
-        .map_err(|e| TypesError::Io(e.to_string()))?;
+    write_if_changed(&types_dir.join("package.json"), package_json)?;
 
     Ok(())
 }
@@ -118,6 +117,7 @@ mod tests {
         assert!(!NODE_BUFFER_TYPES.is_empty());
         assert!(!NODE_FS_TYPES.is_empty());
         assert!(!NODE_PATH_TYPES.is_empty());
+        assert!(!NODE_PROCESS_TYPES.is_empty());
     }
 
     #[test]
@@ -141,6 +141,7 @@ mod tests {
         assert!(node_modules.join("@types/node/fs.d.ts").exists());
         assert!(node_modules.join("@types/node/buffer.d.ts").exists());
         assert!(node_modules.join("@types/node/path.d.ts").exists());
+        assert!(node_modules.join("@types/node/process.d.ts").exists());
 
         // Clean up
         let _ = fs::remove_dir_all(&temp_dir);

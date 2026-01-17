@@ -3,20 +3,46 @@
 use anyhow::Result;
 use clap::Args;
 use otter_engine::{
-    Capabilities, CapabilitiesBuilder, LoaderConfig, ModuleGraph, ModuleLoader, parse_imports,
+    Capabilities, CapabilitiesBuilder, EnvStoreBuilder, IsolatedEnvStore, LoaderConfig,
+    ModuleGraph, ModuleLoader, parse_env_file, parse_imports,
 };
 use otter_node::{
-    create_buffer_extension, create_fs_extension, create_path_extension, create_test_extension,
+    ActiveNetServerCount, ActiveServerCount, ProcessInfo, create_buffer_extension,
+    create_child_process_extension, create_crypto_extension, create_events_extension,
+    create_fs_extension, create_http_server_extension, create_net_extension, create_os_extension,
+    create_path_extension, create_process_extension, create_process_ipc_extension,
+    create_test_extension, create_url_extension, create_util_extension, has_ipc, init_net_manager,
+    IpcChannel, NetEvent,
 };
+use otter_runtime::HttpEvent;
 use otter_runtime::{
     JscConfig, JscRuntime, bundle_modules, needs_transpilation, set_net_permission_checker,
-    transpile_typescript,
+    set_tokio_handle, transpile_typescript,
     tsgo::{TypeCheckConfig, check_types, format_diagnostics, has_errors},
 };
+use otter_jsc_sys::{
+    JSContextGetGlobalObject, JSContextRef, JSObjectCallAsFunction, JSObjectGetProperty,
+    JSObjectIsFunction, JSObjectRef, JSStringCreateWithUTF8CString, JSStringRelease,
+    JSValueMakeNumber, JSValueProtect, JSValueRef,
+};
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Cached HTTP dispatch function for fast handler invocation
+struct CachedDispatchFn {
+    ctx: JSContextRef,
+    func: JSObjectRef,
+}
+
+thread_local! {
+    /// Thread-local cache for the HTTP dispatch function
+    static CACHED_DISPATCH_FN: RefCell<Option<CachedDispatchFn>> = const { RefCell::new(None) };
+}
 
 use crate::config::{Config, ModulesConfig};
 use crate::watch::{
@@ -48,6 +74,14 @@ pub struct RunCommand {
     #[arg(long = "allow-env", value_name = "VAR", num_args = 0..)]
     pub allow_env: Option<Vec<String>>,
 
+    /// Load environment variables from file(s)
+    #[arg(long = "env-file", value_name = "FILE")]
+    pub env_files: Vec<PathBuf>,
+
+    /// Set explicit environment variable (can be used multiple times)
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    pub env_vars: Vec<String>,
+
     /// Allow subprocess execution
     #[arg(long = "allow-run")]
     pub allow_run: bool,
@@ -56,9 +90,9 @@ pub struct RunCommand {
     #[arg(long = "allow-all", short = 'A')]
     pub allow_all: bool,
 
-    /// Skip type checking
-    #[arg(long = "no-check")]
-    pub no_check: bool,
+    /// Enable type checking
+    #[arg(long = "check")]
+    pub check: bool,
 
     /// Timeout in milliseconds (0 = no timeout)
     #[arg(long, default_value_t = 30000)]
@@ -128,6 +162,9 @@ impl RunCommand {
     }
 
     async fn run_once(&self, config: &Config) -> Result<()> {
+        // Set tokio handle for async operations in extensions (HTTP server, etc.)
+        set_tokio_handle(tokio::runtime::Handle::current());
+
         // Build capabilities from CLI flags + config
         let caps = self.build_capabilities(config);
 
@@ -137,7 +174,8 @@ impl RunCommand {
 
         // Type check if needed and file is TypeScript
         let is_typescript = needs_transpilation(&self.entry.to_string_lossy());
-        if !self.no_check && is_typescript && config.typescript.check {
+        let type_check_enabled = self.check || config.typescript.check;
+        if type_check_enabled && is_typescript {
             self.type_check().await?;
         }
 
@@ -204,17 +242,68 @@ impl RunCommand {
         // Create runtime with capabilities
         let runtime = JscRuntime::new(JscConfig::default())?;
 
+        // Create async HTTP event channel for Otter.serve() - instant wake on events!
+        let (http_event_tx, http_event_rx) = unbounded_channel::<HttpEvent>();
+
+        // Create net event channel for node:net TCP servers
+        let (net_event_tx, net_event_rx) = unbounded_channel::<NetEvent>();
+
+        // Initialize net manager (returns active server count for keep-alive)
+        let active_net_server_count = init_net_manager(net_event_tx);
+
+        // Register Web API extensions (URL, etc.)
+        runtime.register_extension(create_url_extension())?;
+
         // Register Node.js compatibility extensions
         runtime.register_extension(create_path_extension())?;
         runtime.register_extension(create_buffer_extension())?;
         runtime.register_extension(create_fs_extension(caps.clone()))?;
         runtime.register_extension(create_test_extension())?;
+        runtime.register_extension(create_events_extension())?;
+        runtime.register_extension(create_crypto_extension())?;
+        runtime.register_extension(create_util_extension())?;
+        runtime.register_extension(create_process_extension())?;
+        runtime.register_extension(create_os_extension())?;
+        runtime.register_extension(create_child_process_extension())?;
+
+        // Register net extension for node:net (TCP server/socket)
+        runtime.register_extension(create_net_extension())?;
+
+        // Register HTTP server extension for Otter.serve()
+        let (http_server_ext, active_http_server_count) = create_http_server_extension(http_event_tx);
+        runtime.register_extension(http_server_ext)?;
+
+        // Check for IPC channel (forked child process)
+        #[cfg(unix)]
+        if has_ipc() {
+            if let Some(fd) = otter_node::ipc::get_ipc_fd() {
+                // SAFETY: fd is a valid Unix socket passed from parent
+                if let Ok(ipc_channel) = unsafe { IpcChannel::from_raw_fd(fd) } {
+                    runtime.register_extension(create_process_ipc_extension(ipc_channel))?;
+                    tracing::debug!(fd, "IPC channel established with parent process");
+                }
+            }
+        }
+
+        // Build isolated env store from CLI flags
+        let env_store = Arc::new(self.build_env_store(config)?);
+
+        // Create process info with isolated env
+        let process_info = ProcessInfo::new(
+            env_store,
+            std::iter::once("otter".to_string())
+                .chain(std::iter::once(self.entry.to_string_lossy().to_string()))
+                .chain(self.args.iter().cloned())
+                .collect(),
+        );
 
         // Set up Otter global namespace with args and capabilities
         let args_json = serde_json::to_string(&self.args)?;
         let hmr_code = if self.watch { hmr_runtime_code() } else { "" };
+        let process_setup = process_info.to_js_setup();
         let setup = format!(
             "{hmr_code}\n\
+             {process_setup}\n\
              globalThis.Otter = globalThis.Otter || {{}};\n\
              globalThis.Otter.args = {};\n\
              globalThis.Otter.capabilities = {};\n",
@@ -243,7 +332,15 @@ impl RunCommand {
             Duration::from_millis(self.timeout)
         };
 
-        runtime.run_event_loop_until_idle(timeout)?;
+        // Run event loop with HTTP and net event handling
+        run_event_loop_with_events(
+            &runtime,
+            http_event_rx,
+            net_event_rx,
+            active_http_server_count,
+            active_net_server_count,
+            timeout,
+        ).await?;
 
         // Check for script errors
         let error = runtime.context().get_global("__otter_script_error")?;
@@ -316,6 +413,65 @@ impl RunCommand {
         builder.build()
     }
 
+    /// Build isolated environment store from CLI flags and config.
+    ///
+    /// Priority (highest to lowest):
+    /// 1. Explicit `-e KEY=VALUE` flags
+    /// 2. Variables from `--env-file` (later files override earlier)
+    /// 3. Passthrough from `--allow-env` (filtered by deny patterns)
+    fn build_env_store(&self, config: &Config) -> Result<IsolatedEnvStore> {
+        let mut builder = EnvStoreBuilder::new();
+
+        // Load from env files first (lowest priority of explicit vars)
+        for env_file in &self.env_files {
+            let content = std::fs::read_to_string(env_file)
+                .map_err(|e| anyhow::anyhow!("Failed to read env file '{}': {}", env_file.display(), e))?;
+            let vars = parse_env_file(&content)
+                .map_err(|e| anyhow::anyhow!("Failed to parse env file '{}': {}", env_file.display(), e))?;
+            builder = builder.explicit_vars(vars);
+        }
+
+        // Parse and add explicit -e KEY=VALUE vars (highest priority)
+        for var in &self.env_vars {
+            if let Some((key, value)) = var.split_once('=') {
+                builder = builder.explicit(key.trim(), value);
+            } else {
+                // If no '=', treat as passthrough from host
+                builder = builder.passthrough_var(var);
+            }
+        }
+
+        // Add passthrough vars from --allow-env (filtered by deny patterns)
+        if let Some(ref vars) = self.allow_env {
+            if vars.is_empty() {
+                // --allow-env without args: pass through ALL host vars (DANGEROUS!)
+                // But still filtered by deny patterns
+                for (key, _) in std::env::vars() {
+                    builder = builder.passthrough_var(key);
+                }
+            } else {
+                // Handle both comma-separated and multiple --allow-env flags
+                let all_vars: Vec<&str> = vars
+                    .iter()
+                    .flat_map(|s| s.split(','))
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                builder = builder.passthrough(&all_vars);
+            }
+        } else if !config.permissions.allow_env.is_empty() {
+            let all_vars: Vec<&str> = config.permissions.allow_env
+                .iter()
+                .flat_map(|s| s.split(','))
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            builder = builder.passthrough(&all_vars);
+        }
+
+        Ok(builder.build())
+    }
+
     async fn type_check(&self) -> Result<()> {
         let tsconfig = crate::config::find_tsconfig_for_file(&self.entry);
 
@@ -377,5 +533,208 @@ fn build_loader_config(entry: &Path, modules: &ModulesConfig) -> LoaderConfig {
         import_map: modules.import_map.clone(),
         extensions: default.extensions,
         condition_names: default.condition_names,
+    }
+}
+
+/// Run the event loop with HTTP and net event handling.
+///
+/// High-performance event loop that processes events with minimal latency.
+/// Uses try_recv() for non-blocking poll, yield_now() to allow I/O processing.
+/// Process stays alive while any HTTP or net servers are active.
+async fn run_event_loop_with_events(
+    runtime: &JscRuntime,
+    mut http_event_rx: UnboundedReceiver<HttpEvent>,
+    mut net_event_rx: UnboundedReceiver<NetEvent>,
+    active_http_servers: ActiveServerCount,
+    active_net_servers: ActiveNetServerCount,
+    timeout: Duration,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    let start = Instant::now();
+    let has_timeout = timeout != Duration::ZERO;
+    let ctx = runtime.context().raw();
+
+    let mut idle_cycles = 0u32;
+    const MAX_IDLE_CYCLES: u32 = 100;
+
+    loop {
+        let has_active_http = active_http_servers.load(Ordering::Relaxed) > 0;
+        let has_active_net = active_net_servers.load(Ordering::Relaxed) > 0;
+        let has_active_servers = has_active_http || has_active_net;
+
+        // Timeout check - but not for active servers (keep-alive)
+        if has_timeout && !has_active_servers && start.elapsed() >= timeout {
+            break;
+        }
+
+        // Process all pending HTTP events (non-blocking hot path)
+        let mut processed = 0usize;
+        while let Ok(ev) = http_event_rx.try_recv() {
+            dispatch_http_event_fast(ctx, ev.server_id, ev.request_id);
+            processed += 1;
+        }
+
+        // Process all pending net events
+        while let Ok(ev) = net_event_rx.try_recv() {
+            dispatch_net_event(ctx, &ev);
+            processed += 1;
+        }
+
+        // Poll JavaScript event loop (promises, timers, async ops)
+        let _ = runtime.poll_event_loop();
+
+        // Yield to tokio to allow I/O to flow (hyper needs this!)
+        if has_active_servers || processed > 0 || runtime.has_pending_tasks() {
+            idle_cycles = 0;
+            tokio::task::yield_now().await;
+        } else {
+            // No work at all - idle countdown
+            idle_cycles += 1;
+            if idle_cycles >= MAX_IDLE_CYCLES {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Fast HTTP event dispatch using cached JSC function call.
+///
+/// This avoids the overhead of `runtime.eval()` which involves string formatting
+/// and JavaScript parsing. Instead, it looks up `__otter_http_dispatch` once,
+/// caches the function reference, and calls it directly via JSC FFI.
+fn dispatch_http_event_fast(ctx: JSContextRef, server_id: u64, request_id: u64) {
+    unsafe {
+        let global = JSContextGetGlobalObject(ctx);
+
+        // Try to get cached function, or look it up and cache it
+        let func = CACHED_DISPATCH_FN.with(|cache| {
+            let mut cache = cache.borrow_mut();
+
+            // Check if we have a cached function for this context
+            if let Some(ref cached) = *cache {
+                if cached.ctx == ctx {
+                    return Some(cached.func);
+                }
+            }
+
+            // Look up the function
+            let func_name = CString::new("__otter_http_dispatch").unwrap();
+            let func_name_ref = JSStringCreateWithUTF8CString(func_name.as_ptr());
+            let mut exception: JSValueRef = std::ptr::null_mut();
+
+            let func_value = JSObjectGetProperty(ctx, global, func_name_ref, &mut exception);
+            JSStringRelease(func_name_ref);
+
+            if exception.is_null() && JSObjectIsFunction(ctx, func_value as JSObjectRef) {
+                let func = func_value as JSObjectRef;
+
+                // Protect from GC and cache
+                JSValueProtect(ctx, func as JSValueRef);
+                *cache = Some(CachedDispatchFn { ctx, func });
+
+                Some(func)
+            } else {
+                None
+            }
+        });
+
+        let Some(func) = func else {
+            tracing::warn!(server_id, request_id, "HTTP dispatch function not found");
+            return;
+        };
+
+        // Create arguments: [serverId, requestId]
+        let args = [
+            JSValueMakeNumber(ctx, server_id as f64),
+            JSValueMakeNumber(ctx, request_id as f64),
+        ];
+
+        // Call the cached function directly
+        let mut call_exception: JSValueRef = std::ptr::null_mut();
+        JSObjectCallAsFunction(ctx, func, global, 2, args.as_ptr(), &mut call_exception);
+
+        if !call_exception.is_null() {
+            tracing::warn!(server_id, request_id, "HTTP dispatch threw exception");
+        }
+    }
+}
+
+// Cached net dispatch function for fast event delivery
+thread_local! {
+    static CACHED_NET_DISPATCH_FN: RefCell<Option<CachedDispatchFn>> = const { RefCell::new(None) };
+}
+
+/// Dispatch a net event to JavaScript by calling __otter_net_dispatch(json).
+fn dispatch_net_event(ctx: JSContextRef, event: &NetEvent) {
+    use otter_jsc_sys::JSValueMakeString;
+
+    // Serialize event to JSON
+    let json = match serde_json::to_string(event) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to serialize net event");
+            return;
+        }
+    };
+
+    unsafe {
+        let global = JSContextGetGlobalObject(ctx);
+
+        // Try to get cached function, or look it up and cache it
+        let func = CACHED_NET_DISPATCH_FN.with(|cache| {
+            let mut cache = cache.borrow_mut();
+
+            // Check if we have a cached function for this context
+            if let Some(ref cached) = *cache {
+                if cached.ctx == ctx {
+                    return Some(cached.func);
+                }
+            }
+
+            // Look up the function
+            let func_name = CString::new("__otter_net_dispatch").unwrap();
+            let func_name_ref = JSStringCreateWithUTF8CString(func_name.as_ptr());
+            let mut exception: JSValueRef = std::ptr::null_mut();
+
+            let func_value = JSObjectGetProperty(ctx, global, func_name_ref, &mut exception);
+            JSStringRelease(func_name_ref);
+
+            if exception.is_null() && JSObjectIsFunction(ctx, func_value as JSObjectRef) {
+                let func = func_value as JSObjectRef;
+
+                // Protect from GC and cache
+                JSValueProtect(ctx, func as JSValueRef);
+                *cache = Some(CachedDispatchFn { ctx, func });
+
+                Some(func)
+            } else {
+                None
+            }
+        });
+
+        let Some(func) = func else {
+            tracing::warn!("Net dispatch function not found");
+            return;
+        };
+
+        // Create JSON string argument
+        let json_cstr = CString::new(json.as_str()).unwrap();
+        let json_ref = JSStringCreateWithUTF8CString(json_cstr.as_ptr());
+        let json_value = JSValueMakeString(ctx, json_ref);
+        JSStringRelease(json_ref);
+
+        // Call the cached function with JSON string
+        let args = [json_value];
+        let mut call_exception: JSValueRef = std::ptr::null_mut();
+        JSObjectCallAsFunction(ctx, func, global, 1, args.as_ptr(), &mut call_exception);
+
+        if !call_exception.is_null() {
+            tracing::warn!("Net dispatch threw exception");
+        }
     }
 }

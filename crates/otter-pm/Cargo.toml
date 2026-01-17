@@ -11,17 +11,26 @@ categories = ["development-tools", "command-line-utilities"]
 readme = "README.md"
 
 [dependencies]
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "http2"] }
 semver = "1"
 sha2 = "0.10"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 flate2 = "1"
 tar = "0.4"
 dirs = "6"
+indicatif = "0.17"
+futures = "0.3"
+console = "0.15"
+hex = "0.4"
+walkdir = "2"
+rayon = "1.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

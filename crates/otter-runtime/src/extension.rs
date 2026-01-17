@@ -53,6 +53,19 @@ impl ExtensionState {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeContextHandle(usize);
+
+impl RuntimeContextHandle {
+    pub fn new(ctx: JSContextRef) -> Self {
+        Self(ctx as usize)
+    }
+
+    pub fn ctx(self) -> JSContextRef {
+        self.0 as JSContextRef
+    }
+}
+
 #[derive(Clone)]
 pub struct OpContext {
     state: ExtensionState,
@@ -233,6 +246,8 @@ impl ExtensionRegistry {
             "Registering extension"
         );
 
+        self.state.put(RuntimeContextHandle::new(ctx));
+
         if let Some(init) = extension.init.as_ref() {
             init(&self.state);
         }
@@ -360,7 +375,7 @@ impl ExtensionRegistry {
             )));
         }
 
-        register_js_op(ctx, op.name())?;
+        register_js_op(ctx, op.name(), self as *const ExtensionRegistry as usize)?;
         ops.insert(op.name().to_string(), op);
         Ok(())
     }
@@ -377,6 +392,31 @@ thread_local! {
 
     /// Thread-local Tokio runtime handle for async operations in worker threads.
     static TOKIO_HANDLE: RefCell<Option<tokio::runtime::Handle>> = const { RefCell::new(None) };
+}
+
+fn registry_key(ctx: JSContextRef) -> usize {
+    unsafe { JSContextGetGlobalObject(ctx) as usize }
+}
+
+unsafe fn registry_ptr_from_function(ctx: JSContextRef, function: JSObjectRef) -> Option<*const ExtensionRegistry> {
+    let key_name_cstr = CString::new("__otter_registry_ptr").ok()?;
+    let key_name_ref = JSStringCreateWithUTF8CString(key_name_cstr.as_ptr());
+
+    let mut exception: JSValueRef = std::ptr::null_mut();
+    let value = JSObjectGetProperty(ctx, function, key_name_ref, &mut exception);
+    JSStringRelease(key_name_ref);
+
+    if !exception.is_null() || value.is_null() || JSValueIsUndefined(ctx, value) {
+        return None;
+    }
+
+    let mut num_exc: JSValueRef = std::ptr::null_mut();
+    let num = JSValueToNumber(ctx, value, &mut num_exc);
+    if !num_exc.is_null() || !num.is_finite() || num < 0.0 {
+        return None;
+    }
+
+    Some(num as usize as *const ExtensionRegistry)
 }
 
 /// Set the Tokio runtime handle for the current worker thread.
@@ -396,19 +436,35 @@ fn get_tokio_handle() -> Option<tokio::runtime::Handle> {
 }
 
 pub(crate) fn register_context_registry(ctx: JSContextRef, registry: Arc<ExtensionRegistry>) {
+    let ctx_key = ctx as usize;
+    let global_key = registry_key(ctx);
+
     REGISTRY_MAP.with(|map| {
-        map.borrow_mut().insert(ctx as usize, registry);
+        let mut map = map.borrow_mut();
+        map.insert(ctx_key, registry.clone());
+        map.insert(global_key, registry);
     });
 }
 
 pub(crate) fn unregister_context_registry(ctx: JSContextRef) {
+    let ctx_key = ctx as usize;
+    let global_key = registry_key(ctx);
+
     REGISTRY_MAP.with(|map| {
-        map.borrow_mut().remove(&(ctx as usize));
+        let mut map = map.borrow_mut();
+        map.remove(&ctx_key);
+        map.remove(&global_key);
     });
 }
 
 fn registry_for_context(ctx: JSContextRef) -> Option<Arc<ExtensionRegistry>> {
-    REGISTRY_MAP.with(|map| map.borrow().get(&(ctx as usize)).cloned())
+    let ctx_key = ctx as usize;
+    let global_key = registry_key(ctx);
+
+    REGISTRY_MAP.with(|map| {
+        let map = map.borrow();
+        map.get(&ctx_key).cloned().or_else(|| map.get(&global_key).cloned())
+    })
 }
 
 pub(crate) fn schedule_promise<F>(ctx: JSContextRef, fut: F) -> JscResult<JSValueRef>
@@ -442,12 +498,29 @@ where
     Ok(promise)
 }
 
-fn register_js_op(ctx: JSContextRef, name: &str) -> JscResult<()> {
+fn register_js_op(ctx: JSContextRef, name: &str, registry_ptr: usize) -> JscResult<()> {
     let name_cstr = CString::new(name).map_err(|e| JscError::internal(e.to_string()))?;
 
     unsafe {
         let name_ref = JSStringCreateWithUTF8CString(name_cstr.as_ptr());
         let func = JSObjectMakeFunctionWithCallback(ctx, name_ref, Some(js_op_dispatch));
+
+        // Tag the function with a pointer to its ExtensionRegistry so we can recover the registry
+        // even if JSC invokes the callback with an unexpected JSContextRef pointer.
+        let ptr_num = registry_ptr as f64;
+        let key_name_cstr = CString::new("__otter_registry_ptr").unwrap();
+        let key_name_ref = JSStringCreateWithUTF8CString(key_name_cstr.as_ptr());
+        let key_value = JSValueMakeNumber(ctx, ptr_num);
+        let mut key_exc: JSValueRef = std::ptr::null_mut();
+        JSObjectSetProperty(
+            ctx,
+            func,
+            key_name_ref,
+            key_value,
+            K_JS_PROPERTY_ATTRIBUTE_DONT_ENUM,
+            &mut key_exc,
+        );
+        JSStringRelease(key_name_ref);
 
         let mut exception: JSValueRef = std::ptr::null_mut();
         JSObjectSetProperty(
@@ -488,8 +561,18 @@ unsafe extern "C" fn js_op_dispatch(
     let registry = match registry_for_context(ctx) {
         Some(registry) => registry,
         None => {
-            *exception = make_exception(ctx, "Extension registry not found");
-            return JSValueMakeUndefined(ctx);
+            if let Some(ptr) = registry_ptr_from_function(ctx, function) {
+                // SAFETY:
+                // - `ptr` points to the inner value of an `Arc<ExtensionRegistry>` created by JscContext.
+                // - We increment the strong count before creating a new Arc from the raw pointer.
+                unsafe {
+                    Arc::increment_strong_count(ptr);
+                    Arc::from_raw(ptr)
+                }
+            } else {
+                *exception = make_exception(ctx, "Extension registry not found");
+                return JSValueMakeUndefined(ctx);
+            }
         }
     };
 

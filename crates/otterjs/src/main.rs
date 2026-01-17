@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use otter_node::create_url_extension;
+use otter_node::ext;
 use otter_runtime::{ConsoleLevel, JscConfig, JscRuntime, set_console_handler};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -190,7 +190,7 @@ async fn run_eval(code: &str, print_result: bool) -> Result<()> {
     let runtime = JscRuntime::new(JscConfig::default())?;
 
     // Register Web API extensions
-    runtime.register_extension(create_url_extension())?;
+    runtime.register_extension(ext::url())?;
 
     let wrapped = if print_result {
         // --print: evaluate and print the result

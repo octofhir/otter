@@ -7,11 +7,7 @@ use otter_engine::{
     ModuleGraph, ModuleLoader, parse_env_file, parse_imports,
 };
 use otter_node::{
-    ActiveNetServerCount, ActiveServerCount, ProcessInfo, create_buffer_extension,
-    create_child_process_extension, create_crypto_extension, create_events_extension,
-    create_fs_extension, create_http_server_extension, create_net_extension, create_os_extension,
-    create_path_extension, create_process_extension, create_process_ipc_extension,
-    create_test_extension, create_url_extension, create_util_extension, has_ipc, init_net_manager,
+    ActiveNetServerCount, ActiveServerCount, ProcessInfo, ext, has_ipc, init_net_manager,
     IpcChannel, NetEvent,
 };
 use otter_runtime::HttpEvent;
@@ -162,25 +158,42 @@ impl RunCommand {
     }
 
     async fn run_once(&self, config: &Config) -> Result<()> {
+        let total_start = std::time::Instant::now();
+        let mut phase_start = total_start;
+
+        macro_rules! timing {
+            ($name:expr) => {
+                if std::env::var("OTTER_TIMING").is_ok() {
+                    eprintln!("[TIMING] {}: {:?}", $name, phase_start.elapsed());
+                    phase_start = std::time::Instant::now();
+                }
+            };
+        }
+
         // Set tokio handle for async operations in extensions (HTTP server, etc.)
         set_tokio_handle(tokio::runtime::Handle::current());
+        timing!("tokio_handle_set");
 
         // Build capabilities from CLI flags + config
         let caps = self.build_capabilities(config);
+        timing!("capabilities_built");
 
         // Set network permission checker for fetch() API using capabilities
         let caps_for_net = Arc::new(caps.clone());
         set_net_permission_checker(Box::new(move |host| caps_for_net.can_net(host)));
+        timing!("net_permission_set");
 
         // Type check if needed and file is TypeScript
         let is_typescript = needs_transpilation(&self.entry.to_string_lossy());
         let type_check_enabled = self.check || config.typescript.check;
         if type_check_enabled && is_typescript {
             self.type_check().await?;
+            timing!("type_check");
         }
 
         // Read source
         let source = std::fs::read_to_string(&self.entry)?;
+        timing!("source_read");
 
         // Build module loader config from CLI config
         let loader_config = build_loader_config(&self.entry, &config.modules);
@@ -233,14 +246,17 @@ impl RunCommand {
             if is_typescript {
                 let result = transpile_typescript(&source)
                     .map_err(|e| anyhow::anyhow!("Transpilation error: {}", e))?;
+                timing!("transpile");
                 result.code
             } else {
                 source
             }
         };
+        timing!("code_prepared");
 
         // Create runtime with capabilities
         let runtime = JscRuntime::new(JscConfig::default())?;
+        timing!("jsc_runtime_created");
 
         // Create async HTTP event channel for Otter.serve() - instant wake on events!
         let (http_event_tx, http_event_rx) = unbounded_channel::<HttpEvent>();
@@ -252,26 +268,44 @@ impl RunCommand {
         let active_net_server_count = init_net_manager(net_event_tx);
 
         // Register Web API extensions (URL, etc.)
-        runtime.register_extension(create_url_extension())?;
+        runtime.register_extension(ext::url())?;
+        timing!("ext_url");
 
         // Register Node.js compatibility extensions
-        runtime.register_extension(create_path_extension())?;
-        runtime.register_extension(create_buffer_extension())?;
-        runtime.register_extension(create_fs_extension(caps.clone()))?;
-        runtime.register_extension(create_test_extension())?;
-        runtime.register_extension(create_events_extension())?;
-        runtime.register_extension(create_crypto_extension())?;
-        runtime.register_extension(create_util_extension())?;
-        runtime.register_extension(create_process_extension())?;
-        runtime.register_extension(create_os_extension())?;
-        runtime.register_extension(create_child_process_extension())?;
+        runtime.register_extension(ext::path())?;
+        timing!("ext_path");
+        runtime.register_extension(ext::buffer())?;
+        timing!("ext_buffer");
+        runtime.register_extension(ext::fs(caps.clone()))?;
+        timing!("ext_fs");
+        runtime.register_extension(ext::test())?;
+        timing!("ext_test");
+        runtime.register_extension(ext::events())?;
+        timing!("ext_events");
+        runtime.register_extension(ext::crypto())?;
+        timing!("ext_crypto");
+        runtime.register_extension(ext::util())?;
+        timing!("ext_util");
+        runtime.register_extension(ext::process())?;
+        timing!("ext_process");
+        runtime.register_extension(ext::os())?;
+        timing!("ext_os");
+        runtime.register_extension(ext::child_process())?;
+        timing!("ext_child_process");
 
         // Register net extension for node:net (TCP server/socket)
-        runtime.register_extension(create_net_extension())?;
+        runtime.register_extension(ext::net())?;
+        timing!("ext_net");
 
         // Register HTTP server extension for Otter.serve()
-        let (http_server_ext, active_http_server_count) = create_http_server_extension(http_event_tx);
+        let (http_server_ext, active_http_server_count) = ext::http_server(http_event_tx);
         runtime.register_extension(http_server_ext)?;
+        timing!("ext_http_server");
+
+        // Register http extension for node:http (built on Otter.serve())
+        // Must be loaded AFTER http_server_extension since it depends on Otter.serve()
+        runtime.register_extension(ext::http())?;
+        timing!("ext_http");
 
         // Check for IPC channel (forked child process)
         #[cfg(unix)]
@@ -279,7 +313,7 @@ impl RunCommand {
             if let Some(fd) = otter_node::ipc::get_ipc_fd() {
                 // SAFETY: fd is a valid Unix socket passed from parent
                 if let Ok(ipc_channel) = unsafe { IpcChannel::from_raw_fd(fd) } {
-                    runtime.register_extension(create_process_ipc_extension(ipc_channel))?;
+                    runtime.register_extension(ext::process_ipc(ipc_channel))?;
                     tracing::debug!(fd, "IPC channel established with parent process");
                 }
             }
@@ -325,6 +359,7 @@ impl RunCommand {
         );
 
         runtime.eval(&wrapped)?;
+        timing!("script_eval");
 
         let timeout = if self.timeout == 0 {
             Duration::ZERO
@@ -341,11 +376,16 @@ impl RunCommand {
             active_net_server_count,
             timeout,
         ).await?;
+        timing!("event_loop_done");
 
         // Check for script errors
         let error = runtime.context().get_global("__otter_script_error")?;
         if !error.is_null() && !error.is_undefined() {
             return Err(anyhow::anyhow!("{}", error.to_string()?));
+        }
+
+        if std::env::var("OTTER_TIMING").is_ok() {
+            eprintln!("[TIMING] TOTAL: {:?}", total_start.elapsed());
         }
 
         Ok(())
@@ -557,7 +597,10 @@ async fn run_event_loop_with_events(
     let ctx = runtime.context().raw();
 
     let mut idle_cycles = 0u32;
-    const MAX_IDLE_CYCLES: u32 = 100;
+    // For scripts without active servers, exit immediately after becoming idle.
+    // For servers, use longer idle threshold to avoid premature exit.
+    const MAX_IDLE_CYCLES_SCRIPT: u32 = 1;
+    const MAX_IDLE_CYCLES_SERVER: u32 = 100;
 
     loop {
         let has_active_http = active_http_servers.load(Ordering::Relaxed) > 0;
@@ -592,10 +635,17 @@ async fn run_event_loop_with_events(
         } else {
             // No work at all - idle countdown
             idle_cycles += 1;
-            if idle_cycles >= MAX_IDLE_CYCLES {
+            let max_cycles = if has_active_servers {
+                MAX_IDLE_CYCLES_SERVER
+            } else {
+                MAX_IDLE_CYCLES_SCRIPT
+            };
+            if idle_cycles >= max_cycles {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            // Shorter sleep for scripts, longer for servers
+            let sleep_ms = if has_active_servers { 5 } else { 1 };
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         }
     }
 

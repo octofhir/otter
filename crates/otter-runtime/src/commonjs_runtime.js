@@ -147,13 +147,18 @@
     // Create require function for a specific module context
     globalThis.__createRequire = function(dirname, filename) {
         var require = function(specifier) {
-            // Check if it's a node: built-in
+            // Use __getModule for lazy loading support
+            if (globalThis.__getModule) {
+                var mod = globalThis.__getModule(specifier);
+                if (mod) return mod;
+            }
+
+            // Fallback: Check if it's a node: built-in (direct access)
             if (specifier.startsWith("node:")) {
                 var builtinName = specifier.slice(5);
                 if (globalThis.__otter_node_builtins && globalThis.__otter_node_builtins[builtinName]) {
                     return globalThis.__otter_node_builtins[builtinName];
                 }
-                throw new Error("Cannot find module '" + specifier + "'");
             }
 
             // Check bare builtin (without node: prefix)
@@ -185,5 +190,10 @@
 
         return require;
     };
+
+    // Create global require for standalone scripts (not bundled)
+    if (typeof globalThis.require !== "function") {
+        globalThis.require = globalThis.__createRequire(".", "script.js");
+    }
 
 })(globalThis);

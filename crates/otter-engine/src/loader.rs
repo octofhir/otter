@@ -376,6 +376,11 @@ impl ModuleLoader {
             if let Some(module_type) = ModuleType::from_extension(Some(ext)) {
                 return module_type;
             }
+
+            // TypeScript files default to ESM (import/export is native TS syntax)
+            if matches!(ext, "ts" | "tsx" | "mts") {
+                return ModuleType::ESM;
+            }
         }
 
         // 2. Check nearest package.json "type" field
@@ -427,6 +432,8 @@ fn is_supported_node_builtin(specifier: &str) -> bool {
             | "crypto"
             | "events"
             | "fs"
+            | "http"
+            | "net"
             | "os"
             | "path"
             | "process"

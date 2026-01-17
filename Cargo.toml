@@ -10,3 +10,18 @@ members = [
     "crates/otter-pm",
     "crates/otterjs",
 ]
+
+# Optimized release profile for minimal startup time
+[profile.release]
+lto = "thin"           # Link-time optimization (improves code layout)
+codegen-units = 1      # Single codegen unit (better inlining, worse compile time)
+strip = true           # Strip symbols (smaller binary)
+panic = "abort"        # No unwinding (smaller binary)
+opt-level = 3          # Maximum optimization
+
+# Fast release for development iteration
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false

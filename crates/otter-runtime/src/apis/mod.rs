@@ -150,5 +150,7 @@ pub fn register_apis_with_config(ctx: JSContextRef, enable_console: bool) -> Jsc
     timers::register_timers_api(ctx)?;
     performance::register_performance_api(ctx)?;
     abort::register_abort_api(ctx)?;
+    // Register CommonJS runtime helpers (require, __createRequire, etc.)
+    crate::commonjs::register_commonjs_runtime(ctx)?;
     Ok(())
 }

@@ -30,26 +30,42 @@
 //! ```
 
 pub mod buffer;
+pub mod buffer_ext;
 pub mod child_process;
+pub mod child_process_ext;
 pub mod crypto;
+pub mod crypto_ext;
 pub mod events;
-pub mod extensions;
+pub mod events_ext;
+pub mod ext;
 pub mod fs;
+pub mod fs_ext;
+pub mod http_ext;
 pub mod http_request;
 pub mod http_server;
+pub mod http_server_ext;
 pub mod http_service;
 pub mod ipc;
 pub mod net;
 pub mod os;
+pub mod os_ext;
 pub mod path;
 pub mod path_ext;
 pub mod process;
+pub mod process_ext;
+pub mod process_ipc_ext;
 pub mod stream;
+pub mod streams_ext;
 pub mod test;
+pub mod test_ext;
 pub mod url;
+pub mod url_ext;
 pub mod util;
+pub mod util_ext;
 pub mod websocket;
+pub mod websocket_ext;
 pub mod worker;
+pub mod worker_ext;
 
 pub use buffer::{Buffer, BufferError};
 pub use child_process::{
@@ -60,16 +76,7 @@ pub use crypto::{CryptoError, Hash, HashAlgorithm, Hmac};
 pub use events::{event_emitter_js, EventEmitter, Listener, DEFAULT_MAX_LISTENERS};
 pub use ipc::{has_ipc, IpcChannel, IpcMessage, IPC_FD_ENV};
 pub use os::{os_module_js, CpuInfo, CpuTimes, NetworkInterface, OsType, UserInfo};
-pub use extensions::{
-    create_buffer_extension, create_child_process_extension, create_crypto_extension,
-    create_events_extension, create_fs_extension, create_http_server_extension,
-    create_os_extension, create_process_extension,
-    create_process_ipc_extension, create_streams_extension, create_test_extension,
-    create_url_extension, create_util_extension, create_websocket_extension, create_worker_extension,
-};
-// Path and net extensions use the new #[dive] macro architecture
-pub use path_ext::create_path_extension;
-pub use net::{create_net_extension, init_net_manager, ActiveNetServerCount, NetError, NetEvent, NetManager};
+pub use net::{init_net_manager, ActiveNetServerCount, NetError, NetEvent, NetManager};
 pub use http_server::{ActiveServerCount, HttpEvent, HttpServer, HttpServerError, HttpServerManager, TlsConfig};
 pub use fs::{FsError, ReadResult, Stats};
 pub use path::ParsedPath;

@@ -3,10 +3,7 @@
 use anyhow::Result;
 use clap::Args;
 use otter_engine::Capabilities;
-use otter_node::{
-    create_buffer_extension, create_fs_extension, create_path_extension, create_test_extension,
-    create_url_extension,
-};
+use otter_node::ext;
 use otter_runtime::{JscConfig, JscRuntime, needs_transpilation, transpile_typescript};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -155,11 +152,11 @@ impl TestCommand {
         } else {
             Capabilities::none()
         };
-        runtime.register_extension(create_url_extension())?;
-        runtime.register_extension(create_path_extension())?;
-        runtime.register_extension(create_buffer_extension())?;
-        runtime.register_extension(create_fs_extension(caps))?;
-        runtime.register_extension(create_test_extension())?;
+        runtime.register_extension(ext::url())?;
+        runtime.register_extension(ext::path())?;
+        runtime.register_extension(ext::buffer())?;
+        runtime.register_extension(ext::fs(caps))?;
+        runtime.register_extension(ext::test())?;
 
         // Inject test framework
         let filter_json = match &self.filter {

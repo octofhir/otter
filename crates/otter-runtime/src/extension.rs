@@ -1,4 +1,22 @@
 //! Safe extension API for registering host functions.
+//!
+//! This module provides the infrastructure for creating JavaScript-callable
+//! native functions (extensions) in the Otter runtime.
+//!
+//! ## Extension Kinds
+//!
+//! Extensions are categorized by their capabilities and safety:
+//! - **Core**: Safe for all contexts (path, buffer, util, events, url, crypto)
+//! - **IO**: Requires file system capabilities (fs, process, child_process)
+//! - **Network**: Requires network access (net, http, http_server, websocket)
+//! - **Runtime**: Runtime-specific features (worker, streams, test, os)
+//!
+//! ## Presets
+//!
+//! Use `ExtensionPreset` to quickly configure extensions for different use cases:
+//! - `Embedded`: Minimal safe set for embedded environments
+//! - `NodeCompat`: Full Node.js compatibility
+//! - `Full`: All available extensions
 
 use crate::apis::json_to_js_value;
 use crate::bindings::*;
@@ -15,6 +33,191 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
+
+// ============================================================================
+// Extension Kind and Presets
+// ============================================================================
+
+/// All available extension types in the Otter runtime.
+///
+/// Extensions are grouped by their capability requirements:
+/// - Core: Safe for all environments
+/// - IO: Requires filesystem access
+/// - Network: Requires network access
+/// - Runtime: Miscellaneous runtime features
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExtensionKind {
+    // Core (safe for all contexts, including embedded)
+    /// Path manipulation utilities (node:path)
+    Path,
+    /// Binary buffer operations (node:buffer)
+    Buffer,
+    /// Utility functions (node:util)
+    Util,
+    /// Event emitter (node:events)
+    Events,
+    /// URL parsing (node:url)
+    Url,
+    /// Cryptographic functions (node:crypto)
+    Crypto,
+
+    // IO (requires capabilities)
+    /// File system operations (node:fs)
+    Fs,
+    /// Process information and control (node:process)
+    Process,
+    /// Child process spawning (node:child_process)
+    ChildProcess,
+    /// Operating system info (node:os)
+    Os,
+
+    // Network (may be disabled in embedded)
+    /// TCP networking (node:net)
+    Net,
+    /// HTTP client (fetch, http)
+    Http,
+    /// HTTP server
+    HttpServer,
+    /// WebSocket client/server
+    WebSocket,
+
+    // Runtime
+    /// Worker threads (node:worker_threads)
+    Worker,
+    /// Stream utilities (node:stream)
+    Streams,
+    /// Test runner utilities
+    Test,
+    /// IPC for child processes
+    ProcessIpc,
+}
+
+impl ExtensionKind {
+    /// Returns all extension kinds.
+    pub fn all() -> Vec<ExtensionKind> {
+        vec![
+            Self::Path,
+            Self::Buffer,
+            Self::Util,
+            Self::Events,
+            Self::Url,
+            Self::Crypto,
+            Self::Fs,
+            Self::Process,
+            Self::ChildProcess,
+            Self::Os,
+            Self::Net,
+            Self::Http,
+            Self::HttpServer,
+            Self::WebSocket,
+            Self::Worker,
+            Self::Streams,
+            Self::Test,
+            Self::ProcessIpc,
+        ]
+    }
+
+    /// Check if this extension is safe for embedded environments.
+    ///
+    /// Embedded-safe extensions don't require filesystem, network,
+    /// or process capabilities.
+    pub fn is_embedded_safe(&self) -> bool {
+        matches!(
+            self,
+            Self::Path | Self::Buffer | Self::Util | Self::Events | Self::Url | Self::Crypto
+        )
+    }
+
+    /// Check if this extension requires network access.
+    pub fn requires_network(&self) -> bool {
+        matches!(
+            self,
+            Self::Net | Self::Http | Self::HttpServer | Self::WebSocket
+        )
+    }
+
+    /// Check if this extension requires filesystem access.
+    pub fn requires_filesystem(&self) -> bool {
+        matches!(self, Self::Fs)
+    }
+
+    /// Check if this extension requires process capabilities.
+    pub fn requires_process(&self) -> bool {
+        matches!(self, Self::Process | Self::ChildProcess | Self::Os)
+    }
+
+    /// Get the module name for this extension (e.g., "path", "fs").
+    pub fn module_name(&self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Buffer => "buffer",
+            Self::Util => "util",
+            Self::Events => "events",
+            Self::Url => "url",
+            Self::Crypto => "crypto",
+            Self::Fs => "fs",
+            Self::Process => "process",
+            Self::ChildProcess => "child_process",
+            Self::Os => "os",
+            Self::Net => "net",
+            Self::Http => "http",
+            Self::HttpServer => "http_server",
+            Self::WebSocket => "websocket",
+            Self::Worker => "worker_threads",
+            Self::Streams => "stream",
+            Self::Test => "test",
+            Self::ProcessIpc => "process_ipc",
+        }
+    }
+}
+
+/// Predefined sets of extensions for common use cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionPreset {
+    /// Minimal safe set for embedded environments.
+    ///
+    /// Includes: path, buffer, util, events, url, crypto
+    Embedded,
+
+    /// Node.js compatibility mode.
+    ///
+    /// Includes all extensions except Test.
+    NodeCompat,
+
+    /// All available extensions.
+    Full,
+}
+
+impl ExtensionPreset {
+    /// Get the list of extension kinds for this preset.
+    pub fn extensions(&self) -> Vec<ExtensionKind> {
+        match self {
+            Self::Embedded => vec![
+                ExtensionKind::Path,
+                ExtensionKind::Buffer,
+                ExtensionKind::Util,
+                ExtensionKind::Events,
+                ExtensionKind::Url,
+                ExtensionKind::Crypto,
+            ],
+            Self::NodeCompat => {
+                let mut exts = ExtensionKind::all();
+                exts.retain(|e| *e != ExtensionKind::Test);
+                exts
+            }
+            Self::Full => ExtensionKind::all(),
+        }
+    }
+
+    /// Check if a specific extension is included in this preset.
+    pub fn includes(&self, kind: ExtensionKind) -> bool {
+        self.extensions().contains(&kind)
+    }
+}
+
+// ============================================================================
+// Core Extension Types
+// ============================================================================
 
 pub type OpResult = JscResult<serde_json::Value>;
 pub type OpFuture = Pin<Box<dyn Future<Output = OpResult> + Send + 'static>>;

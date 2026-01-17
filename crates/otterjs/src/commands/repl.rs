@@ -3,9 +3,7 @@
 use anyhow::Result;
 use clap::Args;
 use otter_engine::Capabilities;
-use otter_node::{
-    create_buffer_extension, create_fs_extension, create_path_extension, create_test_extension,
-};
+use otter_node::ext;
 use otter_runtime::{JscConfig, JscRuntime, transpile_typescript};
 use std::io::{self, BufRead, Write};
 
@@ -40,10 +38,10 @@ impl ReplCommand {
         } else {
             Capabilities::none()
         };
-        runtime.register_extension(create_path_extension())?;
-        runtime.register_extension(create_buffer_extension())?;
-        runtime.register_extension(create_fs_extension(caps))?;
-        runtime.register_extension(create_test_extension())?;
+        runtime.register_extension(ext::path())?;
+        runtime.register_extension(ext::buffer())?;
+        runtime.register_extension(ext::fs(caps))?;
+        runtime.register_extension(ext::test())?;
 
         let stdin = io::stdin();
         let mut stdout = io::stdout();
@@ -143,10 +141,10 @@ impl ReplCommand {
         } else {
             Capabilities::none()
         };
-        runtime.register_extension(create_path_extension())?;
-        runtime.register_extension(create_buffer_extension())?;
-        runtime.register_extension(create_fs_extension(caps))?;
-        runtime.register_extension(create_test_extension())?;
+        runtime.register_extension(ext::path())?;
+        runtime.register_extension(ext::buffer())?;
+        runtime.register_extension(ext::fs(caps))?;
+        runtime.register_extension(ext::test())?;
 
         // Try to transpile as TypeScript
         let js_code = match transpile_typescript(code) {

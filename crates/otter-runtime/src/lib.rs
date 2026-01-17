@@ -100,8 +100,8 @@ pub use context::JscContext;
 pub use engine::{Engine, EngineBuilder, EngineHandle, EngineStats, EngineStatsSnapshot};
 pub use error::{JscError, JscResult};
 pub use extension::{
-    Extension, ExtensionState, OpContext, OpDecl, OpHandler, OpResult, RuntimeContextHandle,
-    op_async, op_sync, set_tokio_handle,
+    Extension, ExtensionKind, ExtensionPreset, ExtensionState, OpContext, OpDecl, OpHandler,
+    OpResult, RuntimeContextHandle, op_async, op_sync, set_tokio_handle,
 };
 pub use holt::{Holt, HoltError, HoltResult, Paw};
 pub use memory::{JscHeapStats, jsc_heap_stats};

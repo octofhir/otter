@@ -13,6 +13,11 @@
 //! - `#[dive]` or `#[dive(swift)]` - Synchronous function, returns value directly
 //! - `#[dive(deep)]` - Async function, returns a Promise that resolves when complete
 //!
+//! ### Options
+//!
+//! - `crate_path` - Custom path to otter_runtime (default: `otter_runtime`)
+//!   Use `crate_path = "crate"` when inside otter-runtime itself.
+//!
 //! ### Example
 //!
 //! ```ignore
@@ -27,6 +32,10 @@
 //! async fn fetch_data(url: String) -> Result<String, Error> {
 //!     // ... async implementation
 //! }
+//!
+//! // Inside otter-runtime crate:
+//! #[dive(swift, crate_path = "crate")]
+//! fn internal_func() -> String { ... }
 //! ```
 //!
 //! ## Otter Terminology
@@ -67,7 +76,7 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
     parse::{Parse, ParseStream},
-    parse_macro_input, FnArg, Ident, ItemFn, Pat, ReturnType, Type,
+    parse_macro_input, FnArg, Ident, ItemFn, LitStr, Pat, ReturnType, Token, Type,
 };
 
 /// Dive mode - how the function behaves
@@ -88,12 +97,15 @@ impl Default for DiveMode {
 /// Arguments to the #[dive] attribute
 struct DiveArgs {
     mode: DiveMode,
+    /// Custom crate path for otter_runtime (e.g., "crate" when inside otter-runtime)
+    crate_path: Option<String>,
 }
 
 impl Default for DiveArgs {
     fn default() -> Self {
         Self {
             mode: DiveMode::default(),
+            crate_path: None,
         }
     }
 }
@@ -104,22 +116,54 @@ impl Parse for DiveArgs {
             return Ok(Self::default());
         }
 
-        let mode_ident: Ident = input.parse()?;
-        let mode = match mode_ident.to_string().as_str() {
-            "swift" => DiveMode::Swift,
-            "deep" => DiveMode::Deep,
-            other => {
-                return Err(syn::Error::new_spanned(
-                    mode_ident,
-                    format!(
-                        "Unknown dive mode '{}'. Expected 'swift' (sync) or 'deep' (async).",
-                        other
-                    ),
-                ))
-            }
-        };
+        let mut mode = DiveMode::default();
+        let mut crate_path = None;
 
-        Ok(Self { mode })
+        // Parse mode (swift or deep)
+        if input.peek(Ident) {
+            let mode_ident: Ident = input.parse()?;
+            mode = match mode_ident.to_string().as_str() {
+                "swift" => DiveMode::Swift,
+                "deep" => DiveMode::Deep,
+                "crate_path" => {
+                    // Handle case: #[dive(crate_path = "...")]
+                    input.parse::<Token![=]>()?;
+                    let path: LitStr = input.parse()?;
+                    crate_path = Some(path.value());
+                    DiveMode::Swift // default mode
+                }
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        mode_ident,
+                        format!(
+                            "Unknown dive mode '{}'. Expected 'swift' (sync) or 'deep' (async).",
+                            other
+                        ),
+                    ))
+                }
+            };
+        }
+
+        // Parse optional crate_path after mode: #[dive(swift, crate_path = "crate")]
+        while input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+            if input.is_empty() {
+                break;
+            }
+            let key: Ident = input.parse()?;
+            if key == "crate_path" {
+                input.parse::<Token![=]>()?;
+                let path: LitStr = input.parse()?;
+                crate_path = Some(path.value());
+            } else {
+                return Err(syn::Error::new_spanned(
+                    &key,
+                    format!("Unknown option '{}'. Expected 'crate_path'.", key),
+                ));
+            }
+        }
+
+        Ok(Self { mode, crate_path })
     }
 }
 
@@ -254,6 +298,13 @@ pub fn dive(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
 
+    // Determine the runtime crate path
+    let runtime_path: syn::Path = args
+        .crate_path
+        .as_ref()
+        .map(|p| syn::parse_str(p).expect("Invalid crate_path"))
+        .unwrap_or_else(|| syn::parse_str("otter_runtime").unwrap());
+
     // Generate argument extraction code
     let arg_extractions: Vec<_> = params
         .iter()
@@ -261,10 +312,11 @@ pub fn dive(attr: TokenStream, item: TokenStream) -> TokenStream {
         .map(|(i, param)| {
             let name = &param.name;
             let ty = &param.ty;
+            let rt = &runtime_path;
             quote! {
                 let #name: #ty = serde_json::from_value(
                     args.get(#i).cloned().unwrap_or(serde_json::Value::Null)
-                ).map_err(|e| otter_runtime::error::JscError::internal(
+                ).map_err(|e| #rt::error::JscError::internal(
                     format!("Failed to deserialize argument {}: {}", #i, e)
                 ))?;
             }
@@ -275,8 +327,9 @@ pub fn dive(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Generate result conversion based on whether it returns Result or not
     let result_conversion = if returns_result {
+        let rt = &runtime_path;
         quote! {
-            let result = result.map_err(|e| otter_runtime::error::JscError::internal(
+            let result = result.map_err(|e| #rt::error::JscError::internal(
                 format!("{}", e)
             ))?;
             Ok(serde_json::to_value(result)?)
@@ -288,13 +341,14 @@ pub fn dive(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // Generate the OpDecl function based on mode
+    let rt = &runtime_path;
     let decl_fn_body = match args.mode {
         DiveMode::Swift => {
             quote! {
                 /// Returns an OpDecl for this dive function.
                 /// Auto-generated by #[dive(swift)]
-                #func_vis fn #decl_fn_name() -> otter_runtime::extension::OpDecl {
-                    otter_runtime::extension::op_sync(#func_name_str, |_ctx, args| {
+                #func_vis fn #decl_fn_name() -> #rt::extension::OpDecl {
+                    #rt::extension::op_sync(#func_name_str, |_ctx, args| {
                         #(#arg_extractions)*
                         let result = #func_name(#(#param_names),*);
                         #result_conversion
@@ -306,8 +360,8 @@ pub fn dive(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 /// Returns an OpDecl for this dive function.
                 /// Auto-generated by #[dive(deep)]
-                #func_vis fn #decl_fn_name() -> otter_runtime::extension::OpDecl {
-                    otter_runtime::extension::op_async(#func_name_str, |_ctx, args| {
+                #func_vis fn #decl_fn_name() -> #rt::extension::OpDecl {
+                    #rt::extension::op_async(#func_name_str, |_ctx, args| {
                         async move {
                             #(#arg_extractions)*
                             let result = #func_name(#(#param_names),*).await;

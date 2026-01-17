@@ -53,6 +53,70 @@ fn main() -> anyhow::Result<()> {
 - Timeout control for script execution
 - Cross-platform: macOS, Linux, Windows
 
+## API Compatibility
+
+### Web APIs
+
+| API | Status | Notes |
+|-----|--------|-------|
+| `fetch` | ✅ Full | Headers, Request, Response, Blob, FormData |
+| `console` | ✅ Full | log, error, warn, info, debug, trace, time/timeEnd |
+| `setTimeout/setInterval` | ✅ Full | + clearTimeout, clearInterval, setImmediate |
+| `AbortController/AbortSignal` | ✅ Full | Cancellation API |
+| `EventTarget/Event` | ✅ Full | DOM-style events |
+| `URL/URLSearchParams` | ✅ Full | WHATWG URL Standard |
+| `TextEncoder/TextDecoder` | ✅ Full | UTF-8 encoding |
+| `ReadableStream/WritableStream` | ✅ Full | WHATWG Streams |
+| `WebSocket` | ✅ Full | RFC 6455 |
+| `Worker` | ✅ Full | Web Workers |
+| `performance.now()` | ✅ Full | High-resolution timing |
+| `crypto.getRandomValues` | ✅ Full | Web Crypto (partial) |
+
+### Node.js Modules
+
+| Module | Status | Implemented APIs |
+|--------|--------|------------------|
+| `buffer` | ✅ Full | `Buffer.alloc`, `from`, `concat`, `slice`, `toString`, `isBuffer`, `byteLength` |
+| `child_process` | ✅ Full | `spawn`, `spawnSync`, `exec`, `execSync`, `execFile`, `execFileSync`, `fork` |
+| `crypto` | ⚠️ Partial | `randomBytes`, `randomUUID`, `createHash`, `createHmac`, `hash` |
+| `events` | ✅ Full | `EventEmitter` with full API (on, once, emit, off, etc.) |
+| `fs` | ✅ Full | `readFile`, `writeFile`, `readdir`, `stat`, `mkdir`, `rm`, `exists`, `rename`, `copyFile` + sync + promises |
+| `os` | ✅ Full | `arch`, `platform`, `hostname`, `homedir`, `tmpdir`, `cpus`, `totalmem`, `freemem`, `userInfo`, etc. |
+| `path` | ✅ Full | `join`, `resolve`, `dirname`, `basename`, `extname`, `normalize`, `isAbsolute`, `relative` |
+| `process` | ✅ Full | `env`, `argv`, `cwd`, `exit`, `memoryUsage`, `platform`, `arch` |
+| `test` | ✅ Full | `describe`, `it`, `test`, `run` (node:test compatible) |
+| `util` | ⚠️ Partial | `promisify`, `inspect`, `format` |
+| `dns` | ❌ | Not yet implemented |
+| `http`/`https` | ❌ | Use `fetch` or `Otter.serve()` instead |
+| `net` | ❌ | TCP/UDP sockets not yet implemented |
+| `zlib` | ❌ | Not yet implemented |
+
+### Otter-specific APIs
+
+| API | Description |
+|-----|-------------|
+| `Otter.serve()` | HTTP/HTTPS server (HTTP/1.1 + HTTP/2 with ALPN, Bun-compatible) |
+| `Otter.spawn()` | Async subprocess with ReadableStream stdout/stderr |
+| `Otter.spawnSync()` | Synchronous subprocess execution |
+
+### Module System
+
+- ✅ ES Modules (import/export)
+- ✅ CommonJS (require/module.exports)
+- ✅ TypeScript (.ts, .tsx)
+- ✅ Import maps
+- ✅ `node:*` built-in module specifiers
+
+### Security (Permissions)
+
+Capability-based, deny-by-default:
+- `--allow-read` - File system read
+- `--allow-write` - File system write
+- `--allow-net` - Network access
+- `--allow-env` - Environment variables (with automatic secret filtering)
+- `--allow-run` - Subprocess execution
+- `--allow-all` - All permissions
+
 ## CLI (Optional)
 
 Otter also provides a standalone CLI for running scripts directly:

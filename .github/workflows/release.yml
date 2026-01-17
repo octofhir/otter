@@ -1,13 +1,12 @@
-name: Release
+name: Release (Manual)
 
+# NOTE: This workflow is for manual runs only.
+# Automatic releases are handled by release-plz.yml
 on:
-  push:
-    tags:
-      - 'otterjs-v*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g., v0.1.0)'
+        description: 'Release tag (e.g., otterjs-v0.1.3)'
         required: true
         type: string
 
@@ -36,6 +35,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -98,8 +99,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: artifacts/**/*
           draft: false
-          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') }}
+          prerelease: ${{ contains(inputs.tag, 'alpha') || contains(inputs.tag, 'beta') }}
           generate_release_notes: true

@@ -7,12 +7,15 @@ permissions:
 on:
   push:
     branches:
-      - main
+      - release
 
 jobs:
   release-plz:
     name: Release-plz
     runs-on: ubuntu-latest
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      releases: ${{ steps.release.outputs.releases }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,7 +32,99 @@ jobs:
           key: bun-webkit-linux-amd64-${{ hashFiles('crates/otter-jsc-sys/build.rs') }}
 
       - name: Run release-plz
+        id: release
         uses: release-plz/action@v0.5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Build binaries when otterjs is released
+  build-binaries:
+    name: Build (${{ matrix.target }})
+    needs: release-plz
+    if: needs.release-plz.outputs.releases_created == 'true' && contains(needs.release-plz.outputs.releases, 'otterjs')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: otter-macos-x64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: otter-macos-arm64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: otter-linux-x64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: otter-windows-x64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache bun-webkit
+        if: runner.os != 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/cache/bun-webkit
+          key: bun-webkit-${{ runner.os }}-${{ hashFiles('crates/otter-jsc-sys/build.rs') }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p otterjs
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/otter dist/
+          cd dist
+          tar -czf ${{ matrix.name }}.tar.gz otter
+          shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+          Copy-Item target/${{ matrix.target }}/release/otter.exe dist/
+          Compress-Archive -Path dist/otter.exe -DestinationPath dist/${{ matrix.name }}.zip
+          Get-FileHash dist/${{ matrix.name }}.zip -Algorithm SHA256 |
+            Select-Object -ExpandProperty Hash > dist/${{ matrix.name }}.zip.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.name }}.*
+
+  # Attach binaries to GitHub release
+  attach-binaries:
+    name: Attach Binaries to Release
+    needs: [release-plz, build-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Get otterjs tag
+        id: get-tag
+        run: |
+          TAG=$(echo '${{ needs.release-plz.outputs.releases }}' | jq -r '.[] | select(.package_name == "otterjs") | .tag')
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.get-tag.outputs.tag }}
+          files: artifacts/**/*

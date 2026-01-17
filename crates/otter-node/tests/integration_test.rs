@@ -7,10 +7,7 @@
 //! The JS wrapper in path.js provides the proper Node.js-compatible API via require('path').
 
 use otter_engine::CapabilitiesBuilder;
-use otter_node::{
-    create_buffer_extension, create_crypto_extension, create_fs_extension, create_path_extension,
-    create_test_extension,
-};
+use otter_node::ext;
 use otter_runtime::{Engine, transform_module, wrap_module};
 use tempfile::TempDir;
 use std::collections::HashMap;
@@ -23,7 +20,7 @@ mod path_tests {
     async fn test_path_join() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_path_extension())
+            .extension(ext::path())
             .build()
             .unwrap();
 
@@ -43,7 +40,7 @@ mod path_tests {
     async fn test_path_dirname() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_path_extension())
+            .extension(ext::path())
             .build()
             .unwrap();
 
@@ -62,7 +59,7 @@ mod path_tests {
     async fn test_path_basename() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_path_extension())
+            .extension(ext::path())
             .build()
             .unwrap();
 
@@ -87,7 +84,7 @@ mod path_tests {
     async fn test_path_extname() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_path_extension())
+            .extension(ext::path())
             .build()
             .unwrap();
 
@@ -106,7 +103,7 @@ mod path_tests {
     async fn test_path_is_absolute() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_path_extension())
+            .extension(ext::path())
             .build()
             .unwrap();
 
@@ -125,7 +122,7 @@ mod path_tests {
     async fn test_path_normalize() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_path_extension())
+            .extension(ext::path())
             .build()
             .unwrap();
 
@@ -144,7 +141,7 @@ mod path_tests {
     async fn test_path_parse() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_path_extension())
+            .extension(ext::path())
             .build()
             .unwrap();
 
@@ -169,7 +166,7 @@ mod path_tests {
     async fn test_path_sep() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_path_extension())
+            .extension(ext::path())
             .build()
             .unwrap();
 
@@ -186,7 +183,7 @@ mod path_tests {
     async fn test_path_relative() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_path_extension())
+            .extension(ext::path())
             .build()
             .unwrap();
 
@@ -210,7 +207,7 @@ mod buffer_tests {
     async fn test_buffer_alloc() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_buffer_extension())
+            .extension(ext::buffer())
             .build()
             .unwrap();
 
@@ -233,7 +230,7 @@ mod buffer_tests {
     async fn test_buffer_from_string() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_buffer_extension())
+            .extension(ext::buffer())
             .build()
             .unwrap();
 
@@ -251,7 +248,7 @@ mod buffer_tests {
     async fn test_buffer_from_base64() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_buffer_extension())
+            .extension(ext::buffer())
             .build()
             .unwrap();
 
@@ -270,7 +267,7 @@ mod buffer_tests {
     async fn test_buffer_from_hex() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_buffer_extension())
+            .extension(ext::buffer())
             .build()
             .unwrap();
 
@@ -289,7 +286,7 @@ mod buffer_tests {
     async fn test_buffer_to_string() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_buffer_extension())
+            .extension(ext::buffer())
             .build()
             .unwrap();
 
@@ -326,7 +323,7 @@ mod buffer_tests {
     async fn test_buffer_concat() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_buffer_extension())
+            .extension(ext::buffer())
             .build()
             .unwrap();
 
@@ -355,7 +352,7 @@ mod buffer_tests {
     async fn test_buffer_slice() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_buffer_extension())
+            .extension(ext::buffer())
             .build()
             .unwrap();
 
@@ -382,7 +379,7 @@ mod buffer_tests {
     async fn test_buffer_equals() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_buffer_extension())
+            .extension(ext::buffer())
             .build()
             .unwrap();
 
@@ -419,7 +416,7 @@ mod buffer_tests {
     async fn test_buffer_compare() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_buffer_extension())
+            .extension(ext::buffer())
             .build()
             .unwrap();
 
@@ -456,7 +453,7 @@ mod buffer_tests {
     async fn test_buffer_is_buffer() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_buffer_extension())
+            .extension(ext::buffer())
             .build()
             .unwrap();
 
@@ -504,7 +501,7 @@ mod fs_tests {
 
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_fs_extension(caps))
+            .extension(ext::fs(caps))
             .build()
             .unwrap();
 
@@ -543,7 +540,7 @@ mod fs_tests {
 
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_fs_extension(caps))
+            .extension(ext::fs(caps))
             .build()
             .unwrap();
 
@@ -577,7 +574,7 @@ mod fs_tests {
 
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_fs_extension(caps))
+            .extension(ext::fs(caps))
             .build()
             .unwrap();
 
@@ -609,7 +606,7 @@ mod fs_tests {
 
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_fs_extension(caps))
+            .extension(ext::fs(caps))
             .build()
             .unwrap();
 
@@ -646,7 +643,7 @@ mod fs_tests {
 
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_fs_extension(caps))
+            .extension(ext::fs(caps))
             .build()
             .unwrap();
 
@@ -681,7 +678,7 @@ mod fs_tests {
 
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_fs_extension(caps))
+            .extension(ext::fs(caps))
             .build()
             .unwrap();
 
@@ -721,7 +718,7 @@ mod fs_tests {
 
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_fs_extension(caps))
+            .extension(ext::fs(caps))
             .build()
             .unwrap();
 
@@ -750,7 +747,7 @@ mod node_builtin_import_tests {
     async fn test_import_node_path() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_path_extension())
+            .extension(ext::path())
             .build()
             .unwrap();
 
@@ -790,7 +787,7 @@ mod node_builtin_import_tests {
 
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_fs_extension(caps))
+            .extension(ext::fs(caps))
             .build()
             .unwrap();
 
@@ -825,7 +822,7 @@ mod node_builtin_import_tests {
     async fn test_import_node_buffer() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_buffer_extension())
+            .extension(ext::buffer())
             .build()
             .unwrap();
 
@@ -857,7 +854,7 @@ mod node_builtin_import_tests {
     async fn test_import_node_crypto_shape() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_crypto_extension())
+            .extension(ext::crypto())
             .build()
             .unwrap();
 
@@ -892,7 +889,7 @@ mod node_builtin_import_tests {
     async fn test_import_node_test_shape() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -933,7 +930,7 @@ mod test_tests {
     async fn test_describe_and_end_describe() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -950,7 +947,7 @@ mod test_tests {
     async fn test_record_result() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -982,7 +979,7 @@ mod test_tests {
     async fn test_skip() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1002,7 +999,7 @@ mod test_tests {
     async fn test_nested_suites() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1035,7 +1032,7 @@ mod test_tests {
     async fn test_assert_equal_pass() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1057,7 +1054,7 @@ mod test_tests {
     async fn test_assert_equal_fail() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1075,7 +1072,7 @@ mod test_tests {
     async fn test_assert_not_equal() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1094,7 +1091,7 @@ mod test_tests {
     async fn test_assert_true_false() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1128,7 +1125,7 @@ mod test_tests {
     async fn test_assert_ok() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1150,7 +1147,7 @@ mod test_tests {
     async fn test_assert_deep_equal() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1178,7 +1175,7 @@ mod test_tests {
     async fn test_reset() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1212,7 +1209,7 @@ mod test_tests {
     async fn test_js_wrapper_functions_exist() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1261,7 +1258,7 @@ mod test_tests {
     async fn test_describe_with_callback() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1293,7 +1290,7 @@ mod test_tests {
     async fn test_nested_describe() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1334,7 +1331,7 @@ mod test_tests {
     async fn test_it_skip() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1369,7 +1366,7 @@ mod test_tests {
     async fn test_it_only() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1406,7 +1403,7 @@ mod test_tests {
     async fn test_before_each_hook() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1446,7 +1443,7 @@ mod test_tests {
     async fn test_after_each_hook() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1487,7 +1484,7 @@ mod test_tests {
     async fn test_failing_test() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1521,7 +1518,7 @@ mod test_tests {
     async fn test_assert_throws() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1560,7 +1557,7 @@ mod test_tests {
     async fn test_async_tests() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1604,7 +1601,7 @@ mod test_tests {
     async fn test_test_alias() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1638,7 +1635,7 @@ mod test_tests {
     async fn test_deep_equal_in_suite() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 
@@ -1677,7 +1674,7 @@ mod test_tests {
     async fn test_standalone_it() {
         let engine = Engine::builder()
             .pool_size(1)
-            .extension(create_test_extension())
+            .extension(ext::test())
             .build()
             .unwrap();
 

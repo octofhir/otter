@@ -1,0 +1,11 @@
+{
+    "private": true,
+    "name": "@types/otter",
+    "version": "0.1.9999",
+    "projects": [
+        "https://github.com/octofhir/otter"
+    ],
+    "dependencies": {
+        "otter-types": "*"
+    }
+}

@@ -15,7 +15,7 @@
       "ES2022"
     ],
     "typeRoots": ["./node_modules/@types"],
-    "types": ["otter", "node"]
+    "types": ["otter", "node", "bun"]
   },
   "include": [
     "src/**/*",

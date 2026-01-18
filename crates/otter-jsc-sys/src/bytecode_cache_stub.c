@@ -100,3 +100,33 @@ bool otter_generate_module_bytecode_to_file(
     }
     return false;
 }
+
+bool otter_evaluate_with_cache(
+    JSContextRef ctx,
+    const char* source,
+    size_t source_len,
+    const char* filename,
+    size_t filename_len,
+    const char* bytecode_path,
+    size_t bytecode_path_len,
+    struct OtterBytecodeResult* out)
+{
+    (void)ctx;
+    (void)source;
+    (void)source_len;
+    (void)filename;
+    (void)filename_len;
+    (void)bytecode_path;
+    (void)bytecode_path_len;
+
+    if (out) {
+        out->success = false;
+        out->data = NULL;
+        out->size = 0;
+        strncpy(out->error_message,
+            "Bytecode cache evaluation not available with system JSC",
+            sizeof(out->error_message) - 1);
+        out->error_message[sizeof(out->error_message) - 1] = '\0';
+    }
+    return false;
+}

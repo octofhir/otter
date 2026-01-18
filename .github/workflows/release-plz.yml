@@ -128,3 +128,30 @@ jobs:
         with:
           tag_name: ${{ steps.get-tag.outputs.tag }}
           files: artifacts/**/*
+
+  # Publish otter-types to npm
+  publish-types:
+    name: Publish otter-types
+    needs: [release-plz, build-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Get otterjs version
+        id: get-version
+        run: |
+          VERSION=$(echo '${{ needs.release-plz.outputs.releases }}' | jq -r '.[] | select(.package_name == "otterjs") | .version')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Publish to npm
+        run: ./scripts/publish-types.sh --version "${{ steps.get-version.outputs.version }}" --publish

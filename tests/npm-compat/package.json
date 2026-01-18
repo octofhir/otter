@@ -1,0 +1,16 @@
+{
+	"name": "otter-npm-compat-tests",
+	"version": "1.0.0",
+	"description": "NPM package compatibility tests for Otter runtime",
+	"type": "module",
+	"dependencies": {
+		"axios": "^1.13.2",
+		"chalk": "^5.6.2",
+		"commander": "^14.0.2",
+		"date-fns": "^4.1.0",
+		"dotenv": "^17.2.3",
+		"lodash-es": "^4.17.21",
+		"uuid": "^13.0.0",
+		"zod": "^4.3.5"
+	}
+}

@@ -1,3 +1,6 @@
+#include <span>
+#define JS_EXPORT_PRIVATE __attribute__((visibility("default")))
+#include <wtf/ExportMacros.h>
 #include <JavaScriptCore/APICast.h>
 #include <JavaScriptCore/JSGlobalObjectInlines.h>
 #include <JavaScriptCore/Heap.h>

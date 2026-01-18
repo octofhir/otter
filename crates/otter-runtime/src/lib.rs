@@ -80,6 +80,7 @@ pub mod extension;
 pub mod holt;
 pub mod memory;
 pub mod modules;
+pub mod modules_ast;
 pub mod runtime;
 pub mod transpiler;
 pub mod tsconfig;

@@ -246,12 +246,24 @@ fn link_bun_webkit(webkit_path: &PathBuf, os: &str) -> Option<PathBuf> {
     }
 
     // Set include path for headers
+    // 1. Try direct include
     let include_dir = webkit_path.join("include");
     if include_dir.exists() {
         println!("cargo:include={}", include_dir.display());
         return Some(include_dir);
     }
 
+    // 2. Try bun-webkit subdirectory (common in tarballs)
+    let subdir_include = webkit_path.join("bun-webkit").join("include");
+    if subdir_include.exists() {
+        println!("cargo:include={}", subdir_include.display());
+        return Some(subdir_include);
+    }
+
+    println!(
+        "cargo:warning=Include directory not found in {}",
+        webkit_path.display()
+    );
     None
 }
 
@@ -261,7 +273,7 @@ fn compile_heap_stats_cpp(include_dir: &PathBuf, os: &str) {
         .cpp(true)
         .file("src/heap_stats.cpp")
         .include(include_dir)
-        .flag_if_supported("-std=c++17");
+        .flag_if_supported("-std=c++20");
 
     if os == "macos" {
         build.flag_if_supported("-stdlib=libc++");
@@ -275,7 +287,7 @@ fn compile_heap_stats_cpp(include_dir: &PathBuf, os: &str) {
         .cpp(true)
         .file("src/bytecode_cache.cpp")
         .include(include_dir)
-        .flag_if_supported("-std=c++17");
+        .flag_if_supported("-std=c++20");
 
     if os == "macos" {
         bytecode_build.flag_if_supported("-stdlib=libc++");

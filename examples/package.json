@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "description": "Example TypeScript files for Otter runtime",
+  "scripts": {
+    "demo:build": "otter build standalone.ts --compile -o standalone && ./standalone hello world"
+  },
   "devDependencies": {
     "typescript": "^5.7.0"
   }

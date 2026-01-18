@@ -1,18 +1,13 @@
 {
   "version": 1,
   "packages": {
-    "@types/node": {
-      "version": "25.0.9",
-      "resolved": "https://registry.npmjs.org/@types/node/-/node-25.0.9.tgz",
-      "integrity": "sha512-/rpCXHlCWeqClNBwUhDcusJxXYDjZTyE8v5oTO7WbL8eij2nKhUeU89/6xgjU7N4/Vh3He0BtyhJdQbDyhiXAw==",
+    "@types/bun": {
+      "version": "1.3.6",
+      "resolved": "https://registry.npmjs.org/@types/bun/-/bun-1.3.6.tgz",
+      "integrity": "sha512-uWCv6FO/8LcpREhenN1d1b6fcspAB+cefwD7uti8C8VffIv0Um08TKMn98FynpTiU38+y2dUO55T11NgDt8VAA==",
       "dependencies": {
-        "undici-types": "~7.16.0"
+        "bun-types": "1.3.6"
       }
-    },
-    "typescript": {
-      "version": "5.9.3",
-      "resolved": "https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz",
-      "integrity": "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="
     },
     "bun-types": {
       "version": "1.3.6",
@@ -22,18 +17,31 @@
         "@types/node": "*"
       }
     },
+    "otter-types": {
+      "version": "0.1.2",
+      "resolved": "https://registry.npmjs.org/otter-types/-/otter-types-0.1.2.tgz",
+      "integrity": "sha512-EyJ5HHxbQZ86Zyoq3a0u2IBvi720aqKn7Silz6XKPBWICnJN5Xz4XF2BB1CE3PfRFKGN7fxMqZ6SVoiAar8djw==",
+      "dependencies": {
+        "@types/node": "*"
+      }
+    },
+    "typescript": {
+      "version": "5.9.3",
+      "resolved": "https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz",
+      "integrity": "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="
+    },
+    "@types/node": {
+      "version": "25.0.9",
+      "resolved": "https://registry.npmjs.org/@types/node/-/node-25.0.9.tgz",
+      "integrity": "sha512-/rpCXHlCWeqClNBwUhDcusJxXYDjZTyE8v5oTO7WbL8eij2nKhUeU89/6xgjU7N4/Vh3He0BtyhJdQbDyhiXAw==",
+      "dependencies": {
+        "undici-types": "~7.16.0"
+      }
+    },
     "undici-types": {
       "version": "7.16.0",
       "resolved": "https://registry.npmjs.org/undici-types/-/undici-types-7.16.0.tgz",
       "integrity": "sha512-Zz+aZWSj8LE6zoxD+xrjh4VfkIG8Ya6LvYkZqtUQGJPZjYl53ypCaUwWqo7eI0x66KBGeRo+mlBEkMSeSZ38Nw=="
-    },
-    "@types/bun": {
-      "version": "1.3.6",
-      "resolved": "https://registry.npmjs.org/@types/bun/-/bun-1.3.6.tgz",
-      "integrity": "sha512-uWCv6FO/8LcpREhenN1d1b6fcspAB+cefwD7uti8C8VffIv0Um08TKMn98FynpTiU38+y2dUO55T11NgDt8VAA==",
-      "dependencies": {
-        "bun-types": "1.3.6"
-      }
     }
   }
 }

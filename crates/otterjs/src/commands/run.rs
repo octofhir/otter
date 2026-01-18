@@ -1,4 +1,4 @@
-//! Run command - execute a JavaScript/TypeScript file.
+//! Run command - execute a JavaScript/TypeScript file or package.json script.
 
 use anyhow::Result;
 use clap::Args;
@@ -16,10 +16,11 @@ use otter_node::{
     ActiveNetServerCount, ActiveServerCount, IpcChannel, NetEvent, ProcessInfo, ext, has_ipc,
     init_net_manager,
 };
+use otter_pm::{ScriptRunner, format_scripts_list};
 use otter_runtime::HttpEvent;
 use otter_runtime::{
-    JscConfig, JscRuntime, bundle_modules, needs_transpilation, set_net_permission_checker,
-    set_tokio_handle, transpile_typescript,
+    JscConfig, JscRuntime, bundle_modules_mixed, needs_transpilation, set_net_permission_checker,
+    set_tokio_handle, transpile_typescript, ModuleFormat, ModuleInfo,
     tsgo::{TypeCheckConfig, check_types, format_diagnostics, has_errors},
 };
 use otter_sql::sql_extension;
@@ -27,8 +28,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
+use strsim::levenshtein;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 /// Cached HTTP dispatch function for fast handler invocation
@@ -49,8 +52,8 @@ use crate::watch::{
 
 #[derive(Args)]
 pub struct RunCommand {
-    /// File to execute
-    pub entry: PathBuf,
+    /// File to execute OR script name from package.json
+    pub entry: Option<String>,
 
     /// Arguments to pass to script
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -99,26 +102,207 @@ pub struct RunCommand {
     /// Watch mode - restart on file changes
     #[arg(long)]
     pub watch: bool,
+
+    /// Force file execution even if script exists with same name
+    #[arg(long)]
+    pub file: bool,
 }
 
 impl RunCommand {
     pub async fn run(&self, config: &Config) -> Result<()> {
-        if self.watch {
-            self.run_watch_mode(config).await
-        } else {
-            self.run_once(config).await
+        let cwd = std::env::current_dir()?;
+
+        // No entry provided - list available scripts
+        let Some(ref entry) = self.entry else {
+            return self.list_scripts(&cwd);
+        };
+
+        // Check if entry looks like a file path
+        let path = PathBuf::from(entry);
+        let is_file_path = self.file  // --file flag forces file mode
+            || path.extension().is_some()  // has extension like .ts, .js
+            || entry.starts_with(".")       // relative path like ./script.ts
+            || entry.starts_with("/")       // absolute path
+            || entry.contains('/');         // path with directory
+
+        if is_file_path {
+            // Treat as file
+            if !path.exists() {
+                return Err(self.file_not_found_error(&path, &cwd));
+            }
+            return self.run_file(&path, config).await;
+        }
+
+        // Try to find as package.json script
+        if let Some(runner) = ScriptRunner::try_new(&cwd) {
+            if runner.has_script(entry) {
+                return self.run_script(&runner, entry);
+            }
+
+            // Script not found - check for typos and show suggestions
+            let suggestions = runner.suggest(entry);
+            if !suggestions.is_empty() {
+                let mut msg = format!("error: Script '{}' not found in package.json\n\n", entry);
+                msg.push_str("Did you mean?\n");
+                for (name, cmd) in &suggestions {
+                    let truncated = if cmd.len() > 40 {
+                        format!("{}...", &cmd[..37])
+                    } else {
+                        cmd.to_string()
+                    };
+                    msg.push_str(&format!("  {} → {}\n", name, truncated));
+                }
+                msg.push_str(&format!(
+                    "\nAvailable scripts: {}",
+                    runner.script_names().join(", ")
+                ));
+                return Err(anyhow::anyhow!("{}", msg));
+            }
+        }
+
+        // Check if file exists (maybe user forgot extension)
+        if path.exists() {
+            return self.run_file(&path, config).await;
+        }
+
+        // Neither script nor file - show helpful error
+        Err(self.entry_not_found_error(entry, &cwd))
+    }
+
+    /// List available scripts from package.json
+    fn list_scripts(&self, cwd: &Path) -> Result<()> {
+        match ScriptRunner::try_new(cwd) {
+            Some(runner) => {
+                let scripts = runner.list();
+                if scripts.is_empty() {
+                    println!("No scripts defined in package.json");
+                } else {
+                    println!("Available scripts:\n");
+                    println!("{}", format_scripts_list(&scripts));
+                    println!("\nRun a script with: otter run <script-name>");
+                }
+                Ok(())
+            }
+            None => {
+                println!("No package.json found in current directory.\n");
+                println!("Usage: otter run <file.ts|script-name> [args...]");
+                println!("\nExamples:");
+                println!("  otter run app.ts          Run a TypeScript file");
+                println!("  otter run build           Run 'build' script from package.json");
+                println!("  otter run test -- --watch Pass args to script");
+                Ok(())
+            }
         }
     }
 
-    async fn run_watch_mode(&self, config: &Config) -> Result<()> {
+    /// Run a package.json script
+    fn run_script(&self, runner: &ScriptRunner, name: &str) -> Result<()> {
+        let script_cmd = runner
+            .get_script(name)
+            .ok_or_else(|| anyhow::anyhow!("Script '{}' not found", name))?;
+
+        // Build the command with arguments
+        let full_cmd = if self.args.is_empty() {
+            script_cmd.clone()
+        } else {
+            format!("{} {}", script_cmd, shell_escape_args(&self.args))
+        };
+
+        // Build PATH with node_modules/.bin
+        let bin_path = runner.project_dir().join("node_modules/.bin");
+        let path = build_script_path(&bin_path);
+
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(&full_cmd)
+            .current_dir(runner.project_dir())
+            .env("PATH", &path)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()?;
+
+        if !status.success() {
+            let code = status.code().unwrap_or(1);
+            std::process::exit(code);
+        }
+
+        Ok(())
+    }
+
+    /// Run a file (the original behavior)
+    async fn run_file(&self, path: &Path, config: &Config) -> Result<()> {
+        // Store path for internal use
+        let entry_path = path.to_path_buf();
+
+        if self.watch {
+            self.run_watch_mode_file(&entry_path, config).await
+        } else {
+            self.run_once_file(&entry_path, config).await
+        }
+    }
+
+    /// Error when file not found
+    fn file_not_found_error(&self, path: &Path, cwd: &Path) -> anyhow::Error {
+        let mut msg = format!("error: Cannot find file '{}'\n", path.display());
+
+        // Try to find similar files
+        if let Some(similar) = find_similar_files(path, cwd) {
+            msg.push_str("\nSimilar files found:\n");
+            for f in similar.iter().take(3) {
+                msg.push_str(&format!("  {}\n", f));
+            }
+        }
+
+        // Suggest scripts if available
+        if let Some(runner) = ScriptRunner::try_new(cwd) {
+            let names = runner.script_names();
+            if !names.is_empty() {
+                msg.push_str("\nDid you mean to run a script? Available scripts:\n  ");
+                msg.push_str(&names.join(", "));
+                msg.push('\n');
+            }
+        }
+
+        anyhow::anyhow!("{}", msg)
+    }
+
+    /// Error when neither file nor script found
+    fn entry_not_found_error(&self, entry: &str, cwd: &Path) -> anyhow::Error {
+        let mut msg = format!("error: '{}' is not a file or script\n", entry);
+
+        // Check for similar files
+        let path = PathBuf::from(entry);
+        if let Some(similar) = find_similar_files(&path, cwd) {
+            msg.push_str("\nSimilar files found:\n");
+            for f in similar.iter().take(3) {
+                msg.push_str(&format!("  {}\n", f));
+            }
+        }
+
+        // List available scripts
+        if let Some(runner) = ScriptRunner::try_new(cwd) {
+            let names = runner.script_names();
+            if !names.is_empty() {
+                msg.push_str("\nAvailable scripts:\n  ");
+                msg.push_str(&names.join(", "));
+                msg.push('\n');
+            }
+        }
+
+        msg.push_str("\nUsage: otter run <file.ts> or otter run <script-name>");
+
+        anyhow::anyhow!("{}", msg)
+    }
+
+    async fn run_watch_mode_file(&self, entry: &Path, config: &Config) -> Result<()> {
         println!("\x1b[36m[HMR]\x1b[0m Watching for file changes...");
 
         let watch_config = WatchConfig::default();
         let mut watcher = FileWatcher::new(watch_config.clone());
 
         // Watch the directory containing the entry file
-        let watch_dir = self
-            .entry
+        let watch_dir = entry
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
@@ -129,7 +313,7 @@ impl RunCommand {
 
         // Initial run
         clear_console(watch_config.clear_console);
-        let result = self.run_once(config).await;
+        let result = self.run_once_file(entry, config).await;
         if let Err(e) = result {
             eprintln!("\x1b[31m[Error]\x1b[0m {}", e);
         }
@@ -141,7 +325,7 @@ impl RunCommand {
                     print_reload_message(&files);
                     clear_console(watch_config.clear_console);
 
-                    let result = self.run_once(config).await;
+                    let result = self.run_once_file(entry, config).await;
                     if let Err(e) = result {
                         eprintln!("\x1b[31m[Error]\x1b[0m {}", e);
                     }
@@ -159,7 +343,7 @@ impl RunCommand {
         Ok(())
     }
 
-    async fn run_once(&self, config: &Config) -> Result<()> {
+    async fn run_once_file(&self, entry: &Path, config: &Config) -> Result<()> {
         let total_start = std::time::Instant::now();
         let mut phase_start = total_start;
 
@@ -186,19 +370,19 @@ impl RunCommand {
         timing!("net_permission_set");
 
         // Type check if needed and file is TypeScript
-        let is_typescript = needs_transpilation(&self.entry.to_string_lossy());
+        let is_typescript = needs_transpilation(&entry.to_string_lossy());
         let type_check_enabled = self.check || config.typescript.check;
         if type_check_enabled && is_typescript {
-            self.type_check().await?;
+            self.type_check_file(entry).await?;
             timing!("type_check");
         }
 
         // Read source
-        let source = std::fs::read_to_string(&self.entry)?;
+        let source = std::fs::read_to_string(entry)?;
         timing!("source_read");
 
         // Build module loader config from CLI config
-        let loader_config = build_loader_config(&self.entry, &config.modules);
+        let loader_config = build_loader_config(entry, &config.modules);
         tracing::debug!(
             base_dir = %loader_config.base_dir.display(),
             remote_allowlist_count = loader_config.remote_allowlist.len(),
@@ -216,12 +400,12 @@ impl RunCommand {
             let mut graph = ModuleGraph::new(loader.clone());
 
             // Load entry file as file:// URL
-            let entry_url = format!("file://{}", self.entry.canonicalize()?.display());
+            let entry_url = format!("file://{}", entry.canonicalize()?.display());
             graph.load(&entry_url).await?;
 
-            // Bundle all modules in topological order
+            // Bundle all modules in topological order with CJS/ESM detection
             let execution_order = graph.execution_order();
-            let mut modules_for_bundle: Vec<(&str, &str, HashMap<String, String>)> = Vec::new();
+            let mut modules_for_bundle: Vec<(String, String, HashMap<String, String>, bool, Option<String>, Option<String>)> = Vec::new();
 
             for url in &execution_order {
                 // Skip built-in modules (node: and otter:) - they have no source
@@ -237,17 +421,38 @@ impl RunCommand {
                             deps.insert(dep_specifier.clone(), resolved);
                         }
                     }
-                    modules_for_bundle.push((url, node.executable_source(), deps));
+                    let is_cjs = node.is_commonjs();
+                    let dirname = node.dirname().map(|s| s.to_string());
+                    let filename = node.filename().map(|s| s.to_string());
+                    modules_for_bundle.push((
+                        url.to_string(),
+                        node.executable_source().to_string(),
+                        deps,
+                        is_cjs,
+                        dirname,
+                        filename,
+                    ));
                 }
             }
 
-            // Convert to borrowed refs for bundle_modules
-            let modules_refs: Vec<(&str, &str, &HashMap<String, String>)> = modules_for_bundle
+            // Convert to ModuleInfo for mixed bundling
+            let modules: Vec<ModuleInfo<'_>> = modules_for_bundle
                 .iter()
-                .map(|(url, src, deps)| (*url, *src, deps))
+                .map(|(url, src, deps, is_cjs, dirname, filename)| ModuleInfo {
+                    url: url.as_str(),
+                    source: src.as_str(),
+                    dependencies: deps,
+                    format: if *is_cjs {
+                        ModuleFormat::CommonJS
+                    } else {
+                        ModuleFormat::ESM
+                    },
+                    dirname: dirname.as_deref(),
+                    filename: filename.as_deref(),
+                })
                 .collect();
 
-            bundle_modules(modules_refs)
+            bundle_modules_mixed(modules)
         } else {
             // No imports - just transpile if needed
             if is_typescript {
@@ -299,6 +504,10 @@ impl RunCommand {
         timing!("ext_os");
         runtime.register_extension(ext::child_process())?;
         timing!("ext_child_process");
+        runtime.register_extension(ext::string_decoder())?;
+        timing!("ext_string_decoder");
+        runtime.register_extension(ext::readline())?;
+        timing!("ext_readline");
 
         // Register net extension for node:net (TCP server/socket)
         runtime.register_extension(ext::net())?;
@@ -341,7 +550,7 @@ impl RunCommand {
         let process_info = ProcessInfo::new(
             env_store,
             std::iter::once("otter".to_string())
-                .chain(std::iter::once(self.entry.to_string_lossy().to_string()))
+                .chain(std::iter::once(entry.to_string_lossy().to_string()))
                 .chain(self.args.iter().cloned())
                 .collect(),
         );
@@ -373,6 +582,10 @@ impl RunCommand {
              }})();\n",
         );
 
+        // Write bundle for debugging if env var is set
+        if std::env::var("OTTER_DEBUG_BUNDLE").is_ok() {
+            std::fs::write("/tmp/otter_bundle_debug.js", &wrapped).ok();
+        }
         runtime.eval(&wrapped)?;
         timing!("script_eval");
 
@@ -532,8 +745,8 @@ impl RunCommand {
         Ok(builder.build())
     }
 
-    async fn type_check(&self) -> Result<()> {
-        let tsconfig = crate::config::find_tsconfig_for_file(&self.entry);
+    async fn type_check_file(&self, entry: &Path) -> Result<()> {
+        let tsconfig = crate::config::find_tsconfig_for_file(entry);
 
         let config = TypeCheckConfig {
             enabled: true,
@@ -545,7 +758,7 @@ impl RunCommand {
             lib: vec!["ES2022".to_string(), "DOM".to_string()],
         };
 
-        let diagnostics = check_types(std::slice::from_ref(&self.entry), &config)
+        let diagnostics = check_types(std::slice::from_ref(&entry.to_path_buf()), &config)
             .await
             .map_err(|e| anyhow::anyhow!("Type check failed: {}", e))?;
 
@@ -555,6 +768,108 @@ impl RunCommand {
         }
 
         Ok(())
+    }
+}
+
+/// Escape arguments for shell execution
+fn shell_escape_args(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if arg.contains(' ') || arg.contains('"') || arg.contains('\'') {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Build PATH with node_modules/.bin prepended
+fn build_script_path(bin_path: &Path) -> String {
+    let mut paths = Vec::new();
+
+    // Local node_modules/.bin (highest priority)
+    if bin_path.exists() {
+        paths.push(bin_path.display().to_string());
+    }
+
+    // Walk up directory tree for nested node_modules
+    let mut current = bin_path.parent().and_then(|p| p.parent());
+    while let Some(dir) = current {
+        let bin = dir.join("node_modules/.bin");
+        if bin.exists() {
+            paths.push(bin.display().to_string());
+        }
+        current = dir.parent();
+    }
+
+    // Existing PATH
+    if let Ok(existing) = std::env::var("PATH") {
+        paths.push(existing);
+    }
+
+    paths.join(":")
+}
+
+/// Find similar files using fuzzy matching
+fn find_similar_files(target: &Path, cwd: &Path) -> Option<Vec<String>> {
+    let target_name = target.file_name()?.to_string_lossy();
+    let target_str = target_name.as_ref();
+
+    let mut similar = Vec::new();
+
+    // Get the directory to search
+    let search_dir = if target.is_absolute() {
+        target.parent().unwrap_or(cwd)
+    } else if let Some(parent) = target.parent() {
+        if parent.as_os_str().is_empty() {
+            cwd
+        } else {
+            &cwd.join(parent)
+        }
+    } else {
+        cwd
+    };
+
+    if let Ok(entries) = std::fs::read_dir(search_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            // Skip hidden files and directories
+            if name.starts_with('.') {
+                continue;
+            }
+
+            // Check file extensions for JS/TS files
+            let is_script = name.ends_with(".ts")
+                || name.ends_with(".js")
+                || name.ends_with(".tsx")
+                || name.ends_with(".jsx")
+                || name.ends_with(".mjs")
+                || name.ends_with(".mts");
+
+            if is_script {
+                let distance = levenshtein(target_str, &name);
+                if distance <= 3 {
+                    let rel_path = if search_dir == cwd {
+                        name
+                    } else if let Ok(rel) = search_dir.strip_prefix(cwd) {
+                        format!("{}/{}", rel.display(), name)
+                    } else {
+                        name
+                    };
+                    similar.push((distance, rel_path));
+                }
+            }
+        }
+    }
+
+    if similar.is_empty() {
+        None
+    } else {
+        similar.sort_by_key(|(d, _)| *d);
+        Some(similar.into_iter().map(|(_, p)| p).collect())
     }
 }
 

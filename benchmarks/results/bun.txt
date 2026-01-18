@@ -1,0 +1,209 @@
+==================================================
+Otter Benchmark Suite
+==================================================
+Runtime: bun 1.3.5
+Category: all
+
+
+[startup]
+  Running: hello-world...
+    Duration: 0.00ms
+    Ops/sec: 62
+
+[startup]
+  Running: json-parse-small...
+    Duration: 1.63ms
+    Ops/sec: 997
+
+[cpu]
+  Running: fibonacci-recursive...
+    Duration: 66.29ms
+    Ops/sec: 1000
+
+[cpu]
+  Running: fibonacci-iterative...
+    Duration: 289.26ms
+    Ops/sec: 1000
+
+[cpu]
+  Running: json-stringify-large...
+    Duration: 15.34ms
+    Ops/sec: 976
+
+[cpu]
+  Running: array-operations...
+    Duration: 1.14ms
+    Ops/sec: 996
+
+[cpu]
+  Running: string-operations...
+    Duration: 1.21ms
+    Ops/sec: 995
+
+[cpu]
+  Running: regex-matching...
+    Duration: 4.07ms
+    Ops/sec: 999
+
+[memory]
+  Running: object-allocation...
+    Duration: 7.28ms
+    Ops/sec: 997
+
+[memory]
+  Running: array-allocation...
+    Duration: 13.10ms
+    Ops/sec: 999
+
+[memory]
+  Running: typed-array-allocation...
+    Duration: 3.30ms
+    Ops/sec: 997
+
+==================================================
+Summary
+==================================================
+
+STARTUP:
+  hello-world: 0.00ms
+  json-parse-small: 1.63ms
+
+CPU:
+  fibonacci-recursive: 66.29ms
+  fibonacci-iterative: 289.26ms
+  json-stringify-large: 15.34ms
+  array-operations: 1.14ms
+  string-operations: 1.21ms
+  regex-matching: 4.07ms
+
+MEMORY:
+  object-allocation: 7.28ms
+  array-allocation: 13.10ms
+  typed-array-allocation: 3.30ms
+
+Results saved to: benchmarks/results/bun-1768721183531.json
+
+Results JSON (copy below):
+[
+  {
+    "name": "hello-world",
+    "category": "startup",
+    "runtime": "bun",
+    "version": "1.3.5",
+    "metrics": {
+      "duration_ms": 0.004042,
+      "ops_per_sec": 61.85056902523504
+    },
+    "timestamp": "2026-01-18T07:26:22.313Z"
+  },
+  {
+    "name": "json-parse-small",
+    "category": "startup",
+    "runtime": "bun",
+    "version": "1.3.5",
+    "metrics": {
+      "duration_ms": 1.628959,
+      "ops_per_sec": 997.4928773529598
+    },
+    "timestamp": "2026-01-18T07:26:22.320Z"
+  },
+  {
+    "name": "fibonacci-recursive",
+    "category": "cpu",
+    "runtime": "bun",
+    "version": "1.3.5",
+    "metrics": {
+      "duration_ms": 66.286917,
+      "ops_per_sec": 999.5015305961506
+    },
+    "timestamp": "2026-01-18T07:26:22.434Z"
+  },
+  {
+    "name": "fibonacci-iterative",
+    "category": "cpu",
+    "runtime": "bun",
+    "version": "1.3.5",
+    "metrics": {
+      "duration_ms": 289.263083,
+      "ops_per_sec": 999.9083913518269
+    },
+    "timestamp": "2026-01-18T07:26:23.009Z"
+  },
+  {
+    "name": "json-stringify-large",
+    "category": "cpu",
+    "runtime": "bun",
+    "version": "1.3.5",
+    "metrics": {
+      "duration_ms": 15.337125,
+      "ops_per_sec": 976.1907137093816
+    },
+    "timestamp": "2026-01-18T07:26:23.039Z"
+  },
+  {
+    "name": "array-operations",
+    "category": "cpu",
+    "runtime": "bun",
+    "version": "1.3.5",
+    "metrics": {
+      "duration_ms": 1.1396625,
+      "ops_per_sec": 996.38041964178
+    },
+    "timestamp": "2026-01-18T07:26:23.054Z"
+  },
+  {
+    "name": "string-operations",
+    "category": "cpu",
+    "runtime": "bun",
+    "version": "1.3.5",
+    "metrics": {
+      "duration_ms": 1.2068667,
+      "ops_per_sec": 995.314975547838
+    },
+    "timestamp": "2026-01-18T07:26:23.068Z"
+  },
+  {
+    "name": "regex-matching",
+    "category": "cpu",
+    "runtime": "bun",
+    "version": "1.3.5",
+    "metrics": {
+      "duration_ms": 4.07317458,
+      "ops_per_sec": 998.7815768996574
+    },
+    "timestamp": "2026-01-18T07:26:23.480Z"
+  },
+  {
+    "name": "object-allocation",
+    "category": "memory",
+    "runtime": "bun",
+    "version": "1.3.5",
+    "metrics": {
+      "duration_ms": 7.275416,
+      "ops_per_sec": 996.8788039061959
+    },
+    "timestamp": "2026-01-18T07:26:23.495Z"
+  },
+  {
+    "name": "array-allocation",
+    "category": "memory",
+    "runtime": "bun",
+    "version": "1.3.5",
+    "metrics": {
+      "duration_ms": 13.1005,
+      "ops_per_sec": 998.8485935651311
+    },
+    "timestamp": "2026-01-18T07:26:23.523Z"
+  },
+  {
+    "name": "typed-array-allocation",
+    "category": "memory",
+    "runtime": "bun",
+    "version": "1.3.5",
+    "metrics": {
+      "duration_ms": 3.304333,
+      "ops_per_sec": 997.0620394494138
+    },
+    "timestamp": "2026-01-18T07:26:23.528Z"
+  }
+]

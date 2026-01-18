@@ -220,7 +220,73 @@ impl TypeChecker {
                     "isNodeSourceFile"
                 ],
                 "logFile": "",
-                "forkContextInfo": {}
+                "forkContextInfo": {
+                    // Web APIs that exist in both @types/node and Otter runtime
+                    // These are ignored when they conflict with Otter's native implementations
+                    "typesNodeIgnorableNames": [
+                        "AbortController",
+                        "AbortSignal",
+                        "Blob",
+                        "BroadcastChannel",
+                        "ByteLengthQueuingStrategy",
+                        "CloseEvent",
+                        "CompressionStream",
+                        "CountQueuingStrategy",
+                        "Crypto",
+                        "CryptoKey",
+                        "CustomEvent",
+                        "DecompressionStream",
+                        "DOMException",
+                        "Event",
+                        "EventSource",
+                        "EventTarget",
+                        "fetch",
+                        "File",
+                        "FormData",
+                        "Headers",
+                        "MessageChannel",
+                        "MessageEvent",
+                        "MessagePort",
+                        "Navigator",
+                        "navigator",
+                        "Performance",
+                        "PerformanceEntry",
+                        "PerformanceMark",
+                        "PerformanceMeasure",
+                        "ProgressEvent",
+                        "ReadableByteStreamController",
+                        "ReadableStream",
+                        "ReadableStreamBYOBReader",
+                        "ReadableStreamBYOBRequest",
+                        "ReadableStreamDefaultController",
+                        "ReadableStreamDefaultReader",
+                        "Request",
+                        "Response",
+                        "SubtleCrypto",
+                        "TextDecoder",
+                        "TextDecoderStream",
+                        "TextEncoder",
+                        "TextEncoderStream",
+                        "TransformStream",
+                        "TransformStreamDefaultController",
+                        "URL",
+                        "URLSearchParams",
+                        "WebSocket",
+                        "WritableStream",
+                        "WritableStreamDefaultController",
+                        "WritableStreamDefaultWriter"
+                    ],
+                    // Node.js-only globals that don't exist in Otter
+                    "nodeOnlyGlobalNames": [
+                        "__dirname",
+                        "__filename",
+                        "Buffer",
+                        "clearImmediate",
+                        "global",
+                        "require",
+                        "setImmediate"
+                    ]
+                }
             }),
         )?;
 

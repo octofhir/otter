@@ -1,0 +1,2 @@
+Timer drift (target 10ms): Avg=1.961ms, P99=4.104ms
+Promise throughput: 4602294 ops/sec

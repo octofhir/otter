@@ -1,0 +1,171 @@
+==================================================
+Otter Benchmark Suite
+==================================================
+Runtime: otter v0.1.3
+Category: cpu
+
+
+[cpu]
+  Running: fibonacci-recursive...
+    Duration: 64.11ms
+    Ops/sec: 999
+
+[cpu]
+  Running: fibonacci-iterative...
+    Duration: 515.81ms
+    Ops/sec: 1000
+
+[cpu]
+  Running: binary-trees...
+    Duration: 5.56ms
+    Ops/sec: 995
+
+[cpu]
+  Running: fannkuch-redux...
+    Duration: 0.66ms
+    Ops/sec: 992
+
+[cpu]
+  Running: n-body-math...
+    Duration: 5078.99ms
+    Ops/sec: 1000
+
+[cpu]
+  Running: json-stringify-large...
+    Duration: 14.46ms
+    Ops/sec: 973
+
+[cpu]
+  Running: array-operations...
+    Duration: 1.17ms
+    Ops/sec: 996
+
+[cpu]
+  Running: string-operations...
+    Duration: 1.40ms
+    Ops/sec: 996
+
+[cpu]
+  Running: regex-matching...
+    Duration: 4.83ms
+    Ops/sec: 996
+
+==================================================
+Summary
+==================================================
+
+CPU:
+  fibonacci-recursive: 64.11ms
+  fibonacci-iterative: 515.81ms
+  binary-trees: 5.56ms
+  fannkuch-redux: 0.66ms
+  n-body-math: 5078.99ms
+  json-stringify-large: 14.46ms
+  array-operations: 1.17ms
+  string-operations: 1.40ms
+  regex-matching: 4.83ms
+
+Results saved to: benchmarks/results/otter-1768721688292.json
+
+Results JSON (copy below):
+[
+  {
+    "name": "fibonacci-recursive",
+    "category": "cpu",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 64.107792,
+      "ops_per_sec": 999.2421514064936
+    },
+    "timestamp": "2026-01-18T07:34:37.447Z"
+  },
+  {
+    "name": "fibonacci-iterative",
+    "category": "cpu",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 515.808834,
+      "ops_per_sec": 999.9139661884891
+    },
+    "timestamp": "2026-01-18T07:34:38.456Z"
+  },
+  {
+    "name": "binary-trees",
+    "category": "cpu",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 5.5635,
+      "ops_per_sec": 995.2741978970072
+    },
+    "timestamp": "2026-01-18T07:34:38.468Z"
+  },
+  {
+    "name": "fannkuch-redux",
+    "category": "cpu",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 0.657917,
+      "ops_per_sec": 991.638762944262
+    },
+    "timestamp": "2026-01-18T07:34:38.470Z"
+  },
+  {
+    "name": "n-body-math",
+    "category": "cpu",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 5078.986209,
+      "ops_per_sec": 999.9697608944621
+    },
+    "timestamp": "2026-01-18T07:34:47.742Z"
+  },
+  {
+    "name": "json-stringify-large",
+    "category": "cpu",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 14.4635,
+      "ops_per_sec": 973.0643343589035
+    },
+    "timestamp": "2026-01-18T07:34:47.772Z"
+  },
+  {
+    "name": "array-operations",
+    "category": "cpu",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 1.1698708,
+      "ops_per_sec": 995.7367087032175
+    },
+    "timestamp": "2026-01-18T07:34:47.788Z"
+  },
+  {
+    "name": "string-operations",
+    "category": "cpu",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 1.4037834,
+      "ops_per_sec": 996.1917201756339
+    },
+    "timestamp": "2026-01-18T07:34:47.804Z"
+  },
+  {
+    "name": "regex-matching",
+    "category": "cpu",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 4.8268625,
+      "ops_per_sec": 996.2352936301791
+    },
+    "timestamp": "2026-01-18T07:34:48.292Z"
+  }
+]

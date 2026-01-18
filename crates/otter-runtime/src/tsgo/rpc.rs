@@ -67,24 +67,10 @@ fn find_typescript_lib_file(lib_name: &str, search_root: Option<&Path>) -> Optio
     None
 }
 
-fn should_rewrite_node_prefix(file_path: &Path) -> bool {
-    if file_path.to_string_lossy().contains("node_modules") {
-        return false;
-    }
-
-    let file_name = match file_path.file_name().and_then(|n| n.to_str()) {
-        Some(name) => name,
-        None => return false,
-    };
-
-    if file_name.ends_with(".d.ts") {
-        return false;
-    }
-
-    matches!(
-        file_path.extension().and_then(|ext| ext.to_str()),
-        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs")
-    )
+fn should_rewrite_node_prefix(_file_path: &Path) -> bool {
+    // Disable node: prefix rewriting - we now handle node:* resolution
+    // properly via the resolveModuleName callback
+    false
 }
 
 fn rewrite_node_prefix(contents: &str) -> Option<String> {
@@ -123,6 +109,282 @@ fn find_node_types_index(start_dir: &Path) -> Option<PathBuf> {
 
         current = current.parent()?;
     }
+}
+
+/// Find a @types package in node_modules.
+/// Returns the path to the index.d.ts file if found.
+fn find_types_package(package_name: &str, start_dir: &Path) -> Option<PathBuf> {
+    let mut current = start_dir;
+
+    loop {
+        // Try @types/<package>
+        let types_dir = current.join("node_modules/@types").join(package_name);
+        if types_dir.exists() {
+            // Check for index.d.ts
+            let index_path = types_dir.join("index.d.ts");
+            if index_path.exists() {
+                return Some(index_path);
+            }
+            // Check package.json for types field
+            let pkg_json_path = types_dir.join("package.json");
+            if let Ok(contents) = std::fs::read_to_string(&pkg_json_path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    if let Some(types) = json.get("types").or_else(|| json.get("typings")) {
+                        if let Some(types_file) = types.as_str() {
+                            let types_path = types_dir.join(types_file);
+                            if types_path.exists() {
+                                return Some(types_path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        current = current.parent()?;
+    }
+}
+
+/// Resolve a type reference directive (e.g., from `/// <reference types="..." />` or tsconfig types)
+fn resolve_type_reference(type_ref: &str, containing_file: &Path) -> Option<serde_json::Value> {
+    // If the path is a directory, use it directly; otherwise get its parent
+    let start_dir = if containing_file.is_dir() {
+        containing_file
+    } else {
+        containing_file
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+    };
+
+    // Try to find in @types
+    if let Some(types_path) = find_types_package(type_ref, start_dir) {
+        let resolved_path = types_path.to_string_lossy().to_string();
+        return Some(serde_json::json!({
+            "primary": true,
+            "resolvedFileName": resolved_path,
+            "isExternalLibraryImport": true
+        }));
+    }
+
+    // Also check for direct packages in node_modules with their own types
+    // This handles packages like "bun-types" that have types directly in the package
+    let mut current = start_dir;
+    loop {
+        let direct_pkg_dir = current.join("node_modules").join(type_ref);
+        if direct_pkg_dir.exists() {
+            // Check package.json for types field
+            let pkg_json_path = direct_pkg_dir.join("package.json");
+            if let Ok(contents) = std::fs::read_to_string(&pkg_json_path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    if let Some(types) = json.get("types").or_else(|| json.get("typings")) {
+                        if let Some(types_file) = types.as_str() {
+                            let types_path = direct_pkg_dir.join(types_file);
+                            if types_path.exists() {
+                                let resolved_path = types_path.to_string_lossy().to_string();
+                                tracing::debug!(
+                                    "Resolved type reference '{}' to direct package types at {:?}",
+                                    type_ref,
+                                    resolved_path
+                                );
+                                return Some(serde_json::json!({
+                                    "primary": true,
+                                    "resolvedFileName": resolved_path,
+                                    "isExternalLibraryImport": true
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+            // Check for index.d.ts
+            let index_path = direct_pkg_dir.join("index.d.ts");
+            if index_path.exists() {
+                let resolved_path = index_path.to_string_lossy().to_string();
+                tracing::debug!(
+                    "Resolved type reference '{}' to direct package at {:?}",
+                    type_ref,
+                    resolved_path
+                );
+                return Some(serde_json::json!({
+                    "primary": true,
+                    "resolvedFileName": resolved_path,
+                    "isExternalLibraryImport": true
+                }));
+            }
+        }
+
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+
+    None
+}
+
+/// Resolve a module name to its type definitions.
+/// This handles imports like `import { SQL } from "otter"` by finding @types/otter.
+fn resolve_module_name(module_name: &str, containing_file: &Path) -> Option<serde_json::Value> {
+    // If the path is a directory, use it directly; otherwise get its parent
+    let start_dir = if containing_file.is_dir() {
+        containing_file
+    } else {
+        containing_file
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+    };
+
+    // Skip relative imports
+    if module_name.starts_with('.') {
+        return None;
+    }
+
+    // Handle node: prefixed imports by looking up @types/node
+    let (package_name, subpath) = if let Some(rest) = module_name.strip_prefix("node:") {
+        // For node:test -> look for @types/node/test.d.ts
+        ("node", Some(rest))
+    } else {
+        // Extract the package name (e.g., "otter" from "otter" or "otter/sql" from "otter/sql")
+        let parts: Vec<&str> = module_name.splitn(2, '/').collect();
+        (parts[0], parts.get(1).copied())
+    };
+
+    // Try to find in @types
+    let mut current = start_dir;
+    while let Some(parent) = current.parent() {
+        let types_dir = current.join("node_modules/@types").join(package_name);
+        if types_dir.exists() {
+            // For subpath imports like node:test, look for <subpath>.d.ts
+            if let Some(sub) = subpath {
+                let subpath_file = types_dir.join(format!("{}.d.ts", sub));
+                if subpath_file.exists() {
+                    let resolved_path = subpath_file.to_string_lossy().to_string();
+                    tracing::debug!(
+                        "Resolved module '{}' to types at {:?}",
+                        module_name,
+                        resolved_path
+                    );
+                    return Some(serde_json::json!({
+                        "resolvedFileName": resolved_path,
+                        "isExternalLibraryImport": true,
+                        "extension": ".d.ts"
+                    }));
+                }
+            }
+
+            // Check for index.d.ts
+            let index_path = types_dir.join("index.d.ts");
+            if index_path.exists() {
+                let resolved_path = index_path.to_string_lossy().to_string();
+                tracing::debug!(
+                    "Resolved module '{}' to types at {:?}",
+                    module_name,
+                    resolved_path
+                );
+                return Some(serde_json::json!({
+                    "resolvedFileName": resolved_path,
+                    "isExternalLibraryImport": true,
+                    "extension": ".d.ts"
+                }));
+            }
+
+            // Check package.json for types field
+            let pkg_json_path = types_dir.join("package.json");
+            if let Ok(contents) = std::fs::read_to_string(&pkg_json_path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    if let Some(types) = json.get("types").or_else(|| json.get("typings")) {
+                        if let Some(types_file) = types.as_str() {
+                            let types_path = types_dir.join(types_file);
+                            if types_path.exists() {
+                                let resolved_path = types_path.to_string_lossy().to_string();
+                                tracing::debug!(
+                                    "Resolved module '{}' to types at {:?}",
+                                    module_name,
+                                    resolved_path
+                                );
+                                return Some(serde_json::json!({
+                                    "resolvedFileName": resolved_path,
+                                    "isExternalLibraryImport": true,
+                                    "extension": ".d.ts"
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also check @types/node for bare module names that might have had node: prefix stripped
+        // This handles cases like import from "test" which was originally "node:test"
+        if subpath.is_none() {
+            let node_types_dir = current.join("node_modules/@types/node");
+            if node_types_dir.exists() {
+                let node_subpath_file = node_types_dir.join(format!("{}.d.ts", package_name));
+                if node_subpath_file.exists() {
+                    let resolved_path = node_subpath_file.to_string_lossy().to_string();
+                    tracing::debug!(
+                        "Resolved module '{}' to node types at {:?}",
+                        module_name,
+                        resolved_path
+                    );
+                    return Some(serde_json::json!({
+                        "resolvedFileName": resolved_path,
+                        "isExternalLibraryImport": true,
+                        "extension": ".d.ts"
+                    }));
+                }
+            }
+        }
+
+        // Also check for direct packages in node_modules with their own types
+        // This handles packages like "bun-types" that have types directly in the package
+        let direct_pkg_dir = current.join("node_modules").join(package_name);
+        if direct_pkg_dir.exists() {
+            // Check package.json for types field
+            let pkg_json_path = direct_pkg_dir.join("package.json");
+            if let Ok(contents) = std::fs::read_to_string(&pkg_json_path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    if let Some(types) = json.get("types").or_else(|| json.get("typings")) {
+                        if let Some(types_file) = types.as_str() {
+                            let types_path = direct_pkg_dir.join(types_file);
+                            if types_path.exists() {
+                                let resolved_path = types_path.to_string_lossy().to_string();
+                                tracing::debug!(
+                                    "Resolved module '{}' to direct package types at {:?}",
+                                    module_name,
+                                    resolved_path
+                                );
+                                return Some(serde_json::json!({
+                                    "resolvedFileName": resolved_path,
+                                    "isExternalLibraryImport": true,
+                                    "extension": ".d.ts"
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+            // Check for index.d.ts
+            let index_path = direct_pkg_dir.join("index.d.ts");
+            if index_path.exists() {
+                let resolved_path = index_path.to_string_lossy().to_string();
+                tracing::debug!(
+                    "Resolved module '{}' to direct package at {:?}",
+                    module_name,
+                    resolved_path
+                );
+                return Some(serde_json::json!({
+                    "resolvedFileName": resolved_path,
+                    "isExternalLibraryImport": true,
+                    "extension": ".d.ts"
+                }));
+            }
+        }
+
+        current = parent;
+    }
+
+    None
 }
 
 fn maybe_prepend_node_types(contents: String, file_path: &Path, had_node_prefix: bool) -> String {
@@ -376,18 +638,73 @@ impl TsgoChannel {
             }
 
             "resolveModuleName" => {
-                // Let tsgo handle module resolution internally
-                // Return null to indicate we can't resolve
+                // Parse the payload to get the module name and containing file
+                // Payload format: { "moduleName": "otter", "containingFile": "/path/to/file.ts", ... }
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) {
+                    let module_name = json
+                        .get("moduleName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let containing_file = json
+                        .get("containingFile")
+                        .and_then(|v| v.as_str())
+                        .map(Path::new)
+                        .or_else(|| self.lib_search_root.as_deref())
+                        .unwrap_or_else(|| Path::new("."));
+
+                    tracing::debug!(
+                        "resolveModuleName: {} from {:?}",
+                        module_name,
+                        containing_file
+                    );
+
+                    if let Some(resolved) = resolve_module_name(module_name, containing_file) {
+                        tracing::debug!("Resolved module '{}' to {:?}", module_name, resolved);
+                        return Ok(serde_json::to_string(&resolved).unwrap_or_else(|_| "null".to_string()));
+                    }
+                }
+
                 tracing::debug!("resolveModuleName: returning null for {}", payload);
                 Ok("null".to_string())
             }
 
             "resolveTypeReferenceDirective" => {
-                // Let tsgo handle type reference resolution internally
-                tracing::debug!(
-                    "resolveTypeReferenceDirective: returning null for {}",
-                    payload
-                );
+                // Parse the payload to get the type reference name and containing file
+                // Payload format: { "typeReferenceDirectiveName": "otter", "containingFile": "/path/to/file.ts", ... }
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) {
+                    let type_ref = json
+                        .get("typeReferenceDirectiveName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    // Get containing file, falling back to lib_search_root for virtual files
+                    let containing_file_str = json
+                        .get("containingFile")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    // Use lib_search_root for virtual files like "__inferred type names__.ts"
+                    let containing_file = if containing_file_str.contains("__inferred") || !Path::new(containing_file_str).exists() {
+                        self.lib_search_root.as_deref().unwrap_or_else(|| Path::new("."))
+                    } else {
+                        Path::new(containing_file_str)
+                    };
+
+                    tracing::debug!(
+                        "resolveTypeReferenceDirective: {} from {:?}",
+                        type_ref,
+                        containing_file
+                    );
+
+                    if !type_ref.is_empty() {
+                        if let Some(resolved) = resolve_type_reference(type_ref, containing_file) {
+                            tracing::debug!("Resolved type reference '{}' to {:?}", type_ref, resolved);
+                            return Ok(serde_json::to_string(&resolved).unwrap_or_else(|_| "null".to_string()));
+                        }
+                    }
+                }
+
+                tracing::debug!("resolveTypeReferenceDirective: returning null for {}", payload);
                 Ok("null".to_string())
             }
 

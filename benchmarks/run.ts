@@ -7,6 +7,11 @@
  * Categories: startup, cpu, file-io, memory, all
  */
 
+// Ambient types for cross-runtime compatibility
+declare const globalThis: any;
+declare const process: any;
+declare const Otter: any;
+
 interface BenchmarkResult {
     name: string;
     category: string;
@@ -37,6 +42,9 @@ function detectRuntime(): { name: string; version: string } {
     }
     if (typeof (globalThis as any).Bun !== "undefined") {
         return { name: "bun", version: ((globalThis as any).Bun as any).version || "unknown" };
+    }
+    if (typeof (globalThis as any).Deno !== "undefined") {
+        return { name: "deno", version: (globalThis as any).Deno.version.deno || "unknown" };
     }
     return { name: "node", version: process.version || "unknown" };
 }
@@ -123,7 +131,7 @@ const startupBenchmarks: BenchmarkSuite[] = [
     },
 ];
 
-// ============ CPU Benchmarks ============
+// ============ CPU & Algo Benchmarks ============
 
 const cpuBenchmarks: BenchmarkSuite[] = [
     {
@@ -158,6 +166,147 @@ const cpuBenchmarks: BenchmarkSuite[] = [
             const end = hrtime();
             return Number(end - start) / 1_000_000;
         },
+    },
+    {
+        name: "binary-trees",
+        category: "cpu",
+        fn: () => {
+            // GC Stress Test based on CLBG
+            function createTree(depth: number): any {
+                if (depth === 0) return { left: null, right: null };
+                return { left: createTree(depth - 1), right: createTree(depth - 1) };
+            }
+            const maxDepth = 12; // keeping it moderate for microbench
+            const stretchDepth = maxDepth + 1;
+
+            const start = hrtime();
+
+            // Stretch tree
+            createTree(stretchDepth);
+
+            // Long lived tree
+            const longLivedTree = createTree(maxDepth);
+
+            for (let depth = 4; depth <= maxDepth; depth += 2) {
+                const iterations = 1 << (maxDepth - depth + 4);
+                for (let i = 0; i < iterations; i++) {
+                    createTree(depth);
+                }
+            }
+
+            // Keep reference
+            if (!longLivedTree.left) throw new Error("sanity");
+
+            const end = hrtime();
+            return Number(end - start) / 1_000_000;
+        }
+    },
+    {
+        name: "fannkuch-redux",
+        category: "cpu",
+        fn: () => {
+            // Permutation & Array Access Stress
+            function fannkuch(n: number) {
+                const p = new Int32Array(n);
+                const q = new Int32Array(n);
+                const s = new Int32Array(n);
+                let sign = 1, maxflips = 0, sum = 0, m = n - 1;
+                for (let i = 0; i < n; i++) { p[i] = i; q[i] = i; s[i] = i; }
+
+                let iterations = 1; // Simplify for microbench loop, normally factorial
+                // We'll just do a fixed number of permutations for stability
+                const limit = 20000;
+
+                for (let i = 0; i < limit; i++) {
+                    // Rotate first i elements
+                    // Mocking the heavy array swapping part of fannkuch
+                    // without full permutation logic to keep code small but stressed
+
+                    // Copy
+                    for (let k = 0; k < n; k++) q[k] = p[k];
+
+                    // Flip
+                    let flips = 0;
+                    if (q[0] !== 0) {
+                        for (let k = 1; ; k++) {
+                            const qq = q[0];
+                            if (qq === 0) break;
+                            flips++;
+                            // swap
+                            let lo = 1, hi = qq - 1;
+                            while (lo < hi) {
+                                const t = q[lo]; q[lo] = q[hi]; q[hi] = t;
+                                lo++; hi--;
+                            }
+                        }
+                    }
+                }
+                return maxflips;
+            }
+
+            const start = hrtime();
+            fannkuch(10); // N=10
+            const end = hrtime();
+            return Number(end - start) / 1_000_000;
+        }
+    },
+    {
+        name: "n-body-math",
+        category: "cpu",
+        fn: () => {
+            // Floating point math stress
+            class Body {
+                x: number; y: number; z: number;
+                vx: number; vy: number; vz: number;
+                mass: number;
+                constructor(x: number, y: number, z: number, vx: number, vy: number, vz: number, mass: number) {
+                    this.x = x; this.y = y; this.z = z;
+                    this.vx = vx; this.vy = vy; this.vz = vz;
+                    this.mass = mass;
+                }
+            }
+
+            const bodies = Array.from({ length: 100 }, () => new Body(
+                Math.random(), Math.random(), Math.random(),
+                Math.random(), Math.random(), Math.random(),
+                Math.random()
+            ));
+
+            const start = hrtime();
+            const iterations = 10000;
+            const dt = 0.01;
+
+            for (let i = 0; i < iterations; i++) {
+                for (let j = 0; j < bodies.length; j++) {
+                    const b1 = bodies[j];
+                    for (let k = j + 1; k < bodies.length; k++) {
+                        const b2 = bodies[k];
+                        const dx = b1.x - b2.x;
+                        const dy = b1.y - b2.y;
+                        const dz = b1.z - b2.z;
+                        const d2 = dx * dx + dy * dy + dz * dz;
+                        const mag = dt / (d2 * Math.sqrt(d2));
+
+                        b1.vx -= dx * b2.mass * mag;
+                        b1.vy -= dy * b2.mass * mag;
+                        b1.vz -= dz * b2.mass * mag;
+
+                        b2.vx += dx * b1.mass * mag;
+                        b2.vy += dy * b1.mass * mag;
+                        b2.vz += dz * b1.mass * mag;
+                    }
+                }
+
+                for (const b of bodies) {
+                    b.x += b.vx * dt;
+                    b.y += b.vy * dt;
+                    b.z += b.vz * dt;
+                }
+            }
+
+            const end = hrtime();
+            return Number(end - start) / 1_000_000;
+        }
     },
     {
         name: "json-stringify-large",
@@ -352,8 +501,9 @@ async function main() {
     const outputFile = `benchmarks/results/${runtime.name}-${Date.now()}.json`;
     console.log(`\nResults saved to: ${outputFile}`);
 
-    // Note: File writing requires --allow-write permission
-    // await Deno.writeTextFile(outputFile, JSON.stringify(results, null, 2));
+    // Output JSON results
+    console.log(`\nResults JSON (copy below):`);
+    console.log(JSON.stringify(results, null, 2));
 }
 
 main().catch(console.error);

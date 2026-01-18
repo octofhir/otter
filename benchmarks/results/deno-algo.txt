@@ -1,0 +1,171 @@
+==================================================
+Otter Benchmark Suite
+==================================================
+Runtime: deno 2.1.1
+Category: cpu
+
+
+[cpu]
+  Running: fibonacci-recursive...
+    Duration: 120.04ms
+    Ops/sec: 1000
+
+[cpu]
+  Running: fibonacci-iterative...
+    Duration: 25.01ms
+    Ops/sec: 999
+
+[cpu]
+  Running: binary-trees...
+    Duration: 5.58ms
+    Ops/sec: 993
+
+[cpu]
+  Running: fannkuch-redux...
+    Duration: 0.44ms
+    Ops/sec: 983
+
+[cpu]
+  Running: n-body-math...
+    Duration: 1850.49ms
+    Ops/sec: 1000
+
+[cpu]
+  Running: json-stringify-large...
+    Duration: 26.50ms
+    Ops/sec: 973
+
+[cpu]
+  Running: array-operations...
+    Duration: 5.48ms
+    Ops/sec: 998
+
+[cpu]
+  Running: string-operations...
+    Duration: 1.49ms
+    Ops/sec: 997
+
+[cpu]
+  Running: regex-matching...
+    Duration: 1.27ms
+    Ops/sec: 997
+
+==================================================
+Summary
+==================================================
+
+CPU:
+  fibonacci-recursive: 120.04ms
+  fibonacci-iterative: 25.01ms
+  binary-trees: 5.58ms
+  fannkuch-redux: 0.44ms
+  n-body-math: 1850.49ms
+  json-stringify-large: 26.50ms
+  array-operations: 5.48ms
+  string-operations: 1.49ms
+  regex-matching: 1.27ms
+
+Results saved to: benchmarks/results/deno-1768721703372.json
+
+Results JSON (copy below):
+[
+  {
+    "name": "fibonacci-recursive",
+    "category": "cpu",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 120.035541,
+      "ops_per_sec": 999.8222859677868
+    },
+    "timestamp": "2026-01-18T07:34:59.299Z"
+  },
+  {
+    "name": "fibonacci-iterative",
+    "category": "cpu",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 25.011917,
+      "ops_per_sec": 998.6472848122758
+    },
+    "timestamp": "2026-01-18T07:34:59.355Z"
+  },
+  {
+    "name": "binary-trees",
+    "category": "cpu",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 5.578042,
+      "ops_per_sec": 993.292090665506
+    },
+    "timestamp": "2026-01-18T07:34:59.367Z"
+  },
+  {
+    "name": "fannkuch-redux",
+    "category": "cpu",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 0.440041,
+      "ops_per_sec": 983.242470587968
+    },
+    "timestamp": "2026-01-18T07:34:59.368Z"
+  },
+  {
+    "name": "n-body-math",
+    "category": "cpu",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 1850.489084,
+      "ops_per_sec": 999.9387097168091
+    },
+    "timestamp": "2026-01-18T07:35:03.111Z"
+  },
+  {
+    "name": "json-stringify-large",
+    "category": "cpu",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 26.501125,
+      "ops_per_sec": 973.3407921361829
+    },
+    "timestamp": "2026-01-18T07:35:03.164Z"
+  },
+  {
+    "name": "array-operations",
+    "category": "cpu",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 5.4802208,
+      "ops_per_sec": 997.5266872458863
+    },
+    "timestamp": "2026-01-18T07:35:03.225Z"
+  },
+  {
+    "name": "string-operations",
+    "category": "cpu",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 1.493825,
+      "ops_per_sec": 997.3640821381355
+    },
+    "timestamp": "2026-01-18T07:35:03.243Z"
+  },
+  {
+    "name": "regex-matching",
+    "category": "cpu",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 1.26984542,
+      "ops_per_sec": 997.4337663870931
+    },
+    "timestamp": "2026-01-18T07:35:03.372Z"
+  }
+]

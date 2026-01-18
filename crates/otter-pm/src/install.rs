@@ -7,6 +7,7 @@ use crate::progress::InstallProgress;
 use crate::registry::NpmRegistry;
 use crate::resolver::{ResolvedPackage, Resolver};
 use crate::types::install_bundled_types;
+use crate::registry::version_matches_range;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -71,10 +72,16 @@ impl Installer {
         binary_lock: &BinaryLockfile,
         deps: &HashMap<String, String>,
     ) -> Result<Option<Lockfile>, InstallError> {
-        // Check if all requested deps are in lockfile
-        for dep_name in deps.keys() {
-            if !binary_lock.packages.contains_key(dep_name) {
-                return Ok(None); // New dependency, need full resolve
+        // Check if all requested deps are in lockfile with compatible versions
+        for (dep_name, dep_range) in deps {
+            match binary_lock.packages.get(dep_name) {
+                None => return Ok(None), // New dependency, need full resolve
+                Some(entry) => {
+                    // Check if locked version satisfies the requested range
+                    if !version_matches_range(&entry.version, dep_range) {
+                        return Ok(None); // Version mismatch, need full resolve
+                    }
+                }
             }
         }
 
@@ -159,10 +166,16 @@ impl Installer {
         lockfile: &Lockfile,
         deps: &HashMap<String, String>,
     ) -> Result<Option<Lockfile>, InstallError> {
-        // Check if all requested deps are in lockfile
-        for dep_name in deps.keys() {
-            if !lockfile.packages.contains_key(dep_name) {
-                return Ok(None); // New dependency, need full resolve
+        // Check if all requested deps are in lockfile with compatible versions
+        for (dep_name, dep_range) in deps {
+            match lockfile.packages.get(dep_name) {
+                None => return Ok(None), // New dependency, need full resolve
+                Some(entry) => {
+                    // Check if locked version satisfies the requested range
+                    if !version_matches_range(&entry.version, dep_range) {
+                        return Ok(None); // Version mismatch, need full resolve
+                    }
+                }
             }
         }
 
@@ -536,8 +549,8 @@ async fn download_package(
     Ok(data)
 }
 
-/// Minimal package.json structure
-#[derive(Debug, serde::Deserialize)]
+/// Package.json structure with scripts and bin support
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct PackageJson {
     pub name: Option<String>,
     pub version: Option<String>,
@@ -545,6 +558,43 @@ pub struct PackageJson {
     pub dependencies: Option<HashMap<String, String>>,
     #[serde(rename = "devDependencies", default)]
     pub dev_dependencies: Option<HashMap<String, String>>,
+    /// Scripts defined in package.json (e.g., "build": "tsc")
+    #[serde(default)]
+    pub scripts: Option<HashMap<String, String>>,
+    /// Binary entry points - can be string or object
+    #[serde(default)]
+    pub bin: Option<BinField>,
+    /// Main entry point
+    pub main: Option<String>,
+    /// Package type (commonjs or module)
+    #[serde(rename = "type")]
+    pub pkg_type: Option<String>,
+}
+
+/// Represents the `bin` field which can have multiple forms
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+pub enum BinField {
+    /// Single binary: "bin": "./cli.js"
+    Single(String),
+    /// Multiple binaries: "bin": { "cmd1": "./cmd1.js", "cmd2": "./cmd2.js" }
+    Multiple(HashMap<String, String>),
+}
+
+impl BinField {
+    /// Resolve bin entries to a map of command_name -> path
+    pub fn to_map(&self, package_name: &str) -> HashMap<String, String> {
+        match self {
+            BinField::Single(path) => {
+                // Use package name (without scope) as command name
+                let cmd_name = package_name.split('/').last().unwrap_or(package_name);
+                let mut map = HashMap::new();
+                map.insert(cmd_name.to_string(), path.clone());
+                map
+            }
+            BinField::Multiple(map) => map.clone(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

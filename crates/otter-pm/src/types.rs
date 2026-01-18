@@ -2,6 +2,9 @@
 //!
 //! This module handles copying Otter's bundled type definitions to node_modules/@types
 //! so that editors can provide IntelliSense and go-to-definition support.
+//!
+//! Note: @types/node is NOT bundled. Instead, @types/otter depends on @types/node from npm.
+//! Web API types (fetch, URL, etc.) come from @types/node.
 
 use std::fs;
 use std::path::Path;
@@ -17,8 +20,11 @@ fn write_if_changed(path: &Path, contents: &str) -> Result<(), TypesError> {
     Ok(())
 }
 
-/// Otter global API types (console, timers, fetch, etc.)
-const OTTER_TYPES: &str = include_str!("types/otter.d.ts");
+/// Otter global API types (CommonJS support)
+const OTTER_GLOBALS_TYPES: &str = include_str!("types/otter/globals.d.ts");
+
+/// Otter index.d.ts (entry point)
+const OTTER_INDEX_TYPES: &str = include_str!("types/otter/index.d.ts");
 
 /// Otter SQL and KV types
 const OTTER_SQL_TYPES: &str = include_str!("types/otter/sql.d.ts");
@@ -26,117 +32,41 @@ const OTTER_SQL_TYPES: &str = include_str!("types/otter/sql.d.ts");
 /// Otter serve types
 const OTTER_SERVE_TYPES: &str = include_str!("types/otter/serve.d.ts");
 
-/// Node.js Buffer types
-const NODE_BUFFER_TYPES: &str = include_str!("types/node/buffer.d.ts");
-
-/// Node.js fs types
-const NODE_FS_TYPES: &str = include_str!("types/node/fs.d.ts");
-
-/// Node.js path types
-const NODE_PATH_TYPES: &str = include_str!("types/node/path.d.ts");
-
-/// Node.js process types
-const NODE_PROCESS_TYPES: &str = include_str!("types/node/process.d.ts");
-
-/// Node.js test types
-const NODE_TEST_TYPES: &str = include_str!("types/node/test.d.ts");
-
-/// Node.js assert types
-const NODE_ASSERT_TYPES: &str = include_str!("types/node/assert.d.ts");
-
 /// Install bundled type definitions to node_modules
 pub fn install_bundled_types(node_modules: &Path) -> Result<(), TypesError> {
-    // Install @types/otter for global APIs
-    install_otter_types(node_modules)?;
-
-    // Install @types/node for Node.js compatibility APIs
-    install_node_types(node_modules)?;
-
-    Ok(())
+    install_otter_types(node_modules)
 }
 
-/// Install @types/otter (global Otter APIs)
+/// Install otter-types (Otter-specific APIs)
 fn install_otter_types(node_modules: &Path) -> Result<(), TypesError> {
-    let types_dir = node_modules.join("@types").join("otter");
+    let types_dir = node_modules.join("otter-types");
     fs::create_dir_all(&types_dir).map_err(|e| TypesError::Io(e.to_string()))?;
 
-    // Write individual module types
-    write_if_changed(&types_dir.join("globals.d.ts"), OTTER_TYPES)?;
+    // Write type definition files
+    write_if_changed(&types_dir.join("index.d.ts"), OTTER_INDEX_TYPES)?;
+    write_if_changed(&types_dir.join("globals.d.ts"), OTTER_GLOBALS_TYPES)?;
     write_if_changed(&types_dir.join("sql.d.ts"), OTTER_SQL_TYPES)?;
     write_if_changed(&types_dir.join("serve.d.ts"), OTTER_SERVE_TYPES)?;
 
-    // Write index.d.ts that references all modules
-    let index_dts = r#"/// <reference path="globals.d.ts" />
-/// <reference path="sql.d.ts" />
-/// <reference path="serve.d.ts" />
-"#;
-    write_if_changed(&types_dir.join("index.d.ts"), index_dts)?;
-
-    // Write package.json
+    // Write package.json with @types/node dependency
     let package_json = r#"{
-  "name": "@types/otter",
-  "version": "0.1.0",
+  "name": "otter-types",
+  "version": "0.1.1",
   "description": "TypeScript definitions for Otter runtime",
   "types": "index.d.ts",
-  "license": "MIT"
-}"#;
-    write_if_changed(&types_dir.join("package.json"), package_json)?;
-
-    Ok(())
-}
-
-/// Install @types/node (Node.js compatibility APIs)
-fn install_node_types(node_modules: &Path) -> Result<(), TypesError> {
-    let types_dir = node_modules.join("@types").join("node");
-    let pkg_json_path = types_dir.join("package.json");
-    if pkg_json_path.exists() && !is_otter_bundled_types_package_json(&pkg_json_path) {
-        return Ok(());
-    }
-
-    fs::create_dir_all(&types_dir).map_err(|e| TypesError::Io(e.to_string()))?;
-
-    // Write individual module types
-    write_if_changed(&types_dir.join("assert.d.ts"), NODE_ASSERT_TYPES)?;
-    write_if_changed(&types_dir.join("buffer.d.ts"), NODE_BUFFER_TYPES)?;
-    write_if_changed(&types_dir.join("fs.d.ts"), NODE_FS_TYPES)?;
-    write_if_changed(&types_dir.join("path.d.ts"), NODE_PATH_TYPES)?;
-    write_if_changed(&types_dir.join("process.d.ts"), NODE_PROCESS_TYPES)?;
-    write_if_changed(&types_dir.join("test.d.ts"), NODE_TEST_TYPES)?;
-
-    // Write index.d.ts that re-exports all modules
-    let index_dts = r#"/// <reference path="assert.d.ts" />
-/// <reference path="buffer.d.ts" />
-/// <reference path="fs.d.ts" />
-/// <reference path="path.d.ts" />
-/// <reference path="process.d.ts" />
-/// <reference path="test.d.ts" />
-"#;
-    write_if_changed(&types_dir.join("index.d.ts"), index_dts)?;
-
-    // Write package.json
-    let package_json = r#"{
-  "name": "@types/node",
-  "version": "0.1.0",
-  "description": "TypeScript definitions for Otter's Node.js compatibility layer",
-  "types": "index.d.ts",
   "license": "MIT",
-  "otterBundled": true
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/octofhir/otter",
+    "directory": "packages/otter-types"
+  },
+  "dependencies": {
+    "@types/node": "*"
+  }
 }"#;
     write_if_changed(&types_dir.join("package.json"), package_json)?;
 
     Ok(())
-}
-
-fn is_otter_bundled_types_package_json(path: &Path) -> bool {
-    let Ok(contents) = fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) else {
-        return false;
-    };
-    json.get("otterBundled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -151,14 +81,10 @@ mod tests {
 
     #[test]
     fn test_bundled_types_not_empty() {
-        assert!(!OTTER_TYPES.is_empty());
+        assert!(!OTTER_INDEX_TYPES.is_empty());
+        assert!(!OTTER_GLOBALS_TYPES.is_empty());
         assert!(!OTTER_SQL_TYPES.is_empty());
         assert!(!OTTER_SERVE_TYPES.is_empty());
-        assert!(!NODE_ASSERT_TYPES.is_empty());
-        assert!(!NODE_BUFFER_TYPES.is_empty());
-        assert!(!NODE_FS_TYPES.is_empty());
-        assert!(!NODE_PATH_TYPES.is_empty());
-        assert!(!NODE_PROCESS_TYPES.is_empty());
     }
 
     #[test]
@@ -174,49 +100,18 @@ mod tests {
         // Install types
         install_bundled_types(&node_modules).unwrap();
 
-        // Verify @types/otter
-        assert!(node_modules.join("@types/otter/index.d.ts").exists());
-        assert!(node_modules.join("@types/otter/globals.d.ts").exists());
-        assert!(node_modules.join("@types/otter/sql.d.ts").exists());
-        assert!(node_modules.join("@types/otter/serve.d.ts").exists());
-        assert!(node_modules.join("@types/otter/package.json").exists());
+        // Verify otter-types
+        assert!(node_modules.join("otter-types/index.d.ts").exists());
+        assert!(node_modules.join("otter-types/globals.d.ts").exists());
+        assert!(node_modules.join("otter-types/sql.d.ts").exists());
+        assert!(node_modules.join("otter-types/serve.d.ts").exists());
+        assert!(node_modules.join("otter-types/package.json").exists());
 
-        // Verify @types/node
-        assert!(node_modules.join("@types/node/index.d.ts").exists());
-        assert!(node_modules.join("@types/node/fs.d.ts").exists());
-        assert!(node_modules.join("@types/node/buffer.d.ts").exists());
-        assert!(node_modules.join("@types/node/path.d.ts").exists());
-        assert!(node_modules.join("@types/node/process.d.ts").exists());
+        // Verify package.json has @types/node dependency
+        let pkg_json = fs::read_to_string(node_modules.join("otter-types/package.json")).unwrap();
+        assert!(pkg_json.contains("\"@types/node\""));
 
         // Clean up
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_does_not_overwrite_real_types_node() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("otter-types-node-real-{}", std::process::id()));
-        let node_modules = temp_dir.join("node_modules");
-
-        let _ = fs::remove_dir_all(&temp_dir);
-        fs::create_dir_all(&node_modules).unwrap();
-
-        let types_node_dir = node_modules.join("@types").join("node");
-        fs::create_dir_all(&types_node_dir).unwrap();
-
-        let real_pkg_json = r#"{
-  "name": "@types/node",
-  "version": "99.0.0",
-  "description": "Real DefinitelyTyped package"
-}"#;
-        fs::write(types_node_dir.join("package.json"), real_pkg_json).unwrap();
-
-        install_bundled_types(&node_modules).unwrap();
-
-        let after = fs::read_to_string(types_node_dir.join("package.json")).unwrap();
-        assert!(after.contains("\"version\": \"99.0.0\""));
-        assert!(!after.contains("\"otterBundled\": true"));
-
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }

@@ -134,6 +134,20 @@ pub fn dgram() -> Extension {
     crate::dgram_ext::extension()
 }
 
+/// Create the string_decoder extension for buffer to string decoding.
+///
+/// Provides StringDecoder class for handling multi-byte sequences across chunks.
+pub fn string_decoder() -> Extension {
+    crate::string_decoder_ext::extension()
+}
+
+/// Create the readline extension for line-by-line input reading.
+///
+/// Provides readline.createInterface() for CLI applications.
+pub fn readline() -> Extension {
+    crate::readline_ext::extension()
+}
+
 // ============================================================================
 // IO Extensions (may require capabilities)
 // ============================================================================
@@ -362,6 +376,8 @@ pub fn for_node_compat(config: ExtensionConfig) -> ExtensionsWithState {
         querystring(),
         dns(),
         dgram(),
+        string_decoder(),
+        readline(),
         os(),
         // IO
         fs(config.capabilities.clone()),
@@ -603,8 +619,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions();
         let result = for_node_compat(config);
 
-        // Should have 19 extensions (no http_server since no tx provided)
-        assert_eq!(result.extensions.len(), 19);
+        // Should have 21 extensions (no http_server since no tx provided)
+        assert_eq!(result.extensions.len(), 21);
         assert!(result.http_server_count.is_none());
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
@@ -619,6 +635,8 @@ mod tests {
         assert!(names.contains(&"querystring"));
         assert!(names.contains(&"dns"));
         assert!(names.contains(&"dgram"));
+        assert!(names.contains(&"string_decoder"));
+        assert!(names.contains(&"readline"));
         // No http_server without tx
         assert!(!names.contains(&"http_server"));
     }
@@ -629,8 +647,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions().http_event_tx(tx);
         let result = for_node_compat(config);
 
-        // Should have 20 extensions (including http_server)
-        assert_eq!(result.extensions.len(), 20);
+        // Should have 22 extensions (including http_server)
+        assert_eq!(result.extensions.len(), 22);
         assert!(result.http_server_count.is_some());
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
@@ -642,8 +660,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions();
         let result = for_full(config);
 
-        // Should have 20 extensions (node_compat 19 + test)
-        assert_eq!(result.extensions.len(), 20);
+        // Should have 22 extensions (node_compat 21 + test)
+        assert_eq!(result.extensions.len(), 22);
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
         assert!(names.contains(&"test"));
@@ -655,8 +673,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions().http_event_tx(tx);
         let result = for_full(config);
 
-        // Should have 21 extensions (all)
-        assert_eq!(result.extensions.len(), 21);
+        // Should have 23 extensions (all)
+        assert_eq!(result.extensions.len(), 23);
         assert!(result.http_server_count.is_some());
     }
 }

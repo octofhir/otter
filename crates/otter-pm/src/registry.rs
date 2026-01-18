@@ -434,6 +434,19 @@ fn normalize_version_req(req: &str) -> String {
     result
 }
 
+/// Check if a concrete version satisfies a version range requirement.
+/// Used by frozen install to verify lockfile versions match package.json requirements.
+pub fn version_matches_range(version: &str, range: &str) -> bool {
+    let normalized = normalize_version_req(range);
+    let Ok(req) = semver::VersionReq::parse(&normalized) else {
+        return false;
+    };
+    let Ok(ver) = semver::Version::parse(version) else {
+        return false;
+    };
+    req.matches(&ver)
+}
+
 /// Verify package integrity using SHA-512
 fn verify_integrity(data: &[u8], integrity: &str) -> Result<(), RegistryError> {
     // Format: sha512-base64hash

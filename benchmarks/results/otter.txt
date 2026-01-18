@@ -1,0 +1,209 @@
+==================================================
+Otter Benchmark Suite
+==================================================
+Runtime: otter v0.1.3
+Category: all
+
+
+[startup]
+  Running: hello-world...
+    Duration: 0.01ms
+    Ops/sec: 73
+
+[startup]
+  Running: json-parse-small...
+    Duration: 6.64ms
+    Ops/sec: 953
+
+[cpu]
+  Running: fibonacci-recursive...
+    Duration: 63.83ms
+    Ops/sec: 1000
+
+[cpu]
+  Running: fibonacci-iterative...
+    Duration: 597.28ms
+    Ops/sec: 999
+
+[cpu]
+  Running: json-stringify-large...
+    Duration: 14.56ms
+    Ops/sec: 957
+
+[cpu]
+  Running: array-operations...
+    Duration: 1.14ms
+    Ops/sec: 996
+
+[cpu]
+  Running: string-operations...
+    Duration: 1.30ms
+    Ops/sec: 996
+
+[cpu]
+  Running: regex-matching...
+    Duration: 3.96ms
+    Ops/sec: 999
+
+[memory]
+  Running: object-allocation...
+    Duration: 6.76ms
+    Ops/sec: 997
+
+[memory]
+  Running: array-allocation...
+    Duration: 12.38ms
+    Ops/sec: 998
+
+[memory]
+  Running: typed-array-allocation...
+    Duration: 1.22ms
+    Ops/sec: 996
+
+==================================================
+Summary
+==================================================
+
+STARTUP:
+  hello-world: 0.01ms
+  json-parse-small: 6.64ms
+
+CPU:
+  fibonacci-recursive: 63.83ms
+  fibonacci-iterative: 597.28ms
+  json-stringify-large: 14.56ms
+  array-operations: 1.14ms
+  string-operations: 1.30ms
+  regex-matching: 3.96ms
+
+MEMORY:
+  object-allocation: 6.76ms
+  array-allocation: 12.38ms
+  typed-array-allocation: 1.22ms
+
+Results saved to: benchmarks/results/otter-1768721182284.json
+
+Results JSON (copy below):
+[
+  {
+    "name": "hello-world",
+    "category": "startup",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 0.005166,
+      "ops_per_sec": 72.59001161440187
+    },
+    "timestamp": "2026-01-18T07:26:20.563Z"
+  },
+  {
+    "name": "json-parse-small",
+    "category": "startup",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 6.640584,
+      "ops_per_sec": 952.9407353329166
+    },
+    "timestamp": "2026-01-18T07:26:20.575Z"
+  },
+  {
+    "name": "fibonacci-recursive",
+    "category": "cpu",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 63.82825,
+      "ops_per_sec": 999.5149796524266
+    },
+    "timestamp": "2026-01-18T07:26:20.697Z"
+  },
+  {
+    "name": "fibonacci-iterative",
+    "category": "cpu",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 597.275125,
+      "ops_per_sec": 999.20381415516
+    },
+    "timestamp": "2026-01-18T07:26:21.774Z"
+  },
+  {
+    "name": "json-stringify-large",
+    "category": "cpu",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 14.558083,
+      "ops_per_sec": 957.0972359478923
+    },
+    "timestamp": "2026-01-18T07:26:21.805Z"
+  },
+  {
+    "name": "array-operations",
+    "category": "cpu",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 1.1382917000000001,
+      "ops_per_sec": 995.5742451605331
+    },
+    "timestamp": "2026-01-18T07:26:21.821Z"
+  },
+  {
+    "name": "string-operations",
+    "category": "cpu",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 1.2962626,
+      "ops_per_sec": 996.1780892235877
+    },
+    "timestamp": "2026-01-18T07:26:21.837Z"
+  },
+  {
+    "name": "regex-matching",
+    "category": "cpu",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 3.95631167,
+      "ops_per_sec": 999.0084754874732
+    },
+    "timestamp": "2026-01-18T07:26:22.237Z"
+  },
+  {
+    "name": "object-allocation",
+    "category": "memory",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 6.7605,
+      "ops_per_sec": 996.6780563567783
+    },
+    "timestamp": "2026-01-18T07:26:22.254Z"
+  },
+  {
+    "name": "array-allocation",
+    "category": "memory",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 12.382834,
+      "ops_per_sec": 998.3780772640575
+    },
+    "timestamp": "2026-01-18T07:26:22.279Z"
+  },
+  {
+    "name": "typed-array-allocation",
+    "category": "memory",
+    "runtime": "otter",
+    "version": "v0.1.3",
+    "metrics": {
+      "duration_ms": 1.220126,
+      "ops_per_sec": 996.2766140546141
+    },
+    "timestamp": "2026-01-18T07:26:22.283Z"
+  }
+]

@@ -9,6 +9,7 @@
 pub mod abort;
 pub mod console;
 pub mod encoding;
+pub mod fs;
 pub mod http;
 pub mod performance;
 pub mod timers;
@@ -136,6 +137,7 @@ pub unsafe fn json_to_js_value(ctx: JSContextRef, json: &serde_json::Value) -> J
 pub fn register_all_apis(ctx: JSContextRef) -> JscResult<()> {
     console::register_console_api(ctx)?;
     http::register_http_api(ctx)?;
+    fs::register_fs_api(ctx)?;
     timers::register_timers_api(ctx)?;
     performance::register_performance_api(ctx)?;
     abort::register_abort_api(ctx)?;
@@ -148,6 +150,7 @@ pub fn register_apis_with_config(ctx: JSContextRef, enable_console: bool) -> Jsc
     if enable_console {
         console::register_console_api(ctx)?;
     }
+    fs::register_fs_api(ctx)?;
     http::register_http_api(ctx)?;
     timers::register_timers_api(ctx)?;
     performance::register_performance_api(ctx)?;

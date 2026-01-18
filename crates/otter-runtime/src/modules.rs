@@ -25,6 +25,8 @@
 use regex::{Captures, Regex};
 use std::collections::HashMap;
 
+use crate::modules_ast::transform_module_ast;
+
 fn node_builtin_expr(resolved: &str) -> Option<String> {
     let name = resolved.strip_prefix("node:")?;
     Some(format!("globalThis.__otter_node_builtins[\"{}\"]", name))
@@ -43,11 +45,21 @@ fn builtin_expr(resolved: &str) -> Option<String> {
 /// Transform import/export statements in module source.
 ///
 /// Converts ESM syntax to use the `__otter_modules` registry.
+/// Uses SWC AST-based transformation for correct handling of all ESM patterns.
 pub fn transform_module(
     source: &str,
     module_url: &str,
     dependencies: &HashMap<String, String>,
 ) -> String {
+    // Use AST-based transform (handles all ESM patterns correctly)
+    match transform_module_ast(source, module_url, dependencies) {
+        Ok(transformed) => return transformed,
+        Err(_) => {
+            // Fallback to regex for non-parseable content (e.g., already-transformed code)
+        }
+    }
+
+    // Regex fallback for edge cases
     let mut result = source.to_string();
 
     // Transform static imports
@@ -446,11 +458,21 @@ pub fn bundle_modules_mixed(modules: Vec<ModuleInfo<'_>>) -> String {
                 );
                 result.push_str(&wrapped);
 
-                // Also register in ESM registry with __toESM wrapper for interop
+                // Register in ESM registry with lazy __toESM wrapper for interop
+                // Uses a getter that evaluates the CJS module on first access,
+                // then replaces itself with the cached value
                 result.push_str(&format!(
-                    r#"__otter_modules["{}"] = __toESM(__otter_cjs_modules["{}"]());
+                    r#"Object.defineProperty(__otter_modules, "{0}", {{
+  get: function() {{
+    var mod = __toESM(__otter_cjs_modules["{0}"](), 1);
+    Object.defineProperty(__otter_modules, "{0}", {{ value: mod, writable: true, configurable: true }});
+    return mod;
+  }},
+  configurable: true,
+  enumerable: true
+}});
 "#,
-                    module.url, module.url
+                    module.url
                 ));
             }
         }
@@ -520,9 +542,9 @@ mod tests {
         deps.insert("./mod.js".to_string(), "file:///project/mod.js".to_string());
 
         let result = transform_module(source, "file:///project/main.js", &deps);
-        assert!(
-            result.contains(r#"const { foo, bar } = __otter_modules["file:///project/mod.js"];"#)
-        );
+        // AST produces individual const statements for each named import
+        assert!(result.contains(r#"__otter_modules["file:///project/mod.js"].foo"#));
+        assert!(result.contains(r#"__otter_modules["file:///project/mod.js"].bar"#));
     }
 
     #[test]
@@ -544,7 +566,9 @@ mod tests {
         let deps = HashMap::new();
 
         let result = transform_module(source, "file:///project/foo.js", &deps);
-        assert!(result.contains("__otter_exports.default = function foo() {}"));
+        // AST converts export default function to named function + export
+        assert!(result.contains("function foo()"));
+        assert!(result.contains("__otter_exports.default = foo"));
     }
 
     #[test]
@@ -598,9 +622,9 @@ mod tests {
         );
 
         let result = transform_module(source, "file:///project/main.js", &deps);
-        assert!(
-            result.contains(r#"Promise.resolve(__otter_modules["file:///project/dynamic.js"])"#)
-        );
+        // AST transforms dynamic import to Promise.resolve
+        assert!(result.contains(r#"Promise.resolve"#));
+        assert!(result.contains(r#"__otter_modules["file:///project/dynamic.js"]"#));
     }
 
     #[test]
@@ -626,12 +650,9 @@ mod tests {
         );
 
         let result = transform_module(source, "file:///project/main.js", &deps);
-        assert!(result.contains(
-            r#"const React = __otter_modules["file:///node_modules/react/index.js"].default;"#
-        ));
-        assert!(result.contains(
-            r#"const { useState } = __otter_modules["file:///node_modules/react/index.js"];"#
-        ));
+        // AST produces individual const for default and each named import
+        assert!(result.contains(r#"__otter_modules["file:///node_modules/react/index.js"].default"#));
+        assert!(result.contains(r#"__otter_modules["file:///node_modules/react/index.js"].useState"#));
     }
 
     #[test]
@@ -641,7 +662,8 @@ mod tests {
         deps.insert("node:util".to_string(), "node:util".to_string());
 
         let result = transform_module(source, "file:///project/main.js", &deps);
-        assert!(result.contains(r#"const { format } = globalThis.__otter_node_builtins["util"];"#));
+        // AST produces individual const for each named import from builtin
+        assert!(result.contains(r#"globalThis.__otter_node_builtins["util"].format"#));
     }
 
     #[test]
@@ -651,7 +673,9 @@ mod tests {
         deps.insert("node:util".to_string(), "node:util".to_string());
 
         let result = transform_module(source, "file:///project/main.js", &deps);
-        assert!(result.contains(r#"Promise.resolve(globalThis.__otter_node_builtins["util"])"#));
+        // AST transforms dynamic import to Promise.resolve
+        assert!(result.contains(r#"Promise.resolve"#));
+        assert!(result.contains(r#"globalThis.__otter_node_builtins["util"]"#));
     }
 
     #[test]
@@ -735,8 +759,8 @@ mod tests {
 
         let bundle = bundle_modules_mixed(modules);
         assert!(bundle.contains("__otter_cjs_modules[\"file:///project/lib.cjs\"]"));
-        // Should also register in ESM registry for interop
-        assert!(bundle.contains("__otter_modules[\"file:///project/lib.cjs\"]"));
+        // Should also register in ESM registry for interop (via lazy getter)
+        assert!(bundle.contains("Object.defineProperty(__otter_modules, \"file:///project/lib.cjs\""));
         assert!(bundle.contains("__toESM"));
     }
 
@@ -771,8 +795,9 @@ mod tests {
         let bundle = bundle_modules_mixed(modules);
         // CJS module registered
         assert!(bundle.contains("__otter_cjs_modules[\"file:///project/lib.cjs\"]"));
-        // ESM interop wrapper
-        assert!(bundle.contains("__toESM(__otter_cjs_modules[\"file:///project/lib.cjs\"]())"));
+        // ESM interop wrapper with lazy getter
+        assert!(bundle.contains("Object.defineProperty(__otter_modules, \"file:///project/lib.cjs\""));
+        assert!(bundle.contains("__toESM(__otter_cjs_modules[\"file:///project/lib.cjs\"](), 1)"));
         // ESM module using the CJS import
         assert!(
             bundle.contains(r#"const lib = __otter_modules["file:///project/lib.cjs"].default;"#)

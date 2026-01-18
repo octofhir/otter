@@ -9,7 +9,10 @@
 		"test": "otter test",
 		"check": "otter check src/**/*.ts"
 	},
-	"dependencies": {},
+	"dependencies": {
+		"bun-types": "^1.3.6",
+		"otter-types": "0.1.2"
+	},
 	"devDependencies": {
 		"typescript": "^5.9.3",
 		"@types/bun": "latest"

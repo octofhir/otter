@@ -98,6 +98,25 @@ pub struct EngineBuilder {
 
 impl Default for EngineBuilder {
     fn default() -> Self {
+        // Initialize JSC options for server-side performance (once globally)
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            // JIT Configuration for Server Workloads
+            // Enable OSR and lower thresholds for faster tier-up
+            // SAFETY: Setting environment variables at startup is safe if no other threads are running yet
+            unsafe {
+                if std::env::var("JSC_useOSR").is_err() {
+                    std::env::set_var("JSC_useOSR", "1");
+                }
+                if std::env::var("JSC_thresholdForJITAfterWarmUp").is_err() {
+                    std::env::set_var("JSC_thresholdForJITAfterWarmUp", "10");
+                }
+                if std::env::var("JSC_thresholdForOptimizeAfterWarmUp").is_err() {
+                    std::env::set_var("JSC_thresholdForOptimizeAfterWarmUp", "100");
+                }
+            }
+        });
+
         // Get current Tokio handle - panics if not in a Tokio context
         let tokio_handle = tokio::runtime::Handle::current();
 

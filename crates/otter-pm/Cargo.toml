@@ -28,6 +28,7 @@ console = "0.16"
 hex = "0.4"
 walkdir = "2"
 rayon = "1.11"
+strsim = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

@@ -1,9 +1,10 @@
-//! Module dependency graph with cycle detection
+//! Module dependency graph
 //!
-//! Provides topological sorting for correct module execution order
-//! and detects circular dependencies.
+//! Provides topological sorting for correct module execution order.
+//! Supports circular dependencies (common in npm packages like zod).
 
 use crate::loader::{ModuleLoader, ModuleType, ResolvedModule, SourceType};
+use otter_runtime::modules_ast::parse_esm_dependencies;
 use otter_runtime::{JscError, JscResult, transpile_typescript};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -86,20 +87,14 @@ impl ModuleGraph {
         // Resolve first to get canonical URL
         let resolved_url = self.loader.resolve(specifier, referrer)?;
 
-        // Check for cycles using resolved URL
-        if stack.contains(&resolved_url) {
-            return Err(JscError::ModuleError(format!(
-                "Circular dependency detected: {} -> {}",
-                stack.join(" -> "),
-                resolved_url
-            )));
-        }
-
-        // Already loaded
-        if visited.contains(&resolved_url) {
+        // Already loaded or in progress - skip
+        // This handles both completed modules and circular dependencies
+        if visited.contains(&resolved_url) || self.nodes.contains_key(&resolved_url) {
             return Ok(());
         }
 
+        // Mark as visited immediately to prevent cycles
+        visited.insert(resolved_url.clone());
         stack.push(resolved_url.clone());
 
         // Load the module
@@ -113,12 +108,7 @@ impl ModuleGraph {
             parse_dependencies(&module.source, module.module_type)
         };
 
-        // Recursively load dependencies
-        for dep in &dependencies {
-            Box::pin(self.load_recursive(dep, Some(&module.url), visited, stack)).await?;
-        }
-
-        // Compile TypeScript if needed
+        // Compile TypeScript if needed (do this before recursing to have source ready)
         let compiled = if module.source_type == SourceType::TypeScript {
             let result = transpile_typescript(&module.source).map_err(|e| {
                 JscError::ModuleError(format!("Failed to transpile '{}': {}", module.url, e))
@@ -128,17 +118,26 @@ impl ModuleGraph {
             None
         };
 
-        // Add to graph using resolved URL as key
+        // Add to graph BEFORE loading dependencies to handle circular deps
+        // JavaScript allows circular dependencies by providing partial exports
         self.nodes.insert(
             resolved_url.clone(),
             ModuleNode {
                 module,
-                dependencies,
+                dependencies: dependencies.clone(),
                 compiled,
             },
         );
 
-        visited.insert(resolved_url.clone());
+        // Now recursively load dependencies
+        // If any dependency tries to import us, we're already in the graph
+        for dep in &dependencies {
+            let module_url = self.nodes.get(&resolved_url).map(|n| n.module.url.clone());
+            if let Some(url) = module_url {
+                Box::pin(self.load_recursive(dep, Some(&url), visited, stack)).await?;
+            }
+        }
+
         stack.pop();
 
         Ok(())
@@ -178,6 +177,9 @@ impl ModuleGraph {
             return;
         }
 
+        // Mark as visited BEFORE recursing to handle circular dependencies
+        visited.insert(specifier);
+
         if let Some(node) = self.nodes.get(specifier) {
             // First visit all dependencies
             for dep in &node.dependencies {
@@ -190,7 +192,6 @@ impl ModuleGraph {
             }
         }
 
-        visited.insert(specifier);
         order.push(specifier);
     }
 
@@ -218,13 +219,16 @@ pub fn parse_imports(source: &str) -> Vec<String> {
 
     // Static imports: import ... from '...'
     // Handles: import foo from 'x', import { foo } from 'x', import * as foo from 'x'
-    let import_re = Regex::new(r#"(?m)^\s*import\s+(?:.*?\s+from\s+)?['"]([^'"]+)['"]"#).unwrap();
+    // Note: [\s\S]*? matches any character INCLUDING newlines for multi-line imports
+    let import_re =
+        Regex::new(r#"(?m)^\s*import\s+(?:[\s\S]*?\s+from\s+)?['"]([^'"]+)['"]"#).unwrap();
 
     // Dynamic imports: import('...')
     let dynamic_re = Regex::new(r#"import\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap();
 
     // Export from: export ... from '...'
-    let export_re = Regex::new(r#"(?m)^\s*export\s+.*?\s+from\s+['"]([^'"]+)['"]"#).unwrap();
+    // Note: [\s\S]*? matches any character INCLUDING newlines for multi-line exports
+    let export_re = Regex::new(r#"(?m)^\s*export\s+[\s\S]*?\s+from\s+['"]([^'"]+)['"]"#).unwrap();
 
     for cap in import_re.captures_iter(source) {
         let specifier = cap[1].to_string();
@@ -273,11 +277,11 @@ pub fn parse_requires(source: &str) -> Vec<String> {
 
 /// Parse dependencies from source based on module type
 ///
-/// For ESM modules, parses import/export statements.
-/// For CommonJS modules, parses require() calls.
+/// For ESM modules, uses SWC AST parser (handles multi-line imports correctly).
+/// For CommonJS modules, parses require() calls with regex.
 pub fn parse_dependencies(source: &str, module_type: ModuleType) -> Vec<String> {
     match module_type {
-        ModuleType::ESM => parse_imports(source),
+        ModuleType::ESM => parse_esm_dependencies(source),
         ModuleType::CommonJS => parse_requires(source),
     }
 }

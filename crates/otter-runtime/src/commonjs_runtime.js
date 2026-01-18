@@ -144,12 +144,45 @@
     // CommonJS module registry (separate from ESM registry)
     globalThis.__otter_cjs_modules = globalThis.__otter_cjs_modules || {};
 
+    // Resolve a relative path against a base directory
+    function resolvePath(specifier, dirname) {
+        if (!specifier.startsWith('./') && !specifier.startsWith('../')) {
+            return specifier;  // Not a relative path
+        }
+
+        // Normalize dirname to remove any trailing slash
+        var base = dirname.endsWith('/') ? dirname.slice(0, -1) : dirname;
+        var parts = base.split('/');
+        var specParts = specifier.split('/');
+
+        for (var i = 0; i < specParts.length; i++) {
+            var part = specParts[i];
+            if (part === '.' || part === '') {
+                continue;
+            } else if (part === '..') {
+                parts.pop();
+            } else {
+                parts.push(part);
+            }
+        }
+
+        return parts.join('/');
+    }
+
     // Create require function for a specific module context
     globalThis.__createRequire = function(dirname, filename) {
         var require = function(specifier) {
+            // Resolve relative paths to absolute paths
+            var resolved = specifier;
+            if (specifier.startsWith('./') || specifier.startsWith('../')) {
+                resolved = resolvePath(specifier, dirname);
+                // Convert to file:// URL for registry lookup
+                resolved = "file://" + resolved;
+            }
+
             // Use __getModule for lazy loading support
             if (globalThis.__getModule) {
-                var mod = globalThis.__getModule(specifier);
+                var mod = globalThis.__getModule(resolved);
                 if (mod) return mod;
             }
 
@@ -166,15 +199,23 @@
                 return globalThis.__otter_node_builtins[specifier];
             }
 
-            // Check CJS module registry
-            if (globalThis.__otter_cjs_modules[specifier]) {
-                return globalThis.__otter_cjs_modules[specifier]();
+            // Try to find module with extension resolution
+            var extensions = ['', '.js', '.mjs', '.cjs', '.json', '/index.js', '/index.mjs', '/index.cjs'];
+            var found = null;
+
+            for (var i = 0; i < extensions.length && !found; i++) {
+                var tryPath = resolved + extensions[i];
+                if (globalThis.__otter_cjs_modules[tryPath]) {
+                    found = globalThis.__otter_cjs_modules[tryPath]();
+                    break;
+                }
+                if (globalThis.__otter_modules && globalThis.__otter_modules[tryPath]) {
+                    found = globalThis.__toCommonJS(globalThis.__otter_modules[tryPath]);
+                    break;
+                }
             }
 
-            // Check ESM module registry (with conversion)
-            if (globalThis.__otter_modules && globalThis.__otter_modules[specifier]) {
-                return globalThis.__toCommonJS(globalThis.__otter_modules[specifier]);
-            }
+            if (found) return found;
 
             throw new Error("Cannot find module '" + specifier + "' from '" + dirname + "'");
         };

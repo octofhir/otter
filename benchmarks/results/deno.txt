@@ -1,0 +1,209 @@
+==================================================
+Otter Benchmark Suite
+==================================================
+Runtime: deno 2.1.1
+Category: all
+
+
+[startup]
+  Running: hello-world...
+    Duration: 0.01ms
+    Ops/sec: 278
+
+[startup]
+  Running: json-parse-small...
+    Duration: 6.20ms
+    Ops/sec: 997
+
+[cpu]
+  Running: fibonacci-recursive...
+    Duration: 119.74ms
+    Ops/sec: 1000
+
+[cpu]
+  Running: fibonacci-iterative...
+    Duration: 24.26ms
+    Ops/sec: 999
+
+[cpu]
+  Running: json-stringify-large...
+    Duration: 25.64ms
+    Ops/sec: 976
+
+[cpu]
+  Running: array-operations...
+    Duration: 4.99ms
+    Ops/sec: 999
+
+[cpu]
+  Running: string-operations...
+    Duration: 2.03ms
+    Ops/sec: 995
+
+[cpu]
+  Running: regex-matching...
+    Duration: 1.20ms
+    Ops/sec: 999
+
+[memory]
+  Running: object-allocation...
+    Duration: 22.06ms
+    Ops/sec: 999
+
+[memory]
+  Running: array-allocation...
+    Duration: 37.07ms
+    Ops/sec: 999
+
+[memory]
+  Running: typed-array-allocation...
+    Duration: 1.54ms
+    Ops/sec: 996
+
+==================================================
+Summary
+==================================================
+
+STARTUP:
+  hello-world: 0.01ms
+  json-parse-small: 6.20ms
+
+CPU:
+  fibonacci-recursive: 119.74ms
+  fibonacci-iterative: 24.26ms
+  json-stringify-large: 25.64ms
+  array-operations: 4.99ms
+  string-operations: 2.03ms
+  regex-matching: 1.20ms
+
+MEMORY:
+  object-allocation: 22.06ms
+  array-allocation: 37.07ms
+  typed-array-allocation: 1.54ms
+
+Results saved to: benchmarks/results/deno-1768721184310.json
+
+Results JSON (copy below):
+[
+  {
+    "name": "hello-world",
+    "category": "startup",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 0.006,
+      "ops_per_sec": 277.8333333333333
+    },
+    "timestamp": "2026-01-18T07:26:23.687Z"
+  },
+  {
+    "name": "json-parse-small",
+    "category": "startup",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 6.200375,
+      "ops_per_sec": 996.5929480071769
+    },
+    "timestamp": "2026-01-18T07:26:23.703Z"
+  },
+  {
+    "name": "fibonacci-recursive",
+    "category": "cpu",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 119.742167,
+      "ops_per_sec": 999.7933058953242
+    },
+    "timestamp": "2026-01-18T07:26:23.913Z"
+  },
+  {
+    "name": "fibonacci-iterative",
+    "category": "cpu",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 24.25575,
+      "ops_per_sec": 999.2304505117343
+    },
+    "timestamp": "2026-01-18T07:26:23.962Z"
+  },
+  {
+    "name": "json-stringify-large",
+    "category": "cpu",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 25.637875,
+      "ops_per_sec": 976.0331930785994
+    },
+    "timestamp": "2026-01-18T07:26:24.014Z"
+  },
+  {
+    "name": "array-operations",
+    "category": "cpu",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 4.9861417,
+      "ops_per_sec": 998.8952780864612
+    },
+    "timestamp": "2026-01-18T07:26:24.069Z"
+  },
+  {
+    "name": "string-operations",
+    "category": "cpu",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 2.0283333,
+      "ops_per_sec": 994.5356613728128
+    },
+    "timestamp": "2026-01-18T07:26:24.092Z"
+  },
+  {
+    "name": "regex-matching",
+    "category": "cpu",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 1.1954912500000001,
+      "ops_per_sec": 998.6209016586278
+    },
+    "timestamp": "2026-01-18T07:26:24.213Z"
+  },
+  {
+    "name": "object-allocation",
+    "category": "memory",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 22.061083,
+      "ops_per_sec": 999.3125450822156
+    },
+    "timestamp": "2026-01-18T07:26:24.248Z"
+  },
+  {
+    "name": "array-allocation",
+    "category": "memory",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 37.065667,
+      "ops_per_sec": 999.4446882609723
+    },
+    "timestamp": "2026-01-18T07:26:24.304Z"
+  },
+  {
+    "name": "typed-array-allocation",
+    "category": "memory",
+    "runtime": "deno",
+    "version": "2.1.1",
+    "metrics": {
+      "duration_ms": 1.541792,
+      "ops_per_sec": 996.3516479525124
+    },
+    "timestamp": "2026-01-18T07:26:24.308Z"
+  }
+]

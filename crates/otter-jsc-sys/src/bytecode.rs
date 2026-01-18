@@ -73,6 +73,18 @@ unsafe extern "C" {
         output_path_len: usize,
         out: *mut OtterBytecodeResult,
     ) -> bool;
+
+    /// Evaluate a script using cached bytecode
+    pub fn otter_evaluate_with_cache(
+        ctx: JSContextRef,
+        source: *const c_char,
+        source_len: usize,
+        filename: *const c_char,
+        filename_len: usize,
+        bytecode_path: *const c_char,
+        bytecode_path_len: usize,
+        out: *mut OtterBytecodeResult,
+    ) -> bool;
 }
 
 /// Safe wrapper to generate program bytecode to a file
@@ -134,6 +146,35 @@ pub fn generate_module_bytecode_to_file(
 
     if success && result.success {
         Ok(result.size)
+    } else {
+        Err(result.error())
+    }
+}
+
+/// Safe wrapper to evaluate script with bytecode cache
+pub fn evaluate_with_cache(
+    ctx: JSContextRef,
+    source: &str,
+    filename: &str,
+    bytecode_path: &str,
+) -> Result<(), String> {
+    let mut result = OtterBytecodeResult::default();
+
+    let success = unsafe {
+        otter_evaluate_with_cache(
+            ctx,
+            source.as_ptr() as *const c_char,
+            source.len(),
+            filename.as_ptr() as *const c_char,
+            filename.len(),
+            bytecode_path.as_ptr() as *const c_char,
+            bytecode_path.len(),
+            &mut result,
+        )
+    };
+
+    if success && result.success {
+        Ok(())
     } else {
         Err(result.error())
     }

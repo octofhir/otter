@@ -13,9 +13,13 @@ pub fn register_timers_api(ctx: JSContextRef) -> JscResult<()> {
     unsafe {
         register_timer_fn(ctx, "setTimeout", Some(js_set_timeout))?;
         register_timer_fn(ctx, "setInterval", Some(js_set_interval))?;
+        register_timer_fn(ctx, "setImmediate", Some(js_set_immediate))?;
         register_timer_fn(ctx, "clearTimeout", Some(js_clear_timeout))?;
         register_timer_fn(ctx, "clearInterval", Some(js_clear_timeout))?;
+        register_timer_fn(ctx, "clearImmediate", Some(js_clear_immediate))?;
         register_timer_fn(ctx, "queueMicrotask", Some(js_queue_microtask))?;
+        register_timer_fn(ctx, "__otter_timer_ref", Some(js_timer_ref))?;
+        register_timer_fn(ctx, "__otter_immediate_ref", Some(js_immediate_ref))?;
     }
 
     Ok(())
@@ -74,7 +78,7 @@ unsafe extern "C" fn js_set_timeout(
         return JSValueMakeUndefined(ctx);
     };
 
-    match loop_ref.schedule_timer(callback, delay, None, args) {
+    match loop_ref.schedule_timer(callback, delay, None, args, true) {
         Ok(id) => create_id_value(ctx, id),
         Err(err) => {
             *exception = crate::apis::make_exception(ctx, &err.to_string());
@@ -113,7 +117,38 @@ unsafe extern "C" fn js_set_interval(
         return JSValueMakeUndefined(ctx);
     };
 
-    match loop_ref.schedule_timer(callback, delay, Some(delay), args) {
+    match loop_ref.schedule_timer(callback, delay, Some(delay), args, true) {
+        Ok(id) => create_id_value(ctx, id),
+        Err(err) => {
+            *exception = crate::apis::make_exception(ctx, &err.to_string());
+            JSValueMakeUndefined(ctx)
+        }
+    }
+}
+
+unsafe extern "C" fn js_set_immediate(
+    ctx: JSContextRef,
+    _function: JSObjectRef,
+    _this_object: JSObjectRef,
+    argument_count: usize,
+    arguments: *const JSValueRef,
+    exception: *mut JSValueRef,
+) -> JSValueRef {
+    let callback = match get_function_arg(ctx, arguments, 0, argument_count) {
+        Ok(value) => value,
+        Err(err) => {
+            *exception = crate::apis::make_exception(ctx, &err.to_string());
+            return JSValueMakeUndefined(ctx);
+        }
+    };
+
+    let args = collect_args(arguments, 1, argument_count);
+    let Some(loop_ref) = event_loop_for_context(ctx) else {
+        *exception = crate::apis::make_exception(ctx, "Event loop not available");
+        return JSValueMakeUndefined(ctx);
+    };
+
+    match loop_ref.schedule_immediate(callback, args, true) {
         Ok(id) => create_id_value(ctx, id),
         Err(err) => {
             *exception = crate::apis::make_exception(ctx, &err.to_string());
@@ -130,6 +165,17 @@ unsafe extern "C" fn js_clear_timeout(
     arguments: *const JSValueRef,
     exception: *mut JSValueRef,
 ) -> JSValueRef {
+    if argument_count == 0 {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    unsafe {
+        let value = *arguments.add(0);
+        if value.is_null() || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value) {
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+
     let id = match parse_id_arg(ctx, arguments, 0, argument_count) {
         Ok(value) => value,
         Err(err) => {
@@ -144,6 +190,108 @@ unsafe extern "C" fn js_clear_timeout(
     };
 
     loop_ref.clear_timer(id);
+    JSValueMakeUndefined(ctx)
+}
+
+unsafe extern "C" fn js_clear_immediate(
+    ctx: JSContextRef,
+    _function: JSObjectRef,
+    _this_object: JSObjectRef,
+    argument_count: usize,
+    arguments: *const JSValueRef,
+    exception: *mut JSValueRef,
+) -> JSValueRef {
+    if argument_count == 0 {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    unsafe {
+        let value = *arguments.add(0);
+        if value.is_null() || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value) {
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+
+    let id = match parse_id_arg(ctx, arguments, 0, argument_count) {
+        Ok(value) => value,
+        Err(err) => {
+            *exception = crate::apis::make_exception(ctx, &err.to_string());
+            return JSValueMakeUndefined(ctx);
+        }
+    };
+
+    let Some(loop_ref) = event_loop_for_context(ctx) else {
+        *exception = crate::apis::make_exception(ctx, "Event loop not available");
+        return JSValueMakeUndefined(ctx);
+    };
+
+    loop_ref.clear_immediate(id);
+    JSValueMakeUndefined(ctx)
+}
+
+unsafe extern "C" fn js_timer_ref(
+    ctx: JSContextRef,
+    _function: JSObjectRef,
+    _this_object: JSObjectRef,
+    argument_count: usize,
+    arguments: *const JSValueRef,
+    exception: *mut JSValueRef,
+) -> JSValueRef {
+    if argument_count < 2 {
+        *exception = crate::apis::make_exception(ctx, "timer id and ref flag required");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    let id = match parse_id_arg(ctx, arguments, 0, argument_count) {
+        Ok(value) => value,
+        Err(err) => {
+            *exception = crate::apis::make_exception(ctx, &err.to_string());
+            return JSValueMakeUndefined(ctx);
+        }
+    };
+
+    unsafe {
+        let refed = JSValueToBoolean(ctx, *arguments.add(1));
+        let Some(loop_ref) = event_loop_for_context(ctx) else {
+            *exception = crate::apis::make_exception(ctx, "Event loop not available");
+            return JSValueMakeUndefined(ctx);
+        };
+        loop_ref.set_timer_ref(id, refed);
+    }
+
+    JSValueMakeUndefined(ctx)
+}
+
+unsafe extern "C" fn js_immediate_ref(
+    ctx: JSContextRef,
+    _function: JSObjectRef,
+    _this_object: JSObjectRef,
+    argument_count: usize,
+    arguments: *const JSValueRef,
+    exception: *mut JSValueRef,
+) -> JSValueRef {
+    if argument_count < 2 {
+        *exception = crate::apis::make_exception(ctx, "immediate id and ref flag required");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    let id = match parse_id_arg(ctx, arguments, 0, argument_count) {
+        Ok(value) => value,
+        Err(err) => {
+            *exception = crate::apis::make_exception(ctx, &err.to_string());
+            return JSValueMakeUndefined(ctx);
+        }
+    };
+
+    unsafe {
+        let refed = JSValueToBoolean(ctx, *arguments.add(1));
+        let Some(loop_ref) = event_loop_for_context(ctx) else {
+            *exception = crate::apis::make_exception(ctx, "Event loop not available");
+            return JSValueMakeUndefined(ctx);
+        };
+        loop_ref.set_immediate_ref(id, refed);
+    }
+
     JSValueMakeUndefined(ctx)
 }
 

@@ -122,6 +122,13 @@ pub fn async_hooks() -> Extension {
     crate::async_hooks_ext::extension()
 }
 
+/// Create the timers extension for scheduling callbacks.
+///
+/// Provides node:timers and node:timers/promises modules.
+pub fn timers() -> Extension {
+    crate::timers_ext::extension()
+}
+
 /// Create the querystring extension for query string parsing.
 ///
 /// Provides Node.js-compatible querystring API (node:querystring).
@@ -418,6 +425,7 @@ pub fn for_node_compat(config: ExtensionConfig) -> ExtensionsWithState {
         readline(),
         os(),
         async_hooks(),
+        timers(),
         // IO
         fs(config.capabilities.clone()),
         process(),
@@ -673,8 +681,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions();
         let result = for_node_compat(config);
 
-        // Should have 23 extensions (no http_server since no tx provided)
-        assert_eq!(result.extensions.len(), 23);
+        // Should have 24 extensions (no http_server since no tx provided)
+        assert_eq!(result.extensions.len(), 24);
         assert!(result.http_server_count.is_none());
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
@@ -692,6 +700,7 @@ mod tests {
         assert!(names.contains(&"string_decoder"));
         assert!(names.contains(&"readline"));
         assert!(names.contains(&"node_stream"));
+        assert!(names.contains(&"node_timers"));
         // No http_server without tx
         assert!(!names.contains(&"http_server"));
     }
@@ -702,8 +711,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions().http_event_tx(tx);
         let result = for_node_compat(config);
 
-        // Should have 24 extensions (including http_server)
-        assert_eq!(result.extensions.len(), 24);
+        // Should have 25 extensions (including http_server)
+        assert_eq!(result.extensions.len(), 25);
         assert!(result.http_server_count.is_some());
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
@@ -715,8 +724,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions();
         let result = for_full(config);
 
-        // Should have 24 extensions (node_compat 23 + test)
-        assert_eq!(result.extensions.len(), 24);
+        // Should have 25 extensions (node_compat 24 + test)
+        assert_eq!(result.extensions.len(), 25);
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
         assert!(names.contains(&"test"));
@@ -728,8 +737,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions().http_event_tx(tx);
         let result = for_full(config);
 
-        // Should have 25 extensions (all)
-        assert_eq!(result.extensions.len(), 25);
+        // Should have 26 extensions (all)
+        assert_eq!(result.extensions.len(), 26);
         assert!(result.http_server_count.is_some());
     }
 }

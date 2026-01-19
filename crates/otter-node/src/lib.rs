@@ -70,6 +70,7 @@ pub mod string_decoder_ext;
 pub mod node_stream_ext;
 pub mod test;
 pub mod test_ext;
+pub mod timers_ext;
 pub mod tty_ext;
 pub mod url;
 pub mod url_ext;

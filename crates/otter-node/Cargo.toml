@@ -22,7 +22,23 @@ hex = "0.4"
 pathdiff = "0.2"
 ring = "0.17"
 md-5 = "0.10"
-sha1 = "0.10"
+sha1 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.10", features = ["oid"] }
+pbkdf2 = "0.12"
+scrypt = "0.11"
+aes = "0.8"
+ctr = "0.9"
+cbc = "0.1"
+cipher = "0.4"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+rsa = { version = "0.9", features = ["pem"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
+pkcs8 = "0.10"
+spki = "0.7"
+pem = "3"
+rand_core = "0.6"
 uuid = { version = "1", features = ["v4"] }
 getrandom = "0.3"
 parking_lot = "0.12"

@@ -7,10 +7,32 @@
 //! - `createHmac(algorithm, key)` - Create HMAC
 //! - `getRandomValues(typedArray)` - Web Crypto API
 
+use aes::Aes128;
+use aes::Aes256;
+use aes_gcm::{AeadInPlace, Aes128Gcm, Aes256Gcm, KeyInit as AesGcmKeyInit};
+use chacha20poly1305::ChaCha20Poly1305;
+use cipher::block_padding::{NoPadding, Pkcs7};
+use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, StreamCipher};
+use ctr::Ctr128BE;
+use ed25519_dalek::{Signer as Ed25519Signer, SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey};
 use md5::{Digest as Md5Digest, Md5};
+use pbkdf2::pbkdf2_hmac;
+use pem::Pem;
+use rand_core::OsRng;
+use rand_core::RngCore;
+use rsa::pkcs1::{
+    DecodeRsaPrivateKey, DecodeRsaPublicKey, EncodeRsaPrivateKey, EncodeRsaPublicKey,
+};
+use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
+use rsa::{Pkcs1v15Sign, Pss, RsaPrivateKey, RsaPublicKey};
 use ring::digest::{self, Context as DigestContext};
 use ring::hmac;
+use scrypt::{Params as ScryptParams, scrypt as scrypt_kdf};
 use sha1::Sha1;
+use sha2::{Sha256, Sha384, Sha512};
+use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey};
+use p256::SecretKey as P256SecretKey;
 use std::fmt;
 use thiserror::Error;
 
@@ -22,6 +44,9 @@ pub enum CryptoError {
 
     #[error("Invalid key length for algorithm")]
     InvalidKeyLength,
+
+    #[error("Invalid parameters: {0}")]
+    InvalidParams(String),
 
     #[error("Random generation failed: {0}")]
     RandomError(String),
@@ -82,6 +107,333 @@ impl fmt::Display for HashAlgorithm {
             HashAlgorithm::Sha256 => write!(f, "sha256"),
             HashAlgorithm::Sha384 => write!(f, "sha384"),
             HashAlgorithm::Sha512 => write!(f, "sha512"),
+        }
+    }
+}
+
+/// Supported cipher algorithms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CipherAlgorithm {
+    Aes128Ctr,
+    Aes256Ctr,
+    Aes128Cbc,
+    Aes256Cbc,
+    Aes128Gcm,
+    Aes256Gcm,
+    ChaCha20Poly1305,
+}
+
+impl CipherAlgorithm {
+    pub fn parse(name: &str) -> Result<Self, CryptoError> {
+        match name.to_lowercase().as_str() {
+            "aes-128-ctr" => Ok(Self::Aes128Ctr),
+            "aes-256-ctr" => Ok(Self::Aes256Ctr),
+            "aes-128-cbc" => Ok(Self::Aes128Cbc),
+            "aes-256-cbc" => Ok(Self::Aes256Cbc),
+            "aes-128-gcm" => Ok(Self::Aes128Gcm),
+            "aes-256-gcm" => Ok(Self::Aes256Gcm),
+            "chacha20-poly1305" => Ok(Self::ChaCha20Poly1305),
+            _ => Err(CryptoError::UnsupportedAlgorithm(name.to_string())),
+        }
+    }
+
+    pub fn key_len(self) -> usize {
+        match self {
+            Self::Aes128Ctr | Self::Aes128Cbc | Self::Aes128Gcm => 16,
+            Self::Aes256Ctr | Self::Aes256Cbc | Self::Aes256Gcm => 32,
+            Self::ChaCha20Poly1305 => 32,
+        }
+    }
+
+    pub fn iv_len(self) -> usize {
+        match self {
+            Self::Aes128Ctr | Self::Aes256Ctr | Self::Aes128Cbc | Self::Aes256Cbc => 16,
+            Self::Aes128Gcm | Self::Aes256Gcm | Self::ChaCha20Poly1305 => 12,
+        }
+    }
+
+    pub fn is_aead(self) -> bool {
+        matches!(
+            self,
+            Self::Aes128Gcm | Self::Aes256Gcm | Self::ChaCha20Poly1305
+        )
+    }
+}
+
+enum CipherState {
+    Aes128Ctr(Ctr128BE<Aes128>),
+    Aes256Ctr(Ctr128BE<Aes256>),
+}
+
+/// Cipher context for createCipheriv/createDecipheriv.
+pub struct CipherContext {
+    algorithm: CipherAlgorithm,
+    encrypt: bool,
+    auto_padding: bool,
+    aad: Vec<u8>,
+    buffer: Vec<u8>,
+    auth_tag: Option<Vec<u8>>,
+    auth_tag_len: usize,
+    state: Option<CipherState>,
+    key: Vec<u8>,
+    iv: Vec<u8>,
+}
+
+impl CipherContext {
+    pub fn new(
+        algorithm: CipherAlgorithm,
+        key: &[u8],
+        iv: &[u8],
+        encrypt: bool,
+        auth_tag_len: Option<usize>,
+    ) -> Result<Self, CryptoError> {
+        if key.len() != algorithm.key_len() {
+            return Err(CryptoError::InvalidKeyLength);
+        }
+        if iv.len() != algorithm.iv_len() {
+            return Err(CryptoError::InvalidKeyLength);
+        }
+        let tag_len = auth_tag_len.unwrap_or(16);
+        if algorithm.is_aead() && tag_len != 16 {
+            return Err(CryptoError::InvalidKeyLength);
+        }
+
+        let state = match algorithm {
+            CipherAlgorithm::Aes128Ctr => {
+                Some(CipherState::Aes128Ctr(Ctr128BE::new(
+                    key.into(),
+                    iv.into(),
+                )))
+            }
+            CipherAlgorithm::Aes256Ctr => {
+                Some(CipherState::Aes256Ctr(Ctr128BE::new(
+                    key.into(),
+                    iv.into(),
+                )))
+            }
+            _ => None,
+        };
+
+        Ok(Self {
+            algorithm,
+            encrypt,
+            auto_padding: true,
+            aad: Vec::new(),
+            buffer: Vec::new(),
+            auth_tag: None,
+            auth_tag_len: tag_len,
+            state,
+            key: key.to_vec(),
+            iv: iv.to_vec(),
+        })
+    }
+
+    pub fn set_auto_padding(&mut self, value: bool) -> Result<(), CryptoError> {
+        self.auto_padding = value;
+        Ok(())
+    }
+
+    pub fn set_aad(&mut self, aad: &[u8]) -> Result<(), CryptoError> {
+        if !self.algorithm.is_aead() {
+            return Err(CryptoError::UnsupportedAlgorithm(format!(
+                "{} does not support AAD",
+                self.algorithm_name()
+            )));
+        }
+        self.aad = aad.to_vec();
+        Ok(())
+    }
+
+    pub fn set_auth_tag(&mut self, tag: &[u8]) -> Result<(), CryptoError> {
+        if !self.algorithm.is_aead() {
+            return Err(CryptoError::UnsupportedAlgorithm(format!(
+                "{} does not support auth tag",
+                self.algorithm_name()
+            )));
+        }
+        if tag.len() != self.auth_tag_len {
+            return Err(CryptoError::InvalidKeyLength);
+        }
+        self.auth_tag = Some(tag.to_vec());
+        Ok(())
+    }
+
+    pub fn get_auth_tag(&self) -> Option<Vec<u8>> {
+        self.auth_tag.clone()
+    }
+
+    pub fn update(&mut self, data: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        if let Some(state) = &mut self.state {
+            let mut out = data.to_vec();
+            match state {
+                CipherState::Aes128Ctr(cipher) => cipher.apply_keystream(&mut out),
+                CipherState::Aes256Ctr(cipher) => cipher.apply_keystream(&mut out),
+            }
+            return Ok(out);
+        }
+
+        self.buffer.extend_from_slice(data);
+        Ok(Vec::new())
+    }
+
+    pub fn finalize(&mut self) -> Result<Vec<u8>, CryptoError> {
+        match self.algorithm {
+            CipherAlgorithm::Aes128Ctr | CipherAlgorithm::Aes256Ctr => Ok(Vec::new()),
+            CipherAlgorithm::Aes128Cbc => self.finalize_cbc_aes128(),
+            CipherAlgorithm::Aes256Cbc => self.finalize_cbc_aes256(),
+            CipherAlgorithm::Aes128Gcm => self.finalize_gcm::<Aes128Gcm>(),
+            CipherAlgorithm::Aes256Gcm => self.finalize_gcm::<Aes256Gcm>(),
+            CipherAlgorithm::ChaCha20Poly1305 => self.finalize_chacha20(),
+        }
+    }
+
+    fn finalize_cbc_aes128(&mut self) -> Result<Vec<u8>, CryptoError> {
+        let data = std::mem::take(&mut self.buffer);
+        let mut buf = data;
+        let block_size = 16;
+        if self.encrypt {
+            if self.auto_padding {
+                let msg_len = buf.len();
+                buf.resize(msg_len + block_size, 0);
+                let encryptor = cbc::Encryptor::<Aes128>::new_from_slices(&self.key, &self.iv)
+                    .map_err(|_| CryptoError::InvalidKeyLength)?;
+                let result = encryptor
+                    .encrypt_padded_mut::<Pkcs7>(&mut buf, msg_len)
+                    .map_err(|e| CryptoError::EncodingError(e.to_string()))?;
+                Ok(result.to_vec())
+            } else {
+                let msg_len = buf.len();
+                buf.resize(msg_len + block_size, 0);
+                let encryptor = cbc::Encryptor::<Aes128>::new_from_slices(&self.key, &self.iv)
+                    .map_err(|_| CryptoError::InvalidKeyLength)?;
+                let result = encryptor
+                    .encrypt_padded_mut::<NoPadding>(&mut buf, msg_len)
+                    .map_err(|e| CryptoError::EncodingError(e.to_string()))?;
+                Ok(result.to_vec())
+            }
+        } else if self.auto_padding {
+            let decryptor = cbc::Decryptor::<Aes128>::new_from_slices(&self.key, &self.iv)
+                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let result = decryptor
+                .decrypt_padded_mut::<Pkcs7>(&mut buf)
+                .map_err(|e| CryptoError::EncodingError(e.to_string()))?;
+            Ok(result.to_vec())
+        } else {
+            let decryptor = cbc::Decryptor::<Aes128>::new_from_slices(&self.key, &self.iv)
+                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let result = decryptor
+                .decrypt_padded_mut::<NoPadding>(&mut buf)
+                .map_err(|e| CryptoError::EncodingError(e.to_string()))?;
+            Ok(result.to_vec())
+        }
+    }
+
+    fn finalize_cbc_aes256(&mut self) -> Result<Vec<u8>, CryptoError> {
+        let data = std::mem::take(&mut self.buffer);
+        let mut buf = data;
+        let block_size = 16;
+        if self.encrypt {
+            if self.auto_padding {
+                let msg_len = buf.len();
+                buf.resize(msg_len + block_size, 0);
+                let encryptor = cbc::Encryptor::<Aes256>::new_from_slices(&self.key, &self.iv)
+                    .map_err(|_| CryptoError::InvalidKeyLength)?;
+                let result = encryptor
+                    .encrypt_padded_mut::<Pkcs7>(&mut buf, msg_len)
+                    .map_err(|e| CryptoError::EncodingError(e.to_string()))?;
+                Ok(result.to_vec())
+            } else {
+                let msg_len = buf.len();
+                buf.resize(msg_len + block_size, 0);
+                let encryptor = cbc::Encryptor::<Aes256>::new_from_slices(&self.key, &self.iv)
+                    .map_err(|_| CryptoError::InvalidKeyLength)?;
+                let result = encryptor
+                    .encrypt_padded_mut::<NoPadding>(&mut buf, msg_len)
+                    .map_err(|e| CryptoError::EncodingError(e.to_string()))?;
+                Ok(result.to_vec())
+            }
+        } else if self.auto_padding {
+            let decryptor = cbc::Decryptor::<Aes256>::new_from_slices(&self.key, &self.iv)
+                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let result = decryptor
+                .decrypt_padded_mut::<Pkcs7>(&mut buf)
+                .map_err(|e| CryptoError::EncodingError(e.to_string()))?;
+            Ok(result.to_vec())
+        } else {
+            let decryptor = cbc::Decryptor::<Aes256>::new_from_slices(&self.key, &self.iv)
+                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let result = decryptor
+                .decrypt_padded_mut::<NoPadding>(&mut buf)
+                .map_err(|e| CryptoError::EncodingError(e.to_string()))?;
+            Ok(result.to_vec())
+        }
+    }
+
+    fn finalize_gcm<C>(&mut self) -> Result<Vec<u8>, CryptoError>
+    where
+        C: AeadInPlace + AesGcmKeyInit,
+    {
+        if self.auth_tag_len != 16 {
+            return Err(CryptoError::InvalidKeyLength);
+        }
+
+        let key = C::new_from_slice(&self.key).unwrap();
+        let nonce = aes_gcm::Nonce::from_slice(&self.iv);
+        let mut buffer = std::mem::take(&mut self.buffer);
+        if self.encrypt {
+            let tag = key
+                .encrypt_in_place_detached(nonce, self.aad.as_slice(), &mut buffer)
+                .map_err(|e| CryptoError::EncodingError(format!("{e:?}")))?;
+            self.auth_tag = Some(tag.to_vec());
+            Ok(buffer)
+        } else {
+            let tag = self
+                .auth_tag
+                .clone()
+                .ok_or_else(|| CryptoError::InvalidKeyLength)?;
+            let tag = aes_gcm::Tag::from_slice(&tag);
+            key.decrypt_in_place_detached(nonce, self.aad.as_slice(), &mut buffer, tag)
+            .map_err(|e| CryptoError::EncodingError(format!("{e:?}")))?;
+            Ok(buffer)
+        }
+    }
+
+    fn finalize_chacha20(&mut self) -> Result<Vec<u8>, CryptoError> {
+        if self.auth_tag_len != 16 {
+            return Err(CryptoError::InvalidKeyLength);
+        }
+
+        let key = ChaCha20Poly1305::new_from_slice(&self.key)
+            .map_err(|_| CryptoError::InvalidKeyLength)?;
+        let nonce = chacha20poly1305::Nonce::from_slice(&self.iv);
+        let mut buffer = std::mem::take(&mut self.buffer);
+        if self.encrypt {
+            let tag = key
+                .encrypt_in_place_detached(nonce, self.aad.as_slice(), &mut buffer)
+                .map_err(|e| CryptoError::EncodingError(format!("{e:?}")))?;
+            self.auth_tag = Some(tag.to_vec());
+            Ok(buffer)
+        } else {
+            let tag = self
+                .auth_tag
+                .clone()
+                .ok_or_else(|| CryptoError::InvalidKeyLength)?;
+            let tag = chacha20poly1305::Tag::from_slice(&tag);
+            key.decrypt_in_place_detached(nonce, self.aad.as_slice(), &mut buffer, tag)
+            .map_err(|e| CryptoError::EncodingError(format!("{e:?}")))?;
+            Ok(buffer)
+        }
+    }
+
+    fn algorithm_name(&self) -> &'static str {
+        match self.algorithm {
+            CipherAlgorithm::Aes128Ctr => "aes-128-ctr",
+            CipherAlgorithm::Aes256Ctr => "aes-256-ctr",
+            CipherAlgorithm::Aes128Cbc => "aes-128-cbc",
+            CipherAlgorithm::Aes256Cbc => "aes-256-cbc",
+            CipherAlgorithm::Aes128Gcm => "aes-128-gcm",
+            CipherAlgorithm::Aes256Gcm => "aes-256-gcm",
+            CipherAlgorithm::ChaCha20Poly1305 => "chacha20-poly1305",
         }
     }
 }
@@ -265,6 +617,791 @@ pub fn from_base64(s: &str) -> Result<Vec<u8>, CryptoError> {
     base64::engine::general_purpose::STANDARD
         .decode(s)
         .map_err(|e| CryptoError::EncodingError(e.to_string()))
+}
+
+/// Get supported hash algorithms.
+pub fn get_hashes() -> Vec<&'static str> {
+    vec!["md5", "sha1", "sha256", "sha384", "sha512"]
+}
+
+/// Get supported cipher algorithms.
+pub fn get_ciphers() -> Vec<&'static str> {
+    vec![
+        "aes-128-ctr",
+        "aes-256-ctr",
+        "aes-128-cbc",
+        "aes-256-cbc",
+        "aes-128-gcm",
+        "aes-256-gcm",
+        "chacha20-poly1305",
+    ]
+}
+
+/// Get supported elliptic curves (empty for now).
+pub fn get_curves() -> Vec<&'static str> {
+    Vec::new()
+}
+
+/// Constant-time equality check. Returns error on length mismatch.
+pub fn timing_safe_equal(a: &[u8], b: &[u8]) -> Result<bool, CryptoError> {
+    if a.len() != b.len() {
+        return Err(CryptoError::InvalidKeyLength);
+    }
+    let mut diff: u8 = 0;
+    for (left, right) in a.iter().zip(b.iter()) {
+        diff |= left ^ right;
+    }
+    Ok(diff == 0)
+}
+
+/// PBKDF2 key derivation.
+pub fn pbkdf2(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    key_len: usize,
+    digest: &str,
+) -> Result<Vec<u8>, CryptoError> {
+    let mut out = vec![0u8; key_len];
+    match digest.to_lowercase().as_str() {
+        "sha1" | "sha-1" => pbkdf2_hmac::<Sha1>(password, salt, iterations, &mut out),
+        "sha256" | "sha-256" => pbkdf2_hmac::<Sha256>(password, salt, iterations, &mut out),
+        "sha384" | "sha-384" => pbkdf2_hmac::<Sha384>(password, salt, iterations, &mut out),
+        "sha512" | "sha-512" => pbkdf2_hmac::<Sha512>(password, salt, iterations, &mut out),
+        _ => return Err(CryptoError::UnsupportedAlgorithm(digest.to_string())),
+    };
+    Ok(out)
+}
+
+/// scrypt key derivation.
+pub fn scrypt(
+    password: &[u8],
+    salt: &[u8],
+    key_len: usize,
+    n: u64,
+    r: u32,
+    p: u32,
+) -> Result<Vec<u8>, CryptoError> {
+    if n == 0 || (n & (n - 1)) != 0 {
+        return Err(CryptoError::InvalidParams(
+            "N must be a power of two".to_string(),
+        ));
+    }
+    let log_n = (64 - n.leading_zeros() - 1) as u8;
+    let params = ScryptParams::new(log_n, r, p, key_len)
+        .map_err(|e| CryptoError::InvalidParams(e.to_string()))?;
+    let mut out = vec![0u8; key_len];
+    scrypt_kdf(password, salt, &params, &mut out)
+        .map_err(|e| CryptoError::InvalidParams(e.to_string()))?;
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyFormat {
+    Pem,
+    Der,
+}
+
+impl KeyFormat {
+    pub fn parse(value: &str) -> Result<Self, CryptoError> {
+        match value.to_lowercase().as_str() {
+            "pem" => Ok(Self::Pem),
+            "der" => Ok(Self::Der),
+            _ => Err(CryptoError::InvalidParams(format!(
+                "Unsupported key format: {}",
+                value
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyType {
+    Pkcs1,
+    Pkcs8,
+    Spki,
+    Sec1,
+}
+
+impl KeyType {
+    pub fn parse(value: &str) -> Result<Self, CryptoError> {
+        match value.to_lowercase().as_str() {
+            "pkcs1" => Ok(Self::Pkcs1),
+            "pkcs8" => Ok(Self::Pkcs8),
+            "spki" => Ok(Self::Spki),
+            "sec1" => Ok(Self::Sec1),
+            _ => Err(CryptoError::InvalidParams(format!(
+                "Unsupported key type: {}",
+                value
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsaEncoding {
+    Der,
+    IeeeP1363,
+}
+
+impl DsaEncoding {
+    pub fn parse(value: &str) -> Result<Self, CryptoError> {
+        match value.to_lowercase().as_str() {
+            "der" => Ok(Self::Der),
+            "ieee-p1363" => Ok(Self::IeeeP1363),
+            _ => Err(CryptoError::InvalidParams(format!(
+                "Unsupported dsaEncoding: {}",
+                value
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsaPadding {
+    Pkcs1,
+    Pss,
+}
+
+#[derive(Debug, Clone)]
+pub struct SignOptions {
+    pub dsa_encoding: Option<DsaEncoding>,
+    pub padding: Option<RsaPadding>,
+    pub salt_length: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KeyInput {
+    pub data: Vec<u8>,
+    pub format: KeyFormat,
+    pub key_type: Option<KeyType>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KeyPairOutput {
+    pub public_key: KeyOutput,
+    pub private_key: KeyOutput,
+}
+
+#[derive(Debug, Clone)]
+pub enum KeyOutput {
+    Pem(String),
+    Der(Vec<u8>),
+}
+
+#[derive(Debug, Clone)]
+pub struct KeyPairOptions {
+    pub key_type: String,
+    pub modulus_length: Option<usize>,
+    pub public_exponent: Option<u64>,
+    pub named_curve: Option<String>,
+    pub public_key_format: KeyFormat,
+    pub public_key_type: KeyType,
+    pub private_key_format: KeyFormat,
+    pub private_key_type: KeyType,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubtleAesGcmOptions {
+    pub iv: Vec<u8>,
+    pub additional_data: Option<Vec<u8>>,
+    pub tag_length: Option<usize>,
+}
+
+fn parse_pem(data: &[u8]) -> Result<Pem, CryptoError> {
+    pem::parse(data).map_err(|e| CryptoError::EncodingError(e.to_string()))
+}
+
+fn pem_key_type(label: &str) -> Option<KeyType> {
+    match label {
+        "RSA PRIVATE KEY" => Some(KeyType::Pkcs1),
+        "RSA PUBLIC KEY" => Some(KeyType::Pkcs1),
+        "PRIVATE KEY" => Some(KeyType::Pkcs8),
+        "PUBLIC KEY" => Some(KeyType::Spki),
+        "EC PRIVATE KEY" => Some(KeyType::Sec1),
+        _ => None,
+    }
+}
+
+fn parse_key_material(key: &KeyInput) -> Result<(Vec<u8>, Option<KeyType>), CryptoError> {
+    match key.format {
+        KeyFormat::Pem => {
+            let pem = parse_pem(&key.data)?;
+            let key_type = key.key_type.or_else(|| pem_key_type(pem.tag()));
+            Ok((pem.contents().to_vec(), key_type))
+        }
+        KeyFormat::Der => Ok((key.data.clone(), key.key_type)),
+    }
+}
+
+fn resolve_hash_algorithm(name: &str) -> Result<HashAlgorithm, CryptoError> {
+    HashAlgorithm::parse(name)
+}
+
+fn resolve_signature_hash(name: &str) -> Result<HashAlgorithm, CryptoError> {
+    match name.to_lowercase().as_str() {
+        "rsa-sha1" | "sha1" | "sha-1" => Ok(HashAlgorithm::Sha1),
+        "rsa-sha256" | "sha256" | "sha-256" => Ok(HashAlgorithm::Sha256),
+        "rsa-sha384" | "sha384" | "sha-384" => Ok(HashAlgorithm::Sha384),
+        "rsa-sha512" | "sha512" | "sha-512" => Ok(HashAlgorithm::Sha512),
+        "ecdsa-with-sha256" => Ok(HashAlgorithm::Sha256),
+        _ => Err(CryptoError::UnsupportedAlgorithm(name.to_string())),
+    }
+}
+
+fn resolve_rsa_padding(algorithm: &str, options: &SignOptions) -> RsaPadding {
+    if let Some(padding) = options.padding {
+        return padding;
+    }
+    if algorithm.to_lowercase().contains("pss") {
+        return RsaPadding::Pss;
+    }
+    RsaPadding::Pkcs1
+}
+
+fn parse_rsa_private(key: &KeyInput) -> Result<RsaPrivateKey, CryptoError> {
+    let (der, key_type) = parse_key_material(key)?;
+    match key_type {
+        Some(KeyType::Pkcs1) => RsaPrivateKey::from_pkcs1_der(&der)
+            .map_err(|e| CryptoError::EncodingError(e.to_string())),
+        Some(KeyType::Pkcs8) | None => RsaPrivateKey::from_pkcs8_der(&der)
+            .map_err(|e| CryptoError::EncodingError(e.to_string())),
+        _ => Err(CryptoError::InvalidParams(
+            "Invalid RSA private key type".to_string(),
+        )),
+    }
+}
+
+fn parse_rsa_public(key: &KeyInput) -> Result<RsaPublicKey, CryptoError> {
+    let (der, key_type) = parse_key_material(key)?;
+    match key_type {
+        Some(KeyType::Pkcs1) => RsaPublicKey::from_pkcs1_der(&der)
+            .map_err(|e| CryptoError::EncodingError(e.to_string())),
+        Some(KeyType::Spki) | Some(KeyType::Pkcs8) | None => {
+            RsaPublicKey::from_public_key_der(&der)
+                .map_err(|e| CryptoError::EncodingError(e.to_string()))
+        }
+        _ => Err(CryptoError::InvalidParams(
+            "Invalid RSA public key type".to_string(),
+        )),
+    }
+}
+
+fn parse_p256_private(key: &KeyInput) -> Result<P256SigningKey, CryptoError> {
+    let (der, key_type) = parse_key_material(key)?;
+    match key_type {
+        Some(KeyType::Sec1) => {
+            let secret = P256SecretKey::from_sec1_der(&der)
+                .map_err(|e| CryptoError::EncodingError(e.to_string()))?;
+            Ok(P256SigningKey::from(secret))
+        }
+        Some(KeyType::Pkcs8) | None => P256SigningKey::from_pkcs8_der(&der)
+            .map_err(|e| CryptoError::EncodingError(e.to_string())),
+        _ => Err(CryptoError::InvalidParams(
+            "Invalid EC private key type".to_string(),
+        )),
+    }
+}
+
+fn parse_p256_public(key: &KeyInput) -> Result<P256VerifyingKey, CryptoError> {
+    let (der, key_type) = parse_key_material(key)?;
+    match key_type {
+        Some(KeyType::Spki) | Some(KeyType::Pkcs8) | None => {
+            P256VerifyingKey::from_public_key_der(&der)
+                .map_err(|e| CryptoError::EncodingError(e.to_string()))
+        }
+        _ => Err(CryptoError::InvalidParams(
+            "Invalid EC public key type".to_string(),
+        )),
+    }
+}
+
+fn parse_ed25519_private(key: &KeyInput) -> Result<Ed25519SigningKey, CryptoError> {
+    let (der, key_type) = parse_key_material(key)?;
+    match key_type {
+        Some(KeyType::Pkcs8) | None => Ed25519SigningKey::from_pkcs8_der(&der)
+            .map_err(|e| CryptoError::EncodingError(e.to_string())),
+        _ => Err(CryptoError::InvalidParams(
+            "Invalid Ed25519 private key type".to_string(),
+        )),
+    }
+}
+
+fn parse_ed25519_public(key: &KeyInput) -> Result<Ed25519VerifyingKey, CryptoError> {
+    let (der, key_type) = parse_key_material(key)?;
+    match key_type {
+        Some(KeyType::Spki) | Some(KeyType::Pkcs8) | None => {
+            Ed25519VerifyingKey::from_public_key_der(&der)
+                .map_err(|e| CryptoError::EncodingError(e.to_string()))
+        }
+        _ => Err(CryptoError::InvalidParams(
+            "Invalid Ed25519 public key type".to_string(),
+        )),
+    }
+}
+
+fn sign_rsa(
+    hash_alg: HashAlgorithm,
+    key: &KeyInput,
+    data: &[u8],
+    options: &SignOptions,
+    padding: RsaPadding,
+) -> Result<Vec<u8>, CryptoError> {
+    let private_key = parse_rsa_private(key)?;
+    let digest = hash(hash_alg.to_string().as_str(), data)?;
+    let mut rng = OsRng;
+    let signature = match (padding, hash_alg) {
+        (RsaPadding::Pkcs1, HashAlgorithm::Sha1) => {
+            private_key.sign(Pkcs1v15Sign::new::<Sha1>(), &digest)
+        }
+        (RsaPadding::Pkcs1, HashAlgorithm::Sha256) => {
+            private_key.sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
+        }
+        (RsaPadding::Pkcs1, HashAlgorithm::Sha384) => {
+            private_key.sign(Pkcs1v15Sign::new::<Sha384>(), &digest)
+        }
+        (RsaPadding::Pkcs1, HashAlgorithm::Sha512) => {
+            private_key.sign(Pkcs1v15Sign::new::<Sha512>(), &digest)
+        }
+        (RsaPadding::Pss, HashAlgorithm::Sha1) => {
+            let scheme = options
+                .salt_length
+                .map(|salt| Pss::new_with_salt::<Sha1>(salt))
+                .unwrap_or_else(Pss::new::<Sha1>);
+            private_key.sign_with_rng(&mut rng, scheme, &digest)
+        }
+        (RsaPadding::Pss, HashAlgorithm::Sha256) => {
+            let scheme = options
+                .salt_length
+                .map(|salt| Pss::new_with_salt::<Sha256>(salt))
+                .unwrap_or_else(Pss::new::<Sha256>);
+            private_key.sign_with_rng(&mut rng, scheme, &digest)
+        }
+        (RsaPadding::Pss, HashAlgorithm::Sha384) => {
+            let scheme = options
+                .salt_length
+                .map(|salt| Pss::new_with_salt::<Sha384>(salt))
+                .unwrap_or_else(Pss::new::<Sha384>);
+            private_key.sign_with_rng(&mut rng, scheme, &digest)
+        }
+        (RsaPadding::Pss, HashAlgorithm::Sha512) => {
+            let scheme = options
+                .salt_length
+                .map(|salt| Pss::new_with_salt::<Sha512>(salt))
+                .unwrap_or_else(Pss::new::<Sha512>);
+            private_key.sign_with_rng(&mut rng, scheme, &digest)
+        }
+        _ => {
+            return Err(CryptoError::UnsupportedAlgorithm(format!(
+                "Unsupported RSA hash {:?}",
+                hash_alg
+            )))
+        }
+    }
+    .map_err(|e| CryptoError::InvalidParams(e.to_string()))?;
+    Ok(signature)
+}
+
+fn verify_rsa(
+    hash_alg: HashAlgorithm,
+    key: &KeyInput,
+    data: &[u8],
+    signature: &[u8],
+    options: &SignOptions,
+    padding: RsaPadding,
+) -> Result<bool, CryptoError> {
+    let public_key = parse_rsa_public(key)?;
+    let digest = hash(hash_alg.to_string().as_str(), data)?;
+    let result = match (padding, hash_alg) {
+        (RsaPadding::Pkcs1, HashAlgorithm::Sha1) => {
+            public_key.verify(Pkcs1v15Sign::new::<Sha1>(), &digest, signature)
+        }
+        (RsaPadding::Pkcs1, HashAlgorithm::Sha256) => {
+            public_key.verify(Pkcs1v15Sign::new::<Sha256>(), &digest, signature)
+        }
+        (RsaPadding::Pkcs1, HashAlgorithm::Sha384) => {
+            public_key.verify(Pkcs1v15Sign::new::<Sha384>(), &digest, signature)
+        }
+        (RsaPadding::Pkcs1, HashAlgorithm::Sha512) => {
+            public_key.verify(Pkcs1v15Sign::new::<Sha512>(), &digest, signature)
+        }
+        (RsaPadding::Pss, HashAlgorithm::Sha1) => {
+            let scheme = options
+                .salt_length
+                .map(|salt| Pss::new_with_salt::<Sha1>(salt))
+                .unwrap_or_else(Pss::new::<Sha1>);
+            public_key.verify(scheme, &digest, signature)
+        }
+        (RsaPadding::Pss, HashAlgorithm::Sha256) => {
+            let scheme = options
+                .salt_length
+                .map(|salt| Pss::new_with_salt::<Sha256>(salt))
+                .unwrap_or_else(Pss::new::<Sha256>);
+            public_key.verify(scheme, &digest, signature)
+        }
+        (RsaPadding::Pss, HashAlgorithm::Sha384) => {
+            let scheme = options
+                .salt_length
+                .map(|salt| Pss::new_with_salt::<Sha384>(salt))
+                .unwrap_or_else(Pss::new::<Sha384>);
+            public_key.verify(scheme, &digest, signature)
+        }
+        (RsaPadding::Pss, HashAlgorithm::Sha512) => {
+            let scheme = options
+                .salt_length
+                .map(|salt| Pss::new_with_salt::<Sha512>(salt))
+                .unwrap_or_else(Pss::new::<Sha512>);
+            public_key.verify(scheme, &digest, signature)
+        }
+        _ => {
+            return Err(CryptoError::UnsupportedAlgorithm(format!(
+                "Unsupported RSA hash {:?}",
+                hash_alg
+            )))
+        }
+    };
+    Ok(result.is_ok())
+}
+
+fn sign_ecdsa_p256(
+    hash: HashAlgorithm,
+    key: &KeyInput,
+    data: &[u8],
+    options: &SignOptions,
+) -> Result<Vec<u8>, CryptoError> {
+    if hash != HashAlgorithm::Sha256 {
+        return Err(CryptoError::UnsupportedAlgorithm(
+            "P-256 only supports SHA-256".to_string(),
+        ));
+    }
+    let signing_key = parse_p256_private(key)?;
+    let signature: P256Signature = signing_key.sign(data);
+    let encoding = options.dsa_encoding.unwrap_or(DsaEncoding::Der);
+    match encoding {
+        DsaEncoding::Der => Ok(signature.to_der().as_bytes().to_vec()),
+        DsaEncoding::IeeeP1363 => Ok(signature.to_bytes().to_vec()),
+    }
+}
+
+fn verify_ecdsa_p256(
+    hash: HashAlgorithm,
+    key: &KeyInput,
+    data: &[u8],
+    signature: &[u8],
+    options: &SignOptions,
+) -> Result<bool, CryptoError> {
+    if hash != HashAlgorithm::Sha256 {
+        return Err(CryptoError::UnsupportedAlgorithm(
+            "P-256 only supports SHA-256".to_string(),
+        ));
+    }
+    let verifying_key = parse_p256_public(key)?;
+    let encoding = options.dsa_encoding.unwrap_or(DsaEncoding::Der);
+    let signature = match encoding {
+        DsaEncoding::Der => P256Signature::from_der(signature)
+            .map_err(|e| CryptoError::EncodingError(e.to_string()))?,
+        DsaEncoding::IeeeP1363 => P256Signature::from_slice(signature)
+            .map_err(|e| CryptoError::EncodingError(e.to_string()))?,
+    };
+    Ok(verifying_key.verify(data, &signature).is_ok())
+}
+
+fn sign_ed25519(key: &KeyInput, data: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let signing_key = parse_ed25519_private(key)?;
+    let signature = signing_key.sign(data);
+    Ok(signature.to_bytes().to_vec())
+}
+
+fn verify_ed25519(
+    key: &KeyInput,
+    data: &[u8],
+    signature: &[u8],
+) -> Result<bool, CryptoError> {
+    let verifying_key = parse_ed25519_public(key)?;
+    let signature = ed25519_dalek::Signature::try_from(signature)
+        .map_err(|e| CryptoError::EncodingError(e.to_string()))?;
+    Ok(verifying_key.verify_strict(data, &signature).is_ok())
+}
+
+pub fn sign(
+    algorithm: &str,
+    key: &KeyInput,
+    data: &[u8],
+    options: &SignOptions,
+) -> Result<Vec<u8>, CryptoError> {
+    let name = algorithm.to_lowercase();
+    if name.contains("ed25519") {
+        return sign_ed25519(key, data);
+    }
+    let hash = resolve_signature_hash(&name)?;
+    if name.contains("ecdsa") || name.contains("ec") {
+        return sign_ecdsa_p256(hash, key, data, options);
+    }
+    let padding = resolve_rsa_padding(&name, options);
+    sign_rsa(hash, key, data, options, padding)
+}
+
+pub fn verify(
+    algorithm: &str,
+    key: &KeyInput,
+    data: &[u8],
+    signature: &[u8],
+    options: &SignOptions,
+) -> Result<bool, CryptoError> {
+    let name = algorithm.to_lowercase();
+    if name.contains("ed25519") {
+        return verify_ed25519(key, data, signature);
+    }
+    let hash = resolve_signature_hash(&name)?;
+    if name.contains("ecdsa") || name.contains("ec") {
+        return verify_ecdsa_p256(hash, key, data, signature, options);
+    }
+    let padding = resolve_rsa_padding(&name, options);
+    verify_rsa(hash, key, data, signature, options, padding)
+}
+
+fn encode_key_output(output: Vec<u8>, format: KeyFormat, label: &str) -> Result<KeyOutput, CryptoError> {
+    match format {
+        KeyFormat::Der => Ok(KeyOutput::Der(output)),
+        KeyFormat::Pem => {
+            let pem = Pem::new(label, output);
+            Ok(KeyOutput::Pem(pem::encode(&pem)))
+        }
+    }
+}
+
+pub fn generate_key_pair(options: &KeyPairOptions) -> Result<KeyPairOutput, CryptoError> {
+    match options.key_type.to_lowercase().as_str() {
+        "rsa" => {
+            let bits = options.modulus_length.unwrap_or(2048);
+            let exponent = options.public_exponent.unwrap_or(65537);
+            let exponent = rsa::BigUint::from(exponent);
+            let mut rng = OsRng;
+            let private_key = RsaPrivateKey::new_with_exp(&mut rng, bits, &exponent)
+                .map_err(|e| CryptoError::InvalidParams(e.to_string()))?;
+            let public_key = RsaPublicKey::from(&private_key);
+
+            let private_der = match options.private_key_type {
+                KeyType::Pkcs1 => private_key
+                    .to_pkcs1_der()
+                    .map_err(|e| CryptoError::EncodingError(e.to_string()))?
+                    .as_bytes()
+                    .to_vec(),
+                KeyType::Pkcs8 => private_key
+                    .to_pkcs8_der()
+                    .map_err(|e| CryptoError::EncodingError(e.to_string()))?
+                    .as_bytes()
+                    .to_vec(),
+                _ => {
+                    return Err(CryptoError::InvalidParams(
+                        "RSA private key must be pkcs1 or pkcs8".to_string(),
+                    ))
+                }
+            };
+
+            let public_der = match options.public_key_type {
+                KeyType::Pkcs1 => public_key
+                    .to_pkcs1_der()
+                    .map_err(|e| CryptoError::EncodingError(e.to_string()))?
+                    .as_bytes()
+                    .to_vec(),
+                KeyType::Spki => public_key
+                    .to_public_key_der()
+                    .map_err(|e| CryptoError::EncodingError(e.to_string()))?
+                    .as_bytes()
+                    .to_vec(),
+                _ => {
+                    return Err(CryptoError::InvalidParams(
+                        "RSA public key must be spki or pkcs1".to_string(),
+                    ))
+                }
+            };
+
+            Ok(KeyPairOutput {
+                public_key: encode_key_output(public_der, options.public_key_format, "PUBLIC KEY")?,
+                private_key: encode_key_output(
+                    private_der,
+                    options.private_key_format,
+                    "PRIVATE KEY",
+                )?,
+            })
+        }
+        "ec" | "ecdsa" => {
+            let curve = options
+                .named_curve
+                .as_deref()
+                .unwrap_or("prime256v1");
+            if !matches!(curve.to_lowercase().as_str(), "prime256v1" | "secp256r1" | "p-256") {
+                return Err(CryptoError::UnsupportedAlgorithm(format!(
+                    "Unsupported curve: {}",
+                    curve
+                )));
+            }
+            let mut rng = OsRng;
+            let secret = P256SecretKey::random(&mut rng);
+            let public_key = secret.public_key();
+
+            let private_der = match options.private_key_type {
+                KeyType::Sec1 => secret
+                    .to_sec1_der()
+                    .map_err(|e| CryptoError::EncodingError(e.to_string()))?
+                    .as_slice()
+                    .to_vec(),
+                KeyType::Pkcs8 => secret
+                    .to_pkcs8_der()
+                    .map_err(|e| CryptoError::EncodingError(e.to_string()))?
+                    .as_bytes()
+                    .to_vec(),
+                _ => {
+                    return Err(CryptoError::InvalidParams(
+                        "EC private key must be sec1 or pkcs8".to_string(),
+                    ))
+                }
+            };
+
+            let public_der = public_key
+                .to_public_key_der()
+                .map_err(|e| CryptoError::EncodingError(e.to_string()))?
+                .as_bytes()
+                .to_vec();
+
+            Ok(KeyPairOutput {
+                public_key: encode_key_output(public_der, options.public_key_format, "PUBLIC KEY")?,
+                private_key: encode_key_output(
+                    private_der,
+                    options.private_key_format,
+                    "PRIVATE KEY",
+                )?,
+            })
+        }
+        "ed25519" => {
+            let mut rng = OsRng;
+            let mut secret = [0u8; 32];
+            rng.fill_bytes(&mut secret);
+            let signing_key = Ed25519SigningKey::from_bytes(&secret);
+            let verifying_key = signing_key.verifying_key();
+
+            let private_der = signing_key
+                .to_pkcs8_der()
+                .map_err(|e: pkcs8::Error| CryptoError::EncodingError(e.to_string()))?
+                .as_bytes()
+                .to_vec();
+
+            let public_der = verifying_key
+                .to_public_key_der()
+                .map_err(|e: spki::Error| CryptoError::EncodingError(e.to_string()))?
+                .as_bytes()
+                .to_vec();
+
+            Ok(KeyPairOutput {
+                public_key: encode_key_output(public_der, options.public_key_format, "PUBLIC KEY")?,
+                private_key: encode_key_output(
+                    private_der,
+                    options.private_key_format,
+                    "PRIVATE KEY",
+                )?,
+            })
+        }
+        other => Err(CryptoError::UnsupportedAlgorithm(other.to_string())),
+    }
+}
+
+pub fn subtle_digest(algorithm: &str, data: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let alg = resolve_hash_algorithm(algorithm)?;
+    hash(alg.to_string().as_str(), data)
+}
+
+pub fn subtle_encrypt_aes_gcm(
+    key: &[u8],
+    data: &[u8],
+    options: &SubtleAesGcmOptions,
+) -> Result<Vec<u8>, CryptoError> {
+    let tag_len = options.tag_length.unwrap_or(128);
+    if tag_len != 128 {
+        return Err(CryptoError::InvalidParams(
+            "Only 128-bit tags are supported".to_string(),
+        ));
+    }
+    let mut buffer = data.to_vec();
+    let aad = options
+        .additional_data
+        .as_ref()
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let tag = match key.len() {
+        16 => {
+            let cipher = Aes128Gcm::new_from_slice(key)
+                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let nonce = aes_gcm::Nonce::from_slice(&options.iv);
+            cipher
+                .encrypt_in_place_detached(nonce, aad, &mut buffer)
+                .map_err(|e| CryptoError::InvalidParams(e.to_string()))?
+        }
+        32 => {
+            let cipher = Aes256Gcm::new_from_slice(key)
+                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let nonce = aes_gcm::Nonce::from_slice(&options.iv);
+            cipher
+                .encrypt_in_place_detached(nonce, aad, &mut buffer)
+                .map_err(|e| CryptoError::InvalidParams(e.to_string()))?
+        }
+        _ => return Err(CryptoError::InvalidKeyLength),
+    };
+    buffer.extend_from_slice(tag.as_slice());
+    Ok(buffer)
+}
+
+pub fn subtle_decrypt_aes_gcm(
+    key: &[u8],
+    data: &[u8],
+    options: &SubtleAesGcmOptions,
+) -> Result<Vec<u8>, CryptoError> {
+    let tag_len = options.tag_length.unwrap_or(128);
+    if tag_len != 128 {
+        return Err(CryptoError::InvalidParams(
+            "Only 128-bit tags are supported".to_string(),
+        ));
+    }
+    if data.len() < 16 {
+        return Err(CryptoError::InvalidParams(
+            "Ciphertext too short".to_string(),
+        ));
+    }
+    let split_at = data.len() - 16;
+    let mut buffer = data[..split_at].to_vec();
+    let tag = &data[split_at..];
+    let aad = options
+        .additional_data
+        .as_ref()
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let result = match key.len() {
+        16 => {
+            let cipher = Aes128Gcm::new_from_slice(key)
+                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let nonce = aes_gcm::Nonce::from_slice(&options.iv);
+            cipher.decrypt_in_place_detached(
+                nonce,
+                aad,
+                &mut buffer,
+                tag.into(),
+            )
+        }
+        32 => {
+            let cipher = Aes256Gcm::new_from_slice(key)
+                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let nonce = aes_gcm::Nonce::from_slice(&options.iv);
+            cipher.decrypt_in_place_detached(
+                nonce,
+                aad,
+                &mut buffer,
+                tag.into(),
+            )
+        }
+        _ => return Err(CryptoError::InvalidKeyLength),
+    };
+    result.map_err(|e| CryptoError::InvalidParams(e.to_string()))?;
+    Ok(buffer)
 }
 
 #[cfg(test)]

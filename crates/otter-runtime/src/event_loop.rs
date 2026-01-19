@@ -28,6 +28,8 @@ struct TimerEntry {
     interval: Option<Duration>,
     /// Flag to mark timer as cancelled (for clearInterval inside callbacks)
     cancelled: AtomicBool,
+    /// Whether this timer keeps the event loop alive.
+    refed: AtomicBool,
 }
 
 impl std::fmt::Debug for TimerEntry {
@@ -37,6 +39,7 @@ impl std::fmt::Debug for TimerEntry {
             .field("when", &self.when)
             .field("interval", &self.interval)
             .field("cancelled", &self.cancelled.load(Ordering::Relaxed))
+            .field("refed", &self.refed.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -46,13 +49,32 @@ struct MicrotaskEntry {
     callback: JSObjectRef,
 }
 
+#[derive(Debug)]
+struct ImmediateEntry {
+    id: u64,
+    callback: JSObjectRef,
+    args: Vec<JSValueRef>,
+    cancelled: AtomicBool,
+    refed: AtomicBool,
+}
+
+#[derive(Debug)]
+struct ExecutingTimerState {
+    cancelled: Arc<AtomicBool>,
+    refed: Arc<AtomicBool>,
+}
+
 pub(crate) struct EventLoop {
     ctx: JSContextRef,
     timers: Mutex<Vec<TimerEntry>>,
     microtasks: Mutex<VecDeque<MicrotaskEntry>>,
+    immediates: Mutex<VecDeque<ImmediateEntry>>,
     next_timer_id: AtomicU64,
+    next_immediate_id: AtomicU64,
     /// Tracks IDs of timers currently being executed (for clearInterval in callbacks)
-    executing_timer_ids: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    executing_timer_ids: Mutex<HashMap<u64, ExecutingTimerState>>,
+    /// Tracks IDs of immediates currently being executed (for clearImmediate in callbacks)
+    executing_immediate_ids: Mutex<HashMap<u64, Arc<AtomicBool>>>,
 }
 
 impl EventLoop {
@@ -61,8 +83,11 @@ impl EventLoop {
             ctx,
             timers: Mutex::new(Vec::new()),
             microtasks: Mutex::new(VecDeque::new()),
+            immediates: Mutex::new(VecDeque::new()),
             next_timer_id: AtomicU64::new(1),
+            next_immediate_id: AtomicU64::new(1),
             executing_timer_ids: Mutex::new(HashMap::new()),
+            executing_immediate_ids: Mutex::new(HashMap::new()),
         }
     }
 
@@ -72,6 +97,7 @@ impl EventLoop {
         delay: Duration,
         interval: Option<Duration>,
         args: Vec<JSValueRef>,
+        refed: bool,
     ) -> JscResult<u64> {
         if unsafe { !JSObjectIsFunction(self.ctx, callback) } {
             return Err(JscError::type_error("function", "non-function"));
@@ -101,6 +127,7 @@ impl EventLoop {
             when: Instant::now() + clamped_delay,
             interval,
             cancelled: AtomicBool::new(false),
+            refed: AtomicBool::new(refed),
         };
 
         self.timers.lock().push(entry);
@@ -112,8 +139,8 @@ impl EventLoop {
         // First check if timer is currently executing
         {
             let executing = self.executing_timer_ids.lock();
-            if let Some(cancelled_flag) = executing.get(&id) {
-                cancelled_flag.store(true, Ordering::SeqCst);
+            if let Some(state) = executing.get(&id) {
+                state.cancelled.store(true, Ordering::SeqCst);
                 return true;
             }
         }
@@ -126,6 +153,94 @@ impl EventLoop {
         }
 
         // Timer not found - might have already executed or been cleared
+        false
+    }
+
+    /// Update whether a timer keeps the event loop alive.
+    pub fn set_timer_ref(&self, id: u64, refed: bool) -> bool {
+        {
+            let executing = self.executing_timer_ids.lock();
+            if let Some(state) = executing.get(&id) {
+                state.refed.store(refed, Ordering::SeqCst);
+                return true;
+            }
+        }
+
+        let timers = self.timers.lock();
+        if let Some(timer) = timers.iter().find(|timer| timer.id == id) {
+            timer.refed.store(refed, Ordering::SeqCst);
+            return true;
+        }
+
+        false
+    }
+
+    /// Schedule an immediate callback (setImmediate).
+    pub fn schedule_immediate(
+        &self,
+        callback: JSObjectRef,
+        args: Vec<JSValueRef>,
+        refed: bool,
+    ) -> JscResult<u64> {
+        if unsafe { !JSObjectIsFunction(self.ctx, callback) } {
+            return Err(JscError::type_error("function", "non-function"));
+        }
+
+        unsafe {
+            JSValueProtect(self.ctx, callback as JSValueRef);
+            for arg in &args {
+                JSValueProtect(self.ctx, *arg);
+            }
+        }
+
+        let id = self.next_immediate_id.fetch_add(1, Ordering::Relaxed);
+        let entry = ImmediateEntry {
+            id,
+            callback,
+            args,
+            cancelled: AtomicBool::new(false),
+            refed: AtomicBool::new(refed),
+        };
+
+        self.immediates.lock().push_back(entry);
+        Ok(id)
+    }
+
+    /// Clear an immediate by ID. Sets cancelled flag so it works even during callback execution.
+    pub fn clear_immediate(&self, id: u64) -> bool {
+        {
+            let executing = self.executing_immediate_ids.lock();
+            if let Some(cancelled_flag) = executing.get(&id) {
+                cancelled_flag.store(true, Ordering::SeqCst);
+                return true;
+            }
+        }
+
+        let immediates = self.immediates.lock();
+        if let Some(entry) = immediates.iter().find(|entry| entry.id == id) {
+            entry.cancelled.store(true, Ordering::SeqCst);
+            return true;
+        }
+
+        false
+    }
+
+    /// Update whether an immediate keeps the event loop alive.
+    pub fn set_immediate_ref(&self, id: u64, refed: bool) -> bool {
+        {
+            let executing = self.executing_immediate_ids.lock();
+            if let Some(state) = executing.get(&id) {
+                state.store(refed, Ordering::SeqCst);
+                return true;
+            }
+        }
+
+        let immediates = self.immediates.lock();
+        if let Some(entry) = immediates.iter().find(|entry| entry.id == id) {
+            entry.refed.store(refed, Ordering::SeqCst);
+            return true;
+        }
+
         false
     }
 
@@ -166,6 +281,7 @@ impl EventLoop {
         let mut executed = 0;
         executed += self.run_microtasks()?;
         executed += self.run_timers()?;
+        executed += self.run_immediates()?;
         Ok(executed)
     }
 
@@ -175,14 +291,32 @@ impl EventLoop {
         }
         // Only count non-cancelled timers
         let timers = self.timers.lock();
-        timers.iter().any(|t| !t.cancelled.load(Ordering::Relaxed))
+        if timers.iter().any(|t| {
+            !t.cancelled.load(Ordering::Relaxed) && t.refed.load(Ordering::Relaxed)
+        }) {
+            return true;
+        }
+
+        let immediates = self.immediates.lock();
+        immediates.iter().any(|i| {
+            !i.cancelled.load(Ordering::Relaxed) && i.refed.load(Ordering::Relaxed)
+        })
     }
 
     pub fn next_timer_deadline(&self) -> Option<Instant> {
+        let immediates = self.immediates.lock();
+        if immediates.iter().any(|i| {
+            !i.cancelled.load(Ordering::Relaxed) && i.refed.load(Ordering::Relaxed)
+        }) {
+            return Some(Instant::now());
+        }
+
         let timers = self.timers.lock();
         timers
             .iter()
-            .filter(|t| !t.cancelled.load(Ordering::Relaxed))
+            .filter(|t| {
+                !t.cancelled.load(Ordering::Relaxed) && t.refed.load(Ordering::Relaxed)
+            })
             .map(|timer| timer.when)
             .min()
     }
@@ -243,9 +377,16 @@ impl EventLoop {
 
             // Create shared cancelled flag for this executing timer
             let cancelled_flag = Arc::new(AtomicBool::new(false));
+            let refed_flag = Arc::new(AtomicBool::new(timer.refed.load(Ordering::Relaxed)));
             self.executing_timer_ids
                 .lock()
-                .insert(timer_id, cancelled_flag.clone());
+                .insert(
+                    timer_id,
+                    ExecutingTimerState {
+                        cancelled: cancelled_flag.clone(),
+                        refed: refed_flag.clone(),
+                    },
+                );
 
             // Increment nesting level for HTML5 spec compliance
             TIMER_NESTING_LEVEL.with(|level| {
@@ -265,6 +406,7 @@ impl EventLoop {
 
             // Check if cancelled during execution
             let was_cancelled = cancelled_flag.load(Ordering::SeqCst);
+            let is_refed = refed_flag.load(Ordering::SeqCst);
 
             match call_result {
                 Ok(()) => {
@@ -286,6 +428,7 @@ impl EventLoop {
 
             // Reschedule interval timers, cleanup one-shot timers
             if is_interval {
+                timer.refed.store(is_refed, Ordering::SeqCst);
                 // Apply clamping for rescheduled intervals too
                 let interval = timer.interval.unwrap();
                 let clamped_interval = TIMER_NESTING_LEVEL.with(|level| {
@@ -334,6 +477,65 @@ impl EventLoop {
         unsafe {
             JSValueUnprotect(self.ctx, timer.callback as JSValueRef);
             for arg in timer.args {
+                JSValueUnprotect(self.ctx, arg);
+            }
+        }
+    }
+
+    fn run_immediates(&self) -> JscResult<usize> {
+        let immediates = {
+            let mut queue = self.immediates.lock();
+            let mut due = Vec::new();
+            while let Some(entry) = queue.pop_front() {
+                due.push(entry);
+            }
+            due
+        };
+
+        let mut ran = 0;
+
+        for immediate in immediates {
+            if immediate.cancelled.load(Ordering::SeqCst) {
+                self.drop_immediate(immediate);
+                continue;
+            }
+
+            let id = immediate.id;
+            let cancelled_flag = Arc::new(AtomicBool::new(false));
+            self.executing_immediate_ids
+                .lock()
+                .insert(id, cancelled_flag.clone());
+
+            let call_result = self.call_function(immediate.callback, &immediate.args);
+            self.executing_immediate_ids.lock().remove(&id);
+
+            let was_cancelled = cancelled_flag.load(Ordering::SeqCst);
+
+            match call_result {
+                Ok(()) => {
+                    ran += 1;
+                    let _ = self.run_microtasks();
+                }
+                Err(e) => {
+                    tracing::warn!("Immediate {} callback error: {}", id, e);
+                }
+            }
+
+            if was_cancelled {
+                self.drop_immediate(immediate);
+                continue;
+            }
+
+            self.drop_immediate(immediate);
+        }
+
+        Ok(ran)
+    }
+
+    fn drop_immediate(&self, immediate: ImmediateEntry) {
+        unsafe {
+            JSValueUnprotect(self.ctx, immediate.callback as JSValueRef);
+            for arg in immediate.args {
                 JSValueUnprotect(self.ctx, arg);
             }
         }

@@ -8,7 +8,7 @@
 
 use otter_engine::CapabilitiesBuilder;
 use otter_node::ext;
-use otter_runtime::{Engine, transform_module, wrap_module};
+use otter_runtime::{Engine, JscConfig, JscRuntime, transform_module, wrap_module};
 use std::collections::HashMap;
 use tempfile::TempDir;
 
@@ -1713,5 +1713,402 @@ mod test_tests {
         assert_eq!(result["failed"], serde_json::json!(0));
 
         engine.shutdown().await;
+    }
+}
+
+/// Test timers module via JavaScript execution.
+mod timers_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_timers_module_fires() {
+        let runtime = JscRuntime::new(JscConfig::default()).unwrap();
+        runtime.register_extension(ext::timers()).unwrap();
+
+        runtime
+            .eval(
+                r#"
+                globalThis.__timer_hits = [];
+                const timers = globalThis.__otter_get_node_builtin('timers');
+                timers.setTimeout(() => __timer_hits.push('timeout'), 1);
+                timers.setImmediate(() => __timer_hits.push('immediate'));
+                "#,
+            )
+            .unwrap();
+
+        runtime
+            .run_event_loop_until_idle(Duration::from_millis(50))
+            .unwrap();
+
+        let result = runtime
+            .eval("__timer_hits.slice().sort().join(',')")
+            .unwrap();
+        assert_eq!(result.to_string().unwrap(), "immediate,timeout");
+    }
+
+    #[test]
+    fn test_timers_promises_set_timeout() {
+        let runtime = JscRuntime::new(JscConfig::default()).unwrap();
+        runtime.register_extension(ext::timers()).unwrap();
+
+        runtime
+            .eval(
+                r#"
+                globalThis.__promise_value = null;
+                const timers = globalThis.__otter_get_node_builtin('timers/promises');
+                timers.setTimeout(1, 'ok').then((value) => {
+                    globalThis.__promise_value = value;
+                });
+                "#,
+            )
+            .unwrap();
+
+        runtime
+            .run_event_loop_until_idle(Duration::from_millis(50))
+            .unwrap();
+
+        let result = runtime.eval("__promise_value").unwrap();
+        assert_eq!(result.to_string().unwrap(), "ok");
+    }
+
+    #[test]
+    fn test_timers_handle_ref_state() {
+        let runtime = JscRuntime::new(JscConfig::default()).unwrap();
+        runtime.register_extension(ext::timers()).unwrap();
+
+        runtime
+            .eval(
+                r#"
+                globalThis.__ref_states = [];
+                const timers = globalThis.__otter_get_node_builtin('timers');
+                const handle = timers.setTimeout(() => {}, 10);
+                __ref_states.push(handle.hasRef());
+                handle.unref();
+                __ref_states.push(handle.hasRef());
+                handle.ref();
+                __ref_states.push(handle.hasRef());
+                timers.clearTimeout(handle);
+                __ref_states.push(handle.hasRef());
+                "#,
+            )
+            .unwrap();
+
+        let result = runtime.eval("__ref_states.join(',')").unwrap();
+        assert_eq!(result.to_string().unwrap(), "true,false,true,false");
+    }
+
+    #[test]
+    fn test_timers_promises_set_interval_abort() {
+        let runtime = JscRuntime::new(JscConfig::default()).unwrap();
+        runtime.register_extension(ext::timers()).unwrap();
+
+        runtime
+            .eval(
+                r#"
+                globalThis.__interval_values = [];
+                globalThis.__interval_error = null;
+                globalThis.__interval_done = false;
+
+                (async () => {
+                    const timers = globalThis.__otter_get_node_builtin('timers/promises');
+                    const controller = new AbortController();
+                    let count = 0;
+                    try {
+                        for await (const value of timers.setInterval(1, 'tick', { signal: controller.signal })) {
+                            __interval_values.push(value);
+                            count += 1;
+                            if (count === 2) {
+                                controller.abort();
+                            }
+                        }
+                    } catch (err) {
+                        __interval_error = err && err.name ? err.name : String(err);
+                    } finally {
+                        __interval_done = true;
+                    }
+                })();
+                "#,
+            )
+            .unwrap();
+
+        runtime
+            .run_event_loop_until_idle(Duration::from_millis(50))
+            .unwrap();
+
+        let values = runtime
+            .eval("__interval_values.join(',')")
+            .unwrap()
+            .to_string()
+            .unwrap();
+        let error = runtime
+            .eval("__interval_error")
+            .unwrap()
+            .to_string()
+            .unwrap();
+        let done = runtime.eval("__interval_done").unwrap();
+
+        assert_eq!(values, "tick,tick");
+        assert_eq!(error, "AbortError");
+        assert_eq!(done.to_bool(), true);
+    }
+
+    #[test]
+    fn test_timers_promises_abort_before_start() {
+        let runtime = JscRuntime::new(JscConfig::default()).unwrap();
+        runtime.register_extension(ext::timers()).unwrap();
+
+        runtime
+            .eval(
+                r#"
+                globalThis.__abort_error = null;
+                const timers = globalThis.__otter_get_node_builtin('timers/promises');
+                const controller = new AbortController();
+                controller.abort('stop');
+                timers.setTimeout(10, 'nope', { signal: controller.signal })
+                    .catch((err) => {
+                        __abort_error = err && err.name ? err.name : String(err);
+                    });
+                "#,
+            )
+            .unwrap();
+
+        runtime
+            .run_event_loop_until_idle(Duration::from_millis(50))
+            .unwrap();
+
+        let result = runtime.eval("__abort_error").unwrap();
+        assert_eq!(result.to_string().unwrap(), "AbortError");
+    }
+
+    #[test]
+    fn test_global_set_immediate_clear() {
+        let runtime = JscRuntime::new(JscConfig::default()).unwrap();
+        runtime.register_extension(ext::timers()).unwrap();
+
+        runtime
+            .eval(
+                r#"
+                globalThis.__immediate_fired = false;
+                const id = setImmediate(() => {
+                    __immediate_fired = true;
+                });
+                clearImmediate(id);
+                "#,
+            )
+            .unwrap();
+
+        runtime
+            .run_event_loop_until_idle(Duration::from_millis(20))
+            .unwrap();
+
+        let fired = runtime.eval("__immediate_fired").unwrap();
+        assert_eq!(fired.to_bool(), false);
+    }
+
+    #[test]
+    fn test_unref_timer_does_not_keep_loop_alive() {
+        let runtime = JscRuntime::new(JscConfig::default()).unwrap();
+        runtime.register_extension(ext::timers()).unwrap();
+
+        runtime
+            .eval(
+                r#"
+                globalThis.__unref_fired = false;
+                const timers = globalThis.__otter_get_node_builtin('timers');
+                const handle = timers.setTimeout(() => {
+                    __unref_fired = true;
+                }, 10);
+                handle.unref();
+                "#,
+            )
+            .unwrap();
+
+        runtime
+            .run_event_loop_until_idle(Duration::from_millis(5))
+            .unwrap();
+
+        let fired = runtime.eval("__unref_fired").unwrap();
+        assert_eq!(fired.to_bool(), false);
+    }
+
+    #[test]
+    fn test_promises_ref_false_still_runs_when_loop_alive() {
+        let runtime = JscRuntime::new(JscConfig::default()).unwrap();
+        runtime.register_extension(ext::timers()).unwrap();
+
+        runtime
+            .eval(
+                r#"
+                globalThis.__promise_unref = null;
+                const timers = globalThis.__otter_get_node_builtin('timers/promises');
+                timers.setTimeout(1, 'ok', { ref: false })
+                    .then((value) => {
+                        __promise_unref = value;
+                    });
+                setTimeout(() => {}, 2);
+                "#,
+            )
+            .unwrap();
+
+        runtime
+            .run_event_loop_until_idle(Duration::from_millis(50))
+            .unwrap();
+
+        let value = runtime.eval("__promise_unref").unwrap();
+        assert_eq!(value.to_string().unwrap(), "ok");
+    }
+}
+
+/// Test crypto module extended APIs.
+mod crypto_tests {
+    use super::*;
+
+    #[test]
+    fn test_crypto_hashes_and_timing_safe_equal() {
+        let runtime = JscRuntime::new(JscConfig::default()).unwrap();
+        runtime.register_extension(ext::buffer()).unwrap();
+        runtime.register_extension(ext::crypto()).unwrap();
+
+        runtime
+            .eval(
+                r#"
+                const crypto = globalThis.__otter_get_node_builtin('crypto');
+                globalThis.__hashes_ok = crypto.getHashes().includes('sha256');
+                let mismatch = false;
+                try {
+                    crypto.timingSafeEqual(Buffer.from('a'), Buffer.from('ab'));
+                } catch (err) {
+                    mismatch = true;
+                }
+                globalThis.__timing_safe_ok = mismatch === true;
+                "#,
+            )
+            .unwrap();
+
+        let hashes_ok = runtime.eval("__hashes_ok").unwrap();
+        assert_eq!(hashes_ok.to_bool(), true);
+
+        let timing_ok = runtime.eval("__timing_safe_ok").unwrap();
+        assert_eq!(timing_ok.to_bool(), true);
+    }
+
+    #[test]
+    fn test_crypto_kdfs() {
+        let runtime = JscRuntime::new(JscConfig::default()).unwrap();
+        runtime.register_extension(ext::buffer()).unwrap();
+        runtime.register_extension(ext::crypto()).unwrap();
+
+        runtime
+            .eval(
+                r#"
+                const crypto = globalThis.__otter_get_node_builtin('crypto');
+                const pbkdf2 = crypto.pbkdf2Sync('password', 'salt', 1, 32, 'sha256').toString('hex');
+                const scrypt = crypto.scryptSync('password', 'salt', 32, { N: 16384, r: 8, p: 1 }).toString('hex');
+                globalThis.__pbkdf2 = pbkdf2;
+                globalThis.__scrypt = scrypt;
+                "#,
+            )
+            .unwrap();
+
+        let pbkdf2 = runtime.eval("__pbkdf2").unwrap();
+        assert_eq!(
+            pbkdf2.to_string().unwrap(),
+            "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+        );
+
+        let scrypt = runtime.eval("__scrypt").unwrap();
+        assert_eq!(
+            scrypt.to_string().unwrap(),
+            "745731af4484f323968969eda289aeee005b5903ac561e64a5aca121797bf773"
+        );
+    }
+
+    #[test]
+    fn test_crypto_cipher_ctr_and_gcm() {
+        let runtime = JscRuntime::new(JscConfig::default()).unwrap();
+        runtime.register_extension(ext::buffer()).unwrap();
+        runtime.register_extension(ext::crypto()).unwrap();
+
+        runtime
+            .eval(
+                r#"
+                const crypto = globalThis.__otter_get_node_builtin('crypto');
+
+                const key = Buffer.alloc(32, 7);
+                const iv = Buffer.alloc(16, 1);
+                const cipher = crypto.createCipheriv('aes-256-ctr', key, iv);
+                const enc = Buffer.concat([cipher.update('hello'), cipher.final()]);
+                const decipher = crypto.createDecipheriv('aes-256-ctr', key, iv);
+                const dec = Buffer.concat([decipher.update(enc), decipher.final()]);
+
+                const gcmKey = Buffer.alloc(32, 2);
+                const gcmIv = Buffer.alloc(12, 3);
+                const aad = Buffer.from('aad');
+                const gcmCipher = crypto.createCipheriv('aes-256-gcm', gcmKey, gcmIv);
+                gcmCipher.setAAD(aad);
+                const gcmEnc = Buffer.concat([gcmCipher.update('secret'), gcmCipher.final()]);
+                const gcmTag = gcmCipher.getAuthTag();
+                const gcmDecipher = crypto.createDecipheriv('aes-256-gcm', gcmKey, gcmIv);
+                gcmDecipher.setAAD(aad);
+                gcmDecipher.setAuthTag(gcmTag);
+                const gcmDec = Buffer.concat([gcmDecipher.update(gcmEnc), gcmDecipher.final()]);
+
+                globalThis.__ctr_ok = dec.toString('utf8') === 'hello';
+                globalThis.__gcm_ok = gcmDec.toString('utf8') === 'secret';
+                "#,
+            )
+            .unwrap();
+
+        let ctr_ok = runtime.eval("__ctr_ok").unwrap();
+        assert_eq!(ctr_ok.to_bool(), true);
+
+        let gcm_ok = runtime.eval("__gcm_ok").unwrap();
+        assert_eq!(gcm_ok.to_bool(), true);
+    }
+
+    #[test]
+    fn test_crypto_sign_verify_and_keypair() {
+        let runtime = JscRuntime::new(JscConfig::default()).unwrap();
+        runtime.register_extension(ext::buffer()).unwrap();
+        runtime.register_extension(ext::crypto()).unwrap();
+
+        runtime
+            .eval(
+                r#"
+                const crypto = globalThis.__otter_get_node_builtin('crypto');
+                const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
+                    modulusLength: 1024,
+                    publicKeyEncoding: { type: 'spki', format: 'pem' },
+                    privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+                });
+                const sign = crypto.createSign('RSA-SHA256');
+                sign.update('hello');
+                const sig = sign.sign(privateKey);
+                const verify = crypto.createVerify('RSA-SHA256');
+                verify.update('hello');
+                globalThis.__rsa_ok = verify.verify(publicKey, sig);
+
+                const sig2 = crypto.sign('RSA-SHA256', Buffer.from('data'), privateKey);
+                globalThis.__rsa_ok2 = crypto.verify('RSA-SHA256', Buffer.from('data'), publicKey, sig2);
+
+                const edKeys = crypto.generateKeyPairSync('ed25519', {
+                    publicKeyEncoding: { type: 'spki', format: 'pem' },
+                    privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+                });
+                const edSig = crypto.sign('ed25519', Buffer.from('ping'), edKeys.privateKey);
+                globalThis.__ed_ok = crypto.verify('ed25519', Buffer.from('ping'), edKeys.publicKey, edSig);
+                "#,
+            )
+            .unwrap();
+
+        let rsa_ok = runtime.eval("__rsa_ok").unwrap();
+        assert_eq!(rsa_ok.to_bool(), true);
+
+        let rsa_ok2 = runtime.eval("__rsa_ok2").unwrap();
+        assert_eq!(rsa_ok2.to_bool(), true);
+
+        let ed_ok = runtime.eval("__ed_ok").unwrap();
+        assert_eq!(ed_ok.to_bool(), true);
     }
 }

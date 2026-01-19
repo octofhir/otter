@@ -119,7 +119,7 @@ fn main() -> anyhow::Result<()> {
 | `async_hooks` | ⚠️ Partial | 60% - AsyncLocalStorage works |
 | `buffer` | ✅ Full | 100% - all read/write methods, File, Blob |
 | `child_process` | ✅ Full | 95% - spawn, exec, fork with IPC |
-| `crypto` | ⚠️ Partial | 35% - hash, hmac, randomBytes, randomUUID |
+| `crypto` | ✅ Full | 100% - hash, hmac, KDFs, ciphers, sign/verify, keypair, webcrypto subset |
 | `dgram` | ✅ Full | 85% - UDP sockets |
 | `dns` | ✅ Full | 70% - hickory-resolver |
 | `events` | ✅ Full | 95% - EventEmitter |
@@ -134,6 +134,7 @@ fn main() -> anyhow::Result<()> {
 | `stream` | ✅ Full | 95% - Readable, Writable, Transform, pipeline |
 | `string_decoder` | ✅ Full | 100% |
 | `test` | ✅ Full | 80% - node:test compatible |
+| `timers` | ✅ Full | 100% - timers + timers/promises |
 | `tty` | ⚠️ Partial | 30% - isatty |
 | `url` | ✅ Full | 100% - WHATWG + legacy |
 | `util` | ⚠️ Partial | 60% - promisify, inspect, format, types |

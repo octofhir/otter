@@ -157,6 +157,7 @@ impl TestCommand {
         runtime.register_extension(ext::buffer())?;
         runtime.register_extension(ext::fs(caps))?;
         runtime.register_extension(ext::test())?;
+        runtime.register_extension(ext::async_hooks())?;
 
         // Inject test framework
         let filter_json = match &self.filter {

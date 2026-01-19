@@ -21,6 +21,7 @@ const testFiles = [
   'date-fns.test.ts',
   'zod.test.ts',
   'uuid.test.ts',
+  'async-hooks.test.ts',
 ];
 
 async function runTest(file: string): Promise<TestResult> {

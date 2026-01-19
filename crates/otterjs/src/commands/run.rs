@@ -494,6 +494,8 @@ impl RunCommand {
         timing!("ext_test");
         runtime.register_extension(ext::events())?;
         timing!("ext_events");
+        runtime.register_extension(ext::async_hooks())?;
+        timing!("ext_async_hooks");
         runtime.register_extension(ext::crypto())?;
         timing!("ext_crypto");
         runtime.register_extension(ext::util())?;

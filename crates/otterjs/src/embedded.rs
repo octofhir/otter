@@ -155,6 +155,7 @@ pub async fn run_embedded(code: String) -> Result<()> {
 
     runtime.register_extension(ext::test())?;
     runtime.register_extension(ext::events())?;
+    runtime.register_extension(ext::async_hooks())?;
     runtime.register_extension(ext::crypto())?;
     runtime.register_extension(ext::util())?;
     runtime.register_extension(ext::process())?;

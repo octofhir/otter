@@ -42,6 +42,7 @@ impl ReplCommand {
         runtime.register_extension(ext::buffer())?;
         runtime.register_extension(ext::fs(caps))?;
         runtime.register_extension(ext::test())?;
+        runtime.register_extension(ext::async_hooks())?;
 
         let stdin = io::stdin();
         let mut stdout = io::stdout();
@@ -145,6 +146,7 @@ impl ReplCommand {
         runtime.register_extension(ext::buffer())?;
         runtime.register_extension(ext::fs(caps))?;
         runtime.register_extension(ext::test())?;
+        runtime.register_extension(ext::async_hooks())?;
 
         // Try to transpile as TypeScript
         let js_code = match transpile_typescript(code) {

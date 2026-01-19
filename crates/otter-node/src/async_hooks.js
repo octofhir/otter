@@ -9,19 +9,31 @@
 (function() {
     'use strict';
 
-    // Simple incrementing ID counter for async contexts
-    let asyncIdCounter = 1;
+    const getExecutionAsyncId = () => __otter_async_hooks_execution_async_id();
+    const getTriggerAsyncId = () => __otter_async_hooks_trigger_async_id();
+    const nextAsyncId = () => __otter_async_hooks_next_async_id();
+    const setCurrentAsyncIds = (asyncId, triggerAsyncId) =>
+        __otter_async_hooks_set_current(asyncId, triggerAsyncId);
 
-    // Current execution context tracking
-    let currentAsyncId = 1;      // Root async ID
-    let currentTriggerAsyncId = 0;
+    let currentAsyncResource = null;
+    const activeHooks = new Set();
+    const asyncLocalStorages = new Set();
+
+    function emitHookEvent(name, asyncId, type, triggerAsyncId, resource) {
+        for (const hook of activeHooks) {
+            const callback = hook._callbacks && hook._callbacks[name];
+            if (typeof callback === 'function') {
+                callback(asyncId, type, triggerAsyncId, resource);
+            }
+        }
+    }
 
     /**
      * Returns the asyncId of the current execution context.
      * @returns {number}
      */
     function executionAsyncId() {
-        return currentAsyncId;
+        return getExecutionAsyncId();
     }
 
     /**
@@ -30,7 +42,15 @@
      * @returns {number}
      */
     function triggerAsyncId() {
-        return currentTriggerAsyncId;
+        return getTriggerAsyncId();
+    }
+
+    /**
+     * Returns the current execution async resource.
+     * @returns {*}
+     */
+    function executionAsyncResource() {
+        return currentAsyncResource;
     }
 
     /**
@@ -48,7 +68,7 @@
             }
 
             this._type = type;
-            this._asyncId = ++asyncIdCounter;
+            this._asyncId = nextAsyncId();
             this._destroyed = false;
 
             // Handle both forms: number or { triggerAsyncId, requireManualDestroy }
@@ -59,6 +79,8 @@
             } else {
                 this._triggerAsyncId = executionAsyncId();
             }
+
+            emitHookEvent('init', this._asyncId, this._type, this._triggerAsyncId, this);
         }
 
         /**
@@ -85,17 +107,32 @@
          * @returns {*} Return value of fn
          */
         runInAsyncScope(fn, thisArg, ...args) {
-            const prevAsyncId = currentAsyncId;
-            const prevTriggerAsyncId = currentTriggerAsyncId;
+            const previousIds = setCurrentAsyncIds(this._asyncId, this._triggerAsyncId);
+            const previousResource = currentAsyncResource;
+            currentAsyncResource = this;
+            emitHookEvent('before', this._asyncId, this._type, this._triggerAsyncId, this);
 
             try {
-                currentAsyncId = this._asyncId;
-                currentTriggerAsyncId = this._triggerAsyncId;
                 return fn.apply(thisArg, args);
             } finally {
-                currentAsyncId = prevAsyncId;
-                currentTriggerAsyncId = prevTriggerAsyncId;
+                emitHookEvent('after', this._asyncId, this._type, this._triggerAsyncId, this);
+                currentAsyncResource = previousResource;
+                setCurrentAsyncIds(previousIds.async_id, previousIds.trigger_async_id);
             }
+        }
+
+        /**
+         * Manually emit the before hook for this resource.
+         */
+        emitBefore() {
+            emitHookEvent('before', this._asyncId, this._type, this._triggerAsyncId, this);
+        }
+
+        /**
+         * Manually emit the after hook for this resource.
+         */
+        emitAfter() {
+            emitHookEvent('after', this._asyncId, this._type, this._triggerAsyncId, this);
         }
 
         /**
@@ -105,7 +142,7 @@
         emitDestroy() {
             if (!this._destroyed) {
                 this._destroyed = true;
-                // In a full implementation, would trigger destroy hooks
+                emitHookEvent('destroy', this._asyncId, this._type, this._triggerAsyncId, this);
             }
             return this;
         }
@@ -162,6 +199,7 @@
             if (options && typeof options === 'object') {
                 this._onPropagate = options.onPropagate;
             }
+            asyncLocalStorages.add(this);
         }
 
         /**
@@ -246,9 +284,36 @@
             if (typeof fn !== 'function') {
                 throw new TypeError('The "fn" argument must be of type function');
             }
-            // Stub: return function as-is
-            // Full implementation would capture current ALS contexts
-            return fn;
+            const snapshot = [];
+            for (const storage of asyncLocalStorages) {
+                snapshot.push({
+                    storage,
+                    enabled: storage.#enabled,
+                    store: storage.#store,
+                });
+            }
+            return function(...args) {
+                const previous = [];
+                for (const entry of snapshot) {
+                    const storage = entry.storage;
+                    previous.push({
+                        storage,
+                        enabled: storage.#enabled,
+                        store: storage.#store,
+                    });
+                    if (entry.enabled && storage.#enabled) {
+                        storage.#store = entry.store;
+                    }
+                }
+                try {
+                    return fn.apply(this, args);
+                } finally {
+                    for (const entry of previous) {
+                        entry.storage.#enabled = entry.enabled;
+                        entry.storage.#store = entry.store;
+                    }
+                }
+            };
         }
 
         /**
@@ -256,9 +321,38 @@
          * @returns {Function} Snapshot function
          */
         static snapshot() {
-            // Stub: return a pass-through function
+            const snapshot = [];
+            for (const storage of asyncLocalStorages) {
+                snapshot.push({
+                    storage,
+                    enabled: storage.#enabled,
+                    store: storage.#store,
+                });
+            }
             return function(fn, ...args) {
-                return fn(...args);
+                if (typeof fn !== 'function') {
+                    throw new TypeError('The "fn" argument must be of type function');
+                }
+                const previous = [];
+                for (const entry of snapshot) {
+                    const storage = entry.storage;
+                    previous.push({
+                        storage,
+                        enabled: storage.#enabled,
+                        store: storage.#store,
+                    });
+                    if (entry.enabled && storage.#enabled) {
+                        storage.#store = entry.store;
+                    }
+                }
+                try {
+                    return fn(...args);
+                } finally {
+                    for (const entry of previous) {
+                        entry.storage.#enabled = entry.enabled;
+                        entry.storage.#store = entry.store;
+                    }
+                }
             };
         }
     }
@@ -270,11 +364,25 @@
      * @returns {object} Hook object with enable/disable
      */
     function createHook(callbacks) {
-        // Stub: return minimal hook object
-        return {
-            enable() { return this; },
-            disable() { return this; },
+        const hook = {
+            _callbacks: callbacks || {},
+            _enabled: false,
+            enable() {
+                if (!this._enabled) {
+                    this._enabled = true;
+                    activeHooks.add(this);
+                }
+                return this;
+            },
+            disable() {
+                if (this._enabled) {
+                    this._enabled = false;
+                    activeHooks.delete(this);
+                }
+                return this;
+            },
         };
+        return hook;
     }
 
     // Module exports
@@ -282,6 +390,7 @@
         // Functions
         executionAsyncId,
         triggerAsyncId,
+        executionAsyncResource,
         createHook,
 
         // Classes

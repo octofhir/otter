@@ -116,7 +116,7 @@ fn main() -> anyhow::Result<()> {
 | Module | Status | Notes |
 |--------|--------|-------|
 | `assert` | ✅ Full | 98% - missing CallTracker |
-| `async_hooks` | ⚠️ Partial | 60% - AsyncLocalStorage works |
+| `async_hooks` | ⚠️ Partial | 90% - AsyncResource + AsyncLocalStorage hooked up with init/before/after/destroy events |
 | `buffer` | ✅ Full | 100% - all read/write methods, File, Blob |
 | `child_process` | ✅ Full | 95% - spawn, exec, fork with IPC |
 | `crypto` | ✅ Full | 100% - hash, hmac, KDFs, ciphers, sign/verify, keypair, webcrypto full |

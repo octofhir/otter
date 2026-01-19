@@ -8,7 +8,9 @@
 
 use otter_engine::CapabilitiesBuilder;
 use otter_node::ext;
-use otter_runtime::{Engine, JscConfig, JscRuntime, transform_module, wrap_module};
+use otter_runtime::{
+    set_tokio_handle, Engine, JscConfig, JscRuntime, transform_module, wrap_module,
+};
 use std::collections::HashMap;
 use tempfile::TempDir;
 
@@ -1963,6 +1965,7 @@ mod timers_tests {
 /// Test crypto module extended APIs.
 mod crypto_tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_crypto_hashes_and_timing_safe_equal() {
@@ -2110,5 +2113,112 @@ mod crypto_tests {
 
         let ed_ok = runtime.eval("__ed_ok").unwrap();
         assert_eq!(ed_ok.to_bool(), true);
+    }
+
+    #[test]
+    fn test_webcrypto_subtle_algorithms() {
+        let tokio = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        set_tokio_handle(tokio.handle().clone());
+
+        let runtime = JscRuntime::new(JscConfig::default()).unwrap();
+        runtime.register_extension(ext::buffer()).unwrap();
+        runtime.register_extension(ext::crypto()).unwrap();
+
+        runtime
+            .eval(
+                r#"
+                const crypto = globalThis.__otter_get_node_builtin('crypto');
+                const subtle = crypto.webcrypto.subtle;
+                const encoder = new TextEncoder();
+                const decoder = new TextDecoder();
+
+                globalThis.__wc_ok = false;
+                globalThis.__wc_err = '';
+
+                (async () => {
+                  try {
+                    const data = encoder.encode('hello');
+                    const digest = await subtle.digest('SHA-256', data);
+                    if (!(digest instanceof ArrayBuffer)) throw new Error('digest not buffer');
+
+                    const gcmKey = await subtle.generateKey({ name: 'AES-GCM', length: 128 }, true, ['encrypt', 'decrypt']);
+                    const gcmIv = new Uint8Array(12);
+                    const gcmEnc = await subtle.encrypt({ name: 'AES-GCM', iv: gcmIv }, gcmKey, data);
+                    const gcmDec = await subtle.decrypt({ name: 'AES-GCM', iv: gcmIv }, gcmKey, gcmEnc);
+                    if (decoder.decode(gcmDec) !== 'hello') throw new Error('gcm mismatch');
+
+                    const cbcKey = await subtle.importKey('raw', new Uint8Array(16), { name: 'AES-CBC' }, false, ['encrypt', 'decrypt']);
+                    const cbcIv = new Uint8Array(16);
+                    const cbcPlain = encoder.encode('0123456789abcdef');
+                    const cbcEnc = await subtle.encrypt({ name: 'AES-CBC', iv: cbcIv }, cbcKey, cbcPlain);
+                    const cbcDec = await subtle.decrypt({ name: 'AES-CBC', iv: cbcIv }, cbcKey, cbcEnc);
+                    if (decoder.decode(cbcDec) !== '0123456789abcdef') throw new Error('cbc mismatch');
+
+                    const ctrKey = await subtle.importKey('raw', new Uint8Array(16), { name: 'AES-CTR' }, false, ['encrypt', 'decrypt']);
+                    const ctrCounter = new Uint8Array(16);
+                    const ctrEnc = await subtle.encrypt({ name: 'AES-CTR', counter: ctrCounter, length: 64 }, ctrKey, data);
+                    const ctrDec = await subtle.decrypt({ name: 'AES-CTR', counter: ctrCounter, length: 64 }, ctrKey, ctrEnc);
+                    if (decoder.decode(ctrDec) !== 'hello') throw new Error('ctr mismatch');
+
+                    const rsaKeys = await subtle.generateKey(
+                      { name: 'RSA-OAEP', hash: 'SHA-256', modulusLength: 1024, publicExponent: new Uint8Array([1, 0, 1]) },
+                      true,
+                      ['encrypt', 'decrypt']
+                    );
+                    const rsaEnc = await subtle.encrypt({ name: 'RSA-OAEP', hash: 'SHA-256' }, rsaKeys.publicKey, data);
+                    const rsaDec = await subtle.decrypt({ name: 'RSA-OAEP', hash: 'SHA-256' }, rsaKeys.privateKey, rsaEnc);
+                    if (decoder.decode(rsaDec) !== 'hello') throw new Error('rsa mismatch');
+
+                    const alice = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+                    const bob = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+                    const aliceBits = await subtle.deriveBits({ name: 'ECDH', public: bob.publicKey }, alice.privateKey, 128);
+                    const bobBits = await subtle.deriveBits({ name: 'ECDH', public: alice.publicKey }, bob.privateKey, 128);
+                    if (Buffer.from(aliceBits).toString('hex') !== Buffer.from(bobBits).toString('hex')) {
+                      throw new Error('ecdh mismatch');
+                    }
+
+                    const hkdfBase = await subtle.importKey('raw', new Uint8Array([1,2,3,4]), { name: 'HKDF' }, false, ['deriveBits']);
+                    const hkdfBits = await subtle.deriveBits(
+                      { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array([1,2,3]), info: new Uint8Array([4,5,6]) },
+                      hkdfBase,
+                      128
+                    );
+                    if (Buffer.from(hkdfBits).length !== 16) throw new Error('hkdf length');
+
+                    const pbkdfBase = await subtle.importKey('raw', new Uint8Array([1,2,3,4]), { name: 'PBKDF2' }, false, ['deriveBits']);
+                    const pbkdfBits = await subtle.deriveBits(
+                      { name: 'PBKDF2', hash: 'SHA-256', salt: new Uint8Array([1,2,3]), iterations: 2 },
+                      pbkdfBase,
+                      128
+                    );
+                    if (Buffer.from(pbkdfBits).length !== 16) throw new Error('pbkdf2 length');
+
+                    const jwk = await subtle.exportKey('jwk', gcmKey);
+                    const gcmKey2 = await subtle.importKey('jwk', jwk, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
+                    const gcmEnc2 = await subtle.encrypt({ name: 'AES-GCM', iv: gcmIv }, gcmKey2, data);
+                    const gcmDec2 = await subtle.decrypt({ name: 'AES-GCM', iv: gcmIv }, gcmKey2, gcmEnc2);
+                    if (decoder.decode(gcmDec2) !== 'hello') throw new Error('jwk mismatch');
+
+                    globalThis.__wc_ok = true;
+                  } catch (err) {
+                    globalThis.__wc_err = String(err && err.message ? err.message : err);
+                  }
+                })();
+                "#,
+            )
+            .unwrap();
+
+        runtime
+            .run_event_loop_until_idle(Duration::from_millis(1000))
+            .unwrap();
+
+        let ok = runtime.eval("__wc_ok").unwrap();
+        if !ok.to_bool() {
+            let err = runtime.eval("__wc_err").unwrap();
+            panic!("webcrypto error: {}", err.to_string().unwrap_or_default());
+        }
     }
 }

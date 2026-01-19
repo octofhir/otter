@@ -119,7 +119,7 @@ fn main() -> anyhow::Result<()> {
 | `async_hooks` | ⚠️ Partial | 60% - AsyncLocalStorage works |
 | `buffer` | ✅ Full | 100% - all read/write methods, File, Blob |
 | `child_process` | ✅ Full | 95% - spawn, exec, fork with IPC |
-| `crypto` | ✅ Full | 100% - hash, hmac, KDFs, ciphers, sign/verify, keypair, webcrypto subset |
+| `crypto` | ✅ Full | 100% - hash, hmac, KDFs, ciphers, sign/verify, keypair, webcrypto full |
 | `dgram` | ✅ Full | 85% - UDP sockets |
 | `dns` | ✅ Full | 70% - hickory-resolver |
 | `events` | ✅ Full | 95% - EventEmitter |

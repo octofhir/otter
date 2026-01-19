@@ -123,6 +123,44 @@ struct SubtleAesGcmOptionsArg {
     tag_length: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubtleAesCbcOptionsArg {
+    iv: BufferLike,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubtleAesCtrOptionsArg {
+    counter: BufferLike,
+    length: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubtleRsaOaepOptionsArg {
+    hash: String,
+    label: Option<BufferLike>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubtleHkdfOptionsArg {
+    hash: String,
+    salt: BufferLike,
+    info: BufferLike,
+    length: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubtlePbkdf2OptionsArg {
+    hash: String,
+    salt: BufferLike,
+    iterations: u32,
+    length: u32,
+}
+
 #[derive(Serialize)]
 struct BufferJson {
     r#type: String,
@@ -141,6 +179,14 @@ enum KeyOutputJson {
 struct KeyPairJson {
     public_key: KeyOutputJson,
     private_key: KeyOutputJson,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KeyMaterialJson {
+    r#type: String,
+    data: Vec<u8>,
+    key_type: String,
 }
 
 fn normalize_key_input(value: KeyInputArg) -> Result<crypto::KeyInput, otter_runtime::error::JscError> {
@@ -256,6 +302,37 @@ fn normalize_aes_gcm_options(
     }
 }
 
+fn normalize_aes_cbc_options(
+    options: SubtleAesCbcOptionsArg,
+) -> Vec<u8> {
+    options.iv.into_vec()
+}
+
+fn normalize_aes_ctr_options(
+    options: SubtleAesCtrOptionsArg,
+) -> (Vec<u8>, u32) {
+    (options.counter.into_vec(), options.length)
+}
+
+fn bits_to_len(bits: u32) -> Result<usize, otter_runtime::error::JscError> {
+    if bits % 8 != 0 {
+        return Err(otter_runtime::error::JscError::internal(
+            "bit length must be a multiple of 8",
+        ));
+    }
+    Ok((bits / 8) as usize)
+}
+
+fn key_type_to_string(key_type: crypto::KeyType) -> String {
+    match key_type {
+        crypto::KeyType::Pkcs1 => "pkcs1",
+        crypto::KeyType::Pkcs8 => "pkcs8",
+        crypto::KeyType::Spki => "spki",
+        crypto::KeyType::Sec1 => "sec1",
+    }
+    .to_string()
+}
+
 // ============================================================================
 // Dive-based ops
 // ============================================================================
@@ -369,6 +446,208 @@ fn crypto_subtle_decrypt_aes_gcm(
     })
 }
 
+#[dive(swift)]
+fn crypto_subtle_encrypt_aes_cbc(
+    key: BufferLike,
+    data: BufferLike,
+    options: SubtleAesCbcOptionsArg,
+) -> Result<BufferJson, crypto::CryptoError> {
+    let iv = normalize_aes_cbc_options(options);
+    let output = crypto::subtle_encrypt_aes_cbc(&key.into_vec(), &data.into_vec(), &iv)?;
+    Ok(BufferJson {
+        r#type: "Buffer".to_string(),
+        data: output,
+    })
+}
+
+#[dive(swift)]
+fn crypto_subtle_decrypt_aes_cbc(
+    key: BufferLike,
+    data: BufferLike,
+    options: SubtleAesCbcOptionsArg,
+) -> Result<BufferJson, crypto::CryptoError> {
+    let iv = normalize_aes_cbc_options(options);
+    let output = crypto::subtle_decrypt_aes_cbc(&key.into_vec(), &data.into_vec(), &iv)?;
+    Ok(BufferJson {
+        r#type: "Buffer".to_string(),
+        data: output,
+    })
+}
+
+#[dive(swift)]
+fn crypto_subtle_encrypt_aes_ctr(
+    key: BufferLike,
+    data: BufferLike,
+    options: SubtleAesCtrOptionsArg,
+) -> Result<BufferJson, crypto::CryptoError> {
+    let (counter, length) = normalize_aes_ctr_options(options);
+    let output = crypto::subtle_encrypt_aes_ctr(
+        &key.into_vec(),
+        &data.into_vec(),
+        &counter,
+        length,
+    )?;
+    Ok(BufferJson {
+        r#type: "Buffer".to_string(),
+        data: output,
+    })
+}
+
+#[dive(swift)]
+fn crypto_subtle_decrypt_aes_ctr(
+    key: BufferLike,
+    data: BufferLike,
+    options: SubtleAesCtrOptionsArg,
+) -> Result<BufferJson, crypto::CryptoError> {
+    let (counter, length) = normalize_aes_ctr_options(options);
+    let output = crypto::subtle_decrypt_aes_ctr(
+        &key.into_vec(),
+        &data.into_vec(),
+        &counter,
+        length,
+    )?;
+    Ok(BufferJson {
+        r#type: "Buffer".to_string(),
+        data: output,
+    })
+}
+
+#[dive(swift)]
+fn crypto_subtle_wrap_aes_kw(
+    key: BufferLike,
+    data: BufferLike,
+) -> Result<BufferJson, crypto::CryptoError> {
+    let output = crypto::subtle_wrap_aes_kw(&key.into_vec(), &data.into_vec())?;
+    Ok(BufferJson {
+        r#type: "Buffer".to_string(),
+        data: output,
+    })
+}
+
+#[dive(swift)]
+fn crypto_subtle_unwrap_aes_kw(
+    key: BufferLike,
+    data: BufferLike,
+) -> Result<BufferJson, crypto::CryptoError> {
+    let output = crypto::subtle_unwrap_aes_kw(&key.into_vec(), &data.into_vec())?;
+    Ok(BufferJson {
+        r#type: "Buffer".to_string(),
+        data: output,
+    })
+}
+
+#[dive(swift)]
+fn crypto_subtle_rsa_oaep_encrypt(
+    key: KeyInputArg,
+    data: BufferLike,
+    options: SubtleRsaOaepOptionsArg,
+) -> Result<BufferJson, crypto::CryptoError> {
+    let key = normalize_key_input(key)
+        .map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
+    let hash = crypto::HashAlgorithm::parse(&options.hash)?;
+    let label = options.label.map(|v| v.into_vec());
+    let output = crypto::subtle_rsa_oaep_encrypt(hash, &key, &data.into_vec(), label.as_deref())?;
+    Ok(BufferJson {
+        r#type: "Buffer".to_string(),
+        data: output,
+    })
+}
+
+#[dive(swift)]
+fn crypto_subtle_rsa_oaep_decrypt(
+    key: KeyInputArg,
+    data: BufferLike,
+    options: SubtleRsaOaepOptionsArg,
+) -> Result<BufferJson, crypto::CryptoError> {
+    let key = normalize_key_input(key)
+        .map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
+    let hash = crypto::HashAlgorithm::parse(&options.hash)?;
+    let label = options.label.map(|v| v.into_vec());
+    let output = crypto::subtle_rsa_oaep_decrypt(hash, &key, &data.into_vec(), label.as_deref())?;
+    Ok(BufferJson {
+        r#type: "Buffer".to_string(),
+        data: output,
+    })
+}
+
+#[dive(swift)]
+fn crypto_subtle_derive_bits_ecdh(
+    private_key: KeyInputArg,
+    public_key: KeyInputArg,
+) -> Result<BufferJson, crypto::CryptoError> {
+    let private_key = normalize_key_input(private_key)
+        .map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
+    let public_key = normalize_key_input(public_key)
+        .map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
+    let output = crypto::subtle_derive_bits_ecdh(&private_key, &public_key)?;
+    Ok(BufferJson {
+        r#type: "Buffer".to_string(),
+        data: output,
+    })
+}
+
+#[dive(swift)]
+fn crypto_subtle_derive_bits_hkdf(
+    key: BufferLike,
+    options: SubtleHkdfOptionsArg,
+) -> Result<BufferJson, crypto::CryptoError> {
+    let length = bits_to_len(options.length)
+        .map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
+    let hash = crypto::HashAlgorithm::parse(&options.hash)?;
+    let output = crypto::subtle_derive_bits_hkdf(
+        hash,
+        &key.into_vec(),
+        &options.salt.into_vec(),
+        &options.info.into_vec(),
+        length,
+    )?;
+    Ok(BufferJson {
+        r#type: "Buffer".to_string(),
+        data: output,
+    })
+}
+
+#[dive(swift)]
+fn crypto_subtle_derive_bits_pbkdf2(
+    key: BufferLike,
+    options: SubtlePbkdf2OptionsArg,
+) -> Result<BufferJson, crypto::CryptoError> {
+    let length = bits_to_len(options.length)
+        .map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
+    let hash = crypto::HashAlgorithm::parse(&options.hash)?;
+    let output = crypto::subtle_derive_bits_pbkdf2(
+        hash,
+        &key.into_vec(),
+        &options.salt.into_vec(),
+        options.iterations,
+        length,
+    )?;
+    Ok(BufferJson {
+        r#type: "Buffer".to_string(),
+        data: output,
+    })
+}
+
+#[dive(swift)]
+fn crypto_jwk_to_der(jwk: crypto::JwkKey) -> Result<KeyMaterialJson, crypto::CryptoError> {
+    let (data, key_type) = crypto::jwk_to_der(&jwk)?;
+    Ok(KeyMaterialJson {
+        r#type: "Buffer".to_string(),
+        data,
+        key_type: key_type_to_string(key_type),
+    })
+}
+
+#[dive(swift)]
+fn crypto_der_to_jwk(
+    algorithm: String,
+    key_type: String,
+    key: BufferLike,
+) -> Result<crypto::JwkKey, crypto::CryptoError> {
+    let key_type = crypto::KeyType::parse(&key_type)?;
+    crypto::der_to_jwk(&key.into_vec(), key_type, &algorithm)
+}
+
 /// Create the crypto extension.
 ///
 /// This extension provides Node.js-compatible cryptographic functionality:
@@ -480,6 +759,19 @@ pub fn extension() -> Extension {
     ops.push(crypto_subtle_digest_dive_decl());
     ops.push(crypto_subtle_encrypt_aes_gcm_dive_decl());
     ops.push(crypto_subtle_decrypt_aes_gcm_dive_decl());
+    ops.push(crypto_subtle_encrypt_aes_cbc_dive_decl());
+    ops.push(crypto_subtle_decrypt_aes_cbc_dive_decl());
+    ops.push(crypto_subtle_encrypt_aes_ctr_dive_decl());
+    ops.push(crypto_subtle_decrypt_aes_ctr_dive_decl());
+    ops.push(crypto_subtle_wrap_aes_kw_dive_decl());
+    ops.push(crypto_subtle_unwrap_aes_kw_dive_decl());
+    ops.push(crypto_subtle_rsa_oaep_encrypt_dive_decl());
+    ops.push(crypto_subtle_rsa_oaep_decrypt_dive_decl());
+    ops.push(crypto_subtle_derive_bits_ecdh_dive_decl());
+    ops.push(crypto_subtle_derive_bits_hkdf_dive_decl());
+    ops.push(crypto_subtle_derive_bits_pbkdf2_dive_decl());
+    ops.push(crypto_jwk_to_der_dive_decl());
+    ops.push(crypto_der_to_jwk_dive_decl());
 
     // createHash(algorithm) -> hash_id
     let hash_ctx = hash_contexts.clone();

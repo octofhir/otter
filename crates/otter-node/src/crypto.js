@@ -41,6 +41,19 @@
     const _cryptoSubtleDigest = crypto_subtle_digest;
     const _cryptoSubtleEncryptAesGcm = crypto_subtle_encrypt_aes_gcm;
     const _cryptoSubtleDecryptAesGcm = crypto_subtle_decrypt_aes_gcm;
+    const _cryptoSubtleEncryptAesCbc = crypto_subtle_encrypt_aes_cbc;
+    const _cryptoSubtleDecryptAesCbc = crypto_subtle_decrypt_aes_cbc;
+    const _cryptoSubtleEncryptAesCtr = crypto_subtle_encrypt_aes_ctr;
+    const _cryptoSubtleDecryptAesCtr = crypto_subtle_decrypt_aes_ctr;
+    const _cryptoSubtleWrapAesKw = crypto_subtle_wrap_aes_kw;
+    const _cryptoSubtleUnwrapAesKw = crypto_subtle_unwrap_aes_kw;
+    const _cryptoSubtleRsaOaepEncrypt = crypto_subtle_rsa_oaep_encrypt;
+    const _cryptoSubtleRsaOaepDecrypt = crypto_subtle_rsa_oaep_decrypt;
+    const _cryptoSubtleDeriveBitsEcdh = crypto_subtle_derive_bits_ecdh;
+    const _cryptoSubtleDeriveBitsHkdf = crypto_subtle_derive_bits_hkdf;
+    const _cryptoSubtleDeriveBitsPbkdf2 = crypto_subtle_derive_bits_pbkdf2;
+    const _cryptoJwkToDer = crypto_jwk_to_der;
+    const _cryptoDerToJwk = crypto_der_to_jwk;
 
     const Buffer = globalThis.Buffer || (globalThis.__otter_get_node_builtin
         ? globalThis.__otter_get_node_builtin('buffer').Buffer
@@ -82,7 +95,100 @@
 
     function toArrayBuffer(buffer) {
         const view = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+        if (view && Array.isArray(view.data)) {
+            const bytes = Uint8Array.from(view.data);
+            return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        }
         return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+    }
+
+    function base64UrlEncode(buffer) {
+        return Buffer.from(buffer)
+            .toString('base64')
+            .replace(/\+/g, '-')
+            .replace(/\//g, '_')
+            .replace(/=+$/g, '');
+    }
+
+    function base64UrlDecode(text) {
+        const padded = String(text || '').replace(/-/g, '+').replace(/_/g, '/');
+        const pad = padded.length % 4 ? '='.repeat(4 - (padded.length % 4)) : '';
+        return Buffer.from(padded + pad, 'base64');
+    }
+
+    function normalizeAlgorithmName(value) {
+        const name = typeof value === 'string' ? value : value && value.name;
+        return String(name || '').toUpperCase();
+    }
+
+    function ensureUsage(algorithm, keyType, usages) {
+        const usageTable = {
+            'AES-GCM': { secret: ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey'] },
+            'AES-CBC': { secret: ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey'] },
+            'AES-CTR': { secret: ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey'] },
+            'AES-KW': { secret: ['wrapKey', 'unwrapKey'] },
+            'HMAC': { secret: ['sign', 'verify'] },
+            'RSA-PSS': { public: ['verify'], private: ['sign'] },
+            'RSASSA-PKCS1-V1_5': { public: ['verify'], private: ['sign'] },
+            'RSA-OAEP': { public: ['encrypt', 'wrapKey'], private: ['decrypt', 'unwrapKey'] },
+            'ECDSA': { public: ['verify'], private: ['sign'] },
+            'ECDH': { public: [], private: ['deriveKey', 'deriveBits'] },
+            'HKDF': { secret: ['deriveKey', 'deriveBits'] },
+            'PBKDF2': { secret: ['deriveKey', 'deriveBits'] },
+        };
+        const allowed = (usageTable[algorithm] && usageTable[algorithm][keyType]) || [];
+        for (const usage of usages || []) {
+            if (!allowed.includes(usage)) {
+                throw new Error(`Usage ${usage} is not allowed for ${algorithm}`);
+            }
+        }
+    }
+
+    function splitUsages(algorithm, usages) {
+        const usageTable = {
+            'RSA-PSS': { public: ['verify'], private: ['sign'] },
+            'RSASSA-PKCS1-V1_5': { public: ['verify'], private: ['sign'] },
+            'RSA-OAEP': { public: ['encrypt', 'wrapKey'], private: ['decrypt', 'unwrapKey'] },
+            'ECDSA': { public: ['verify'], private: ['sign'] },
+            'ECDH': { public: [], private: ['deriveKey', 'deriveBits'] },
+        };
+        const allowed = usageTable[algorithm] || { public: [], private: [] };
+        const publicUsages = [];
+        const privateUsages = [];
+        for (const usage of usages || []) {
+            if (allowed.public.includes(usage)) {
+                publicUsages.push(usage);
+            } else if (allowed.private.includes(usage)) {
+                privateUsages.push(usage);
+            } else {
+                throw new Error(`Usage ${usage} is not allowed for ${algorithm}`);
+            }
+        }
+        return { publicUsages, privateUsages };
+    }
+
+    function assertKeyAlgorithm(key, algorithm) {
+        const keyAlg = normalizeAlgorithmName(key.algorithm || {});
+        if (keyAlg && algorithm && keyAlg !== normalizeAlgorithmName(algorithm)) {
+            throw new Error('Algorithm mismatch');
+        }
+    }
+
+    function ensureKeyType(key, allowed, label) {
+        if (!allowed.includes(key.type)) {
+            throw new Error(`${label} requires ${allowed.join(' or ')} key`);
+        }
+    }
+
+    function jwkAlgorithmName(key) {
+        const name = normalizeAlgorithmName(key.algorithm || {});
+        if (name.startsWith('RSA')) {
+            return 'RSA';
+        }
+        if (name === 'ECDSA' || name === 'ECDH') {
+            return 'EC';
+        }
+        return name;
     }
 
     function normalizeKeyInput(input) {
@@ -501,6 +607,21 @@
         return new CryptoKey(kind, algorithm, extractable, usages, data, format, keyType);
     }
 
+    function parsePublicExponent(value) {
+        if (value === undefined || value === null) {
+            return 65537;
+        }
+        if (typeof value === 'number') {
+            return value;
+        }
+        const bytes = toBuffer(value);
+        let result = 0;
+        for (const byte of bytes) {
+            result = (result << 8) + byte;
+        }
+        return result || 65537;
+    }
+
     const subtle = {
         async digest(algorithm, data) {
             const name = resolveHashName(algorithm);
@@ -511,12 +632,15 @@
             if (!key || !(key instanceof CryptoKey)) {
                 throw new Error('Invalid CryptoKey');
             }
+            assertKeyAlgorithm(key, algorithm);
             if (key.algorithm && key.algorithm.name === 'HMAC') {
+                ensureKeyType(key, ['secret'], 'HMAC sign');
                 const hash = resolveHashName(key.algorithm.hash);
                 const hmac = globalThis.crypto.createHmac(hash, key[kKeyData]);
                 hmac.update(toBuffer(data));
                 return toArrayBuffer(hmac.digest());
             }
+            ensureKeyType(key, ['private'], 'sign');
             const options = {};
             if (algorithm && algorithm.saltLength !== undefined) {
                 options.saltLength = algorithm.saltLength;
@@ -536,13 +660,16 @@
             if (!key || !(key instanceof CryptoKey)) {
                 throw new Error('Invalid CryptoKey');
             }
+            assertKeyAlgorithm(key, algorithm);
             if (key.algorithm && key.algorithm.name === 'HMAC') {
+                ensureKeyType(key, ['secret'], 'HMAC verify');
                 const hash = resolveHashName(key.algorithm.hash);
                 const hmac = globalThis.crypto.createHmac(hash, key[kKeyData]);
                 hmac.update(toBuffer(data));
                 const digest = hmac.digest();
                 return globalThis.crypto.timingSafeEqual(digest, toBuffer(signature));
             }
+            ensureKeyType(key, ['public'], 'verify');
             const options = {};
             if (algorithm && algorithm.saltLength !== undefined) {
                 options.saltLength = algorithm.saltLength;
@@ -559,56 +686,122 @@
             );
         },
         async encrypt(algorithm, key, data) {
-            const name = String(algorithm.name || algorithm).toUpperCase();
-            if (name !== 'AES-GCM') {
-                throw new Error(`Unsupported algorithm ${name}`);
+            const name = normalizeAlgorithmName(algorithm);
+            assertKeyAlgorithm(key, algorithm);
+            if (name === 'AES-GCM') {
+                ensureKeyType(key, ['secret'], 'AES-GCM encrypt');
+                const result = _cryptoSubtleEncryptAesGcm(
+                    key[kKeyData],
+                    toBuffer(data),
+                    {
+                        iv: toBuffer(algorithm.iv),
+                        additionalData: algorithm.additionalData ? toBuffer(algorithm.additionalData) : undefined,
+                        tagLength: algorithm.tagLength,
+                    }
+                );
+                return toArrayBuffer(fromBufferResult(result));
             }
-            const result = _cryptoSubtleEncryptAesGcm(
-                key[kKeyData],
-                toBuffer(data),
-                {
-                    iv: toBuffer(algorithm.iv),
-                    additionalData: algorithm.additionalData ? toBuffer(algorithm.additionalData) : undefined,
-                    tagLength: algorithm.tagLength,
-                }
-            );
-            return toArrayBuffer(fromBufferResult(result));
+            if (name === 'AES-CBC') {
+                ensureKeyType(key, ['secret'], 'AES-CBC encrypt');
+                const result = _cryptoSubtleEncryptAesCbc(
+                    key[kKeyData],
+                    toBuffer(data),
+                    { iv: toBuffer(algorithm.iv) }
+                );
+                return toArrayBuffer(fromBufferResult(result));
+            }
+            if (name === 'AES-CTR') {
+                ensureKeyType(key, ['secret'], 'AES-CTR encrypt');
+                const result = _cryptoSubtleEncryptAesCtr(
+                    key[kKeyData],
+                    toBuffer(data),
+                    { counter: toBuffer(algorithm.counter), length: algorithm.length }
+                );
+                return toArrayBuffer(fromBufferResult(result));
+            }
+            if (name === 'RSA-OAEP') {
+                ensureKeyType(key, ['public'], 'RSA-OAEP encrypt');
+                const result = _cryptoSubtleRsaOaepEncrypt(
+                    { key: key[kKeyData], format: key[kKeyFormat], type: key[kKeyType] },
+                    toBuffer(data),
+                    { hash: resolveHashName(algorithm.hash), label: algorithm.label ? toBuffer(algorithm.label) : undefined }
+                );
+                return toArrayBuffer(fromBufferResult(result));
+            }
+            throw new Error(`Unsupported algorithm ${name}`);
         },
         async decrypt(algorithm, key, data) {
-            const name = String(algorithm.name || algorithm).toUpperCase();
-            if (name !== 'AES-GCM') {
-                throw new Error(`Unsupported algorithm ${name}`);
+            const name = normalizeAlgorithmName(algorithm);
+            assertKeyAlgorithm(key, algorithm);
+            if (name === 'AES-GCM') {
+                ensureKeyType(key, ['secret'], 'AES-GCM decrypt');
+                const result = _cryptoSubtleDecryptAesGcm(
+                    key[kKeyData],
+                    toBuffer(data),
+                    {
+                        iv: toBuffer(algorithm.iv),
+                        additionalData: algorithm.additionalData ? toBuffer(algorithm.additionalData) : undefined,
+                        tagLength: algorithm.tagLength,
+                    }
+                );
+                return toArrayBuffer(fromBufferResult(result));
             }
-            const result = _cryptoSubtleDecryptAesGcm(
-                key[kKeyData],
-                toBuffer(data),
-                {
-                    iv: toBuffer(algorithm.iv),
-                    additionalData: algorithm.additionalData ? toBuffer(algorithm.additionalData) : undefined,
-                    tagLength: algorithm.tagLength,
-                }
-            );
-            return toArrayBuffer(fromBufferResult(result));
+            if (name === 'AES-CBC') {
+                ensureKeyType(key, ['secret'], 'AES-CBC decrypt');
+                const result = _cryptoSubtleDecryptAesCbc(
+                    key[kKeyData],
+                    toBuffer(data),
+                    { iv: toBuffer(algorithm.iv) }
+                );
+                return toArrayBuffer(fromBufferResult(result));
+            }
+            if (name === 'AES-CTR') {
+                ensureKeyType(key, ['secret'], 'AES-CTR decrypt');
+                const result = _cryptoSubtleDecryptAesCtr(
+                    key[kKeyData],
+                    toBuffer(data),
+                    { counter: toBuffer(algorithm.counter), length: algorithm.length }
+                );
+                return toArrayBuffer(fromBufferResult(result));
+            }
+            if (name === 'RSA-OAEP') {
+                ensureKeyType(key, ['private'], 'RSA-OAEP decrypt');
+                const result = _cryptoSubtleRsaOaepDecrypt(
+                    { key: key[kKeyData], format: key[kKeyFormat], type: key[kKeyType] },
+                    toBuffer(data),
+                    { hash: resolveHashName(algorithm.hash), label: algorithm.label ? toBuffer(algorithm.label) : undefined }
+                );
+                return toArrayBuffer(fromBufferResult(result));
+            }
+            throw new Error(`Unsupported algorithm ${name}`);
         },
         async generateKey(algorithm, extractable, usages) {
-            const name = String(algorithm.name || algorithm).toUpperCase();
-            if (name === 'AES-GCM' || name === 'HMAC') {
+            const name = normalizeAlgorithmName(algorithm);
+            if (name === 'AES-GCM' || name === 'AES-CBC' || name === 'AES-CTR' || name === 'AES-KW') {
                 const length = algorithm.length || 256;
                 const bytes = globalThis.crypto.randomBytes(Math.ceil(length / 8));
+                ensureUsage(name, 'secret', usages);
+                return createCryptoKey('secret', { name, length }, extractable, usages, bytes, 'raw', 'raw');
+            }
+            if (name === 'HMAC') {
+                const length = algorithm.length || 256;
+                const bytes = globalThis.crypto.randomBytes(Math.ceil(length / 8));
+                ensureUsage(name, 'secret', usages);
                 return createCryptoKey('secret', { name, length, hash: algorithm.hash }, extractable, usages, bytes, 'raw', 'raw');
             }
-            if (name === 'RSA-PSS' || name === 'RSASSA-PKCS1-V1_5') {
+            if (name === 'RSA-PSS' || name === 'RSASSA-PKCS1-V1_5' || name === 'RSA-OAEP') {
                 const result = await _cryptoGenerateKeyPair('rsa', {
                     modulusLength: algorithm.modulusLength || 2048,
-                    publicExponent: algorithm.publicExponent || 65537,
+                    publicExponent: parsePublicExponent(algorithm.publicExponent),
                     publicKeyEncoding: { format: 'der', type: 'spki' },
                     privateKeyEncoding: { format: 'der', type: 'pkcs8' },
                 });
+                const { publicUsages, privateUsages } = splitUsages(name, usages);
                 const publicKey = createCryptoKey(
                     'public',
                     { name, hash: algorithm.hash },
                     true,
-                    usages,
+                    publicUsages,
                     normalizeKeyOutput(result.publicKey),
                     'der',
                     'spki'
@@ -617,24 +810,25 @@
                     'private',
                     { name, hash: algorithm.hash },
                     extractable,
-                    usages,
+                    privateUsages,
                     normalizeKeyOutput(result.privateKey),
                     'der',
                     'pkcs8'
                 );
                 return { publicKey, privateKey };
             }
-            if (name === 'ECDSA') {
+            if (name === 'ECDSA' || name === 'ECDH') {
                 const result = await _cryptoGenerateKeyPair('ec', {
                     namedCurve: algorithm.namedCurve || 'prime256v1',
                     publicKeyEncoding: { format: 'der', type: 'spki' },
                     privateKeyEncoding: { format: 'der', type: 'pkcs8' },
                 });
+                const { publicUsages, privateUsages } = splitUsages(name, usages);
                 const publicKey = createCryptoKey(
                     'public',
                     { name, namedCurve: algorithm.namedCurve || 'prime256v1' },
                     true,
-                    usages,
+                    publicUsages,
                     normalizeKeyOutput(result.publicKey),
                     'der',
                     'spki'
@@ -643,7 +837,7 @@
                     'private',
                     { name, namedCurve: algorithm.namedCurve || 'prime256v1' },
                     extractable,
-                    usages,
+                    privateUsages,
                     normalizeKeyOutput(result.privateKey),
                     'der',
                     'pkcs8'
@@ -653,15 +847,41 @@
             throw new Error(`Unsupported algorithm ${name}`);
         },
         async importKey(format, keyData, algorithm, extractable, usages) {
-            const name = String(algorithm.name || algorithm).toUpperCase();
+            const name = normalizeAlgorithmName(algorithm);
             if (format === 'raw') {
+                ensureUsage(name, 'secret', usages);
                 return createCryptoKey('secret', { name, hash: algorithm.hash, length: algorithm.length }, extractable, usages, toBuffer(keyData), 'raw', 'raw');
             }
             if (format === 'pkcs8') {
+                ensureUsage(name, 'private', usages);
                 return createCryptoKey('private', { name, hash: algorithm.hash, namedCurve: algorithm.namedCurve }, extractable, usages, toBuffer(keyData), 'der', 'pkcs8');
             }
             if (format === 'spki') {
+                ensureUsage(name, 'public', usages);
                 return createCryptoKey('public', { name, hash: algorithm.hash, namedCurve: algorithm.namedCurve }, true, usages, toBuffer(keyData), 'der', 'spki');
+            }
+            if (format === 'jwk') {
+                const jwk = typeof keyData === 'string' ? JSON.parse(keyData) : keyData;
+                if (jwk.ext === false && extractable) {
+                    throw new Error('Key is not extractable');
+                }
+                if (Array.isArray(jwk.key_ops)) {
+                    for (const usage of usages || []) {
+                        if (!jwk.key_ops.includes(usage)) {
+                            throw new Error('Key usage not allowed by jwk.key_ops');
+                        }
+                    }
+                }
+                if (jwk.kty && jwk.kty.toUpperCase() === 'OCT') {
+                    const bytes = base64UrlDecode(jwk.k || '');
+                    ensureUsage(name, 'secret', usages);
+                    return createCryptoKey('secret', { name, hash: algorithm.hash, length: bytes.length * 8 }, extractable, usages, bytes, 'raw', 'raw');
+                }
+                const material = _cryptoJwkToDer(jwk);
+                const keyType = material.keyType;
+                const kind = keyType === 'spki' ? 'public' : 'private';
+                ensureUsage(name, kind, usages);
+                return createCryptoKey(kind, { name, hash: algorithm.hash, namedCurve: algorithm.namedCurve }, extractable, usages, normalizeKeyOutput(material), 'der', keyType);
             }
             throw new Error(`Unsupported import format ${format}`);
         },
@@ -678,7 +898,92 @@
             if (format === 'pkcs8' || format === 'spki') {
                 return toArrayBuffer(toBuffer(key[kKeyData]));
             }
+            if (format === 'jwk') {
+                if (key.type === 'secret') {
+                    return {
+                        kty: 'oct',
+                        k: base64UrlEncode(key[kKeyData]),
+                        ext: true,
+                        key_ops: key.usages.slice(),
+                    };
+                }
+                const jwk = _cryptoDerToJwk(
+                    jwkAlgorithmName(key),
+                    key[kKeyType],
+                    key[kKeyData]
+                );
+                jwk.ext = true;
+                jwk.key_ops = key.usages.slice();
+                return jwk;
+            }
             throw new Error(`Unsupported export format ${format}`);
+        },
+        async deriveBits(algorithm, baseKey, length) {
+            if (!baseKey || !(baseKey instanceof CryptoKey)) {
+                throw new Error('Invalid CryptoKey');
+            }
+            const name = normalizeAlgorithmName(algorithm);
+            if (name === 'ECDH') {
+                ensureKeyType(baseKey, ['private'], 'ECDH deriveBits');
+                const publicKey = algorithm.public;
+                ensureKeyType(publicKey, ['public'], 'ECDH public key');
+                const result = _cryptoSubtleDeriveBitsEcdh(
+                    { key: baseKey[kKeyData], format: baseKey[kKeyFormat], type: baseKey[kKeyType] },
+                    { key: publicKey[kKeyData], format: publicKey[kKeyFormat], type: publicKey[kKeyType] }
+                );
+                const raw = fromBufferResult(result);
+                const byteLen = Math.ceil((length || raw.length * 8) / 8);
+                return toArrayBuffer(raw.slice(0, byteLen));
+            }
+            if (name === 'HKDF') {
+                ensureKeyType(baseKey, ['secret'], 'HKDF deriveBits');
+                const result = _cryptoSubtleDeriveBitsHkdf(
+                    baseKey[kKeyData],
+                    {
+                        hash: resolveHashName(algorithm.hash),
+                        salt: toBuffer(algorithm.salt),
+                        info: toBuffer(algorithm.info || new Uint8Array(0)),
+                        length: length || (algorithm.length || 256),
+                    }
+                );
+                return toArrayBuffer(fromBufferResult(result));
+            }
+            if (name === 'PBKDF2') {
+                ensureKeyType(baseKey, ['secret'], 'PBKDF2 deriveBits');
+                const result = _cryptoSubtleDeriveBitsPbkdf2(
+                    baseKey[kKeyData],
+                    {
+                        hash: resolveHashName(algorithm.hash),
+                        salt: toBuffer(algorithm.salt),
+                        iterations: algorithm.iterations,
+                        length: length || (algorithm.length || 256),
+                    }
+                );
+                return toArrayBuffer(fromBufferResult(result));
+            }
+            throw new Error(`Unsupported algorithm ${name}`);
+        },
+        async deriveKey(algorithm, baseKey, derivedKeyType, extractable, usages) {
+            const bits = await subtle.deriveBits(algorithm, baseKey, derivedKeyType.length || 256);
+            return subtle.importKey('raw', bits, derivedKeyType, extractable, usages);
+        },
+        async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
+            const exported = await subtle.exportKey(format, key);
+            const data = format === 'jwk' ? Buffer.from(JSON.stringify(exported)) : Buffer.from(exported);
+            const name = normalizeAlgorithmName(wrapAlgorithm);
+            if (name === 'AES-KW') {
+                const wrapped = _cryptoSubtleWrapAesKw(wrappingKey[kKeyData], data);
+                return toArrayBuffer(fromBufferResult(wrapped));
+            }
+            return subtle.encrypt(wrapAlgorithm, wrappingKey, data);
+        },
+        async unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlgorithm, unwrappedKeyAlgorithm, extractable, usages) {
+            const name = normalizeAlgorithmName(unwrapAlgorithm);
+            const plaintext = name === 'AES-KW'
+                ? toArrayBuffer(fromBufferResult(_cryptoSubtleUnwrapAesKw(unwrappingKey[kKeyData], toBuffer(wrappedKey))))
+                : await subtle.decrypt(unwrapAlgorithm, unwrappingKey, wrappedKey);
+            const data = format === 'jwk' ? JSON.parse(Buffer.from(plaintext).toString('utf8')) : plaintext;
+            return subtle.importKey(format, data, unwrappedKeyAlgorithm, extractable, usages);
         },
     };
 

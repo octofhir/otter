@@ -133,9 +133,9 @@ impl BuildCommand {
 
                 if let Some(node) = graph.get(url) {
                     let mut deps = HashMap::new();
-                    for dep_specifier in &node.dependencies {
-                        if let Ok(resolved) = loader.resolve(dep_specifier, Some(url)) {
-                            deps.insert(dep_specifier.clone(), resolved);
+                    for record in &node.import_records {
+                        if let Some(resolved) = record.resolved_url.clone() {
+                            deps.insert(record.specifier.clone(), resolved);
                         }
                     }
                     let is_cjs = node.is_commonjs();

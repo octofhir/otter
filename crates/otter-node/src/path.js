@@ -98,8 +98,7 @@
     pathModule.default = pathModule;
 
     // Register module
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('path', pathModule);
-        globalThis.__registerModule('node:path', pathModule);
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('path', pathModule);
     }
 })();

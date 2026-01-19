@@ -1365,33 +1365,31 @@
     // ============================================================================
     // Module Export
     // ============================================================================
-    const streamModule = {
-        Stream,
-        Readable,
-        Writable,
-        Duplex,
-        Transform,
-        PassThrough,
-        pipeline,
-        finished,
-        compose,
-        addAbortSignal,
-        getDefaultHighWaterMark,
-        setDefaultHighWaterMark,
-        isErrored,
-        isReadable,
-        isWritable,
-        promises,
-    };
+    // Node.js exports the Stream class itself as the module, with other classes as properties
+    // This is important for code that uses: require('stream') and util.inherits(MyStream, Stream)
+    Stream.Stream = Stream;
+    Stream.Readable = Readable;
+    Stream.Writable = Writable;
+    Stream.Duplex = Duplex;
+    Stream.Transform = Transform;
+    Stream.PassThrough = PassThrough;
+    Stream.pipeline = pipeline;
+    Stream.finished = finished;
+    Stream.compose = compose;
+    Stream.addAbortSignal = addAbortSignal;
+    Stream.getDefaultHighWaterMark = getDefaultHighWaterMark;
+    Stream.setDefaultHighWaterMark = setDefaultHighWaterMark;
+    Stream.isErrored = isErrored;
+    Stream.isReadable = isReadable;
+    Stream.isWritable = isWritable;
+    Stream.promises = promises;
 
     // Default export for ES module compat
-    streamModule.default = streamModule;
+    Stream.default = Stream;
 
-    // Register modules
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('stream', streamModule);
-        globalThis.__registerModule('node:stream', streamModule);
-        globalThis.__registerModule('stream/promises', promises);
-        globalThis.__registerModule('node:stream/promises', promises);
+    // Register modules - export Stream class directly (like Node.js does)
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('stream', Stream);
+        globalThis.__registerNodeBuiltin('stream/promises', promises);
     }
 })();

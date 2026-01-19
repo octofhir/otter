@@ -290,8 +290,7 @@
     };
     stringDecoderModule.default = stringDecoderModule;
 
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('string_decoder', stringDecoderModule);
-        globalThis.__registerModule('node:string_decoder', stringDecoderModule);
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('string_decoder', stringDecoderModule);
     }
 })();

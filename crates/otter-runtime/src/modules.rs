@@ -23,18 +23,21 @@
 //! ```
 
 use regex::{Captures, Regex};
+use serde_json;
 use std::collections::HashMap;
 
 use crate::modules_ast::transform_module_ast;
 
 fn node_builtin_expr(resolved: &str) -> Option<String> {
-    let name = resolved.strip_prefix("node:")?;
-    Some(format!("globalThis.__otter_node_builtins[\"{}\"]", name))
+    resolved.strip_prefix("node:")?;
+    let spec = serde_json::to_string(resolved).unwrap();
+    Some(format!("globalThis.__otter_get_node_builtin({})", spec))
 }
 
 fn otter_builtin_expr(resolved: &str) -> Option<String> {
-    let name = resolved.strip_prefix("otter:")?;
-    Some(format!("globalThis.__otter_node_builtins[\"{}\"]", name))
+    resolved.strip_prefix("otter:")?;
+    let spec = serde_json::to_string(resolved).unwrap();
+    Some(format!("globalThis.__otter_get_otter_builtin({})", spec))
 }
 
 /// Check if resolved URL is any built-in (node: or otter:) and return the expr
@@ -176,7 +179,7 @@ pub fn transform_module(
         })
         .to_string();
 
-    // Transform dynamic imports: import('./foo.js') -> Promise.resolve(__otter_modules["resolved_url"])
+    // Transform dynamic imports: import('./foo.js') -> __otter_dynamic_import("resolved_url")
     // This handles string literal specifiers only - truly dynamic specifiers need runtime loading
     let dynamic_import_re = Regex::new(r#"import\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap();
 
@@ -184,10 +187,8 @@ pub fn transform_module(
         .replace_all(&result, |caps: &Captures| {
             let specifier = &caps[1];
             let resolved = resolve(specifier);
-            if let Some(expr) = builtin_expr(&resolved) {
-                return format!("Promise.resolve({})", expr);
-            }
-            format!("Promise.resolve(__otter_modules[\"{}\"])", resolved)
+            let resolved_lit = serde_json::to_string(&resolved).unwrap();
+            format!("__otter_dynamic_import({})", resolved_lit)
         })
         .to_string();
 
@@ -622,9 +623,8 @@ mod tests {
         );
 
         let result = transform_module(source, "file:///project/main.js", &deps);
-        // AST transforms dynamic import to Promise.resolve
-        assert!(result.contains(r#"Promise.resolve"#));
-        assert!(result.contains(r#"__otter_modules["file:///project/dynamic.js"]"#));
+        assert!(result.contains(r#"__otter_dynamic_import"#));
+        assert!(result.contains(r#""file:///project/dynamic.js""#));
     }
 
     #[test]
@@ -663,7 +663,7 @@ mod tests {
 
         let result = transform_module(source, "file:///project/main.js", &deps);
         // AST produces individual const for each named import from builtin
-        assert!(result.contains(r#"globalThis.__otter_node_builtins["util"].format"#));
+        assert!(result.contains(r#"globalThis.__otter_get_node_builtin("node:util").format"#));
     }
 
     #[test]
@@ -673,9 +673,7 @@ mod tests {
         deps.insert("node:util".to_string(), "node:util".to_string());
 
         let result = transform_module(source, "file:///project/main.js", &deps);
-        // AST transforms dynamic import to Promise.resolve
-        assert!(result.contains(r#"Promise.resolve"#));
-        assert!(result.contains(r#"globalThis.__otter_node_builtins["util"]"#));
+        assert!(result.contains(r#"__otter_dynamic_import("node:util")"#));
     }
 
     #[test]

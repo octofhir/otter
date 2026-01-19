@@ -8,7 +8,7 @@
     'use strict';
 
     // Get the http module for shared classes
-    const http = globalThis.__otter_node_builtins?.http;
+    const http = globalThis.__otter_get_node_builtin('http');
 
     if (!http) {
         console.warn('https module: http module not available');
@@ -182,13 +182,7 @@
     httpsModule.default = httpsModule;
 
     // Register module
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('https', httpsModule);
-        globalThis.__registerModule('node:https', httpsModule);
-    }
-
-    // Also expose for direct access
-    if (globalThis.__otter_node_builtins) {
-        globalThis.__otter_node_builtins.https = httpsModule;
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('https', httpsModule);
     }
 })();

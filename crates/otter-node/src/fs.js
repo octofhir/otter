@@ -58,9 +58,8 @@
     };
     fsModule.default = fsModule;
 
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('fs', fsModule);
-        globalThis.__registerModule('node:fs', fsModule);
-        globalThis.__registerModule('node:fs/promises', fsPromises);
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('fs', fsModule);
+        globalThis.__registerNodeBuiltin('fs/promises', fsPromises);
     }
 })();

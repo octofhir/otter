@@ -189,6 +189,7 @@ pub async fn run_embedded(code: String) -> Result<()> {
     let process_setup = process_info.to_js_setup();
     let setup = format!(
         "{process_setup}\n\
+         globalThis.__otter_lock_builtins && globalThis.__otter_lock_builtins();\n\
          globalThis.Otter = globalThis.Otter || {{}};\n\
          globalThis.Otter.args = {args_json};\n"
     );

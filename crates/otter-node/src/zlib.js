@@ -441,8 +441,8 @@
   };
 
   // Register as node:zlib module
-  if (typeof __registerModule === "function") {
-    __registerModule("zlib", zlib);
+  if (typeof __registerNodeBuiltin === "function") {
+    __registerNodeBuiltin("zlib", zlib);
   }
 
   // Also expose on global for direct access

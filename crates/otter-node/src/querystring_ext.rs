@@ -39,6 +39,6 @@ mod tests {
         assert!(js.contains("stringify"));
         assert!(js.contains("escape"));
         assert!(js.contains("unescape"));
-        assert!(js.contains("__registerModule"));
+        assert!(js.contains("__registerNodeBuiltin"));
     }
 }

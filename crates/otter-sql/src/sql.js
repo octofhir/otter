@@ -501,7 +501,9 @@ globalThis.Otter.sql = sql;
 globalThis.Otter.SQL = SQL;
 
 // Register the module (additive - don't overwrite existing exports)
-if (typeof __registerModule === "function") {
-    const existing = globalThis.__otter_node_builtins?.otter || {};
-    __registerModule("otter", { ...existing, sql, SQL });
+if (typeof __registerOtterBuiltin === "function") {
+    const existing = (typeof __otter_peek_otter_builtin === "function")
+        ? (__otter_peek_otter_builtin("otter") || {})
+        : {};
+    __registerOtterBuiltin("otter", { ...existing, sql, SQL });
 }

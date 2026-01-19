@@ -112,7 +112,8 @@ fn test_node_builtin_import_executes() {
 
     // Register a synthetic node:util module (the real one is provided by otter-node).
     runtime
-        .eval(r#"__registerModule('util', { format: (s) => 'ok:' + s });"#)
+        .context()
+        .eval(r#"__registerNodeBuiltin('util', { format: (s) => 'ok:' + s });"#)
         .unwrap();
 
     let mut deps = HashMap::new();
@@ -245,13 +246,12 @@ fn test_dynamic_import_execution() {
     );
     runtime.eval(&bundle).unwrap();
 
-    // Now test that the transformed dynamic import works
-    // Dynamic import('./dynamic.js') becomes Promise.resolve(__otter_modules["..."])
-    // We can verify the module is accessible via promise resolution
+    // Now test that the transformed dynamic import works.
+    // Dynamic import('./dynamic.js') becomes __otter_dynamic_import("file:///...")
     runtime
         .eval(
             r#"
-            Promise.resolve(__otter_modules["file:///test/dynamic.js"])
+            __otter_dynamic_import("file:///test/dynamic.js")
                 .then(mod => { globalThis.__dynamicResult = mod.value; });
         "#,
         )

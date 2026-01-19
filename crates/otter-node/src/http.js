@@ -12,64 +12,7 @@
     'use strict';
 
     // Get EventEmitter from the runtime
-    const EventEmitter = globalThis.__otter_node_builtins?.EventEmitter ||
-        (globalThis.require && globalThis.require('events').EventEmitter) ||
-        class EventEmitter {
-            constructor() {
-                this._events = {};
-                this._maxListeners = 10;
-            }
-            on(event, listener) {
-                if (!this._events[event]) this._events[event] = [];
-                this._events[event].push(listener);
-                return this;
-            }
-            once(event, listener) {
-                const wrapper = (...args) => {
-                    this.off(event, wrapper);
-                    listener.apply(this, args);
-                };
-                wrapper._original = listener;
-                return this.on(event, wrapper);
-            }
-            off(event, listener) {
-                if (!this._events[event]) return this;
-                this._events[event] = this._events[event].filter(
-                    l => l !== listener && l._original !== listener
-                );
-                return this;
-            }
-            emit(event, ...args) {
-                if (!this._events[event]) return false;
-                this._events[event].slice().forEach(listener => listener.apply(this, args));
-                return true;
-            }
-            removeListener(event, listener) { return this.off(event, listener); }
-            addListener(event, listener) { return this.on(event, listener); }
-            removeAllListeners(event) {
-                if (event) {
-                    delete this._events[event];
-                } else {
-                    this._events = {};
-                }
-                return this;
-            }
-            listenerCount(event) {
-                return this._events[event]?.length || 0;
-            }
-            setMaxListeners(n) {
-                this._maxListeners = n;
-                return this;
-            }
-            getMaxListeners() {
-                return this._maxListeners;
-            }
-            prependListener(event, listener) {
-                if (!this._events[event]) this._events[event] = [];
-                this._events[event].unshift(listener);
-                return this;
-            }
-        };
+    const { EventEmitter } = globalThis.__otter_get_node_builtin('events');
 
     // Symbols for internal data
     const kServer = Symbol('server');
@@ -1293,13 +1236,7 @@
     httpModule.default = httpModule;
 
     // Register module
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('http', httpModule);
-        globalThis.__registerModule('node:http', httpModule);
-    }
-
-    // Also expose for direct access
-    if (globalThis.__otter_node_builtins) {
-        globalThis.__otter_node_builtins.http = httpModule;
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('http', httpModule);
     }
 })();

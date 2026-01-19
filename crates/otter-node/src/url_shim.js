@@ -797,8 +797,8 @@
   };
 
   // Register as node:url module
-  if (typeof __registerModule === "function") {
-    __registerModule("url", urlModule);
+  if (typeof __registerNodeBuiltin === "function") {
+    __registerNodeBuiltin("url", urlModule);
   }
 
   // Export to global

@@ -671,9 +671,8 @@ pub fn event_emitter_js() -> &'static str {
     };
 
     // Register with module system if available
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('events', eventsModule);
-        globalThis.__registerModule('node:events', eventsModule);
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('events', eventsModule);
     }
 })();
 "#

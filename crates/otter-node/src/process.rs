@@ -244,10 +244,9 @@ impl ProcessInfo {
         }}
     }};
 
-    // Expose as a builtin module (node:process / process) when module system is present.
-    if (globalThis.__registerModule) {{
-        globalThis.__registerModule('process', globalThis.process);
-        globalThis.__registerModule('node:process', globalThis.process);
+    // Expose as a Node.js builtin module when module system is present.
+    if (globalThis.__registerNodeBuiltin) {{
+        globalThis.__registerNodeBuiltin('process', globalThis.process);
     }}
 }})();
 "#,

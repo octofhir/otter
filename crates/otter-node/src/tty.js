@@ -89,13 +89,7 @@
     ttyModule.default = ttyModule;
 
     // Register module
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('tty', ttyModule);
-        globalThis.__registerModule('node:tty', ttyModule);
-    }
-
-    // Also expose for direct access
-    if (globalThis.__otter_node_builtins) {
-        globalThis.__otter_node_builtins.tty = ttyModule;
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('tty', ttyModule);
     }
 })();

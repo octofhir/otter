@@ -133,7 +133,7 @@ pub(crate) fn run_worker(
     }
 
     // Register runtime bootstrap (module registry helpers, etc.)
-    if let Err(e) = register_bootstrap(context.raw()) {
+    if let Err(e) = register_bootstrap(&context) {
         error!(error = %e, "Failed to register runtime bootstrap");
         return;
     }
@@ -241,7 +241,7 @@ pub(crate) fn run_worker_with_events(
     }
 
     // Register runtime bootstrap
-    if let Err(e) = register_bootstrap(context.raw()) {
+    if let Err(e) = register_bootstrap(&context) {
         error!(error = %e, "Failed to register runtime bootstrap");
         return;
     }

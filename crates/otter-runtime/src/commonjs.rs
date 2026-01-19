@@ -167,11 +167,13 @@ mod tests {
     #[test]
     fn test_wrap_commonjs_module() {
         let source = "module.exports = { foo: 1 };";
+        let deps = std::collections::HashMap::new();
         let wrapped = wrap_commonjs_module(
             "file:///project/lib.cjs",
             source,
             "/project",
             "/project/lib.cjs",
+            &deps,
         );
 
         assert!(wrapped.contains("__otter_cjs_modules[\"file:///project/lib.cjs\"]"));

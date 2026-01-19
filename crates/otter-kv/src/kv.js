@@ -135,7 +135,9 @@ globalThis.Otter.kv = kv;
 globalThis.Otter.KVStore = KVStore;
 
 // Register the module (additive - don't overwrite existing exports like sql, SQL)
-if (typeof __registerModule === "function") {
-    const existing = globalThis.__otter_node_builtins?.otter || {};
-    __registerModule("otter", { ...existing, kv });
+if (typeof __registerOtterBuiltin === "function") {
+    const existing = (typeof __otter_peek_otter_builtin === "function")
+        ? (__otter_peek_otter_builtin("otter") || {})
+        : {};
+    __registerOtterBuiltin("otter", { ...existing, kv });
 }

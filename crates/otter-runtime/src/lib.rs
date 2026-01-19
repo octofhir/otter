@@ -81,6 +81,7 @@ pub mod holt;
 pub mod memory;
 pub mod modules;
 pub mod modules_ast;
+pub mod node_builtins;
 pub mod runtime;
 pub mod transpiler;
 pub mod tsconfig;
@@ -111,6 +112,7 @@ pub use modules::{
     ModuleFormat, ModuleInfo, bundle_modules, bundle_modules_mixed, entry_execution,
     entry_execution_mixed, transform_module, wrap_module,
 };
+pub use node_builtins::{NODE_BUILTINS, is_supported_node_builtin, normalize_node_builtin};
 pub use runtime::{JscConfig, JscRuntime, JscRuntimePool, PromiseDriver};
 pub use transpiler::{
     TranspileError, TranspileOptions, TranspileResult, is_typescript, needs_transpilation,

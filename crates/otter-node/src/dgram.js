@@ -414,9 +414,8 @@
     };
 
     // Register the module
-    if (typeof __registerModule === 'function') {
-        __registerModule('dgram', dgram);
-        __registerModule('node:dgram', dgram);
+    if (typeof __registerNodeBuiltin === 'function') {
+        __registerNodeBuiltin('dgram', dgram);
     }
 
     // Also make available globally for direct use

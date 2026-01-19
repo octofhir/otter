@@ -106,8 +106,7 @@
     };
     cryptoModule.default = cryptoModule;
 
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('crypto', cryptoModule);
-        globalThis.__registerModule('node:crypto', cryptoModule);
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('crypto', cryptoModule);
     }
 })();

@@ -185,8 +185,8 @@
   };
 
   // Register as node:querystring module
-  if (typeof __registerModule === "function") {
-    __registerModule("querystring", querystring);
+  if (typeof __registerNodeBuiltin === "function") {
+    __registerNodeBuiltin("querystring", querystring);
   }
 
   // Also expose on global for direct access

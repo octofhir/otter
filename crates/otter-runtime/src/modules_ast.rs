@@ -4,6 +4,7 @@
 //! to correctly handle all ESM patterns including multi-line imports.
 
 use std::collections::HashMap;
+use serde_json;
 use swc_common::{sync::Lrc, FileName, SourceMap, DUMMY_SP};
 use swc_ecma_ast::*;
 use swc_ecma_codegen::{text_writer::JsWriter, Emitter};
@@ -17,10 +18,12 @@ fn is_builtin(resolved: &str) -> bool {
 
 /// Helper to get module expression for built-ins
 fn builtin_expr(resolved: &str) -> Option<String> {
-    if let Some(name) = resolved.strip_prefix("node:") {
-        Some(format!("globalThis.__otter_node_builtins[\"{}\"]", name))
-    } else if let Some(name) = resolved.strip_prefix("otter:") {
-        Some(format!("globalThis.__otter_node_builtins[\"{}\"]", name))
+    if resolved.starts_with("node:") {
+        let spec = serde_json::to_string(resolved).unwrap();
+        Some(format!("globalThis.__otter_get_node_builtin({})", spec))
+    } else if resolved.starts_with("otter:") {
+        let spec = serde_json::to_string(resolved).unwrap();
+        Some(format!("globalThis.__otter_get_otter_builtin({})", spec))
     } else {
         None
     }
@@ -492,7 +495,7 @@ impl VisitMut for EsmTransformer {
     }
 
     /// Transform dynamic imports:
-    /// - String literal: import('./foo.js') -> Promise.resolve(__otter_modules["resolved"])
+    /// - String literal: import('./foo.js') -> __otter_dynamic_import("resolved")
     /// - Variable/expression: import(expr) -> __otter_dynamic_import(expr)
     fn visit_mut_expr(&mut self, expr: &mut Expr) {
         // First, visit children
@@ -506,10 +509,10 @@ impl VisitMut for EsmTransformer {
                         // String literal - resolve at compile time
                         let specifier = wtf8_to_string(s);
                         let resolved = self.resolve(&specifier);
-                        let module_access = module_expr(&resolved);
+                        let resolved_lit = serde_json::to_string(&resolved).unwrap();
 
-                        // Replace with Promise.resolve(module)
-                        let new_code = format!("Promise.resolve({})", module_access);
+                        // Replace with __otter_dynamic_import("resolved")
+                        let new_code = format!("__otter_dynamic_import({})", resolved_lit);
                         let cm: Lrc<SourceMap> = Default::default();
                         let fm = cm.new_source_file(
                             Lrc::new(FileName::Anon),
@@ -684,7 +687,7 @@ mod tests {
         deps.insert("node:util".to_string(), "node:util".to_string());
 
         let result = transform_module_ast(source, "file:///project/main.js", &deps).unwrap();
-        assert!(result.contains("globalThis.__otter_node_builtins[\"util\"]"));
+        assert!(result.contains("globalThis.__otter_get_node_builtin(\"node:util\")"));
     }
 
     #[test]
@@ -694,8 +697,7 @@ mod tests {
         deps.insert("./foo.js".to_string(), "file:///project/foo.js".to_string());
 
         let result = transform_module_ast(source, "file:///project/main.js", &deps).unwrap();
-        assert!(result.contains("Promise.resolve"));
-        assert!(result.contains("__otter_modules[\"file:///project/foo.js\"]"));
+        assert!(result.contains("__otter_dynamic_import(\"file:///project/foo.js\")"));
     }
 
     #[test]

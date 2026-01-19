@@ -3,12 +3,14 @@
 //! Provides:
 //! - `randomBytes(size)` - Generate cryptographically secure random bytes
 //! - `randomUUID()` - Generate a random UUID v4
-//! - `createHash(algorithm)` - Create hash (sha256, sha384, sha512)
+//! - `createHash(algorithm)` - Create hash (md5, sha1, sha256, sha384, sha512)
 //! - `createHmac(algorithm, key)` - Create HMAC
 //! - `getRandomValues(typedArray)` - Web Crypto API
 
+use md5::{Digest as Md5Digest, Md5};
 use ring::digest::{self, Context as DigestContext};
 use ring::hmac;
+use sha1::Sha1;
 use std::fmt;
 use thiserror::Error;
 
@@ -31,6 +33,8 @@ pub enum CryptoError {
 /// Supported hash algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashAlgorithm {
+    Md5,
+    Sha1,
     Sha256,
     Sha384,
     Sha512,
@@ -40,6 +44,8 @@ impl HashAlgorithm {
     /// Parse algorithm name from string.
     pub fn parse(s: &str) -> Result<Self, CryptoError> {
         match s.to_lowercase().as_str() {
+            "md5" => Ok(HashAlgorithm::Md5),
+            "sha1" | "sha-1" => Ok(HashAlgorithm::Sha1),
             "sha256" | "sha-256" => Ok(HashAlgorithm::Sha256),
             "sha384" | "sha-384" => Ok(HashAlgorithm::Sha384),
             "sha512" | "sha-512" => Ok(HashAlgorithm::Sha512),
@@ -47,21 +53,23 @@ impl HashAlgorithm {
         }
     }
 
-    /// Get the ring digest algorithm.
-    fn to_ring_algorithm(self) -> &'static digest::Algorithm {
+    /// Get the ring digest algorithm (only for SHA-256/384/512).
+    fn to_ring_algorithm(self) -> Option<&'static digest::Algorithm> {
         match self {
-            HashAlgorithm::Sha256 => &digest::SHA256,
-            HashAlgorithm::Sha384 => &digest::SHA384,
-            HashAlgorithm::Sha512 => &digest::SHA512,
+            HashAlgorithm::Sha256 => Some(&digest::SHA256),
+            HashAlgorithm::Sha384 => Some(&digest::SHA384),
+            HashAlgorithm::Sha512 => Some(&digest::SHA512),
+            _ => None,
         }
     }
 
-    /// Get the ring HMAC algorithm.
-    fn to_hmac_algorithm(self) -> hmac::Algorithm {
+    /// Get the ring HMAC algorithm (only for SHA-256/384/512).
+    fn to_hmac_algorithm(self) -> Option<hmac::Algorithm> {
         match self {
-            HashAlgorithm::Sha256 => hmac::HMAC_SHA256,
-            HashAlgorithm::Sha384 => hmac::HMAC_SHA384,
-            HashAlgorithm::Sha512 => hmac::HMAC_SHA512,
+            HashAlgorithm::Sha256 => Some(hmac::HMAC_SHA256),
+            HashAlgorithm::Sha384 => Some(hmac::HMAC_SHA384),
+            HashAlgorithm::Sha512 => Some(hmac::HMAC_SHA512),
+            _ => None,
         }
     }
 }
@@ -69,6 +77,8 @@ impl HashAlgorithm {
 impl fmt::Display for HashAlgorithm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            HashAlgorithm::Md5 => write!(f, "md5"),
+            HashAlgorithm::Sha1 => write!(f, "sha1"),
             HashAlgorithm::Sha256 => write!(f, "sha256"),
             HashAlgorithm::Sha384 => write!(f, "sha384"),
             HashAlgorithm::Sha512 => write!(f, "sha512"),
@@ -76,29 +86,48 @@ impl fmt::Display for HashAlgorithm {
     }
 }
 
+/// Internal hash context that can use different backends.
+enum HashContext {
+    Md5(Md5),
+    Sha1(Sha1),
+    Ring(DigestContext),
+}
+
 /// A hash object for incremental hashing.
 pub struct Hash {
-    context: DigestContext,
+    context: HashContext,
     algorithm: HashAlgorithm,
 }
 
 impl Hash {
     /// Create a new hash with the given algorithm.
     pub fn new(algorithm: HashAlgorithm) -> Self {
-        Self {
-            context: DigestContext::new(algorithm.to_ring_algorithm()),
-            algorithm,
-        }
+        let context = match algorithm {
+            HashAlgorithm::Md5 => HashContext::Md5(Md5::new()),
+            HashAlgorithm::Sha1 => HashContext::Sha1(Sha1::new()),
+            HashAlgorithm::Sha256 | HashAlgorithm::Sha384 | HashAlgorithm::Sha512 => {
+                HashContext::Ring(DigestContext::new(algorithm.to_ring_algorithm().unwrap()))
+            }
+        };
+        Self { context, algorithm }
     }
 
     /// Update the hash with data.
     pub fn update(&mut self, data: &[u8]) {
-        self.context.update(data);
+        match &mut self.context {
+            HashContext::Md5(ctx) => ctx.update(data),
+            HashContext::Sha1(ctx) => ctx.update(data),
+            HashContext::Ring(ctx) => ctx.update(data),
+        }
     }
 
     /// Finalize and return the digest.
     pub fn digest(self) -> Vec<u8> {
-        self.context.finish().as_ref().to_vec()
+        match self.context {
+            HashContext::Md5(ctx) => ctx.finalize().to_vec(),
+            HashContext::Sha1(ctx) => ctx.finalize().to_vec(),
+            HashContext::Ring(ctx) => ctx.finish().as_ref().to_vec(),
+        }
     }
 
     /// Get the algorithm name.
@@ -116,12 +145,16 @@ pub struct Hmac {
 
 impl Hmac {
     /// Create a new HMAC with the given algorithm and key.
-    pub fn new(algorithm: HashAlgorithm, key: &[u8]) -> Self {
-        Self {
-            key: hmac::Key::new(algorithm.to_hmac_algorithm(), key),
+    /// Note: Only SHA-256/384/512 are supported for HMAC.
+    pub fn new(algorithm: HashAlgorithm, key: &[u8]) -> Result<Self, CryptoError> {
+        let hmac_alg = algorithm
+            .to_hmac_algorithm()
+            .ok_or_else(|| CryptoError::UnsupportedAlgorithm(format!("{} HMAC", algorithm)))?;
+        Ok(Self {
+            key: hmac::Key::new(hmac_alg, key),
             data: Vec::new(),
             algorithm,
-        }
+        })
     }
 
     /// Update the HMAC with data.
@@ -161,20 +194,37 @@ pub fn create_hash(algorithm: &str) -> Result<Hash, CryptoError> {
 /// Create an HMAC with the given algorithm and key.
 pub fn create_hmac(algorithm: &str, key: &[u8]) -> Result<Hmac, CryptoError> {
     let alg = HashAlgorithm::parse(algorithm)?;
-    Ok(Hmac::new(alg, key))
+    Hmac::new(alg, key)
 }
 
 /// One-shot hash computation.
 pub fn hash(algorithm: &str, data: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let alg = HashAlgorithm::parse(algorithm)?;
-    let digest = digest::digest(alg.to_ring_algorithm(), data);
-    Ok(digest.as_ref().to_vec())
+    match alg {
+        HashAlgorithm::Md5 => {
+            let mut hasher = Md5::new();
+            hasher.update(data);
+            Ok(hasher.finalize().to_vec())
+        }
+        HashAlgorithm::Sha1 => {
+            let mut hasher = Sha1::new();
+            hasher.update(data);
+            Ok(hasher.finalize().to_vec())
+        }
+        _ => {
+            let digest = digest::digest(alg.to_ring_algorithm().unwrap(), data);
+            Ok(digest.as_ref().to_vec())
+        }
+    }
 }
 
 /// One-shot HMAC computation.
 pub fn hmac_sign(algorithm: &str, key: &[u8], data: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let alg = HashAlgorithm::parse(algorithm)?;
-    let hmac_key = hmac::Key::new(alg.to_hmac_algorithm(), key);
+    let hmac_alg = alg
+        .to_hmac_algorithm()
+        .ok_or_else(|| CryptoError::UnsupportedAlgorithm(format!("{} HMAC", alg)))?;
+    let hmac_key = hmac::Key::new(hmac_alg, key);
     Ok(hmac::sign(&hmac_key, data).as_ref().to_vec())
 }
 
@@ -186,7 +236,10 @@ pub fn hmac_verify(
     signature: &[u8],
 ) -> Result<bool, CryptoError> {
     let alg = HashAlgorithm::parse(algorithm)?;
-    let hmac_key = hmac::Key::new(alg.to_hmac_algorithm(), key);
+    let hmac_alg = alg
+        .to_hmac_algorithm()
+        .ok_or_else(|| CryptoError::UnsupportedAlgorithm(format!("{} HMAC", alg)))?;
+    let hmac_key = hmac::Key::new(hmac_alg, key);
     Ok(hmac::verify(&hmac_key, data, signature).is_ok())
 }
 
@@ -298,8 +351,30 @@ mod tests {
     }
 
     #[test]
+    fn test_hash_md5() {
+        let mut h = create_hash("md5").unwrap();
+        h.update(b"hello");
+        let digest = h.digest();
+
+        // Known MD5 of "hello"
+        let expected = "5d41402abc4b2a76b9719d911017c592";
+        assert_eq!(to_hex(&digest), expected);
+    }
+
+    #[test]
+    fn test_hash_sha1() {
+        let mut h = create_hash("sha1").unwrap();
+        h.update(b"hello");
+        let digest = h.digest();
+
+        // Known SHA1 of "hello"
+        let expected = "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d";
+        assert_eq!(to_hex(&digest), expected);
+    }
+
+    #[test]
     fn test_unsupported_algorithm() {
-        let result = create_hash("md5");
+        let result = create_hash("blake2");
         assert!(result.is_err());
     }
 }

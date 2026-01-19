@@ -40,6 +40,6 @@ mod tests {
         assert!(js.contains("strictEqual"));
         assert!(js.contains("deepEqual"));
         assert!(js.contains("throws"));
-        assert!(js.contains("__registerModule"));
+        assert!(js.contains("__registerNodeBuiltin"));
     }
 }

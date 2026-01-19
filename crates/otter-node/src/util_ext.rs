@@ -5,7 +5,6 @@
 //!
 //! ## Architecture
 //!
-//! - `util.rs` - Original Rust implementation with JS code
 //! - `util_ext.rs` - Extension creation
 //! - `util.js` - JavaScript util module implementation
 

@@ -753,9 +753,8 @@ pub fn os_module_js() -> &'static str {
     };
 
     // Register with module system if available
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('os', osModule);
-        globalThis.__registerModule('node:os', osModule);
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('os', osModule);
     }
 
     globalThis.__osModule = osModule;

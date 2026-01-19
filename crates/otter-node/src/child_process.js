@@ -516,8 +516,7 @@
     };
 
     // Register module
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('child_process', childProcessModule);
-        globalThis.__registerModule('node:child_process', childProcessModule);
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('child_process', childProcessModule);
     }
 })();

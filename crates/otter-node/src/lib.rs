@@ -30,6 +30,7 @@
 //! ```
 
 pub mod assert_ext;
+pub mod async_hooks_ext;
 pub mod buffer;
 pub mod buffer_ext;
 pub mod child_process;
@@ -72,7 +73,6 @@ pub mod test_ext;
 pub mod tty_ext;
 pub mod url;
 pub mod url_ext;
-pub mod util;
 pub mod util_ext;
 pub mod websocket;
 pub mod websocket_ext;

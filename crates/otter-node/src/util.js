@@ -265,8 +265,7 @@
     };
     utilModule.default = utilModule;
 
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('util', utilModule);
-        globalThis.__registerModule('node:util', utilModule);
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('util', utilModule);
     }
 })();

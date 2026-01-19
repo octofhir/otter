@@ -46,8 +46,8 @@ pub use env_store::{
     DEFAULT_DENY_PATTERNS, EnvFileError, EnvStoreBuilder, EnvWriteError, IsolatedEnvStore,
     parse_env_file,
 };
-pub use graph::{ModuleGraph, ModuleNode, parse_imports};
-pub use loader::{LoaderConfig, ModuleLoader, ResolvedModule, SourceType};
+pub use graph::{ImportRecord, ModuleGraph, ModuleNode, parse_imports};
+pub use loader::{ImportContext, LoaderConfig, ModuleLoader, ModuleType, ResolvedModule, SourceType};
 
 // Re-export error types from otter-runtime for convenience
 pub use otter_runtime::{JscError, JscResult};

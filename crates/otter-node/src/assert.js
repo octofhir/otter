@@ -659,8 +659,8 @@
   assert.strict = strict;
 
   // Register as node:assert module
-  if (typeof __registerModule === "function") {
-    __registerModule("assert", assert);
+  if (typeof __registerNodeBuiltin === "function") {
+    __registerNodeBuiltin("assert", assert);
   }
 
   // Also expose on global for direct access

@@ -279,9 +279,9 @@
   };
 
   // Register as node:dns module
-  if (typeof __registerModule === "function") {
-    __registerModule("dns", dns);
-    __registerModule("dns/promises", promises);
+  if (typeof __registerNodeBuiltin === "function") {
+    __registerNodeBuiltin("dns", dns);
+    __registerNodeBuiltin("dns/promises", promises);
   }
 
   // Also expose on global for direct access

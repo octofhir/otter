@@ -5,7 +5,7 @@
     'use strict';
 
     // Get EventEmitter from node:events
-    const { EventEmitter } = globalThis.__otter_node_builtins?.events || { EventEmitter: class extends Object {} };
+    const { EventEmitter } = globalThis.__otter_get_node_builtin('events');
 
     /**
      * Interface for reading line-by-line from a stream.
@@ -433,8 +433,7 @@
     };
     readlineModule.default = readlineModule;
 
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('readline', readlineModule);
-        globalThis.__registerModule('node:readline', readlineModule);
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('readline', readlineModule);
     }
 })();

@@ -8,48 +8,7 @@
     'use strict';
 
     // Get EventEmitter from the runtime
-    const EventEmitter = globalThis.__otter_node_builtins?.EventEmitter ||
-        (globalThis.require && globalThis.require('events').EventEmitter) ||
-        class EventEmitter {
-            constructor() {
-                this._events = {};
-            }
-            on(event, listener) {
-                if (!this._events[event]) this._events[event] = [];
-                this._events[event].push(listener);
-                return this;
-            }
-            once(event, listener) {
-                const wrapper = (...args) => {
-                    this.off(event, wrapper);
-                    listener.apply(this, args);
-                };
-                wrapper._original = listener;
-                return this.on(event, wrapper);
-            }
-            off(event, listener) {
-                if (!this._events[event]) return this;
-                this._events[event] = this._events[event].filter(
-                    l => l !== listener && l._original !== listener
-                );
-                return this;
-            }
-            emit(event, ...args) {
-                if (!this._events[event]) return false;
-                this._events[event].forEach(listener => listener.apply(this, args));
-                return true;
-            }
-            removeListener(event, listener) { return this.off(event, listener); }
-            addListener(event, listener) { return this.on(event, listener); }
-            removeAllListeners(event) {
-                if (event) {
-                    delete this._events[event];
-                } else {
-                    this._events = {};
-                }
-                return this;
-            }
-        };
+    const { EventEmitter } = globalThis.__otter_get_node_builtin('events');
 
     // Symbol for internal handle
     const kHandle = Symbol('handle');
@@ -620,14 +579,8 @@
     netModule.default = netModule;
 
     // Register module
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('net', netModule);
-        globalThis.__registerModule('node:net', netModule);
-    }
-
-    // Also expose for direct access
-    if (globalThis.__otter_node_builtins) {
-        globalThis.__otter_node_builtins.net = netModule;
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('net', netModule);
     }
 
     // Register global dispatch function for native events

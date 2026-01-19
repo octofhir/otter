@@ -3,8 +3,29 @@
 
     class EventEmitter {
         constructor() {
-            this._events = new Map();
-            this._maxListeners = DEFAULT_MAX_LISTENERS;
+            EventEmitter.init.call(this);
+        }
+
+        // Initialize _events and _maxListeners - can be called on any object
+        // This is needed because many libraries (Express, etc.) mixin EventEmitter
+        // methods onto objects without calling the constructor
+        static init() {
+            if (!this._events || !(this._events instanceof Map)) {
+                this._events = new Map();
+            }
+            if (this._maxListeners === undefined) {
+                this._maxListeners = DEFAULT_MAX_LISTENERS;
+            }
+        }
+
+        // Ensure _events is initialized before accessing it
+        _ensureInit() {
+            if (!this._events || !(this._events instanceof Map)) {
+                this._events = new Map();
+            }
+            if (this._maxListeners === undefined) {
+                this._maxListeners = DEFAULT_MAX_LISTENERS;
+            }
         }
 
         addListener(event, listener) {
@@ -15,6 +36,8 @@
             if (typeof listener !== 'function') {
                 throw new TypeError('The "listener" argument must be of type Function');
             }
+
+            this._ensureInit();
 
             if (!this._events.has(event)) {
                 this._events.set(event, []);
@@ -42,6 +65,8 @@
                 throw new TypeError('The "listener" argument must be of type Function');
             }
 
+            this._ensureInit();
+
             if (!this._events.has(event)) {
                 this._events.set(event, []);
             }
@@ -59,6 +84,8 @@
             if (typeof listener !== 'function') {
                 throw new TypeError('The "listener" argument must be of type Function');
             }
+
+            this._ensureInit();
 
             if (!this._events.has(event)) {
                 this._events.set(event, []);
@@ -78,6 +105,8 @@
                 throw new TypeError('The "listener" argument must be of type Function');
             }
 
+            this._ensureInit();
+
             if (!this._events.has(event)) {
                 this._events.set(event, []);
             }
@@ -96,6 +125,8 @@
         }
 
         off(event, listener) {
+            this._ensureInit();
+
             if (!this._events.has(event)) {
                 return this;
             }
@@ -115,6 +146,8 @@
         }
 
         removeAllListeners(event) {
+            this._ensureInit();
+
             if (event === undefined) {
                 const events = [...this._events.keys()];
                 for (const e of events) {
@@ -137,6 +170,8 @@
         }
 
         emit(event, ...args) {
+            this._ensureInit();
+
             if (!this._events.has(event)) {
                 if (event === 'error') {
                     const err = args[0];
@@ -179,6 +214,7 @@
         }
 
         listeners(event) {
+            this._ensureInit();
             if (!this._events.has(event)) {
                 return [];
             }
@@ -186,6 +222,7 @@
         }
 
         rawListeners(event) {
+            this._ensureInit();
             if (!this._events.has(event)) {
                 return [];
             }
@@ -193,6 +230,7 @@
         }
 
         listenerCount(event) {
+            this._ensureInit();
             if (!this._events.has(event)) {
                 return 0;
             }
@@ -200,10 +238,12 @@
         }
 
         eventNames() {
+            this._ensureInit();
             return [...this._events.keys()].filter(e => this._events.get(e).length > 0);
         }
 
         setMaxListeners(n) {
+            this._ensureInit();
             if (typeof n !== 'number' || n < 0 || Number.isNaN(n)) {
                 throw new RangeError('The "n" argument must be a non-negative number');
             }
@@ -212,6 +252,7 @@
         }
 
         getMaxListeners() {
+            this._ensureInit();
             return this._maxListeners;
         }
 
@@ -340,16 +381,12 @@
 
     globalThis.__EventEmitter = EventEmitter;
 
-    const eventsModule = {
-        EventEmitter,
-        once: EventEmitter.once,
-        on: EventEmitter.on,
-        listenerCount: EventEmitter.listenerCount,
-        default: EventEmitter,
-    };
+    // Node.js exports EventEmitter class directly with static methods as properties
+    // This is important for code that uses: require('events') and util.inherits(MyEmitter, EventEmitter)
+    EventEmitter.EventEmitter = EventEmitter;
+    EventEmitter.default = EventEmitter;
 
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('events', eventsModule);
-        globalThis.__registerModule('node:events', eventsModule);
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('events', EventEmitter);
     }
 })();

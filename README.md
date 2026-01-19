@@ -113,28 +113,33 @@ fn main() -> anyhow::Result<()> {
 
 ### Node.js Modules
 
-| Module | Status |
-|--------|--------|
-| `assert` | Full |
-| `buffer` | Full |
-| `child_process` | Full (spawn, exec, fork with IPC) |
-| `crypto` | Partial (randomBytes, createHash, createHmac) |
-| `dgram` | Full (UDP sockets) |
-| `dns` | Full (hickory-resolver) |
-| `events` | Full (EventEmitter) |
-| `fs` | Full (sync + promises) |
-| `os` | Full |
-| `path` | Full |
-| `process` | Full |
-| `querystring` | Full |
-| `test` | Full (node:test compatible) |
-| `url` | Full (WHATWG + legacy) |
-| `util` | Partial (promisify, inspect, format) |
-| `zlib` | Full (gzip, deflate, brotli) |
-| `string_decoder` | Full |
-| `readline` | Full |
-| `net` | Partial (TCP) |
-| `http`/`https` | Not implemented (use fetch or Otter.serve) |
+| Module | Status | Notes |
+|--------|--------|-------|
+| `assert` | ✅ Full | 98% - missing CallTracker |
+| `async_hooks` | ⚠️ Partial | 60% - AsyncLocalStorage works |
+| `buffer` | ✅ Full | 100% - all read/write methods, File, Blob |
+| `child_process` | ✅ Full | 95% - spawn, exec, fork with IPC |
+| `crypto` | ⚠️ Partial | 35% - hash, hmac, randomBytes, randomUUID |
+| `dgram` | ✅ Full | 85% - UDP sockets |
+| `dns` | ✅ Full | 70% - hickory-resolver |
+| `events` | ✅ Full | 95% - EventEmitter |
+| `fs` | ✅ Full | 55% - sync + promises, missing watch/streams |
+| `http`/`https` | ✅ Full | 80% - createServer, request, get |
+| `net` | ⚠️ Partial | 50% - TCP client/server |
+| `os` | ✅ Full | 85% - all main APIs |
+| `path` | ✅ Full | 100% |
+| `process` | ✅ Full | 85% |
+| `querystring` | ✅ Full | 100% |
+| `readline` | ⚠️ Partial | 70% - missing completer |
+| `stream` | ✅ Full | 95% - Readable, Writable, Transform, pipeline |
+| `string_decoder` | ✅ Full | 100% |
+| `test` | ✅ Full | 80% - node:test compatible |
+| `tty` | ⚠️ Partial | 30% - isatty |
+| `url` | ✅ Full | 100% - WHATWG + legacy |
+| `util` | ⚠️ Partial | 60% - promisify, inspect, format, types |
+| `zlib` | ✅ Full | 98% - gzip, deflate, brotli |
+
+**Not yet implemented:** `cluster`, `worker_threads`, `tls`, `vm`, `perf_hooks`, `inspector`
 
 ### Otter APIs
 

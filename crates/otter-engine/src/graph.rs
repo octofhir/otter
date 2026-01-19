@@ -3,18 +3,84 @@
 //! Provides topological sorting for correct module execution order.
 //! Supports circular dependencies (common in npm packages like zod).
 
-use crate::loader::{ModuleLoader, ModuleType, ResolvedModule, SourceType};
+use crate::loader::{ImportContext, ModuleLoader, ModuleType, ResolvedModule, SourceType};
 use otter_runtime::modules_ast::parse_esm_dependencies;
 use otter_runtime::{JscError, JscResult, transpile_typescript};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Import record tracking the relationship between modules
+#[derive(Debug, Clone)]
+pub struct ImportRecord {
+    /// The original import specifier (e.g., "axios", "./utils", "node:fs")
+    pub specifier: String,
+
+    /// The resolved URL (e.g., "file:///node_modules/axios/dist/axios.cjs")
+    pub resolved_url: Option<String>,
+
+    /// Whether this is a require() call (true) or import statement (false)
+    pub is_require: bool,
+
+    /// Whether the imported module needs __toESM wrapper
+    /// (CJS module being imported by ESM)
+    pub wrap_with_to_esm: bool,
+
+    /// Whether the imported module needs __toCommonJS wrapper
+    /// (ESM module being required by CJS)
+    pub wrap_with_to_commonjs: bool,
+}
+
+impl ImportRecord {
+    /// Create a new import record for an ESM import
+    pub fn esm_import(specifier: impl Into<String>) -> Self {
+        Self {
+            specifier: specifier.into(),
+            resolved_url: None,
+            is_require: false,
+            wrap_with_to_esm: false,
+            wrap_with_to_commonjs: false,
+        }
+    }
+
+    /// Create a new import record for a CJS require
+    pub fn cjs_require(specifier: impl Into<String>) -> Self {
+        Self {
+            specifier: specifier.into(),
+            resolved_url: None,
+            is_require: true,
+            wrap_with_to_esm: false,
+            wrap_with_to_commonjs: false,
+        }
+    }
+
+    /// Set the resolved URL
+    pub fn with_resolved_url(mut self, url: impl Into<String>) -> Self {
+        self.resolved_url = Some(url.into());
+        self
+    }
+
+    /// Set whether __toESM wrapper is needed
+    pub fn with_to_esm(mut self, wrap: bool) -> Self {
+        self.wrap_with_to_esm = wrap;
+        self
+    }
+
+    /// Set whether __toCommonJS wrapper is needed
+    pub fn with_to_commonjs(mut self, wrap: bool) -> Self {
+        self.wrap_with_to_commonjs = wrap;
+        self
+    }
+}
+
 /// Module in the graph
 #[derive(Debug)]
 pub struct ModuleNode {
     pub module: ResolvedModule,
+    /// Simple list of dependency specifiers (for backward compatibility)
     pub dependencies: Vec<String>,
+    /// Detailed import records with wrapping information
+    pub import_records: Vec<ImportRecord>,
     /// Compiled JavaScript (if source was TypeScript or JSON)
     pub compiled: Option<String>,
 }
@@ -73,7 +139,7 @@ impl ModuleGraph {
         let mut visited = HashSet::new();
         let mut stack = Vec::new();
 
-        self.load_recursive(specifier, None, &mut visited, &mut stack)
+        self.load_recursive(specifier, None, ImportContext::ESM, &mut visited, &mut stack)
             .await
     }
 
@@ -81,11 +147,14 @@ impl ModuleGraph {
         &mut self,
         specifier: &str,
         referrer: Option<&str>,
+        context: ImportContext,
         visited: &mut HashSet<String>,
         stack: &mut Vec<String>,
     ) -> JscResult<()> {
         // Resolve first to get canonical URL
-        let resolved_url = self.loader.resolve(specifier, referrer)?;
+        let resolved_url = self
+            .loader
+            .resolve_with_context(specifier, referrer, context)?;
 
         // Already loaded or in progress - skip
         // This handles both completed modules and circular dependencies
@@ -98,15 +167,57 @@ impl ModuleGraph {
         stack.push(resolved_url.clone());
 
         // Load the module
-        let module = self.loader.load(specifier, referrer).await?;
+        let module = self
+            .loader
+            .load_with_context(specifier, referrer, context)
+            .await?;
+        let importer_type = module.module_type;
+        let module_url = module.url.clone();
 
         // Skip parsing dependencies for built-ins (they have no source)
-        let dependencies = if module.url.starts_with("node:") || module.url.starts_with("otter:") {
-            Vec::new()
-        } else {
-            // Parse dependencies based on module type (ESM or CommonJS)
-            parse_dependencies(&module.source, module.module_type)
-        };
+        let (dependencies, import_records) =
+            if module.url.starts_with("node:") || module.url.starts_with("otter:") {
+                (Vec::new(), Vec::new())
+            } else {
+                // Parse dependencies based on module type (ESM or CommonJS)
+                let deps = parse_dependencies(&module.source, module.module_type);
+
+                // Create import records with proper context
+                let records: Vec<ImportRecord> = deps
+                    .iter()
+                    .map(|spec| {
+                        let is_require = module.module_type.is_commonjs();
+
+                        // Resolve the dependency to determine its module type
+                        let context = if is_require {
+                            ImportContext::CJS
+                        } else {
+                            ImportContext::ESM
+                        };
+
+                        let resolved = self
+                            .loader
+                            .resolve_with_context(spec, Some(&module.url), context)
+                            .ok();
+
+                        // Determine wrapping flags based on importer and imported module types
+                        // We'll update these after loading the dependency
+                        let mut record = if is_require {
+                            ImportRecord::cjs_require(spec.clone())
+                        } else {
+                            ImportRecord::esm_import(spec.clone())
+                        };
+
+                        if let Some(url) = resolved {
+                            record = record.with_resolved_url(url);
+                        }
+
+                        record
+                    })
+                    .collect();
+
+                (deps, records)
+            };
 
         // Compile TypeScript or wrap JSON (do this before recursing to have source ready)
         let compiled = match module.source_type {
@@ -130,6 +241,7 @@ impl ModuleGraph {
             ModuleNode {
                 module,
                 dependencies: dependencies.clone(),
+                import_records,
                 compiled,
             },
         );
@@ -137,9 +249,53 @@ impl ModuleGraph {
         // Now recursively load dependencies
         // If any dependency tries to import us, we're already in the graph
         for dep in &dependencies {
-            let module_url = self.nodes.get(&resolved_url).map(|n| n.module.url.clone());
-            if let Some(url) = module_url {
-                Box::pin(self.load_recursive(dep, Some(&url), visited, stack)).await?;
+            let dep_context = if importer_type.is_commonjs() {
+                ImportContext::CJS
+            } else {
+                ImportContext::ESM
+            };
+            Box::pin(self.load_recursive(
+                dep,
+                Some(&module_url),
+                dep_context,
+                visited,
+                stack,
+            ))
+            .await?;
+        }
+
+        // Update wrapping flags now that we know the imported module types
+        // First, collect the module types of dependencies
+        let dep_types: HashMap<String, ModuleType> = {
+            let node = self.nodes.get(&resolved_url);
+            if let Some(n) = node {
+                n.import_records
+                    .iter()
+                    .filter_map(|r| {
+                        r.resolved_url.as_ref().and_then(|url| {
+                            self.nodes.get(url).map(|dep| (url.clone(), dep.module.module_type))
+                        })
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            }
+        };
+
+        // Then update the wrapping flags
+        if let Some(node) = self.nodes.get_mut(&resolved_url) {
+            for record in &mut node.import_records {
+                if let Some(ref dep_url) = record.resolved_url {
+                    if let Some(&imported_type) = dep_types.get(dep_url) {
+                        // ESM importing CJS -> needs __toESM
+                        record.wrap_with_to_esm =
+                            importer_type.is_esm() && imported_type.is_commonjs();
+
+                        // CJS requiring ESM -> needs __toCommonJS
+                        record.wrap_with_to_commonjs =
+                            importer_type.is_commonjs() && imported_type.is_esm();
+                    }
+                }
             }
         }
 
@@ -187,10 +343,25 @@ impl ModuleGraph {
 
         if let Some(node) = self.nodes.get(specifier) {
             // First visit all dependencies
-            for dep in &node.dependencies {
-                // Resolve the dependency to its canonical URL
-                if let Ok(resolved) = self.loader.resolve(dep, Some(specifier))
-                    && let Some(key) = self.nodes.keys().find(|k| **k == resolved)
+            for record in &node.import_records {
+                // Prefer the resolved URL captured during graph loading.
+                if let Some(dep_url) = record.resolved_url.as_deref()
+                    && self.nodes.contains_key(dep_url)
+                {
+                    self.visit_for_order(dep_url, visited, order);
+                    continue;
+                }
+
+                // Fallback: resolve now with the correct context.
+                let context = if record.is_require {
+                    ImportContext::CJS
+                } else {
+                    ImportContext::ESM
+                };
+                if let Ok(resolved) =
+                    self.loader
+                        .resolve_with_context(&record.specifier, Some(specifier), context)
+                    && let Some(key) = self.nodes.keys().find(|k| k.as_str() == resolved)
                 {
                     self.visit_for_order(key, visited, order);
                 }

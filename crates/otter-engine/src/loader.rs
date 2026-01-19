@@ -6,6 +6,7 @@
 //! - `https://` URLs for remote modules (with allowlist-based security)
 
 use otter_runtime::{JscError, JscResult};
+use otter_runtime::normalize_node_builtin;
 use oxc_resolver::{ResolveOptions, Resolver};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,8 +31,16 @@ pub struct LoaderConfig {
     /// File extensions to resolve
     pub extensions: Vec<String>,
 
-    /// Condition names for package.json exports
+    /// Condition names for package.json exports (legacy, used for ESM)
     pub condition_names: Vec<String>,
+
+    /// Condition names for ESM imports (import/export statements)
+    /// e.g., ["import", "module", "node", "default"]
+    pub esm_conditions: Vec<String>,
+
+    /// Condition names for CJS requires (require() calls)
+    /// e.g., ["require", "node", "default"]
+    pub cjs_conditions: Vec<String>,
 }
 
 impl Default for LoaderConfig {
@@ -56,7 +65,17 @@ impl Default for LoaderConfig {
                 ".mts".into(),
                 ".json".into(),
             ],
+            // Legacy field - keep for backward compatibility
             condition_names: vec!["import".into(), "module".into(), "default".into()],
+            // ESM: prefer "import" and "module" entry points
+            esm_conditions: vec![
+                "import".into(),
+                "module".into(),
+                "node".into(),
+                "default".into(),
+            ],
+            // CJS: prefer "require" entry points
+            cjs_conditions: vec!["require".into(), "node".into(), "default".into()],
         }
     }
 }
@@ -109,32 +128,69 @@ impl ModuleType {
     }
 }
 
+/// Import context for resolution
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImportContext {
+    /// ESM import (import/export statements)
+    #[default]
+    ESM,
+    /// CommonJS require (require() calls)
+    CJS,
+}
+
 /// Module loader with caching and oxc-resolver integration
 pub struct ModuleLoader {
     config: LoaderConfig,
-    resolver: Resolver,
+    /// Resolver for ESM imports (uses esm_conditions)
+    esm_resolver: Resolver,
+    /// Resolver for CJS requires (uses cjs_conditions)
+    cjs_resolver: Resolver,
     cache: Arc<RwLock<HashMap<String, ResolvedModule>>>,
 }
 
 impl ModuleLoader {
     pub fn new(config: LoaderConfig) -> Self {
-        let resolve_options = ResolveOptions {
+        // ESM resolver with "import", "module" conditions
+        let esm_options = ResolveOptions {
             extensions: config.extensions.clone(),
-            condition_names: config.condition_names.clone(),
+            condition_names: config.esm_conditions.clone(),
+            ..ResolveOptions::default()
+        };
+
+        // CJS resolver with "require" conditions
+        let cjs_options = ResolveOptions {
+            extensions: config.extensions.clone(),
+            condition_names: config.cjs_conditions.clone(),
             ..ResolveOptions::default()
         };
 
         Self {
+            esm_resolver: Resolver::new(esm_options),
+            cjs_resolver: Resolver::new(cjs_options),
             config,
-            resolver: Resolver::new(resolve_options),
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Resolve and load a module
+    /// Resolve and load a module (uses ESM conditions by default)
     pub async fn load(&self, specifier: &str, referrer: Option<&str>) -> JscResult<ResolvedModule> {
-        // Check cache first
-        let cache_key = format!("{}|{}", specifier, referrer.unwrap_or(""));
+        self.load_with_context(specifier, referrer, ImportContext::ESM)
+            .await
+    }
+
+    /// Resolve and load a module with explicit import context
+    pub async fn load_with_context(
+        &self,
+        specifier: &str,
+        referrer: Option<&str>,
+        context: ImportContext,
+    ) -> JscResult<ResolvedModule> {
+        // Check cache first (include context in key for different resolutions)
+        let context_str = match context {
+            ImportContext::ESM => "esm",
+            ImportContext::CJS => "cjs",
+        };
+        let cache_key = format!("{}|{}|{}", specifier, referrer.unwrap_or(""), context_str);
         {
             let cache = self.cache.read().await;
             if let Some(module) = cache.get(&cache_key) {
@@ -142,8 +198,8 @@ impl ModuleLoader {
             }
         }
 
-        // Resolve the specifier
-        let resolved_url = self.resolve(specifier, referrer)?;
+        // Resolve the specifier with context
+        let resolved_url = self.resolve_with_context(specifier, referrer, context)?;
 
         // Load the module
         let module = self.load_url(&resolved_url).await?;
@@ -157,11 +213,30 @@ impl ModuleLoader {
         Ok(module)
     }
 
-    /// Resolve a module specifier to a URL or file path
+    /// Resolve a module specifier to a URL or file path (uses ESM conditions by default)
     pub fn resolve(&self, specifier: &str, referrer: Option<&str>) -> JscResult<String> {
+        self.resolve_with_context(specifier, referrer, ImportContext::ESM)
+    }
+
+    /// Resolve a module specifier for a require() call (uses CJS conditions)
+    pub fn resolve_require(&self, specifier: &str, referrer: Option<&str>) -> JscResult<String> {
+        self.resolve_with_context(specifier, referrer, ImportContext::CJS)
+    }
+
+    /// Resolve a module specifier with explicit import context
+    ///
+    /// The context determines which package.json exports conditions are used:
+    /// - ESM: ["import", "module", "node", "default"]
+    /// - CJS: ["require", "node", "default"]
+    pub fn resolve_with_context(
+        &self,
+        specifier: &str,
+        referrer: Option<&str>,
+        context: ImportContext,
+    ) -> JscResult<String> {
         // Check import map first
         if let Some(mapped) = self.config.import_map.get(specifier) {
-            return self.resolve(mapped, referrer);
+            return self.resolve_with_context(mapped, referrer, context);
         }
 
         // Otter built-in modules
@@ -174,10 +249,18 @@ impl ModuleLoader {
 
         // Node.js built-in modules
         if specifier.starts_with("node:") {
-            return Ok(specifier.to_string());
+            let Some(name) = normalize_node_builtin(specifier) else {
+                return Err(JscError::ModuleError(format!(
+                    "Unsupported Node.js builtin module '{}'.\n\
+Only known node:* builtins are allowed for compatibility.\n\
+If you meant to import an npm package, remove the 'node:' prefix.",
+                    specifier
+                )));
+            };
+            return Ok(format!("node:{}", name));
         }
-        if is_supported_node_builtin(specifier) {
-            return Ok(format!("node:{}", specifier));
+        if let Some(name) = normalize_node_builtin(specifier) {
+            return Ok(format!("node:{}", name));
         }
 
         // Absolute URLs (https://, http://)
@@ -198,7 +281,13 @@ impl ModuleLoader {
             })
             .unwrap_or_else(|| self.config.base_dir.clone());
 
-        match self.resolver.resolve(&base_dir, specifier) {
+        // Select resolver based on import context
+        let resolver = match context {
+            ImportContext::ESM => &self.esm_resolver,
+            ImportContext::CJS => &self.cjs_resolver,
+        };
+
+        match resolver.resolve(&base_dir, specifier) {
             Ok(resolution) => {
                 let path = resolution.full_path();
                 Ok(format!("file://{}", path.display()))
@@ -444,37 +533,6 @@ impl ModuleLoader {
     }
 }
 
-fn is_supported_node_builtin(specifier: &str) -> bool {
-    matches!(
-        specifier,
-        "assert"
-            | "buffer"
-            | "child_process"
-            | "crypto"
-            | "dgram"
-            | "dns"
-            | "events"
-            | "fs"
-            | "http"
-            | "http2"
-            | "https"
-            | "net"
-            | "os"
-            | "path"
-            | "process"
-            | "querystring"
-            | "readline"
-            | "stream"
-            | "stream/promises"
-            | "string_decoder"
-            | "test"
-            | "tty"
-            | "url"
-            | "util"
-            | "zlib"
-    )
-}
-
 /// Check if a specifier is an Otter built-in module
 fn is_otter_builtin(specifier: &str) -> bool {
     matches!(specifier, "otter")
@@ -514,6 +572,27 @@ mod tests {
         let loader = ModuleLoader::new(LoaderConfig::default());
         let result = loader.resolve("util", None).unwrap();
         assert_eq!(result, "node:util");
+    }
+
+    #[test]
+    fn test_resolve_supported_node_builtin_subpath_bare() {
+        let loader = ModuleLoader::new(LoaderConfig::default());
+        let result = loader.resolve("fs/promises", None).unwrap();
+        assert_eq!(result, "node:fs/promises");
+    }
+
+    #[test]
+    fn test_resolve_supported_node_builtin_subpath_prefixed() {
+        let loader = ModuleLoader::new(LoaderConfig::default());
+        let result = loader.resolve("node:fs/promises", None).unwrap();
+        assert_eq!(result, "node:fs/promises");
+    }
+
+    #[test]
+    fn test_resolve_unknown_node_builtin_rejected() {
+        let loader = ModuleLoader::new(LoaderConfig::default());
+        let result = loader.resolve("node:not_a_real_builtin", None);
+        assert!(result.is_err());
     }
 
     #[test]

@@ -224,6 +224,823 @@ pub fn extension() -> Extension {
                 let buf2 = buffer::Buffer::from_bytes(&buf2_data);
                 Ok(json!(buf1.compare(&buf2)))
             }),
+            op_sync("copy", |_ctx, args| {
+                let source_data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let mut target_data: Vec<u8> = args
+                    .get(1)
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let target_start = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let source_start = args.get(3).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let source_end = args
+                    .get(4)
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(source_data.len());
+
+                let source = buffer::Buffer::from_bytes(&source_data);
+                let mut target = buffer::Buffer::from_bytes(&target_data);
+                let copied = source.copy_to(&mut target, target_start, source_start, source_end);
+
+                Ok(json!({
+                    "copied": copied,
+                    "targetData": target.as_bytes(),
+                }))
+            }),
+            op_sync("fill", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let len = data.len();
+                let mut buf = buffer::Buffer::from_bytes(&data);
+
+                let value = args.get(1);
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let end = args.get(3).and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(len);
+                let encoding = args.get(4).and_then(|v| v.as_str()).unwrap_or("utf8");
+
+                if let Some(v) = value {
+                    if let Some(n) = v.as_u64() {
+                        buf.fill(n as u8, offset, end);
+                    } else if let Some(s) = v.as_str() {
+                        buf.fill_string(s, encoding, offset, end);
+                    }
+                }
+
+                Ok(json!({
+                    "type": "Buffer",
+                    "data": buf.as_bytes(),
+                }))
+            }),
+            op_sync("indexOf", |_ctx, args| {
+                let buf_data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let value = args.get(1);
+                let byte_offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let encoding = args.get(3).and_then(|v| v.as_str()).unwrap_or("utf8");
+
+                let search_bytes: Vec<u8> = if let Some(v) = value {
+                    if let Some(n) = v.as_u64() {
+                        vec![n as u8]
+                    } else if let Some(s) = v.as_str() {
+                        match encoding {
+                            "base64" => base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).unwrap_or_default(),
+                            "hex" => hex::decode(s).unwrap_or_default(),
+                            _ => s.as_bytes().to_vec(),
+                        }
+                    } else if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+                        arr.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect()
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    vec![]
+                };
+
+                let buf = buffer::Buffer::from_bytes(&buf_data);
+                match buf.index_of(&search_bytes, byte_offset) {
+                    Some(idx) => Ok(json!(idx)),
+                    None => Ok(json!(-1)),
+                }
+            }),
+            op_sync("lastIndexOf", |_ctx, args| {
+                let buf_data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let value = args.get(1);
+                let byte_offset = args.get(2).and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(buf_data.len());
+                let encoding = args.get(3).and_then(|v| v.as_str()).unwrap_or("utf8");
+
+                let search_bytes: Vec<u8> = if let Some(v) = value {
+                    if let Some(n) = v.as_u64() {
+                        vec![n as u8]
+                    } else if let Some(s) = v.as_str() {
+                        match encoding {
+                            "base64" => base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).unwrap_or_default(),
+                            "hex" => hex::decode(s).unwrap_or_default(),
+                            _ => s.as_bytes().to_vec(),
+                        }
+                    } else if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+                        arr.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect()
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    vec![]
+                };
+
+                let buf = buffer::Buffer::from_bytes(&buf_data);
+                match buf.last_index_of(&search_bytes, byte_offset) {
+                    Some(idx) => Ok(json!(idx)),
+                    None => Ok(json!(-1)),
+                }
+            }),
+            op_sync("includes", |_ctx, args| {
+                let buf_data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let value = args.get(1);
+                let byte_offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let encoding = args.get(3).and_then(|v| v.as_str()).unwrap_or("utf8");
+
+                let search_bytes: Vec<u8> = if let Some(v) = value {
+                    if let Some(n) = v.as_u64() {
+                        vec![n as u8]
+                    } else if let Some(s) = v.as_str() {
+                        match encoding {
+                            "base64" => base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).unwrap_or_default(),
+                            "hex" => hex::decode(s).unwrap_or_default(),
+                            _ => s.as_bytes().to_vec(),
+                        }
+                    } else if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+                        arr.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect()
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    vec![]
+                };
+
+                let buf = buffer::Buffer::from_bytes(&buf_data);
+                Ok(json!(buf.includes(&search_bytes, byte_offset)))
+            }),
+            op_sync("write", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let string = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let length = args.get(3).and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(data.len().saturating_sub(offset));
+                let encoding = args.get(4).and_then(|v| v.as_str()).unwrap_or("utf8");
+
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                let written = buf.write(string, offset, length, encoding);
+
+                Ok(json!({
+                    "written": written,
+                    "data": buf.as_bytes(),
+                }))
+            }),
+            op_sync("swap16", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                buf.swap16().map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+
+                Ok(json!({
+                    "type": "Buffer",
+                    "data": buf.as_bytes(),
+                }))
+            }),
+            op_sync("swap32", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                buf.swap32().map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+
+                Ok(json!({
+                    "type": "Buffer",
+                    "data": buf.as_bytes(),
+                }))
+            }),
+            op_sync("swap64", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                buf.swap64().map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+
+                Ok(json!({
+                    "type": "Buffer",
+                    "data": buf.as_bytes(),
+                }))
+            }),
+            // Read methods
+            op_sync("readUInt8", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_uint8(offset) {
+                    Some(v) => Ok(json!(v)),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readInt8", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_int8(offset) {
+                    Some(v) => Ok(json!(v)),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readUInt16LE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_uint16_le(offset) {
+                    Some(v) => Ok(json!(v)),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readUInt16BE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_uint16_be(offset) {
+                    Some(v) => Ok(json!(v)),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readInt16LE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_int16_le(offset) {
+                    Some(v) => Ok(json!(v)),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readInt16BE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_int16_be(offset) {
+                    Some(v) => Ok(json!(v)),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readUInt32LE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_uint32_le(offset) {
+                    Some(v) => Ok(json!(v)),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readUInt32BE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_uint32_be(offset) {
+                    Some(v) => Ok(json!(v)),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readInt32LE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_int32_le(offset) {
+                    Some(v) => Ok(json!(v)),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readInt32BE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_int32_be(offset) {
+                    Some(v) => Ok(json!(v)),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readFloatLE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_float_le(offset) {
+                    Some(v) => Ok(json!(v)),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readFloatBE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_float_be(offset) {
+                    Some(v) => Ok(json!(v)),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readDoubleLE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_double_le(offset) {
+                    Some(v) => Ok(json!(v)),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readDoubleBE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_double_be(offset) {
+                    Some(v) => Ok(json!(v)),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readBigInt64LE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_big_int64_le(offset) {
+                    Some(v) => Ok(json!(v.to_string())),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readBigInt64BE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_big_int64_be(offset) {
+                    Some(v) => Ok(json!(v.to_string())),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readBigUInt64LE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_big_uint64_le(offset) {
+                    Some(v) => Ok(json!(v.to_string())),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            op_sync("readBigUInt64BE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let buf = buffer::Buffer::from_bytes(&data);
+                match buf.read_big_uint64_be(offset) {
+                    Some(v) => Ok(json!(v.to_string())),
+                    None => Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE")),
+                }
+            }),
+            // Write methods
+            op_sync("writeUInt8", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_uint8(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 1 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeInt8", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as i8;
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_int8(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 1 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeUInt16LE", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_uint16_le(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 2 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeUInt16BE", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_uint16_be(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 2 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeInt16LE", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as i16;
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_int16_le(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 2 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeInt16BE", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as i16;
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_int16_be(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 2 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeUInt32LE", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_uint32_le(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 4 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeUInt32BE", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_uint32_be(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 4 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeInt32LE", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_int32_le(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 4 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeInt32BE", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_int32_be(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 4 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeFloatLE", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_float_le(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 4 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeFloatBE", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_float_be(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 4 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeDoubleLE", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_double_le(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 8 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeDoubleBE", |_ctx, args| {
+                let mut data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_double_be(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 8 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeBigInt64LE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_big_int64_le(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 8 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeBigInt64BE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_big_int64_be(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 8 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeBigUInt64LE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_big_uint64_le(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 8 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
+            op_sync("writeBigUInt64BE", |_ctx, args| {
+                let data: Vec<u8> = args
+                    .first()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default();
+                let value = args.get(1).and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut buf = buffer::Buffer::from_bytes(&data);
+                if buf.write_big_uint64_be(value, offset) {
+                    Ok(json!({ "type": "Buffer", "data": buf.as_bytes(), "offset": offset + 8 }))
+                } else {
+                    Err(otter_runtime::error::JscError::internal("ERR_OUT_OF_RANGE"))
+                }
+            }),
         ])
         .with_js(include_str!("buffer.js"))
 }

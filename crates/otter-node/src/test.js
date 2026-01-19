@@ -374,8 +374,7 @@
     };
     testModule.default = testModule;
 
-    if (globalThis.__registerModule) {
-        globalThis.__registerModule('test', testModule);
-        globalThis.__registerModule('node:test', testModule);
+    if (globalThis.__registerNodeBuiltin) {
+        globalThis.__registerNodeBuiltin('test', testModule);
     }
 })();

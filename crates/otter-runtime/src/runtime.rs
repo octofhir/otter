@@ -56,7 +56,7 @@ impl JscRuntime {
         register_apis_with_config(context.raw(), config.enable_console)?;
 
         // Register runtime bootstrap (module registry helpers, etc.)
-        register_bootstrap(context.raw())?;
+        register_bootstrap(&context)?;
 
         Ok(Self { context, config })
     }

@@ -409,16 +409,16 @@ impl RunCommand {
 
             for url in &execution_order {
                 // Skip built-in modules (node: and otter:) - they have no source
-                // and are resolved via __otter_node_builtins
+                // and are resolved via __otter_get_node_builtin
                 if url.starts_with("node:") || url.starts_with("otter:") {
                     continue;
                 }
                 if let Some(node) = graph.get(url) {
                     // Build dependency map for this module
                     let mut deps = HashMap::new();
-                    for dep_specifier in &node.dependencies {
-                        if let Ok(resolved) = loader.resolve(dep_specifier, Some(url)) {
-                            deps.insert(dep_specifier.clone(), resolved);
+                    for record in &node.import_records {
+                        if let Some(resolved) = record.resolved_url.clone() {
+                            deps.insert(record.specifier.clone(), resolved);
                         }
                     }
                     let is_cjs = node.is_commonjs();
@@ -580,6 +580,7 @@ impl RunCommand {
         let setup = format!(
             "{hmr_code}\n\
              {process_setup}\n\
+             globalThis.__otter_lock_builtins && globalThis.__otter_lock_builtins();\n\
              globalThis.Otter = globalThis.Otter || {{}};\n\
              globalThis.Otter.args = {};\n\
              globalThis.Otter.capabilities = {};\n",
@@ -926,6 +927,8 @@ fn build_loader_config(entry: &Path, modules: &ModulesConfig) -> LoaderConfig {
         import_map: modules.import_map.clone(),
         extensions: default.extensions,
         condition_names: default.condition_names,
+        esm_conditions: default.esm_conditions,
+        cjs_conditions: default.cjs_conditions,
     }
 }
 

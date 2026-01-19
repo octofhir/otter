@@ -113,6 +113,15 @@ pub fn assert() -> Extension {
     crate::assert_ext::extension()
 }
 
+/// Create the async_hooks extension for async context tracking.
+///
+/// Provides Node.js-compatible async_hooks API (node:async_hooks).
+/// This is a stub implementation that provides the API surface
+/// needed for Express dependencies to work.
+pub fn async_hooks() -> Extension {
+    crate::async_hooks_ext::extension()
+}
+
 /// Create the querystring extension for query string parsing.
 ///
 /// Provides Node.js-compatible querystring API (node:querystring).
@@ -408,6 +417,7 @@ pub fn for_node_compat(config: ExtensionConfig) -> ExtensionsWithState {
         string_decoder(),
         readline(),
         os(),
+        async_hooks(),
         // IO
         fs(config.capabilities.clone()),
         process(),
@@ -517,6 +527,13 @@ mod tests {
     fn test_assert_extension() {
         let ext = assert();
         assert_eq!(ext.name(), "assert");
+        assert!(ext.js_code().is_some());
+    }
+
+    #[test]
+    fn test_async_hooks_extension() {
+        let ext = async_hooks();
+        assert_eq!(ext.name(), "async_hooks");
         assert!(ext.js_code().is_some());
     }
 
@@ -656,8 +673,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions();
         let result = for_node_compat(config);
 
-        // Should have 22 extensions (no http_server since no tx provided)
-        assert_eq!(result.extensions.len(), 22);
+        // Should have 23 extensions (no http_server since no tx provided)
+        assert_eq!(result.extensions.len(), 23);
         assert!(result.http_server_count.is_none());
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
@@ -685,8 +702,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions().http_event_tx(tx);
         let result = for_node_compat(config);
 
-        // Should have 23 extensions (including http_server)
-        assert_eq!(result.extensions.len(), 23);
+        // Should have 24 extensions (including http_server)
+        assert_eq!(result.extensions.len(), 24);
         assert!(result.http_server_count.is_some());
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
@@ -698,8 +715,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions();
         let result = for_full(config);
 
-        // Should have 23 extensions (node_compat 22 + test)
-        assert_eq!(result.extensions.len(), 23);
+        // Should have 24 extensions (node_compat 23 + test)
+        assert_eq!(result.extensions.len(), 24);
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
         assert!(names.contains(&"test"));
@@ -711,8 +728,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions().http_event_tx(tx);
         let result = for_full(config);
 
-        // Should have 24 extensions (all)
-        assert_eq!(result.extensions.len(), 24);
+        // Should have 25 extensions (all)
+        assert_eq!(result.extensions.len(), 25);
         assert!(result.http_server_count.is_some());
     }
 }

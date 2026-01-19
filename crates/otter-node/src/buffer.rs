@@ -166,6 +166,517 @@ impl Buffer {
             false
         }
     }
+
+    /// Fill buffer with value.
+    pub fn fill(&mut self, value: u8, start: usize, end: usize) {
+        let end = end.min(self.data.len());
+        let start = start.min(end);
+        for i in start..end {
+            self.data[i] = value;
+        }
+    }
+
+    /// Fill buffer with string value.
+    pub fn fill_string(&mut self, value: &str, encoding: &str, start: usize, end: usize) {
+        let end = end.min(self.data.len());
+        let start = start.min(end);
+        let fill_bytes = match encoding {
+            "base64" => general_purpose::STANDARD.decode(value).unwrap_or_default(),
+            "hex" => hex::decode(value).unwrap_or_default(),
+            _ => value.as_bytes().to_vec(),
+        };
+        if fill_bytes.is_empty() {
+            return;
+        }
+        let mut j = 0;
+        for i in start..end {
+            self.data[i] = fill_bytes[j % fill_bytes.len()];
+            j += 1;
+        }
+    }
+
+    /// Find index of value in buffer.
+    pub fn index_of(&self, value: &[u8], byte_offset: usize) -> Option<usize> {
+        if value.is_empty() || byte_offset >= self.data.len() {
+            return if value.is_empty() && byte_offset <= self.data.len() {
+                Some(byte_offset)
+            } else {
+                None
+            };
+        }
+        self.data[byte_offset..]
+            .windows(value.len())
+            .position(|window| window == value)
+            .map(|pos| pos + byte_offset)
+    }
+
+    /// Find last index of value in buffer.
+    pub fn last_index_of(&self, value: &[u8], byte_offset: usize) -> Option<usize> {
+        if value.is_empty() {
+            return Some(byte_offset.min(self.data.len()));
+        }
+        if value.len() > self.data.len() {
+            return None;
+        }
+        let search_end = (byte_offset + 1).min(self.data.len() - value.len() + 1);
+        self.data[..search_end]
+            .windows(value.len())
+            .rposition(|window| window == value)
+    }
+
+    /// Check if buffer includes value.
+    pub fn includes(&self, value: &[u8], byte_offset: usize) -> bool {
+        self.index_of(value, byte_offset).is_some()
+    }
+
+    /// Swap bytes in 16-bit units.
+    pub fn swap16(&mut self) -> Result<(), BufferError> {
+        if self.data.len() % 2 != 0 {
+            return Err(BufferError::InvalidEncoding(
+                "Buffer size must be a multiple of 16-bits".to_string(),
+            ));
+        }
+        for chunk in self.data.chunks_exact_mut(2) {
+            chunk.swap(0, 1);
+        }
+        Ok(())
+    }
+
+    /// Swap bytes in 32-bit units.
+    pub fn swap32(&mut self) -> Result<(), BufferError> {
+        if self.data.len() % 4 != 0 {
+            return Err(BufferError::InvalidEncoding(
+                "Buffer size must be a multiple of 32-bits".to_string(),
+            ));
+        }
+        for chunk in self.data.chunks_exact_mut(4) {
+            chunk.reverse();
+        }
+        Ok(())
+    }
+
+    /// Swap bytes in 64-bit units.
+    pub fn swap64(&mut self) -> Result<(), BufferError> {
+        if self.data.len() % 8 != 0 {
+            return Err(BufferError::InvalidEncoding(
+                "Buffer size must be a multiple of 64-bits".to_string(),
+            ));
+        }
+        for chunk in self.data.chunks_exact_mut(8) {
+            chunk.reverse();
+        }
+        Ok(())
+    }
+
+    /// Write string to buffer at offset.
+    pub fn write(&mut self, string: &str, offset: usize, length: usize, encoding: &str) -> usize {
+        let bytes = match encoding {
+            "base64" => general_purpose::STANDARD.decode(string).unwrap_or_default(),
+            "hex" => hex::decode(string).unwrap_or_default(),
+            _ => string.as_bytes().to_vec(),
+        };
+        let write_len = length.min(bytes.len()).min(self.data.len().saturating_sub(offset));
+        for i in 0..write_len {
+            if offset + i < self.data.len() {
+                self.data[offset + i] = bytes[i];
+            }
+        }
+        write_len
+    }
+
+    // Read methods
+    pub fn read_uint8(&self, offset: usize) -> Option<u8> {
+        self.data.get(offset).copied()
+    }
+
+    pub fn read_int8(&self, offset: usize) -> Option<i8> {
+        self.data.get(offset).map(|&b| b as i8)
+    }
+
+    pub fn read_uint16_le(&self, offset: usize) -> Option<u16> {
+        if offset + 2 > self.data.len() {
+            return None;
+        }
+        Some(u16::from_le_bytes([self.data[offset], self.data[offset + 1]]))
+    }
+
+    pub fn read_uint16_be(&self, offset: usize) -> Option<u16> {
+        if offset + 2 > self.data.len() {
+            return None;
+        }
+        Some(u16::from_be_bytes([self.data[offset], self.data[offset + 1]]))
+    }
+
+    pub fn read_int16_le(&self, offset: usize) -> Option<i16> {
+        if offset + 2 > self.data.len() {
+            return None;
+        }
+        Some(i16::from_le_bytes([self.data[offset], self.data[offset + 1]]))
+    }
+
+    pub fn read_int16_be(&self, offset: usize) -> Option<i16> {
+        if offset + 2 > self.data.len() {
+            return None;
+        }
+        Some(i16::from_be_bytes([self.data[offset], self.data[offset + 1]]))
+    }
+
+    pub fn read_uint32_le(&self, offset: usize) -> Option<u32> {
+        if offset + 4 > self.data.len() {
+            return None;
+        }
+        Some(u32::from_le_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+            self.data[offset + 2],
+            self.data[offset + 3],
+        ]))
+    }
+
+    pub fn read_uint32_be(&self, offset: usize) -> Option<u32> {
+        if offset + 4 > self.data.len() {
+            return None;
+        }
+        Some(u32::from_be_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+            self.data[offset + 2],
+            self.data[offset + 3],
+        ]))
+    }
+
+    pub fn read_int32_le(&self, offset: usize) -> Option<i32> {
+        if offset + 4 > self.data.len() {
+            return None;
+        }
+        Some(i32::from_le_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+            self.data[offset + 2],
+            self.data[offset + 3],
+        ]))
+    }
+
+    pub fn read_int32_be(&self, offset: usize) -> Option<i32> {
+        if offset + 4 > self.data.len() {
+            return None;
+        }
+        Some(i32::from_be_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+            self.data[offset + 2],
+            self.data[offset + 3],
+        ]))
+    }
+
+    pub fn read_float_le(&self, offset: usize) -> Option<f32> {
+        if offset + 4 > self.data.len() {
+            return None;
+        }
+        Some(f32::from_le_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+            self.data[offset + 2],
+            self.data[offset + 3],
+        ]))
+    }
+
+    pub fn read_float_be(&self, offset: usize) -> Option<f32> {
+        if offset + 4 > self.data.len() {
+            return None;
+        }
+        Some(f32::from_be_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+            self.data[offset + 2],
+            self.data[offset + 3],
+        ]))
+    }
+
+    pub fn read_double_le(&self, offset: usize) -> Option<f64> {
+        if offset + 8 > self.data.len() {
+            return None;
+        }
+        Some(f64::from_le_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+            self.data[offset + 2],
+            self.data[offset + 3],
+            self.data[offset + 4],
+            self.data[offset + 5],
+            self.data[offset + 6],
+            self.data[offset + 7],
+        ]))
+    }
+
+    pub fn read_double_be(&self, offset: usize) -> Option<f64> {
+        if offset + 8 > self.data.len() {
+            return None;
+        }
+        Some(f64::from_be_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+            self.data[offset + 2],
+            self.data[offset + 3],
+            self.data[offset + 4],
+            self.data[offset + 5],
+            self.data[offset + 6],
+            self.data[offset + 7],
+        ]))
+    }
+
+    pub fn read_big_int64_le(&self, offset: usize) -> Option<i64> {
+        if offset + 8 > self.data.len() {
+            return None;
+        }
+        Some(i64::from_le_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+            self.data[offset + 2],
+            self.data[offset + 3],
+            self.data[offset + 4],
+            self.data[offset + 5],
+            self.data[offset + 6],
+            self.data[offset + 7],
+        ]))
+    }
+
+    pub fn read_big_int64_be(&self, offset: usize) -> Option<i64> {
+        if offset + 8 > self.data.len() {
+            return None;
+        }
+        Some(i64::from_be_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+            self.data[offset + 2],
+            self.data[offset + 3],
+            self.data[offset + 4],
+            self.data[offset + 5],
+            self.data[offset + 6],
+            self.data[offset + 7],
+        ]))
+    }
+
+    pub fn read_big_uint64_le(&self, offset: usize) -> Option<u64> {
+        if offset + 8 > self.data.len() {
+            return None;
+        }
+        Some(u64::from_le_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+            self.data[offset + 2],
+            self.data[offset + 3],
+            self.data[offset + 4],
+            self.data[offset + 5],
+            self.data[offset + 6],
+            self.data[offset + 7],
+        ]))
+    }
+
+    pub fn read_big_uint64_be(&self, offset: usize) -> Option<u64> {
+        if offset + 8 > self.data.len() {
+            return None;
+        }
+        Some(u64::from_be_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+            self.data[offset + 2],
+            self.data[offset + 3],
+            self.data[offset + 4],
+            self.data[offset + 5],
+            self.data[offset + 6],
+            self.data[offset + 7],
+        ]))
+    }
+
+    // Write methods
+    pub fn write_uint8(&mut self, value: u8, offset: usize) -> bool {
+        if offset >= self.data.len() {
+            return false;
+        }
+        self.data[offset] = value;
+        true
+    }
+
+    pub fn write_int8(&mut self, value: i8, offset: usize) -> bool {
+        if offset >= self.data.len() {
+            return false;
+        }
+        self.data[offset] = value as u8;
+        true
+    }
+
+    pub fn write_uint16_le(&mut self, value: u16, offset: usize) -> bool {
+        if offset + 2 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_le_bytes();
+        self.data[offset] = bytes[0];
+        self.data[offset + 1] = bytes[1];
+        true
+    }
+
+    pub fn write_uint16_be(&mut self, value: u16, offset: usize) -> bool {
+        if offset + 2 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_be_bytes();
+        self.data[offset] = bytes[0];
+        self.data[offset + 1] = bytes[1];
+        true
+    }
+
+    pub fn write_int16_le(&mut self, value: i16, offset: usize) -> bool {
+        if offset + 2 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_le_bytes();
+        self.data[offset] = bytes[0];
+        self.data[offset + 1] = bytes[1];
+        true
+    }
+
+    pub fn write_int16_be(&mut self, value: i16, offset: usize) -> bool {
+        if offset + 2 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_be_bytes();
+        self.data[offset] = bytes[0];
+        self.data[offset + 1] = bytes[1];
+        true
+    }
+
+    pub fn write_uint32_le(&mut self, value: u32, offset: usize) -> bool {
+        if offset + 4 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_le_bytes();
+        for i in 0..4 {
+            self.data[offset + i] = bytes[i];
+        }
+        true
+    }
+
+    pub fn write_uint32_be(&mut self, value: u32, offset: usize) -> bool {
+        if offset + 4 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_be_bytes();
+        for i in 0..4 {
+            self.data[offset + i] = bytes[i];
+        }
+        true
+    }
+
+    pub fn write_int32_le(&mut self, value: i32, offset: usize) -> bool {
+        if offset + 4 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_le_bytes();
+        for i in 0..4 {
+            self.data[offset + i] = bytes[i];
+        }
+        true
+    }
+
+    pub fn write_int32_be(&mut self, value: i32, offset: usize) -> bool {
+        if offset + 4 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_be_bytes();
+        for i in 0..4 {
+            self.data[offset + i] = bytes[i];
+        }
+        true
+    }
+
+    pub fn write_float_le(&mut self, value: f32, offset: usize) -> bool {
+        if offset + 4 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_le_bytes();
+        for i in 0..4 {
+            self.data[offset + i] = bytes[i];
+        }
+        true
+    }
+
+    pub fn write_float_be(&mut self, value: f32, offset: usize) -> bool {
+        if offset + 4 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_be_bytes();
+        for i in 0..4 {
+            self.data[offset + i] = bytes[i];
+        }
+        true
+    }
+
+    pub fn write_double_le(&mut self, value: f64, offset: usize) -> bool {
+        if offset + 8 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_le_bytes();
+        for i in 0..8 {
+            self.data[offset + i] = bytes[i];
+        }
+        true
+    }
+
+    pub fn write_double_be(&mut self, value: f64, offset: usize) -> bool {
+        if offset + 8 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_be_bytes();
+        for i in 0..8 {
+            self.data[offset + i] = bytes[i];
+        }
+        true
+    }
+
+    pub fn write_big_int64_le(&mut self, value: i64, offset: usize) -> bool {
+        if offset + 8 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_le_bytes();
+        for i in 0..8 {
+            self.data[offset + i] = bytes[i];
+        }
+        true
+    }
+
+    pub fn write_big_int64_be(&mut self, value: i64, offset: usize) -> bool {
+        if offset + 8 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_be_bytes();
+        for i in 0..8 {
+            self.data[offset + i] = bytes[i];
+        }
+        true
+    }
+
+    pub fn write_big_uint64_le(&mut self, value: u64, offset: usize) -> bool {
+        if offset + 8 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_le_bytes();
+        for i in 0..8 {
+            self.data[offset + i] = bytes[i];
+        }
+        true
+    }
+
+    pub fn write_big_uint64_be(&mut self, value: u64, offset: usize) -> bool {
+        if offset + 8 > self.data.len() {
+            return false;
+        }
+        let bytes = value.to_be_bytes();
+        for i in 0..8 {
+            self.data[offset + i] = bytes[i];
+        }
+        true
+    }
 }
 
 impl std::ops::Index<usize> for Buffer {

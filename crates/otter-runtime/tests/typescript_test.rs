@@ -184,99 +184,45 @@ fn test_embedded_types_available() {
 
 #[test]
 fn test_get_otter_types() {
-    let otter_types = get_embedded_type("otter.d.ts");
-    assert!(otter_types.is_some(), "otter.d.ts should be embedded");
+    let otter_index = get_embedded_type("otter/index.d.ts");
+    assert!(otter_index.is_some(), "otter/index.d.ts should be embedded");
 
-    let content = otter_types.unwrap();
-    // Should contain our runtime APIs
-    assert!(content.contains("console"), "Should have console API");
-    assert!(content.contains("setTimeout"), "Should have timer APIs");
-    assert!(content.contains("fetch"), "Should have fetch API");
+    let content = otter_index.unwrap();
+    // Otter types reference @types/node for Web/Node globals.
+    assert!(
+        content.contains("reference types=\"node\""),
+        "Should reference @types/node"
+    );
+
+    // Spot-check that Otter module types are embedded.
+    let sql_types = get_embedded_type("otter/sql.d.ts");
+    assert!(sql_types.is_some(), "otter/sql.d.ts should be embedded");
+    assert!(
+        sql_types.unwrap().contains("declare module \"otter\""),
+        "Should declare \"otter\" module"
+    );
 }
 
 #[test]
 fn test_get_node_path_types() {
-    let path_types = get_embedded_type("node/path.d.ts");
-    assert!(path_types.is_some(), "node/path.d.ts should be embedded");
-
-    let content = path_types.unwrap();
-    assert!(
-        content.contains("node:path"),
-        "Should declare node:path module"
-    );
-    assert!(
-        content.contains("function join"),
-        "Should have join function"
-    );
-    assert!(
-        content.contains("function dirname"),
-        "Should have dirname function"
-    );
-    assert!(
-        content.contains("ParsedPath"),
-        "Should have ParsedPath interface"
-    );
+    // Node types are referenced via `/// <reference types="node" />` and are
+    // expected to be provided by the package manager (e.g. `@types/node`).
+    assert!(get_embedded_type("node/path.d.ts").is_none());
 }
 
 #[test]
 fn test_get_node_buffer_types() {
-    let buffer_types = get_embedded_type("node/buffer.d.ts");
-    assert!(
-        buffer_types.is_some(),
-        "node/buffer.d.ts should be embedded"
-    );
-
-    let content = buffer_types.unwrap();
-    assert!(
-        content.contains("node:buffer"),
-        "Should declare node:buffer module"
-    );
-    assert!(content.contains("class Buffer"), "Should have Buffer class");
-    assert!(content.contains("static alloc"), "Should have alloc method");
-    assert!(content.contains("static from"), "Should have from method");
+    assert!(get_embedded_type("node/buffer.d.ts").is_none());
 }
 
 #[test]
 fn test_get_node_fs_types() {
-    let fs_types = get_embedded_type("node/fs.d.ts");
-    assert!(fs_types.is_some(), "node/fs.d.ts should be embedded");
-
-    let content = fs_types.unwrap();
-    assert!(content.contains("node:fs"), "Should declare node:fs module");
-    assert!(content.contains("readFileSync"), "Should have readFileSync");
-    assert!(
-        content.contains("writeFileSync"),
-        "Should have writeFileSync"
-    );
-    assert!(
-        content.contains("node:fs/promises"),
-        "Should declare promises module"
-    );
+    assert!(get_embedded_type("node/fs.d.ts").is_none());
 }
 
 #[test]
 fn test_get_node_test_types() {
-    let test_types = get_embedded_type("node/test.d.ts");
-    assert!(test_types.is_some(), "node/test.d.ts should be embedded");
-
-    let content = test_types.unwrap();
-    assert!(
-        content.contains("node:test"),
-        "Should declare node:test module"
-    );
-    assert!(
-        content.contains("function describe"),
-        "Should have describe function"
-    );
-    assert!(content.contains("function it"), "Should have it function");
-    assert!(
-        content.contains("export const assert"),
-        "Should have assert object"
-    );
-    assert!(
-        content.contains("TestSummary"),
-        "Should have TestSummary interface"
-    );
+    assert!(get_embedded_type("node/test.d.ts").is_none());
 }
 
 // ============================================================================

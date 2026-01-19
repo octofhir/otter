@@ -18,18 +18,24 @@ mod tests {
 
     #[test]
     fn test_get_otter_types() {
-        let otter_types = get_embedded_type("otter.d.ts");
-        assert!(otter_types.is_some(), "otter.d.ts not found");
+        let otter_types = get_embedded_type("otter/index.d.ts");
+        assert!(otter_types.is_some(), "otter/index.d.ts not found");
 
         let contents = otter_types.unwrap();
-        assert!(contents.contains("console"), "Should contain console API");
-        assert!(contents.contains("setTimeout"), "Should contain timer APIs");
+        assert!(
+            contents.contains("reference types=\"node\""),
+            "Should reference @types/node"
+        );
+        assert!(
+            contents.contains("./globals.d.ts"),
+            "Should reference Otter globals"
+        );
     }
 
     #[test]
     fn test_list_embedded_types() {
         let types: Vec<_> = list_embedded_types().collect();
         assert!(!types.is_empty());
-        assert!(types.iter().any(|t| t.contains("otter.d.ts")));
+        assert!(types.iter().any(|t| t.contains("otter/index.d.ts")));
     }
 }

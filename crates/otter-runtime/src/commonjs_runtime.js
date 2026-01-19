@@ -14,16 +14,24 @@
     // Cache for __toCommonJS results
     var __moduleCache = new WeakMap();
 
-    // Lazy CommonJS wrapper with caching
+    // Lazy CommonJS wrapper with caching and thunk optimization
     // Usage: var require_foo = __commonJS((exports, module) => { ... });
     // Then: require_foo() returns module.exports
+    //
+    // Optimization: After first execution, replace the thunk with a simple getter
+    // to avoid the closure overhead on subsequent calls (like Bun does)
     globalThis.__commonJS = function(cb, mod) {
-        return function() {
+        var fn = function __cjs_thunk() {
             if (mod) return mod.exports;
             mod = { exports: {} };
             cb(mod.exports, mod);
+            // Replace thunk with simple getter after initialization
+            fn = function __cjs_getter() { return mod.exports; };
             return mod.exports;
         };
+        // Return stable wrapper that delegates to fn
+        // This allows fn to be replaced while maintaining the same reference
+        return function __cjs_wrapper() { return fn(); };
     };
 
     // Convert CommonJS module to ESM format
@@ -196,6 +204,16 @@
         var require = function(specifier) {
             var resolvedFromDeps, resolved, absolutePath, mod;
 
+            // Node.js builtins (strict allowlist + helpful errors)
+            if (globalThis.__otter_is_node_builtin && globalThis.__otter_is_node_builtin(specifier)) {
+                return globalThis.__otter_get_node_builtin(specifier);
+            }
+
+            // Otter builtins (e.g. "otter")
+            if (globalThis.__otter_is_otter_builtin && globalThis.__otter_is_otter_builtin(specifier)) {
+                return globalThis.__otter_get_otter_builtin(specifier);
+            }
+
             // First, check if we have a pre-resolved dependency from the bundler
             // This handles bare specifiers like 'combined-stream' that were resolved at bundle time
             if (deps[specifier]) {
@@ -208,11 +226,6 @@
                 if (globalThis.__otter_modules?.[resolvedFromDeps]) {
                     return globalThis.__toCommonJS(globalThis.__otter_modules[resolvedFromDeps]);
                 }
-                // Try with lazy loading
-                if (globalThis.__getModule) {
-                    mod = globalThis.__getModule(resolvedFromDeps);
-                    if (mod) return mod;
-                }
             }
 
             // Resolve relative paths to absolute paths
@@ -223,25 +236,6 @@
                 absolutePath = resolved;
                 // Convert to file:// URL for registry lookup
                 resolved = "file://" + resolved;
-            }
-
-            // Use __getModule for lazy loading support
-            if (globalThis.__getModule) {
-                mod = globalThis.__getModule(resolved);
-                if (mod) return mod;
-            }
-
-            // Fallback: Check if it's a node: built-in (direct access)
-            if (specifier.startsWith("node:")) {
-                var builtinName = specifier.slice(5);
-                if (globalThis.__otter_node_builtins && globalThis.__otter_node_builtins[builtinName]) {
-                    return globalThis.__otter_node_builtins[builtinName];
-                }
-            }
-
-            // Check bare builtin (without node: prefix)
-            if (globalThis.__otter_node_builtins && globalThis.__otter_node_builtins[specifier]) {
-                return globalThis.__otter_node_builtins[specifier];
             }
 
             // Try to find module with extension resolution
@@ -285,8 +279,9 @@
                     if (__jsonCache[jsonPath]) {
                         return __jsonCache[jsonPath];
                     }
+                    // If node:fs is not registered, throw a clear error.
+                    jsonFs = globalThis.__otter_get_node_builtin('fs');
                     try {
-                        jsonFs = globalThis.__otter_node_builtins && globalThis.__otter_node_builtins.fs;
                         if (jsonFs && jsonFs.readFileSync) {
                             jsonContent = jsonFs.readFileSync(jsonPath, 'utf8');
                             jsonData = JSON.parse(jsonContent);

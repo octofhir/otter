@@ -415,7 +415,8 @@ impl ModuleLoader {
         ModuleType::ESM
     }
 
-    /// Find the nearest package.json and return its "type" field value
+    /// Find the nearest package.json and return its "type" field value.
+    /// Returns "commonjs" if package.json exists but has no "type" field (Node.js default).
     fn find_package_type(&self, path: &Path) -> Option<String> {
         let mut current = path.parent()?;
 
@@ -429,8 +430,8 @@ impl ModuleLoader {
                         }
                     }
                 }
-                // Found package.json but no "type" field - stop searching
-                return None;
+                // Found package.json but no "type" field - Node.js defaults to CommonJS
+                return Some("commonjs".to_string());
             }
 
             match current.parent() {
@@ -446,18 +447,31 @@ impl ModuleLoader {
 fn is_supported_node_builtin(specifier: &str) -> bool {
     matches!(
         specifier,
-        "buffer"
+        "assert"
+            | "buffer"
             | "child_process"
             | "crypto"
+            | "dgram"
+            | "dns"
             | "events"
             | "fs"
             | "http"
+            | "http2"
+            | "https"
             | "net"
             | "os"
             | "path"
             | "process"
+            | "querystring"
+            | "readline"
+            | "stream"
+            | "stream/promises"
+            | "string_decoder"
             | "test"
+            | "tty"
+            | "url"
             | "util"
+            | "zlib"
     )
 }
 

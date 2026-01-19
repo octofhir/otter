@@ -508,6 +508,18 @@ impl RunCommand {
         timing!("ext_string_decoder");
         runtime.register_extension(ext::readline())?;
         timing!("ext_readline");
+        runtime.register_extension(ext::node_stream())?;
+        timing!("ext_node_stream");
+
+        // Register additional Node.js compatibility extensions
+        runtime.register_extension(ext::assert())?;
+        timing!("ext_assert");
+        runtime.register_extension(ext::zlib())?;
+        timing!("ext_zlib");
+        runtime.register_extension(ext::querystring())?;
+        timing!("ext_querystring");
+        // runtime.register_extension(ext::dgram())?;  // EventEmitter not available
+        // runtime.register_extension(ext::dns())?;
 
         // Register net extension for node:net (TCP server/socket)
         runtime.register_extension(ext::net())?;
@@ -522,6 +534,12 @@ impl RunCommand {
         // Must be loaded AFTER http_server_extension since it depends on Otter.serve()
         runtime.register_extension(ext::http())?;
         timing!("ext_http");
+        runtime.register_extension(ext::https())?;
+        timing!("ext_https");
+        runtime.register_extension(ext::http2())?;
+        timing!("ext_http2");
+        runtime.register_extension(ext::tty())?;
+        timing!("ext_tty");
 
         // Register SQL extension for "otter" module (sql, SQL)
         runtime.register_extension(sql_extension())?;

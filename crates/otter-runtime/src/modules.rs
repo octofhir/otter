@@ -432,8 +432,9 @@ pub struct ModuleInfo<'a> {
 pub fn bundle_modules_mixed(modules: Vec<ModuleInfo<'_>>) -> String {
     let mut result = String::new();
 
-    // Wrap everything in an async IIFE to support top-level await
-    result.push_str("(async () => {\n");
+    // NOTE: This function returns raw code without an async IIFE wrapper.
+    // The caller (run.rs) wraps everything in `(async () => { try { ... } catch { ... } })();`
+    // which provides the async context for top-level await support.
 
     // Initialize both module registries
     result.push_str("globalThis.__otter_modules = globalThis.__otter_modules || {};\n");
@@ -455,6 +456,7 @@ pub fn bundle_modules_mixed(modules: Vec<ModuleInfo<'_>>) -> String {
                     module.source,
                     dirname,
                     filename,
+                    module.dependencies,
                 );
                 result.push_str(&wrapped);
 
@@ -478,8 +480,6 @@ pub fn bundle_modules_mixed(modules: Vec<ModuleInfo<'_>>) -> String {
         }
         result.push('\n');
     }
-
-    result.push_str("})();\n");
 
     result
 }

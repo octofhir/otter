@@ -217,6 +217,21 @@ pub async fn rm(caps: &Capabilities, path: &str, recursive: bool) -> Result<(), 
     Ok(())
 }
 
+/// Unlink (remove) a file.
+pub async fn unlink(caps: &Capabilities, path: &str) -> Result<(), FsError> {
+    let path_buf = Path::new(path).to_path_buf();
+
+    if !caps.can_write(&path_buf) {
+        return Err(FsError::PermissionDenied(format!(
+            "write access to '{}'. Use --allow-write to grant permission.",
+            path
+        )));
+    }
+
+    fs::remove_file(&path_buf).await?;
+    Ok(())
+}
+
 /// Check if a path exists.
 pub async fn exists(caps: &Capabilities, path: &str) -> Result<bool, FsError> {
     let path_buf = Path::new(path).to_path_buf();

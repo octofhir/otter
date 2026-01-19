@@ -258,6 +258,29 @@ pub fn extension(capabilities: Capabilities) -> Extension {
         Ok(json!(null))
     }));
 
+    // unlinkSync (alias for rmSync for files)
+    let caps_unlink_sync = caps.clone();
+    ops.push(op_sync("unlinkSync", move |_ctx, args| {
+        let path = args
+            .first()
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| otter_runtime::error::JscError::internal("unlinkSync requires path"))?;
+
+        let path_buf = std::path::Path::new(path).to_path_buf();
+        if !caps_unlink_sync.can_write(&path_buf) {
+            return Err(otter_runtime::error::JscError::internal(format!(
+                "Permission denied: write access to '{}'",
+                path
+            )));
+        }
+
+        std::fs::remove_file(&path_buf).map_err(|e| {
+            otter_runtime::error::JscError::internal(format!("Failed to unlink '{}': {}", path, e))
+        })?;
+
+        Ok(json!(null))
+    }));
+
     // existsSync
     let caps_exists_sync = caps.clone();
     ops.push(op_sync("existsSync", move |_ctx, args| {
@@ -466,6 +489,24 @@ pub fn extension(capabilities: Capabilities) -> Extension {
                 .unwrap_or(false);
 
             fs::rm(&caps, path, recursive)
+                .await
+                .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+
+            Ok(json!(null))
+        }
+    }));
+
+    // unlink
+    let caps_unlink = caps.clone();
+    ops.push(op_async("unlink", move |_ctx, args| {
+        let caps = caps_unlink.clone();
+        async move {
+            let path = args
+                .first()
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| otter_runtime::error::JscError::internal("unlink requires path"))?;
+
+            fs::unlink(&caps, path)
                 .await
                 .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
 

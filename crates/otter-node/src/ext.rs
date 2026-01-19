@@ -148,6 +148,14 @@ pub fn readline() -> Extension {
     crate::readline_ext::extension()
 }
 
+/// Create the Node.js stream extension.
+///
+/// Provides Node.js-compatible stream classes (Readable, Writable, Duplex, Transform, PassThrough)
+/// and utility functions (pipeline, finished, compose).
+pub fn node_stream() -> Extension {
+    crate::node_stream_ext::extension()
+}
+
 // ============================================================================
 // IO Extensions (may require capabilities)
 // ============================================================================
@@ -185,6 +193,27 @@ pub fn process() -> Extension {
 /// Provides http.request and http.get methods.
 pub fn http() -> Extension {
     crate::http_ext::extension()
+}
+
+/// Create the HTTPS extension for HTTPS client functionality.
+///
+/// Provides https.request and https.get methods (TLS-encrypted HTTP).
+pub fn https() -> Extension {
+    crate::https_ext::extension()
+}
+
+/// Create the HTTP/2 extension (stub for compatibility).
+///
+/// HTTP/2 is not fully implemented; this provides basic exports for compatibility.
+pub fn http2() -> Extension {
+    crate::http2_ext::extension()
+}
+
+/// Create the TTY extension for terminal detection.
+///
+/// Provides isatty, ReadStream, and WriteStream.
+pub fn tty() -> Extension {
+    crate::tty_ext::extension()
 }
 
 // ============================================================================
@@ -384,6 +413,7 @@ pub fn for_node_compat(config: ExtensionConfig) -> ExtensionsWithState {
         process(),
         child_process(),
         streams(),
+        node_stream(),
         // Network
         http(),
         websocket(),
@@ -555,6 +585,13 @@ mod tests {
     }
 
     #[test]
+    fn test_node_stream_extension() {
+        let ext = node_stream();
+        assert_eq!(ext.name(), "node_stream");
+        assert!(ext.js_code().is_some());
+    }
+
+    #[test]
     fn test_http_server_extension() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (ext, _count) = http_server(tx);
@@ -619,8 +656,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions();
         let result = for_node_compat(config);
 
-        // Should have 21 extensions (no http_server since no tx provided)
-        assert_eq!(result.extensions.len(), 21);
+        // Should have 22 extensions (no http_server since no tx provided)
+        assert_eq!(result.extensions.len(), 22);
         assert!(result.http_server_count.is_none());
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
@@ -637,6 +674,7 @@ mod tests {
         assert!(names.contains(&"dgram"));
         assert!(names.contains(&"string_decoder"));
         assert!(names.contains(&"readline"));
+        assert!(names.contains(&"node_stream"));
         // No http_server without tx
         assert!(!names.contains(&"http_server"));
     }
@@ -647,8 +685,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions().http_event_tx(tx);
         let result = for_node_compat(config);
 
-        // Should have 22 extensions (including http_server)
-        assert_eq!(result.extensions.len(), 22);
+        // Should have 23 extensions (including http_server)
+        assert_eq!(result.extensions.len(), 23);
         assert!(result.http_server_count.is_some());
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
@@ -660,8 +698,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions();
         let result = for_full(config);
 
-        // Should have 22 extensions (node_compat 21 + test)
-        assert_eq!(result.extensions.len(), 22);
+        // Should have 23 extensions (node_compat 22 + test)
+        assert_eq!(result.extensions.len(), 23);
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
         assert!(names.contains(&"test"));
@@ -673,8 +711,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions().http_event_tx(tx);
         let result = for_full(config);
 
-        // Should have 23 extensions (all)
-        assert_eq!(result.extensions.len(), 23);
+        // Should have 24 extensions (all)
+        assert_eq!(result.extensions.len(), 24);
         assert!(result.http_server_count.is_some());
     }
 }

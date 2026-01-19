@@ -62,23 +62,32 @@ pub fn register_commonjs_runtime(ctx: JSContextRef) -> JscResult<()> {
 ///     module.exports = { foo: 1 };
 /// });
 /// ```
+///
+/// The `dependencies` map is passed to `__createRequire` so that bare specifiers
+/// like `require('combined-stream')` can be resolved to their full URLs.
 pub fn wrap_commonjs_module(
     module_id: &str,
     source: &str,
     dirname: &str,
     filename: &str,
+    dependencies: &std::collections::HashMap<String, String>,
 ) -> String {
+    // Serialize dependencies as JSON object for runtime resolution
+    let deps_json = serde_json::to_string(dependencies).unwrap_or_else(|_| "{}".to_string());
+
     format!(
         r#"globalThis.__otter_cjs_modules["{module_id}"] = __commonJS(function(exports, module) {{
     var __dirname = "{dirname}";
     var __filename = "{filename}";
-    var require = __createRequire(__dirname, __filename);
+    var __deps = {deps_json};
+    var require = __createRequire(__dirname, __filename, __deps);
     {source}
 }});
 "#,
         module_id = escape_string(module_id),
         dirname = escape_string(dirname),
         filename = escape_string(filename),
+        deps_json = deps_json,
         source = source,
     )
 }

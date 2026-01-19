@@ -25,6 +25,7 @@
         stat: (...args) => stat(...args),
         mkdir: (...args) => mkdir(...args),
         rm: (...args) => rm(...args),
+        unlink: (...args) => unlink(...args),
         exists: (...args) => exists(...args),
         rename: (...args) => rename(...args),
         copyFile: (...args) => copyFile(...args),
@@ -38,6 +39,7 @@
         statSync: (...args) => statSync(...args),
         mkdirSync: (...args) => mkdirSync(...args),
         rmSync: (...args) => rmSync(...args),
+        unlinkSync: (...args) => unlinkSync(...args),
         existsSync: (...args) => existsSync(...args),
         copyFileSync: (...args) => copyFileSync(...args),
 
@@ -47,6 +49,7 @@
         stat: callbackify(stat),
         mkdir: callbackify(mkdir),
         rm: callbackify(rm),
+        unlink: callbackify(unlink),
         exists: callbackify(exists),
         rename: callbackify(rename),
         copyFile: callbackify(copyFile),

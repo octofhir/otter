@@ -10,6 +10,11 @@ use swc_ecma_codegen::{text_writer::JsWriter, Emitter};
 use swc_ecma_parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax, TsSyntax};
 use swc_ecma_visit::{VisitMut, VisitMutWith};
 
+/// Check if a resolved URL is a built-in (node: or otter:)
+fn is_builtin(resolved: &str) -> bool {
+    resolved.starts_with("node:") || resolved.starts_with("otter:")
+}
+
 /// Helper to get module expression for built-ins
 fn builtin_expr(resolved: &str) -> Option<String> {
     if let Some(name) = resolved.strip_prefix("node:") {
@@ -262,10 +267,15 @@ impl VisitMut for EsmTransformer {
                         match specifier {
                             // import foo from 'mod'
                             ImportSpecifier::Default(default) => {
-                                let stmt = create_const_stmt(
-                                    default.local.sym.as_str(),
-                                    &format!("{}.default", module_access),
-                                );
+                                // For builtins (node:*, otter:*), return the whole module
+                                // because they don't have a .default export.
+                                // For user modules, use .default as per ESM/CJS interop.
+                                let value_expr = if is_builtin(&resolved) {
+                                    module_access.clone()
+                                } else {
+                                    format!("{}.default", module_access)
+                                };
+                                let stmt = create_const_stmt(default.local.sym.as_str(), &value_expr);
                                 new_items.push(ModuleItem::Stmt(stmt));
                             }
                             // import { foo, bar as baz } from 'mod'
@@ -481,7 +491,9 @@ impl VisitMut for EsmTransformer {
         }
     }
 
-    /// Transform dynamic imports: import('./foo.js') -> Promise.resolve(__otter_modules["resolved"])
+    /// Transform dynamic imports:
+    /// - String literal: import('./foo.js') -> Promise.resolve(__otter_modules["resolved"])
+    /// - Variable/expression: import(expr) -> __otter_dynamic_import(expr)
     fn visit_mut_expr(&mut self, expr: &mut Expr) {
         // First, visit children
         expr.visit_mut_children_with(self);
@@ -491,6 +503,7 @@ impl VisitMut for EsmTransformer {
             if let Callee::Import(_) = &call.callee {
                 if let Some(arg) = call.args.first() {
                     if let Expr::Lit(Lit::Str(s)) = &*arg.expr {
+                        // String literal - resolve at compile time
                         let specifier = wtf8_to_string(s);
                         let resolved = self.resolve(&specifier);
                         let module_access = module_expr(&resolved);
@@ -514,6 +527,14 @@ impl VisitMut for EsmTransformer {
                         if let Ok(new_expr) = parser.parse_expr() {
                             *expr = *new_expr;
                         }
+                    } else {
+                        // Non-literal (variable, template string, etc.) - use runtime resolution
+                        // Transform: import(expr) -> __otter_dynamic_import(expr)
+                        call.callee = Callee::Expr(Box::new(Expr::Ident(Ident::new(
+                            "__otter_dynamic_import".into(),
+                            DUMMY_SP,
+                            Default::default(),
+                        ))));
                     }
                 }
             }
@@ -664,5 +685,26 @@ mod tests {
 
         let result = transform_module_ast(source, "file:///project/main.js", &deps).unwrap();
         assert!(result.contains("globalThis.__otter_node_builtins[\"util\"]"));
+    }
+
+    #[test]
+    fn test_transform_dynamic_import_literal() {
+        let source = "const mod = await import('./foo.js');";
+        let mut deps = HashMap::new();
+        deps.insert("./foo.js".to_string(), "file:///project/foo.js".to_string());
+
+        let result = transform_module_ast(source, "file:///project/main.js", &deps).unwrap();
+        assert!(result.contains("Promise.resolve"));
+        assert!(result.contains("__otter_modules[\"file:///project/foo.js\"]"));
+    }
+
+    #[test]
+    fn test_transform_dynamic_import_variable() {
+        let source = "const name = './foo.js'; const mod = await import(name);";
+        let deps = HashMap::new();
+
+        let result = transform_module_ast(source, "file:///project/main.js", &deps).unwrap();
+        // Variable-based import should be transformed to __otter_dynamic_import
+        assert!(result.contains("__otter_dynamic_import"));
     }
 }

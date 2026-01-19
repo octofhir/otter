@@ -64,6 +64,34 @@ struct DirectRun {
     /// Config file path
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// Allow file system read access
+    #[arg(long = "allow-read", value_name = "PATH", num_args = 0..)]
+    allow_read: Option<Vec<String>>,
+
+    /// Allow file system write access
+    #[arg(long = "allow-write", value_name = "PATH", num_args = 0..)]
+    allow_write: Option<Vec<String>>,
+
+    /// Allow network access
+    #[arg(long = "allow-net", value_name = "HOST", num_args = 0..)]
+    allow_net: Option<Vec<String>>,
+
+    /// Allow environment variable access
+    #[arg(long = "allow-env", value_name = "VAR", num_args = 0..)]
+    allow_env: Option<Vec<String>>,
+
+    /// Allow subprocess execution
+    #[arg(long = "allow-run")]
+    allow_run: bool,
+
+    /// Allow all permissions
+    #[arg(long = "allow-all", short = 'A')]
+    allow_all: bool,
+
+    /// Script execution timeout in milliseconds
+    #[arg(long, default_value = "30000")]
+    timeout: u64,
 }
 
 #[derive(Subcommand)]
@@ -161,16 +189,16 @@ async fn main() -> Result<()> {
         let run_cmd = commands::run::RunCommand {
             entry: Some(direct.file),
             args: direct.args,
-            allow_read: None,
-            allow_write: None,
-            allow_net: None,
-            allow_env: None,
+            allow_read: direct.allow_read,
+            allow_write: direct.allow_write,
+            allow_net: direct.allow_net,
+            allow_env: direct.allow_env,
             env_files: vec![],
             env_vars: vec![],
-            allow_run: false,
-            allow_all: false,
+            allow_run: direct.allow_run,
+            allow_all: direct.allow_all,
             check: false,
-            timeout: 30000,
+            timeout: direct.timeout,
             watch: false,
             file: false,
         };

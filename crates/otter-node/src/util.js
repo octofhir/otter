@@ -150,10 +150,118 @@
 
     promisify.custom = kPromisifyCustom;
 
+    // Node.js util.inherits - sets up prototype chain inheritance
+    function inherits(ctor, superCtor) {
+        if (ctor === undefined || ctor === null) {
+            throw new TypeError('The constructor to "inherits" must not be null or undefined');
+        }
+        if (superCtor === undefined || superCtor === null) {
+            throw new TypeError('The super constructor to "inherits" must not be null or undefined');
+        }
+        if (superCtor.prototype === undefined) {
+            throw new TypeError('The super constructor to "inherits" must have a prototype');
+        }
+        Object.defineProperty(ctor, 'super_', {
+            value: superCtor,
+            writable: true,
+            configurable: true
+        });
+        Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
+    }
+
+    // Node.js util.deprecate - wraps a function with deprecation warning
+    function deprecate(fn, msg, code) {
+        if (typeof fn !== 'function') {
+            throw new TypeError('The "fn" argument must be of type function');
+        }
+        let warned = false;
+        function deprecated(...args) {
+            if (!warned) {
+                warned = true;
+                console.warn(`DeprecationWarning: ${msg}${code ? ` [${code}]` : ''}`);
+            }
+            return fn.apply(this, args);
+        }
+        return deprecated;
+    }
+
+    // Node.js util.types - type checking utilities
+    const types = {
+        isArray: Array.isArray,
+        isArrayBuffer: (v) => v instanceof ArrayBuffer,
+        isDate: (v) => v instanceof Date,
+        isRegExp: (v) => v instanceof RegExp,
+        isMap: (v) => v instanceof Map,
+        isSet: (v) => v instanceof Set,
+        isWeakMap: (v) => v instanceof WeakMap,
+        isWeakSet: (v) => v instanceof WeakSet,
+        isPromise: (v) => v instanceof Promise,
+        isGeneratorFunction: (v) => v && v.constructor && v.constructor.name === 'GeneratorFunction',
+        isAsyncFunction: (v) => v && v.constructor && v.constructor.name === 'AsyncFunction',
+        isTypedArray: (v) => ArrayBuffer.isView(v) && !(v instanceof DataView),
+        isDataView: (v) => v instanceof DataView,
+        isUint8Array: (v) => v instanceof Uint8Array,
+        isUint16Array: (v) => v instanceof Uint16Array,
+        isUint32Array: (v) => v instanceof Uint32Array,
+        isInt8Array: (v) => v instanceof Int8Array,
+        isInt16Array: (v) => v instanceof Int16Array,
+        isInt32Array: (v) => v instanceof Int32Array,
+        isFloat32Array: (v) => v instanceof Float32Array,
+        isFloat64Array: (v) => v instanceof Float64Array,
+        isBigInt64Array: (v) => typeof BigInt64Array !== 'undefined' && v instanceof BigInt64Array,
+        isBigUint64Array: (v) => typeof BigUint64Array !== 'undefined' && v instanceof BigUint64Array,
+    };
+
+    // Node.js util.callbackify - converts promise-returning function to callback style
+    function callbackify(original) {
+        if (typeof original !== 'function') {
+            throw new TypeError('The "original" argument must be of type function');
+        }
+        return function callbackified(...args) {
+            const callback = args.pop();
+            if (typeof callback !== 'function') {
+                throw new TypeError('The last argument must be of type function');
+            }
+            Promise.resolve(original.apply(this, args))
+                .then((result) => callback(null, result))
+                .catch((err) => callback(err));
+        };
+    }
+
+    // Node.js util.isDeepStrictEqual - simplified version
+    function isDeepStrictEqual(a, b) {
+        if (Object.is(a, b)) return true;
+        if (typeof a !== typeof b) return false;
+        if (typeof a !== 'object' || a === null || b === null) return false;
+
+        if (Array.isArray(a) !== Array.isArray(b)) return false;
+        if (Array.isArray(a)) {
+            if (a.length !== b.length) return false;
+            for (let i = 0; i < a.length; i++) {
+                if (!isDeepStrictEqual(a[i], b[i])) return false;
+            }
+            return true;
+        }
+
+        const keysA = Object.keys(a);
+        const keysB = Object.keys(b);
+        if (keysA.length !== keysB.length) return false;
+        for (const key of keysA) {
+            if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+            if (!isDeepStrictEqual(a[key], b[key])) return false;
+        }
+        return true;
+    }
+
     const utilModule = {
         format,
         inspect,
         promisify,
+        inherits,
+        deprecate,
+        types,
+        callbackify,
+        isDeepStrictEqual,
     };
     utilModule.default = utilModule;
 

@@ -29,12 +29,27 @@
     // Convert CommonJS module to ESM format
     // Creates an object with 'default' pointing to module.exports
     // and copies named exports if the module has them
+    // CRITICAL: Preserves callable nature of functions (e.g., axios)
     globalThis.__toESM = function(mod, isNodeMode) {
         if (mod && mod.__esModule) {
             return mod;
         }
 
-        var target = mod != null ? __create(__getProtoOf(mod)) : {};
+        var target;
+
+        // CRITICAL: Preserve callable nature for function exports (axios, express, etc.)
+        if (typeof mod === "function") {
+            // Create callable wrapper that delegates to original function
+            target = function __esm_callable_wrapper() {
+                return mod.apply(this, arguments);
+            };
+            // Preserve prototype for instanceof checks
+            target.prototype = mod.prototype;
+            // Preserve prototype chain
+            Object.setPrototypeOf(target, Object.getPrototypeOf(mod));
+        } else {
+            target = mod != null ? __create(__getProtoOf(mod)) : {};
+        }
 
         // If not a module or in Node compatibility mode, set default to the whole module
         if (isNodeMode || !mod || !mod.__esModule) {
@@ -42,9 +57,10 @@
         }
 
         // Copy all properties with getters for live bindings
+        // Skip 'prototype' for functions as it's already set above
         if (mod != null) {
             for (var key of __getOwnPropNames(mod)) {
-                if (!__hasOwnProp.call(target, key)) {
+                if (!__hasOwnProp.call(target, key) && key !== "default" && key !== "prototype") {
                     __defProp(target, key, {
                         get: (function(k) { return function() { return mod[k]; }; })(key),
                         enumerable: true
@@ -169,20 +185,49 @@
         return parts.join('/');
     }
 
+    // JSON module cache
+    var __jsonCache = {};
+
     // Create require function for a specific module context
-    globalThis.__createRequire = function(dirname, filename) {
+    // deps: optional map from specifier to resolved URL (passed by bundler for pre-resolved deps)
+    globalThis.__createRequire = function(dirname, filename, deps) {
+        deps = deps || {};
+
         var require = function(specifier) {
+            var resolvedFromDeps, resolved, absolutePath, mod;
+
+            // First, check if we have a pre-resolved dependency from the bundler
+            // This handles bare specifiers like 'combined-stream' that were resolved at bundle time
+            if (deps[specifier]) {
+                resolvedFromDeps = deps[specifier];
+                // Try CJS module first (most common for npm packages)
+                if (globalThis.__otter_cjs_modules[resolvedFromDeps]) {
+                    return globalThis.__otter_cjs_modules[resolvedFromDeps]();
+                }
+                // Try ESM module (convert to CJS)
+                if (globalThis.__otter_modules?.[resolvedFromDeps]) {
+                    return globalThis.__toCommonJS(globalThis.__otter_modules[resolvedFromDeps]);
+                }
+                // Try with lazy loading
+                if (globalThis.__getModule) {
+                    mod = globalThis.__getModule(resolvedFromDeps);
+                    if (mod) return mod;
+                }
+            }
+
             // Resolve relative paths to absolute paths
-            var resolved = specifier;
+            resolved = specifier;
+            absolutePath = null;
             if (specifier.startsWith('./') || specifier.startsWith('../')) {
                 resolved = resolvePath(specifier, dirname);
+                absolutePath = resolved;
                 // Convert to file:// URL for registry lookup
                 resolved = "file://" + resolved;
             }
 
             // Use __getModule for lazy loading support
             if (globalThis.__getModule) {
-                var mod = globalThis.__getModule(resolved);
+                mod = globalThis.__getModule(resolved);
                 if (mod) return mod;
             }
 
@@ -216,6 +261,43 @@
             }
 
             if (found) return found;
+
+            // Handle JSON files specially - load via fs at runtime
+            var jsonPath, jsonFs, jsonContent, jsonData, cwd, absDir;
+            if (specifier.endsWith('.json')) {
+                // Resolve the JSON file path
+                cwd = globalThis.process && globalThis.process.cwd ? globalThis.process.cwd() : '';
+                if (specifier.startsWith('/')) {
+                    jsonPath = specifier;
+                } else if (specifier.startsWith('./') || specifier.startsWith('../')) {
+                    // For relative paths, resolve against cwd if dirname is "." or empty
+                    if (dirname === '.' || dirname === '') {
+                        jsonPath = cwd ? resolvePath(specifier, cwd) : null;
+                    } else if (dirname.startsWith('/')) {
+                        jsonPath = resolvePath(specifier, dirname);
+                    } else {
+                        // dirname is relative, resolve against cwd first
+                        absDir = cwd ? resolvePath('./' + dirname, cwd) : dirname;
+                        jsonPath = resolvePath(specifier, absDir);
+                    }
+                }
+                if (jsonPath) {
+                    if (__jsonCache[jsonPath]) {
+                        return __jsonCache[jsonPath];
+                    }
+                    try {
+                        jsonFs = globalThis.__otter_node_builtins && globalThis.__otter_node_builtins.fs;
+                        if (jsonFs && jsonFs.readFileSync) {
+                            jsonContent = jsonFs.readFileSync(jsonPath, 'utf8');
+                            jsonData = JSON.parse(jsonContent);
+                            __jsonCache[jsonPath] = jsonData;
+                            return jsonData;
+                        }
+                    } catch (_) {
+                        // Fall through to error
+                    }
+                }
+            }
 
             throw new Error("Cannot find module '" + specifier + "' from '" + dirname + "'");
         };

@@ -15,7 +15,7 @@ use std::sync::Arc;
 pub struct ModuleNode {
     pub module: ResolvedModule,
     pub dependencies: Vec<String>,
-    /// Compiled JavaScript (if source was TypeScript)
+    /// Compiled JavaScript (if source was TypeScript or JSON)
     pub compiled: Option<String>,
 }
 
@@ -108,14 +108,19 @@ impl ModuleGraph {
             parse_dependencies(&module.source, module.module_type)
         };
 
-        // Compile TypeScript if needed (do this before recursing to have source ready)
-        let compiled = if module.source_type == SourceType::TypeScript {
-            let result = transpile_typescript(&module.source).map_err(|e| {
-                JscError::ModuleError(format!("Failed to transpile '{}': {}", module.url, e))
-            })?;
-            Some(result.code)
-        } else {
-            None
+        // Compile TypeScript or wrap JSON (do this before recursing to have source ready)
+        let compiled = match module.source_type {
+            SourceType::TypeScript => {
+                let result = transpile_typescript(&module.source).map_err(|e| {
+                    JscError::ModuleError(format!("Failed to transpile '{}': {}", module.url, e))
+                })?;
+                Some(result.code)
+            }
+            SourceType::Json => {
+                // Wrap JSON in module.exports = ...
+                Some(format!("module.exports = {};", module.source))
+            }
+            SourceType::JavaScript => None,
         };
 
         // Add to graph BEFORE loading dependencies to handle circular deps

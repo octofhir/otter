@@ -74,5 +74,47 @@
       return undefined;
     };
   }
+
+  // Dynamic import runtime function for variable-based imports
+  // Handles: import(variableName) or import(expression)
+  if (typeof globalThis.__otter_dynamic_import !== "function") {
+    globalThis.__otter_dynamic_import = async function __otter_dynamic_import(specifier) {
+      // Ensure specifier is a string
+      specifier = String(specifier);
+
+      // Check pre-bundled ESM modules
+      if (globalThis.__otter_modules && globalThis.__otter_modules[specifier]) {
+        return globalThis.__otter_modules[specifier];
+      }
+
+      // Check Node.js builtins
+      const builtinName = specifier.startsWith("node:") ? specifier.slice(5) : specifier;
+      if (globalThis.__otter_node_builtins && globalThis.__otter_node_builtins[builtinName]) {
+        return globalThis.__otter_node_builtins[builtinName];
+      }
+
+      // Try lazy module loader
+      const mod = globalThis.__getModule(specifier);
+      if (mod) {
+        return mod;
+      }
+
+      // Try loading via native op (if available)
+      if (typeof globalThis.__otter_load_module === "function") {
+        return await globalThis.__otter_load_module(specifier);
+      }
+
+      // Try CommonJS require as fallback
+      if (typeof require === "function") {
+        try {
+          return require(specifier);
+        } catch (e) {
+          // Fall through to error
+        }
+      }
+
+      throw new Error(`Cannot dynamically import module: ${specifier}`);
+    };
+  }
 })(globalThis);
 

@@ -5,10 +5,11 @@
 //!
 //! # Security
 //!
-//! The `process.env` object is backed by `IsolatedEnvStore` which:
+//! The `process.env` object is initialized from `IsolatedEnvStore` which:
 //! - Blocks access to sensitive env vars by default (AWS keys, tokens, etc.)
 //! - Only exposes explicitly configured variables
-//! - Prevents enumeration of host environment
+//! - Script-local writes are allowed (standard Node.js behavior)
+//! - Writes don't affect the host environment
 //!
 //! # Example
 //!
@@ -112,11 +113,18 @@ impl ProcessInfo {
             return undefined;
         }},
         set(target, prop, value) {{
-            // Silently ignore writes (or throw if strict mode needed)
+            // Allow writes (standard Node.js behavior, writes are script-local)
+            if (typeof prop === 'string') {{
+                target[prop] = String(value);
+            }}
             return true;
         }},
         deleteProperty(target, prop) {{
-            return false;
+            // Allow deletes (standard Node.js behavior)
+            if (typeof prop === 'string') {{
+                delete target[prop];
+            }}
+            return true;
         }},
         has(target, prop) {{
             return typeof prop === 'string' && prop in target;

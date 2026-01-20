@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Args;
 use otter_engine::{
     Capabilities, CapabilitiesBuilder, EnvStoreBuilder, IsolatedEnvStore, LoaderConfig,
-    ModuleGraph, ModuleLoader, parse_env_file, parse_imports,
+    ModuleGraph, ModuleLoader, dynamic_import, parse_env_file, parse_imports,
 };
 use otter_jsc_sys::{
     JSContextGetGlobalObject, JSContextRef, JSObjectCallAsFunction, JSObjectGetProperty,
@@ -13,14 +13,14 @@ use otter_jsc_sys::{
 };
 use otter_kv::kv_extension;
 use otter_node::{
-    ActiveNetServerCount, ActiveServerCount, IpcChannel, NetEvent, ProcessInfo, ext, has_ipc,
-    init_net_manager,
+    ActiveNetServerCount, ActiveServerCount, ActiveWorkerCount, IpcChannel, NetEvent, ProcessInfo,
+    ext, has_ipc, init_net_manager,
 };
 use otter_pm::{ScriptRunner, format_scripts_list};
 use otter_runtime::HttpEvent;
 use otter_runtime::{
-    JscConfig, JscRuntime, bundle_modules_mixed, needs_transpilation, set_net_permission_checker,
-    set_tokio_handle, transpile_typescript, ModuleFormat, ModuleInfo,
+    JscConfig, JscRuntime, ModuleFormat, ModuleInfo, bundle_modules_mixed, needs_transpilation,
+    set_net_permission_checker, set_tokio_handle, transpile_typescript,
     tsgo::{TypeCheckConfig, check_types, format_diagnostics, has_errors},
 };
 use otter_sql::sql_extension;
@@ -123,7 +123,7 @@ impl RunCommand {
             || path.extension().is_some()  // has extension like .ts, .js
             || entry.starts_with(".")       // relative path like ./script.ts
             || entry.starts_with("/")       // absolute path
-            || entry.contains('/');         // path with directory
+            || entry.contains('/'); // path with directory
 
         if is_file_path {
             // Treat as file
@@ -377,8 +377,9 @@ impl RunCommand {
             timing!("type_check");
         }
 
-        // Read source
+        // Read source and strip shebang if present
         let source = std::fs::read_to_string(entry)?;
+        let source = strip_shebang(&source);
         timing!("source_read");
 
         // Build module loader config from CLI config
@@ -389,6 +390,9 @@ impl RunCommand {
             import_map_count = loader_config.import_map.len(),
             "Module loader config"
         );
+
+        // Clone loader_config for dynamic import extension (registered later)
+        let loader_config_for_dynamic_import = loader_config.clone();
 
         // Check if file has imports - if so, use module bundler
         let imports = parse_imports(&source);
@@ -405,7 +409,14 @@ impl RunCommand {
 
             // Bundle all modules in topological order with CJS/ESM detection
             let execution_order = graph.execution_order();
-            let mut modules_for_bundle: Vec<(String, String, HashMap<String, String>, bool, Option<String>, Option<String>)> = Vec::new();
+            let mut modules_for_bundle: Vec<(
+                String,
+                String,
+                HashMap<String, String>,
+                bool,
+                Option<String>,
+                Option<String>,
+            )> = Vec::new();
 
             for url in &execution_order {
                 // Skip built-in modules (node: and otter:) - they have no source
@@ -455,14 +466,19 @@ impl RunCommand {
             bundle_modules_mixed(modules)
         } else {
             // No imports - just transpile if needed
-            if is_typescript {
+            let code = if is_typescript {
                 let result = transpile_typescript(&source)
                     .map_err(|e| anyhow::anyhow!("Transpilation error: {}", e))?;
                 timing!("transpile");
                 result.code
             } else {
                 source
-            }
+            };
+
+            // Transform dynamic imports even without static imports
+            // import(variableName) -> __otter_dynamic_import(variableName)
+            otter_runtime::modules_ast::transform_dynamic_imports(&code)
+                .unwrap_or(code)
         };
         timing!("code_prepared");
 
@@ -504,8 +520,15 @@ impl RunCommand {
         timing!("ext_process");
         runtime.register_extension(ext::os())?;
         timing!("ext_os");
+        runtime.register_extension(ext::perf_hooks())?;
+        timing!("ext_perf_hooks");
+        runtime.register_extension(ext::module())?;
+        timing!("ext_module");
         runtime.register_extension(ext::child_process())?;
         timing!("ext_child_process");
+        let (worker_threads_ext, active_worker_count) = ext::worker_threads();
+        runtime.register_extension(worker_threads_ext)?;
+        timing!("ext_worker_threads");
         runtime.register_extension(ext::string_decoder())?;
         timing!("ext_string_decoder");
         runtime.register_extension(ext::readline())?;
@@ -550,6 +573,10 @@ impl RunCommand {
         // Register KV extension for "otter" module (kv)
         runtime.register_extension(kv_extension())?;
         timing!("ext_kv");
+
+        // Register dynamic import extension for runtime module loading
+        runtime.register_extension(dynamic_import::extension(loader_config_for_dynamic_import))?;
+        timing!("ext_dynamic_import");
 
         // Check for IPC channel (forked child process)
         #[cfg(unix)]
@@ -623,6 +650,7 @@ impl RunCommand {
             net_event_rx,
             active_http_server_count,
             active_net_server_count,
+            active_worker_count,
             timeout,
         )
         .await?;
@@ -907,14 +935,40 @@ fn caps_to_json(caps: &Capabilities) -> serde_json::Value {
     })
 }
 
+/// Strip shebang line from source code if present.
+///
+/// Handles both `#!/path/to/interpreter` and `#! /path/to/interpreter` formats.
+fn strip_shebang(source: &str) -> String {
+    if source.starts_with("#!") {
+        // Find the end of the first line
+        if let Some(newline_pos) = source.find('\n') {
+            // Replace shebang with empty line to preserve line numbers
+            format!("{}{}", " ".repeat(newline_pos), &source[newline_pos..])
+        } else {
+            // Entire file is just a shebang
+            String::new()
+        }
+    } else {
+        source.to_string()
+    }
+}
+
 /// Build LoaderConfig from CLI entry file and ModulesConfig
 ///
 /// This wires the CLI configuration to the module loader.
 fn build_loader_config(entry: &Path, modules: &ModulesConfig) -> LoaderConfig {
+    // Canonicalize entry path to get absolute directory for module resolution
     let base_dir = entry
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| {
+            // Fallback: use parent of entry path (may be relative)
+            entry
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        });
 
     let default = LoaderConfig::default();
 
@@ -938,13 +992,14 @@ fn build_loader_config(entry: &Path, modules: &ModulesConfig) -> LoaderConfig {
 ///
 /// High-performance event loop that processes events with minimal latency.
 /// Uses try_recv() for non-blocking poll, yield_now() to allow I/O processing.
-/// Process stays alive while any HTTP or net servers are active.
+/// Process stays alive while any HTTP or net servers or workers are active.
 async fn run_event_loop_with_events(
     runtime: &JscRuntime,
     mut http_event_rx: UnboundedReceiver<HttpEvent>,
     mut net_event_rx: UnboundedReceiver<NetEvent>,
     active_http_servers: ActiveServerCount,
     active_net_servers: ActiveNetServerCount,
+    active_workers: ActiveWorkerCount,
     timeout: Duration,
 ) -> Result<()> {
     use std::sync::atomic::Ordering;
@@ -955,15 +1010,16 @@ async fn run_event_loop_with_events(
     let ctx = runtime.context().raw();
 
     let mut idle_cycles = 0u32;
-    // For scripts without active servers, exit immediately after becoming idle.
-    // For servers, use longer idle threshold to avoid premature exit.
+    // For scripts without active servers/workers, exit immediately after becoming idle.
+    // For servers/workers, use longer idle threshold to avoid premature exit.
     const MAX_IDLE_CYCLES_SCRIPT: u32 = 1;
     const MAX_IDLE_CYCLES_SERVER: u32 = 100;
 
     loop {
         let has_active_http = active_http_servers.load(Ordering::Relaxed) > 0;
         let has_active_net = active_net_servers.load(Ordering::Relaxed) > 0;
-        let has_active_servers = has_active_http || has_active_net;
+        let has_active_workers = active_workers.load(Ordering::Relaxed) > 0;
+        let has_active_servers = has_active_http || has_active_net || has_active_workers;
 
         // Timeout check - but not for active servers (keep-alive)
         if has_timeout && !has_active_servers && start.elapsed() >= timeout {

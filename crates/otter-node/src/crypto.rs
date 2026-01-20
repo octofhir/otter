@@ -10,38 +10,45 @@
 use aes::Aes128;
 use aes::Aes192;
 use aes::Aes256;
-use aes_kw::Kek;
 use aes_gcm::{AeadInPlace, Aes128Gcm, Aes256Gcm, KeyInit as AesGcmKeyInit};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use aes_kw::Kek;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chacha20poly1305::ChaCha20Poly1305;
 use cipher::block_padding::{NoPadding, Pkcs7};
 use cipher::{BlockDecryptMut, BlockEncrypt, BlockEncryptMut, KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
-use ed25519_dalek::{Signer as Ed25519Signer, SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey};
+use ed25519_dalek::{
+    Signer as Ed25519Signer, SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey,
+};
 use hkdf::Hkdf;
 use md5::{Digest as Md5Digest, Md5};
+use p256::ecdh::diffie_hellman;
+use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::{
+    Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey,
+};
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::{
+    EncodedPoint as P256EncodedPoint, FieldBytes as P256FieldBytes, PublicKey as P256PublicKey,
+    SecretKey as P256SecretKey,
+};
 use pbkdf2::pbkdf2_hmac;
 use pem::Pem;
 use rand_core::OsRng;
 use rand_core::RngCore;
+use ring::digest::{self, Context as DigestContext};
+use ring::hmac;
 use rsa::pkcs1::{
     DecodeRsaPrivateKey, DecodeRsaPublicKey, EncodeRsaPrivateKey, EncodeRsaPublicKey,
 };
 use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
-use rsa::{Oaep, Pkcs1v15Sign, Pss, RsaPrivateKey, RsaPublicKey};
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
-use ring::digest::{self, Context as DigestContext};
-use ring::hmac;
-use serde::{Deserialize, Serialize};
+use rsa::{Oaep, Pkcs1v15Sign, Pss, RsaPrivateKey, RsaPublicKey};
 use scrypt::{Params as ScryptParams, scrypt as scrypt_kdf};
+use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
-use p256::ecdsa::signature::Verifier;
-use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey};
-use p256::ecdh::diffie_hellman;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
-use p256::{EncodedPoint as P256EncodedPoint, FieldBytes as P256FieldBytes, PublicKey as P256PublicKey, SecretKey as P256SecretKey};
 use std::fmt;
 use thiserror::Error;
 
@@ -209,16 +216,10 @@ impl CipherContext {
 
         let state = match algorithm {
             CipherAlgorithm::Aes128Ctr => {
-                Some(CipherState::Aes128Ctr(Ctr128BE::new(
-                    key.into(),
-                    iv.into(),
-                )))
+                Some(CipherState::Aes128Ctr(Ctr128BE::new(key.into(), iv.into())))
             }
             CipherAlgorithm::Aes256Ctr => {
-                Some(CipherState::Aes256Ctr(Ctr128BE::new(
-                    key.into(),
-                    iv.into(),
-                )))
+                Some(CipherState::Aes256Ctr(Ctr128BE::new(key.into(), iv.into())))
             }
             _ => None,
         };
@@ -402,7 +403,7 @@ impl CipherContext {
                 .ok_or_else(|| CryptoError::InvalidKeyLength)?;
             let tag = aes_gcm::Tag::from_slice(&tag);
             key.decrypt_in_place_detached(nonce, self.aad.as_slice(), &mut buffer, tag)
-            .map_err(|e| CryptoError::EncodingError(format!("{e:?}")))?;
+                .map_err(|e| CryptoError::EncodingError(format!("{e:?}")))?;
             Ok(buffer)
         }
     }
@@ -429,7 +430,7 @@ impl CipherContext {
                 .ok_or_else(|| CryptoError::InvalidKeyLength)?;
             let tag = chacha20poly1305::Tag::from_slice(&tag);
             key.decrypt_in_place_detached(nonce, self.aad.as_slice(), &mut buffer, tag)
-            .map_err(|e| CryptoError::EncodingError(format!("{e:?}")))?;
+                .map_err(|e| CryptoError::EncodingError(format!("{e:?}")))?;
             Ok(buffer)
         }
     }
@@ -1070,7 +1071,7 @@ fn sign_rsa(
             return Err(CryptoError::UnsupportedAlgorithm(format!(
                 "Unsupported RSA hash {:?}",
                 hash_alg
-            )))
+            )));
         }
     }
     .map_err(|e| CryptoError::InvalidParams(e.to_string()))?;
@@ -1132,7 +1133,7 @@ fn verify_rsa(
             return Err(CryptoError::UnsupportedAlgorithm(format!(
                 "Unsupported RSA hash {:?}",
                 hash_alg
-            )))
+            )));
         }
     };
     Ok(result.is_ok())
@@ -1187,11 +1188,7 @@ fn sign_ed25519(key: &KeyInput, data: &[u8]) -> Result<Vec<u8>, CryptoError> {
     Ok(signature.to_bytes().to_vec())
 }
 
-fn verify_ed25519(
-    key: &KeyInput,
-    data: &[u8],
-    signature: &[u8],
-) -> Result<bool, CryptoError> {
+fn verify_ed25519(key: &KeyInput, data: &[u8], signature: &[u8]) -> Result<bool, CryptoError> {
     let verifying_key = parse_ed25519_public(key)?;
     let signature = ed25519_dalek::Signature::try_from(signature)
         .map_err(|e| CryptoError::EncodingError(e.to_string()))?;
@@ -1270,9 +1267,8 @@ fn jwk_to_rsa_key(jwk: &JwkKey) -> Result<(Option<RsaPrivateKey>, RsaPublicKey),
             .as_deref()
             .ok_or_else(|| CryptoError::InvalidParams("Missing RSA prime q".to_string()))
             .and_then(jwk_biguint)?;
-        let private_key =
-            RsaPrivateKey::from_components(n, e, d, vec![p, q])
-                .map_err(|e| CryptoError::InvalidParams(e.to_string()))?;
+        let private_key = RsaPrivateKey::from_components(n, e, d, vec![p, q])
+            .map_err(|e| CryptoError::InvalidParams(e.to_string()))?;
         Ok((Some(private_key), public_key))
     } else {
         Ok((None, public_key))
@@ -1301,8 +1297,8 @@ fn jwk_to_p256_key(jwk: &JwkKey) -> Result<(Option<P256SecretKey>, P256PublicKey
     if let Some(d) = jwk.d.as_deref() {
         let d = b64url_decode(d)?;
         let d = pad_left(&d, 32);
-        let secret = P256SecretKey::from_slice(&d)
-            .map_err(|e| CryptoError::InvalidParams(e.to_string()))?;
+        let secret =
+            P256SecretKey::from_slice(&d).map_err(|e| CryptoError::InvalidParams(e.to_string()))?;
         Ok((Some(secret), public_key))
     } else {
         Ok((None, public_key))
@@ -1472,7 +1468,11 @@ pub fn der_to_jwk(der: &[u8], key_type: KeyType, algorithm: &str) -> Result<JwkK
     }
 }
 
-fn encode_key_output(output: Vec<u8>, format: KeyFormat, label: &str) -> Result<KeyOutput, CryptoError> {
+fn encode_key_output(
+    output: Vec<u8>,
+    format: KeyFormat,
+    label: &str,
+) -> Result<KeyOutput, CryptoError> {
     match format {
         KeyFormat::Der => Ok(KeyOutput::Der(output)),
         KeyFormat::Pem => {
@@ -1507,7 +1507,7 @@ pub fn generate_key_pair(options: &KeyPairOptions) -> Result<KeyPairOutput, Cryp
                 _ => {
                     return Err(CryptoError::InvalidParams(
                         "RSA private key must be pkcs1 or pkcs8".to_string(),
-                    ))
+                    ));
                 }
             };
 
@@ -1525,7 +1525,7 @@ pub fn generate_key_pair(options: &KeyPairOptions) -> Result<KeyPairOutput, Cryp
                 _ => {
                     return Err(CryptoError::InvalidParams(
                         "RSA public key must be spki or pkcs1".to_string(),
-                    ))
+                    ));
                 }
             };
 
@@ -1539,11 +1539,11 @@ pub fn generate_key_pair(options: &KeyPairOptions) -> Result<KeyPairOutput, Cryp
             })
         }
         "ec" | "ecdsa" => {
-            let curve = options
-                .named_curve
-                .as_deref()
-                .unwrap_or("prime256v1");
-            if !matches!(curve.to_lowercase().as_str(), "prime256v1" | "secp256r1" | "p-256") {
+            let curve = options.named_curve.as_deref().unwrap_or("prime256v1");
+            if !matches!(
+                curve.to_lowercase().as_str(),
+                "prime256v1" | "secp256r1" | "p-256"
+            ) {
                 return Err(CryptoError::UnsupportedAlgorithm(format!(
                     "Unsupported curve: {}",
                     curve
@@ -1567,7 +1567,7 @@ pub fn generate_key_pair(options: &KeyPairOptions) -> Result<KeyPairOutput, Cryp
                 _ => {
                     return Err(CryptoError::InvalidParams(
                         "EC private key must be sec1 or pkcs8".to_string(),
-                    ))
+                    ));
                 }
             };
 
@@ -1642,16 +1642,16 @@ pub fn subtle_encrypt_aes_gcm(
         .unwrap_or(&[]);
     let tag = match key.len() {
         16 => {
-            let cipher = Aes128Gcm::new_from_slice(key)
-                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let cipher =
+                Aes128Gcm::new_from_slice(key).map_err(|_| CryptoError::InvalidKeyLength)?;
             let nonce = aes_gcm::Nonce::from_slice(&options.iv);
             cipher
                 .encrypt_in_place_detached(nonce, aad, &mut buffer)
                 .map_err(|e| CryptoError::InvalidParams(e.to_string()))?
         }
         32 => {
-            let cipher = Aes256Gcm::new_from_slice(key)
-                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let cipher =
+                Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::InvalidKeyLength)?;
             let nonce = aes_gcm::Nonce::from_slice(&options.iv);
             cipher
                 .encrypt_in_place_detached(nonce, aad, &mut buffer)
@@ -1689,26 +1689,16 @@ pub fn subtle_decrypt_aes_gcm(
         .unwrap_or(&[]);
     let result = match key.len() {
         16 => {
-            let cipher = Aes128Gcm::new_from_slice(key)
-                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let cipher =
+                Aes128Gcm::new_from_slice(key).map_err(|_| CryptoError::InvalidKeyLength)?;
             let nonce = aes_gcm::Nonce::from_slice(&options.iv);
-            cipher.decrypt_in_place_detached(
-                nonce,
-                aad,
-                &mut buffer,
-                tag.into(),
-            )
+            cipher.decrypt_in_place_detached(nonce, aad, &mut buffer, tag.into())
         }
         32 => {
-            let cipher = Aes256Gcm::new_from_slice(key)
-                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let cipher =
+                Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::InvalidKeyLength)?;
             let nonce = aes_gcm::Nonce::from_slice(&options.iv);
-            cipher.decrypt_in_place_detached(
-                nonce,
-                aad,
-                &mut buffer,
-                tag.into(),
-            )
+            cipher.decrypt_in_place_detached(nonce, aad, &mut buffer, tag.into())
         }
         _ => return Err(CryptoError::InvalidKeyLength),
     };
@@ -1757,7 +1747,8 @@ fn aes_ctr_crypt(
         16 => {
             let cipher = Aes128::new_from_slice(key).map_err(|_| CryptoError::InvalidKeyLength)?;
             for (chunk, out_chunk) in data.chunks(16).zip(output.chunks_mut(16)) {
-                let mut block = cipher::generic_array::GenericArray::clone_from_slice(&counter_block);
+                let mut block =
+                    cipher::generic_array::GenericArray::clone_from_slice(&counter_block);
                 cipher.encrypt_block(&mut block);
                 for (i, byte) in chunk.iter().enumerate() {
                     out_chunk[i] = byte ^ block[i];
@@ -1768,7 +1759,8 @@ fn aes_ctr_crypt(
         32 => {
             let cipher = Aes256::new_from_slice(key).map_err(|_| CryptoError::InvalidKeyLength)?;
             for (chunk, out_chunk) in data.chunks(16).zip(output.chunks_mut(16)) {
-                let mut block = cipher::generic_array::GenericArray::clone_from_slice(&counter_block);
+                let mut block =
+                    cipher::generic_array::GenericArray::clone_from_slice(&counter_block);
                 cipher.encrypt_block(&mut block);
                 for (i, byte) in chunk.iter().enumerate() {
                     out_chunk[i] = byte ^ block[i];
@@ -1782,11 +1774,7 @@ fn aes_ctr_crypt(
     Ok(output)
 }
 
-pub fn subtle_encrypt_aes_cbc(
-    key: &[u8],
-    data: &[u8],
-    iv: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
+pub fn subtle_encrypt_aes_cbc(key: &[u8], data: &[u8], iv: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if data.len() % 16 != 0 {
         return Err(CryptoError::InvalidParams(
             "AES-CBC data length must be multiple of 16".to_string(),
@@ -1815,11 +1803,7 @@ pub fn subtle_encrypt_aes_cbc(
     }
 }
 
-pub fn subtle_decrypt_aes_cbc(
-    key: &[u8],
-    data: &[u8],
-    iv: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
+pub fn subtle_decrypt_aes_cbc(key: &[u8], data: &[u8], iv: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if data.len() % 16 != 0 {
         return Err(CryptoError::InvalidParams(
             "AES-CBC data length must be multiple of 16".to_string(),
@@ -1905,7 +1889,9 @@ pub fn subtle_unwrap_aes_kw(key: &[u8], data: &[u8]) -> Result<Vec<u8>, CryptoEr
             let kek = Kek::<Aes128>::try_from(key)
                 .map_err(|e| CryptoError::InvalidParams(e.to_string()))?;
             if data.len() < 8 {
-                return Err(CryptoError::InvalidParams("AES-KW data too short".to_string()));
+                return Err(CryptoError::InvalidParams(
+                    "AES-KW data too short".to_string(),
+                ));
             }
             let mut out = vec![0u8; data.len() - 8];
             kek.unwrap(data, &mut out)
@@ -1916,7 +1902,9 @@ pub fn subtle_unwrap_aes_kw(key: &[u8], data: &[u8]) -> Result<Vec<u8>, CryptoEr
             let kek = Kek::<Aes192>::try_from(key)
                 .map_err(|e| CryptoError::InvalidParams(e.to_string()))?;
             if data.len() < 8 {
-                return Err(CryptoError::InvalidParams("AES-KW data too short".to_string()));
+                return Err(CryptoError::InvalidParams(
+                    "AES-KW data too short".to_string(),
+                ));
             }
             let mut out = vec![0u8; data.len() - 8];
             kek.unwrap(data, &mut out)
@@ -1927,7 +1915,9 @@ pub fn subtle_unwrap_aes_kw(key: &[u8], data: &[u8]) -> Result<Vec<u8>, CryptoEr
             let kek = Kek::<Aes256>::try_from(key)
                 .map_err(|e| CryptoError::InvalidParams(e.to_string()))?;
             if data.len() < 8 {
-                return Err(CryptoError::InvalidParams("AES-KW data too short".to_string()));
+                return Err(CryptoError::InvalidParams(
+                    "AES-KW data too short".to_string(),
+                ));
             }
             let mut out = vec![0u8; data.len() - 8];
             kek.unwrap(data, &mut out)
@@ -1948,26 +1938,30 @@ pub fn subtle_rsa_oaep_encrypt(
     let public_key = parse_rsa_public(key)?;
     let padding = match (hash, label) {
         (HashAlgorithm::Sha1, Some(label)) => {
-            let label = String::from_utf8(label.to_vec())
-                .map_err(|_| CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string()))?;
+            let label = String::from_utf8(label.to_vec()).map_err(|_| {
+                CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string())
+            })?;
             Oaep::new_with_label::<Sha1, _>(label)
         }
         (HashAlgorithm::Sha1, None) => Oaep::new::<Sha1>(),
         (HashAlgorithm::Sha256, Some(label)) => {
-            let label = String::from_utf8(label.to_vec())
-                .map_err(|_| CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string()))?;
+            let label = String::from_utf8(label.to_vec()).map_err(|_| {
+                CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string())
+            })?;
             Oaep::new_with_label::<Sha256, _>(label)
         }
         (HashAlgorithm::Sha256, None) => Oaep::new::<Sha256>(),
         (HashAlgorithm::Sha384, Some(label)) => {
-            let label = String::from_utf8(label.to_vec())
-                .map_err(|_| CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string()))?;
+            let label = String::from_utf8(label.to_vec()).map_err(|_| {
+                CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string())
+            })?;
             Oaep::new_with_label::<Sha384, _>(label)
         }
         (HashAlgorithm::Sha384, None) => Oaep::new::<Sha384>(),
         (HashAlgorithm::Sha512, Some(label)) => {
-            let label = String::from_utf8(label.to_vec())
-                .map_err(|_| CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string()))?;
+            let label = String::from_utf8(label.to_vec()).map_err(|_| {
+                CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string())
+            })?;
             Oaep::new_with_label::<Sha512, _>(label)
         }
         (HashAlgorithm::Sha512, None) => Oaep::new::<Sha512>(),
@@ -1975,7 +1969,7 @@ pub fn subtle_rsa_oaep_encrypt(
             return Err(CryptoError::UnsupportedAlgorithm(format!(
                 "Unsupported RSA-OAEP hash {:?}",
                 hash
-            )))
+            )));
         }
     };
     let mut rng = OsRng;
@@ -1993,26 +1987,30 @@ pub fn subtle_rsa_oaep_decrypt(
     let private_key = parse_rsa_private(key)?;
     let padding = match (hash, label) {
         (HashAlgorithm::Sha1, Some(label)) => {
-            let label = String::from_utf8(label.to_vec())
-                .map_err(|_| CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string()))?;
+            let label = String::from_utf8(label.to_vec()).map_err(|_| {
+                CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string())
+            })?;
             Oaep::new_with_label::<Sha1, _>(label)
         }
         (HashAlgorithm::Sha1, None) => Oaep::new::<Sha1>(),
         (HashAlgorithm::Sha256, Some(label)) => {
-            let label = String::from_utf8(label.to_vec())
-                .map_err(|_| CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string()))?;
+            let label = String::from_utf8(label.to_vec()).map_err(|_| {
+                CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string())
+            })?;
             Oaep::new_with_label::<Sha256, _>(label)
         }
         (HashAlgorithm::Sha256, None) => Oaep::new::<Sha256>(),
         (HashAlgorithm::Sha384, Some(label)) => {
-            let label = String::from_utf8(label.to_vec())
-                .map_err(|_| CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string()))?;
+            let label = String::from_utf8(label.to_vec()).map_err(|_| {
+                CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string())
+            })?;
             Oaep::new_with_label::<Sha384, _>(label)
         }
         (HashAlgorithm::Sha384, None) => Oaep::new::<Sha384>(),
         (HashAlgorithm::Sha512, Some(label)) => {
-            let label = String::from_utf8(label.to_vec())
-                .map_err(|_| CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string()))?;
+            let label = String::from_utf8(label.to_vec()).map_err(|_| {
+                CryptoError::InvalidParams("RSA-OAEP label must be UTF-8".to_string())
+            })?;
             Oaep::new_with_label::<Sha512, _>(label)
         }
         (HashAlgorithm::Sha512, None) => Oaep::new::<Sha512>(),
@@ -2020,7 +2018,7 @@ pub fn subtle_rsa_oaep_decrypt(
             return Err(CryptoError::UnsupportedAlgorithm(format!(
                 "Unsupported RSA-OAEP hash {:?}",
                 hash
-            )))
+            )));
         }
     };
     private_key
@@ -2071,7 +2069,7 @@ pub fn subtle_derive_bits_hkdf(
             return Err(CryptoError::UnsupportedAlgorithm(format!(
                 "Unsupported HKDF hash {:?}",
                 hash
-            )))
+            )));
         }
     }
     Ok(okm)
@@ -2094,7 +2092,7 @@ pub fn subtle_derive_bits_pbkdf2(
             return Err(CryptoError::UnsupportedAlgorithm(format!(
                 "Unsupported PBKDF2 hash {:?}",
                 hash
-            )))
+            )));
         }
     }
     Ok(out)

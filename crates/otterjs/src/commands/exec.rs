@@ -180,12 +180,7 @@ impl ExecCommand {
     }
 
     /// Find the binary in an installed package
-    fn find_bin_in_package(
-        &self,
-        cache_path: &Path,
-        package: &str,
-        cmd: &str,
-    ) -> Result<PathBuf> {
+    fn find_bin_in_package(&self, cache_path: &Path, package: &str, cmd: &str) -> Result<PathBuf> {
         // Check node_modules/.bin
         let bin_dir = cache_path.join("node_modules/.bin");
         let bin_path = bin_dir.join(cmd);

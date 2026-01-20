@@ -20,7 +20,7 @@
 
 use anyhow::Result;
 use otter_engine::{Capabilities, EnvStoreBuilder};
-use otter_node::{ext, ProcessInfo};
+use otter_node::{ProcessInfo, ext};
 use otter_runtime::{JscConfig, JscRuntime, set_tokio_handle};
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,7 +77,11 @@ pub fn load_embedded_code() -> Result<Option<String>> {
 ///
 /// This copies the source binary, appends the code, and writes a trailer
 /// with the magic bytes and offset.
-pub fn embed_code(otter_exe: &std::path::Path, code: &[u8], output: &std::path::Path) -> Result<()> {
+pub fn embed_code(
+    otter_exe: &std::path::Path,
+    code: &[u8],
+    output: &std::path::Path,
+) -> Result<()> {
     let mut binary = std::fs::read(otter_exe)?;
 
     // Strip any existing embedded code (allows recompiling)

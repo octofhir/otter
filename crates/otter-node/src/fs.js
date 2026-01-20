@@ -3,6 +3,29 @@
 (function() {
     'use strict';
 
+    // Convert URL objects to file paths (Node.js compatibility)
+    function toPath(pathOrUrl) {
+        if (pathOrUrl == null) return pathOrUrl;
+
+        // Handle URL objects (both native URL and file:// strings)
+        if (typeof pathOrUrl === 'object' && pathOrUrl.href) {
+            const href = pathOrUrl.href;
+            if (href.startsWith('file://')) {
+                // Extract path from file:// URL
+                // file:///path/to/file -> /path/to/file
+                return href.slice(7); // Remove 'file://'
+            }
+            return href;
+        }
+
+        // Handle file:// URL strings
+        if (typeof pathOrUrl === 'string' && pathOrUrl.startsWith('file://')) {
+            return pathOrUrl.slice(7);
+        }
+
+        return pathOrUrl;
+    }
+
     function callbackify(promiseFn) {
         return function(...args) {
             const cb = args.length && typeof args[args.length - 1] === 'function'
@@ -19,40 +42,40 @@
     }
 
     const fsPromises = {
-        readFile: (...args) => readFile(...args),
-        writeFile: (...args) => writeFile(...args),
-        readdir: (...args) => readdir(...args),
-        stat: (...args) => stat(...args),
-        mkdir: (...args) => mkdir(...args),
-        rm: (...args) => rm(...args),
-        unlink: (...args) => unlink(...args),
-        exists: (...args) => exists(...args),
-        rename: (...args) => rename(...args),
-        copyFile: (...args) => copyFile(...args),
+        readFile: (path, ...args) => readFile(toPath(path), ...args),
+        writeFile: (path, ...args) => writeFile(toPath(path), ...args),
+        readdir: (path, ...args) => readdir(toPath(path), ...args),
+        stat: (path, ...args) => stat(toPath(path), ...args),
+        mkdir: (path, ...args) => mkdir(toPath(path), ...args),
+        rm: (path, ...args) => rm(toPath(path), ...args),
+        unlink: (path, ...args) => unlink(toPath(path), ...args),
+        exists: (path, ...args) => exists(toPath(path), ...args),
+        rename: (oldPath, newPath, ...args) => rename(toPath(oldPath), toPath(newPath), ...args),
+        copyFile: (src, dest, ...args) => copyFile(toPath(src), toPath(dest), ...args),
     };
     fsPromises.default = fsPromises;
 
     const fsModule = {
-        readFileSync: (...args) => readFileSync(...args),
-        writeFileSync: (...args) => writeFileSync(...args),
-        readdirSync: (...args) => readdirSync(...args),
-        statSync: (...args) => statSync(...args),
-        mkdirSync: (...args) => mkdirSync(...args),
-        rmSync: (...args) => rmSync(...args),
-        unlinkSync: (...args) => unlinkSync(...args),
-        existsSync: (...args) => existsSync(...args),
-        copyFileSync: (...args) => copyFileSync(...args),
+        readFileSync: (path, ...args) => readFileSync(toPath(path), ...args),
+        writeFileSync: (path, ...args) => writeFileSync(toPath(path), ...args),
+        readdirSync: (path, ...args) => readdirSync(toPath(path), ...args),
+        statSync: (path, ...args) => statSync(toPath(path), ...args),
+        mkdirSync: (path, ...args) => mkdirSync(toPath(path), ...args),
+        rmSync: (path, ...args) => rmSync(toPath(path), ...args),
+        unlinkSync: (path, ...args) => unlinkSync(toPath(path), ...args),
+        existsSync: (path, ...args) => existsSync(toPath(path), ...args),
+        copyFileSync: (src, dest, ...args) => copyFileSync(toPath(src), toPath(dest), ...args),
 
-        readFile: callbackify(readFile),
-        writeFile: callbackify(writeFile),
-        readdir: callbackify(readdir),
-        stat: callbackify(stat),
-        mkdir: callbackify(mkdir),
-        rm: callbackify(rm),
-        unlink: callbackify(unlink),
-        exists: callbackify(exists),
-        rename: callbackify(rename),
-        copyFile: callbackify(copyFile),
+        readFile: callbackify((path, ...args) => readFile(toPath(path), ...args)),
+        writeFile: callbackify((path, ...args) => writeFile(toPath(path), ...args)),
+        readdir: callbackify((path, ...args) => readdir(toPath(path), ...args)),
+        stat: callbackify((path, ...args) => stat(toPath(path), ...args)),
+        mkdir: callbackify((path, ...args) => mkdir(toPath(path), ...args)),
+        rm: callbackify((path, ...args) => rm(toPath(path), ...args)),
+        unlink: callbackify((path, ...args) => unlink(toPath(path), ...args)),
+        exists: callbackify((path, ...args) => exists(toPath(path), ...args)),
+        rename: callbackify((oldPath, newPath, ...args) => rename(toPath(oldPath), toPath(newPath), ...args)),
+        copyFile: callbackify((src, dest, ...args) => copyFile(toPath(src), toPath(dest), ...args)),
 
         promises: fsPromises,
     };

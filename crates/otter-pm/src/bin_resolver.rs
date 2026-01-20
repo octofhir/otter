@@ -97,9 +97,7 @@ impl BinResolver {
 
     /// Get the path where a package would be cached
     pub fn cache_path(&self, package: &str, version: &str) -> PathBuf {
-        self.cache_dir
-            .join(Self::safe_name(package))
-            .join(version)
+        self.cache_dir.join(Self::safe_name(package)).join(version)
     }
 
     /// Check if a package is cached

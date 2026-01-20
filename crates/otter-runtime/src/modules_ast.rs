@@ -3,12 +3,12 @@
 //! This module replaces the regex-based transform_module with proper AST parsing
 //! to correctly handle all ESM patterns including multi-line imports.
 
-use std::collections::HashMap;
 use serde_json;
-use swc_common::{sync::Lrc, FileName, SourceMap, DUMMY_SP};
+use std::collections::HashMap;
+use swc_common::{DUMMY_SP, FileName, SourceMap, sync::Lrc};
 use swc_ecma_ast::*;
-use swc_ecma_codegen::{text_writer::JsWriter, Emitter};
-use swc_ecma_parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax, TsSyntax};
+use swc_ecma_codegen::{Emitter, text_writer::JsWriter};
+use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 use swc_ecma_visit::{VisitMut, VisitMutWith};
 
 /// Check if a resolved URL is a built-in (node: or otter:)
@@ -278,7 +278,8 @@ impl VisitMut for EsmTransformer {
                                 } else {
                                     format!("{}.default", module_access)
                                 };
-                                let stmt = create_const_stmt(default.local.sym.as_str(), &value_expr);
+                                let stmt =
+                                    create_const_stmt(default.local.sym.as_str(), &value_expr);
                                 new_items.push(ModuleItem::Stmt(stmt));
                             }
                             // import { foo, bar as baz } from 'mod'
@@ -501,6 +502,18 @@ impl VisitMut for EsmTransformer {
         // First, visit children
         expr.visit_mut_children_with(self);
 
+        // Handle import.meta references injected during bundling
+        if let Expr::MetaProp(meta_prop) = expr {
+            if matches!(meta_prop.kind, MetaPropKind::ImportMeta) {
+                *expr = Expr::Ident(Ident::new(
+                    "__otter_import_meta__".into(),
+                    DUMMY_SP,
+                    Default::default(),
+                ));
+                return;
+            }
+        }
+
         // Then transform dynamic imports
         if let Expr::Call(call) = expr {
             if let Callee::Import(_) = &call.callee {
@@ -514,10 +527,7 @@ impl VisitMut for EsmTransformer {
                         // Replace with __otter_dynamic_import("resolved")
                         let new_code = format!("__otter_dynamic_import({})", resolved_lit);
                         let cm: Lrc<SourceMap> = Default::default();
-                        let fm = cm.new_source_file(
-                            Lrc::new(FileName::Anon),
-                            new_code.clone(),
-                        );
+                        let fm = cm.new_source_file(Lrc::new(FileName::Anon), new_code.clone());
 
                         let lexer = Lexer::new(
                             Syntax::Es(EsSyntax::default()),
@@ -578,6 +588,74 @@ fn create_const_stmt(name: &str, value: &str) -> Stmt {
         }],
         ctxt: Default::default(),
     })))
+}
+
+/// Transform only dynamic imports in source code.
+///
+/// This is a lightweight transformation for files without static imports.
+/// Transforms: import(expr) -> __otter_dynamic_import(expr)
+pub fn transform_dynamic_imports(source: &str) -> Result<String, String> {
+    let cm: Lrc<SourceMap> = Default::default();
+    let fm = cm.new_source_file(Lrc::new(FileName::Anon), source.to_string());
+
+    let lexer = Lexer::new(
+        Syntax::Es(EsSyntax {
+            jsx: false,
+            ..Default::default()
+        }),
+        EsVersion::Es2022,
+        StringInput::from(&*fm),
+        None,
+    );
+
+    let mut parser = Parser::new_from(lexer);
+
+    // Collect parse errors silently
+    for _e in parser.take_errors() {}
+
+    let mut module = parser
+        .parse_module()
+        .map_err(|e| format!("Failed to parse module: {:?}", e.kind()))?;
+
+    // Transform only dynamic imports
+    let mut transformer = DynamicImportTransformer;
+    module.visit_mut_with(&mut transformer);
+
+    // Generate code
+    let mut buf = vec![];
+    {
+        let mut emitter = Emitter {
+            cfg: swc_ecma_codegen::Config::default().with_minify(false),
+            cm: cm.clone(),
+            comments: None,
+            wr: JsWriter::new(cm.clone(), "\n", &mut buf, None),
+        };
+        emitter.emit_module(&module).map_err(|e| e.to_string())?;
+    }
+
+    String::from_utf8(buf).map_err(|e| e.to_string())
+}
+
+/// Simple transformer that only handles dynamic imports
+struct DynamicImportTransformer;
+
+impl VisitMut for DynamicImportTransformer {
+    fn visit_mut_expr(&mut self, expr: &mut Expr) {
+        // First, visit children
+        expr.visit_mut_children_with(self);
+
+        // Transform dynamic imports: import(expr) -> __otter_dynamic_import(expr)
+        if let Expr::Call(call) = expr {
+            if let Callee::Import(_) = &call.callee {
+                // Transform all dynamic imports to use __otter_dynamic_import
+                call.callee = Callee::Expr(Box::new(Expr::Ident(Ident::new(
+                    "__otter_dynamic_import".into(),
+                    DUMMY_SP,
+                    Default::default(),
+                ))));
+            }
+        }
+    }
 }
 
 /// Create an expression statement

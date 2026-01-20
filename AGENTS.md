@@ -15,6 +15,7 @@ Otter is an embeddable TypeScript/JavaScript engine for Rust applications built 
 3. **Keep patches surgical**: avoid refactors unless requested; keep public APIs stable.
 4. **Respect safety boundaries**: follow the `unsafe`/FFI rules and JSC threading invariants below.
 5. **Update the “triangle” when needed**: runtime behavior ↔ TypeScript `.d.ts` ↔ docs/examples/tests.
+6. **Parse JS/TS with ASTs**: use `oxc`/SWC; never regex-parse JS/TS.
 
 ## Repository Map (where to change what)
 
@@ -31,6 +32,7 @@ Otter is an embeddable TypeScript/JavaScript engine for Rust applications built 
 - **Production-ready code**: No premature micro-optimizations. Write clean, idiomatic Rust first.
 - **Performance target**: Match or exceed Node.js and Deno performance; approach Bun where possible.
 - **API compatibility**: Prioritize compatibility with Node.js APIs and web standards.
+- **AST-first parsing**: Use ASTs via `oxc`/SWC for JS/TS analysis or transforms; do not use regex to parse JS/TS code.
 - **Idiomatic Rust**: Follow Rust best practices, use proper error handling, leverage the type system.
 - **Secure defaults**: deny-by-default permissions; new capabilities must be explicit and testable.
 
@@ -97,6 +99,7 @@ Supporting crates:
 4. **Async ops require Tokio**: async ops are scheduled onto a Tokio runtime handle (thread-local). If you add/modify async ops, ensure the caller sets a handle (CLI does via `set_tokio_handle(Handle::current())`).
 
 5. **TypeScript Pipeline**: Type checking via tsgo (10x faster than tsc), transpilation via SWC.
+6. **AST-only parsing**: Use ASTs via `oxc`/SWC for JS/TS analysis or transforms; no regex parsing.
 
 ### Node.js Module Implementation Pattern
 

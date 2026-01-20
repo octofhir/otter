@@ -12,12 +12,21 @@
     const getExecutionAsyncId = () => __otter_async_hooks_execution_async_id();
     const getTriggerAsyncId = () => __otter_async_hooks_trigger_async_id();
     const nextAsyncId = () => __otter_async_hooks_next_async_id();
-    const setCurrentAsyncIds = (asyncId, triggerAsyncId) =>
-        __otter_async_hooks_set_current(asyncId, triggerAsyncId);
+    const setCurrentAsyncIds = (asyncId, triggerAsyncId) => {
+        const previous = __otter_async_hooks_set_current(asyncId, triggerAsyncId);
+        updateAsyncLocalStorageContext(asyncId, triggerAsyncId);
+        return previous;
+    };
 
     let currentAsyncResource = null;
     const activeHooks = new Set();
     const asyncLocalStorages = new Set();
+
+    function updateAsyncLocalStorageContext(asyncId, triggerAsyncId) {
+        for (const storage of asyncLocalStorages) {
+            storage._updateContext(asyncId, triggerAsyncId);
+        }
+    }
 
     function emitHookEvent(name, asyncId, type, triggerAsyncId, resource) {
         for (const hook of activeHooks) {
@@ -188,16 +197,25 @@
      * Similar to thread-local storage but for async contexts.
      */
     class AsyncLocalStorage {
-        #store = undefined;
+        #storeMap = new Map();
+        #currentStore = undefined;
         #enabled = true;
+        #suspended = 0;
+        #defaultValue = undefined;
+        name = undefined;
 
         /**
          * @param {object} [options] - Options object
          */
         constructor(options) {
-            // Node.js 19+ added options.onPropagate
             if (options && typeof options === 'object') {
                 this._onPropagate = options.onPropagate;
+                if (options.defaultValue !== undefined) {
+                    this.#defaultValue = options.defaultValue;
+                }
+                if (typeof options.name === 'string') {
+                    this.name = options.name;
+                }
             }
             asyncLocalStorages.add(this);
         }
@@ -207,7 +225,8 @@
          */
         disable() {
             this.#enabled = false;
-            this.#store = undefined;
+            this.#storeMap.clear();
+            this.#currentStore = undefined;
         }
 
         /**
@@ -215,10 +234,10 @@
          * @returns {*} Current store value or undefined
          */
         getStore() {
-            if (!this.#enabled) {
+            if (!this.#enabled || this.#suspended > 0) {
                 return undefined;
             }
-            return this.#store;
+            return this.#currentStore;
         }
 
         /**
@@ -229,18 +248,17 @@
          * @returns {*} Return value of callback
          */
         run(store, callback, ...args) {
+            if (typeof callback !== 'function') {
+                throw new TypeError('The "callback" argument must be of type function');
+            }
+
             if (!this.#enabled) {
                 return callback(...args);
             }
 
-            const previousStore = this.#store;
-            this.#store = store;
-
-            try {
-                return callback(...args);
-            } finally {
-                this.#store = previousStore;
-            }
+            const resource = new AsyncResource('AsyncLocalStorage.run', executionAsyncId());
+            this.#storeMap.set(resource._asyncId, store);
+            return resource.runInAsyncScope(() => callback(...args));
         }
 
         /**
@@ -250,17 +268,19 @@
          * @returns {*} Return value of callback
          */
         exit(callback, ...args) {
+            if (typeof callback !== 'function') {
+                throw new TypeError('The "callback" argument must be of type function');
+            }
+
             if (!this.#enabled) {
                 return callback(...args);
             }
 
-            const previousStore = this.#store;
-            this.#store = undefined;
-
+            this.#suspended += 1;
             try {
                 return callback(...args);
             } finally {
-                this.#store = previousStore;
+                this.#suspended -= 1;
             }
         }
 
@@ -270,9 +290,12 @@
          * @param {*} store - Store value
          */
         enterWith(store) {
-            if (this.#enabled) {
-                this.#store = store;
+            if (!this.#enabled) {
+                return;
             }
+            const id = executionAsyncId();
+            this.#storeMap.set(id, store);
+            this._updateContext(id, triggerAsyncId());
         }
 
         /**
@@ -284,35 +307,9 @@
             if (typeof fn !== 'function') {
                 throw new TypeError('The "fn" argument must be of type function');
             }
-            const snapshot = [];
-            for (const storage of asyncLocalStorages) {
-                snapshot.push({
-                    storage,
-                    enabled: storage.#enabled,
-                    store: storage.#store,
-                });
-            }
+            const snapshot = AsyncLocalStorage.snapshot();
             return function(...args) {
-                const previous = [];
-                for (const entry of snapshot) {
-                    const storage = entry.storage;
-                    previous.push({
-                        storage,
-                        enabled: storage.#enabled,
-                        store: storage.#store,
-                    });
-                    if (entry.enabled && storage.#enabled) {
-                        storage.#store = entry.store;
-                    }
-                }
-                try {
-                    return fn.apply(this, args);
-                } finally {
-                    for (const entry of previous) {
-                        entry.storage.#enabled = entry.enabled;
-                        entry.storage.#store = entry.store;
-                    }
-                }
+                return snapshot(fn, ...args);
             };
         }
 
@@ -321,41 +318,124 @@
          * @returns {Function} Snapshot function
          */
         static snapshot() {
-            const snapshot = [];
+            const saved = [];
             for (const storage of asyncLocalStorages) {
-                snapshot.push({
+                saved.push({
                     storage,
-                    enabled: storage.#enabled,
-                    store: storage.#store,
+                    state: storage._captureState(),
                 });
             }
             return function(fn, ...args) {
                 if (typeof fn !== 'function') {
                     throw new TypeError('The "fn" argument must be of type function');
                 }
-                const previous = [];
-                for (const entry of snapshot) {
-                    const storage = entry.storage;
-                    previous.push({
-                        storage,
-                        enabled: storage.#enabled,
-                        store: storage.#store,
-                    });
-                    if (entry.enabled && storage.#enabled) {
-                        storage.#store = entry.store;
-                    }
+                const prevStates = [];
+                for (const entry of saved) {
+                    prevStates.push(entry.storage._captureState());
+                    entry.storage._setStoreForCurrentId(entry.state.currentStore);
                 }
                 try {
                     return fn(...args);
                 } finally {
-                    for (const entry of previous) {
-                        entry.storage.#enabled = entry.enabled;
-                        entry.storage.#store = entry.store;
+                    for (let i = 0; i < saved.length; i++) {
+                        saved[i].storage._restoreState(prevStates[i]);
                     }
                 }
             };
         }
+
+        _setStoreForCurrentId(store) {
+            if (!this.#enabled) {
+                return;
+            }
+            const id = executionAsyncId();
+            this.#storeMap.set(id, store);
+            this._updateContext(id, triggerAsyncId());
+        }
+
+        _captureState() {
+            return {
+                enabled: this.#enabled,
+                suspended: this.#suspended,
+                currentStore: this.#currentStore,
+            };
+        }
+
+        _restoreState(state) {
+            this.#enabled = state.enabled;
+            this.#suspended = state.suspended;
+            this.#currentStore = state.currentStore;
+        }
+
+        _updateContext(asyncId, triggerAsyncId) {
+            if (!this.#enabled || this.#suspended > 0) {
+                this.#currentStore = undefined;
+                return;
+            }
+            if (this.#storeMap.has(asyncId)) {
+                this.#currentStore = this.#storeMap.get(asyncId);
+                return;
+            }
+            if (this.#storeMap.has(triggerAsyncId)) {
+                const parent = this.#storeMap.get(triggerAsyncId);
+                this.#storeMap.set(asyncId, parent);
+                this.#currentStore = parent;
+                return;
+            }
+            if (this.#defaultValue !== undefined) {
+                this.#storeMap.set(asyncId, this.#defaultValue);
+                this.#currentStore = this.#defaultValue;
+                return;
+            }
+            this.#currentStore = undefined;
+        }
     }
+
+    function wrapWithAsyncResource(type, callback) {
+        if (typeof callback !== 'function') {
+            throw new TypeError('The "callback" argument must be of type function');
+        }
+        const triggerId = executionAsyncId();
+        return function(...args) {
+            const resource = new AsyncResource(type, triggerId);
+            return resource.runInAsyncScope(() => callback.apply(this, args));
+        };
+    }
+
+    function wrapGlobalAsyncFn(name, type) {
+        const original = globalThis[name];
+        if (typeof original !== 'function') {
+            return;
+        }
+        const flag = `__otter_async_hooks_${name}_wrapped`;
+        if (globalThis[flag]) {
+            return;
+        }
+        globalThis[flag] = true;
+        globalThis[name] = function(callback, ...rest) {
+            return original.call(this, wrapWithAsyncResource(type, callback), ...rest);
+        };
+    }
+
+    function wrapQueueMicrotask() {
+        if (typeof globalThis.queueMicrotask !== 'function') {
+            return;
+        }
+        const flag = '__otter_async_hooks_queueMicrotask_wrapped';
+        if (globalThis[flag]) {
+            return;
+        }
+        const original = globalThis.queueMicrotask;
+        globalThis[flag] = true;
+        globalThis.queueMicrotask = function queueMicrotaskPatched(callback) {
+            return original.call(globalThis, wrapWithAsyncResource('Microtask', callback));
+        };
+    }
+
+    wrapGlobalAsyncFn('setTimeout', 'Timeout');
+    wrapGlobalAsyncFn('setInterval', 'Interval');
+    wrapGlobalAsyncFn('setImmediate', 'Immediate');
+    wrapQueueMicrotask();
 
     /**
      * Creates an async hook (stub implementation).

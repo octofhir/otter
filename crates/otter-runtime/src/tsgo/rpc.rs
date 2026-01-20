@@ -151,9 +151,7 @@ fn resolve_type_reference(type_ref: &str, containing_file: &Path) -> Option<serd
     let start_dir = if containing_file.is_dir() {
         containing_file
     } else {
-        containing_file
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
+        containing_file.parent().unwrap_or_else(|| Path::new("."))
     };
 
     // Try to find in @types
@@ -229,9 +227,7 @@ fn resolve_module_name(module_name: &str, containing_file: &Path) -> Option<serd
     let start_dir = if containing_file.is_dir() {
         containing_file
     } else {
-        containing_file
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
+        containing_file.parent().unwrap_or_else(|| Path::new("."))
     };
 
     // Skip relative imports
@@ -660,7 +656,9 @@ impl TsgoChannel {
 
                     if let Some(resolved) = resolve_module_name(module_name, containing_file) {
                         tracing::debug!("Resolved module '{}' to {:?}", module_name, resolved);
-                        return Ok(serde_json::to_string(&resolved).unwrap_or_else(|_| "null".to_string()));
+                        return Ok(
+                            serde_json::to_string(&resolved).unwrap_or_else(|_| "null".to_string())
+                        );
                     }
                 }
 
@@ -684,8 +682,12 @@ impl TsgoChannel {
                         .unwrap_or("");
 
                     // Use lib_search_root for virtual files like "__inferred type names__.ts"
-                    let containing_file = if containing_file_str.contains("__inferred") || !Path::new(containing_file_str).exists() {
-                        self.lib_search_root.as_deref().unwrap_or_else(|| Path::new("."))
+                    let containing_file = if containing_file_str.contains("__inferred")
+                        || !Path::new(containing_file_str).exists()
+                    {
+                        self.lib_search_root
+                            .as_deref()
+                            .unwrap_or_else(|| Path::new("."))
                     } else {
                         Path::new(containing_file_str)
                     };
@@ -698,13 +700,21 @@ impl TsgoChannel {
 
                     if !type_ref.is_empty() {
                         if let Some(resolved) = resolve_type_reference(type_ref, containing_file) {
-                            tracing::debug!("Resolved type reference '{}' to {:?}", type_ref, resolved);
-                            return Ok(serde_json::to_string(&resolved).unwrap_or_else(|_| "null".to_string()));
+                            tracing::debug!(
+                                "Resolved type reference '{}' to {:?}",
+                                type_ref,
+                                resolved
+                            );
+                            return Ok(serde_json::to_string(&resolved)
+                                .unwrap_or_else(|_| "null".to_string()));
                         }
                     }
                 }
 
-                tracing::debug!("resolveTypeReferenceDirective: returning null for {}", payload);
+                tracing::debug!(
+                    "resolveTypeReferenceDirective: returning null for {}",
+                    payload
+                );
                 Ok("null".to_string())
             }
 

@@ -139,8 +139,14 @@ impl ModuleGraph {
         let mut visited = HashSet::new();
         let mut stack = Vec::new();
 
-        self.load_recursive(specifier, None, ImportContext::ESM, &mut visited, &mut stack)
-            .await
+        self.load_recursive(
+            specifier,
+            None,
+            ImportContext::ESM,
+            &mut visited,
+            &mut stack,
+        )
+        .await
     }
 
     async fn load_recursive(
@@ -248,20 +254,27 @@ impl ModuleGraph {
 
         // Now recursively load dependencies
         // If any dependency tries to import us, we're already in the graph
+        // Note: We continue on resolution errors to support optional dependencies
+        // (common in Node.js ecosystem where packages use try/catch around require)
         for dep in &dependencies {
             let dep_context = if importer_type.is_commonjs() {
                 ImportContext::CJS
             } else {
                 ImportContext::ESM
             };
-            Box::pin(self.load_recursive(
+            let result = Box::pin(self.load_recursive(
                 dep,
                 Some(&module_url),
                 dep_context,
                 visited,
                 stack,
             ))
-            .await?;
+            .await;
+
+            if let Err(_e) = result {
+                // Don't fail - dependency might be optional (try/catch in source)
+                // This is common in Node.js ecosystem (e.g., pnpapi, fsevents)
+            }
         }
 
         // Update wrapping flags now that we know the imported module types
@@ -273,7 +286,9 @@ impl ModuleGraph {
                     .iter()
                     .filter_map(|r| {
                         r.resolved_url.as_ref().and_then(|url| {
-                            self.nodes.get(url).map(|dep| (url.clone(), dep.module.module_type))
+                            self.nodes
+                                .get(url)
+                                .map(|dep| (url.clone(), dep.module.module_type))
                         })
                     })
                     .collect()

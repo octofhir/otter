@@ -13,7 +13,7 @@ use otter_runtime::Extension;
 use otter_runtime::extension::op_sync;
 use serde_json::json;
 
-use crate::zlib::{self, CompressOptions, constants};
+use crate::zlib::{self, CompressOptions, DEFAULT_CHUNK_SIZE, constants};
 
 /// Helper to extract bytes from JS value (string, array, or Buffer object).
 fn extract_bytes(value: &serde_json::Value) -> Vec<u8> {
@@ -63,6 +63,15 @@ fn extract_options(value: Option<&serde_json::Value>) -> Option<CompressOptions>
             .and_then(|v| v.as_i64())
             .map(|v| v as i32)
             .unwrap_or(15),
+        chunk_size: obj
+            .get("chunkSize")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(DEFAULT_CHUNK_SIZE),
+        dictionary: obj
+            .get("dictionary")
+            .map(|value| extract_bytes(value))
+            .filter(|dict| !dict.is_empty()),
     })
 }
 
@@ -125,8 +134,9 @@ pub fn extension() -> Extension {
                 })?;
 
                 let bytes = extract_bytes(data);
+                let options = extract_options(args.get(1));
 
-                match zlib::inflate(&bytes) {
+                match zlib::inflate(&bytes, options) {
                     Ok(decompressed) => Ok(json!({
                         "type": "Buffer",
                         "data": decompressed,
@@ -157,8 +167,9 @@ pub fn extension() -> Extension {
                 })?;
 
                 let bytes = extract_bytes(data);
+                let options = extract_options(args.get(1));
 
-                match zlib::inflate_raw(&bytes) {
+                match zlib::inflate_raw(&bytes, options) {
                     Ok(decompressed) => Ok(json!({
                         "type": "Buffer",
                         "data": decompressed,
@@ -257,12 +268,19 @@ mod tests {
         let value = json!({
             "level": 9,
             "memLevel": 9,
-            "strategy": 0
+            "strategy": 0,
+            "windowBits": 12,
+            "chunkSize": 8192,
+            "dictionary": "abc"
         });
 
         let opts = extract_options(Some(&value)).unwrap();
         assert_eq!(opts.level, 9);
         assert_eq!(opts.mem_level, 9);
         assert_eq!(opts.strategy, 0);
+
+        assert_eq!(opts.window_bits, 12);
+        assert_eq!(opts.chunk_size, 8192);
+        assert_eq!(opts.dictionary.as_deref(), Some(b"abc".as_slice()));
     }
 }

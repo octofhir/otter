@@ -10,6 +10,16 @@
 (function (globalThis) {
   "use strict";
 
+  // Node.js compatibility: `global` is an alias for `globalThis`
+  if (typeof globalThis.global === 'undefined') {
+    Object.defineProperty(globalThis, 'global', {
+      value: globalThis,
+      writable: false,
+      enumerable: false,
+      configurable: false,
+    });
+  }
+
   // V8-compatible Error.prepareStackTrace and CallSite API for Node.js compatibility
   // Many packages like depd, source-map-support use this API
   if (!Error.prepareStackTrace) {
@@ -404,6 +414,43 @@
     });
   }
 
+  // Event loop polling infrastructure
+  // Extensions can register poll functions that are called during each event loop iteration
+  const __otter_poll_handlers = [];
+
+  if (typeof globalThis.__otter_register_poll_handler !== "function") {
+    __otter_define_immutable_global("__otter_register_poll_handler", function __otter_register_poll_handler(handler) {
+      if (typeof handler === "function") {
+        __otter_poll_handlers.push(handler);
+      }
+    });
+  }
+
+  // Main poll function called by the event loop
+  if (typeof globalThis.__otter_poll_all !== "function") {
+    __otter_define_immutable_global("__otter_poll_all", function __otter_poll_all() {
+      let handled = 0;
+      for (const handler of __otter_poll_handlers) {
+        try {
+          handled += handler() || 0;
+        } catch (e) {
+          console.error("Poll handler error:", e);
+        }
+      }
+      // Also call legacy poll functions if they exist
+      if (typeof globalThis.__otter_cp_poll === "function") {
+        handled += globalThis.__otter_cp_poll() || 0;
+      }
+      if (typeof globalThis.__otter_worker_poll === "function") {
+        handled += globalThis.__otter_worker_poll() || 0;
+      }
+      if (typeof globalThis.__otter_worker_threads_poll === "function") {
+        handled += globalThis.__otter_worker_threads_poll() || 0;
+      }
+      return handled;
+    });
+  }
+
   // Dynamic import runtime function for variable-based imports
   // Handles: import(variableName) or import(expression)
   if (typeof globalThis.__otter_dynamic_import !== "function") {
@@ -439,7 +486,45 @@
 
       // Try loading via native op (if available)
       if (typeof globalThis.__otter_load_module === "function") {
-        return await globalThis.__otter_load_module(specifier);
+        try {
+          const result = await globalThis.__otter_load_module(specifier);
+
+          // The native op returns { code, entry, urls }
+          // - code: bundled JavaScript to eval (registers modules in __otter_modules)
+          // - entry: the resolved URL of the requested module
+          // - urls: all module URLs in execution order
+          if (result && result.code) {
+            // The bundled code uses top-level await, so we need to execute it
+            // in an async context. Use AsyncFunction to create an async wrapper.
+            const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+            const asyncEval = new AsyncFunction(result.code);
+            await asyncEval();
+
+            // Return the requested module from registry
+            const entryUrl = result.entry;
+
+            // Check ESM modules first
+            if (globalThis.__otter_modules?.[entryUrl]) {
+              return globalThis.__otter_modules[entryUrl];
+            }
+
+            // Check CJS modules
+            if (globalThis.__otter_cjs_modules?.[entryUrl]) {
+              const cjsMod = globalThis.__otter_cjs_modules[entryUrl]();
+              const esmMod = typeof __toESM === "function" ? __toESM(cjsMod, 1) : cjsMod;
+              globalThis.__otter_modules = globalThis.__otter_modules || {};
+              globalThis.__otter_modules[entryUrl] = esmMod;
+              return esmMod;
+            }
+
+            throw new Error(`Module ${entryUrl} was loaded but not found in registry`);
+          }
+        } catch (loadError) {
+          // Fall through to other methods or error
+          if (loadError.message && !loadError.message.includes("not found in registry")) {
+            throw loadError;
+          }
+        }
       }
 
       // Try CommonJS require as fallback

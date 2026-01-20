@@ -291,32 +291,32 @@ impl EventLoop {
         }
         // Only count non-cancelled timers
         let timers = self.timers.lock();
-        if timers.iter().any(|t| {
-            !t.cancelled.load(Ordering::Relaxed) && t.refed.load(Ordering::Relaxed)
-        }) {
+        if timers
+            .iter()
+            .any(|t| !t.cancelled.load(Ordering::Relaxed) && t.refed.load(Ordering::Relaxed))
+        {
             return true;
         }
 
         let immediates = self.immediates.lock();
-        immediates.iter().any(|i| {
-            !i.cancelled.load(Ordering::Relaxed) && i.refed.load(Ordering::Relaxed)
-        })
+        immediates
+            .iter()
+            .any(|i| !i.cancelled.load(Ordering::Relaxed) && i.refed.load(Ordering::Relaxed))
     }
 
     pub fn next_timer_deadline(&self) -> Option<Instant> {
         let immediates = self.immediates.lock();
-        if immediates.iter().any(|i| {
-            !i.cancelled.load(Ordering::Relaxed) && i.refed.load(Ordering::Relaxed)
-        }) {
+        if immediates
+            .iter()
+            .any(|i| !i.cancelled.load(Ordering::Relaxed) && i.refed.load(Ordering::Relaxed))
+        {
             return Some(Instant::now());
         }
 
         let timers = self.timers.lock();
         timers
             .iter()
-            .filter(|t| {
-                !t.cancelled.load(Ordering::Relaxed) && t.refed.load(Ordering::Relaxed)
-            })
+            .filter(|t| !t.cancelled.load(Ordering::Relaxed) && t.refed.load(Ordering::Relaxed))
             .map(|timer| timer.when)
             .min()
     }
@@ -378,15 +378,13 @@ impl EventLoop {
             // Create shared cancelled flag for this executing timer
             let cancelled_flag = Arc::new(AtomicBool::new(false));
             let refed_flag = Arc::new(AtomicBool::new(timer.refed.load(Ordering::Relaxed)));
-            self.executing_timer_ids
-                .lock()
-                .insert(
-                    timer_id,
-                    ExecutingTimerState {
-                        cancelled: cancelled_flag.clone(),
-                        refed: refed_flag.clone(),
-                    },
-                );
+            self.executing_timer_ids.lock().insert(
+                timer_id,
+                ExecutingTimerState {
+                    cancelled: cancelled_flag.clone(),
+                    refed: refed_flag.clone(),
+                },
+            );
 
             // Increment nesting level for HTML5 spec compliance
             TIMER_NESTING_LEVEL.with(|level| {

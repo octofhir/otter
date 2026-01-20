@@ -677,8 +677,8 @@ pub struct StoreStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::io::Write;
     use tar::Builder;
 
@@ -763,11 +763,15 @@ mod tests {
         let _ = fs::remove_dir_all(&store_root);
 
         let tgz = make_tgz("package");
-        let index = store.store_package_from_tarball("x", "1.0.0", &tgz).unwrap();
+        let index = store
+            .store_package_from_tarball("x", "1.0.0", &tgz)
+            .unwrap();
         assert!(index.files.iter().any(|f| f.path == "package.json"));
 
         let tgz = make_tgz("node");
-        let index = store.store_package_from_tarball("y", "1.0.0", &tgz).unwrap();
+        let index = store
+            .store_package_from_tarball("y", "1.0.0", &tgz)
+            .unwrap();
         assert!(index.files.iter().any(|f| f.path == "package.json"));
         assert!(!index.files.iter().any(|f| f.path == "node/package.json"));
 

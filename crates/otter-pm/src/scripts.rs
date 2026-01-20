@@ -238,7 +238,11 @@ pub fn format_scripts_list(scripts: &[(&str, &str)]) -> String {
         return String::from("  (no scripts defined)");
     }
 
-    let max_name_len = scripts.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+    let max_name_len = scripts
+        .iter()
+        .map(|(name, _)| name.len())
+        .max()
+        .unwrap_or(0);
 
     scripts
         .iter()
@@ -248,7 +252,12 @@ pub fn format_scripts_list(scripts: &[(&str, &str)]) -> String {
             } else {
                 cmd.to_string()
             };
-            format!("  {:<width$} → {}", name, truncated_cmd, width = max_name_len)
+            format!(
+                "  {:<width$} → {}",
+                name,
+                truncated_cmd,
+                width = max_name_len
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")

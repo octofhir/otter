@@ -275,7 +275,9 @@ impl Buffer {
             "hex" => hex::decode(string).unwrap_or_default(),
             _ => string.as_bytes().to_vec(),
         };
-        let write_len = length.min(bytes.len()).min(self.data.len().saturating_sub(offset));
+        let write_len = length
+            .min(bytes.len())
+            .min(self.data.len().saturating_sub(offset));
         for i in 0..write_len {
             if offset + i < self.data.len() {
                 self.data[offset + i] = bytes[i];
@@ -297,28 +299,40 @@ impl Buffer {
         if offset + 2 > self.data.len() {
             return None;
         }
-        Some(u16::from_le_bytes([self.data[offset], self.data[offset + 1]]))
+        Some(u16::from_le_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+        ]))
     }
 
     pub fn read_uint16_be(&self, offset: usize) -> Option<u16> {
         if offset + 2 > self.data.len() {
             return None;
         }
-        Some(u16::from_be_bytes([self.data[offset], self.data[offset + 1]]))
+        Some(u16::from_be_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+        ]))
     }
 
     pub fn read_int16_le(&self, offset: usize) -> Option<i16> {
         if offset + 2 > self.data.len() {
             return None;
         }
-        Some(i16::from_le_bytes([self.data[offset], self.data[offset + 1]]))
+        Some(i16::from_le_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+        ]))
     }
 
     pub fn read_int16_be(&self, offset: usize) -> Option<i16> {
         if offset + 2 > self.data.len() {
             return None;
         }
-        Some(i16::from_be_bytes([self.data[offset], self.data[offset + 1]]))
+        Some(i16::from_be_bytes([
+            self.data[offset],
+            self.data[offset + 1],
+        ]))
     }
 
     pub fn read_uint32_le(&self, offset: usize) -> Option<u32> {

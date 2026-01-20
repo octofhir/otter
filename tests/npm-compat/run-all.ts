@@ -22,6 +22,10 @@ const testFiles = [
   'zod.test.ts',
   'uuid.test.ts',
   'async-hooks.test.ts',
+  'async-hooks-extra.test.js',
+  'util.test.ts',
+  'util-extra.test.js',
+  'zlib.test.ts',
 ];
 
 async function runTest(file: string): Promise<TestResult> {

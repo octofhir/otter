@@ -140,6 +140,28 @@ const tests: TestCase[] = [
     },
     expect: { id: 9 },
   },
+  {
+    name: 'AsyncLocalStorage.run preserves store across setTimeout',
+    fn: () =>
+      new Promise((resolve) => {
+        const als = new AsyncLocalStorage();
+        als.run({ id: 'timeout' }, () => {
+          setTimeout(() => resolve(als.getStore()), 0);
+        });
+      }),
+    expect: { id: 'timeout' },
+  },
+  {
+    name: 'AsyncLocalStorage.run preserves store across queueMicrotask',
+    fn: () =>
+      new Promise((resolve) => {
+        const als = new AsyncLocalStorage();
+        als.run({ id: 'micro' }, () => {
+          queueMicrotask(() => resolve(als.getStore()));
+        });
+      }),
+    expect: { id: 'micro' },
+  },
 ];
 
 // Run tests

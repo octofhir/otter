@@ -130,7 +130,7 @@
 
   function inflateSync(buffer, options) {
     const buf = ensureBuffer(buffer);
-    const result = __otter_zlib_inflate_sync(buf);
+    const result = __otter_zlib_inflate_sync(buf, options || {});
     return Buffer.from(result.data);
   }
 
@@ -142,7 +142,7 @@
 
   function inflateRawSync(buffer, options) {
     const buf = ensureBuffer(buffer);
-    const result = __otter_zlib_inflate_raw_sync(buf);
+    const result = __otter_zlib_inflate_raw_sync(buf, options || {});
     return Buffer.from(result.data);
   }
 

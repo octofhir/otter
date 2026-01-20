@@ -281,7 +281,11 @@ pub fn extension() -> Extension {
 
                 let value = args.get(1);
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                let end = args.get(3).and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(len);
+                let end = args
+                    .get(3)
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(len);
                 let encoding = args.get(4).and_then(|v| v.as_str()).unwrap_or("utf8");
 
                 if let Some(v) = value {
@@ -318,12 +322,18 @@ pub fn extension() -> Extension {
                         vec![n as u8]
                     } else if let Some(s) = v.as_str() {
                         match encoding {
-                            "base64" => base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).unwrap_or_default(),
+                            "base64" => base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD,
+                                s,
+                            )
+                            .unwrap_or_default(),
                             "hex" => hex::decode(s).unwrap_or_default(),
                             _ => s.as_bytes().to_vec(),
                         }
                     } else if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
-                        arr.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect()
+                        arr.iter()
+                            .filter_map(|x| x.as_u64().map(|n| n as u8))
+                            .collect()
                     } else {
                         vec![]
                     }
@@ -350,7 +360,11 @@ pub fn extension() -> Extension {
                     .unwrap_or_default();
 
                 let value = args.get(1);
-                let byte_offset = args.get(2).and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(buf_data.len());
+                let byte_offset = args
+                    .get(2)
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(buf_data.len());
                 let encoding = args.get(3).and_then(|v| v.as_str()).unwrap_or("utf8");
 
                 let search_bytes: Vec<u8> = if let Some(v) = value {
@@ -358,12 +372,18 @@ pub fn extension() -> Extension {
                         vec![n as u8]
                     } else if let Some(s) = v.as_str() {
                         match encoding {
-                            "base64" => base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).unwrap_or_default(),
+                            "base64" => base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD,
+                                s,
+                            )
+                            .unwrap_or_default(),
                             "hex" => hex::decode(s).unwrap_or_default(),
                             _ => s.as_bytes().to_vec(),
                         }
                     } else if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
-                        arr.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect()
+                        arr.iter()
+                            .filter_map(|x| x.as_u64().map(|n| n as u8))
+                            .collect()
                     } else {
                         vec![]
                     }
@@ -398,12 +418,18 @@ pub fn extension() -> Extension {
                         vec![n as u8]
                     } else if let Some(s) = v.as_str() {
                         match encoding {
-                            "base64" => base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).unwrap_or_default(),
+                            "base64" => base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD,
+                                s,
+                            )
+                            .unwrap_or_default(),
                             "hex" => hex::decode(s).unwrap_or_default(),
                             _ => s.as_bytes().to_vec(),
                         }
                     } else if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
-                        arr.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect()
+                        arr.iter()
+                            .filter_map(|x| x.as_u64().map(|n| n as u8))
+                            .collect()
                     } else {
                         vec![]
                     }
@@ -428,7 +454,11 @@ pub fn extension() -> Extension {
 
                 let string = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                let length = args.get(3).and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(data.len().saturating_sub(offset));
+                let length = args
+                    .get(3)
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(data.len().saturating_sub(offset));
                 let encoding = args.get(4).and_then(|v| v.as_str()).unwrap_or("utf8");
 
                 let mut buf = buffer::Buffer::from_bytes(&data);
@@ -452,7 +482,8 @@ pub fn extension() -> Extension {
                     .unwrap_or_default();
 
                 let mut buf = buffer::Buffer::from_bytes(&data);
-                buf.swap16().map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+                buf.swap16()
+                    .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
 
                 Ok(json!({
                     "type": "Buffer",
@@ -472,7 +503,8 @@ pub fn extension() -> Extension {
                     .unwrap_or_default();
 
                 let mut buf = buffer::Buffer::from_bytes(&data);
-                buf.swap32().map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+                buf.swap32()
+                    .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
 
                 Ok(json!({
                     "type": "Buffer",
@@ -492,7 +524,8 @@ pub fn extension() -> Extension {
                     .unwrap_or_default();
 
                 let mut buf = buffer::Buffer::from_bytes(&data);
-                buf.swap64().map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+                buf.swap64()
+                    .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
 
                 Ok(json!({
                     "type": "Buffer",
@@ -505,7 +538,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -519,7 +556,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -533,7 +574,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -547,7 +592,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -561,7 +610,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -575,7 +628,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -589,7 +646,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -603,7 +664,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -617,7 +682,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -631,7 +700,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -645,7 +718,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -659,7 +736,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -673,7 +754,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -687,7 +772,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -701,7 +790,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -715,7 +808,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -729,7 +826,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -743,7 +844,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let offset = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let buf = buffer::Buffer::from_bytes(&data);
@@ -758,7 +863,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let value = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u8;
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -774,7 +883,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let value = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as i8;
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -790,7 +903,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let value = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u16;
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -806,7 +923,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let value = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u16;
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -822,7 +943,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let value = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as i16;
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -838,7 +963,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let value = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as i16;
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -854,7 +983,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let value = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -870,7 +1003,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let value = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -886,7 +1023,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let value = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -902,7 +1043,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let value = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -918,7 +1063,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let value = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -934,7 +1083,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let value = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -950,7 +1103,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let value = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -966,7 +1123,11 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let value = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -982,9 +1143,17 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
-                let value = args.get(1).and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let value = args
+                    .get(1)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let mut buf = buffer::Buffer::from_bytes(&data);
                 if buf.write_big_int64_le(value, offset) {
@@ -998,9 +1167,17 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
-                let value = args.get(1).and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let value = args
+                    .get(1)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let mut buf = buffer::Buffer::from_bytes(&data);
                 if buf.write_big_int64_be(value, offset) {
@@ -1014,9 +1191,17 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
-                let value = args.get(1).and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let value = args
+                    .get(1)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let mut buf = buffer::Buffer::from_bytes(&data);
                 if buf.write_big_uint64_le(value, offset) {
@@ -1030,9 +1215,17 @@ pub fn extension() -> Extension {
                     .first()
                     .and_then(|v| v.get("data"))
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect()
+                    })
                     .unwrap_or_default();
-                let value = args.get(1).and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let value = args
+                    .get(1)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
                 let offset = args.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let mut buf = buffer::Buffer::from_bytes(&data);
                 if buf.write_big_uint64_be(value, offset) {

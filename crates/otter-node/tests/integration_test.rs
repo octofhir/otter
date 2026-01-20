@@ -9,7 +9,7 @@
 use otter_engine::CapabilitiesBuilder;
 use otter_node::ext;
 use otter_runtime::{
-    set_tokio_handle, Engine, JscConfig, JscRuntime, transform_module, wrap_module,
+    Engine, JscConfig, JscRuntime, set_tokio_handle, transform_module, wrap_module,
 };
 use std::collections::HashMap;
 use tempfile::TempDir;

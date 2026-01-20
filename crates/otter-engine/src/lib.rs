@@ -37,6 +37,7 @@
 //! ```
 
 pub mod capabilities;
+pub mod dynamic_import;
 pub mod env_store;
 pub mod graph;
 pub mod loader;
@@ -47,7 +48,9 @@ pub use env_store::{
     parse_env_file,
 };
 pub use graph::{ImportRecord, ModuleGraph, ModuleNode, parse_imports};
-pub use loader::{ImportContext, LoaderConfig, ModuleLoader, ModuleType, ResolvedModule, SourceType};
+pub use loader::{
+    ImportContext, LoaderConfig, ModuleLoader, ModuleType, ResolvedModule, SourceType,
+};
 
 // Re-export error types from otter-runtime for convenience
 pub use otter_runtime::{JscError, JscResult};

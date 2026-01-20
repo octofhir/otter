@@ -5,8 +5,8 @@
 //! - `node:` URLs for Node.js built-in modules
 //! - `https://` URLs for remote modules (with allowlist-based security)
 
-use otter_runtime::{JscError, JscResult};
 use otter_runtime::normalize_node_builtin;
+use otter_runtime::{JscError, JscResult};
 use oxc_resolver::{ResolveOptions, Resolver};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -348,6 +348,9 @@ If you meant to import an npm package, remove the 'node:' prefix.",
             JscError::ModuleError(format!("Failed to read '{}': {}", path.display(), e))
         })?;
 
+        // Strip shebang if present (e.g., #!/usr/bin/env node)
+        let source = strip_shebang(&source);
+
         let source_type = Self::source_type_from_path(&path);
         let module_type = self.detect_module_type(&path);
 
@@ -546,6 +549,21 @@ fn glob_match(pattern: &str, url: &str) -> bool {
         url.starts_with(prefix)
     } else {
         pattern == url
+    }
+}
+
+/// Strip shebang line from source code if present.
+///
+/// Replaces the shebang line with spaces to preserve line numbers for error messages.
+fn strip_shebang(source: &str) -> String {
+    if source.starts_with("#!") {
+        if let Some(newline_pos) = source.find('\n') {
+            format!("{}{}", " ".repeat(newline_pos), &source[newline_pos..])
+        } else {
+            String::new()
+        }
+    } else {
+        source.to_string()
     }
 }
 

@@ -99,6 +99,20 @@ pub fn os() -> Extension {
     crate::os_ext::extension()
 }
 
+/// Create the perf_hooks extension for performance measurement.
+///
+/// Provides Node.js-compatible performance APIs (node:perf_hooks).
+pub fn perf_hooks() -> Extension {
+    crate::perf_hooks_ext::extension()
+}
+
+/// Create the module extension for module-related utilities.
+///
+/// Provides Node.js-compatible module APIs (node:module).
+pub fn module() -> Extension {
+    crate::module_ext::extension()
+}
+
 /// Create the test extension for test runner functionality.
 ///
 /// Provides describe, it, test, and assertion APIs.
@@ -257,6 +271,17 @@ pub fn worker() -> Extension {
     crate::worker_ext::extension()
 }
 
+/// Create the worker_threads extension for Node.js worker threads.
+///
+/// Provides Node.js-compatible worker_threads API (node:worker_threads).
+/// Create the worker_threads extension for Node.js-compatible worker threads.
+///
+/// Returns a tuple of (Extension, ActiveWorkerCount) so the runtime can track
+/// when all workers have stopped.
+pub fn worker_threads() -> (Extension, crate::worker_threads::ActiveWorkerCount) {
+    crate::worker_threads_ext::extension()
+}
+
 /// Create the streams extension for Web Streams API.
 ///
 /// Provides ReadableStream, WritableStream, and TransformStream.
@@ -383,6 +408,8 @@ pub struct ExtensionsWithState {
     pub extensions: Vec<Extension>,
     /// HTTP server active count (if http_server was created)
     pub http_server_count: Option<crate::http_server::ActiveServerCount>,
+    /// Worker threads active count
+    pub worker_count: Option<crate::worker_threads::ActiveWorkerCount>,
 }
 
 /// Get extensions for Node.js compatibility with full config.
@@ -438,6 +465,10 @@ pub fn for_node_compat(config: ExtensionConfig) -> ExtensionsWithState {
         worker(),
     ];
 
+    // Add worker_threads extension (returns tuple with active count)
+    let (worker_ext, worker_count) = worker_threads();
+    extensions.push(worker_ext);
+
     let mut http_server_count = None;
 
     // Add http_server if tx is provided
@@ -450,6 +481,7 @@ pub fn for_node_compat(config: ExtensionConfig) -> ExtensionsWithState {
     ExtensionsWithState {
         extensions,
         http_server_count,
+        worker_count: Some(worker_count),
     }
 }
 
@@ -596,6 +628,13 @@ mod tests {
     }
 
     #[test]
+    fn test_worker_threads_extension() {
+        let ext = worker_threads();
+        assert_eq!(ext.name(), "worker_threads");
+        assert!(ext.js_code().is_some());
+    }
+
+    #[test]
     fn test_streams_extension() {
         let ext = streams();
         assert_eq!(ext.name(), "Streams");
@@ -681,8 +720,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions();
         let result = for_node_compat(config);
 
-        // Should have 24 extensions (no http_server since no tx provided)
-        assert_eq!(result.extensions.len(), 24);
+        // Should have 25 extensions (no http_server since no tx provided)
+        assert_eq!(result.extensions.len(), 25);
         assert!(result.http_server_count.is_none());
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
@@ -701,6 +740,7 @@ mod tests {
         assert!(names.contains(&"readline"));
         assert!(names.contains(&"node_stream"));
         assert!(names.contains(&"node_timers"));
+        assert!(names.contains(&"worker_threads"));
         // No http_server without tx
         assert!(!names.contains(&"http_server"));
     }
@@ -711,8 +751,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions().http_event_tx(tx);
         let result = for_node_compat(config);
 
-        // Should have 25 extensions (including http_server)
-        assert_eq!(result.extensions.len(), 25);
+        // Should have 26 extensions (including http_server)
+        assert_eq!(result.extensions.len(), 26);
         assert!(result.http_server_count.is_some());
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
@@ -724,8 +764,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions();
         let result = for_full(config);
 
-        // Should have 25 extensions (node_compat 24 + test)
-        assert_eq!(result.extensions.len(), 25);
+        // Should have 26 extensions (node_compat 25 + test)
+        assert_eq!(result.extensions.len(), 26);
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
         assert!(names.contains(&"test"));
@@ -737,8 +777,8 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions().http_event_tx(tx);
         let result = for_full(config);
 
-        // Should have 26 extensions (all)
-        assert_eq!(result.extensions.len(), 26);
+        // Should have 27 extensions (all)
+        assert_eq!(result.extensions.len(), 27);
         assert!(result.http_server_count.is_some());
     }
 }

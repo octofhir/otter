@@ -116,7 +116,7 @@ fn main() -> anyhow::Result<()> {
 | Module | Status | Notes |
 |--------|--------|-------|
 | `assert` | ✅ Full | 98% - missing CallTracker |
-| `async_hooks` | ⚠️ Partial | 90% - AsyncResource + AsyncLocalStorage hooked up with init/before/after/destroy events |
+| `async_hooks` | ✅ Full | 100% - AsyncResource + AsyncLocalStorage keep stores/callbacks across timers & microtasks |
 | `buffer` | ✅ Full | 100% - all read/write methods, File, Blob |
 | `child_process` | ✅ Full | 95% - spawn, exec, fork with IPC |
 | `crypto` | ✅ Full | 100% - hash, hmac, KDFs, ciphers, sign/verify, keypair, webcrypto full |
@@ -137,10 +137,11 @@ fn main() -> anyhow::Result<()> {
 | `timers` | ✅ Full | 100% - timers + timers/promises |
 | `tty` | ⚠️ Partial | 30% - isatty |
 | `url` | ✅ Full | 100% - WHATWG + legacy |
-| `util` | ⚠️ Partial | 60% - promisify, inspect, format, types |
-| `zlib` | ✅ Full | 98% - gzip, deflate, brotli |
+| `util` | ✅ Full | 100% - promisify, inspect, format, formatWithOptions, debuglog, parseArgs, MIMEType, types, callbackify, isDeepStrictEqual |
+| `worker_threads` | ✅ Full | 100% - Real threading: Worker, MessageChannel, MessagePort, BroadcastChannel, workerData |
+| `zlib` | ✅ Full | 100% - gzip/deflate/brotli with chunkSize/dictionary + CRC32 + stream classes |
 
-**Not yet implemented:** `cluster`, `worker_threads`, `tls`, `vm`, `perf_hooks`, `inspector`
+**Not yet implemented:** `cluster`, `tls`, `vm`, `perf_hooks`, `inspector`
 
 ### Otter APIs
 

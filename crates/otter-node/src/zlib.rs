@@ -6,6 +6,11 @@
 use std::io::{Read, Write};
 use thiserror::Error;
 
+use flate2::write::{DeflateEncoder, ZlibEncoder};
+use flate2::{Compress, Compression, Decompress, FlushDecompress, Status};
+
+pub(crate) const DEFAULT_CHUNK_SIZE: usize = 16 * 1024;
+
 /// Compression level constants matching Node.js zlib.
 pub mod constants {
     pub const Z_NO_COMPRESSION: i32 = 0;
@@ -65,6 +70,10 @@ pub struct CompressOptions {
     pub strategy: i32,
     /// Window bits (8-15 for deflate, 9-15 for gzip).
     pub window_bits: i32,
+    /// Chunk size for streaming inflations.
+    pub chunk_size: usize,
+    /// Optional compression dictionary.
+    pub dictionary: Option<Vec<u8>>,
 }
 
 impl Default for CompressOptions {
@@ -74,8 +83,148 @@ impl Default for CompressOptions {
             mem_level: 8,
             strategy: constants::Z_DEFAULT_STRATEGY,
             window_bits: 15,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            dictionary: None,
         }
     }
+}
+
+fn normalize_window_bits(bits: i32) -> u8 {
+    let bits = bits.abs();
+    bits.clamp(9, 15) as u8
+}
+
+fn compression_error_message(err: &flate2::CompressError) -> String {
+    format!("{}", err)
+}
+
+fn decompression_error_message(err: &flate2::DecompressError) -> String {
+    err.to_string()
+}
+
+fn apply_compression_dictionary(
+    compression: &mut Compress,
+    dictionary: &[u8],
+) -> Result<(), ZlibError> {
+    compression
+        .set_dictionary(dictionary)
+        .map(|_| ())
+        .map_err(|err| ZlibError::Compression(compression_error_message(&err)))
+}
+
+fn apply_decompression_dictionary(
+    decompression: &mut Decompress,
+    dictionary: &[u8],
+) -> Result<(), ZlibError> {
+    decompression
+        .set_dictionary(dictionary)
+        .map(|_| ())
+        .map_err(|err| ZlibError::Decompression(decompression_error_message(&err)))
+}
+
+fn compress_with_options(
+    data: &[u8],
+    options: Option<CompressOptions>,
+    header: bool,
+) -> Result<Vec<u8>, ZlibError> {
+    let opts = options.unwrap_or_default();
+    let level = to_flate2_level(opts.level);
+    let window_bits = normalize_window_bits(opts.window_bits);
+    let mut compressor = Compress::new_with_window_bits(level, header, window_bits);
+
+    if let Some(dictionary) = opts.dictionary.as_ref() {
+        apply_compression_dictionary(&mut compressor, dictionary)?;
+    }
+
+    // Use raw Compress API for full control over window bits and dictionary
+    let mut output = Vec::with_capacity(data.len());
+    let mut input_offset = 0;
+
+    loop {
+        let input = &data[input_offset..];
+        let before_out = compressor.total_out();
+        let before_in = compressor.total_in();
+
+        output.reserve(output.len() + 4096);
+        let output_len = output.len();
+        output.resize(output.capacity(), 0);
+
+        let flush = if input.is_empty() {
+            flate2::FlushCompress::Finish
+        } else {
+            flate2::FlushCompress::None
+        };
+
+        let status = compressor
+            .compress(input, &mut output[output_len..], flush)
+            .map_err(|e| ZlibError::Compression(compression_error_message(&e)))?;
+
+        let consumed = (compressor.total_in() - before_in) as usize;
+        let produced = (compressor.total_out() - before_out) as usize;
+
+        input_offset += consumed;
+        output.truncate(output_len + produced);
+
+        match status {
+            flate2::Status::StreamEnd => break,
+            flate2::Status::Ok | flate2::Status::BufError => {
+                if input.is_empty() && produced == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+fn decompress_with_options(
+    data: &[u8],
+    options: Option<CompressOptions>,
+    header: bool,
+) -> Result<Vec<u8>, ZlibError> {
+    let opts = options.unwrap_or_default();
+    let window_bits = normalize_window_bits(opts.window_bits);
+    let chunk_size = opts.chunk_size.max(1);
+
+    let mut decompressor = Decompress::new_with_window_bits(header, window_bits);
+    if let Some(dictionary) = opts.dictionary.as_ref() {
+        apply_decompression_dictionary(&mut decompressor, dictionary)?;
+    }
+
+    let mut output = Vec::new();
+    let mut input_offset = 0usize;
+    let mut total_out = 0usize;
+
+    loop {
+        let mut buffer = vec![0u8; chunk_size];
+        let status = decompressor
+            .decompress(&data[input_offset..], &mut buffer, FlushDecompress::Finish)
+            .map_err(|err| ZlibError::Decompression(decompression_error_message(&err)))?;
+
+        let consumed = (decompressor.total_in() as usize).saturating_sub(input_offset);
+        let produced = (decompressor.total_out() as usize).saturating_sub(total_out);
+
+        input_offset = input_offset.saturating_add(consumed);
+        total_out = total_out.saturating_add(produced);
+        output.extend_from_slice(&buffer[..produced]);
+
+        if status == Status::StreamEnd {
+            break;
+        }
+
+        if consumed == 0 && produced == 0 {
+            return Err(ZlibError::Decompression(
+                "decompression did not make progress".to_string(),
+            ));
+        }
+
+        if consumed == 0 {
+            break;
+        }
+    }
+
+    Ok(output)
 }
 
 /// Convert level to flate2 Compression.
@@ -122,24 +271,12 @@ pub fn gunzip(data: &[u8]) -> Result<Vec<u8>, ZlibError> {
 
 /// Compress data using raw deflate.
 pub fn deflate_raw(data: &[u8], options: Option<CompressOptions>) -> Result<Vec<u8>, ZlibError> {
-    let opts = options.unwrap_or_default();
-    let level = to_flate2_level(opts.level);
-
-    let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), level);
-    encoder.write_all(data)?;
-    encoder
-        .finish()
-        .map_err(|e| ZlibError::Compression(e.to_string()))
+    compress_with_options(data, options, false)
 }
 
 /// Decompress raw deflate data.
-pub fn inflate_raw(data: &[u8]) -> Result<Vec<u8>, ZlibError> {
-    let mut decoder = flate2::read::DeflateDecoder::new(data);
-    let mut result = Vec::new();
-    decoder
-        .read_to_end(&mut result)
-        .map_err(|e| ZlibError::Decompression(e.to_string()))?;
-    Ok(result)
+pub fn inflate_raw(data: &[u8], options: Option<CompressOptions>) -> Result<Vec<u8>, ZlibError> {
+    decompress_with_options(data, options, false)
 }
 
 // ============================================================================
@@ -148,24 +285,12 @@ pub fn inflate_raw(data: &[u8]) -> Result<Vec<u8>, ZlibError> {
 
 /// Compress data using zlib format (deflate with zlib header).
 pub fn deflate(data: &[u8], options: Option<CompressOptions>) -> Result<Vec<u8>, ZlibError> {
-    let opts = options.unwrap_or_default();
-    let level = to_flate2_level(opts.level);
-
-    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), level);
-    encoder.write_all(data)?;
-    encoder
-        .finish()
-        .map_err(|e| ZlibError::Compression(e.to_string()))
+    compress_with_options(data, options, true)
 }
 
 /// Decompress zlib format data.
-pub fn inflate(data: &[u8]) -> Result<Vec<u8>, ZlibError> {
-    let mut decoder = flate2::read::ZlibDecoder::new(data);
-    let mut result = Vec::new();
-    decoder
-        .read_to_end(&mut result)
-        .map_err(|e| ZlibError::Decompression(e.to_string()))?;
-    Ok(result)
+pub fn inflate(data: &[u8], options: Option<CompressOptions>) -> Result<Vec<u8>, ZlibError> {
+    decompress_with_options(data, options, true)
 }
 
 // ============================================================================
@@ -250,14 +375,14 @@ mod tests {
     #[test]
     fn test_deflate_roundtrip() {
         let compressed = deflate(TEST_DATA, None).unwrap();
-        let decompressed = inflate(&compressed).unwrap();
+        let decompressed = inflate(&compressed, None).unwrap();
         assert_eq!(decompressed, TEST_DATA);
     }
 
     #[test]
     fn test_deflate_raw_roundtrip() {
         let compressed = deflate_raw(TEST_DATA, None).unwrap();
-        let decompressed = inflate_raw(&compressed).unwrap();
+        let decompressed = inflate_raw(&compressed, None).unwrap();
         assert_eq!(decompressed, TEST_DATA);
     }
 
@@ -291,7 +416,7 @@ mod tests {
         assert_eq!(gunzip(&gz).unwrap(), empty);
 
         let zlib = deflate(empty, None).unwrap();
-        assert_eq!(inflate(&zlib).unwrap(), empty);
+        assert_eq!(inflate(&zlib, None).unwrap(), empty);
 
         let br = brotli_compress(empty, None).unwrap();
         assert_eq!(brotli_decompress(&br).unwrap(), empty);

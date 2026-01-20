@@ -101,12 +101,36 @@ impl JscContext {
             .poll_promises(self.ctx as JSContextRef)
     }
 
-    /// Run the full event loop tick (microtasks + timers + async ops)
+    /// Run the full event loop tick (microtasks + timers + async ops + JS poll handlers)
     pub fn poll_event_loop(&self) -> JscResult<usize> {
         let mut handled = 0;
         handled += self.poll_promises()?;
         handled += self.event_loop.poll()?;
+        handled += self.poll_js_handlers()?;
         Ok(handled)
+    }
+
+    /// Call JavaScript poll handlers (__otter_poll_all)
+    fn poll_js_handlers(&self) -> JscResult<usize> {
+        // Use eval to safely call the JS poll function without raw FFI
+        // The function returns the count of handled events, or undefined if not defined
+        let result = self.eval(
+            "typeof __otter_poll_all === 'function' ? __otter_poll_all() : 0"
+        );
+
+        match result {
+            Ok(value) => {
+                if let Ok(count) = value.to_number() {
+                    Ok(count as usize)
+                } else {
+                    Ok(0)
+                }
+            }
+            Err(_) => {
+                // Silently ignore poll errors to avoid breaking the event loop
+                Ok(0)
+            }
+        }
     }
 
     pub fn has_pending_tasks(&self) -> bool {

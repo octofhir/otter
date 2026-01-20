@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::Args;
 use otter_engine::{LoaderConfig, ModuleGraph, ModuleLoader, parse_imports};
 use otter_runtime::{
-    bundle_modules_mixed, needs_transpilation, transpile_typescript, ModuleFormat, ModuleInfo,
+    ModuleFormat, ModuleInfo, bundle_modules_mixed, needs_transpilation, transpile_typescript,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -118,7 +118,14 @@ impl BuildCommand {
 
             // Bundle in topological order with proper CJS/ESM handling
             let execution_order = graph.execution_order();
-            let mut modules_for_bundle: Vec<(String, String, HashMap<String, String>, bool, Option<String>, Option<String>)> = Vec::new();
+            let mut modules_for_bundle: Vec<(
+                String,
+                String,
+                HashMap<String, String>,
+                bool,
+                Option<String>,
+                Option<String>,
+            )> = Vec::new();
 
             for url in &execution_order {
                 // Skip built-in modules
@@ -200,8 +207,7 @@ impl BuildCommand {
             .unwrap_or_else(|| PathBuf::from("a.out"));
 
         // Get current otter executable as base
-        let otter_exe = std::env::current_exe()
-            .context("Failed to get current executable path")?;
+        let otter_exe = std::env::current_exe().context("Failed to get current executable path")?;
 
         // Embed code
         embedded::embed_code(&otter_exe, code.as_bytes(), &output)?;

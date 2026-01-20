@@ -46,16 +46,19 @@ pub mod events_ext;
 pub mod ext;
 pub mod fs;
 pub mod fs_ext;
+pub mod http2_ext;
 pub mod http_ext;
 pub mod http_request;
 pub mod http_server;
 pub mod http_server_ext;
 pub mod http_service;
-pub mod http2_ext;
 pub mod https_ext;
 pub mod ipc;
+pub mod module_ext;
 pub mod net;
+pub mod node_stream_ext;
 pub mod os;
+pub mod perf_hooks_ext;
 pub mod os_ext;
 pub mod path;
 pub mod path_ext;
@@ -67,7 +70,6 @@ pub mod readline_ext;
 pub mod stream;
 pub mod streams_ext;
 pub mod string_decoder_ext;
-pub mod node_stream_ext;
 pub mod test;
 pub mod test_ext;
 pub mod timers_ext;
@@ -79,6 +81,8 @@ pub mod websocket;
 pub mod websocket_ext;
 pub mod worker;
 pub mod worker_ext;
+pub mod worker_threads;
+pub mod worker_threads_ext;
 pub mod zlib;
 pub mod zlib_ext;
 
@@ -108,6 +112,10 @@ pub use websocket::{
     ReadyState, WebSocketError, WebSocketEvent, WebSocketManager, WebSocketMessage,
 };
 pub use worker::{WorkerError, WorkerEvent, WorkerManager, WorkerMessage};
+pub use worker_threads::{
+    ActiveWorkerCount, ResourceLimits, WorkerThreadError, WorkerThreadEvent, WorkerThreadManager,
+    WorkerThreadOptions,
+};
 
 // Re-export capabilities for convenience
 pub use otter_engine::Capabilities;

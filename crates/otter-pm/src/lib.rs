@@ -24,5 +24,7 @@ pub use manifest_cache::{CachedManifest, ManifestCache};
 pub use progress::InstallProgress;
 pub use registry::{DistInfo, NpmRegistry, PackageMetadata, RegistryError, VersionInfo};
 pub use resolver::{ResolvedPackage, Resolver, ResolverError};
-pub use scripts::{ScriptError, ScriptResult, ScriptRunner, find_package_json, format_scripts_list};
+pub use scripts::{
+    ScriptError, ScriptResult, ScriptRunner, find_package_json, format_scripts_list,
+};
 pub use types::{TypesError, install_bundled_types};

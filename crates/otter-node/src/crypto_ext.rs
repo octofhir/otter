@@ -189,7 +189,9 @@ struct KeyMaterialJson {
     key_type: String,
 }
 
-fn normalize_key_input(value: KeyInputArg) -> Result<crypto::KeyInput, otter_runtime::error::JscError> {
+fn normalize_key_input(
+    value: KeyInputArg,
+) -> Result<crypto::KeyInput, otter_runtime::error::JscError> {
     let format = match value.format.as_deref() {
         Some(fmt) => crypto::KeyFormat::parse(fmt)
             .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?,
@@ -257,28 +259,18 @@ fn normalize_key_pair_options(
         r#type: Some("pkcs8".to_string()),
     });
 
-    let public_key_format = crypto::KeyFormat::parse(
-        public_encoding
-            .format
-            .as_deref()
-            .unwrap_or("pem"),
-    )
-    .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
-    let public_key_type = crypto::KeyType::parse(
-        public_encoding.r#type.as_deref().unwrap_or("spki"),
-    )
-    .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
-    let private_key_format = crypto::KeyFormat::parse(
-        private_encoding
-            .format
-            .as_deref()
-            .unwrap_or("pem"),
-    )
-    .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
-    let private_key_type = crypto::KeyType::parse(
-        private_encoding.r#type.as_deref().unwrap_or("pkcs8"),
-    )
-    .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+    let public_key_format =
+        crypto::KeyFormat::parse(public_encoding.format.as_deref().unwrap_or("pem"))
+            .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+    let public_key_type =
+        crypto::KeyType::parse(public_encoding.r#type.as_deref().unwrap_or("spki"))
+            .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+    let private_key_format =
+        crypto::KeyFormat::parse(private_encoding.format.as_deref().unwrap_or("pem"))
+            .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+    let private_key_type =
+        crypto::KeyType::parse(private_encoding.r#type.as_deref().unwrap_or("pkcs8"))
+            .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
 
     Ok(crypto::KeyPairOptions {
         key_type,
@@ -292,9 +284,7 @@ fn normalize_key_pair_options(
     })
 }
 
-fn normalize_aes_gcm_options(
-    options: SubtleAesGcmOptionsArg,
-) -> crypto::SubtleAesGcmOptions {
+fn normalize_aes_gcm_options(options: SubtleAesGcmOptionsArg) -> crypto::SubtleAesGcmOptions {
     crypto::SubtleAesGcmOptions {
         iv: options.iv.into_vec(),
         additional_data: options.additional_data.map(BufferLike::into_vec),
@@ -302,15 +292,11 @@ fn normalize_aes_gcm_options(
     }
 }
 
-fn normalize_aes_cbc_options(
-    options: SubtleAesCbcOptionsArg,
-) -> Vec<u8> {
+fn normalize_aes_cbc_options(options: SubtleAesCbcOptionsArg) -> Vec<u8> {
     options.iv.into_vec()
 }
 
-fn normalize_aes_ctr_options(
-    options: SubtleAesCtrOptionsArg,
-) -> (Vec<u8>, u32) {
+fn normalize_aes_ctr_options(options: SubtleAesCtrOptionsArg) -> (Vec<u8>, u32) {
     (options.counter.into_vec(), options.length)
 }
 
@@ -344,8 +330,8 @@ fn crypto_sign(
     data: BufferLike,
     options: Option<SignOptionsArg>,
 ) -> Result<BufferJson, crypto::CryptoError> {
-    let key = normalize_key_input(key)
-        .map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
+    let key =
+        normalize_key_input(key).map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
     let opts = normalize_sign_options(options)
         .map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
     let signature = crypto::sign(&algorithm, &key, &data.into_vec(), &opts)?;
@@ -363,8 +349,8 @@ fn crypto_verify(
     signature: BufferLike,
     options: Option<SignOptionsArg>,
 ) -> Result<bool, crypto::CryptoError> {
-    let key = normalize_key_input(key)
-        .map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
+    let key =
+        normalize_key_input(key).map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
     let opts = normalize_sign_options(options)
         .map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
     crypto::verify(
@@ -481,12 +467,8 @@ fn crypto_subtle_encrypt_aes_ctr(
     options: SubtleAesCtrOptionsArg,
 ) -> Result<BufferJson, crypto::CryptoError> {
     let (counter, length) = normalize_aes_ctr_options(options);
-    let output = crypto::subtle_encrypt_aes_ctr(
-        &key.into_vec(),
-        &data.into_vec(),
-        &counter,
-        length,
-    )?;
+    let output =
+        crypto::subtle_encrypt_aes_ctr(&key.into_vec(), &data.into_vec(), &counter, length)?;
     Ok(BufferJson {
         r#type: "Buffer".to_string(),
         data: output,
@@ -500,12 +482,8 @@ fn crypto_subtle_decrypt_aes_ctr(
     options: SubtleAesCtrOptionsArg,
 ) -> Result<BufferJson, crypto::CryptoError> {
     let (counter, length) = normalize_aes_ctr_options(options);
-    let output = crypto::subtle_decrypt_aes_ctr(
-        &key.into_vec(),
-        &data.into_vec(),
-        &counter,
-        length,
-    )?;
+    let output =
+        crypto::subtle_decrypt_aes_ctr(&key.into_vec(), &data.into_vec(), &counter, length)?;
     Ok(BufferJson {
         r#type: "Buffer".to_string(),
         data: output,
@@ -542,8 +520,8 @@ fn crypto_subtle_rsa_oaep_encrypt(
     data: BufferLike,
     options: SubtleRsaOaepOptionsArg,
 ) -> Result<BufferJson, crypto::CryptoError> {
-    let key = normalize_key_input(key)
-        .map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
+    let key =
+        normalize_key_input(key).map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
     let hash = crypto::HashAlgorithm::parse(&options.hash)?;
     let label = options.label.map(|v| v.into_vec());
     let output = crypto::subtle_rsa_oaep_encrypt(hash, &key, &data.into_vec(), label.as_deref())?;
@@ -559,8 +537,8 @@ fn crypto_subtle_rsa_oaep_decrypt(
     data: BufferLike,
     options: SubtleRsaOaepOptionsArg,
 ) -> Result<BufferJson, crypto::CryptoError> {
-    let key = normalize_key_input(key)
-        .map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
+    let key =
+        normalize_key_input(key).map_err(|e| crypto::CryptoError::InvalidParams(e.to_string()))?;
     let hash = crypto::HashAlgorithm::parse(&options.hash)?;
     let label = options.label.map(|v| v.into_vec());
     let output = crypto::subtle_rsa_oaep_decrypt(hash, &key, &data.into_vec(), label.as_deref())?;
@@ -748,9 +726,15 @@ pub fn extension() -> Extension {
         Ok(json!(bytes))
     }));
 
-    ops.push(op_sync("getHashes", |_ctx, _args| Ok(json!(crypto::get_hashes()))));
-    ops.push(op_sync("getCiphers", |_ctx, _args| Ok(json!(crypto::get_ciphers()))));
-    ops.push(op_sync("getCurves", |_ctx, _args| Ok(json!(crypto::get_curves()))));
+    ops.push(op_sync("getHashes", |_ctx, _args| {
+        Ok(json!(crypto::get_hashes()))
+    }));
+    ops.push(op_sync("getCiphers", |_ctx, _args| {
+        Ok(json!(crypto::get_ciphers()))
+    }));
+    ops.push(op_sync("getCurves", |_ctx, _args| {
+        Ok(json!(crypto::get_curves()))
+    }));
 
     ops.push(crypto_sign_dive_decl());
     ops.push(crypto_verify_dive_decl());
@@ -1015,12 +999,12 @@ pub fn extension() -> Extension {
 
     // timingSafeEqual(a, b) -> bool
     ops.push(op_sync("timingSafeEqual", |_ctx, args| {
-        let a = args
-            .first()
-            .ok_or_else(|| otter_runtime::error::JscError::internal("timingSafeEqual requires a"))?;
-        let b = args
-            .get(1)
-            .ok_or_else(|| otter_runtime::error::JscError::internal("timingSafeEqual requires b"))?;
+        let a = args.first().ok_or_else(|| {
+            otter_runtime::error::JscError::internal("timingSafeEqual requires a")
+        })?;
+        let b = args.get(1).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("timingSafeEqual requires b")
+        })?;
 
         let a_bytes = value_to_bytes(a)?;
         let b_bytes = value_to_bytes(b)?;
@@ -1032,22 +1016,19 @@ pub fn extension() -> Extension {
 
     // pbkdf2Sync(password, salt, iterations, keylen, digest) -> Buffer
     ops.push(op_sync("pbkdf2Sync", |_ctx, args| {
-        let password = args
-            .first()
-            .ok_or_else(|| otter_runtime::error::JscError::internal("pbkdf2Sync requires password"))?;
+        let password = args.first().ok_or_else(|| {
+            otter_runtime::error::JscError::internal("pbkdf2Sync requires password")
+        })?;
         let salt = args
             .get(1)
             .ok_or_else(|| otter_runtime::error::JscError::internal("pbkdf2Sync requires salt"))?;
-        let iterations = args
-            .get(2)
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("pbkdf2Sync requires iterations"))?
-            as u32;
-        let key_len = args
-            .get(3)
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("pbkdf2Sync requires keylen"))?
-            as usize;
+        let iterations = args.get(2).and_then(|v| v.as_u64()).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("pbkdf2Sync requires iterations")
+        })? as u32;
+        let key_len =
+            args.get(3).and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("pbkdf2Sync requires keylen")
+            })? as usize;
         let digest = args.get(4).and_then(|v| v.as_str()).unwrap_or("sha1");
 
         let out = crypto::pbkdf2(
@@ -1073,17 +1054,20 @@ pub fn extension() -> Extension {
         let salt = args
             .get(1)
             .ok_or_else(|| otter_runtime::error::JscError::internal("pbkdf2 requires salt"))?;
-        let iterations = args
-            .get(2)
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("pbkdf2 requires iterations"))?
-            as u32;
+        let iterations =
+            args.get(2).and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("pbkdf2 requires iterations")
+            })? as u32;
         let key_len = args
             .get(3)
             .and_then(|v| v.as_u64())
             .ok_or_else(|| otter_runtime::error::JscError::internal("pbkdf2 requires keylen"))?
             as usize;
-        let digest = args.get(4).and_then(|v| v.as_str()).unwrap_or("sha1").to_string();
+        let digest = args
+            .get(4)
+            .and_then(|v| v.as_str())
+            .unwrap_or("sha1")
+            .to_string();
 
         let password_bytes = value_to_bytes(password)?;
         let salt_bytes = value_to_bytes(salt)?;
@@ -1107,17 +1091,16 @@ pub fn extension() -> Extension {
 
     // scryptSync(password, salt, keylen, options) -> Buffer
     ops.push(op_sync("scryptSync", |_ctx, args| {
-        let password = args
-            .first()
-            .ok_or_else(|| otter_runtime::error::JscError::internal("scryptSync requires password"))?;
+        let password = args.first().ok_or_else(|| {
+            otter_runtime::error::JscError::internal("scryptSync requires password")
+        })?;
         let salt = args
             .get(1)
             .ok_or_else(|| otter_runtime::error::JscError::internal("scryptSync requires salt"))?;
-        let key_len = args
-            .get(2)
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("scryptSync requires keylen"))?
-            as usize;
+        let key_len =
+            args.get(2).and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("scryptSync requires keylen")
+            })? as usize;
         let options = args.get(3);
         let (n, r, p) = parse_scrypt_options(options)?;
 
@@ -1185,16 +1168,15 @@ pub fn extension() -> Extension {
     let cipher_ctx_create = cipher_contexts.clone();
     let cipher_id = next_id.clone();
     ops.push(op_sync("createCipheriv", move |_ctx, args| {
-        let algorithm = args
-            .first()
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("createCipheriv requires algorithm"))?;
-        let key = args
-            .get(1)
-            .ok_or_else(|| otter_runtime::error::JscError::internal("createCipheriv requires key"))?;
-        let iv = args
-            .get(2)
-            .ok_or_else(|| otter_runtime::error::JscError::internal("createCipheriv requires iv"))?;
+        let algorithm = args.first().and_then(|v| v.as_str()).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("createCipheriv requires algorithm")
+        })?;
+        let key = args.get(1).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("createCipheriv requires key")
+        })?;
+        let iv = args.get(2).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("createCipheriv requires iv")
+        })?;
         let options = args.get(3);
 
         let alg = crypto::CipherAlgorithm::parse(algorithm)
@@ -1218,16 +1200,15 @@ pub fn extension() -> Extension {
     let decipher_ctx_create = decipher_contexts.clone();
     let decipher_id = next_id.clone();
     ops.push(op_sync("createDecipheriv", move |_ctx, args| {
-        let algorithm = args
-            .first()
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("createDecipheriv requires algorithm"))?;
-        let key = args
-            .get(1)
-            .ok_or_else(|| otter_runtime::error::JscError::internal("createDecipheriv requires key"))?;
-        let iv = args
-            .get(2)
-            .ok_or_else(|| otter_runtime::error::JscError::internal("createDecipheriv requires iv"))?;
+        let algorithm = args.first().and_then(|v| v.as_str()).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("createDecipheriv requires algorithm")
+        })?;
+        let key = args.get(1).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("createDecipheriv requires key")
+        })?;
+        let iv = args.get(2).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("createDecipheriv requires iv")
+        })?;
         let options = args.get(3);
 
         let alg = crypto::CipherAlgorithm::parse(algorithm)
@@ -1250,14 +1231,13 @@ pub fn extension() -> Extension {
     // cipherUpdate(id, data) -> Buffer
     let cipher_ctx_update = cipher_contexts.clone();
     ops.push(op_sync("cipherUpdate", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("cipherUpdate requires id"))?
-            as u32;
-        let data = args
-            .get(1)
-            .ok_or_else(|| otter_runtime::error::JscError::internal("cipherUpdate requires data"))?;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("cipherUpdate requires id")
+            })? as u32;
+        let data = args.get(1).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("cipherUpdate requires data")
+        })?;
 
         let mut contexts = cipher_ctx_update.lock();
         let ctx = contexts
@@ -1276,11 +1256,10 @@ pub fn extension() -> Extension {
     // cipherFinal(id) -> Buffer
     let cipher_ctx_final = cipher_contexts.clone();
     ops.push(op_sync("cipherFinal", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("cipherFinal requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("cipherFinal requires id")
+            })? as u32;
 
         let mut contexts = cipher_ctx_final.lock();
         let mut ctx = contexts
@@ -1301,11 +1280,10 @@ pub fn extension() -> Extension {
     // cipherSetAAD(id, aad)
     let cipher_ctx_aad = cipher_contexts.clone();
     ops.push(op_sync("cipherSetAAD", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("cipherSetAAD requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("cipherSetAAD requires id")
+            })? as u32;
         let aad = args
             .get(1)
             .ok_or_else(|| otter_runtime::error::JscError::internal("cipherSetAAD requires aad"))?;
@@ -1322,15 +1300,10 @@ pub fn extension() -> Extension {
     // cipherSetAutoPadding(id, value)
     let cipher_ctx_pad = cipher_contexts.clone();
     ops.push(op_sync("cipherSetAutoPadding", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("cipherSetAutoPadding requires id"))?
-            as u32;
-        let value = args
-            .get(1)
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let id = args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("cipherSetAutoPadding requires id")
+        })? as u32;
+        let value = args.get(1).and_then(|v| v.as_bool()).unwrap_or(true);
 
         let mut contexts = cipher_ctx_pad.lock();
         let ctx = contexts
@@ -1344,11 +1317,9 @@ pub fn extension() -> Extension {
     // cipherGetAuthTag(id) -> Buffer
     let cipher_ctx_tag = cipher_contexts.clone();
     ops.push(op_sync("cipherGetAuthTag", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("cipherGetAuthTag requires id"))?
-            as u32;
+        let id = args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("cipherGetAuthTag requires id")
+        })? as u32;
         let contexts = cipher_ctx_tag.lock();
         let ctx = contexts
             .get(&id)
@@ -1365,14 +1336,13 @@ pub fn extension() -> Extension {
     // decipherUpdate(id, data) -> Buffer
     let decipher_ctx_update = decipher_contexts.clone();
     ops.push(op_sync("decipherUpdate", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("decipherUpdate requires id"))?
-            as u32;
-        let data = args
-            .get(1)
-            .ok_or_else(|| otter_runtime::error::JscError::internal("decipherUpdate requires data"))?;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("decipherUpdate requires id")
+            })? as u32;
+        let data = args.get(1).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("decipherUpdate requires data")
+        })?;
 
         let mut contexts = decipher_ctx_update.lock();
         let ctx = contexts
@@ -1391,11 +1361,10 @@ pub fn extension() -> Extension {
     // decipherFinal(id) -> Buffer
     let decipher_ctx_final = decipher_contexts.clone();
     ops.push(op_sync("decipherFinal", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("decipherFinal requires id"))?
-            as u32;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("decipherFinal requires id")
+            })? as u32;
 
         let mut contexts = decipher_ctx_final.lock();
         let mut ctx = contexts
@@ -1414,14 +1383,13 @@ pub fn extension() -> Extension {
     // decipherSetAAD(id, aad)
     let decipher_ctx_aad = decipher_contexts.clone();
     ops.push(op_sync("decipherSetAAD", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("decipherSetAAD requires id"))?
-            as u32;
-        let aad = args
-            .get(1)
-            .ok_or_else(|| otter_runtime::error::JscError::internal("decipherSetAAD requires aad"))?;
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("decipherSetAAD requires id")
+            })? as u32;
+        let aad = args.get(1).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("decipherSetAAD requires aad")
+        })?;
 
         let mut contexts = decipher_ctx_aad.lock();
         let ctx = contexts
@@ -1435,14 +1403,12 @@ pub fn extension() -> Extension {
     // decipherSetAuthTag(id, tag)
     let decipher_ctx_tag = decipher_contexts.clone();
     ops.push(op_sync("decipherSetAuthTag", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("decipherSetAuthTag requires id"))?
-            as u32;
-        let tag = args
-            .get(1)
-            .ok_or_else(|| otter_runtime::error::JscError::internal("decipherSetAuthTag requires tag"))?;
+        let id = args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("decipherSetAuthTag requires id")
+        })? as u32;
+        let tag = args.get(1).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("decipherSetAuthTag requires tag")
+        })?;
 
         let mut contexts = decipher_ctx_tag.lock();
         let ctx = contexts
@@ -1456,15 +1422,10 @@ pub fn extension() -> Extension {
     // decipherSetAutoPadding(id, value)
     let decipher_ctx_pad = decipher_contexts.clone();
     ops.push(op_sync("decipherSetAutoPadding", move |_ctx, args| {
-        let id = args
-            .first()
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| otter_runtime::error::JscError::internal("decipherSetAutoPadding requires id"))?
-            as u32;
-        let value = args
-            .get(1)
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let id = args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+            otter_runtime::error::JscError::internal("decipherSetAutoPadding requires id")
+        })? as u32;
+        let value = args.get(1).and_then(|v| v.as_bool()).unwrap_or(true);
 
         let mut contexts = decipher_ctx_pad.lock();
         let ctx = contexts

@@ -493,7 +493,7 @@ impl RunCommand {
         let (net_event_tx, net_event_rx) = unbounded_channel::<NetEvent>();
 
         // Initialize net manager (returns active server count for keep-alive)
-        let active_net_server_count = init_net_manager(net_event_tx);
+        let active_net_server_count = init_net_manager(net_event_tx.clone());
 
         // Register Web API extensions (URL, etc.)
         runtime.register_extension(ext::url())?;
@@ -549,6 +549,11 @@ impl RunCommand {
         // Register net extension for node:net (TCP server/socket)
         runtime.register_extension(ext::net())?;
         timing!("ext_net");
+
+        // Register TLS extension for node:tls (TLS client sockets)
+        let (tls_ext, _tls_active_count) = ext::tls(net_event_tx.clone());
+        runtime.register_extension(tls_ext)?;
+        timing!("ext_tls");
 
         // Register HTTP server extension for Otter.serve()
         let (http_server_ext, active_http_server_count) = ext::http_server(http_event_tx);
@@ -606,28 +611,45 @@ impl RunCommand {
         let args_json = serde_json::to_string(&self.args)?;
         let hmr_code = if self.watch { hmr_runtime_code() } else { "" };
         let process_setup = process_info.to_js_setup();
+
+        // Get entry dirname and filename for proper require() resolution
+        let entry_canonical = entry.canonicalize()?;
+        let entry_dirname = entry_canonical
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let entry_filename = entry_canonical.to_string_lossy().to_string();
+
         let setup = format!(
             "{hmr_code}\n\
              {process_setup}\n\
              globalThis.__otter_lock_builtins && globalThis.__otter_lock_builtins();\n\
+             globalThis.__otter_set_entry_dirname && globalThis.__otter_set_entry_dirname({entry_dirname_json}, {entry_filename_json});\n\
              globalThis.Otter = globalThis.Otter || {{}};\n\
-             globalThis.Otter.args = {};\n\
-             globalThis.Otter.capabilities = {};\n",
-            args_json,
-            serde_json::to_string(&caps_to_json(&caps))?,
+             globalThis.Otter.args = {args_json};\n\
+             globalThis.Otter.capabilities = {caps_json};\n",
+            entry_dirname_json = serde_json::to_string(&entry_dirname)?,
+            entry_filename_json = serde_json::to_string(&entry_filename)?,
+            args_json = args_json,
+            caps_json = serde_json::to_string(&caps_to_json(&caps))?,
         );
 
         // Execute with error handling wrapper
+        // NOTE: We store the main promise in a global and attach a .catch() handler.
+        // This ensures JSC keeps tracking the Promise, preventing premature event loop exit.
+        // Without this, calling an async function like `main()` without awaiting would
+        // leave the Promise unobserved, and JSC might not keep the event loop alive.
         let wrapped = format!(
             "{setup}\n\
              globalThis.__otter_script_error = null;\n\
-             (async () => {{\n\
+             globalThis.__otter_main_promise = (async () => {{\n\
                try {{\n\
                  {code}\n\
                }} catch (err) {{\n\
                  globalThis.__otter_script_error = err ? String(err) : 'Error';\n\
                }}\n\
-             }})();\n",
+             }})();\n\
+             globalThis.__otter_main_promise.catch(() => {{}});\n",
         );
 
         // Write bundle for debugging if env var is set
@@ -1010,9 +1032,11 @@ async fn run_event_loop_with_events(
     let ctx = runtime.context().raw();
 
     let mut idle_cycles = 0u32;
-    // For scripts without active servers/workers, exit immediately after becoming idle.
+    // Scripts need a few idle cycles to let Promise continuations run.
+    // This accounts for cases where async work completes but the event loop
+    // hasn't yet processed the continuation (e.g., after child process close events).
     // For servers/workers, use longer idle threshold to avoid premature exit.
-    const MAX_IDLE_CYCLES_SCRIPT: u32 = 1;
+    const MAX_IDLE_CYCLES_SCRIPT: u32 = 5;
     const MAX_IDLE_CYCLES_SERVER: u32 = 100;
 
     loop {
@@ -1040,27 +1064,37 @@ async fn run_event_loop_with_events(
         }
 
         // Poll JavaScript event loop (promises, timers, async ops)
-        let _ = runtime.poll_event_loop();
+        // IMPORTANT: We must check the return value - if events were processed,
+        // we need another iteration to run any Promise continuations that were scheduled.
+        let polled = runtime.poll_event_loop().unwrap_or(0);
 
         // Yield to tokio to allow I/O to flow (hyper needs this!)
-        if has_active_servers || processed > 0 || runtime.has_pending_tasks() {
+        if has_active_servers || processed > 0 || polled > 0 {
             idle_cycles = 0;
             tokio::task::yield_now().await;
-        } else {
-            // No work at all - idle countdown
-            idle_cycles += 1;
-            let max_cycles = if has_active_servers {
-                MAX_IDLE_CYCLES_SERVER
-            } else {
-                MAX_IDLE_CYCLES_SCRIPT
-            };
-            if idle_cycles >= max_cycles {
-                break;
-            }
-            // Shorter sleep for scripts, longer for servers
-            let sleep_ms = if has_active_servers { 5 } else { 1 };
-            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            continue;
         }
+
+        if runtime.has_pending_tasks() {
+            idle_cycles = 0;
+            let sleep_for = runtime.next_wake_delay().max(Duration::from_millis(1));
+            tokio::time::sleep(sleep_for).await;
+            continue;
+        }
+
+        // No work at all - idle countdown
+        idle_cycles += 1;
+        let max_cycles = if has_active_servers {
+            MAX_IDLE_CYCLES_SERVER
+        } else {
+            MAX_IDLE_CYCLES_SCRIPT
+        };
+        if idle_cycles >= max_cycles {
+            break;
+        }
+        // Shorter sleep for scripts, longer for servers
+        let sleep_ms = if has_active_servers { 5 } else { 1 };
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
     }
 
     Ok(())

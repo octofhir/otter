@@ -498,6 +498,16 @@
         return events.length;
     };
 
+    if (typeof globalThis.__otter_register_refed_checker === 'function') {
+        globalThis.__otter_register_refed_checker(() => {
+            try {
+                return cpHasActiveRefs() ? 1 : 0;
+            } catch {
+                return 0;
+            }
+        });
+    }
+
     // Register Otter.spawn
     if (!globalThis.Otter) globalThis.Otter = {};
     globalThis.Otter.spawn = otterSpawn;

@@ -72,6 +72,8 @@ pub mod streams_ext;
 pub mod string_decoder_ext;
 pub mod test;
 pub mod test_ext;
+pub mod tls;
+pub mod tls_ext;
 pub mod timers_ext;
 pub mod tty_ext;
 pub mod url;
@@ -116,6 +118,7 @@ pub use worker_threads::{
     ActiveWorkerCount, ResourceLimits, WorkerThreadError, WorkerThreadEvent, WorkerThreadManager,
     WorkerThreadOptions,
 };
+pub use tls::{ActiveTlsServerCount, TlsError, TlsEvent, TlsManager, TlsResult};
 
 // Re-export capabilities for convenience
 pub use otter_engine::Capabilities;

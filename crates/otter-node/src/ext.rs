@@ -322,6 +322,21 @@ pub fn process_ipc(ipc_channel: crate::ipc::IpcChannel) -> Extension {
     crate::process_ipc_ext::extension(ipc_channel)
 }
 
+/// Create the TLS extension for TLS/SSL encrypted connections.
+///
+/// Provides Node.js-compatible TLS API (node:tls).
+/// Returns a tuple of (Extension, ActiveServerCount) so the runtime can track
+/// when all TLS connections have stopped.
+pub fn tls(
+    event_tx: tokio::sync::mpsc::UnboundedSender<crate::net::NetEvent>,
+) -> (Extension, crate::tls::ActiveTlsServerCount) {
+    crate::tls_ext::init(event_tx);
+    (
+        crate::tls_ext::extension(),
+        crate::tls_ext::get_active_count(),
+    )
+}
+
 // ============================================================================
 // Preset-based Extension Registration
 // ============================================================================
@@ -366,6 +381,8 @@ pub struct ExtensionConfig {
     pub capabilities: crate::Capabilities,
     /// HTTP event sender for Otter.serve()
     pub http_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::http_server::HttpEvent>>,
+    /// Net event sender for TCP/TLS sockets
+    pub net_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::net::NetEvent>>,
 }
 
 impl Default for ExtensionConfig {
@@ -373,6 +390,7 @@ impl Default for ExtensionConfig {
         Self {
             capabilities: crate::Capabilities::none(),
             http_event_tx: None,
+            net_event_tx: None,
         }
     }
 }
@@ -383,6 +401,7 @@ impl ExtensionConfig {
         Self {
             capabilities: crate::Capabilities::all(),
             http_event_tx: None,
+            net_event_tx: None,
         }
     }
 
@@ -400,6 +419,15 @@ impl ExtensionConfig {
         self.http_event_tx = Some(tx);
         self
     }
+
+    /// Set net event sender for TCP/TLS sockets.
+    pub fn net_event_tx(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::net::NetEvent>,
+    ) -> Self {
+        self.net_event_tx = Some(tx);
+        self
+    }
 }
 
 /// Result of creating extensions with config.
@@ -410,6 +438,8 @@ pub struct ExtensionsWithState {
     pub http_server_count: Option<crate::http_server::ActiveServerCount>,
     /// Worker threads active count
     pub worker_count: Option<crate::worker_threads::ActiveWorkerCount>,
+    /// TLS connection active count
+    pub tls_count: Option<crate::tls::ActiveTlsServerCount>,
 }
 
 /// Get extensions for Node.js compatibility with full config.
@@ -470,18 +500,26 @@ pub fn for_node_compat(config: ExtensionConfig) -> ExtensionsWithState {
     extensions.push(worker_ext);
 
     let mut http_server_count = None;
+    let mut tls_count = None;
 
     // Add http_server if tx is provided
-    if let Some(tx) = config.http_event_tx {
+    if let Some(tx) = config.http_event_tx.clone() {
         let (ext, count) = http_server(tx);
         extensions.push(ext);
         http_server_count = Some(count);
+    }
+
+    if let Some(tx) = config.net_event_tx.clone() {
+        let (tls_ext, tls_active_count) = tls(tx);
+        extensions.push(tls_ext);
+        tls_count = Some(tls_active_count);
     }
 
     ExtensionsWithState {
         extensions,
         http_server_count,
         worker_count: Some(worker_count),
+        tls_count,
     }
 }
 
@@ -697,22 +735,27 @@ mod tests {
         let config = ExtensionConfig::default();
         // Default should have no permissions
         assert!(config.http_event_tx.is_none());
+        assert!(config.net_event_tx.is_none());
     }
 
     #[test]
     fn test_extension_config_with_all_permissions() {
         let config = ExtensionConfig::with_all_permissions();
         assert!(config.http_event_tx.is_none());
+        assert!(config.net_event_tx.is_none());
     }
 
     #[test]
     fn test_extension_config_builder() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (net_tx, _net_rx) = tokio::sync::mpsc::unbounded_channel();
         let config = ExtensionConfig::default()
             .capabilities(crate::Capabilities::all())
-            .http_event_tx(tx);
+            .http_event_tx(tx)
+            .net_event_tx(net_tx);
 
         assert!(config.http_event_tx.is_some());
+        assert!(config.net_event_tx.is_some());
     }
 
     #[test]
@@ -720,9 +763,10 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions();
         let result = for_node_compat(config);
 
-        // Should have 25 extensions (no http_server since no tx provided)
+        // Should have 25 extensions (no http_server/tls since no tx provided)
         assert_eq!(result.extensions.len(), 25);
         assert!(result.http_server_count.is_none());
+        assert!(result.tls_count.is_none());
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
         assert!(names.contains(&"path"));
@@ -741,8 +785,9 @@ mod tests {
         assert!(names.contains(&"node_stream"));
         assert!(names.contains(&"node_timers"));
         assert!(names.contains(&"worker_threads"));
-        // No http_server without tx
+        // No http_server/tls without tx
         assert!(!names.contains(&"http_server"));
+        assert!(!names.contains(&"tls"));
     }
 
     #[test]
@@ -751,12 +796,14 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions().http_event_tx(tx);
         let result = for_node_compat(config);
 
-        // Should have 26 extensions (including http_server)
+        // Should have 26 extensions (including http_server, no tls)
         assert_eq!(result.extensions.len(), 26);
         assert!(result.http_server_count.is_some());
+        assert!(result.tls_count.is_none());
 
         let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
         assert!(names.contains(&"http_server"));
+        assert!(!names.contains(&"tls"));
     }
 
     #[test]
@@ -777,8 +824,28 @@ mod tests {
         let config = ExtensionConfig::with_all_permissions().http_event_tx(tx);
         let result = for_full(config);
 
-        // Should have 27 extensions (all)
+        // Should have 27 extensions (all except tls)
         assert_eq!(result.extensions.len(), 27);
         assert!(result.http_server_count.is_some());
+        assert!(result.tls_count.is_none());
+    }
+
+    #[test]
+    fn test_tls_extension() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ext, _count) = tls(tx);
+        assert_eq!(ext.name(), "tls");
+        assert!(ext.js_code().is_some());
+    }
+
+    #[test]
+    fn test_for_node_compat_with_tls() {
+        let (net_tx, _net_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = ExtensionConfig::with_all_permissions().net_event_tx(net_tx);
+        let result = for_node_compat(config);
+
+        assert!(result.tls_count.is_some());
+        let names: Vec<&str> = result.extensions.iter().map(|e| e.name()).collect();
+        assert!(names.contains(&"tls"));
     }
 }

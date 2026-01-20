@@ -37,6 +37,7 @@ pub fn extension() -> Extension {
     let mgr_ref = manager.clone();
     let mgr_unref = manager.clone();
     let mgr_poll = manager.clone();
+    let mgr_has_active_refs = manager.clone();
 
     let mut ops: Vec<OpDecl> = Vec::new();
 
@@ -206,6 +207,11 @@ pub fn extension() -> Extension {
 
         mgr_unref.unref_process(id);
         Ok(json!(null))
+    }));
+
+    // cpHasActiveRefs() -> boolean
+    ops.push(op_sync("cpHasActiveRefs", move |_ctx, _args| {
+        Ok(json!(mgr_has_active_refs.has_active_refs()))
     }));
 
     // cpPollEvents() -> array

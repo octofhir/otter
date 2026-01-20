@@ -1,0 +1,257 @@
+name: Node.js Compatibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 0 * * *'  # Daily at midnight UTC
+  workflow_dispatch:  # Manual trigger
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  node-compat:
+    name: Node.js Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # Windows excluded initially due to path differences in Node.js tests
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "node-compat-v1"
+
+      # Cache bun-webkit (Linux/Windows only, macOS uses system JSC)
+      - name: Cache bun-webkit
+        if: runner.os != 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/cache/bun-webkit
+          key: bun-webkit-${{ runner.os }}-${{ hashFiles('crates/otter-jsc-sys/build.rs') }}
+
+      # Cache Node.js test suite
+      - name: Cache Node.js tests
+        uses: actions/cache@v4
+        with:
+          path: tests/node-compat/node-src
+          key: node-tests-v22-${{ hashFiles('tests/node-compat/fetch-tests.sh') }}
+
+      - name: Build Otter
+        run: cargo build --release -p otterjs
+
+      - name: Add Otter to PATH
+        run: echo "$PWD/target/release" >> $GITHUB_PATH
+
+      - name: Verify Otter installation
+        run: otter --version
+
+      - name: Fetch Node.js tests
+        run: |
+          cd tests/node-compat
+          ./fetch-tests.sh
+
+      - name: Run Node.js test suite
+        id: run-tests
+        run: |
+          cd tests/node-compat
+          # Run tests and capture output, but don't fail the step yet
+          set +e
+          otter run run-node-tests.ts \
+            --allow-read --allow-write --allow-net --allow-env --allow-run \
+            --json > node-results.json 2>&1
+          TEST_EXIT_CODE=$?
+          set -e
+
+          # Also generate human-readable output
+          echo "=== Test Results ==="
+          cat node-results.json | jq -r '"Pass Rate: \(.summary.passRate) (\(.summary.passed)/\(.summary.total))"'
+
+          # Save exit code for later
+          echo "test_exit_code=$TEST_EXIT_CODE" >> $GITHUB_OUTPUT
+        env:
+          OTTER_VERSION: ${{ github.sha }}
+
+      - name: Check for regressions
+        if: github.event_name == 'pull_request'
+        run: |
+          cd tests/node-compat
+          # Only check regressions if baseline exists
+          if [ -f reports/baseline.json ]; then
+            otter run check-regression.ts --allow-read --allow-write --warn-only || true
+          else
+            echo "No baseline found, skipping regression check"
+          fi
+
+      - name: Upload test report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: node-compat-report-${{ matrix.os }}
+          path: |
+            tests/node-compat/reports/latest.json
+            tests/node-compat/node-results.json
+          retention-days: 30
+
+      - name: Generate summary
+        if: always()
+        run: |
+          cd tests/node-compat
+          if [ -f node-results.json ]; then
+            echo "## Node.js Compatibility Results (${{ matrix.os }})" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            cat node-results.json | jq -r '"| Pass Rate | \(.summary.passRate) |"' >> $GITHUB_STEP_SUMMARY
+            cat node-results.json | jq -r '"| Total | \(.summary.total) |"' >> $GITHUB_STEP_SUMMARY
+            cat node-results.json | jq -r '"| Passed | \(.summary.passed) |"' >> $GITHUB_STEP_SUMMARY
+            cat node-results.json | jq -r '"| Failed | \(.summary.failed) |"' >> $GITHUB_STEP_SUMMARY
+            cat node-results.json | jq -r '"| Skipped | \(.summary.skipped) |"' >> $GITHUB_STEP_SUMMARY
+            cat node-results.json | jq -r '"| Duration | \(.duration / 1000 | floor)s |"' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Top Modules" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Module | Pass Rate |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|----------|" >> $GITHUB_STEP_SUMMARY
+            cat node-results.json | jq -r '.modules | to_entries | sort_by(-.value.passed) | .[0:10] | .[] | "| \(.key) | \(.value.rate) (\(.value.passed)/\(.value.total)) |"' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const reportPath = 'tests/node-compat/node-results.json';
+
+            if (!fs.existsSync(reportPath)) {
+              console.log('No report file found');
+              return;
+            }
+
+            const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+
+            let body = `## Node.js Compatibility Report (${{ matrix.os }})\n\n`;
+            body += `| Metric | Value |\n|--------|-------|\n`;
+            body += `| Pass Rate | ${report.summary.passRate} |\n`;
+            body += `| Total | ${report.summary.total} |\n`;
+            body += `| Passed | ${report.summary.passed} |\n`;
+            body += `| Failed | ${report.summary.failed} |\n`;
+            body += `| Skipped | ${report.summary.skipped} |\n`;
+            body += `| Duration | ${Math.floor(report.duration / 1000)}s |\n\n`;
+
+            body += `### Top Modules\n\n`;
+            body += `| Module | Pass Rate |\n|--------|----------|\n`;
+
+            const sortedModules = Object.entries(report.modules)
+              .sort((a, b) => b[1].passed - a[1].passed)
+              .slice(0, 10);
+
+            for (const [mod, stats] of sortedModules) {
+              body += `| ${mod} | ${stats.rate} (${stats.passed}/${stats.total}) |\n`;
+            }
+
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' &&
+              c.body.includes('Node.js Compatibility Report')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body
+              });
+            }
+
+  # Update module status on main branch
+  update-status:
+    name: Update Module Status
+    runs-on: ubuntu-latest
+    needs: node-compat
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download report
+        uses: actions/download-artifact@v4
+        with:
+          name: node-compat-report-ubuntu-latest
+          path: tests/node-compat/reports
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache bun-webkit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/cache/bun-webkit
+          key: bun-webkit-Linux-${{ hashFiles('crates/otter-jsc-sys/build.rs') }}
+
+      - name: Build Otter
+        run: cargo build --release -p otterjs
+
+      - name: Update module-status.json
+        run: |
+          cd tests/node-compat
+          if [ -f reports/latest.json ]; then
+            # Use jq to update module-status.json with actual results
+            jq --slurpfile report reports/latest.json '
+              . as $status |
+              $report[0].modules | to_entries | reduce .[] as $mod (
+                $status;
+                if .[$mod.key] then
+                  .[$mod.key].total = $mod.value.total |
+                  .[$mod.key].passed = $mod.value.passed |
+                  .[$mod.key].failed = $mod.value.failed |
+                  .[$mod.key].skipped = $mod.value.skipped |
+                  .[$mod.key].rate = $mod.value.rate
+                else
+                  .
+                end
+              ) |
+              ._updated = (now | strftime("%Y-%m-%d"))
+            ' config/module-status.json > config/module-status.json.tmp
+            mv config/module-status.json.tmp config/module-status.json
+          fi
+
+      - name: Commit status update
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update Node.js module compatibility status"
+          file_pattern: "tests/node-compat/config/module-status.json"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"

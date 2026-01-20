@@ -134,6 +134,10 @@
         }
     };
 
+    globalThis.suite = globalThis.describe;
+    globalThis.suite.skip = globalThis.describe.skip;
+    globalThis.suite.only = globalThis.describe.only;
+
     // Hook functions
     globalThis.beforeEach = function beforeEach(fn) {
         if (currentSuite) {
@@ -367,6 +371,7 @@
 
     const testModule = {
         describe: globalThis.describe,
+        suite: globalThis.suite,
         it: globalThis.it,
         test: globalThis.test,
         run: globalThis.run,

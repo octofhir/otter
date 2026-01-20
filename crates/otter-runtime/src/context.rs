@@ -102,12 +102,37 @@ impl JscContext {
     }
 
     /// Run the full event loop tick (microtasks + timers + async ops + JS poll handlers)
+    ///
+    /// This function loops until no more work is done in a single iteration,
+    /// ensuring that Promise continuations triggered by JS poll handlers
+    /// (like child process close events) are properly processed.
     pub fn poll_event_loop(&self) -> JscResult<usize> {
-        let mut handled = 0;
-        handled += self.poll_promises()?;
-        handled += self.event_loop.poll()?;
-        handled += self.poll_js_handlers()?;
-        Ok(handled)
+        let mut total_handled = 0;
+        loop {
+            let mut handled = 0;
+            handled += self.poll_promises()?;
+            handled += self.event_loop.poll()?;
+            handled += self.poll_js_handlers()?;
+            total_handled += handled;
+
+            // If no work was done this iteration, we're done
+            if handled == 0 {
+                break;
+            }
+            // Otherwise loop to process any newly scheduled work
+            // (e.g., Promise continuations from resolved child process events)
+        }
+
+        // Final trigger: evaluate an empty expression to ensure JSC drains
+        // any pending Promise jobs that were scheduled during the poll.
+        // This is necessary because JSC's internal Promise job queue is
+        // processed during script evaluation, and we need to ensure
+        // async/await continuations are run even when no events are pending.
+        if total_handled > 0 {
+            let _ = self.eval("void 0");
+        }
+
+        Ok(total_handled)
     }
 
     /// Call JavaScript poll handlers (__otter_poll_all)
@@ -134,7 +159,32 @@ impl JscContext {
     }
 
     pub fn has_pending_tasks(&self) -> bool {
-        self.extension_registry.has_pending_async_ops() || self.event_loop.has_pending_tasks()
+        self.extension_registry.has_pending_async_ops()
+            || self.event_loop.has_pending_tasks()
+            || self.has_pending_js_refs()
+            || self.is_main_promise_pending()
+    }
+
+    fn has_pending_js_refs(&self) -> bool {
+        let result = self.eval(
+            "typeof __otter_refed_count === 'function' ? __otter_refed_count() : 0",
+        );
+
+        match result {
+            Ok(value) => value.to_number().map(|count| count > 0.0).unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    fn is_main_promise_pending(&self) -> bool {
+        let result = self.eval(
+            "typeof __otter_is_main_promise_pending === 'function' ? __otter_is_main_promise_pending() : false",
+        );
+
+        match result {
+            Ok(value) => value.to_bool(),
+            Err(_) => false,
+        }
     }
 
     pub fn next_wake_delay(&self) -> Duration {

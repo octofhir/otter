@@ -196,10 +196,113 @@
     // JSON module cache
     var __jsonCache = {};
 
+    // File module cache (for dynamically loaded .js files)
+    var __fileModuleCache = {};
+
+    // Helper to resolve file path with extension resolution
+    function resolveFilePath(basePath, fs) {
+        var extensions = ['', '.js', '.cjs', '/index.js', '/index.cjs'];
+        for (var i = 0; i < extensions.length; i++) {
+            var tryPath = basePath + extensions[i];
+            try {
+                // Check if file exists using fs.statSync or readFileSync
+                if (fs.existsSync && fs.existsSync(tryPath)) {
+                    // Check if it's a directory, if so try index.js
+                    var stat = fs.statSync(tryPath);
+                    if (stat.isDirectory && stat.isDirectory()) {
+                        var indexPath = tryPath + '/index.js';
+                        if (fs.existsSync(indexPath)) {
+                            return indexPath;
+                        }
+                        continue;
+                    }
+                    return tryPath;
+                }
+            } catch (e) {
+                // File doesn't exist, try next extension
+            }
+        }
+        return null;
+    }
+
+    // Load and execute a CommonJS module from disk
+    function loadFileModule(filePath, fs) {
+        // Check cache first
+        if (__fileModuleCache[filePath]) {
+            return __fileModuleCache[filePath].exports;
+        }
+
+        // Read file content
+        var content;
+        try {
+            content = fs.readFileSync(filePath, 'utf8');
+        } catch (e) {
+            return null;
+        }
+
+        // Extract dirname and filename
+        var lastSlash = filePath.lastIndexOf('/');
+        var moduleDirname = lastSlash > 0 ? filePath.slice(0, lastSlash) : '/';
+        var moduleFilename = filePath;
+
+        // Create module object
+        var module = {
+            id: filePath,
+            filename: filePath,
+            loaded: false,
+            exports: {},
+            paths: [],
+            children: []
+        };
+
+        // Cache before executing (handles circular dependencies)
+        __fileModuleCache[filePath] = module;
+
+        // Create require function for this module
+        var moduleRequire = globalThis.__createRequire(moduleDirname, moduleFilename);
+
+        // Wrap the module code
+        var wrappedCode = '(function(exports, require, module, __filename, __dirname) {\n' +
+            content +
+            '\n});';
+
+        try {
+            // Execute the wrapper to get the function
+            var moduleFunc = (0, eval)(wrappedCode);
+
+            // Execute the module
+            moduleFunc.call(
+                module.exports,
+                module.exports,
+                moduleRequire,
+                module,
+                moduleFilename,
+                moduleDirname
+            );
+
+            module.loaded = true;
+        } catch (e) {
+            // Remove from cache on error
+            delete __fileModuleCache[filePath];
+            throw e;
+        }
+
+        return module.exports;
+    }
+
     // Create require function for a specific module context
     // deps: optional map from specifier to resolved URL (passed by bundler for pre-resolved deps)
     globalThis.__createRequire = function(dirname, filename, deps) {
         deps = deps || {};
+
+        // Normalize dirname to absolute path if possible
+        var cwd = globalThis.process && globalThis.process.cwd ? globalThis.process.cwd() : '';
+        var effectiveDirname = dirname;
+        if (dirname === '.' || dirname === '') {
+            effectiveDirname = cwd || '.';
+        } else if (!dirname.startsWith('/') && cwd) {
+            effectiveDirname = resolvePath('./' + dirname, cwd);
+        }
 
         var require = function(specifier) {
             var resolvedFromDeps, resolved, absolutePath, mod;
@@ -232,13 +335,16 @@
             resolved = specifier;
             absolutePath = null;
             if (specifier.startsWith('./') || specifier.startsWith('../')) {
-                resolved = resolvePath(specifier, dirname);
+                resolved = resolvePath(specifier, effectiveDirname);
                 absolutePath = resolved;
                 // Convert to file:// URL for registry lookup
                 resolved = "file://" + resolved;
+            } else if (specifier.startsWith('/')) {
+                absolutePath = specifier;
+                resolved = "file://" + specifier;
             }
 
-            // Try to find module with extension resolution
+            // Try to find module with extension resolution in registries
             var extensions = ['', '.js', '.mjs', '.cjs', '.json', '/index.js', '/index.mjs', '/index.cjs'];
             var found = null;
 
@@ -256,62 +362,69 @@
 
             if (found) return found;
 
-            // Handle JSON files specially - load via fs at runtime
-            var jsonPath, jsonFs, jsonContent, jsonData, cwd, absDir;
-            if (specifier.endsWith('.json')) {
-                // Resolve the JSON file path
-                cwd = globalThis.process && globalThis.process.cwd ? globalThis.process.cwd() : '';
-                if (specifier.startsWith('/')) {
-                    jsonPath = specifier;
-                } else if (specifier.startsWith('./') || specifier.startsWith('../')) {
-                    // For relative paths, resolve against cwd if dirname is "." or empty
-                    if (dirname === '.' || dirname === '') {
-                        jsonPath = cwd ? resolvePath(specifier, cwd) : null;
-                    } else if (dirname.startsWith('/')) {
-                        jsonPath = resolvePath(specifier, dirname);
-                    } else {
-                        // dirname is relative, resolve against cwd first
-                        absDir = cwd ? resolvePath('./' + dirname, cwd) : dirname;
-                        jsonPath = resolvePath(specifier, absDir);
+            // Try to load from file system
+            var fs = globalThis.__otter_get_node_builtin ? globalThis.__otter_get_node_builtin('fs') : null;
+            if (fs && absolutePath) {
+                // Handle JSON files
+                if (specifier.endsWith('.json')) {
+                    if (__jsonCache[absolutePath]) {
+                        return __jsonCache[absolutePath];
+                    }
+                    try {
+                        var jsonContent = fs.readFileSync(absolutePath, 'utf8');
+                        var jsonData = JSON.parse(jsonContent);
+                        __jsonCache[absolutePath] = jsonData;
+                        return jsonData;
+                    } catch (e) {
+                        // Fall through to error
                     }
                 }
-                if (jsonPath) {
-                    if (__jsonCache[jsonPath]) {
-                        return __jsonCache[jsonPath];
-                    }
-                    // If node:fs is not registered, throw a clear error.
-                    jsonFs = globalThis.__otter_get_node_builtin('fs');
-                    try {
-                        if (jsonFs && jsonFs.readFileSync) {
-                            jsonContent = jsonFs.readFileSync(jsonPath, 'utf8');
-                            jsonData = JSON.parse(jsonContent);
-                            __jsonCache[jsonPath] = jsonData;
-                            return jsonData;
-                        }
-                    } catch (_) {
-                        // Fall through to error
+
+                // Handle JS/CJS files
+                var resolvedPath = resolveFilePath(absolutePath, fs);
+                if (resolvedPath) {
+                    var loadedModule = loadFileModule(resolvedPath, fs);
+                    if (loadedModule !== null) {
+                        return loadedModule;
                     }
                 }
             }
 
-            throw new Error("Cannot find module '" + specifier + "' from '" + dirname + "'");
+            throw new Error("Cannot find module '" + specifier + "' from '" + effectiveDirname + "'");
         };
 
         require.resolve = function(specifier) {
-            // For now, just return the specifier
-            // Full resolution would need the module loader
+            // Resolve relative paths
+            if (specifier.startsWith('./') || specifier.startsWith('../')) {
+                var resolved = resolvePath(specifier, effectiveDirname);
+                var fs = globalThis.__otter_get_node_builtin ? globalThis.__otter_get_node_builtin('fs') : null;
+                if (fs) {
+                    var resolvedPath = resolveFilePath(resolved, fs);
+                    if (resolvedPath) return resolvedPath;
+                }
+                return resolved;
+            }
             return specifier;
         };
 
-        require.cache = globalThis.__otter_cjs_modules;
+        require.cache = __fileModuleCache;
         require.main = undefined;
 
         return require;
     };
 
     // Create global require for standalone scripts (not bundled)
+    // Note: This will be overwritten when the entry script runs with proper dirname
     if (typeof globalThis.require !== "function") {
         globalThis.require = globalThis.__createRequire(".", "script.js");
     }
+
+    // Expose helper to update global require with proper dirname
+    globalThis.__otter_set_entry_dirname = function(dirname, filename) {
+        globalThis.require = globalThis.__createRequire(dirname, filename);
+        // Also set __dirname and __filename globals for the entry script
+        globalThis.__dirname = dirname;
+        globalThis.__filename = filename;
+    };
 
 })(globalThis);

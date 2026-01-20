@@ -82,3 +82,40 @@ check-examples:
 # Type check with a tsconfig.json project
 check-project project:
     cargo run -p otterjs -- check -p {{project}} .
+
+# === Node.js Compatibility Tests ===
+
+# Run Node.js compatibility test suite (fetches tests if needed)
+node-compat:
+    @echo "=== Node.js Compatibility Tests ==="
+    cd tests/node-compat && ./run.sh --fetch
+
+# Run Node.js tests (quick, no fetch)
+node-compat-quick:
+    cd tests/node-compat && ./run.sh
+
+# Run tests for a specific module
+node-compat-module module:
+    cd tests/node-compat && ./run.sh --module {{module}} --verbose
+
+# Fetch/update Node.js test suite
+node-compat-fetch:
+    cd tests/node-compat && ./fetch-tests.sh
+
+# Check for test regressions
+node-compat-check:
+    cd tests/node-compat && otter run check-regression.ts --allow-read --allow-write
+
+# Update baseline after intentional changes
+node-compat-baseline:
+    cp tests/node-compat/reports/latest.json tests/node-compat/reports/baseline.json
+    @echo "Baseline updated from latest results"
+
+# Show Node.js compat summary (requires jq)
+node-compat-status:
+    @if [ -f tests/node-compat/reports/latest.json ]; then \
+        echo "=== Node.js Compatibility Status ==="; \
+        cat tests/node-compat/reports/latest.json | jq -r '"Pass Rate: \(.summary.passRate) (\(.summary.passed)/\(.summary.total))"'; \
+    else \
+        echo "No report found. Run 'just node-compat' first."; \
+    fi

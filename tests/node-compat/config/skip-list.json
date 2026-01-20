@@ -1,0 +1,68 @@
+{
+  "_comment": "Tests to skip - organized by reason",
+  "_updated": "2026-01-20",
+
+  "patterns": {
+    "inspector_required": [
+      "test-inspector-",
+      "test-debugger-"
+    ],
+    "native_addon_required": [
+      "test-addon-",
+      "test-napi-"
+    ],
+    "vm_module_required": [
+      "test-vm-"
+    ],
+    "cluster_required": [
+      "test-cluster-"
+    ],
+    "tls_not_implemented": [
+      "test-tls-",
+      "test-https-"
+    ],
+    "http_hang_risk": [
+      "test-http-",
+      "test-http2-"
+    ],
+    "repl_not_implemented": [
+      "test-repl-"
+    ],
+    "v8_specific": [
+      "test-v8-"
+    ],
+    "process_binding": [
+      "test-process-binding-"
+    ],
+    "child_process_hang_risk": [
+      "test-child-process-"
+    ],
+    "wasi_not_implemented": [
+      "test-wasi-"
+    ],
+    "worker_advanced": [
+      "test-worker-"
+    ],
+    "net_hang_risk": [
+      "test-net-",
+      "test-dgram-"
+    ]
+  },
+
+  "explicit": [
+    "test-dgram-multicast-multi-process.js",
+    "test-dgram-cluster-bind-fail.js",
+    "test-domain-abort-on-uncaught.js",
+    "test-domain-nested-throw.js",
+    "test-fs-watch-recursive-linux.js",
+    "test-fs-watch-recursive-windows.js",
+    "test-http2-client-destroy.js",
+    "test-http2-compat-socket-set.js",
+    "test-http-agent-keepalive-delay.js",
+    "test-perf-hooks-histogram.js",
+    "test-process-exit-from-before-exit.js",
+    "test-tick-processor-builtin.js",
+    "test-trace-events-api.js",
+    "test-worker-onmessage-largedata.js"
+  ]
+}

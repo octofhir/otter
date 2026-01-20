@@ -417,12 +417,36 @@
   // Event loop polling infrastructure
   // Extensions can register poll functions that are called during each event loop iteration
   const __otter_poll_handlers = [];
+  const __otter_refed_checkers = [];
 
   if (typeof globalThis.__otter_register_poll_handler !== "function") {
     __otter_define_immutable_global("__otter_register_poll_handler", function __otter_register_poll_handler(handler) {
       if (typeof handler === "function") {
         __otter_poll_handlers.push(handler);
       }
+    });
+  }
+
+  // Refed handle tracking infrastructure
+  if (typeof globalThis.__otter_register_refed_checker !== "function") {
+    __otter_define_immutable_global("__otter_register_refed_checker", function __otter_register_refed_checker(handler) {
+      if (typeof handler === "function") {
+        __otter_refed_checkers.push(handler);
+      }
+    });
+  }
+
+  if (typeof globalThis.__otter_refed_count !== "function") {
+    __otter_define_immutable_global("__otter_refed_count", function __otter_refed_count() {
+      let count = 0;
+      for (const handler of __otter_refed_checkers) {
+        try {
+          count += handler() || 0;
+        } catch (e) {
+          console.error("Refed checker error:", e);
+        }
+      }
+      return count;
     });
   }
 
@@ -448,6 +472,28 @@
         handled += globalThis.__otter_worker_threads_poll() || 0;
       }
       return handled;
+    });
+  }
+
+  // Check if the main script promise is still pending
+  // This is used by the event loop to know when the script has completed
+  if (typeof globalThis.__otter_is_main_promise_pending !== "function") {
+    let __otter_main_promise_settled = false;
+    __otter_define_immutable_global("__otter_is_main_promise_pending", function() {
+      if (__otter_main_promise_settled) {
+        return false;
+      }
+      // Check if globalThis.__otter_main_promise exists and track its settlement
+      if (globalThis.__otter_main_promise) {
+        // Attach a handler to detect when it settles (only once)
+        globalThis.__otter_main_promise.then(
+          () => { __otter_main_promise_settled = true; },
+          () => { __otter_main_promise_settled = true; }
+        );
+        // On first check, always return true (it's pending until we know otherwise)
+        return !__otter_main_promise_settled;
+      }
+      return false;
     });
   }
 

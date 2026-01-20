@@ -1,0 +1,13 @@
+# Node.js test suite (downloaded)
+node-src/
+
+# Test reports (generated)
+reports/latest.json
+reports/history/
+
+# Temporary files
+tmp/
+*.log
+
+# Node modules (if any)
+node_modules/

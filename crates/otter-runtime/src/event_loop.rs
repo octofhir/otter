@@ -5,7 +5,8 @@ use crate::error::{JscError, JscResult};
 use crate::value::extract_exception;
 use parking_lot::Mutex;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -48,6 +49,31 @@ impl std::fmt::Debug for TimerEntry {
     }
 }
 
+/// Entry in the timer heap for O(log n) scheduling.
+/// Uses Reverse for min-heap semantics (earliest `when` first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimerHeapEntry {
+    when: Instant,
+    id: u64,
+}
+
+impl Ord for TimerHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse ordering: smaller `when` = higher priority (min-heap)
+        // Break ties by ID (lower ID = higher priority for FIFO)
+        other
+            .when
+            .cmp(&self.when)
+            .then_with(|| other.id.cmp(&self.id))
+    }
+}
+
+impl PartialOrd for TimerHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Debug)]
 struct MicrotaskEntry {
     callback: JSObjectRef,
@@ -76,7 +102,10 @@ struct ExecutingImmediateState {
 
 pub(crate) struct EventLoop {
     ctx: JSContextRef,
-    timers: Mutex<Vec<TimerEntry>>,
+    /// Timer storage by ID for O(1) lookup
+    timers: Mutex<HashMap<u64, TimerEntry>>,
+    /// Timer heap for O(log n) scheduling - min-heap ordered by `when`
+    timer_heap: Mutex<BinaryHeap<TimerHeapEntry>>,
     microtasks: Mutex<VecDeque<MicrotaskEntry>>,
     immediates: Mutex<VecDeque<ImmediateEntry>>,
     next_timer_id: AtomicU64,
@@ -85,19 +114,24 @@ pub(crate) struct EventLoop {
     executing_timer_ids: Mutex<HashMap<u64, ExecutingTimerState>>,
     /// Tracks IDs of immediates currently being executed (for clearImmediate in callbacks)
     executing_immediate_ids: Mutex<HashMap<u64, ExecutingImmediateState>>,
+    /// Marker to ensure EventLoop is !Send + !Sync.
+    /// JSC contexts must be used only from the thread that created them.
+    _marker: PhantomData<*mut ()>,
 }
 
 impl EventLoop {
     pub fn new(ctx: JSContextRef) -> Self {
         Self {
             ctx,
-            timers: Mutex::new(Vec::new()),
+            timers: Mutex::new(HashMap::new()),
+            timer_heap: Mutex::new(BinaryHeap::new()),
             microtasks: Mutex::new(VecDeque::new()),
             immediates: Mutex::new(VecDeque::new()),
             next_timer_id: AtomicU64::new(1),
             next_immediate_id: AtomicU64::new(1),
             executing_timer_ids: Mutex::new(HashMap::new()),
             executing_immediate_ids: Mutex::new(HashMap::new()),
+            _marker: PhantomData,
         }
     }
 
@@ -135,22 +169,27 @@ impl EventLoop {
         }
 
         let id = self.next_timer_id.fetch_add(1, Ordering::Relaxed);
+        let when = Instant::now() + clamped_delay;
         let entry = TimerEntry {
             id,
             callback,
             args,
-            when: Instant::now() + clamped_delay,
+            when,
             interval,
             cancelled: AtomicBool::new(false),
             refed: AtomicBool::new(refed),
             nesting_level: timer_nesting_level,
         };
 
-        self.timers.lock().push(entry);
+        // Insert into HashMap for O(1) lookup by ID
+        self.timers.lock().insert(id, entry);
+        // Insert into heap for O(log n) scheduling
+        self.timer_heap.lock().push(TimerHeapEntry { when, id });
         Ok(id)
     }
 
     /// Clear a timer by ID. Sets cancelled flag so it works even during callback execution.
+    /// O(1) lookup thanks to HashMap storage.
     pub fn clear_timer(&self, id: u64) -> bool {
         // First check if timer is currently executing
         {
@@ -161,9 +200,9 @@ impl EventLoop {
             }
         }
 
-        // Then check the timer queue
+        // Then check the timer map - O(1) lookup
         let timers = self.timers.lock();
-        if let Some(timer) = timers.iter().find(|timer| timer.id == id) {
+        if let Some(timer) = timers.get(&id) {
             timer.cancelled.store(true, Ordering::SeqCst);
             return true;
         }
@@ -173,6 +212,7 @@ impl EventLoop {
     }
 
     /// Update whether a timer keeps the event loop alive.
+    /// O(1) lookup thanks to HashMap storage.
     pub fn set_timer_ref(&self, id: u64, refed: bool) -> bool {
         {
             let executing = self.executing_timer_ids.lock();
@@ -182,8 +222,9 @@ impl EventLoop {
             }
         }
 
+        // O(1) lookup in HashMap
         let timers = self.timers.lock();
-        if let Some(timer) = timers.iter().find(|timer| timer.id == id) {
+        if let Some(timer) = timers.get(&id) {
             timer.refed.store(refed, Ordering::SeqCst);
             return true;
         }
@@ -262,18 +303,20 @@ impl EventLoop {
 
     /// Remove cancelled timers and clean up their resources
     fn cleanup_cancelled_timers(&self) {
-        let mut timers = self.timers.lock();
-        let mut i = 0;
-        while i < timers.len() {
-            if timers[i].cancelled.load(Ordering::SeqCst) {
-                let timer = timers.remove(i);
-                // Drop lock before calling drop_timer to avoid potential issues
-                drop(timers);
+        // Collect IDs of cancelled timers
+        let cancelled_ids: Vec<u64> = {
+            let timers = self.timers.lock();
+            timers
+                .iter()
+                .filter(|(_, t)| t.cancelled.load(Ordering::SeqCst))
+                .map(|(&id, _)| id)
+                .collect()
+        };
+
+        // Remove and drop each cancelled timer
+        for id in cancelled_ids {
+            if let Some(timer) = self.timers.lock().remove(&id) {
                 self.drop_timer(timer);
-                timers = self.timers.lock();
-                // Don't increment i - we removed an element
-            } else {
-                i += 1;
             }
         }
     }
@@ -305,10 +348,10 @@ impl EventLoop {
         if !self.microtasks.lock().is_empty() {
             return true;
         }
-        // Only count non-cancelled timers
+        // Only count non-cancelled, refed timers
         let timers = self.timers.lock();
         if timers
-            .iter()
+            .values()
             .any(|t| !t.cancelled.load(Ordering::Relaxed) && t.refed.load(Ordering::Relaxed))
         {
             return true;
@@ -331,7 +374,7 @@ impl EventLoop {
 
         let timers = self.timers.lock();
         timers
-            .iter()
+            .values()
             .filter(|t| !t.cancelled.load(Ordering::Relaxed) && t.refed.load(Ordering::Relaxed))
             .map(|timer| timer.when)
             .min()
@@ -395,29 +438,38 @@ impl EventLoop {
 
     fn run_timers(&self) -> JscResult<usize> {
         let now = Instant::now();
-
-        // Step 1: Collect IDs of due timers WITHOUT removing them from storage.
-        // This ensures clearTimeout(id) can still find them during execution of other timers.
-        let mut due_ids: Vec<(u64, Instant)> = {
-            let timers = self.timers.lock();
-            timers
-                .iter()
-                .filter(|t| t.when <= now)
-                .map(|t| (t.id, t.when))
-                .collect()
-        };
-
-        // Sort by `when` to ensure correct execution order.
-        due_ids.sort_by_key(|(_, when)| *when);
-
         let mut ran = 0;
 
-        for (timer_id, _) in due_ids {
-            // Step 2: Look up timer info while it's STILL in self.timers.
-            // This allows clearTimeout to find and cancel it.
+        // Collect due timer IDs from heap - O(log n) per pop
+        // We collect first to avoid holding locks during callback execution
+        let mut due_ids = Vec::new();
+        {
+            let mut heap = self.timer_heap.lock();
+            let timers = self.timers.lock();
+
+            while let Some(&entry) = heap.peek() {
+                if entry.when > now {
+                    break; // No more due timers
+                }
+
+                heap.pop();
+
+                // Check if this is a valid, non-cancelled timer
+                if let Some(timer) = timers.get(&entry.id) {
+                    // Skip if cancelled or if `when` doesn't match (stale heap entry)
+                    if !timer.cancelled.load(Ordering::SeqCst) && timer.when == entry.when {
+                        due_ids.push(entry.id);
+                    }
+                }
+                // Stale entries (timer removed or rescheduled) are just discarded
+            }
+        }
+
+        for timer_id in due_ids {
+            // Look up timer info while it's STILL in self.timers (O(1) lookup)
             let timer_info = {
                 let timers = self.timers.lock();
-                timers.iter().find(|t| t.id == timer_id).map(|t| {
+                timers.get(&timer_id).map(|t| {
                     (
                         t.callback,
                         t.args.clone(),
@@ -432,18 +484,15 @@ impl EventLoop {
             let Some((callback, args, interval, nesting_level, is_refed, is_cancelled)) =
                 timer_info
             else {
-                // Timer was already removed (e.g., by clearTimeout from another callback)
-                continue;
+                continue; // Timer was removed
             };
 
-            // Check if cancelled before execution (might have been cancelled by previous timer)
             if is_cancelled {
                 self.remove_and_drop_timer(timer_id);
                 continue;
             }
 
-            // Step 3: Register in executing_timer_ids.
-            // Timer is now findable in BOTH self.timers AND executing_timer_ids.
+            // Register in executing_timer_ids
             let cancelled_flag = Arc::new(AtomicBool::new(false));
             let refed_flag = Arc::new(AtomicBool::new(is_refed));
             self.executing_timer_ids.lock().insert(
@@ -454,70 +503,59 @@ impl EventLoop {
                 },
             );
 
-            // Step 4: Set nesting level and execute callback.
-            TIMER_NESTING_LEVEL.with(|level| {
-                level.set(nesting_level);
-            });
-
+            // Set nesting level and execute callback
+            TIMER_NESTING_LEVEL.with(|level| level.set(nesting_level));
             let call_result = self.call_function(callback, &args);
-
-            TIMER_NESTING_LEVEL.with(|level| {
-                level.set(0);
-            });
+            TIMER_NESTING_LEVEL.with(|level| level.set(0));
 
             match &call_result {
-                Ok(()) => {
-                    ran += 1;
-                }
-                Err(e) => {
-                    tracing::warn!("Timer {} callback error: {}", timer_id, e);
-                }
+                Ok(()) => ran += 1,
+                Err(e) => tracing::warn!("Timer {} callback error: {}", timer_id, e),
             }
 
-            // Step 5: Run microtasks WHILE timer is still in executing_timer_ids.
-            // This allows clearInterval from a microtask to work.
+            // Run microtasks while timer is still in executing_timer_ids
             let _ = self.run_microtasks_continue_on_error();
 
-            // Step 6: Check cancellation from executing state and from timer entry.
+            // Check cancellation
             let was_cancelled = cancelled_flag.load(Ordering::SeqCst);
             let final_refed = refed_flag.load(Ordering::SeqCst);
-
-            // Also check the timer's own cancelled flag (set by clearTimeout on self.timers)
             let timer_cancelled = {
                 let timers = self.timers.lock();
                 timers
-                    .iter()
-                    .find(|t| t.id == timer_id)
+                    .get(&timer_id)
                     .map(|t| t.cancelled.load(Ordering::SeqCst))
-                    .unwrap_or(true) // If not found, treat as cancelled
+                    .unwrap_or(true)
             };
 
-            // Step 7: Remove from executing map.
             self.executing_timer_ids.lock().remove(&timer_id);
 
-            // Step 8: Handle cleanup or reschedule.
             if was_cancelled || timer_cancelled {
                 self.remove_and_drop_timer(timer_id);
                 continue;
             }
 
-            if interval.is_some() {
-                // Reschedule interval timer
-                let interval_duration = interval.unwrap();
+            // Handle reschedule or cleanup
+            if let Some(interval_duration) = interval {
                 let clamped_interval = if nesting_level > MAX_TIMER_NESTING_LEVEL {
                     interval_duration.max(Duration::from_millis(MIN_TIMEOUT_MS))
                 } else {
                     interval_duration
                 };
+                let new_when = Instant::now() + clamped_interval;
 
-                let mut timers = self.timers.lock();
-                if let Some(timer) = timers.iter_mut().find(|t| t.id == timer_id) {
-                    timer.when = Instant::now() + clamped_interval;
-                    timer.refed.store(final_refed, Ordering::SeqCst);
-                    timer.cancelled.store(false, Ordering::SeqCst);
+                // Update timer and push new heap entry
+                {
+                    let mut timers = self.timers.lock();
+                    if let Some(timer) = timers.get_mut(&timer_id) {
+                        timer.when = new_when;
+                        timer.refed.store(final_refed, Ordering::SeqCst);
+                        timer.cancelled.store(false, Ordering::SeqCst);
+                    }
                 }
+                self.timer_heap
+                    .lock()
+                    .push(TimerHeapEntry { when: new_when, id: timer_id });
             } else {
-                // One-shot timer - remove it
                 self.remove_and_drop_timer(timer_id);
             }
         }
@@ -528,16 +566,9 @@ impl EventLoop {
         Ok(ran)
     }
 
-    /// Remove a timer by ID from the timers vec and drop it (unprotect JS values).
+    /// Remove a timer by ID from the HashMap and drop it (unprotect JS values).
     fn remove_and_drop_timer(&self, timer_id: u64) {
-        let timer = {
-            let mut timers = self.timers.lock();
-            if let Some(idx) = timers.iter().position(|t| t.id == timer_id) {
-                Some(timers.remove(idx))
-            } else {
-                None
-            }
-        };
+        let timer = self.timers.lock().remove(&timer_id);
 
         if let Some(timer) = timer {
             self.drop_timer(timer);

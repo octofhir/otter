@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_extension_creation() {
-        let ext = extension();
+        let (ext, _) = extension();
         assert_eq!(ext.name(), "worker_threads");
         assert!(ext.js_code().is_some());
     }

@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// HTML5 spec: timers nested more than this level get clamped to MIN_TIMEOUT_MS
-const MAX_TIMER_NESTING_LEVEL: u32 = 4;
+/// Per spec: "If nesting level is greater than 5, and timeout is less than 4, then set timeout to 4."
+const MAX_TIMER_NESTING_LEVEL: u32 = 5;
 /// HTML5 spec: minimum timeout for deeply nested timers
 const MIN_TIMEOUT_MS: u64 = 4;
 
@@ -30,6 +31,8 @@ struct TimerEntry {
     cancelled: AtomicBool,
     /// Whether this timer keeps the event loop alive.
     refed: AtomicBool,
+    /// HTML5 spec: timer nesting level at creation time (inherited from creating task)
+    nesting_level: u32,
 }
 
 impl std::fmt::Debug for TimerEntry {
@@ -40,6 +43,7 @@ impl std::fmt::Debug for TimerEntry {
             .field("interval", &self.interval)
             .field("cancelled", &self.cancelled.load(Ordering::Relaxed))
             .field("refed", &self.refed.load(Ordering::Relaxed))
+            .field("nesting_level", &self.nesting_level)
             .finish()
     }
 }
@@ -64,6 +68,12 @@ struct ExecutingTimerState {
     refed: Arc<AtomicBool>,
 }
 
+#[derive(Debug)]
+struct ExecutingImmediateState {
+    cancelled: Arc<AtomicBool>,
+    refed: Arc<AtomicBool>,
+}
+
 pub(crate) struct EventLoop {
     ctx: JSContextRef,
     timers: Mutex<Vec<TimerEntry>>,
@@ -74,7 +84,7 @@ pub(crate) struct EventLoop {
     /// Tracks IDs of timers currently being executed (for clearInterval in callbacks)
     executing_timer_ids: Mutex<HashMap<u64, ExecutingTimerState>>,
     /// Tracks IDs of immediates currently being executed (for clearImmediate in callbacks)
-    executing_immediate_ids: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    executing_immediate_ids: Mutex<HashMap<u64, ExecutingImmediateState>>,
 }
 
 impl EventLoop {
@@ -103,14 +113,19 @@ impl EventLoop {
             return Err(JscError::type_error("function", "non-function"));
         }
 
-        // HTML5 spec: Apply nested timer clamping
-        let clamped_delay = TIMER_NESTING_LEVEL.with(|level| {
-            if level.get() > MAX_TIMER_NESTING_LEVEL {
-                delay.max(Duration::from_millis(MIN_TIMEOUT_MS))
-            } else {
-                delay
-            }
-        });
+        // HTML5 spec: Timer nesting level is inherited from the currently executing task.
+        // The NEW timer's nesting level is the current level + 1.
+        // If we're not inside a timer callback, current level is 0, so new timer gets level 1.
+        let inherited_nesting = TIMER_NESTING_LEVEL.with(|level| level.get());
+        let timer_nesting_level = inherited_nesting.saturating_add(1);
+
+        // HTML5 spec: "If nesting level is greater than 5, and timeout is less than 4,
+        // then set timeout to 4."
+        let clamped_delay = if timer_nesting_level > MAX_TIMER_NESTING_LEVEL {
+            delay.max(Duration::from_millis(MIN_TIMEOUT_MS))
+        } else {
+            delay
+        };
 
         unsafe {
             JSValueProtect(self.ctx, callback as JSValueRef);
@@ -128,6 +143,7 @@ impl EventLoop {
             interval,
             cancelled: AtomicBool::new(false),
             refed: AtomicBool::new(refed),
+            nesting_level: timer_nesting_level,
         };
 
         self.timers.lock().push(entry);
@@ -210,8 +226,8 @@ impl EventLoop {
     pub fn clear_immediate(&self, id: u64) -> bool {
         {
             let executing = self.executing_immediate_ids.lock();
-            if let Some(cancelled_flag) = executing.get(&id) {
-                cancelled_flag.store(true, Ordering::SeqCst);
+            if let Some(state) = executing.get(&id) {
+                state.cancelled.store(true, Ordering::SeqCst);
                 return true;
             }
         }
@@ -230,7 +246,7 @@ impl EventLoop {
         {
             let executing = self.executing_immediate_ids.lock();
             if let Some(state) = executing.get(&id) {
-                state.store(refed, Ordering::SeqCst);
+                state.refed.store(refed, Ordering::SeqCst);
                 return true;
             }
         }
@@ -345,39 +361,91 @@ impl EventLoop {
         Ok(ran)
     }
 
+    /// Run microtasks, logging errors but continuing to process the queue.
+    /// This prevents a single failing microtask from jamming the entire queue.
+    fn run_microtasks_continue_on_error(&self) -> usize {
+        let mut ran = 0;
+        loop {
+            let task = {
+                let mut microtasks = self.microtasks.lock();
+                microtasks.pop_front()
+            };
+
+            let Some(task) = task else {
+                break;
+            };
+
+            let result = self.call_function(task.callback, &[]);
+            unsafe {
+                JSValueUnprotect(self.ctx, task.callback as JSValueRef);
+            }
+
+            match result {
+                Ok(()) => {}
+                Err(e) => {
+                    // Log error but continue processing - don't jam the queue
+                    tracing::warn!("Microtask error: {}", e);
+                }
+            }
+            ran += 1;
+        }
+
+        ran
+    }
+
     fn run_timers(&self) -> JscResult<usize> {
         let now = Instant::now();
 
-        // Extract due timers (including cancelled ones - we'll check later)
-        let due = {
-            let mut timers = self.timers.lock();
-            let mut due = Vec::new();
-            let mut index = 0;
-            while index < timers.len() {
-                if timers[index].when <= now {
-                    due.push(timers.remove(index));
-                } else {
-                    index += 1;
-                }
-            }
-            due
+        // Step 1: Collect IDs of due timers WITHOUT removing them from storage.
+        // This ensures clearTimeout(id) can still find them during execution of other timers.
+        let mut due_ids: Vec<(u64, Instant)> = {
+            let timers = self.timers.lock();
+            timers
+                .iter()
+                .filter(|t| t.when <= now)
+                .map(|t| (t.id, t.when))
+                .collect()
         };
+
+        // Sort by `when` to ensure correct execution order.
+        due_ids.sort_by_key(|(_, when)| *when);
 
         let mut ran = 0;
 
-        for mut timer in due {
-            // Check cancelled BEFORE execution (might have been cancelled by previous timer)
-            if timer.cancelled.load(Ordering::SeqCst) {
-                self.drop_timer(timer);
+        for (timer_id, _) in due_ids {
+            // Step 2: Look up timer info while it's STILL in self.timers.
+            // This allows clearTimeout to find and cancel it.
+            let timer_info = {
+                let timers = self.timers.lock();
+                timers.iter().find(|t| t.id == timer_id).map(|t| {
+                    (
+                        t.callback,
+                        t.args.clone(),
+                        t.interval,
+                        t.nesting_level,
+                        t.refed.load(Ordering::Relaxed),
+                        t.cancelled.load(Ordering::SeqCst),
+                    )
+                })
+            };
+
+            let Some((callback, args, interval, nesting_level, is_refed, is_cancelled)) =
+                timer_info
+            else {
+                // Timer was already removed (e.g., by clearTimeout from another callback)
+                continue;
+            };
+
+            // Check if cancelled before execution (might have been cancelled by previous timer)
+            if is_cancelled {
+                self.remove_and_drop_timer(timer_id);
                 continue;
             }
 
-            let timer_id = timer.id;
-            let is_interval = timer.interval.is_some();
-
-            // Create shared cancelled flag for this executing timer
+            // Step 3: Register in executing_timer_ids.
+            // Timer is now findable in BOTH self.timers AND executing_timer_ids.
             let cancelled_flag = Arc::new(AtomicBool::new(false));
-            let refed_flag = Arc::new(AtomicBool::new(timer.refed.load(Ordering::Relaxed)));
+            let refed_flag = Arc::new(AtomicBool::new(is_refed));
             self.executing_timer_ids.lock().insert(
                 timer_id,
                 ExecutingTimerState {
@@ -386,69 +454,94 @@ impl EventLoop {
                 },
             );
 
-            // Increment nesting level for HTML5 spec compliance
+            // Step 4: Set nesting level and execute callback.
             TIMER_NESTING_LEVEL.with(|level| {
-                level.set(level.get().saturating_add(1));
+                level.set(nesting_level);
             });
 
-            // Execute callback - continue on error (browser behavior)
-            let call_result = self.call_function(timer.callback, &timer.args);
+            let call_result = self.call_function(callback, &args);
 
-            // Decrement nesting level
             TIMER_NESTING_LEVEL.with(|level| {
-                level.set(level.get().saturating_sub(1));
+                level.set(0);
             });
 
-            // Remove from executing map
-            self.executing_timer_ids.lock().remove(&timer_id);
-
-            // Check if cancelled during execution
-            let was_cancelled = cancelled_flag.load(Ordering::SeqCst);
-            let is_refed = refed_flag.load(Ordering::SeqCst);
-
-            match call_result {
+            match &call_result {
                 Ok(()) => {
                     ran += 1;
-                    // Run microtasks after each timer (ignore microtask errors too)
-                    let _ = self.run_microtasks();
                 }
                 Err(e) => {
-                    // Log error but continue event loop (browser behavior)
                     tracing::warn!("Timer {} callback error: {}", timer_id, e);
                 }
             }
 
-            // Check cancelled AFTER execution (clearInterval might have been called in callback)
-            if was_cancelled || timer.cancelled.load(Ordering::SeqCst) {
-                self.drop_timer(timer);
+            // Step 5: Run microtasks WHILE timer is still in executing_timer_ids.
+            // This allows clearInterval from a microtask to work.
+            let _ = self.run_microtasks_continue_on_error();
+
+            // Step 6: Check cancellation from executing state and from timer entry.
+            let was_cancelled = cancelled_flag.load(Ordering::SeqCst);
+            let final_refed = refed_flag.load(Ordering::SeqCst);
+
+            // Also check the timer's own cancelled flag (set by clearTimeout on self.timers)
+            let timer_cancelled = {
+                let timers = self.timers.lock();
+                timers
+                    .iter()
+                    .find(|t| t.id == timer_id)
+                    .map(|t| t.cancelled.load(Ordering::SeqCst))
+                    .unwrap_or(true) // If not found, treat as cancelled
+            };
+
+            // Step 7: Remove from executing map.
+            self.executing_timer_ids.lock().remove(&timer_id);
+
+            // Step 8: Handle cleanup or reschedule.
+            if was_cancelled || timer_cancelled {
+                self.remove_and_drop_timer(timer_id);
                 continue;
             }
 
-            // Reschedule interval timers, cleanup one-shot timers
-            if is_interval {
-                timer.refed.store(is_refed, Ordering::SeqCst);
-                // Apply clamping for rescheduled intervals too
-                let interval = timer.interval.unwrap();
-                let clamped_interval = TIMER_NESTING_LEVEL.with(|level| {
-                    if level.get() > MAX_TIMER_NESTING_LEVEL {
-                        interval.max(Duration::from_millis(MIN_TIMEOUT_MS))
-                    } else {
-                        interval
-                    }
-                });
-                timer.when = Instant::now() + clamped_interval;
-                // Reset cancelled flag for next iteration
-                timer.cancelled.store(false, Ordering::SeqCst);
-                self.timers.lock().push(timer);
+            if interval.is_some() {
+                // Reschedule interval timer
+                let interval_duration = interval.unwrap();
+                let clamped_interval = if nesting_level > MAX_TIMER_NESTING_LEVEL {
+                    interval_duration.max(Duration::from_millis(MIN_TIMEOUT_MS))
+                } else {
+                    interval_duration
+                };
+
+                let mut timers = self.timers.lock();
+                if let Some(timer) = timers.iter_mut().find(|t| t.id == timer_id) {
+                    timer.when = Instant::now() + clamped_interval;
+                    timer.refed.store(final_refed, Ordering::SeqCst);
+                    timer.cancelled.store(false, Ordering::SeqCst);
+                }
             } else {
-                self.drop_timer(timer);
+                // One-shot timer - remove it
+                self.remove_and_drop_timer(timer_id);
             }
         }
 
-        // Periodically cleanup cancelled timers that are still in the queue
+        // Cleanup any remaining cancelled timers
         self.cleanup_cancelled_timers();
 
         Ok(ran)
+    }
+
+    /// Remove a timer by ID from the timers vec and drop it (unprotect JS values).
+    fn remove_and_drop_timer(&self, timer_id: u64) {
+        let timer = {
+            let mut timers = self.timers.lock();
+            if let Some(idx) = timers.iter().position(|t| t.id == timer_id) {
+                Some(timers.remove(idx))
+            } else {
+                None
+            }
+        };
+
+        if let Some(timer) = timer {
+            self.drop_timer(timer);
+        }
     }
 
     fn call_function(&self, callback: JSObjectRef, args: &[JSValueRef]) -> JscResult<()> {
@@ -481,53 +574,109 @@ impl EventLoop {
     }
 
     fn run_immediates(&self) -> JscResult<usize> {
-        let immediates = {
-            let mut queue = self.immediates.lock();
-            let mut due = Vec::new();
-            while let Some(entry) = queue.pop_front() {
-                due.push(entry);
-            }
-            due
+        // Step 1: Collect IDs of pending immediates WITHOUT removing them from storage.
+        // This ensures clearImmediate(id) can still find them during execution of other immediates.
+        let due_ids: Vec<u64> = {
+            let queue = self.immediates.lock();
+            queue.iter().map(|i| i.id).collect()
         };
 
         let mut ran = 0;
 
-        for immediate in immediates {
-            if immediate.cancelled.load(Ordering::SeqCst) {
-                self.drop_immediate(immediate);
+        for immediate_id in due_ids {
+            // Step 2: Look up immediate info while it's STILL in self.immediates.
+            let immediate_info = {
+                let queue = self.immediates.lock();
+                queue.iter().find(|i| i.id == immediate_id).map(|i| {
+                    (
+                        i.callback,
+                        i.args.clone(),
+                        i.refed.load(Ordering::Relaxed),
+                        i.cancelled.load(Ordering::SeqCst),
+                    )
+                })
+            };
+
+            let Some((callback, args, is_refed, is_cancelled)) = immediate_info else {
+                // Immediate was already removed (e.g., by clearImmediate from another callback)
+                continue;
+            };
+
+            // Check if cancelled before execution
+            if is_cancelled {
+                self.remove_and_drop_immediate(immediate_id);
                 continue;
             }
 
-            let id = immediate.id;
+            // Step 3: Register in executing_immediate_ids.
+            // Immediate is now findable in BOTH self.immediates AND executing_immediate_ids.
             let cancelled_flag = Arc::new(AtomicBool::new(false));
-            self.executing_immediate_ids
-                .lock()
-                .insert(id, cancelled_flag.clone());
+            let refed_flag = Arc::new(AtomicBool::new(is_refed));
+            self.executing_immediate_ids.lock().insert(
+                immediate_id,
+                ExecutingImmediateState {
+                    cancelled: cancelled_flag.clone(),
+                    refed: refed_flag.clone(),
+                },
+            );
 
-            let call_result = self.call_function(immediate.callback, &immediate.args);
-            self.executing_immediate_ids.lock().remove(&id);
+            // Step 4: Execute callback.
+            let call_result = self.call_function(callback, &args);
 
-            let was_cancelled = cancelled_flag.load(Ordering::SeqCst);
-
-            match call_result {
+            match &call_result {
                 Ok(()) => {
                     ran += 1;
-                    let _ = self.run_microtasks();
                 }
                 Err(e) => {
-                    tracing::warn!("Immediate {} callback error: {}", id, e);
+                    tracing::warn!("Immediate {} callback error: {}", immediate_id, e);
                 }
             }
 
-            if was_cancelled {
-                self.drop_immediate(immediate);
+            // Step 5: Run microtasks WHILE immediate is still in executing_immediate_ids.
+            let _ = self.run_microtasks_continue_on_error();
+
+            // Step 6: Check cancellation.
+            let was_cancelled = cancelled_flag.load(Ordering::SeqCst);
+
+            // Also check the immediate's own cancelled flag
+            let immediate_cancelled = {
+                let queue = self.immediates.lock();
+                queue
+                    .iter()
+                    .find(|i| i.id == immediate_id)
+                    .map(|i| i.cancelled.load(Ordering::SeqCst))
+                    .unwrap_or(true)
+            };
+
+            // Step 7: Remove from executing map.
+            self.executing_immediate_ids.lock().remove(&immediate_id);
+
+            // Step 8: Remove from queue (immediates don't reschedule like intervals).
+            self.remove_and_drop_immediate(immediate_id);
+
+            // Track if cancelled for logging purposes (immediate is already cleaned up)
+            if was_cancelled || immediate_cancelled {
                 continue;
             }
-
-            self.drop_immediate(immediate);
         }
 
         Ok(ran)
+    }
+
+    /// Remove an immediate by ID from the immediates queue and drop it (unprotect JS values).
+    fn remove_and_drop_immediate(&self, immediate_id: u64) {
+        let immediate = {
+            let mut queue = self.immediates.lock();
+            if let Some(idx) = queue.iter().position(|i| i.id == immediate_id) {
+                Some(queue.remove(idx).unwrap())
+            } else {
+                None
+            }
+        };
+
+        if let Some(immediate) = immediate {
+            self.drop_immediate(immediate);
+        }
     }
 
     fn drop_immediate(&self, immediate: ImmediateEntry) {

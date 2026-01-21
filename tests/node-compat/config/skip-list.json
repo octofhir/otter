@@ -34,9 +34,6 @@
     "process_binding": [
       "test-process-binding-"
     ],
-    "child_process_hang_risk": [
-      "test-child-process-"
-    ],
     "wasi_not_implemented": [
       "test-wasi-"
     ],

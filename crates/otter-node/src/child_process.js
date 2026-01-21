@@ -176,7 +176,7 @@
 
     // === ChildProcess class (Node.js-style) ===
     class ChildProcess extends EventEmitter {
-        constructor(id) {
+        constructor(id, options = {}) {
             super();
             this._id = id;
             this._pid = cpPid(id);
@@ -184,12 +184,35 @@
             this._signalCode = null;
             this._killed = false;
 
-            // Create stream-like objects
-            this.stdin = new ChildStdin(id);
-            this.stdout = new ChildReadable(id, 'stdout');
-            this.stderr = new ChildReadable(id, 'stderr');
+            // Normalize stdio options - default to 'pipe'
+            const stdinOpt = this._normalizeStdio(options.stdio, 0, options.stdin);
+            const stdoutOpt = this._normalizeStdio(options.stdio, 1, options.stdout);
+            const stderrOpt = this._normalizeStdio(options.stdio, 2, options.stderr);
+
+            // Only create streams if stdio is 'pipe'
+            this.stdin = stdinOpt === 'pipe' ? new ChildStdin(id) : null;
+            this.stdout = stdoutOpt === 'pipe' ? new ChildReadable(id, 'stdout') : null;
+            this.stderr = stderrOpt === 'pipe' ? new ChildReadable(id, 'stderr') : null;
 
             processes.set(id, this);
+        }
+
+        // Normalize stdio option to string
+        _normalizeStdio(stdio, index, explicit) {
+            // Explicit option takes precedence
+            if (explicit !== undefined) {
+                return explicit;
+            }
+            // If stdio is an array, use the index
+            if (Array.isArray(stdio) && stdio[index] !== undefined) {
+                return stdio[index];
+            }
+            // If stdio is a string, apply to all
+            if (typeof stdio === 'string') {
+                return stdio;
+            }
+            // Default to 'pipe'
+            return 'pipe';
         }
 
         get pid() { return this._pid; }
@@ -218,14 +241,22 @@
                 case 'spawn':
                     this.emit('spawn');
                     break;
-                case 'stdout':
-                    const stdoutData = event.data.data || event.data;
-                    this.stdout._push(Buffer.from(stdoutData));
+                case 'stdout': {
+                    // Only push if stdout stream exists (stdio is 'pipe')
+                    if (this.stdout) {
+                        const data = event.data.data || event.data;
+                        this.stdout._push(Buffer.from(data));
+                    }
                     break;
-                case 'stderr':
-                    const stderrData = event.data.data || event.data;
-                    this.stderr._push(Buffer.from(stderrData));
+                }
+                case 'stderr': {
+                    // Only push if stderr stream exists (stdio is 'pipe')
+                    if (this.stderr) {
+                        const data = event.data.data || event.data;
+                        this.stderr._push(Buffer.from(data));
+                    }
                     break;
+                }
                 case 'exit':
                     this._exitCode = event.code;
                     this._signalCode = event.signal;
@@ -245,9 +276,15 @@
             }
         }
 
-        send(message) {
-            // IPC send - to be implemented
-            return true;
+        send(message, callback) {
+            try {
+                cpSendMessage(this._id, message);
+                if (callback) queueMicrotask(() => callback(null));
+                return true;
+            } catch (e) {
+                if (callback) queueMicrotask(() => callback(e));
+                return false;
+            }
         }
     }
 
@@ -327,8 +364,9 @@
         }
 
         const cmd = [command, ...(args || [])];
-        const id = cpSpawn(cmd, options || {});
-        return new ChildProcess(id);
+        const opts = options || {};
+        const id = cpSpawn(cmd, opts);
+        return new ChildProcess(id, opts);
     }
 
     // Node.js exec

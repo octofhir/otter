@@ -278,6 +278,8 @@ async function runTest(
     String(timeoutSec),
   ];
 
+  console.log(`DEBUG: Starting test: ${file}`);
+
   return new Promise((resolve) => {
     const proc = spawn(
       'timeout',
@@ -308,6 +310,7 @@ async function runTest(
 
     proc.on('close', (code) => {
       const duration = Date.now() - startTime;
+      console.log(`DEBUG: Finished test: ${file} (code=${code}, ${duration}ms)`);
 
       // Check for skip indication
       if (stdout.includes('# Skipped:') || stdout.includes('1..0')) {

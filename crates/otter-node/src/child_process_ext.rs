@@ -38,6 +38,7 @@ pub fn extension() -> Extension {
     let mgr_unref = manager.clone();
     let mgr_poll = manager.clone();
     let mgr_has_active_refs = manager.clone();
+    let mgr_send_message = manager.clone();
 
     let mut ops: Vec<OpDecl> = Vec::new();
 
@@ -113,6 +114,22 @@ pub fn extension() -> Extension {
             .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
 
         Ok(json!(null))
+    }));
+
+    // cpSendMessage(id: number, message: any) -> boolean
+    ops.push(op_sync("cpSendMessage", move |_ctx, args| {
+        let id =
+            args.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                otter_runtime::error::JscError::internal("cpSendMessage requires id")
+            })? as u32;
+
+        let message = args.get(1).cloned().unwrap_or(serde_json::Value::Null);
+
+        mgr_send_message
+            .send_message(id, message)
+            .map_err(|e| otter_runtime::error::JscError::internal(e.to_string()))?;
+
+        Ok(json!(true))
     }));
 
     // cpKill(id: number, signal?: string) -> boolean
@@ -294,6 +311,10 @@ fn parse_spawn_options(value: Option<&serde_json::Value>) -> SpawnOptions {
             }
         }),
         timeout: obj.get("timeout").and_then(|v| v.as_u64()),
+        kill_signal: obj
+            .get("killSignal")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         detached: obj
             .get("detached")
             .and_then(|v| v.as_bool())

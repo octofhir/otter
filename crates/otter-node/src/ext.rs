@@ -667,7 +667,7 @@ mod tests {
 
     #[test]
     fn test_worker_threads_extension() {
-        let ext = worker_threads();
+        let (ext, _) = worker_threads();
         assert_eq!(ext.name(), "worker_threads");
         assert!(ext.js_code().is_some());
     }

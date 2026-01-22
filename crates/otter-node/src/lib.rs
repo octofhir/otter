@@ -58,10 +58,10 @@ pub mod module_ext;
 pub mod net;
 pub mod node_stream_ext;
 pub mod os;
-pub mod perf_hooks_ext;
 pub mod os_ext;
 pub mod path;
 pub mod path_ext;
+pub mod perf_hooks_ext;
 pub mod process;
 pub mod process_ext;
 pub mod process_ipc_ext;
@@ -72,9 +72,9 @@ pub mod streams_ext;
 pub mod string_decoder_ext;
 pub mod test;
 pub mod test_ext;
+pub mod timers_ext;
 pub mod tls;
 pub mod tls_ext;
-pub mod timers_ext;
 pub mod tty_ext;
 pub mod url;
 pub mod url_ext;
@@ -110,6 +110,7 @@ pub use test::{
     SnapshotManagerHandle, SnapshotResult, SnapshotStats, TestResult, TestRunner, TestRunnerHandle,
     TestSummary, diff_snapshots, mock_assertions,
 };
+pub use tls::{ActiveTlsServerCount, TlsError, TlsEvent, TlsManager, TlsResult};
 pub use websocket::{
     ReadyState, WebSocketError, WebSocketEvent, WebSocketManager, WebSocketMessage,
 };
@@ -118,7 +119,6 @@ pub use worker_threads::{
     ActiveWorkerCount, ResourceLimits, WorkerThreadError, WorkerThreadEvent, WorkerThreadManager,
     WorkerThreadOptions,
 };
-pub use tls::{ActiveTlsServerCount, TlsError, TlsEvent, TlsManager, TlsResult};
 
 // Re-export capabilities for convenience
 pub use otter_engine::Capabilities;

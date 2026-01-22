@@ -19,7 +19,9 @@
 //! }
 //! ```
 
-use otter_runtime::{JscConfig, JscRuntime, set_tokio_handle, transpile_typescript, needs_transpilation};
+use otter_runtime::{
+    JscConfig, JscRuntime, needs_transpilation, set_tokio_handle, transpile_typescript,
+};
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -332,7 +334,8 @@ impl WorkerThreadManager {
                         running_clone,
                         message_rx,
                         event_tx_clone,
-                    ).await;
+                    )
+                    .await;
                 });
 
                 // Decrement active worker count
@@ -874,10 +877,8 @@ async fn run_worker_thread(
             Ok(WorkerThreadMessage::Data(data)) => {
                 // Call the worker's message handler
                 let data_json = serde_json::to_string(&data).unwrap_or("null".to_string());
-                let call_code = format!(
-                    "globalThis.__otter_worker_receive_message({});",
-                    data_json
-                );
+                let call_code =
+                    format!("globalThis.__otter_worker_receive_message({});", data_json);
                 if let Err(e) = runtime.eval(&call_code) {
                     let _ = event_tx_for_messages.send(WorkerThreadEvent::Error {
                         worker_id,
@@ -911,16 +912,36 @@ fn register_worker_extensions(runtime: &JscRuntime) -> Result<(), String> {
     use crate::ext;
 
     // Register essential Node.js compatibility extensions
-    runtime.register_extension(ext::path()).map_err(|e| e.to_string())?;
-    runtime.register_extension(ext::buffer()).map_err(|e| e.to_string())?;
-    runtime.register_extension(ext::events()).map_err(|e| e.to_string())?;
-    runtime.register_extension(ext::util()).map_err(|e| e.to_string())?;
-    runtime.register_extension(ext::url()).map_err(|e| e.to_string())?;
-    runtime.register_extension(ext::crypto()).map_err(|e| e.to_string())?;
-    runtime.register_extension(ext::timers()).map_err(|e| e.to_string())?;
-    runtime.register_extension(ext::string_decoder()).map_err(|e| e.to_string())?;
-    runtime.register_extension(ext::querystring()).map_err(|e| e.to_string())?;
-    runtime.register_extension(ext::assert()).map_err(|e| e.to_string())?;
+    runtime
+        .register_extension(ext::path())
+        .map_err(|e| e.to_string())?;
+    runtime
+        .register_extension(ext::buffer())
+        .map_err(|e| e.to_string())?;
+    runtime
+        .register_extension(ext::events())
+        .map_err(|e| e.to_string())?;
+    runtime
+        .register_extension(ext::util())
+        .map_err(|e| e.to_string())?;
+    runtime
+        .register_extension(ext::url())
+        .map_err(|e| e.to_string())?;
+    runtime
+        .register_extension(ext::crypto())
+        .map_err(|e| e.to_string())?;
+    runtime
+        .register_extension(ext::timers())
+        .map_err(|e| e.to_string())?;
+    runtime
+        .register_extension(ext::string_decoder())
+        .map_err(|e| e.to_string())?;
+    runtime
+        .register_extension(ext::querystring())
+        .map_err(|e| e.to_string())?;
+    runtime
+        .register_extension(ext::assert())
+        .map_err(|e| e.to_string())?;
 
     Ok(())
 }

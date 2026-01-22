@@ -812,8 +812,12 @@ impl ChildProcessManager {
         let _ = child.wait();
 
         // Collect any output that was produced before timeout
-        stdout_data = stdout_rx.recv_timeout(Duration::from_millis(100)).unwrap_or_default();
-        stderr_data = stderr_rx.recv_timeout(Duration::from_millis(100)).unwrap_or_default();
+        stdout_data = stdout_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_or_default();
+        stderr_data = stderr_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_or_default();
 
         SpawnSyncResult {
             pid: Some(pid),
@@ -957,7 +961,7 @@ impl ChildProcessManager {
             if let Some(pid) = handle.pid {
                 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
                 use windows_sys::Win32::System::Threading::{
-                    OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+                    OpenProcess, PROCESS_TERMINATE, TerminateProcess,
                 };
 
                 // SAFETY: Windows API calls with proper handle management

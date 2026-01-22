@@ -139,9 +139,7 @@ impl JscContext {
     fn poll_js_handlers(&self) -> JscResult<usize> {
         // Use eval to safely call the JS poll function without raw FFI
         // The function returns the count of handled events, or undefined if not defined
-        let result = self.eval(
-            "typeof __otter_poll_all === 'function' ? __otter_poll_all() : 0"
-        );
+        let result = self.eval("typeof __otter_poll_all === 'function' ? __otter_poll_all() : 0");
 
         match result {
             Ok(value) => {
@@ -166,9 +164,8 @@ impl JscContext {
     }
 
     fn has_pending_js_refs(&self) -> bool {
-        let result = self.eval(
-            "typeof __otter_refed_count === 'function' ? __otter_refed_count() : 0",
-        );
+        let result =
+            self.eval("typeof __otter_refed_count === 'function' ? __otter_refed_count() : 0");
 
         match result {
             Ok(value) => value.to_number().map(|count| count > 0.0).unwrap_or(false),

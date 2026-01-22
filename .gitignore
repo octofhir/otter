@@ -22,3 +22,6 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Test262 output
+tests/test262-results/

@@ -262,14 +262,9 @@ impl ModuleGraph {
             } else {
                 ImportContext::ESM
             };
-            let result = Box::pin(self.load_recursive(
-                dep,
-                Some(&module_url),
-                dep_context,
-                visited,
-                stack,
-            ))
-            .await;
+            let result =
+                Box::pin(self.load_recursive(dep, Some(&module_url), dep_context, visited, stack))
+                    .await;
 
             if let Err(_e) = result {
                 // Don't fail - dependency might be optional (try/catch in source)

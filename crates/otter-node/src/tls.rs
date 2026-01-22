@@ -30,7 +30,9 @@ use dashmap::DashMap;
 use otter_macros::dive;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::net::SocketAddr;
@@ -42,8 +44,8 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::TlsConnector;
 
-use std::io::Cursor;
 use base64::Engine;
+use std::io::Cursor;
 
 pub type Paw = u32;
 const TLS_SOCKET_ID_BASE: u32 = 1_000_000_000;
@@ -181,7 +183,11 @@ impl ServerCertVerifier for AcceptAllCertVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         rustls::crypto::CryptoProvider::get_default()
-            .map(|provider| provider.signature_verification_algorithms.supported_schemes())
+            .map(|provider| {
+                provider
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            })
             .unwrap_or_default()
     }
 }
@@ -285,7 +291,12 @@ impl TlsManager {
         let peer_addr = stream.peer_addr()?;
         let local_addr = stream.local_addr()?;
 
-        let config = self.build_client_config(reject_unauthorized, ca.as_deref(), cert.as_deref(), key.as_deref())?;
+        let config = self.build_client_config(
+            reject_unauthorized,
+            ca.as_deref(),
+            cert.as_deref(),
+            key.as_deref(),
+        )?;
         let connector = TlsConnector::from(Arc::new(config));
 
         let server_name = servername.clone().unwrap_or_else(|| host.clone());
@@ -501,9 +512,7 @@ fn parse_private_key(pem: &str) -> TlsResult<PrivateKeyDer<'static>> {
     let key = rustls_pemfile::private_key(&mut reader)
         .map_err(|e| TlsError::InvalidPrivateKey(e.to_string()))?;
 
-    key.ok_or_else(|| {
-        TlsError::InvalidPrivateKey("No private key found in PEM data".to_string())
-    })
+    key.ok_or_else(|| TlsError::InvalidPrivateKey("No private key found in PEM data".to_string()))
 }
 
 // ============================================================================

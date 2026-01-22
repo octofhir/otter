@@ -477,8 +477,7 @@ impl RunCommand {
 
             // Transform dynamic imports even without static imports
             // import(variableName) -> __otter_dynamic_import(variableName)
-            otter_runtime::modules_ast::transform_dynamic_imports(&code)
-                .unwrap_or(code)
+            otter_runtime::modules_ast::transform_dynamic_imports(&code).unwrap_or(code)
         };
         timing!("code_prepared");
 

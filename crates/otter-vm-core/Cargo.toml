@@ -1,0 +1,16 @@
+[package]
+name = "otter-vm-core"
+version = "0.1.0"
+edition = "2024"
+description = "Core VM execution engine for Otter"
+license = "MIT"
+
+[dependencies]
+otter-vm-bytecode = { path = "../otter-vm-bytecode" }
+otter-vm-gc = { path = "../otter-vm-gc" }
+thiserror.workspace = true
+parking_lot = "0.12"
+dashmap = "6"
+rustc-hash = "2"
+
+[dev-dependencies]

@@ -1,7 +1,7 @@
 [package]
 name = "otter-kv"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Key-value store for Otter runtime"
 license = "MIT"
 authors = ["Otter Authors"]
@@ -10,7 +10,7 @@ authors = ["Otter Authors"]
 otter-runtime = { path = "../otter-runtime", version = "0.1.3" }
 
 # KV store backend
-redb = "2.4"
+redb = "3"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

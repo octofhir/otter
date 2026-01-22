@@ -552,9 +552,10 @@ impl EventLoop {
                         timer.cancelled.store(false, Ordering::SeqCst);
                     }
                 }
-                self.timer_heap
-                    .lock()
-                    .push(TimerHeapEntry { when: new_when, id: timer_id });
+                self.timer_heap.lock().push(TimerHeapEntry {
+                    when: new_when,
+                    id: timer_id,
+                });
             } else {
                 self.remove_and_drop_timer(timer_id);
             }

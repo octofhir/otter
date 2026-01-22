@@ -83,6 +83,24 @@ check-examples:
 check-project project:
     cargo run -p otterjs -- check -p {{project}} .
 
+# === Test262 Conformance Tests ===
+
+# Run Test262 tests (all)
+test262 *args:
+    cargo run -p otter-test262 -- {{args}}
+
+# Run Test262 tests with filter (e.g., "literals")
+test262-filter filter:
+    cargo run -p otter-test262 -- --filter {{filter}} --verbose
+
+# Run Test262 for specific directory (e.g., "language/expressions")
+test262-dir dir:
+    cargo run -p otter-test262 -- --subdir {{dir}} --verbose
+
+# List Test262 tests (with optional filter)
+test262-list filter="":
+    cargo run -p otter-test262 -- --list-only {{ if filter != "" { "--filter " + filter } else { "" } }}
+
 # === Node.js Compatibility Tests ===
 
 # Run Node.js compatibility test suite (fetches tests if needed)

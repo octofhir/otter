@@ -13,7 +13,7 @@ readme = "README.md"
 [dependencies]
 otter-jsc-sys = { path = "../otter-jsc-sys", version = "0.1.1" }
 otter-jsc-core = { path = "../otter-jsc-core", version = "0.1.2" }
-thiserror = "2"
+thiserror.workspace = true
 anyhow = "1"
 url = "2"
 

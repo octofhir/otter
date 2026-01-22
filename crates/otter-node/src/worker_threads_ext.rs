@@ -16,7 +16,9 @@ use otter_runtime::extension::{OpDecl, op_sync};
 use serde_json::json;
 use std::sync::Arc;
 
-use crate::worker_threads::{ActiveWorkerCount, ResourceLimits, WorkerThreadManager, WorkerThreadOptions};
+use crate::worker_threads::{
+    ActiveWorkerCount, ResourceLimits, WorkerThreadManager, WorkerThreadOptions,
+};
 
 /// Create the worker_threads extension.
 ///

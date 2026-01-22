@@ -1,0 +1,13 @@
+[package]
+name = "otter-vm-gc"
+version = "0.1.0"
+edition = "2024"
+description = "Garbage collector for Otter VM"
+license = "MIT"
+repository = "https://github.com/aspect-build/otter"
+
+[dependencies]
+parking_lot = "0.12"
+crossbeam-utils = "0.8"
+
+[dev-dependencies]

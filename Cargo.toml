@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/otter-vm-bytecode",
+    "crates/otter-vm-core",
+    "crates/otter-vm-compiler",
+    "crates/otter-vm-gc",
+    "crates/otter-test262",
     "crates/otter-jsc-sys",
     "crates/otter-jsc-core",
     "crates/otter-macros",
@@ -12,6 +17,9 @@ members = [
     "crates/otter-pm",
     "crates/otterjs",
 ]
+
+[workspace.dependencies]
+thiserror = "2"
 
 # Optimized release profile for minimal startup time
 [profile.release]

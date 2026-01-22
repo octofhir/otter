@@ -1,0 +1,450 @@
+//! JavaScript values with NaN-boxing
+//!
+//! NaN-boxing encodes JS values in 64 bits using the IEEE 754 NaN space.
+//! This allows storing pointers, integers, and special values without
+//! additional allocation.
+//!
+//! ## Encoding Scheme
+//!
+//! ```text
+//! 64 bits: SEEEEEEE EEEEMMMM MMMMMMMM ... MMMMMMMM
+//!          S = sign bit
+//!          E = exponent (11 bits)
+//!          M = mantissa (52 bits)
+//!
+//! Regular doubles: When exponent != 0x7FF (NaN)
+//! NaN-boxed values: When exponent == 0x7FF and mantissa != 0 (quiet NaN)
+//!
+//! Encoding:
+//! - Double:     stored directly
+//! - Integer:    0x7FF8_0001_XXXX_XXXX (32-bit signed in lower bits)
+//! - Pointer:    0x7FFC_XXXX_XXXX_XXXX (48-bit pointer)
+//! - Undefined:  0x7FF8_0000_0000_0000
+//! - Null:       0x7FF8_0000_0000_0001
+//! - True:       0x7FF8_0000_0000_0002
+//! - False:      0x7FF8_0000_0000_0003
+//! ```
+
+use crate::object::JsObject;
+use crate::string::JsString;
+use std::sync::Arc;
+
+// NaN-boxing constants
+const QUIET_NAN: u64 = 0x7FF8_0000_0000_0000;
+#[allow(dead_code)]
+const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
+const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+// Tags (in the upper 16 bits after quiet NaN prefix)
+const TAG_UNDEFINED: u64 = 0x7FF8_0000_0000_0000;
+const TAG_NULL: u64 = 0x7FF8_0000_0000_0001;
+const TAG_TRUE: u64 = 0x7FF8_0000_0000_0002;
+const TAG_FALSE: u64 = 0x7FF8_0000_0000_0003;
+const TAG_INT32: u64 = 0x7FF8_0001_0000_0000;
+const TAG_POINTER: u64 = 0x7FFC_0000_0000_0000;
+
+/// A JavaScript value using NaN-boxing for efficient storage
+///
+/// This type is `Send + Sync` because all heap-allocated data is behind `Arc`.
+#[derive(Clone)]
+pub struct Value {
+    bits: u64,
+    /// Heap reference to prevent GC while value is alive
+    /// This is Some only for pointer types (Object, String, etc.)
+    heap_ref: Option<HeapRef>,
+}
+
+// SAFETY: Value contains only u64 bits and Arc (which is Send+Sync)
+unsafe impl Send for Value {}
+unsafe impl Sync for Value {}
+
+/// Reference to heap-allocated data
+#[derive(Clone, Debug)]
+pub enum HeapRef {
+    /// String value
+    String(Arc<JsString>),
+    /// Object value
+    Object(Arc<JsObject>),
+    /// Array value (stored as Object internally)
+    Array(Arc<JsObject>),
+    /// Function closure
+    Function(Arc<Closure>),
+    /// Symbol
+    Symbol(Arc<Symbol>),
+    /// BigInt
+    BigInt(Arc<BigInt>),
+}
+
+/// A JavaScript function closure
+#[derive(Debug)]
+pub struct Closure {
+    /// Function index in the module
+    pub function_index: u32,
+    /// Captured upvalues
+    pub upvalues: Vec<Value>,
+}
+
+/// A JavaScript Symbol
+#[derive(Debug)]
+pub struct Symbol {
+    /// Symbol description
+    pub description: Option<String>,
+    /// Unique ID
+    pub id: u64,
+}
+
+/// A JavaScript BigInt (arbitrary precision integer)
+#[derive(Debug)]
+pub struct BigInt {
+    /// String representation (for now)
+    pub value: String,
+}
+
+impl Value {
+    /// Create undefined value
+    #[inline]
+    pub const fn undefined() -> Self {
+        Self {
+            bits: TAG_UNDEFINED,
+            heap_ref: None,
+        }
+    }
+
+    /// Create null value
+    #[inline]
+    pub const fn null() -> Self {
+        Self {
+            bits: TAG_NULL,
+            heap_ref: None,
+        }
+    }
+
+    /// Create boolean value
+    #[inline]
+    pub const fn boolean(b: bool) -> Self {
+        Self {
+            bits: if b { TAG_TRUE } else { TAG_FALSE },
+            heap_ref: None,
+        }
+    }
+
+    /// Create 32-bit integer value
+    #[inline]
+    pub fn int32(n: i32) -> Self {
+        Self {
+            bits: TAG_INT32 | (n as u32 as u64),
+            heap_ref: None,
+        }
+    }
+
+    /// Create number (f64) value
+    #[inline]
+    pub fn number(n: f64) -> Self {
+        // Check if it fits in i32 for optimization
+        if n.fract() == 0.0 && n >= i32::MIN as f64 && n <= i32::MAX as f64 {
+            return Self::int32(n as i32);
+        }
+
+        Self {
+            bits: n.to_bits(),
+            heap_ref: None,
+        }
+    }
+
+    /// Create string value
+    pub fn string(s: Arc<JsString>) -> Self {
+        // Store pointer address in NaN-boxed format
+        let ptr = Arc::as_ptr(&s) as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::String(s)),
+        }
+    }
+
+    /// Create object value
+    pub fn object(obj: Arc<JsObject>) -> Self {
+        let ptr = Arc::as_ptr(&obj) as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::Object(obj)),
+        }
+    }
+
+    /// Create function closure value
+    pub fn function(closure: Arc<Closure>) -> Self {
+        let ptr = Arc::as_ptr(&closure) as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::Function(closure)),
+        }
+    }
+
+    /// Check if value is undefined
+    #[inline]
+    pub fn is_undefined(&self) -> bool {
+        self.bits == TAG_UNDEFINED
+    }
+
+    /// Check if value is null
+    #[inline]
+    pub fn is_null(&self) -> bool {
+        self.bits == TAG_NULL
+    }
+
+    /// Check if value is null or undefined
+    #[inline]
+    pub fn is_nullish(&self) -> bool {
+        self.bits == TAG_UNDEFINED || self.bits == TAG_NULL
+    }
+
+    /// Check if value is a boolean
+    #[inline]
+    pub fn is_boolean(&self) -> bool {
+        self.bits == TAG_TRUE || self.bits == TAG_FALSE
+    }
+
+    /// Check if value is an integer
+    #[inline]
+    pub fn is_int32(&self) -> bool {
+        (self.bits & 0xFFFF_FFFF_0000_0000) == TAG_INT32
+    }
+
+    /// Check if value is a number (including int32)
+    #[inline]
+    pub fn is_number(&self) -> bool {
+        self.is_int32() || !self.is_nan_boxed()
+    }
+
+    /// Check if value is a string
+    #[inline]
+    pub fn is_string(&self) -> bool {
+        matches!(&self.heap_ref, Some(HeapRef::String(_)))
+    }
+
+    /// Check if value is an object
+    #[inline]
+    pub fn is_object(&self) -> bool {
+        matches!(&self.heap_ref, Some(HeapRef::Object(_)))
+    }
+
+    /// Check if value is a function
+    #[inline]
+    pub fn is_function(&self) -> bool {
+        matches!(&self.heap_ref, Some(HeapRef::Function(_)))
+    }
+
+    /// Check if this is a NaN-boxed value (vs regular double)
+    #[inline]
+    fn is_nan_boxed(&self) -> bool {
+        // Quiet NaN pattern: exponent all 1s, quiet bit set
+        (self.bits & QUIET_NAN) == QUIET_NAN
+    }
+
+    /// Get as boolean
+    pub fn as_boolean(&self) -> Option<bool> {
+        match self.bits {
+            TAG_TRUE => Some(true),
+            TAG_FALSE => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Get as 32-bit integer
+    pub fn as_int32(&self) -> Option<i32> {
+        if self.is_int32() {
+            Some((self.bits & 0xFFFF_FFFF) as i32)
+        } else {
+            None
+        }
+    }
+
+    /// Get as number (f64)
+    pub fn as_number(&self) -> Option<f64> {
+        if self.is_int32() {
+            Some((self.bits & 0xFFFF_FFFF) as i32 as f64)
+        } else if !self.is_nan_boxed() {
+            Some(f64::from_bits(self.bits))
+        } else {
+            None
+        }
+    }
+
+    /// Get as string
+    pub fn as_string(&self) -> Option<&Arc<JsString>> {
+        match &self.heap_ref {
+            Some(HeapRef::String(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Get as object
+    pub fn as_object(&self) -> Option<&Arc<JsObject>> {
+        match &self.heap_ref {
+            Some(HeapRef::Object(o)) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// Get as function closure
+    pub fn as_function(&self) -> Option<&Arc<Closure>> {
+        match &self.heap_ref {
+            Some(HeapRef::Function(f)) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// Convert to boolean (ToBoolean)
+    pub fn to_boolean(&self) -> bool {
+        match self.bits {
+            TAG_UNDEFINED | TAG_NULL | TAG_FALSE => false,
+            TAG_TRUE => true,
+            _ if self.is_int32() => self.as_int32().unwrap() != 0,
+            _ if !self.is_nan_boxed() => {
+                let n = f64::from_bits(self.bits);
+                !n.is_nan() && n != 0.0
+            }
+            _ => {
+                // Strings: empty string is false
+                if let Some(s) = self.as_string() {
+                    !s.is_empty()
+                } else {
+                    // Objects, functions are always truthy
+                    true
+                }
+            }
+        }
+    }
+
+    /// Get the type name (for typeof)
+    pub fn type_of(&self) -> &'static str {
+        match self.bits {
+            TAG_UNDEFINED => "undefined",
+            TAG_NULL => "object", // typeof null === "object" (historical bug)
+            TAG_TRUE | TAG_FALSE => "boolean",
+            _ if self.is_int32() || !self.is_nan_boxed() => "number",
+            _ => match &self.heap_ref {
+                Some(HeapRef::String(_)) => "string",
+                Some(HeapRef::Function(_)) => "function",
+                Some(HeapRef::Symbol(_)) => "symbol",
+                Some(HeapRef::BigInt(_)) => "bigint",
+                Some(HeapRef::Object(_) | HeapRef::Array(_)) => "object",
+                None => "undefined", // Should not happen
+            },
+        }
+    }
+}
+
+impl Default for Value {
+    fn default() -> Self {
+        Self::undefined()
+    }
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.bits {
+            TAG_UNDEFINED => write!(f, "undefined"),
+            TAG_NULL => write!(f, "null"),
+            TAG_TRUE => write!(f, "true"),
+            TAG_FALSE => write!(f, "false"),
+            _ if self.is_int32() => write!(f, "{}", self.as_int32().unwrap()),
+            _ if !self.is_nan_boxed() => write!(f, "{}", f64::from_bits(self.bits)),
+            _ => match &self.heap_ref {
+                Some(HeapRef::String(s)) => write!(f, "\"{}\"", s.as_str()),
+                Some(HeapRef::Object(_)) => write!(f, "[object Object]"),
+                Some(HeapRef::Array(_)) => write!(f, "[object Array]"),
+                Some(HeapRef::Function(_)) => write!(f, "[Function]"),
+                Some(HeapRef::Symbol(s)) => {
+                    if let Some(desc) = &s.description {
+                        write!(f, "Symbol({})", desc)
+                    } else {
+                        write!(f, "Symbol()")
+                    }
+                }
+                Some(HeapRef::BigInt(b)) => write!(f, "{}n", b.value),
+                None => write!(f, "<unknown>"),
+            },
+        }
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        // Fast path: same bits
+        if self.bits == other.bits {
+            return true;
+        }
+
+        // Numbers: need special handling for NaN
+        if self.is_number() && other.is_number() {
+            let a = self.as_number().unwrap();
+            let b = other.as_number().unwrap();
+            return a == b; // NaN != NaN is correct
+        }
+
+        // Strings: compare contents
+        if let (Some(a), Some(b)) = (self.as_string(), other.as_string()) {
+            return a.as_str() == b.as_str();
+        }
+
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_undefined() {
+        let v = Value::undefined();
+        assert!(v.is_undefined());
+        assert!(!v.to_boolean());
+        assert_eq!(v.type_of(), "undefined");
+    }
+
+    #[test]
+    fn test_null() {
+        let v = Value::null();
+        assert!(v.is_null());
+        assert!(v.is_nullish());
+        assert!(!v.to_boolean());
+        assert_eq!(v.type_of(), "object");
+    }
+
+    #[test]
+    fn test_boolean() {
+        let t = Value::boolean(true);
+        let f = Value::boolean(false);
+
+        assert!(t.is_boolean());
+        assert!(f.is_boolean());
+        assert!(t.to_boolean());
+        assert!(!f.to_boolean());
+        assert_eq!(t.type_of(), "boolean");
+    }
+
+    #[test]
+    fn test_int32() {
+        let v = Value::int32(42);
+        assert!(v.is_int32());
+        assert!(v.is_number());
+        assert_eq!(v.as_int32(), Some(42));
+        assert_eq!(v.as_number(), Some(42.0));
+        assert_eq!(v.type_of(), "number");
+    }
+
+    #[test]
+    fn test_number() {
+        let v = Value::number(3.15);
+        assert!(v.is_number());
+        assert!(!v.is_int32()); // Has fractional part
+        assert_eq!(v.as_number(), Some(3.15));
+    }
+
+    #[test]
+    fn test_value_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Value>();
+    }
+}

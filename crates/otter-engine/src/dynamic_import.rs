@@ -17,9 +17,9 @@
 
 use crate::graph::ModuleGraph;
 use crate::loader::{LoaderConfig, ModuleLoader};
-use otter_runtime::extension::{op_async, Extension};
-use otter_runtime::modules::{ModuleFormat, ModuleInfo, bundle_modules_mixed};
 use otter_runtime::JscError;
+use otter_runtime::extension::{Extension, op_async};
+use otter_runtime::modules::{ModuleFormat, ModuleInfo, bundle_modules_mixed};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;

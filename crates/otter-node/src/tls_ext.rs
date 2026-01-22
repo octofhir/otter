@@ -3,7 +3,7 @@
 //! This module provides TLS/SSL encrypted TCP connections using rustls.
 
 use crate::net::NetEvent;
-use crate::tls::{init_tls_manager, ActiveTlsServerCount};
+use crate::tls::{ActiveTlsServerCount, init_tls_manager};
 use otter_runtime::Extension;
 use std::cell::RefCell;
 use tokio::sync::mpsc;

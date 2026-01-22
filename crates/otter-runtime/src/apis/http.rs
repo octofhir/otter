@@ -172,6 +172,7 @@ pub fn register_http_api(ctx: JSContextRef) -> JscResult<()> {
         );
         JSStringRelease(fetch_name_ref);
 
+        // Evaluate fetch shim
         let shim_cstr = CString::new(FETCH_SHIM).unwrap();
         let shim_ref = JSStringCreateWithUTF8CString(shim_cstr.as_ptr());
         let source_cstr = CString::new("<otter_fetch_shim>").unwrap();

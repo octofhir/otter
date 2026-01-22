@@ -3,7 +3,6 @@
 pub mod add;
 pub mod build;
 pub mod check;
-pub mod compile;
 pub mod exec;
 pub mod info;
 pub mod init;

@@ -17,8 +17,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BUN_WEBKIT_VERSION");
     println!("cargo:rerun-if-changed=src/heap_stats.cpp");
     println!("cargo:rerun-if-changed=src/heap_stats_stub.c");
-    println!("cargo:rerun-if-changed=src/bytecode_cache.cpp");
-    println!("cargo:rerun-if-changed=src/bytecode_cache_stub.c");
 
     match target_os.as_str() {
         "macos" => configure_macos(),
@@ -280,31 +278,12 @@ fn compile_heap_stats_cpp(include_dir: &PathBuf, os: &str) {
     }
 
     build.compile("otter_jsc_heap_stats");
-
-    // Compile bytecode cache with bun-webkit
-    let mut bytecode_build = Build::new();
-    bytecode_build
-        .cpp(true)
-        .file("src/bytecode_cache.cpp")
-        .include(include_dir)
-        .flag_if_supported("-std=c++20");
-
-    if os == "macos" {
-        bytecode_build.flag_if_supported("-stdlib=libc++");
-    }
-
-    bytecode_build.compile("otter_jsc_bytecode_cache");
 }
 
 fn compile_heap_stats_stub() {
     Build::new()
         .file("src/heap_stats_stub.c")
         .compile("otter_jsc_heap_stats");
-
-    // Compile bytecode cache stub for system JSC
-    Build::new()
-        .file("src/bytecode_cache_stub.c")
-        .compile("otter_jsc_bytecode_cache");
 }
 
 fn find_lib_dir(webkit_path: &PathBuf) -> PathBuf {

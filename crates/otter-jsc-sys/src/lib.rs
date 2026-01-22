@@ -12,9 +12,6 @@ use std::os::raw::{c_char, c_int, c_uint};
 // WTF Timer implementation for bun-webkit integration
 pub mod wtf_timer;
 
-// Bytecode cache API for JSC
-pub mod bytecode;
-
 // Type aliases for JSC opaque pointers
 pub type JSContextGroupRef = *mut c_void;
 pub type JSContextRef = *mut c_void;

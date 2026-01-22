@@ -127,9 +127,6 @@ enum Commands {
     /// Initialize a new project
     Init(commands::init::InitCommand),
 
-    /// Compile a script to bytecode (deprecated: use `build --compile`)
-    Compile(commands::compile::CompileCommand),
-
     /// Show runtime information
     Info(commands::info::InfoCommand),
 }
@@ -173,7 +170,6 @@ async fn main() -> Result<()> {
                     | "add"
                     | "remove"
                     | "init"
-                    | "compile"
                     | "info"
                     | "help"
             )
@@ -230,7 +226,6 @@ async fn main() -> Result<()> {
         Some(Commands::Add(cmd)) => cmd.run().await,
         Some(Commands::Remove(cmd)) => cmd.run().await,
         Some(Commands::Init(cmd)) => cmd.run().await,
-        Some(Commands::Compile(cmd)) => cmd.run().await,
         Some(Commands::Info(cmd)) => cmd.run(),
         None => {
             // No command - show help and available scripts

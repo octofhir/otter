@@ -149,7 +149,10 @@ fn run_code(source: &str, source_url: &str) -> Result<()> {
 }
 
 /// Set up extension ops as global functions
-fn setup_extension_globals(ctx: &mut otter_vm_core::context::VmContext, registry: &ExtensionRegistry) {
+fn setup_extension_globals(
+    ctx: &mut otter_vm_core::context::VmContext,
+    registry: &ExtensionRegistry,
+) {
     for op_name in registry.op_names() {
         if let Some(handler) = registry.get_op(op_name) {
             let handler = handler.clone();
@@ -194,7 +197,10 @@ fn run_extension_js(
             }
             Err(e) => {
                 // Log warning but continue - builtins may use unsupported features
-                tracing::warn!("Could not compile builtin JS (some features may be unavailable): {:?}", e);
+                tracing::warn!(
+                    "Could not compile builtin JS (some features may be unavailable): {:?}",
+                    e
+                );
             }
         }
     }

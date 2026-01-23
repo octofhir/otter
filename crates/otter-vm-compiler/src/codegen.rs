@@ -214,6 +214,16 @@ impl CodeGen {
         idx
     }
 
+    /// Emit a conditional jump if true (returns index for patching)
+    pub fn emit_jump_if_true(&mut self, cond: Register) -> usize {
+        let idx = self.current_index();
+        self.emit(Instruction::JumpIfTrue {
+            cond,
+            offset: JumpOffset(0),
+        });
+        idx
+    }
+
     /// Enter a block scope
     pub fn enter_scope(&mut self) {
         self.current.scopes.enter(false);

@@ -102,6 +102,8 @@ impl Compiler {
 
             Statement::ForStatement(for_stmt) => self.compile_for_statement(for_stmt),
 
+            Statement::ForOfStatement(for_of_stmt) => self.compile_for_of_statement(for_of_stmt),
+
             Statement::FunctionDeclaration(func) => self.compile_function_declaration(func),
 
             Statement::EmptyStatement(_) => Ok(()),
@@ -746,10 +748,100 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compile a for-of statement
+    /// for (const x of iterable) { ... }
+    fn compile_for_of_statement(&mut self, for_of_stmt: &ForOfStatement) -> CompileResult<()> {
+        self.codegen.enter_scope();
+
+        // Compile the iterable expression
+        let iterable = self.compile_expression(&for_of_stmt.right)?;
+
+        // Get iterator: iterator = iterable[Symbol.iterator]()
+        let iterator = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::GetIterator {
+            dst: iterator,
+            src: iterable,
+        });
+        self.codegen.free_reg(iterable);
+
+        // Allocate registers for value and done
+        let value_reg = self.codegen.alloc_reg();
+        let done_reg = self.codegen.alloc_reg();
+
+        // Loop start
+        let loop_start = self.codegen.current_index();
+
+        // IteratorNext: {value, done} = iterator.next()
+        self.codegen.emit(Instruction::IteratorNext {
+            dst: value_reg,
+            done: done_reg,
+            iter: iterator,
+        });
+
+        // JumpIfTrue done -> end
+        let jump_end = self.codegen.emit_jump_if_true(done_reg);
+
+        // Assign value to the left side
+        match &for_of_stmt.left {
+            ForStatementLeft::VariableDeclaration(decl) => {
+                // For variable declarations like `const x` or `let x`
+                let is_const = decl.kind == VariableDeclarationKind::Const;
+                if let Some(declarator) = decl.declarations.first() {
+                    match &declarator.id {
+                        BindingPattern::BindingIdentifier(ident) => {
+                            // Declare the variable and set its value
+                            let local_idx = self.codegen.declare_variable(&ident.name, is_const)?;
+                            self.codegen.emit(Instruction::SetLocal {
+                                idx: LocalIndex(local_idx),
+                                src: value_reg,
+                            });
+                        }
+                        _ => {
+                            // Destructuring patterns in for-of
+                            return Err(CompileError::unsupported(
+                                "Destructuring in for-of not yet supported",
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Assignment to existing variable
+                // For simple identifiers, we can handle them
+                // Complex assignment targets (destructuring, member access) need more work
+                return Err(CompileError::unsupported(
+                    "Complex for-of left-hand side not yet supported",
+                ));
+            }
+        }
+
+        // Compile the loop body
+        self.compile_statement(&for_of_stmt.body)?;
+
+        // Jump back to loop start
+        let back_offset = loop_start as i32 - self.codegen.current_index() as i32;
+        self.codegen.emit(Instruction::Jump {
+            offset: JumpOffset(back_offset),
+        });
+
+        // Patch jump to end
+        let end_offset = self.codegen.current_index() as i32 - jump_end as i32;
+        self.codegen.patch_jump(jump_end, end_offset);
+
+        // Clean up registers
+        self.codegen.free_reg(done_reg);
+        self.codegen.free_reg(value_reg);
+        self.codegen.free_reg(iterator);
+
+        self.codegen.exit_scope();
+        Ok(())
+    }
+
     /// Compile a function declaration
     fn compile_function_declaration(&mut self, func: &oxc_ast::ast::Function) -> CompileResult<()> {
         let name = func.id.as_ref().map(|id| id.name.to_string());
         let is_async = func.r#async;
+        let is_generator = func.generator;
 
         // Declare function in current scope
         if let Some(ref n) = name {
@@ -759,6 +851,7 @@ impl Compiler {
         // Enter function context
         self.codegen.enter_function(name.clone());
         self.codegen.current.flags.is_async = is_async;
+        self.codegen.current.flags.is_generator = is_generator;
 
         // Declare parameters
         for param in &func.params.items {
@@ -799,7 +892,12 @@ impl Compiler {
             && let Some(ResolvedBinding::Local(idx)) = self.codegen.resolve_variable(&n)
         {
             let dst = self.codegen.alloc_reg();
-            if is_async {
+            if is_generator {
+                self.codegen.emit(Instruction::GeneratorClosure {
+                    dst,
+                    func: otter_vm_bytecode::FunctionIndex(func_idx),
+                });
+            } else if is_async {
                 self.codegen.emit(Instruction::AsyncClosure {
                     dst,
                     func: otter_vm_bytecode::FunctionIndex(func_idx),
@@ -827,10 +925,12 @@ impl Compiler {
     ) -> CompileResult<Register> {
         let name = func.id.as_ref().map(|id| id.name.to_string());
         let is_async = func.r#async;
+        let is_generator = func.generator;
 
         // Enter function context
         self.codegen.enter_function(name);
         self.codegen.current.flags.is_async = is_async;
+        self.codegen.current.flags.is_generator = is_generator;
 
         // Declare parameters
         for param in &func.params.items {
@@ -868,7 +968,12 @@ impl Compiler {
 
         // Create closure
         let dst = self.codegen.alloc_reg();
-        if is_async {
+        if is_generator {
+            self.codegen.emit(Instruction::GeneratorClosure {
+                dst,
+                func: otter_vm_bytecode::FunctionIndex(func_idx),
+            });
+        } else if is_async {
             self.codegen.emit(Instruction::AsyncClosure {
                 dst,
                 func: otter_vm_bytecode::FunctionIndex(func_idx),
@@ -1036,6 +1141,8 @@ impl Compiler {
 
             Expression::AwaitExpression(await_expr) => self.compile_await_expression(await_expr),
 
+            Expression::YieldExpression(yield_expr) => self.compile_yield_expression(yield_expr),
+
             // TypeScript expressions - type erasure (compile inner expression, ignore type)
             Expression::TSAsExpression(expr) => self.compile_expression(&expr.expression),
 
@@ -1064,6 +1171,28 @@ impl Compiler {
         // Emit await instruction
         let dst = self.codegen.alloc_reg();
         self.codegen.emit(Instruction::Await { dst, src });
+        self.codegen.free_reg(src);
+
+        Ok(dst)
+    }
+
+    /// Compile a yield expression
+    fn compile_yield_expression(
+        &mut self,
+        yield_expr: &oxc_ast::ast::YieldExpression,
+    ) -> CompileResult<Register> {
+        // Compile the argument (value to yield)
+        let src = if let Some(argument) = &yield_expr.argument {
+            self.compile_expression(argument)?
+        } else {
+            let r = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::LoadUndefined { dst: r });
+            r
+        };
+
+        // Emit yield instruction
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::Yield { dst, src });
         self.codegen.free_reg(src);
 
         Ok(dst)
@@ -1224,6 +1353,11 @@ impl Compiler {
 
     /// Compile a call expression
     fn compile_call_expression(&mut self, call: &CallExpression) -> CompileResult<Register> {
+        // Check if this is a method call (obj.method() or obj["method"]())
+        if let Expression::StaticMemberExpression(member) = &call.callee {
+            return self.compile_method_call(call, member);
+        }
+
         // Compile callee
         let func = self.compile_expression(&call.callee)?;
 
@@ -1252,7 +1386,10 @@ impl Compiler {
                 let temp = self.compile_expression(arg.to_expression())?;
                 let target = Register(func.0 + 1 + i as u8);
                 if temp.0 != target.0 {
-                    self.codegen.emit(Instruction::Move { dst: target, src: temp });
+                    self.codegen.emit(Instruction::Move {
+                        dst: target,
+                        src: temp,
+                    });
                     self.codegen.free_reg(temp);
                 }
             }
@@ -1271,6 +1408,78 @@ impl Compiler {
         }
     }
 
+    /// Compile a method call (obj.method(...))
+    fn compile_method_call(
+        &mut self,
+        call: &CallExpression,
+        member: &oxc_ast::ast::StaticMemberExpression,
+    ) -> CompileResult<Register> {
+        // Compile the object (receiver)
+        let obj = self.compile_expression(&member.object)?;
+
+        // Get method name as constant
+        let method_name = member.property.name.as_str();
+        let method_idx = self.codegen.add_string(method_name);
+
+        // Check if we have any spread arguments
+        let has_spread = call
+            .arguments
+            .iter()
+            .any(|arg| matches!(arg, Argument::SpreadElement(_)));
+
+        if has_spread {
+            // For spread with method call, we need to get the method and use CallSpread
+            // Get method into a register first
+            let func = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::GetPropConst {
+                dst: func,
+                obj,
+                name: method_idx,
+            });
+            // Use regular spread handling (this won't preserve `this` perfectly, but is a fallback)
+            self.compile_call_with_spread(call, func)
+        } else {
+            // Regular method call without spread
+            let argc = call.arguments.len() as u8;
+
+            // Reserve registers for arguments right after obj
+            let mut reserved = Vec::with_capacity(call.arguments.len());
+            for _ in 0..call.arguments.len() {
+                reserved.push(self.codegen.alloc_reg());
+            }
+
+            // Compile each argument and move to its designated register
+            for (i, arg) in call.arguments.iter().enumerate() {
+                let temp = self.compile_expression(arg.to_expression())?;
+                let target = Register(obj.0 + 1 + i as u8);
+                if temp.0 != target.0 {
+                    self.codegen.emit(Instruction::Move {
+                        dst: target,
+                        src: temp,
+                    });
+                    self.codegen.free_reg(temp);
+                }
+            }
+
+            // Allocate dst register
+            let dst = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::CallMethod {
+                dst,
+                obj,
+                method: method_idx,
+                argc,
+            });
+
+            // Free obj and reserved arg registers
+            self.codegen.free_reg(obj);
+            for reg in reserved {
+                self.codegen.free_reg(reg);
+            }
+
+            Ok(dst)
+        }
+    }
+
     /// Compile a call expression with spread arguments
     fn compile_call_with_spread(
         &mut self,
@@ -1279,8 +1488,10 @@ impl Compiler {
     ) -> CompileResult<Register> {
         // Create an array to hold all arguments (including spread)
         let args_arr = self.codegen.alloc_reg();
-        self.codegen
-            .emit(Instruction::NewArray { dst: args_arr, len: 0 });
+        self.codegen.emit(Instruction::NewArray {
+            dst: args_arr,
+            len: 0,
+        });
 
         // Process each argument
         for arg in &call.arguments {
@@ -1875,8 +2086,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(module.functions.len(), 2);
-        // The async function should have is_async flag
-        assert!(module.functions[1].is_async());
+        // The async function (fetchData) is at index 0, main is at index 1
+        assert!(module.functions[0].is_async());
+        assert_eq!(module.functions[0].name, Some("fetchData".to_string()));
     }
 
     #[test]
@@ -1887,7 +2099,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(module.functions.len(), 2);
-        assert!(module.functions[1].is_async());
+        // The async arrow function is at index 0, main is at index 1
+        assert!(module.functions[0].is_async());
     }
 
     #[test]
@@ -1901,7 +2114,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(module.functions.len(), 2);
-        assert!(module.functions[1].is_async());
+        // The async function (test) is at index 0, main is at index 1
+        assert!(module.functions[0].is_async());
+        assert_eq!(module.functions[0].name, Some("test".to_string()));
     }
 
     #[test]

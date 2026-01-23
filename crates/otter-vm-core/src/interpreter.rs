@@ -6,6 +6,7 @@ use otter_vm_bytecode::{Instruction, Module};
 
 use crate::context::VmContext;
 use crate::error::{VmError, VmResult};
+use crate::generator::JsGenerator;
 use crate::object::{JsObject, PropertyKey};
 use crate::promise::{JsPromise, PromiseState};
 use crate::string::JsString;
@@ -152,6 +153,15 @@ impl Interpreter {
                         }
                     }
                 }
+                InstructionResult::Yield { value } => {
+                    // Generator yielded a value
+                    // Create an iterator result object { value, done: false }
+                    let result = Arc::new(JsObject::new(None));
+                    result.set(PropertyKey::string("value"), value);
+                    result.set(PropertyKey::string("done"), Value::boolean(false));
+                    ctx.advance_pc();
+                    return Ok(Value::object(result));
+                }
             }
         }
     }
@@ -246,6 +256,12 @@ impl Interpreter {
 
                 let value = ctx.get_register(src.0).clone();
                 ctx.set_global(name_str, value);
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::LoadThis { dst } => {
+                let this_value = ctx.this_value();
+                ctx.set_register(dst.0, this_value);
                 Ok(InstructionResult::Continue)
             }
 
@@ -501,6 +517,13 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
+            Instruction::GeneratorClosure { dst, func } => {
+                // Create a generator function - when called, it creates a generator object
+                let generator_fn = JsGenerator::new(func.0, Vec::new());
+                ctx.set_register(dst.0, Value::generator(generator_fn));
+                Ok(InstructionResult::Continue)
+            }
+
             Instruction::Call { dst, func, argc } => {
                 let func_value = ctx.get_register(func.0).clone();
 
@@ -574,6 +597,68 @@ impl Interpreter {
                     // Not a function - return error
                     Err(VmError::type_error("not a constructor"))
                 }
+            }
+
+            Instruction::CallMethod {
+                dst,
+                obj,
+                method,
+                argc,
+            } => {
+                let object = ctx.get_register(obj.0).clone();
+                let method_const = module
+                    .constants
+                    .get(method.0)
+                    .ok_or_else(|| VmError::internal("constant not found"))?;
+                let method_name = method_const
+                    .as_string()
+                    .ok_or_else(|| VmError::internal("expected string constant"))?;
+
+                // Get the method from the object
+                let method_value = if let Some(obj_ref) = object.as_object() {
+                    obj_ref
+                        .get(&PropertyKey::string(method_name))
+                        .unwrap_or_else(Value::undefined)
+                } else {
+                    return Err(VmError::type_error("Cannot read property of non-object"));
+                };
+
+                // Check if it's a native function
+                if let Some(native_fn) = method_value.as_native_function() {
+                    // Collect arguments
+                    let mut args = Vec::with_capacity(*argc as usize);
+                    for i in 0..*argc {
+                        let arg = ctx.get_register(obj.0 + 1 + i).clone();
+                        args.push(arg);
+                    }
+
+                    // Call the native function directly
+                    let result = native_fn(&args).map_err(VmError::type_error)?;
+                    ctx.set_register(dst.0, result);
+                    return Ok(InstructionResult::Continue);
+                }
+
+                // Regular closure call with `this` binding
+                let closure = method_value
+                    .as_function()
+                    .ok_or_else(|| VmError::type_error("not a function"))?;
+
+                // Copy arguments from caller registers
+                let mut args = Vec::with_capacity(*argc as usize);
+                for i in 0..*argc {
+                    let arg = ctx.get_register(obj.0 + 1 + i).clone();
+                    args.push(arg);
+                }
+
+                // Store args and `this` value in context for new frame
+                ctx.set_pending_args(args);
+                ctx.set_pending_this(object);
+
+                Ok(InstructionResult::Call {
+                    func_index: closure.function_index,
+                    argc: *argc,
+                    return_reg: dst.0,
+                })
             }
 
             Instruction::Return { src } => {
@@ -671,6 +756,17 @@ impl Interpreter {
                     ctx.set_register(dst.0, value);
                     Ok(InstructionResult::Continue)
                 }
+            }
+
+            Instruction::Yield { dst, src } => {
+                let value = ctx.get_register(src.0).clone();
+
+                // Yield suspends the generator and returns the value
+                // The dst register will receive the value sent to next() on resumption
+                ctx.set_register(dst.0, Value::undefined()); // Will be set on resume
+
+                // Return a yield result
+                Ok(InstructionResult::Yield { value })
             }
 
             // ==================== Objects ====================
@@ -858,6 +954,72 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
+            // ==================== Iteration ====================
+            Instruction::GetIterator { dst, src } => {
+                use crate::value::HeapRef;
+
+                let obj = ctx.get_register(src.0).clone();
+
+                // Get Symbol.iterator method using well-known symbol ID (1)
+                const SYMBOL_ITERATOR_ID: u64 = 1;
+                let iterator_method = match obj.heap_ref() {
+                    Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
+                        o.get(&PropertyKey::Symbol(SYMBOL_ITERATOR_ID))
+                    }
+                    _ => None,
+                };
+
+                let iterator_fn =
+                    iterator_method.ok_or_else(|| VmError::type_error("Object is not iterable"))?;
+
+                // Call the iterator method with obj as `this`
+                let iterator = if let Some(native_fn) = iterator_fn.as_native_function() {
+                    native_fn(std::slice::from_ref(&obj)).map_err(VmError::type_error)?
+                } else {
+                    return Err(VmError::type_error("Symbol.iterator is not a function"));
+                };
+
+                ctx.set_register(dst.0, iterator);
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::IteratorNext { dst, done, iter } => {
+                let iterator = ctx.get_register(iter.0).clone();
+
+                // Get the next method
+                let next_method = if let Some(obj) = iterator.as_object() {
+                    obj.get(&PropertyKey::string("next"))
+                } else {
+                    None
+                };
+
+                let next_fn = next_method
+                    .ok_or_else(|| VmError::type_error("Iterator has no next method"))?;
+
+                // Call next()
+                let result = if let Some(native_fn) = next_fn.as_native_function() {
+                    native_fn(std::slice::from_ref(&iterator)).map_err(VmError::type_error)?
+                } else {
+                    return Err(VmError::type_error("next is not a function"));
+                };
+
+                // Extract done and value from result object
+                let result_obj = result
+                    .as_object()
+                    .ok_or_else(|| VmError::type_error("Iterator result is not an object"))?;
+
+                let done_value = result_obj
+                    .get(&PropertyKey::string("done"))
+                    .unwrap_or_else(|| Value::boolean(false));
+                let value = result_obj
+                    .get(&PropertyKey::string("value"))
+                    .unwrap_or_else(Value::undefined);
+
+                ctx.set_register(dst.0, value);
+                ctx.set_register(done.0, done_value);
+                Ok(InstructionResult::Continue)
+            }
+
             // Catch-all for unimplemented instructions
             _ => Err(VmError::internal(format!(
                 "Unimplemented instruction: {:?}",
@@ -1009,6 +1171,10 @@ enum InstructionResult {
     Suspend {
         promise: Arc<JsPromise>,
         resume_reg: u8,
+    },
+    /// Yield from generator
+    Yield {
+        value: Value,
     },
 }
 

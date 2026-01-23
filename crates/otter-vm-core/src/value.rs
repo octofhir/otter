@@ -26,8 +26,10 @@
 //! - False:      0x7FF8_0000_0000_0003
 //! ```
 
+use crate::generator::JsGenerator;
 use crate::object::JsObject;
 use crate::promise::JsPromise;
+use crate::proxy::JsProxy;
 use crate::shared_buffer::SharedArrayBuffer;
 use crate::string::JsString;
 use std::sync::Arc;
@@ -82,6 +84,10 @@ pub enum HeapRef {
     BigInt(Arc<BigInt>),
     /// Promise
     Promise(Arc<JsPromise>),
+    /// Proxy object
+    Proxy(Arc<JsProxy>),
+    /// Generator object
+    Generator(Arc<JsGenerator>),
     /// SharedArrayBuffer (can be shared between workers)
     SharedArrayBuffer(Arc<SharedArrayBuffer>),
     /// Native function (implemented in Rust)
@@ -98,6 +104,8 @@ impl std::fmt::Debug for HeapRef {
             HeapRef::Symbol(s) => f.debug_tuple("Symbol").field(s).finish(),
             HeapRef::BigInt(b) => f.debug_tuple("BigInt").field(b).finish(),
             HeapRef::Promise(p) => f.debug_tuple("Promise").field(p).finish(),
+            HeapRef::Proxy(p) => f.debug_tuple("Proxy").field(p).finish(),
+            HeapRef::Generator(g) => f.debug_tuple("Generator").field(g).finish(),
             HeapRef::SharedArrayBuffer(s) => f.debug_tuple("SharedArrayBuffer").field(s).finish(),
             HeapRef::NativeFunction(_) => f.debug_tuple("NativeFunction").finish(),
         }
@@ -236,6 +244,24 @@ impl Value {
         }
     }
 
+    /// Create proxy value
+    pub fn proxy(proxy: Arc<JsProxy>) -> Self {
+        let ptr = Arc::as_ptr(&proxy) as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::Proxy(proxy)),
+        }
+    }
+
+    /// Create generator value
+    pub fn generator(generator: Arc<JsGenerator>) -> Self {
+        let ptr = Arc::as_ptr(&generator) as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::Generator(generator)),
+        }
+    }
+
     /// Create SharedArrayBuffer value
     pub fn shared_array_buffer(sab: Arc<SharedArrayBuffer>) -> Self {
         let ptr = Arc::as_ptr(&sab) as u64;
@@ -261,6 +287,15 @@ impl Value {
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::BigInt(bi)),
+        }
+    }
+
+    /// Create Symbol value
+    pub fn symbol(sym: Arc<Symbol>) -> Self {
+        let ptr = Arc::as_ptr(&sym) as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::Symbol(sym)),
         }
     }
 
@@ -343,6 +378,18 @@ impl Value {
         matches!(&self.heap_ref, Some(HeapRef::Promise(_)))
     }
 
+    /// Check if value is a proxy
+    #[inline]
+    pub fn is_proxy(&self) -> bool {
+        matches!(&self.heap_ref, Some(HeapRef::Proxy(_)))
+    }
+
+    /// Check if value is a generator
+    #[inline]
+    pub fn is_generator(&self) -> bool {
+        matches!(&self.heap_ref, Some(HeapRef::Generator(_)))
+    }
+
     /// Check if value is a SharedArrayBuffer
     #[inline]
     pub fn is_shared_array_buffer(&self) -> bool {
@@ -359,6 +406,12 @@ impl Value {
     #[inline]
     pub fn is_callable(&self) -> bool {
         self.is_function() || self.is_native_function()
+    }
+
+    /// Check if value is a symbol
+    #[inline]
+    pub fn is_symbol(&self) -> bool {
+        matches!(&self.heap_ref, Some(HeapRef::Symbol(_)))
     }
 
     /// Check if this is a NaN-boxed value (vs regular double)
@@ -415,6 +468,14 @@ impl Value {
         }
     }
 
+    /// Get as array object
+    pub fn as_array(&self) -> Option<&Arc<JsObject>> {
+        match &self.heap_ref {
+            Some(HeapRef::Array(a)) => Some(a),
+            _ => None,
+        }
+    }
+
     /// Get as function closure
     pub fn as_function(&self) -> Option<&Arc<Closure>> {
         match &self.heap_ref {
@@ -439,10 +500,34 @@ impl Value {
         }
     }
 
+    /// Get as proxy
+    pub fn as_proxy(&self) -> Option<&Arc<JsProxy>> {
+        match &self.heap_ref {
+            Some(HeapRef::Proxy(p)) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Get as generator
+    pub fn as_generator(&self) -> Option<&Arc<JsGenerator>> {
+        match &self.heap_ref {
+            Some(HeapRef::Generator(g)) => Some(g),
+            _ => None,
+        }
+    }
+
     /// Get as SharedArrayBuffer
     pub fn as_shared_array_buffer(&self) -> Option<&Arc<SharedArrayBuffer>> {
         match &self.heap_ref {
             Some(HeapRef::SharedArrayBuffer(sab)) => Some(sab),
+            _ => None,
+        }
+    }
+
+    /// Get as symbol
+    pub fn as_symbol(&self) -> Option<&Arc<Symbol>> {
+        match &self.heap_ref {
+            Some(HeapRef::Symbol(s)) => Some(s),
             _ => None,
         }
     }
@@ -492,6 +577,8 @@ impl Value {
                     HeapRef::Object(_)
                     | HeapRef::Array(_)
                     | HeapRef::Promise(_)
+                    | HeapRef::Proxy(_)
+                    | HeapRef::Generator(_)
                     | HeapRef::SharedArrayBuffer(_),
                 ) => "object",
                 None => "undefined", // Should not happen
@@ -522,6 +609,8 @@ impl std::fmt::Debug for Value {
                 Some(HeapRef::Function(_)) => write!(f, "[Function]"),
                 Some(HeapRef::NativeFunction(_)) => write!(f, "[NativeFunction]"),
                 Some(HeapRef::Promise(p)) => write!(f, "{:?}", p),
+                Some(HeapRef::Proxy(p)) => write!(f, "{:?}", p),
+                Some(HeapRef::Generator(g)) => write!(f, "{:?}", g),
                 Some(HeapRef::Symbol(s)) => {
                     if let Some(desc) = &s.description {
                         write!(f, "Symbol({})", desc)

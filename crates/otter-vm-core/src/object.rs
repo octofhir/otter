@@ -147,8 +147,8 @@ impl PropertyDescriptor {
 pub struct JsObject {
     /// Properties storage
     properties: RwLock<FxHashMap<PropertyKey, PropertyDescriptor>>,
-    /// Prototype (null for Object.prototype)
-    prototype: Option<Arc<JsObject>>,
+    /// Prototype (null for Object.prototype, mutable via Reflect.setPrototypeOf)
+    prototype: RwLock<Option<Arc<JsObject>>>,
     /// Array elements (for array-like objects)
     elements: RwLock<Vec<Value>>,
     /// Object flags (mutable for freeze/seal/preventExtensions)
@@ -173,7 +173,7 @@ impl JsObject {
     pub fn new(prototype: Option<Arc<JsObject>>) -> Self {
         Self {
             properties: RwLock::new(FxHashMap::default()),
-            prototype,
+            prototype: RwLock::new(prototype),
             elements: RwLock::new(Vec::new()),
             flags: RwLock::new(ObjectFlags {
                 extensible: true,
@@ -193,12 +193,11 @@ impl JsObject {
     /// Get property by key
     pub fn get(&self, key: &PropertyKey) -> Option<Value> {
         // Special handling for array "length" property
-        if self.is_array() {
-            if let PropertyKey::String(s) = key {
-                if s.as_str() == "length" {
-                    return Some(Value::int32(self.elements.read().len() as i32));
-                }
-            }
+        if self.is_array()
+            && let PropertyKey::String(s) = key
+            && s.as_str() == "length"
+        {
+            return Some(Value::int32(self.elements.read().len() as i32));
         }
 
         // Check own properties first
@@ -215,7 +214,7 @@ impl JsObject {
         }
 
         // Check prototype chain
-        if let Some(proto) = &self.prototype {
+        if let Some(proto) = self.prototype.read().as_ref() {
             return proto.get(key);
         }
 
@@ -318,7 +317,7 @@ impl JsObject {
             return true;
         }
 
-        if let Some(proto) = &self.prototype {
+        if let Some(proto) = self.prototype.read().as_ref() {
             return proto.has(key);
         }
 
@@ -362,8 +361,18 @@ impl JsObject {
     }
 
     /// Get prototype
-    pub fn prototype(&self) -> Option<&Arc<JsObject>> {
-        self.prototype.as_ref()
+    pub fn prototype(&self) -> Option<Arc<JsObject>> {
+        self.prototype.read().clone()
+    }
+
+    /// Set prototype
+    /// Returns false if object is not extensible
+    pub fn set_prototype(&self, prototype: Option<Arc<JsObject>>) -> bool {
+        if !self.flags.read().extensible {
+            return false;
+        }
+        *self.prototype.write() = prototype;
+        true
     }
 
     /// Check if object is an array

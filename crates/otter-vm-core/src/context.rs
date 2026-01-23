@@ -30,6 +30,8 @@ pub struct CallFrame {
     pub return_register: Option<u8>,
     /// Source location for error reporting
     pub source_location: Option<SourceLocation>,
+    /// The `this` value for this call frame
+    pub this_value: Value,
 }
 
 /// Source location for error reporting
@@ -61,6 +63,8 @@ pub struct VmContext {
     running: bool,
     /// Pending arguments for next call
     pending_args: Vec<Value>,
+    /// Pending `this` value for next call
+    pending_this: Option<Value>,
 }
 
 impl VmContext {
@@ -73,6 +77,7 @@ impl VmContext {
             exception: None,
             running: false,
             pending_args: Vec::new(),
+            pending_this: None,
         }
     }
 
@@ -168,6 +173,9 @@ impl VmContext {
             }
         }
 
+        // Take pending this value (defaults to undefined)
+        let this_value = self.take_pending_this();
+
         self.call_stack.push(CallFrame {
             function_index,
             pc: 0,
@@ -175,6 +183,7 @@ impl VmContext {
             locals,
             return_register,
             source_location: None,
+            this_value,
         });
 
         Ok(())
@@ -255,6 +264,23 @@ impl VmContext {
     /// Take pending arguments (transfers ownership)
     pub fn take_pending_args(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.pending_args)
+    }
+
+    /// Set pending `this` value for next function call
+    pub fn set_pending_this(&mut self, this_value: Value) {
+        self.pending_this = Some(this_value);
+    }
+
+    /// Take pending `this` value (defaults to undefined)
+    pub fn take_pending_this(&mut self) -> Value {
+        self.pending_this.take().unwrap_or_else(Value::undefined)
+    }
+
+    /// Get the `this` value of the current call frame
+    pub fn this_value(&self) -> Value {
+        self.current_frame()
+            .map(|f| f.this_value.clone())
+            .unwrap_or_else(Value::undefined)
     }
 
     /// Check if context is running

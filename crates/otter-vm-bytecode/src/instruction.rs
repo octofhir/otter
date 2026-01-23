@@ -40,6 +40,8 @@ pub enum Opcode {
     GetGlobal = 0x14,
     /// Store global variable: globals\[name\] = src
     SetGlobal = 0x15,
+    /// Load `this` value: dst = this
+    LoadThis = 0x16,
 
     // ==================== Arithmetic ====================
     /// Addition: dst = lhs + rhs
@@ -239,6 +241,7 @@ impl Opcode {
             0x13 => Some(Self::SetUpvalue),
             0x14 => Some(Self::GetGlobal),
             0x15 => Some(Self::SetGlobal),
+            0x16 => Some(Self::LoadThis),
 
             0x20 => Some(Self::Add),
             0x21 => Some(Self::Sub),
@@ -357,6 +360,7 @@ impl Opcode {
             Self::SetUpvalue => "SetUpvalue",
             Self::GetGlobal => "GetGlobal",
             Self::SetGlobal => "SetGlobal",
+            Self::LoadThis => "LoadThis",
             // Arithmetic
             Self::Add => "Add",
             Self::Sub => "Sub",
@@ -504,6 +508,10 @@ pub enum Instruction {
     SetGlobal {
         name: ConstantIndex,
         src: Register,
+    },
+    /// Load `this` value into register
+    LoadThis {
+        dst: Register,
     },
 
     // Arithmetic

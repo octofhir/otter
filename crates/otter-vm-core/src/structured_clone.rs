@@ -103,6 +103,10 @@ impl StructuredCloner {
 
             Some(HeapRef::Promise(_)) => Err(StructuredCloneError::NotCloneable("promise")),
 
+            Some(HeapRef::Proxy(_)) => Err(StructuredCloneError::NotCloneable("proxy")),
+
+            Some(HeapRef::Generator(_)) => Err(StructuredCloneError::NotCloneable("generator")),
+
             None => Ok(Value::undefined()),
         }
     }

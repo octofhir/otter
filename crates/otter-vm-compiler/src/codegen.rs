@@ -1,8 +1,9 @@
 //! Bytecode generation from AST
 
 use otter_vm_bytecode::{
-    function::{FunctionBuilder, FunctionFlags},
     ConstantIndex, ConstantPool, Function, Instruction, JumpOffset, Module, Register,
+    function::{FunctionBuilder, FunctionFlags},
+    module::{ExportRecord, ImportRecord},
 };
 
 use crate::error::{CompileError, CompileResult};
@@ -137,6 +138,12 @@ pub struct CodeGen {
     pub current: FunctionContext,
     /// Function context stack (for nested functions)
     func_stack: Vec<FunctionContext>,
+    /// Import records collected during compilation
+    imports: Vec<ImportRecord>,
+    /// Export records collected during compilation
+    exports: Vec<ExportRecord>,
+    /// Whether this is an ES module
+    is_esm: bool,
 }
 
 impl CodeGen {
@@ -147,6 +154,9 @@ impl CodeGen {
             functions: Vec::new(),
             current: FunctionContext::new(Some("main".to_string())),
             func_stack: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            is_esm: false,
         }
     }
 
@@ -247,16 +257,61 @@ impl CodeGen {
         idx
     }
 
+    /// Add an import record
+    pub fn add_import(&mut self, record: ImportRecord) {
+        self.imports.push(record);
+        self.is_esm = true;
+    }
+
+    /// Add an export record
+    pub fn add_export(&mut self, record: ExportRecord) {
+        self.exports.push(record);
+        self.is_esm = true;
+    }
+
+    /// Set whether this is an ES module
+    pub fn set_esm(&mut self, is_esm: bool) {
+        self.is_esm = is_esm;
+    }
+
+    /// Get current imports
+    pub fn imports(&self) -> &[ImportRecord] {
+        &self.imports
+    }
+
+    /// Get current exports
+    pub fn exports(&self) -> &[ExportRecord] {
+        &self.exports
+    }
+
+    /// Check if this is an ES module
+    pub fn is_esm(&self) -> bool {
+        self.is_esm
+    }
+
     /// Finalize compilation
     pub fn finish(mut self, source_url: &str) -> Module {
-        // Add main function
+        // Add main function at the end (don't shift child function indices!)
         let main = self.current.build();
-        self.functions.insert(0, main);
+        let entry_point = self.functions.len() as u32;
+        self.functions.push(main);
 
-        Module::builder(source_url)
+        let mut builder = Module::builder(source_url)
             .constants(self.constants)
-            .entry_point(0)
-            .build_with_functions(self.functions)
+            .entry_point(entry_point)
+            .is_esm(self.is_esm);
+
+        // Add imports
+        for import in self.imports {
+            builder = builder.import(import);
+        }
+
+        // Add exports
+        for export in self.exports {
+            builder = builder.export(export);
+        }
+
+        builder.build_with_functions(self.functions)
     }
 }
 

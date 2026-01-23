@@ -148,6 +148,8 @@ pub enum Opcode {
     Return = 0x85,
     /// Return undefined from function
     ReturnUndefined = 0x86,
+    /// Call with spread arguments: dst = func(...spread_arr)
+    CallSpread = 0x87,
 
     // ==================== Control Flow ====================
     /// Unconditional jump
@@ -291,6 +293,7 @@ impl Opcode {
             0x84 => Some(Self::Construct),
             0x85 => Some(Self::Return),
             0x86 => Some(Self::ReturnUndefined),
+            0x87 => Some(Self::CallSpread),
 
             0x90 => Some(Self::Jump),
             0x91 => Some(Self::JumpIfTrue),
@@ -408,6 +411,7 @@ impl Opcode {
             Self::Construct => "Construct",
             Self::Return => "Return",
             Self::ReturnUndefined => "ReturnUndefined",
+            Self::CallSpread => "CallSpread",
             // Control flow
             Self::Jump => "Jump",
             Self::JumpIfTrue => "JumpIfTrue",
@@ -730,6 +734,15 @@ pub enum Instruction {
         src: Register,
     },
     ReturnUndefined,
+    /// Call function with spread: dst = func(args..., ...spread_arr)
+    CallSpread {
+        dst: Register,
+        func: Register,
+        /// Number of regular (non-spread) arguments
+        argc: u8,
+        /// Register containing the array to spread
+        spread: Register,
+    },
 
     // Control flow
     Jump {

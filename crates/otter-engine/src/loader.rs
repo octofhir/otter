@@ -5,8 +5,8 @@
 //! - `node:` URLs for Node.js built-in modules
 //! - `https://` URLs for remote modules (with allowlist-based security)
 
-use otter_runtime::normalize_node_builtin;
-use otter_runtime::{JscError, JscResult};
+use crate::error::{EngineError, EngineResult};
+use crate::node_builtins::normalize_node_builtin;
 use oxc_resolver::{ResolveOptions, Resolver};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -173,7 +173,11 @@ impl ModuleLoader {
     }
 
     /// Resolve and load a module (uses ESM conditions by default)
-    pub async fn load(&self, specifier: &str, referrer: Option<&str>) -> JscResult<ResolvedModule> {
+    pub async fn load(
+        &self,
+        specifier: &str,
+        referrer: Option<&str>,
+    ) -> EngineResult<ResolvedModule> {
         self.load_with_context(specifier, referrer, ImportContext::ESM)
             .await
     }
@@ -184,7 +188,7 @@ impl ModuleLoader {
         specifier: &str,
         referrer: Option<&str>,
         context: ImportContext,
-    ) -> JscResult<ResolvedModule> {
+    ) -> EngineResult<ResolvedModule> {
         // Check cache first (include context in key for different resolutions)
         let context_str = match context {
             ImportContext::ESM => "esm",
@@ -214,12 +218,12 @@ impl ModuleLoader {
     }
 
     /// Resolve a module specifier to a URL or file path (uses ESM conditions by default)
-    pub fn resolve(&self, specifier: &str, referrer: Option<&str>) -> JscResult<String> {
+    pub fn resolve(&self, specifier: &str, referrer: Option<&str>) -> EngineResult<String> {
         self.resolve_with_context(specifier, referrer, ImportContext::ESM)
     }
 
     /// Resolve a module specifier for a require() call (uses CJS conditions)
-    pub fn resolve_require(&self, specifier: &str, referrer: Option<&str>) -> JscResult<String> {
+    pub fn resolve_require(&self, specifier: &str, referrer: Option<&str>) -> EngineResult<String> {
         self.resolve_with_context(specifier, referrer, ImportContext::CJS)
     }
 
@@ -233,7 +237,7 @@ impl ModuleLoader {
         specifier: &str,
         referrer: Option<&str>,
         context: ImportContext,
-    ) -> JscResult<String> {
+    ) -> EngineResult<String> {
         // Check import map first
         if let Some(mapped) = self.config.import_map.get(specifier) {
             return self.resolve_with_context(mapped, referrer, context);
@@ -250,7 +254,7 @@ impl ModuleLoader {
         // Node.js built-in modules
         if specifier.starts_with("node:") {
             let Some(name) = normalize_node_builtin(specifier) else {
-                return Err(JscError::ModuleError(format!(
+                return Err(EngineError::ModuleError(format!(
                     "Unsupported Node.js builtin module '{}'.\n\
 Only known node:* builtins are allowed for compatibility.\n\
 If you meant to import an npm package, remove the 'node:' prefix.",
@@ -292,7 +296,7 @@ If you meant to import an npm package, remove the 'node:' prefix.",
                 let path = resolution.full_path();
                 Ok(format!("file://{}", path.display()))
             }
-            Err(e) => Err(JscError::ModuleError(format!(
+            Err(e) => Err(EngineError::ModuleError(format!(
                 "Cannot resolve '{}' from '{}': {}",
                 specifier,
                 base_dir.display(),
@@ -302,21 +306,21 @@ If you meant to import an npm package, remove the 'node:' prefix.",
     }
 
     /// Validate remote URL against allowlist
-    fn validate_remote_url(&self, url: &str) -> JscResult<String> {
+    fn validate_remote_url(&self, url: &str) -> EngineResult<String> {
         for pattern in &self.config.remote_allowlist {
             if glob_match(pattern, url) {
                 return Ok(url.to_string());
             }
         }
 
-        Err(JscError::ModuleError(format!(
+        Err(EngineError::ModuleError(format!(
             "Remote module '{}' not in allowlist. Add to remote_allowlist in config.",
             url
         )))
     }
 
     /// Load module from URL
-    async fn load_url(&self, url: &str) -> JscResult<ResolvedModule> {
+    async fn load_url(&self, url: &str) -> EngineResult<ResolvedModule> {
         // Otter built-in modules (e.g., "otter")
         if let Some(builtin) = url.strip_prefix("otter:") {
             return self.load_otter_builtin(builtin);
@@ -334,18 +338,18 @@ If you meant to import an npm package, remove the 'node:' prefix.",
             return self.load_remote(url).await;
         }
 
-        Err(JscError::ModuleError(format!(
+        Err(EngineError::ModuleError(format!(
             "Unsupported URL scheme: {}",
             url
         )))
     }
 
     /// Load a local file
-    async fn load_file(&self, path: &str) -> JscResult<ResolvedModule> {
+    async fn load_file(&self, path: &str) -> EngineResult<ResolvedModule> {
         let path = PathBuf::from(path);
 
         let source = tokio::fs::read_to_string(&path).await.map_err(|e| {
-            JscError::ModuleError(format!("Failed to read '{}': {}", path.display(), e))
+            EngineError::ModuleError(format!("Failed to read '{}': {}", path.display(), e))
         })?;
 
         // Strip shebang if present (e.g., #!/usr/bin/env node)
@@ -364,13 +368,13 @@ If you meant to import an npm package, remove the 'node:' prefix.",
     }
 
     /// Load a remote module
-    async fn load_remote(&self, url: &str) -> JscResult<ResolvedModule> {
+    async fn load_remote(&self, url: &str) -> EngineResult<ResolvedModule> {
         // Check disk cache first
         let cache_path = self.get_cache_path(url);
         if cache_path.exists() {
             let source = tokio::fs::read_to_string(&cache_path)
                 .await
-                .map_err(|e| JscError::ModuleError(format!("Failed to read cache: {}", e)))?;
+                .map_err(|e| EngineError::ModuleError(format!("Failed to read cache: {}", e)))?;
 
             return Ok(ResolvedModule {
                 specifier: url.to_string(),
@@ -384,10 +388,10 @@ If you meant to import an npm package, remove the 'node:' prefix.",
         // Fetch from network
         let response = reqwest::get(url)
             .await
-            .map_err(|e| JscError::ModuleError(format!("Failed to fetch '{}': {}", url, e)))?;
+            .map_err(|e| EngineError::ModuleError(format!("Failed to fetch '{}': {}", url, e)))?;
 
         if !response.status().is_success() {
-            return Err(JscError::ModuleError(format!(
+            return Err(EngineError::ModuleError(format!(
                 "Failed to fetch '{}': HTTP {}",
                 url,
                 response.status()
@@ -397,7 +401,7 @@ If you meant to import an npm package, remove the 'node:' prefix.",
         let source = response
             .text()
             .await
-            .map_err(|e| JscError::ModuleError(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| EngineError::ModuleError(format!("Failed to read response: {}", e)))?;
 
         // Cache to disk
         if let Some(parent) = cache_path.parent() {
@@ -415,7 +419,7 @@ If you meant to import an npm package, remove the 'node:' prefix.",
     }
 
     /// Load a Node.js built-in module
-    fn load_node_builtin(&self, name: &str) -> JscResult<ResolvedModule> {
+    fn load_node_builtin(&self, name: &str) -> EngineResult<ResolvedModule> {
         Ok(ResolvedModule {
             specifier: format!("node:{}", name),
             url: format!("node:{}", name),
@@ -426,7 +430,7 @@ If you meant to import an npm package, remove the 'node:' prefix.",
     }
 
     /// Load an Otter built-in module (e.g., "otter")
-    fn load_otter_builtin(&self, name: &str) -> JscResult<ResolvedModule> {
+    fn load_otter_builtin(&self, name: &str) -> EngineResult<ResolvedModule> {
         Ok(ResolvedModule {
             specifier: format!("otter:{}", name),
             url: format!("otter:{}", name),

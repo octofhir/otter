@@ -25,12 +25,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache bun-webkit
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/cache/bun-webkit
-          key: bun-webkit-linux-amd64-${{ hashFiles('crates/otter-jsc-sys/build.rs') }}
-
       - name: Run release-plz
         id: release
         uses: release-plz/action@v0.5
@@ -70,13 +64,6 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Cache bun-webkit
-        if: runner.os != 'macOS'
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/cache/bun-webkit
-          key: bun-webkit-${{ runner.os }}-${{ hashFiles('crates/otter-jsc-sys/build.rs') }}
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p otterjs

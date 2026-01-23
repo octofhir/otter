@@ -55,6 +55,17 @@ impl GcHeader {
     }
 }
 
+impl Clone for GcHeader {
+    fn clone(&self) -> Self {
+        // Cloned header starts with White mark (fresh GC state)
+        Self {
+            mark: AtomicU8::new(MarkColor::White as u8),
+            tag: self.tag,
+            _reserved: [0; 6],
+        }
+    }
+}
+
 /// Trait for GC-managed objects
 pub trait GcObject {
     /// Get the GC header

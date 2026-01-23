@@ -1,45 +1,40 @@
 //! Otter CLI - A fast TypeScript/JavaScript runtime.
 //!
-//! This binary serves dual purposes:
-//! 1. Normal CLI mode - parse commands and execute scripts
-//! 2. Standalone executable mode - when embedded code is detected, run it directly
+//! VM-based JavaScript execution with pluggable builtins.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use otter_node::ext;
-use otter_runtime::{ConsoleLevel, JscConfig, JscRuntime, set_console_handler};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
 use tracing_subscriber::filter::EnvFilter;
 
-mod embedded;
+use otter_vm_builtins::create_builtins_extension;
+use otter_vm_compiler::Compiler;
+use otter_vm_core::object::{JsObject, PropertyKey};
+use otter_vm_core::runtime::VmRuntime;
+use otter_vm_core::value::Value;
+use otter_vm_runtime::{ExtensionRegistry, OpHandler};
 
-mod commands;
 mod config;
-mod watch;
 
 #[derive(Parser)]
 #[command(
     name = "otter",
     version,
     about = "A fast TypeScript/JavaScript runtime",
-    long_about = "Otter is a secure, fast TypeScript/JavaScript runtime built on JavaScriptCore.\n\n\
-                  Run a script:  otter run script.ts\n\
-                  Or directly:   otter script.ts\n\
-                  Or eval code:  otter -e 'console.log(1+1)'",
-    args_conflicts_with_subcommands = true
+    long_about = "Otter is a secure, fast TypeScript/JavaScript runtime powered by a custom VM."
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
+    /// Script file to run (shorthand for `otter run <file>`)
+    #[arg(value_name = "FILE")]
+    file: Option<PathBuf>,
+
     /// Evaluate argument as a script
     #[arg(short = 'e', long = "eval")]
     eval: Option<String>,
-
-    /// Evaluate and print the result
-    #[arg(short = 'p', long = "print")]
-    print: Option<String>,
 
     /// Verbose output
     #[arg(short, long, global = true)]
@@ -50,266 +45,353 @@ struct Cli {
     config: Option<PathBuf>,
 }
 
-/// Alternative CLI for direct file execution: otter file.ts [args...]
-#[derive(Parser)]
-#[command(name = "otter")]
-struct DirectRun {
-    /// File to execute or script name
-    file: String,
-
-    /// Arguments to pass to script
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    args: Vec<String>,
-
-    /// Config file path
-    #[arg(long)]
-    config: Option<PathBuf>,
-
-    /// Allow file system read access
-    #[arg(long = "allow-read", value_name = "PATH", num_args = 0..)]
-    allow_read: Option<Vec<String>>,
-
-    /// Allow file system write access
-    #[arg(long = "allow-write", value_name = "PATH", num_args = 0..)]
-    allow_write: Option<Vec<String>>,
-
-    /// Allow network access
-    #[arg(long = "allow-net", value_name = "HOST", num_args = 0..)]
-    allow_net: Option<Vec<String>>,
-
-    /// Allow environment variable access
-    #[arg(long = "allow-env", value_name = "VAR", num_args = 0..)]
-    allow_env: Option<Vec<String>>,
-
-    /// Allow subprocess execution
-    #[arg(long = "allow-run")]
-    allow_run: bool,
-
-    /// Allow all permissions
-    #[arg(long = "allow-all", short = 'A')]
-    allow_all: bool,
-
-    /// Script execution timeout in milliseconds
-    #[arg(long, default_value = "30000")]
-    timeout: u64,
-}
-
 #[derive(Subcommand)]
 enum Commands {
-    /// Run a JavaScript/TypeScript file or package.json script
-    Run(commands::run::RunCommand),
-
-    /// Bundle and compile JavaScript/TypeScript
-    Build(commands::build::BuildCommand),
-
-    /// Execute a package binary (npx-like)
-    #[command(name = "x")]
-    Exec(commands::exec::ExecCommand),
-
-    /// Type check TypeScript files
-    Check(commands::check::CheckCommand),
-
-    /// Run tests
-    Test(commands::test::TestCommand),
-
-    /// Start interactive REPL
-    Repl(commands::repl::ReplCommand),
-
-    /// Install dependencies from package.json
-    Install(commands::install::InstallCommand),
-
-    /// Add a dependency
-    Add(commands::add::AddCommand),
-
-    /// Remove a dependency
-    Remove(commands::remove::RemoveCommand),
-
-    /// Initialize a new project
-    Init(commands::init::InitCommand),
-
+    /// Run a JavaScript/TypeScript file
+    Run {
+        /// The script file to run
+        file: PathBuf,
+    },
     /// Show runtime information
-    Info(commands::info::InfoCommand),
+    Info,
+    /// Initialize a new project
+    Init,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Set up console handler
-    set_console_handler(|level, message| match level {
-        ConsoleLevel::Warn | ConsoleLevel::Error => eprintln!("{}", message),
-        _ => println!("{}", message),
-    });
-
-    // Check if we have embedded code FIRST (standalone executable mode)
-    // This must happen before any CLI parsing to support compiled executables
-    if let Some(code) = embedded::load_embedded_code()? {
-        return embedded::run_embedded(code).await;
-    }
-
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("warn".parse()?))
         .init();
 
-    // First try parsing as main CLI with subcommands
-    let args: Vec<String> = std::env::args().collect();
-
-    // Check if first non-flag arg looks like a file path (not a subcommand)
-    let maybe_file = args.get(1).map(|s| s.as_str());
-    let is_direct_run = match maybe_file {
-        Some(arg) if !arg.starts_with('-') => {
-            // Not a flag - check if it's a known subcommand
-            !matches!(
-                arg,
-                "run"
-                    | "build"
-                    | "x"
-                    | "check"
-                    | "test"
-                    | "repl"
-                    | "install"
-                    | "add"
-                    | "remove"
-                    | "init"
-                    | "info"
-                    | "help"
-            )
-        }
-        _ => false,
-    };
-
-    if is_direct_run {
-        // Direct file execution: otter file.ts [args...]
-        let direct = DirectRun::parse();
-        let config = config::load_config(direct.config.as_deref())?;
-
-        let run_cmd = commands::run::RunCommand {
-            entry: Some(direct.file),
-            args: direct.args,
-            allow_read: direct.allow_read,
-            allow_write: direct.allow_write,
-            allow_net: direct.allow_net,
-            allow_env: direct.allow_env,
-            env_files: vec![],
-            env_vars: vec![],
-            allow_run: direct.allow_run,
-            allow_all: direct.allow_all,
-            check: false,
-            timeout: direct.timeout,
-            watch: false,
-            file: false,
-        };
-        return run_cmd.run(&config).await;
-    }
-
-    // Standard subcommand parsing
     let cli = Cli::parse();
-    let config = config::load_config(cli.config.as_deref())?;
 
-    // Handle --eval / -e flag
+    // Handle --eval flag
     if let Some(code) = cli.eval {
-        return run_eval(&code, false).await;
+        return run_code(&code, "<eval>");
     }
 
-    // Handle --print / -p flag
-    if let Some(code) = cli.print {
-        return run_eval(&code, true).await;
+    // Handle direct file argument (otter script.js)
+    if let Some(file) = cli.file {
+        return run_file(&file);
     }
 
     match cli.command {
-        Some(Commands::Run(cmd)) => cmd.run(&config).await,
-        Some(Commands::Build(cmd)) => cmd.run(&config).await,
-        Some(Commands::Exec(cmd)) => cmd.run().await,
-        Some(Commands::Check(cmd)) => cmd.run(&config).await,
-        Some(Commands::Test(cmd)) => cmd.run(&config).await,
-        Some(Commands::Repl(cmd)) => cmd.run(&config).await,
-        Some(Commands::Install(cmd)) => cmd.run().await,
-        Some(Commands::Add(cmd)) => cmd.run().await,
-        Some(Commands::Remove(cmd)) => cmd.run().await,
-        Some(Commands::Init(cmd)) => cmd.run().await,
-        Some(Commands::Info(cmd)) => cmd.run(),
+        Some(Commands::Run { file }) => run_file(&file),
+        Some(Commands::Info) => {
+            println!("Otter Runtime");
+            println!("Version: {}", env!("CARGO_PKG_VERSION"));
+            println!("VM: otter-vm-core");
+            println!("Platform: {}", std::env::consts::OS);
+            println!("Arch: {}", std::env::consts::ARCH);
+            Ok(())
+        }
+        Some(Commands::Init) => {
+            init_project()?;
+            Ok(())
+        }
         None => {
-            // No command - show help and available scripts
-            show_help_with_scripts()
+            use clap::CommandFactory;
+            Cli::command().print_help()?;
+            println!();
+            Ok(())
         }
     }
 }
 
-/// Show help with available scripts from package.json
-fn show_help_with_scripts() -> Result<()> {
-    use clap::CommandFactory;
-    use otter_pm::ScriptRunner;
+/// Run a JavaScript file
+fn run_file(path: &PathBuf) -> Result<()> {
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read file: {}", path.display()))?;
 
-    Cli::command().print_help()?;
-    println!();
+    let source_url = path.to_string_lossy();
+    run_code(&source, &source_url)
+}
 
-    // Show available scripts if in a project
-    let cwd = std::env::current_dir()?;
-    if let Some(runner) = ScriptRunner::try_new(&cwd) {
-        let scripts = runner.list();
-        if !scripts.is_empty() {
-            println!("\nAvailable scripts (from package.json):");
-            for (name, cmd) in scripts.iter().take(5) {
-                let truncated = if cmd.len() > 40 {
-                    format!("{}...", &cmd[..37])
-                } else {
-                    cmd.to_string()
-                };
-                println!("  {} → {}", name, truncated);
-            }
-            if scripts.len() > 5 {
-                println!("  ... and {} more", scripts.len() - 5);
-            }
-            println!("\nRun 'otter run <script>' or 'otter <file.ts>'");
-        }
+/// Run JavaScript code
+fn run_code(source: &str, source_url: &str) -> Result<()> {
+    // Create extension registry with builtins
+    let mut registry = ExtensionRegistry::new();
+    let builtins = create_builtins_extension();
+    registry
+        .register(builtins)
+        .map_err(|e| anyhow::anyhow!("Failed to register builtins: {}", e))?;
+
+    // Create the VM runtime
+    let runtime = VmRuntime::new();
+
+    // Create a context with builtins set up
+    let mut ctx = runtime.create_context();
+
+    // Wire up extension ops as global native functions
+    setup_extension_globals(&mut ctx, &registry);
+
+    // Run extension JS setup code (this creates Object, console, etc.)
+    run_extension_js(&registry, &runtime, &mut ctx)?;
+
+    // Compile user code
+    let compiler = Compiler::new();
+    let module = compiler
+        .compile(source, source_url)
+        .map_err(|e| anyhow::anyhow!("Compilation error: {:?}", e))?;
+
+    // Execute the module
+    let result = runtime
+        .execute_module_with_context(&module, &mut ctx)
+        .map_err(|e| anyhow::anyhow!("Runtime error: {:?}", e))?;
+
+    // Print result if it's not undefined
+    if !result.is_undefined() {
+        println!("{}", format_value(&result));
     }
 
     Ok(())
 }
 
-/// Run code from --eval / -e or --print / -p flag
-async fn run_eval(code: &str, print_result: bool) -> Result<()> {
-    let runtime = JscRuntime::new(JscConfig::default())?;
+/// Set up extension ops as global functions
+fn setup_extension_globals(ctx: &mut otter_vm_core::context::VmContext, registry: &ExtensionRegistry) {
+    for op_name in registry.op_names() {
+        if let Some(handler) = registry.get_op(op_name) {
+            let handler = handler.clone();
+            let native_fn = move |args: &[Value]| -> Result<Value, String> {
+                match &handler {
+                    OpHandler::Native(f) => f(args),
+                    OpHandler::Sync(f) => {
+                        // Convert VmValue to JsonValue
+                        let json_args: Vec<serde_json::Value> =
+                            args.iter().map(|v| vm_value_to_json(v)).collect();
 
-    // Register essential extensions for eval mode
-    runtime.register_extension(ext::url())?;
-    runtime.register_extension(ext::buffer())?;
-    runtime.register_extension(ext::events())?;
-    runtime.register_extension(ext::util())?;
-    runtime.register_extension(ext::process())?;
-    runtime.register_extension(ext::string_decoder())?;
-    runtime.register_extension(ext::readline())?;
+                        // Call the handler
+                        let result = f(&json_args)?;
 
-    // Set up minimal process object for eval mode
-    let process_setup = r#"
-(function() {
-    globalThis.process = globalThis.process || {};
-    process.env = process.env || {};
-    process.argv = ['otter', '-e'];
-    process.cwd = () => '.';
-    process.platform = 'darwin';
-    process.arch = 'arm64';
-    process.version = 'v1.0.0';
-    process.exit = (code) => { throw new Error('process.exit() called with code ' + code); };
-    process.stdout = { write: (s) => { console.log(s); return true; }, isTTY: false };
-    process.stderr = { write: (s) => { console.error(s); return true; }, isTTY: false };
-    process.stdin = { isTTY: false };
-})();
+                        // Convert JsonValue back to VmValue
+                        Ok(json_to_vm_value(&result))
+                    }
+                    OpHandler::Async(_) => {
+                        // Async ops not yet supported in sync context
+                        Err("Async operations not supported in sync context".to_string())
+                    }
+                }
+            };
+            ctx.set_global(op_name, Value::native_function(native_fn));
+        }
+    }
+}
+
+/// Run extension JS setup code
+fn run_extension_js(
+    registry: &ExtensionRegistry,
+    runtime: &VmRuntime,
+    ctx: &mut otter_vm_core::context::VmContext,
+) -> Result<()> {
+    for js_code in registry.all_js() {
+        let compiler = Compiler::new();
+        match compiler.compile(js_code, "<builtin>") {
+            Ok(module) => {
+                runtime
+                    .execute_module_with_context(&module, ctx)
+                    .map_err(|e| anyhow::anyhow!("Failed to execute builtin JS: {:?}", e))?;
+            }
+            Err(e) => {
+                // Log warning but continue - builtins may use unsupported features
+                tracing::warn!("Could not compile builtin JS (some features may be unavailable): {:?}", e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Convert VM Value to JSON Value
+fn vm_value_to_json(value: &Value) -> serde_json::Value {
+    use serde_json::json;
+
+    if value.is_undefined() {
+        return json!(null);
+    }
+
+    if value.is_null() {
+        return json!(null);
+    }
+
+    if let Some(b) = value.as_boolean() {
+        return json!(b);
+    }
+
+    if let Some(n) = value.as_number() {
+        if n.is_nan() || n.is_infinite() {
+            return json!(null);
+        }
+        return json!(n);
+    }
+
+    if let Some(s) = value.as_string() {
+        return json!(s.as_str());
+    }
+
+    if let Some(obj) = value.as_object() {
+        // Check if array
+        if obj.is_array() {
+            let len = obj
+                .get(&PropertyKey::string("length"))
+                .and_then(|v| v.as_int32())
+                .unwrap_or(0) as usize;
+
+            let mut arr = Vec::with_capacity(len);
+            for i in 0..len {
+                if let Some(elem) = obj.get(&PropertyKey::Index(i as u32)) {
+                    arr.push(vm_value_to_json(&elem));
+                } else {
+                    arr.push(json!(null));
+                }
+            }
+            return serde_json::Value::Array(arr);
+        }
+
+        // Regular object
+        let mut map = serde_json::Map::new();
+        for key in obj.own_keys() {
+            if let Some(val) = obj.get(&key) {
+                let key_str = match key {
+                    PropertyKey::String(s) => s.as_str().to_string(),
+                    PropertyKey::Index(i) => i.to_string(),
+                    PropertyKey::Symbol(_) => continue,
+                };
+                map.insert(key_str, vm_value_to_json(&val));
+            }
+        }
+        return serde_json::Value::Object(map);
+    }
+
+    json!(null)
+}
+
+/// Convert JSON Value to VM Value
+fn json_to_vm_value(json: &serde_json::Value) -> Value {
+    use otter_vm_core::string::JsString;
+
+    match json {
+        serde_json::Value::Null => Value::null(),
+        serde_json::Value::Bool(b) => Value::boolean(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                    Value::int32(i as i32)
+                } else {
+                    Value::number(i as f64)
+                }
+            } else {
+                Value::number(n.as_f64().unwrap_or(f64::NAN))
+            }
+        }
+        serde_json::Value::String(s) => Value::string(JsString::intern(s)),
+        serde_json::Value::Array(arr) => {
+            let obj = Arc::new(JsObject::array(arr.len()));
+            for (i, elem) in arr.iter().enumerate() {
+                obj.set(PropertyKey::Index(i as u32), json_to_vm_value(elem));
+            }
+            Value::object(obj)
+        }
+        serde_json::Value::Object(map) => {
+            let obj = Arc::new(JsObject::new(None));
+            for (key, val) in map {
+                obj.set(PropertyKey::string(key), json_to_vm_value(val));
+            }
+            Value::object(obj)
+        }
+    }
+}
+
+/// Format a Value for display
+fn format_value(value: &Value) -> String {
+    if value.is_undefined() {
+        return "undefined".to_string();
+    }
+
+    if value.is_null() {
+        return "null".to_string();
+    }
+
+    if let Some(b) = value.as_boolean() {
+        return b.to_string();
+    }
+
+    if let Some(n) = value.as_number() {
+        if n.is_nan() {
+            return "NaN".to_string();
+        }
+        if n.is_infinite() {
+            return if n.is_sign_positive() {
+                "Infinity"
+            } else {
+                "-Infinity"
+            }
+            .to_string();
+        }
+        if n.fract() == 0.0 && n.abs() < 1e15 {
+            return format!("{}", n as i64);
+        }
+        return format!("{}", n);
+    }
+
+    if let Some(s) = value.as_string() {
+        return format!("'{}'", s.as_str());
+    }
+
+    if let Some(obj) = value.as_object() {
+        if obj.is_array() {
+            let len = obj
+                .get(&PropertyKey::string("length"))
+                .and_then(|v| v.as_int32())
+                .unwrap_or(0);
+            return format!("[Array({})]", len);
+        }
+        return "[object Object]".to_string();
+    }
+
+    if value.is_function() {
+        return "[Function]".to_string();
+    }
+
+    "[unknown]".to_string()
+}
+
+/// Initialize a new project
+fn init_project() -> Result<()> {
+    use std::fs;
+
+    // Create package.json
+    let package_json = r#"{
+  "name": "my-otter-project",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "otter run index.js"
+  }
+}
 "#;
 
-    let wrapped = if print_result {
-        // --print: evaluate and print the result
-        format!(
-            "{process_setup}\n\
-             globalThis.__eval_result = (function() {{ return ({code}); }})();\n\
-             console.log(__eval_result);"
-        )
+    // Create index.js
+    let index_js = r#"// Welcome to Otter!
+console.log("Hello from Otter!");
+
+const sum = (a, b) => a + b;
+console.log("2 + 3 =", sum(2, 3));
+"#;
+
+    if !std::path::Path::new("package.json").exists() {
+        fs::write("package.json", package_json)?;
+        println!("Created package.json");
     } else {
-        // --eval: just evaluate
-        format!("{process_setup}\n{code}")
-    };
+        println!("package.json already exists, skipping");
+    }
 
-    runtime.eval(&wrapped)?;
-    runtime.run_event_loop_until_idle(Duration::from_millis(30000))?;
+    if !std::path::Path::new("index.js").exists() {
+        fs::write("index.js", index_js)?;
+        println!("Created index.js");
+    } else {
+        println!("index.js already exists, skipping");
+    }
 
+    println!("\nProject initialized! Run 'otter run index.js' to start.");
     Ok(())
 }

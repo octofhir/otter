@@ -44,14 +44,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Cache bun-webkit (Linux/Windows only)
-      - name: Cache bun-webkit
-        if: runner.os != 'macOS'
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/cache/bun-webkit
-          key: bun-webkit-${{ runner.os }}-${{ hashFiles('crates/otter-jsc-sys/build.rs') }}
-
       # Build
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p otterjs

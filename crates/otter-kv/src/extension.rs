@@ -2,13 +2,13 @@
 //!
 //! Registers the KV ops with the runtime and provides JS interop.
 
-use crate::store::KvStore;
 use crate::KV_JS;
-use otter_runtime::error::{JscError, JscResult};
-use otter_runtime::extension::{op_sync, OpContext};
+use crate::store::KvStore;
 use otter_runtime::Extension;
+use otter_runtime::error::{JscError, JscResult};
+use otter_runtime::extension::{OpContext, op_sync};
 use parking_lot::RwLock;
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 

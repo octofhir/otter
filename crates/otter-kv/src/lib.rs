@@ -19,10 +19,10 @@
 //! store.close();
 //! ```
 
-mod extension;
+// mod extension; // TODO: re-enable when extension system is ported to new VM
 mod store;
 
-pub use extension::kv_extension;
+// pub use extension::kv_extension;
 pub use store::{KvError, KvResult, KvStore};
 
 /// JS wrapper code for the KV module

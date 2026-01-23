@@ -28,6 +28,8 @@ pub struct FunctionFlags {
     pub is_getter: bool,
     /// Is a setter
     pub is_setter: bool,
+    /// Has rest parameter (...args)
+    pub has_rest: bool,
 }
 
 /// Upvalue capture mode

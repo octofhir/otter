@@ -1,8 +1,8 @@
 //! GC Heap management
 
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// GC configuration
 #[derive(Debug, Clone)]

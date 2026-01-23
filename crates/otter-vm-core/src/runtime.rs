@@ -9,6 +9,7 @@ use otter_vm_bytecode::Module;
 
 use crate::context::VmContext;
 use crate::error::VmResult;
+use crate::globals;
 use crate::interpreter::Interpreter;
 use crate::object::JsObject;
 use crate::value::Value;
@@ -56,31 +57,14 @@ impl VmRuntime {
 
     /// Create a new runtime with custom configuration
     pub fn with_config(config: RuntimeConfig) -> Self {
-        let global = JsObject::new(None);
-        Self::setup_global_object(&global);
+        let global = Arc::new(JsObject::new(None));
+        globals::setup_global_object(&global);
 
         Self {
             modules: DashMap::new(),
-            global_template: Arc::new(global),
+            global_template: global,
             config,
         }
-    }
-
-    /// Set up built-in globals on the global object
-    fn setup_global_object(global: &JsObject) {
-        use crate::object::PropertyKey;
-
-        // Basic globals
-        global.set(PropertyKey::string("undefined"), Value::undefined());
-        global.set(PropertyKey::string("NaN"), Value::number(f64::NAN));
-        global.set(
-            PropertyKey::string("Infinity"),
-            Value::number(f64::INFINITY),
-        );
-
-        // TODO: Add more built-ins as they're implemented
-        // - Object, Array, Function, etc.
-        // - console, Math, JSON, etc.
     }
 
     /// Load a module from bytecode
@@ -101,7 +85,7 @@ impl VmRuntime {
         // Clone global object for isolation
         // TODO: Proper cloning with prototype chain
         let global = Arc::new(JsObject::new(None));
-        Self::setup_global_object(&global);
+        globals::setup_global_object(&global);
         VmContext::new(global)
     }
 

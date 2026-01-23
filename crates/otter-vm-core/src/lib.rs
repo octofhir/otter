@@ -17,16 +17,23 @@
 pub mod context;
 pub mod error;
 pub mod gc;
+pub mod globals;
 pub mod interpreter;
 pub mod object;
+pub mod promise;
 pub mod runtime;
+pub mod shared_buffer;
 pub mod string;
+pub mod structured_clone;
 pub mod value;
 
 pub use context::VmContext;
 pub use error::{VmError, VmResult};
 pub use interpreter::Interpreter;
 pub use object::{JsObject, PropertyKey};
+pub use promise::JsPromise;
 pub use runtime::VmRuntime;
+pub use shared_buffer::SharedArrayBuffer;
 pub use string::JsString;
-pub use value::Value;
+pub use structured_clone::{StructuredCloneError, StructuredCloner, structured_clone};
+pub use value::{NativeFn, Value};

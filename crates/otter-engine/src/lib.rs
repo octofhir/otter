@@ -8,7 +8,6 @@
 //! - **ESM Module Loading**: Load ES modules from file://, node:, and https:// URLs
 //! - **Security**: Capability-based permissions and allowlist for remote modules
 //! - **Caching**: In-memory and disk caching for loaded modules
-//! - **TypeScript**: Automatic transpilation of .ts/.tsx files
 //! - **Import Maps**: Support for module aliasing
 //! - **Dependency Graph**: Cycle detection and topological sorting
 //!
@@ -37,20 +36,20 @@
 //! ```
 
 pub mod capabilities;
-pub mod dynamic_import;
 pub mod env_store;
+pub mod error;
 pub mod graph;
 pub mod loader;
+pub mod node_builtins;
 
 pub use capabilities::{Capabilities, CapabilitiesBuilder, PermissionDenied};
 pub use env_store::{
     DEFAULT_DENY_PATTERNS, EnvFileError, EnvStoreBuilder, EnvWriteError, IsolatedEnvStore,
     parse_env_file,
 };
+pub use error::{EngineError, EngineResult};
 pub use graph::{ImportRecord, ModuleGraph, ModuleNode, parse_imports};
 pub use loader::{
     ImportContext, LoaderConfig, ModuleLoader, ModuleType, ResolvedModule, SourceType,
 };
-
-// Re-export error types from otter-runtime for convenience
-pub use otter_runtime::{JscError, JscResult};
+pub use node_builtins::normalize_node_builtin;

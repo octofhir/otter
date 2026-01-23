@@ -34,14 +34,6 @@ jobs:
         with:
           prefix-key: "node-compat-v1"
 
-      # Cache bun-webkit (Linux/Windows only, macOS uses system JSC)
-      - name: Cache bun-webkit
-        if: runner.os != 'macOS'
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/cache/bun-webkit
-          key: bun-webkit-${{ runner.os }}-${{ hashFiles('crates/otter-jsc-sys/build.rs') }}
-
       # Cache Node.js test suite
       - name: Cache Node.js tests
         uses: actions/cache@v4
@@ -214,12 +206,6 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
-
-      - name: Cache bun-webkit
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/cache/bun-webkit
-          key: bun-webkit-Linux-${{ hashFiles('crates/otter-jsc-sys/build.rs') }}
 
       - name: Build Otter
         run: cargo build --release -p otterjs

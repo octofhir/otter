@@ -16,7 +16,8 @@
 //! NaN-boxed values: When exponent == 0x7FF and mantissa != 0 (quiet NaN)
 //!
 //! Encoding:
-//! - Double:     stored directly
+//! - Double:     stored directly (except NaN)
+//! - NaN:        0x7FFA_0000_0000_0000 (canonical NaN, distinct from undefined)
 //! - Integer:    0x7FF8_0001_XXXX_XXXX (32-bit signed in lower bits)
 //! - Pointer:    0x7FFC_XXXX_XXXX_XXXX (48-bit pointer)
 //! - Undefined:  0x7FF8_0000_0000_0000
@@ -26,6 +27,8 @@
 //! ```
 
 use crate::object::JsObject;
+use crate::promise::JsPromise;
+use crate::shared_buffer::SharedArrayBuffer;
 use crate::string::JsString;
 use std::sync::Arc;
 
@@ -40,6 +43,7 @@ const TAG_UNDEFINED: u64 = 0x7FF8_0000_0000_0000;
 const TAG_NULL: u64 = 0x7FF8_0000_0000_0001;
 const TAG_TRUE: u64 = 0x7FF8_0000_0000_0002;
 const TAG_FALSE: u64 = 0x7FF8_0000_0000_0003;
+const TAG_NAN: u64 = 0x7FFA_0000_0000_0000; // Canonical NaN (distinct from undefined)
 const TAG_INT32: u64 = 0x7FF8_0001_0000_0000;
 const TAG_POINTER: u64 = 0x7FFC_0000_0000_0000;
 
@@ -58,8 +62,11 @@ pub struct Value {
 unsafe impl Send for Value {}
 unsafe impl Sync for Value {}
 
+/// Native function handler type
+pub type NativeFn = Arc<dyn Fn(&[Value]) -> Result<Value, String> + Send + Sync>;
+
 /// Reference to heap-allocated data
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum HeapRef {
     /// String value
     String(Arc<JsString>),
@@ -73,6 +80,28 @@ pub enum HeapRef {
     Symbol(Arc<Symbol>),
     /// BigInt
     BigInt(Arc<BigInt>),
+    /// Promise
+    Promise(Arc<JsPromise>),
+    /// SharedArrayBuffer (can be shared between workers)
+    SharedArrayBuffer(Arc<SharedArrayBuffer>),
+    /// Native function (implemented in Rust)
+    NativeFunction(NativeFn),
+}
+
+impl std::fmt::Debug for HeapRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeapRef::String(s) => f.debug_tuple("String").field(s).finish(),
+            HeapRef::Object(o) => f.debug_tuple("Object").field(o).finish(),
+            HeapRef::Array(a) => f.debug_tuple("Array").field(a).finish(),
+            HeapRef::Function(c) => f.debug_tuple("Function").field(c).finish(),
+            HeapRef::Symbol(s) => f.debug_tuple("Symbol").field(s).finish(),
+            HeapRef::BigInt(b) => f.debug_tuple("BigInt").field(b).finish(),
+            HeapRef::Promise(p) => f.debug_tuple("Promise").field(p).finish(),
+            HeapRef::SharedArrayBuffer(s) => f.debug_tuple("SharedArrayBuffer").field(s).finish(),
+            HeapRef::NativeFunction(_) => f.debug_tuple("NativeFunction").finish(),
+        }
+    }
 }
 
 /// A JavaScript function closure
@@ -82,6 +111,8 @@ pub struct Closure {
     pub function_index: u32,
     /// Captured upvalues
     pub upvalues: Vec<Value>,
+    /// Is this an async function
+    pub is_async: bool,
 }
 
 /// A JavaScript Symbol
@@ -140,6 +171,14 @@ impl Value {
     /// Create number (f64) value
     #[inline]
     pub fn number(n: f64) -> Self {
+        // Handle NaN specially to avoid collision with undefined
+        if n.is_nan() {
+            return Self {
+                bits: TAG_NAN,
+                heap_ref: None,
+            };
+        }
+
         // Check if it fits in i32 for optimization
         if n.fract() == 0.0 && n >= i32::MIN as f64 && n <= i32::MAX as f64 {
             return Self::int32(n as i32);
@@ -147,6 +186,15 @@ impl Value {
 
         Self {
             bits: n.to_bits(),
+            heap_ref: None,
+        }
+    }
+
+    /// Create NaN value explicitly
+    #[inline]
+    pub const fn nan() -> Self {
+        Self {
+            bits: TAG_NAN,
             heap_ref: None,
         }
     }
@@ -176,6 +224,56 @@ impl Value {
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::Function(closure)),
+        }
+    }
+
+    /// Create promise value
+    pub fn promise(promise: Arc<JsPromise>) -> Self {
+        let ptr = Arc::as_ptr(&promise) as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::Promise(promise)),
+        }
+    }
+
+    /// Create SharedArrayBuffer value
+    pub fn shared_array_buffer(sab: Arc<SharedArrayBuffer>) -> Self {
+        let ptr = Arc::as_ptr(&sab) as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::SharedArrayBuffer(sab)),
+        }
+    }
+
+    /// Create array value
+    pub fn array(arr: Arc<JsObject>) -> Self {
+        let ptr = Arc::as_ptr(&arr) as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::Array(arr)),
+        }
+    }
+
+    /// Create BigInt value
+    pub fn bigint(value: String) -> Self {
+        let bi = Arc::new(BigInt { value });
+        let ptr = Arc::as_ptr(&bi) as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::BigInt(bi)),
+        }
+    }
+
+    /// Create native function value
+    pub fn native_function<F>(f: F) -> Self
+    where
+        F: Fn(&[Value]) -> Result<Value, String> + Send + Sync + 'static,
+    {
+        let func: NativeFn = Arc::new(f);
+        // Use a dummy pointer for NaN-boxing (the actual function is in heap_ref)
+        Self {
+            bits: TAG_POINTER,
+            heap_ref: Some(HeapRef::NativeFunction(func)),
         }
     }
 
@@ -209,10 +307,16 @@ impl Value {
         (self.bits & 0xFFFF_FFFF_0000_0000) == TAG_INT32
     }
 
-    /// Check if value is a number (including int32)
+    /// Check if value is NaN
+    #[inline]
+    pub fn is_nan(&self) -> bool {
+        self.bits == TAG_NAN
+    }
+
+    /// Check if value is a number (including int32 and NaN)
     #[inline]
     pub fn is_number(&self) -> bool {
-        self.is_int32() || !self.is_nan_boxed()
+        self.is_int32() || self.is_nan() || !self.is_nan_boxed()
     }
 
     /// Check if value is a string
@@ -231,6 +335,30 @@ impl Value {
     #[inline]
     pub fn is_function(&self) -> bool {
         matches!(&self.heap_ref, Some(HeapRef::Function(_)))
+    }
+
+    /// Check if value is a promise
+    #[inline]
+    pub fn is_promise(&self) -> bool {
+        matches!(&self.heap_ref, Some(HeapRef::Promise(_)))
+    }
+
+    /// Check if value is a SharedArrayBuffer
+    #[inline]
+    pub fn is_shared_array_buffer(&self) -> bool {
+        matches!(&self.heap_ref, Some(HeapRef::SharedArrayBuffer(_)))
+    }
+
+    /// Check if value is a native function
+    #[inline]
+    pub fn is_native_function(&self) -> bool {
+        matches!(&self.heap_ref, Some(HeapRef::NativeFunction(_)))
+    }
+
+    /// Check if value is callable (function or native function)
+    #[inline]
+    pub fn is_callable(&self) -> bool {
+        self.is_function() || self.is_native_function()
     }
 
     /// Check if this is a NaN-boxed value (vs regular double)
@@ -262,6 +390,8 @@ impl Value {
     pub fn as_number(&self) -> Option<f64> {
         if self.is_int32() {
             Some((self.bits & 0xFFFF_FFFF) as i32 as f64)
+        } else if self.bits == TAG_NAN {
+            Some(f64::NAN)
         } else if !self.is_nan_boxed() {
             Some(f64::from_bits(self.bits))
         } else {
@@ -293,10 +423,40 @@ impl Value {
         }
     }
 
+    /// Get as native function
+    pub fn as_native_function(&self) -> Option<&NativeFn> {
+        match &self.heap_ref {
+            Some(HeapRef::NativeFunction(f)) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// Get as promise
+    pub fn as_promise(&self) -> Option<&Arc<JsPromise>> {
+        match &self.heap_ref {
+            Some(HeapRef::Promise(p)) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Get as SharedArrayBuffer
+    pub fn as_shared_array_buffer(&self) -> Option<&Arc<SharedArrayBuffer>> {
+        match &self.heap_ref {
+            Some(HeapRef::SharedArrayBuffer(sab)) => Some(sab),
+            _ => None,
+        }
+    }
+
+    /// Get the heap reference (for structured clone)
+    #[doc(hidden)]
+    pub fn heap_ref(&self) -> &Option<HeapRef> {
+        &self.heap_ref
+    }
+
     /// Convert to boolean (ToBoolean)
     pub fn to_boolean(&self) -> bool {
         match self.bits {
-            TAG_UNDEFINED | TAG_NULL | TAG_FALSE => false,
+            TAG_UNDEFINED | TAG_NULL | TAG_FALSE | TAG_NAN => false, // NaN is falsy
             TAG_TRUE => true,
             _ if self.is_int32() => self.as_int32().unwrap() != 0,
             _ if !self.is_nan_boxed() => {
@@ -321,13 +481,19 @@ impl Value {
             TAG_UNDEFINED => "undefined",
             TAG_NULL => "object", // typeof null === "object" (historical bug)
             TAG_TRUE | TAG_FALSE => "boolean",
+            TAG_NAN => "number", // NaN is a number
             _ if self.is_int32() || !self.is_nan_boxed() => "number",
             _ => match &self.heap_ref {
                 Some(HeapRef::String(_)) => "string",
-                Some(HeapRef::Function(_)) => "function",
+                Some(HeapRef::Function(_) | HeapRef::NativeFunction(_)) => "function",
                 Some(HeapRef::Symbol(_)) => "symbol",
                 Some(HeapRef::BigInt(_)) => "bigint",
-                Some(HeapRef::Object(_) | HeapRef::Array(_)) => "object",
+                Some(
+                    HeapRef::Object(_)
+                    | HeapRef::Array(_)
+                    | HeapRef::Promise(_)
+                    | HeapRef::SharedArrayBuffer(_),
+                ) => "object",
                 None => "undefined", // Should not happen
             },
         }
@@ -354,6 +520,8 @@ impl std::fmt::Debug for Value {
                 Some(HeapRef::Object(_)) => write!(f, "[object Object]"),
                 Some(HeapRef::Array(_)) => write!(f, "[object Array]"),
                 Some(HeapRef::Function(_)) => write!(f, "[Function]"),
+                Some(HeapRef::NativeFunction(_)) => write!(f, "[NativeFunction]"),
+                Some(HeapRef::Promise(p)) => write!(f, "{:?}", p),
                 Some(HeapRef::Symbol(s)) => {
                     if let Some(desc) = &s.description {
                         write!(f, "Symbol({})", desc)
@@ -362,6 +530,9 @@ impl std::fmt::Debug for Value {
                     }
                 }
                 Some(HeapRef::BigInt(b)) => write!(f, "{}n", b.value),
+                Some(HeapRef::SharedArrayBuffer(sab)) => {
+                    write!(f, "SharedArrayBuffer({})", sab.byte_length())
+                }
                 None => write!(f, "<unknown>"),
             },
         }
@@ -370,6 +541,11 @@ impl std::fmt::Debug for Value {
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
+        // NaN != NaN (IEEE 754)
+        if self.bits == TAG_NAN || other.bits == TAG_NAN {
+            return false;
+        }
+
         // Fast path: same bits
         if self.bits == other.bits {
             return true;
@@ -440,6 +616,25 @@ mod tests {
         assert!(v.is_number());
         assert!(!v.is_int32()); // Has fractional part
         assert_eq!(v.as_number(), Some(3.15));
+    }
+
+    #[test]
+    fn test_nan() {
+        // NaN via number()
+        let v = Value::number(f64::NAN);
+        assert!(v.is_nan());
+        assert!(v.is_number());
+        assert!(!v.is_undefined()); // NaN is distinct from undefined
+        assert!(v.as_number().unwrap().is_nan());
+        assert_eq!(v.type_of(), "number");
+
+        // NaN via nan()
+        let v2 = Value::nan();
+        assert!(v2.is_nan());
+        assert!(v2.is_number());
+
+        // NaN != NaN (per IEEE 754)
+        assert_ne!(v, v2); // Our PartialEq uses a == b which returns false for NaN
     }
 
     #[test]

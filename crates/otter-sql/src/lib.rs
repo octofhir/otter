@@ -23,12 +23,12 @@ pub mod sqlite;
 pub mod transaction;
 
 mod error;
-mod extension;
+// mod extension; // TODO: re-enable when extension system is ported to new VM
 mod value;
 
 pub use adapter::{SqlAdapter, SqlRow};
 pub use error::{SqlError, SqlResult};
-pub use extension::sql_extension;
+// pub use extension::sql_extension;
 pub use query::QueryBuilder;
 pub use value::SqlValue;
 

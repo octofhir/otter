@@ -3,12 +3,27 @@
 //! Provides topological sorting for correct module execution order.
 //! Supports circular dependencies (common in npm packages like zod).
 
+use crate::error::{EngineError, EngineResult};
 use crate::loader::{ImportContext, ModuleLoader, ModuleType, ResolvedModule, SourceType};
-use otter_runtime::modules_ast::parse_esm_dependencies;
-use otter_runtime::{JscError, JscResult, transpile_typescript};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// Stub: transpile TypeScript to JavaScript
+///
+/// TODO: Implement actual transpilation using swc or oxc
+fn transpile_typescript(source: &str) -> Result<TranspileResult, String> {
+    // For now, just return the source as-is
+    // This is a stub - TypeScript files won't work until this is implemented
+    Ok(TranspileResult {
+        code: source.to_string(),
+    })
+}
+
+/// Result of TypeScript transpilation
+struct TranspileResult {
+    code: String,
+}
 
 /// Import record tracking the relationship between modules
 #[derive(Debug, Clone)]
@@ -135,7 +150,7 @@ impl ModuleGraph {
     }
 
     /// Load a module and all its dependencies
-    pub async fn load(&mut self, specifier: &str) -> JscResult<()> {
+    pub async fn load(&mut self, specifier: &str) -> EngineResult<()> {
         let mut visited = HashSet::new();
         let mut stack = Vec::new();
 
@@ -156,7 +171,7 @@ impl ModuleGraph {
         context: ImportContext,
         visited: &mut HashSet<String>,
         stack: &mut Vec<String>,
-    ) -> JscResult<()> {
+    ) -> EngineResult<()> {
         // Resolve first to get canonical URL
         let resolved_url = self
             .loader
@@ -229,7 +244,7 @@ impl ModuleGraph {
         let compiled = match module.source_type {
             SourceType::TypeScript => {
                 let result = transpile_typescript(&module.source).map_err(|e| {
-                    JscError::ModuleError(format!("Failed to transpile '{}': {}", module.url, e))
+                    EngineError::ModuleError(format!("Failed to transpile '{}': {}", module.url, e))
                 })?;
                 Some(result.code)
             }
@@ -463,11 +478,13 @@ pub fn parse_requires(source: &str) -> Vec<String> {
 
 /// Parse dependencies from source based on module type
 ///
-/// For ESM modules, uses SWC AST parser (handles multi-line imports correctly).
+/// For ESM modules, uses regex-based parser.
 /// For CommonJS modules, parses require() calls with regex.
+///
+/// TODO: Use AST-based parsing for better accuracy
 pub fn parse_dependencies(source: &str, module_type: ModuleType) -> Vec<String> {
     match module_type {
-        ModuleType::ESM => parse_esm_dependencies(source),
+        ModuleType::ESM => parse_imports(source),
         ModuleType::CommonJS => parse_requires(source),
     }
 }

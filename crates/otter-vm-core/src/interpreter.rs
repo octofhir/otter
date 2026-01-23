@@ -7,6 +7,7 @@ use otter_vm_bytecode::{Instruction, Module};
 use crate::context::VmContext;
 use crate::error::{VmError, VmResult};
 use crate::object::{JsObject, PropertyKey};
+use crate::promise::{JsPromise, PromiseState};
 use crate::string::JsString;
 use crate::value::{Closure, Value};
 
@@ -98,7 +99,58 @@ impl Interpreter {
                         .function(func_index)
                         .ok_or_else(|| VmError::internal("callee not found"))?;
 
+                    // Handle rest parameters
+                    if callee.flags.has_rest {
+                        let mut args = ctx.take_pending_args();
+                        let param_count = callee.param_count as usize;
+
+                        // Collect extra arguments into rest array
+                        let rest_args: Vec<Value> = if args.len() > param_count {
+                            args.drain(param_count..).collect()
+                        } else {
+                            Vec::new()
+                        };
+
+                        // Create rest array
+                        let rest_arr = Arc::new(JsObject::array(rest_args.len()));
+                        for (i, arg) in rest_args.into_iter().enumerate() {
+                            rest_arr.set(PropertyKey::Index(i as u32), arg);
+                        }
+
+                        // Append rest array to args
+                        args.push(Value::object(rest_arr));
+                        ctx.set_pending_args(args);
+                    }
+
                     ctx.push_frame(func_index, callee.local_count, Some(return_reg))?;
+                }
+                InstructionResult::Suspend {
+                    promise,
+                    resume_reg,
+                } => {
+                    // Store the pending promise state for later resumption
+                    // For now, we poll the promise - a real implementation would
+                    // integrate with the event loop for true async suspension
+                    ctx.advance_pc();
+
+                    // Busy-wait poll the promise (temporary - will integrate with event loop)
+                    // In a real implementation, this would yield to the event loop
+                    match promise.state() {
+                        PromiseState::Fulfilled(value) => {
+                            ctx.set_register(resume_reg, value);
+                        }
+                        PromiseState::Rejected(error) => {
+                            return Err(VmError::type_error(format!(
+                                "Promise rejected: {:?}",
+                                error
+                            )));
+                        }
+                        PromiseState::Pending => {
+                            // Promise still pending - return a pending promise as result
+                            // In a real async runtime, we'd suspend and resume later
+                            return Ok(Value::promise(promise));
+                        }
+                    }
                 }
             }
         }
@@ -433,6 +485,17 @@ impl Interpreter {
                 let closure = Arc::new(Closure {
                     function_index: func.0,
                     upvalues: Vec::new(),
+                    is_async: false,
+                });
+                ctx.set_register(dst.0, Value::function(closure));
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::AsyncClosure { dst, func } => {
+                let closure = Arc::new(Closure {
+                    function_index: func.0,
+                    upvalues: Vec::new(),
+                    is_async: true,
                 });
                 ctx.set_register(dst.0, Value::function(closure));
                 Ok(InstructionResult::Continue)
@@ -440,6 +503,23 @@ impl Interpreter {
 
             Instruction::Call { dst, func, argc } => {
                 let func_value = ctx.get_register(func.0).clone();
+
+                // Check if it's a native function first
+                if let Some(native_fn) = func_value.as_native_function() {
+                    // Collect arguments
+                    let mut args = Vec::with_capacity(*argc as usize);
+                    for i in 0..*argc {
+                        let arg = ctx.get_register(func.0 + 1 + i).clone();
+                        args.push(arg);
+                    }
+
+                    // Call the native function directly
+                    let result = native_fn(&args).map_err(VmError::type_error)?;
+                    ctx.set_register(dst.0, result);
+                    return Ok(InstructionResult::Continue);
+                }
+
+                // Regular closure call
                 let closure = func_value
                     .as_function()
                     .ok_or_else(|| VmError::type_error("not a function"))?;
@@ -502,6 +582,96 @@ impl Interpreter {
             }
 
             Instruction::ReturnUndefined => Ok(InstructionResult::Return(Value::undefined())),
+
+            Instruction::CallSpread {
+                dst,
+                func,
+                argc,
+                spread,
+            } => {
+                let func_value = ctx.get_register(func.0).clone();
+                let spread_arr = ctx.get_register(spread.0).clone();
+
+                // Collect regular arguments first
+                let mut args = Vec::with_capacity(*argc as usize);
+                for i in 0..*argc {
+                    let arg = ctx.get_register(func.0 + 1 + i).clone();
+                    args.push(arg);
+                }
+
+                // Spread the array into args
+                if let Some(arr_obj) = spread_arr.as_object() {
+                    let len = arr_obj
+                        .get(&PropertyKey::string("length"))
+                        .and_then(|v| v.as_int32())
+                        .unwrap_or(0) as u32;
+
+                    for i in 0..len {
+                        if let Some(elem) = arr_obj.get(&PropertyKey::Index(i)) {
+                            args.push(elem);
+                        } else {
+                            args.push(Value::undefined());
+                        }
+                    }
+                }
+
+                // Check if it's a native function first
+                if let Some(native_fn) = func_value.as_native_function() {
+                    // Call the native function directly
+                    let result = native_fn(&args).map_err(VmError::type_error)?;
+                    ctx.set_register(dst.0, result);
+                    return Ok(InstructionResult::Continue);
+                }
+
+                // Regular closure call
+                let closure = func_value
+                    .as_function()
+                    .ok_or_else(|| VmError::type_error("not a function"))?;
+
+                // Store args in context for new frame to pick up
+                ctx.set_pending_args(args.clone());
+
+                Ok(InstructionResult::Call {
+                    func_index: closure.function_index,
+                    argc: args.len() as u8,
+                    return_reg: dst.0,
+                })
+            }
+
+            // ==================== Async/Await ====================
+            Instruction::Await { dst, src } => {
+                let value = ctx.get_register(src.0).clone();
+
+                // Check if the value is a Promise
+                if let Some(promise) = value.as_promise() {
+                    match promise.state() {
+                        PromiseState::Fulfilled(resolved) => {
+                            // Promise already resolved, use the value
+                            ctx.set_register(dst.0, resolved);
+                            Ok(InstructionResult::Continue)
+                        }
+                        PromiseState::Rejected(error) => {
+                            // Promise rejected, propagate the error
+                            Err(VmError::type_error(format!(
+                                "Promise rejected: {:?}",
+                                error
+                            )))
+                        }
+                        PromiseState::Pending => {
+                            // Promise is pending, suspend execution
+                            Ok(InstructionResult::Suspend {
+                                promise: Arc::clone(promise),
+                                resume_reg: dst.0,
+                            })
+                        }
+                    }
+                } else {
+                    // Not a Promise, wrap in resolved promise and return immediately
+                    // Per JS spec: await non-promise returns the value directly
+                    ctx.set_register(dst.0, value);
+                    Ok(InstructionResult::Continue)
+                }
+            }
 
             // ==================== Objects ====================
             Instruction::NewObject { dst } => {
@@ -633,6 +803,42 @@ impl Interpreter {
                         let idx_str = self.to_string(index);
                         obj.set(PropertyKey::string(&idx_str), value);
                     }
+                }
+
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::Spread { dst, src } => {
+                // Spread elements from src array into dst array
+                let dst_arr = ctx.get_register(dst.0);
+                let src_arr = ctx.get_register(src.0);
+
+                if let (Some(dst_obj), Some(src_obj)) = (dst_arr.as_object(), src_arr.as_object()) {
+                    // Get current length of dst array
+                    let dst_len = dst_obj
+                        .get(&PropertyKey::string("length"))
+                        .and_then(|v| v.as_int32())
+                        .unwrap_or(0) as u32;
+
+                    // Get length of src array
+                    let src_len = src_obj
+                        .get(&PropertyKey::string("length"))
+                        .and_then(|v| v.as_int32())
+                        .unwrap_or(0) as u32;
+
+                    // Copy elements from src to dst
+                    for i in 0..src_len {
+                        let elem = src_obj
+                            .get(&PropertyKey::Index(i))
+                            .unwrap_or_else(Value::undefined);
+                        dst_obj.set(PropertyKey::Index(dst_len + i), elem);
+                    }
+
+                    // Update dst length
+                    dst_obj.set(
+                        PropertyKey::string("length"),
+                        Value::int32((dst_len + src_len) as i32),
+                    );
                 }
 
                 Ok(InstructionResult::Continue)
@@ -798,6 +1004,11 @@ enum InstructionResult {
         func_index: u32,
         argc: u8,
         return_reg: u8,
+    },
+    /// Suspend execution waiting for Promise
+    Suspend {
+        promise: Arc<JsPromise>,
+        resume_reg: u8,
     },
 }
 

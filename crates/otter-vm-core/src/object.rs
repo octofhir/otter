@@ -151,8 +151,8 @@ pub struct JsObject {
     prototype: Option<Arc<JsObject>>,
     /// Array elements (for array-like objects)
     elements: RwLock<Vec<Value>>,
-    /// Object flags
-    flags: ObjectFlags,
+    /// Object flags (mutable for freeze/seal/preventExtensions)
+    flags: RwLock<ObjectFlags>,
 }
 
 /// Object flags
@@ -175,23 +175,32 @@ impl JsObject {
             properties: RwLock::new(FxHashMap::default()),
             prototype,
             elements: RwLock::new(Vec::new()),
-            flags: ObjectFlags {
+            flags: RwLock::new(ObjectFlags {
                 extensible: true,
                 ..Default::default()
-            },
+            }),
         }
     }
 
     /// Create a new array
     pub fn array(length: usize) -> Self {
-        let mut obj = Self::new(None); // TODO: Array.prototype
-        obj.flags.is_array = true;
+        let obj = Self::new(None); // TODO: Array.prototype
+        obj.flags.write().is_array = true;
         obj.elements.write().resize(length, Value::undefined());
         obj
     }
 
     /// Get property by key
     pub fn get(&self, key: &PropertyKey) -> Option<Value> {
+        // Special handling for array "length" property
+        if self.is_array() {
+            if let PropertyKey::String(s) = key {
+                if s.as_str() == "length" {
+                    return Some(Value::int32(self.elements.read().len() as i32));
+                }
+            }
+        }
+
         // Check own properties first
         if let Some(desc) = self.properties.read().get(key) {
             return desc.value().cloned();
@@ -215,44 +224,61 @@ impl JsObject {
 
     /// Set property by key
     pub fn set(&self, key: PropertyKey, value: Value) -> bool {
+        let flags = self.flags.read();
+
+        // Frozen objects cannot have properties changed
+        if flags.frozen {
+            return false;
+        }
+
         // Handle indexed elements for arrays
         if let PropertyKey::Index(i) = &key {
+            // Sealed objects cannot have new properties added, but existing can be changed
             let mut elements = self.elements.write();
             let idx = *i as usize;
             if idx < elements.len() {
                 elements[idx] = value;
                 return true;
-            } else if self.flags.is_array && self.flags.extensible {
-                // Extend array
+            } else if flags.is_array && flags.extensible && !flags.sealed {
+                // Extend array (only if extensible and not sealed)
                 elements.resize(idx + 1, Value::undefined());
                 elements[idx] = value;
                 return true;
             }
+            return false;
         }
 
         // Check if property exists and is writable
         {
             let props = self.properties.read();
-            if let Some(desc) = props.get(&key) {
-                if !desc.is_writable() {
-                    return false; // Not writable
-                }
+            if let Some(desc) = props.get(&key)
+                && !desc.is_writable()
+            {
+                return false; // Not writable
             }
         }
 
         // Set or create property
-        if self.flags.extensible || self.properties.read().contains_key(&key) {
+        let property_exists = self.properties.read().contains_key(&key);
+        if property_exists || (flags.extensible && !flags.sealed) {
             self.properties
                 .write()
                 .insert(key, PropertyDescriptor::data(value));
             true
         } else {
-            false // Not extensible
+            false // Not extensible or sealed
         }
     }
 
     /// Delete property
     pub fn delete(&self, key: &PropertyKey) -> bool {
+        // Sealed or frozen objects cannot have properties deleted
+        let flags = self.flags.read();
+        if flags.sealed || flags.frozen {
+            return false;
+        }
+        drop(flags);
+
         // Check if configurable
         {
             let props = self.properties.read();
@@ -314,7 +340,20 @@ impl JsObject {
 
     /// Define a property with descriptor
     pub fn define_property(&self, key: PropertyKey, desc: PropertyDescriptor) -> bool {
-        if !self.flags.extensible && !self.properties.read().contains_key(&key) {
+        let flags = self.flags.read();
+
+        // Frozen objects cannot have properties defined
+        if flags.frozen {
+            return false;
+        }
+
+        // Can't add new properties if not extensible or sealed
+        if !flags.extensible && !self.properties.read().contains_key(&key) {
+            return false;
+        }
+
+        // Sealed objects can't have new properties
+        if flags.sealed && !self.properties.read().contains_key(&key) {
             return false;
         }
 
@@ -329,7 +368,75 @@ impl JsObject {
 
     /// Check if object is an array
     pub fn is_array(&self) -> bool {
-        self.flags.is_array
+        self.flags.read().is_array
+    }
+
+    // ========================================================================
+    // Object.freeze / Object.seal / Object.preventExtensions
+    // ========================================================================
+
+    /// Freeze the object - makes all properties non-writable and non-configurable,
+    /// and prevents adding new properties
+    pub fn freeze(&self) {
+        let mut flags = self.flags.write();
+        flags.frozen = true;
+        flags.sealed = true;
+        flags.extensible = false;
+        drop(flags);
+
+        // Make all existing properties non-writable and non-configurable
+        let mut props = self.properties.write();
+        for desc in props.values_mut() {
+            match desc {
+                PropertyDescriptor::Data { attributes, .. } => {
+                    attributes.writable = false;
+                    attributes.configurable = false;
+                }
+                PropertyDescriptor::Accessor { attributes, .. } => {
+                    attributes.configurable = false;
+                }
+            }
+        }
+    }
+
+    /// Check if object is frozen
+    pub fn is_frozen(&self) -> bool {
+        self.flags.read().frozen
+    }
+
+    /// Seal the object - prevents adding new properties and makes all existing
+    /// properties non-configurable
+    pub fn seal(&self) {
+        let mut flags = self.flags.write();
+        flags.sealed = true;
+        flags.extensible = false;
+        drop(flags);
+
+        // Make all existing properties non-configurable
+        let mut props = self.properties.write();
+        for desc in props.values_mut() {
+            match desc {
+                PropertyDescriptor::Data { attributes, .. }
+                | PropertyDescriptor::Accessor { attributes, .. } => {
+                    attributes.configurable = false;
+                }
+            }
+        }
+    }
+
+    /// Check if object is sealed
+    pub fn is_sealed(&self) -> bool {
+        self.flags.read().sealed
+    }
+
+    /// Prevent extensions - prevents adding new properties
+    pub fn prevent_extensions(&self) {
+        self.flags.write().extensible = false;
+    }
+
+    /// Check if object is extensible
+    pub fn is_extensible(&self) -> bool {
+        self.flags.read().extensible
     }
 
     /// Get array length (for arrays)
@@ -351,9 +458,10 @@ impl JsObject {
 impl std::fmt::Debug for JsObject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let props = self.properties.read();
+        let flags = self.flags.read();
         f.debug_struct("JsObject")
             .field("properties", &props.len())
-            .field("is_array", &self.flags.is_array)
+            .field("is_array", &flags.is_array)
             .finish()
     }
 }
@@ -402,5 +510,83 @@ mod tests {
     fn test_object_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<JsObject>();
+    }
+
+    #[test]
+    fn test_object_freeze() {
+        let obj = JsObject::new(None);
+        obj.set(PropertyKey::string("foo"), Value::int32(42));
+
+        assert!(!obj.is_frozen());
+        assert!(obj.is_extensible());
+
+        obj.freeze();
+
+        assert!(obj.is_frozen());
+        assert!(obj.is_sealed());
+        assert!(!obj.is_extensible());
+
+        // Cannot modify existing property
+        assert!(!obj.set(PropertyKey::string("foo"), Value::int32(100)));
+        assert_eq!(obj.get(&PropertyKey::string("foo")), Some(Value::int32(42)));
+
+        // Cannot add new property
+        assert!(!obj.set(PropertyKey::string("bar"), Value::int32(200)));
+        assert_eq!(obj.get(&PropertyKey::string("bar")), None);
+
+        // Cannot delete property
+        assert!(!obj.delete(&PropertyKey::string("foo")));
+        assert!(obj.has_own(&PropertyKey::string("foo")));
+    }
+
+    #[test]
+    fn test_object_seal() {
+        let obj = JsObject::new(None);
+        obj.set(PropertyKey::string("foo"), Value::int32(42));
+
+        assert!(!obj.is_sealed());
+
+        obj.seal();
+
+        assert!(obj.is_sealed());
+        assert!(!obj.is_frozen());
+        assert!(!obj.is_extensible());
+
+        // CAN modify existing property (seal allows writes, freeze doesn't)
+        assert!(obj.set(PropertyKey::string("foo"), Value::int32(100)));
+        assert_eq!(
+            obj.get(&PropertyKey::string("foo")),
+            Some(Value::int32(100))
+        );
+
+        // Cannot add new property
+        assert!(!obj.set(PropertyKey::string("bar"), Value::int32(200)));
+        assert_eq!(obj.get(&PropertyKey::string("bar")), None);
+
+        // Cannot delete property
+        assert!(!obj.delete(&PropertyKey::string("foo")));
+    }
+
+    #[test]
+    fn test_object_prevent_extensions() {
+        let obj = JsObject::new(None);
+        obj.set(PropertyKey::string("foo"), Value::int32(42));
+
+        assert!(obj.is_extensible());
+
+        obj.prevent_extensions();
+
+        assert!(!obj.is_extensible());
+        assert!(!obj.is_sealed());
+        assert!(!obj.is_frozen());
+
+        // CAN modify existing property
+        assert!(obj.set(PropertyKey::string("foo"), Value::int32(100)));
+
+        // Cannot add new property
+        assert!(!obj.set(PropertyKey::string("bar"), Value::int32(200)));
+
+        // CAN delete property (prevent_extensions only stops adding)
+        assert!(obj.delete(&PropertyKey::string("foo")));
     }
 }

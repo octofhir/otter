@@ -180,7 +180,7 @@ mod tests {
         let mut pool = ConstantPool::new();
 
         let idx1 = pool.add_number(42.0);
-        let idx2 = pool.add_number(3.14);
+        let idx2 = pool.add_number(3.15);
         let idx3 = pool.add_number(42.0); // duplicate
 
         assert_eq!(idx1, 0);

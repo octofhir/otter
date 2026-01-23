@@ -1,15 +1,17 @@
 # Otter
 
-TypeScript/JavaScript runtime built on JavaScriptCore.
+TypeScript/JavaScript runtime with a custom bytecode VM.
 
 ## Overview
 
 Otter is a TypeScript/JavaScript runtime that can be used as:
 
-1. **Embeddable engine** - Add scripting to Rust applications via `otter-runtime` crate
+1. **Embeddable engine** - Add scripting to Rust applications via `otter-vm-runtime` crate
 2. **Standalone CLI** - Run scripts directly with `otter run script.ts`
 
-Built on JavaScriptCore (JSC) from WebKit. Uses bun-webkit for JIT compilation on all platforms.
+Built on a custom bytecode VM with garbage collection, written entirely in Rust.
+
+> **Note:** The VM is currently under active development. Some features are temporarily disabled.
 
 ## Installation
 
@@ -17,7 +19,7 @@ Built on JavaScriptCore (JSC) from WebKit. Uses bun-webkit for JIT compilation o
 
 ```toml
 [dependencies]
-otter-runtime = "0.1"
+otter-vm-runtime = "0.1"
 ```
 
 ### As CLI
@@ -72,27 +74,21 @@ Environment variables have automatic filtering for secrets (AWS_*, *_SECRET*, et
 ## Embedding in Rust
 
 ```rust
-use otter_runtime::{JscConfig, JscRuntime, set_console_handler, ConsoleLevel};
-use std::time::Duration;
+use otter_vm_runtime::Runtime;
 
 fn main() -> anyhow::Result<()> {
-    set_console_handler(|level, message| match level {
-        ConsoleLevel::Error | ConsoleLevel::Warn => eprintln!("{}", message),
-        _ => println!("{}", message),
-    });
-
-    let runtime = JscRuntime::new(JscConfig::default())?;
+    let mut runtime = Runtime::new();
 
     runtime.eval(r#"
-        interface User { name: string; age: number }
-        const user: User = { name: "Alice", age: 30 };
+        const user = { name: "Alice", age: 30 };
         console.log(JSON.stringify(user));
     "#)?;
 
-    runtime.run_event_loop_until_idle(Duration::from_millis(5000))?;
     Ok(())
 }
 ```
+
+> **Note:** TypeScript support and full API surface are being ported to the new VM.
 
 ## API Support
 
@@ -199,13 +195,13 @@ store.get("key");
 
 ## Platform Support
 
-| Platform | Architecture  | JSC Source                     |
-|----------|---------------|--------------------------------|
-| macOS    | x86_64, ARM64 | bun-webkit (JIT) or system JSC |
-| Linux    | x86_64, ARM64 | bun-webkit (static)            |
-| Windows  | x86_64        | bun-webkit (static)            |
+| Platform | Architecture  |
+|----------|---------------|
+| macOS    | x86_64, ARM64 |
+| Linux    | x86_64, ARM64 |
+| Windows  | x86_64        |
 
-Set `OTTER_USE_SYSTEM_JSC=1` on macOS to use system JavaScriptCore (faster builds, no JIT).
+Pure Rust implementation - no external JavaScript engine dependencies.
 
 ## Performance
 
@@ -224,11 +220,14 @@ PostgreSQL COPY FROM: 108K rows/sec (bulk import).
 
 ```text
 crates/
-├── otter-jsc-sys      # JSC FFI bindings
-├── otter-jsc-core     # Safe JSC wrappers
-├── otter-runtime      # Event loop, extensions, Web APIs
+├── otter-vm-bytecode  # Bytecode definitions
+├── otter-vm-gc        # Garbage collector
+├── otter-vm-core      # VM interpreter
+├── otter-vm-compiler  # JS/TS to bytecode compiler
+├── otter-vm-runtime   # Runtime with builtins
+├── otter-vm-builtins  # Built-in functions
 ├── otter-engine       # Module loader, capabilities
-├── otter-node         # Node.js compatibility
+├── otter-node         # Node.js compatibility (reference)
 ├── otter-pm           # Package manager
 ├── otter-sql          # SQLite + PostgreSQL
 ├── otter-kv           # Key-value store

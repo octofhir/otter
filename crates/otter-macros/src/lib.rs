@@ -29,9 +29,9 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
+    FnArg, Ident, ItemFn, ItemImpl, ItemStruct, LitStr, Pat, ReturnType, Token, Type,
     parse::{Parse, ParseStream},
-    parse_macro_input, FnArg, Ident, ItemFn, ItemImpl, ItemStruct, LitStr, Pat, ReturnType, Token,
-    Type,
+    parse_macro_input,
 };
 
 // =============================================================================
@@ -592,7 +592,10 @@ fn expand_js_class_impl(input: ItemImpl) -> TokenStream {
 
     for item in &input.items {
         if let syn::ImplItem::Fn(method) = item {
-            let is_constructor = method.attrs.iter().any(|a| a.path().is_ident("js_constructor"));
+            let is_constructor = method
+                .attrs
+                .iter()
+                .any(|a| a.path().is_ident("js_constructor"));
             let is_static = method.attrs.iter().any(|a| a.path().is_ident("js_static"));
             let is_getter = method.attrs.iter().any(|a| a.path().is_ident("js_getter"));
             let is_setter = method.attrs.iter().any(|a| a.path().is_ident("js_setter"));

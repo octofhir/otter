@@ -5,7 +5,10 @@ use oxc_ast::ast::*;
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
-use otter_vm_bytecode::{Instruction, JumpOffset, LocalIndex, Register};
+use otter_vm_bytecode::{
+    Instruction, JumpOffset, LocalIndex, Register,
+    module::{ExportRecord, ImportBinding, ImportRecord},
+};
 
 use crate::codegen::CodeGen;
 use crate::error::{CompileError, CompileResult};
@@ -115,8 +118,492 @@ impl Compiler {
                 Ok(())
             }
 
+            Statement::ImportDeclaration(import_decl) => {
+                self.compile_import_declaration(import_decl)
+            }
+
+            Statement::ExportNamedDeclaration(export_decl) => {
+                self.compile_export_named_declaration(export_decl)
+            }
+
+            Statement::ExportDefaultDeclaration(export_decl) => {
+                self.compile_export_default_declaration(export_decl)
+            }
+
+            Statement::ExportAllDeclaration(export_decl) => {
+                self.compile_export_all_declaration(export_decl)
+            }
+
+            // TypeScript statements - type erasure (skip type-only declarations)
+            Statement::TSTypeAliasDeclaration(_) => Ok(()),
+            Statement::TSInterfaceDeclaration(_) => Ok(()),
+            Statement::TSEnumDeclaration(decl) => self.compile_ts_enum_declaration(decl),
+            Statement::TSModuleDeclaration(decl) => self.compile_ts_module_declaration(decl),
+            Statement::TSImportEqualsDeclaration(_) => {
+                // import x = require('y') - old TS syntax, skip for now
+                Err(CompileError::unsupported("TSImportEqualsDeclaration"))
+            }
+            Statement::TSExportAssignment(_) => {
+                // export = x - old TS syntax, skip for now
+                Err(CompileError::unsupported("TSExportAssignment"))
+            }
+            Statement::TSNamespaceExportDeclaration(_) => {
+                // export as namespace X - for UMD, skip for now
+                Err(CompileError::unsupported("TSNamespaceExportDeclaration"))
+            }
+
             _ => Err(CompileError::unsupported("Unknown statement type")),
         }
+    }
+
+    /// Compile an import declaration
+    ///
+    /// import { foo } from './module.js'
+    /// import foo from './module.js'
+    /// import * as foo from './module.js'
+    fn compile_import_declaration(&mut self, import: &ImportDeclaration) -> CompileResult<()> {
+        let specifier = import.source.value.to_string();
+
+        let mut bindings = Vec::new();
+
+        if let Some(specifiers) = &import.specifiers {
+            for spec in specifiers {
+                match spec {
+                    ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                        bindings.push(ImportBinding::Named {
+                            imported: s.imported.name().to_string(),
+                            local: s.local.name.to_string(),
+                        });
+                        // Declare local variable for the import
+                        self.codegen.declare_variable(&s.local.name, true)?;
+                    }
+                    ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                        bindings.push(ImportBinding::Default {
+                            local: s.local.name.to_string(),
+                        });
+                        self.codegen.declare_variable(&s.local.name, true)?;
+                    }
+                    ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                        bindings.push(ImportBinding::Namespace {
+                            local: s.local.name.to_string(),
+                        });
+                        self.codegen.declare_variable(&s.local.name, true)?;
+                    }
+                }
+            }
+        }
+
+        self.codegen.add_import(ImportRecord {
+            specifier,
+            bindings,
+        });
+        Ok(())
+    }
+
+    /// Compile an export named declaration
+    ///
+    /// export { foo, bar }
+    /// export { foo as bar }
+    /// export const x = 1
+    /// export { foo } from './module.js'
+    fn compile_export_named_declaration(
+        &mut self,
+        export: &ExportNamedDeclaration,
+    ) -> CompileResult<()> {
+        // Handle re-exports: export { foo } from './module.js'
+        if let Some(source) = &export.source {
+            let specifier = source.value.to_string();
+
+            for spec in &export.specifiers {
+                let exported = spec.exported.name().to_string();
+                let imported = spec.local.name().to_string();
+
+                self.codegen.add_export(ExportRecord::ReExportNamed {
+                    specifier: specifier.clone(),
+                    imported,
+                    exported,
+                });
+            }
+            return Ok(());
+        }
+
+        // Handle local exports: export { foo } or export { foo as bar }
+        for spec in &export.specifiers {
+            let local = spec.local.name().to_string();
+            let exported = spec.exported.name().to_string();
+
+            self.codegen
+                .add_export(ExportRecord::Named { local, exported });
+        }
+
+        // Handle declaration: export const x = 1
+        if let Some(decl) = &export.declaration {
+            match decl {
+                Declaration::VariableDeclaration(var_decl) => {
+                    // Compile the variable declaration
+                    self.compile_variable_declaration(var_decl)?;
+
+                    // Add exports for each declarator
+                    for declarator in &var_decl.declarations {
+                        if let BindingPattern::BindingIdentifier(ident) = &declarator.id {
+                            let name = ident.name.to_string();
+                            self.codegen.add_export(ExportRecord::Named {
+                                local: name.clone(),
+                                exported: name,
+                            });
+                        }
+                    }
+                }
+                Declaration::FunctionDeclaration(func) => {
+                    self.compile_function_declaration(func)?;
+                    if let Some(id) = &func.id {
+                        let name = id.name.to_string();
+                        self.codegen.add_export(ExportRecord::Named {
+                            local: name.clone(),
+                            exported: name,
+                        });
+                    }
+                }
+                Declaration::ClassDeclaration(class) => {
+                    // TODO: Add class compilation when we have class support
+                    if let Some(id) = &class.id {
+                        let name = id.name.to_string();
+                        self.codegen.add_export(ExportRecord::Named {
+                            local: name.clone(),
+                            exported: name,
+                        });
+                    }
+                    return Err(CompileError::unsupported("Class declarations"));
+                }
+                _ => return Err(CompileError::unsupported("Export declaration type")),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Compile an export default declaration
+    ///
+    /// export default function() {}
+    /// export default class {}
+    /// export default expression
+    fn compile_export_default_declaration(
+        &mut self,
+        export: &ExportDefaultDeclaration,
+    ) -> CompileResult<()> {
+        match &export.declaration {
+            ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
+                // If the function has a name, use it; otherwise use a generated name
+                let name = func
+                    .id
+                    .as_ref()
+                    .map(|id| id.name.to_string())
+                    .unwrap_or_else(|| "__default__".to_string());
+
+                // Declare the variable
+                self.codegen.declare_variable(&name, false)?;
+
+                // Compile the function
+                self.codegen.enter_function(Some(name.clone()));
+                self.codegen.current.flags.is_async = func.r#async;
+
+                // Declare parameters
+                for param in &func.params.items {
+                    if let BindingPattern::BindingIdentifier(ident) = &param.pattern {
+                        self.codegen.declare_variable(&ident.name, false)?;
+                        self.codegen.current.param_count += 1;
+                    }
+                }
+
+                // Compile function body
+                if let Some(body) = &func.body {
+                    for stmt in &body.statements {
+                        self.compile_statement(stmt)?;
+                    }
+                }
+
+                self.codegen.emit(Instruction::ReturnUndefined);
+                let func_idx = self.codegen.exit_function();
+
+                // Create closure and store
+                if let Some(ResolvedBinding::Local(idx)) = self.codegen.resolve_variable(&name) {
+                    let dst = self.codegen.alloc_reg();
+                    if func.r#async {
+                        self.codegen.emit(Instruction::AsyncClosure {
+                            dst,
+                            func: otter_vm_bytecode::FunctionIndex(func_idx),
+                        });
+                    } else {
+                        self.codegen.emit(Instruction::Closure {
+                            dst,
+                            func: otter_vm_bytecode::FunctionIndex(func_idx),
+                        });
+                    }
+                    self.codegen.emit(Instruction::SetLocal {
+                        idx: LocalIndex(idx),
+                        src: dst,
+                    });
+                    self.codegen.free_reg(dst);
+                }
+
+                self.codegen
+                    .add_export(ExportRecord::Default { local: name });
+            }
+
+            ExportDefaultDeclarationKind::ClassDeclaration(_) => {
+                return Err(CompileError::unsupported("Class declarations"));
+            }
+
+            _ => {
+                // Expression: export default expression
+                // Create a local variable to hold the value
+                let local_name = "__default__".to_string();
+                let local_idx = self.codegen.declare_variable(&local_name, false)?;
+
+                // Compile the expression
+                let expr = export.declaration.to_expression();
+                let reg = self.compile_expression(expr)?;
+
+                // Store in local
+                self.codegen.emit(Instruction::SetLocal {
+                    idx: LocalIndex(local_idx),
+                    src: reg,
+                });
+                self.codegen.free_reg(reg);
+
+                self.codegen
+                    .add_export(ExportRecord::Default { local: local_name });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Compile an export all declaration
+    ///
+    /// export * from './module.js'
+    fn compile_export_all_declaration(
+        &mut self,
+        export: &ExportAllDeclaration,
+    ) -> CompileResult<()> {
+        let specifier = export.source.value.to_string();
+        self.codegen
+            .add_export(ExportRecord::ReExportAll { specifier });
+        Ok(())
+    }
+
+    /// Compile a TypeScript enum declaration
+    ///
+    /// enum Color { Red, Green, Blue }
+    /// Compiles to object with bidirectional mapping:
+    /// { Red: 0, Green: 1, Blue: 2, 0: "Red", 1: "Green", 2: "Blue" }
+    fn compile_ts_enum_declaration(&mut self, decl: &TSEnumDeclaration) -> CompileResult<()> {
+        let enum_name = decl.id.name.as_str();
+
+        // Declare variable for the enum
+        let local_idx = self.codegen.declare_variable(enum_name, true)?;
+
+        // Create enum object
+        let enum_obj = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::NewObject { dst: enum_obj });
+
+        // Iterate members
+        let mut auto_value: i64 = 0;
+
+        for member in &decl.body.members {
+            let member_name = match &member.id {
+                TSEnumMemberName::Identifier(id) => id.name.to_string(),
+                TSEnumMemberName::String(s) => s.value.to_string(),
+                TSEnumMemberName::ComputedString(s) => s.value.to_string(),
+                TSEnumMemberName::ComputedTemplateString(_) => {
+                    // Template string enum member - not supported for now
+                    continue;
+                }
+            };
+
+            // Compute value
+            let is_numeric = if let Some(init) = &member.initializer {
+                // Has explicit initializer
+                let val_reg = self.compile_expression(init)?;
+
+                // Set forward mapping: Color["Red"] = value
+                let name_idx = self.codegen.add_string(&member_name);
+                self.codegen.emit(Instruction::SetPropConst {
+                    obj: enum_obj,
+                    name: name_idx,
+                    val: val_reg,
+                });
+
+                // For numeric values, also set reverse mapping
+                // We check if it's a numeric literal to set reverse mapping
+                let is_numeric = matches!(init, Expression::NumericLiteral(_));
+                if is_numeric {
+                    // Set reverse mapping: Color[value] = "Red"
+                    let str_val = self.codegen.alloc_reg();
+                    let str_idx = self.codegen.add_string(&member_name);
+                    self.codegen.emit(Instruction::LoadConst {
+                        dst: str_val,
+                        idx: str_idx,
+                    });
+                    self.codegen.emit(Instruction::SetProp {
+                        obj: enum_obj,
+                        key: val_reg,
+                        val: str_val,
+                    });
+                    self.codegen.free_reg(str_val);
+
+                    // Update auto_value if numeric literal
+                    if let Expression::NumericLiteral(lit) = init {
+                        auto_value = lit.value as i64 + 1;
+                    }
+                }
+
+                self.codegen.free_reg(val_reg);
+                is_numeric
+            } else {
+                // Auto-increment numeric value
+                let val_reg = self.codegen.alloc_reg();
+                self.codegen.emit(Instruction::LoadInt32 {
+                    dst: val_reg,
+                    value: auto_value as i32,
+                });
+
+                // Set forward mapping: Color["Red"] = 0
+                let name_idx = self.codegen.add_string(&member_name);
+                self.codegen.emit(Instruction::SetPropConst {
+                    obj: enum_obj,
+                    name: name_idx,
+                    val: val_reg,
+                });
+
+                // Set reverse mapping: Color[0] = "Red"
+                let str_val = self.codegen.alloc_reg();
+                let str_idx = self.codegen.add_string(&member_name);
+                self.codegen.emit(Instruction::LoadConst {
+                    dst: str_val,
+                    idx: str_idx,
+                });
+                self.codegen.emit(Instruction::SetProp {
+                    obj: enum_obj,
+                    key: val_reg,
+                    val: str_val,
+                });
+                self.codegen.free_reg(str_val);
+                self.codegen.free_reg(val_reg);
+
+                auto_value += 1;
+                true
+            };
+
+            // For string enums (non-numeric), no reverse mapping
+            let _ = is_numeric;
+        }
+
+        // Store enum object in variable
+        self.codegen.emit(Instruction::SetLocal {
+            idx: LocalIndex(local_idx),
+            src: enum_obj,
+        });
+        self.codegen.free_reg(enum_obj);
+
+        Ok(())
+    }
+
+    /// Compile a TypeScript module/namespace declaration
+    ///
+    /// namespace Foo { export const x = 1; }
+    fn compile_ts_module_declaration(&mut self, decl: &TSModuleDeclaration) -> CompileResult<()> {
+        // Get namespace name
+        let ns_name = match &decl.id {
+            TSModuleDeclarationName::Identifier(id) => id.name.to_string(),
+            TSModuleDeclarationName::StringLiteral(s) => s.value.to_string(),
+        };
+
+        // Declare variable for the namespace
+        let local_idx = self.codegen.declare_variable(&ns_name, false)?;
+
+        // Create namespace object
+        let ns_obj = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::NewObject { dst: ns_obj });
+
+        // Store namespace object first (so recursive references work)
+        self.codegen.emit(Instruction::SetLocal {
+            idx: LocalIndex(local_idx),
+            src: ns_obj,
+        });
+
+        // Compile body if present
+        if let Some(body) = &decl.body {
+            match body {
+                TSModuleDeclarationBody::TSModuleBlock(block) => {
+                    self.codegen.enter_scope();
+
+                    for stmt in &block.body {
+                        // Handle exports within namespace differently
+                        match stmt {
+                            Statement::ExportNamedDeclaration(export) => {
+                                // Compile the declaration
+                                if let Some(inner_decl) = &export.declaration {
+                                    match inner_decl {
+                                        Declaration::VariableDeclaration(var_decl) => {
+                                            self.compile_variable_declaration(var_decl)?;
+
+                                            // Add to namespace object
+                                            for declarator in &var_decl.declarations {
+                                                if let BindingPattern::BindingIdentifier(ident) =
+                                                    &declarator.id
+                                                {
+                                                    let val =
+                                                        self.compile_identifier(&ident.name)?;
+                                                    let name_idx =
+                                                        self.codegen.add_string(&ident.name);
+                                                    self.codegen.emit(Instruction::SetPropConst {
+                                                        obj: ns_obj,
+                                                        name: name_idx,
+                                                        val,
+                                                    });
+                                                    self.codegen.free_reg(val);
+                                                }
+                                            }
+                                        }
+                                        Declaration::FunctionDeclaration(func) => {
+                                            self.compile_function_declaration(func)?;
+
+                                            if let Some(id) = &func.id {
+                                                let val = self.compile_identifier(&id.name)?;
+                                                let name_idx = self.codegen.add_string(&id.name);
+                                                self.codegen.emit(Instruction::SetPropConst {
+                                                    obj: ns_obj,
+                                                    name: name_idx,
+                                                    val,
+                                                });
+                                                self.codegen.free_reg(val);
+                                            }
+                                        }
+                                        _ => {
+                                            // Other declarations (classes, etc.)
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                // Non-export statements - compile normally
+                                self.compile_statement(stmt)?;
+                            }
+                        }
+                    }
+
+                    self.codegen.exit_scope();
+                }
+                TSModuleDeclarationBody::TSModuleDeclaration(nested) => {
+                    // Nested namespace: namespace A.B.C { }
+                    self.compile_ts_module_declaration(nested)?;
+                }
+            }
+        }
+
+        self.codegen.free_reg(ns_obj);
+        Ok(())
     }
 
     /// Compile a variable declaration
@@ -262,6 +749,7 @@ impl Compiler {
     /// Compile a function declaration
     fn compile_function_declaration(&mut self, func: &oxc_ast::ast::Function) -> CompileResult<()> {
         let name = func.id.as_ref().map(|id| id.name.to_string());
+        let is_async = func.r#async;
 
         // Declare function in current scope
         if let Some(ref n) = name {
@@ -270,6 +758,7 @@ impl Compiler {
 
         // Enter function context
         self.codegen.enter_function(name.clone());
+        self.codegen.current.flags.is_async = is_async;
 
         // Declare parameters
         for param in &func.params.items {
@@ -279,6 +768,16 @@ impl Compiler {
                     self.codegen.current.param_count += 1;
                 }
                 _ => return Err(CompileError::unsupported("Complex parameter patterns")),
+            }
+        }
+
+        // Check for rest parameter at function level
+        if let Some(rest) = &func.params.rest {
+            if let BindingPattern::BindingIdentifier(ident) = &rest.rest.argument {
+                self.codegen.declare_variable(&ident.name, false)?;
+                self.codegen.current.flags.has_rest = true;
+            } else {
+                return Err(CompileError::unsupported("Complex rest parameter pattern"));
             }
         }
 
@@ -300,10 +799,17 @@ impl Compiler {
             && let Some(ResolvedBinding::Local(idx)) = self.codegen.resolve_variable(&n)
         {
             let dst = self.codegen.alloc_reg();
-            self.codegen.emit(Instruction::Closure {
-                dst,
-                func: otter_vm_bytecode::FunctionIndex(func_idx),
-            });
+            if is_async {
+                self.codegen.emit(Instruction::AsyncClosure {
+                    dst,
+                    func: otter_vm_bytecode::FunctionIndex(func_idx),
+                });
+            } else {
+                self.codegen.emit(Instruction::Closure {
+                    dst,
+                    func: otter_vm_bytecode::FunctionIndex(func_idx),
+                });
+            }
             self.codegen.emit(Instruction::SetLocal {
                 idx: LocalIndex(idx),
                 src: dst,
@@ -320,9 +826,11 @@ impl Compiler {
         func: &oxc_ast::ast::Function,
     ) -> CompileResult<Register> {
         let name = func.id.as_ref().map(|id| id.name.to_string());
+        let is_async = func.r#async;
 
         // Enter function context
         self.codegen.enter_function(name);
+        self.codegen.current.flags.is_async = is_async;
 
         // Declare parameters
         for param in &func.params.items {
@@ -332,6 +840,16 @@ impl Compiler {
                     self.codegen.current.param_count += 1;
                 }
                 _ => return Err(CompileError::unsupported("Complex parameter patterns")),
+            }
+        }
+
+        // Check for rest parameter at function level
+        if let Some(rest) = &func.params.rest {
+            if let BindingPattern::BindingIdentifier(ident) = &rest.rest.argument {
+                self.codegen.declare_variable(&ident.name, false)?;
+                self.codegen.current.flags.has_rest = true;
+            } else {
+                return Err(CompileError::unsupported("Complex rest parameter pattern"));
             }
         }
 
@@ -350,10 +868,17 @@ impl Compiler {
 
         // Create closure
         let dst = self.codegen.alloc_reg();
-        self.codegen.emit(Instruction::Closure {
-            dst,
-            func: otter_vm_bytecode::FunctionIndex(func_idx),
-        });
+        if is_async {
+            self.codegen.emit(Instruction::AsyncClosure {
+                dst,
+                func: otter_vm_bytecode::FunctionIndex(func_idx),
+            });
+        } else {
+            self.codegen.emit(Instruction::Closure {
+                dst,
+                func: otter_vm_bytecode::FunctionIndex(func_idx),
+            });
+        }
 
         Ok(dst)
     }
@@ -363,9 +888,12 @@ impl Compiler {
         &mut self,
         arrow: &ArrowFunctionExpression,
     ) -> CompileResult<Register> {
+        let is_async = arrow.r#async;
+
         // Enter function context
         self.codegen.enter_function(None);
         self.codegen.current.flags.is_arrow = true;
+        self.codegen.current.flags.is_async = is_async;
 
         // Declare parameters
         for param in &arrow.params.items {
@@ -375,6 +903,16 @@ impl Compiler {
                     self.codegen.current.param_count += 1;
                 }
                 _ => return Err(CompileError::unsupported("Complex parameter patterns")),
+            }
+        }
+
+        // Check for rest parameter at function level
+        if let Some(rest) = &arrow.params.rest {
+            if let BindingPattern::BindingIdentifier(ident) = &rest.rest.argument {
+                self.codegen.declare_variable(&ident.name, false)?;
+                self.codegen.current.flags.has_rest = true;
+            } else {
+                return Err(CompileError::unsupported("Complex rest parameter pattern"));
             }
         }
 
@@ -402,10 +940,17 @@ impl Compiler {
 
         // Create closure
         let dst = self.codegen.alloc_reg();
-        self.codegen.emit(Instruction::Closure {
-            dst,
-            func: otter_vm_bytecode::FunctionIndex(func_idx),
-        });
+        if is_async {
+            self.codegen.emit(Instruction::AsyncClosure {
+                dst,
+                func: otter_vm_bytecode::FunctionIndex(func_idx),
+            });
+        } else {
+            self.codegen.emit(Instruction::Closure {
+                dst,
+                func: otter_vm_bytecode::FunctionIndex(func_idx),
+            });
+        }
 
         Ok(dst)
     }
@@ -489,8 +1034,39 @@ impl Compiler {
 
             Expression::UpdateExpression(update) => self.compile_update_expression(update),
 
+            Expression::AwaitExpression(await_expr) => self.compile_await_expression(await_expr),
+
+            // TypeScript expressions - type erasure (compile inner expression, ignore type)
+            Expression::TSAsExpression(expr) => self.compile_expression(&expr.expression),
+
+            Expression::TSSatisfiesExpression(expr) => self.compile_expression(&expr.expression),
+
+            Expression::TSTypeAssertion(expr) => self.compile_expression(&expr.expression),
+
+            Expression::TSNonNullExpression(expr) => self.compile_expression(&expr.expression),
+
+            Expression::TSInstantiationExpression(expr) => {
+                self.compile_expression(&expr.expression)
+            }
+
             _ => Err(CompileError::unsupported("Unknown expression type")),
         }
+    }
+
+    /// Compile an await expression
+    fn compile_await_expression(
+        &mut self,
+        await_expr: &oxc_ast::ast::AwaitExpression,
+    ) -> CompileResult<Register> {
+        // Compile the argument (promise)
+        let src = self.compile_expression(&await_expr.argument)?;
+
+        // Emit await instruction
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::Await { dst, src });
+        self.codegen.free_reg(src);
+
+        Ok(dst)
     }
 
     /// Compile an identifier reference
@@ -556,7 +1132,7 @@ impl Compiler {
                 return Err(CompileError::unsupported(format!(
                     "Binary operator: {:?}",
                     binary.operator
-                )))
+                )));
             }
         };
 
@@ -581,7 +1157,7 @@ impl Compiler {
                 return Err(CompileError::unsupported(format!(
                     "Unary operator: {:?}",
                     unary.operator
-                )))
+                )));
             }
         };
 
@@ -651,29 +1227,111 @@ impl Compiler {
         // Compile callee
         let func = self.compile_expression(&call.callee)?;
 
-        // Compile arguments - collect them first
-        let argc = call.arguments.len() as u8;
-        let mut arg_regs = Vec::with_capacity(call.arguments.len());
+        // Check if we have any spread arguments
+        let has_spread = call
+            .arguments
+            .iter()
+            .any(|arg| matches!(arg, Argument::SpreadElement(_)));
 
+        if has_spread {
+            // Handle spread arguments
+            self.compile_call_with_spread(call, func)
+        } else {
+            // Regular call without spread
+            // Arguments MUST be at func+1, func+2, ... for the Call instruction
+            let argc = call.arguments.len() as u8;
+
+            // Reserve registers for arguments right after func
+            let mut reserved = Vec::with_capacity(call.arguments.len());
+            for _ in 0..call.arguments.len() {
+                reserved.push(self.codegen.alloc_reg());
+            }
+
+            // Compile each argument and move to its designated register
+            for (i, arg) in call.arguments.iter().enumerate() {
+                let temp = self.compile_expression(arg.to_expression())?;
+                let target = Register(func.0 + 1 + i as u8);
+                if temp.0 != target.0 {
+                    self.codegen.emit(Instruction::Move { dst: target, src: temp });
+                    self.codegen.free_reg(temp);
+                }
+            }
+
+            // Allocate dst register (will be after all args)
+            let dst = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::Call { dst, func, argc });
+
+            // Free func and reserved arg registers
+            self.codegen.free_reg(func);
+            for reg in reserved {
+                self.codegen.free_reg(reg);
+            }
+
+            Ok(dst)
+        }
+    }
+
+    /// Compile a call expression with spread arguments
+    fn compile_call_with_spread(
+        &mut self,
+        call: &CallExpression,
+        func: Register,
+    ) -> CompileResult<Register> {
+        // Create an array to hold all arguments (including spread)
+        let args_arr = self.codegen.alloc_reg();
+        self.codegen
+            .emit(Instruction::NewArray { dst: args_arr, len: 0 });
+
+        // Process each argument
         for arg in &call.arguments {
             match arg {
-                Argument::SpreadElement(_) => {
-                    return Err(CompileError::unsupported("Spread arguments"));
+                Argument::SpreadElement(spread) => {
+                    // Spread the array: concat elements to args_arr
+                    let spread_val = self.compile_expression(&spread.argument)?;
+
+                    // Use Spread instruction to expand and concat
+                    self.codegen.emit(Instruction::Spread {
+                        dst: args_arr,
+                        src: spread_val,
+                    });
+                    self.codegen.free_reg(spread_val);
                 }
                 _ => {
-                    let reg = self.compile_expression(arg.to_expression())?;
-                    arg_regs.push(reg);
+                    // Regular argument: push to array
+                    let arg_val = self.compile_expression(arg.to_expression())?;
+
+                    // Get current length to use as index
+                    let len_name = self.codegen.add_string("length");
+                    let len_reg = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::GetPropConst {
+                        dst: len_reg,
+                        obj: args_arr,
+                        name: len_name,
+                    });
+
+                    // Set element at current length
+                    self.codegen.emit(Instruction::SetElem {
+                        arr: args_arr,
+                        idx: len_reg,
+                        val: arg_val,
+                    });
+
+                    self.codegen.free_reg(len_reg);
+                    self.codegen.free_reg(arg_val);
                 }
             }
         }
 
-        // Free argument registers after we're done with them
-        for reg in arg_regs.iter().rev() {
-            self.codegen.free_reg(*reg);
-        }
-
+        // Emit CallSpread instruction
         let dst = self.codegen.alloc_reg();
-        self.codegen.emit(Instruction::Call { dst, func, argc });
+        self.codegen.emit(Instruction::CallSpread {
+            dst,
+            func,
+            argc: 0, // All args are in the spread array
+            spread: args_arr,
+        });
+
+        self.codegen.free_reg(args_arr);
         self.codegen.free_reg(func);
 
         Ok(dst)
@@ -684,20 +1342,25 @@ impl Compiler {
         // Compile callee (constructor)
         let func = self.compile_expression(&new_expr.callee)?;
 
+        // Check if we have any spread arguments
+        let has_spread = new_expr
+            .arguments
+            .iter()
+            .any(|arg| matches!(arg, Argument::SpreadElement(_)));
+
+        if has_spread {
+            // For now, spread in new expressions is not supported
+            // This would require a ConstructSpread instruction
+            return Err(CompileError::unsupported("Spread in new expressions"));
+        }
+
         // Compile arguments
         let argc = new_expr.arguments.len() as u8;
         let mut arg_regs = Vec::with_capacity(new_expr.arguments.len());
 
         for arg in &new_expr.arguments {
-            match arg {
-                Argument::SpreadElement(_) => {
-                    return Err(CompileError::unsupported("Spread arguments"));
-                }
-                _ => {
-                    let reg = self.compile_expression(arg.to_expression())?;
-                    arg_regs.push(reg);
-                }
-            }
+            let reg = self.compile_expression(arg.to_expression())?;
+            arg_regs.push(reg);
         }
 
         // Free argument registers
@@ -706,7 +1369,8 @@ impl Compiler {
         }
 
         let dst = self.codegen.alloc_reg();
-        self.codegen.emit(Instruction::Construct { dst, func, argc });
+        self.codegen
+            .emit(Instruction::Construct { dst, func, argc });
         self.codegen.free_reg(func);
 
         Ok(dst)
@@ -719,13 +1383,11 @@ impl Compiler {
 
         match argument {
             SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => {
-                return self.compile_update_identifier(ident, update.operator, update.prefix);
+                self.compile_update_identifier(ident, update.operator, update.prefix)
             }
-            _ => {
-                return Err(CompileError::unsupported(
-                    "Update expression on non-identifier",
-                ));
-            }
+            _ => Err(CompileError::unsupported(
+                "Update expression on non-identifier",
+            )),
         }
     }
 
@@ -806,7 +1468,10 @@ impl Compiler {
             }
             Some(ResolvedBinding::Global(name)) => {
                 let name_idx = self.codegen.add_string(&name);
-                self.codegen.emit(Instruction::SetGlobal { name: name_idx, src });
+                self.codegen.emit(Instruction::SetGlobal {
+                    name: name_idx,
+                    src,
+                });
             }
             Some(ResolvedBinding::Upvalue { .. }) => {
                 return Err(CompileError::unsupported("Upvalues"));
@@ -814,7 +1479,10 @@ impl Compiler {
             None => {
                 // Undeclared variable - treat as global
                 let name_idx = self.codegen.add_string(name);
-                self.codegen.emit(Instruction::SetGlobal { name: name_idx, src });
+                self.codegen.emit(Instruction::SetGlobal {
+                    name: name_idx,
+                    src,
+                });
             }
         }
         Ok(())
@@ -860,7 +1528,9 @@ impl Compiler {
             match prop {
                 ObjectPropertyKind::ObjectProperty(prop) => {
                     let key = match &prop.key {
-                        PropertyKey::StaticIdentifier(ident) => self.codegen.add_string(&ident.name),
+                        PropertyKey::StaticIdentifier(ident) => {
+                            self.codegen.add_string(&ident.name)
+                        }
                         PropertyKey::StringLiteral(lit) => self.codegen.add_string(&lit.value),
                         _ => return Err(CompileError::unsupported("Computed property keys")),
                     };
@@ -1195,5 +1865,329 @@ mod tests {
             .unwrap();
 
         assert_eq!(module.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_async_function() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("async function fetchData() { return 42; }", "test.js")
+            .unwrap();
+
+        assert_eq!(module.functions.len(), 2);
+        // The async function should have is_async flag
+        assert!(module.functions[1].is_async());
+    }
+
+    #[test]
+    fn test_compile_async_arrow() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("let f = async () => 42;", "test.js")
+            .unwrap();
+
+        assert_eq!(module.functions.len(), 2);
+        assert!(module.functions[1].is_async());
+    }
+
+    #[test]
+    fn test_compile_await() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile(
+                "async function test() { let x = await fetch(); return x; }",
+                "test.js",
+            )
+            .unwrap();
+
+        assert_eq!(module.functions.len(), 2);
+        assert!(module.functions[1].is_async());
+    }
+
+    #[test]
+    fn test_compile_import() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("import { foo } from './module.js';", "test.js")
+            .unwrap();
+
+        assert!(module.is_esm);
+        assert_eq!(module.imports.len(), 1);
+        assert_eq!(module.imports[0].specifier, "./module.js");
+        assert_eq!(module.imports[0].bindings.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_import_default() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("import foo from './module.js';", "test.js")
+            .unwrap();
+
+        assert!(module.is_esm);
+        assert_eq!(module.imports.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_import_namespace() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("import * as utils from './utils.js';", "test.js")
+            .unwrap();
+
+        assert!(module.is_esm);
+        assert_eq!(module.imports.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_export_named() {
+        let compiler = Compiler::new();
+        let module = compiler.compile("export const x = 42;", "test.js").unwrap();
+
+        assert!(module.is_esm);
+        assert_eq!(module.exports.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_export_function() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("export function add(a, b) { return a + b; }", "test.js")
+            .unwrap();
+
+        assert!(module.is_esm);
+        assert_eq!(module.exports.len(), 1);
+        assert_eq!(module.functions.len(), 2); // main + add
+    }
+
+    #[test]
+    fn test_compile_export_default() {
+        let compiler = Compiler::new();
+        let module = compiler.compile("export default 42;", "test.js").unwrap();
+
+        assert!(module.is_esm);
+        assert_eq!(module.exports.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_export_default_function() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("export default function() { return 42; }", "test.js")
+            .unwrap();
+
+        assert!(module.is_esm);
+        assert_eq!(module.exports.len(), 1);
+        assert_eq!(module.functions.len(), 2);
+    }
+
+    #[test]
+    fn test_compile_export_all() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("export * from './other.js';", "test.js")
+            .unwrap();
+
+        assert!(module.is_esm);
+        assert_eq!(module.exports.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_reexport_named() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("export { foo } from './module.js';", "test.js")
+            .unwrap();
+
+        assert!(module.is_esm);
+        assert_eq!(module.exports.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_mixed_imports_exports() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile(
+                r#"
+                import { add } from './math.js';
+                export const result = add(1, 2);
+                export function multiply(a, b) { return a * b; }
+                "#,
+                "test.js",
+            )
+            .unwrap();
+
+        assert!(module.is_esm);
+        assert_eq!(module.imports.len(), 1);
+        assert_eq!(module.exports.len(), 2);
+    }
+
+    // TypeScript tests
+
+    #[test]
+    fn test_compile_ts_type_alias() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("type Foo = string; let x = 42;", "test.ts")
+            .unwrap();
+
+        // Type alias is erased, only variable remains
+        assert_eq!(module.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_ts_interface() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile(
+                "interface User { name: string; } let user = { name: 'Alice' };",
+                "test.ts",
+            )
+            .unwrap();
+
+        // Interface is erased, only variable remains
+        assert_eq!(module.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_ts_as_expression() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("let x = (42 as number);", "test.ts")
+            .unwrap();
+
+        assert_eq!(module.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_ts_type_assertion() {
+        let compiler = Compiler::new();
+        let module = compiler.compile("let x = <number>42;", "test.ts").unwrap();
+
+        assert_eq!(module.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_ts_non_null_assertion() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("let x = null; let y = x!;", "test.ts")
+            .unwrap();
+
+        assert_eq!(module.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_ts_satisfies() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile(
+                "let x = { name: 'test' } satisfies { name: string };",
+                "test.ts",
+            )
+            .unwrap();
+
+        assert_eq!(module.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_ts_enum_basic() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("enum Color { Red, Green, Blue }", "test.ts")
+            .unwrap();
+
+        assert_eq!(module.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_ts_enum_with_values() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("enum Status { Active = 1, Inactive = 2 }", "test.ts")
+            .unwrap();
+
+        assert_eq!(module.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_ts_string_enum() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile(r#"enum Direction { Up = "UP", Down = "DOWN" }"#, "test.ts")
+            .unwrap();
+
+        assert_eq!(module.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_ts_function_with_types() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile(
+                "function add(a: number, b: number): number { return a + b; }",
+                "test.ts",
+            )
+            .unwrap();
+
+        assert_eq!(module.functions.len(), 2);
+    }
+
+    #[test]
+    fn test_compile_ts_generic_function() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("function identity<T>(x: T): T { return x; }", "test.ts")
+            .unwrap();
+
+        assert_eq!(module.functions.len(), 2);
+    }
+
+    #[test]
+    fn test_compile_ts_arrow_with_types() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile(
+                "let add = (a: number, b: number): number => a + b;",
+                "test.ts",
+            )
+            .unwrap();
+
+        assert_eq!(module.functions.len(), 2);
+    }
+
+    #[test]
+    fn test_compile_ts_namespace() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("namespace Utils { export const PI = 3.14; }", "test.ts")
+            .unwrap();
+
+        assert_eq!(module.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_ts_mixed() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile(
+                r#"
+                type ID = string | number;
+                interface User {
+                    id: ID;
+                    name: string;
+                }
+                enum Role { Admin, User }
+                function createUser(name: string): User {
+                    return { id: 1, name };
+                }
+                const admin = createUser("Admin") as User;
+                "#,
+                "test.ts",
+            )
+            .unwrap();
+
+        // 1 main function + 1 createUser function
+        assert_eq!(module.functions.len(), 2);
     }
 }

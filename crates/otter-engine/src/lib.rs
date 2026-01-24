@@ -32,11 +32,10 @@
 //! }
 //! ```
 
-// Own modules (ESM loader, graph, node builtins)
+// Own modules (ESM loader, graph)
 pub mod error;
 pub mod graph;
 pub mod loader;
-pub mod node_builtins;
 
 // Re-export own types
 pub use error::{EngineError, EngineResult};
@@ -44,7 +43,6 @@ pub use graph::{ImportRecord, ModuleGraph, ModuleNode, parse_imports};
 pub use loader::{
     ImportContext, LoaderConfig, ModuleLoader, ModuleType, ResolvedModule, SourceType,
 };
-pub use node_builtins::normalize_node_builtin;
 
 // ============================================================================
 // Re-exports from VM crates

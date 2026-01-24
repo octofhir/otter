@@ -1,8 +1,0 @@
-{
-  "_comment": "Test include/exclude patterns (regex)",
-  "_updated": "2026-01-21",
-
-  "include": [],
-
-  "exclude": []
-}

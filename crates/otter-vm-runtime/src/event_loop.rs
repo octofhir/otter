@@ -940,7 +940,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_immediate_fires_after_timeout() {
-        // Per Node.js semantics: timers phase runs before check (immediate) phase
+        // Per spec: timers phase runs before check (immediate) phase
         let order = Arc::new(Mutex::new(Vec::new()));
 
         let order1 = order.clone();
@@ -967,7 +967,7 @@ mod tests {
         event_loop.run_until_complete_async().await;
 
         let result = order.lock();
-        // Timers run before immediates (Node.js semantics)
+        // Timers run before immediates
         assert_eq!(*result, vec!["timeout", "immediate"]);
     }
 

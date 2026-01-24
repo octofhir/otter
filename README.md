@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
 ## Runtime Features (current)
 
 - Custom bytecode VM + JS/TS compiler with TypeScript support out of the box
-- ESM and CommonJS module loader with node-style resolution and import maps
+- ESM and CommonJS module loader with resolution and import maps
 - Remote modules over `https://` with allowlist-based security
 - Capability-based permissions for `read`, `write`, `net`, and `env`
 - Web-compatible `fetch` with `Headers`, `Request`, and `Response`
@@ -89,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
 
 ## Status
 
-Otter is actively evolving. Node.js compatibility and package ecosystem support are in progress (see `crates/otter-node` and `crates/otter-pm`). Expect regular additions to the runtime surface — follow `ROADMAP.md` for planned work.
+Otter is actively evolving. The package ecosystem support is in progress (see `crates/otter-pm`). Expect regular additions to the runtime surface — follow `ROADMAP.md` for planned work.
 
 ## Project Structure
 
@@ -102,7 +102,6 @@ crates/
 ├── otter-vm-runtime   # Runtime with builtins
 ├── otter-vm-builtins  # Built-in functions and JS shims
 ├── otter-engine       # Module loader, capabilities, extensions
-├── otter-node         # Node.js compatibility layer (in progress)
 ├── otter-pm           # Package manager integration (in progress)
 ├── otter-sql          # SQL extension (SQLite + PostgreSQL)
 ├── otter-kv           # Key-value store extension

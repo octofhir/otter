@@ -2,11 +2,9 @@
 //!
 //! Supports loading modules from:
 //! - Local files via oxc-resolver (node_modules, tsconfig paths, etc.)
-//! - `node:` URLs for Node.js built-in modules
 //! - `https://` URLs for remote modules (with allowlist-based security)
 
 use crate::error::{EngineError, EngineResult};
-use crate::node_builtins::normalize_node_builtin;
 use oxc_resolver::{ResolveOptions, Resolver};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -251,20 +249,12 @@ impl ModuleLoader {
             return Ok(format!("otter:{}", specifier));
         }
 
-        // Node.js built-in modules
+        // node: imports are not supported - use otter: builtins instead
         if specifier.starts_with("node:") {
-            let Some(name) = normalize_node_builtin(specifier) else {
-                return Err(EngineError::ModuleError(format!(
-                    "Unsupported Node.js builtin module '{}'.\n\
-Only known node:* builtins are allowed for compatibility.\n\
-If you meant to import an npm package, remove the 'node:' prefix.",
-                    specifier
-                )));
-            };
-            return Ok(format!("node:{}", name));
-        }
-        if let Some(name) = normalize_node_builtin(specifier) {
-            return Ok(format!("node:{}", name));
+            return Err(EngineError::ModuleError(format!(
+                "Node.js built-in modules are not supported.\n\
+Use Otter built-in modules (otter:*) instead, or install npm packages.",
+            )));
         }
 
         // Absolute URLs (https://, http://)
@@ -324,10 +314,6 @@ If you meant to import an npm package, remove the 'node:' prefix.",
         // Otter built-in modules (e.g., "otter")
         if let Some(builtin) = url.strip_prefix("otter:") {
             return self.load_otter_builtin(builtin);
-        }
-
-        if let Some(builtin) = url.strip_prefix("node:") {
-            return self.load_node_builtin(builtin);
         }
 
         if let Some(path) = url.strip_prefix("file://") {
@@ -415,17 +401,6 @@ If you meant to import an npm package, remove the 'node:' prefix.",
             source,
             source_type: Self::source_type_from_url(url),
             module_type: Self::module_type_from_url(url),
-        })
-    }
-
-    /// Load a Node.js built-in module
-    fn load_node_builtin(&self, name: &str) -> EngineResult<ResolvedModule> {
-        Ok(ResolvedModule {
-            specifier: format!("node:{}", name),
-            url: format!("node:{}", name),
-            source: String::new(),
-            source_type: SourceType::JavaScript,
-            module_type: ModuleType::ESM, // Node builtins are exposed as ESM
         })
     }
 
@@ -576,45 +551,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_resolve_node_builtin() {
+    fn test_resolve_node_imports_rejected() {
         let loader = ModuleLoader::new(LoaderConfig::default());
-        let result = loader.resolve("node:fs", None).unwrap();
-        assert_eq!(result, "node:fs");
-    }
-
-    #[test]
-    fn test_resolve_node_builtin_path() {
-        let loader = ModuleLoader::new(LoaderConfig::default());
-        let result = loader.resolve("node:path", None).unwrap();
-        assert_eq!(result, "node:path");
-    }
-
-    #[test]
-    fn test_resolve_supported_node_builtin_bare() {
-        let loader = ModuleLoader::new(LoaderConfig::default());
-        let result = loader.resolve("util", None).unwrap();
-        assert_eq!(result, "node:util");
-    }
-
-    #[test]
-    fn test_resolve_supported_node_builtin_subpath_bare() {
-        let loader = ModuleLoader::new(LoaderConfig::default());
-        let result = loader.resolve("fs/promises", None).unwrap();
-        assert_eq!(result, "node:fs/promises");
-    }
-
-    #[test]
-    fn test_resolve_supported_node_builtin_subpath_prefixed() {
-        let loader = ModuleLoader::new(LoaderConfig::default());
-        let result = loader.resolve("node:fs/promises", None).unwrap();
-        assert_eq!(result, "node:fs/promises");
-    }
-
-    #[test]
-    fn test_resolve_unknown_node_builtin_rejected() {
-        let loader = ModuleLoader::new(LoaderConfig::default());
-        let result = loader.resolve("node:not_a_real_builtin", None);
+        let result = loader.resolve("node:fs", None);
         assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not supported"));
     }
 
     #[test]

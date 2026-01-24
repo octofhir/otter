@@ -1,3 +1,0 @@
-# This file ensures the reports directory exists in git
-# Report files (latest.json, history/) are gitignored
-# Only baseline.json is committed for regression detection

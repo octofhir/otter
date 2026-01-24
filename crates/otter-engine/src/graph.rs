@@ -196,8 +196,7 @@ impl ModuleGraph {
         let module_url = module.url.clone();
 
         // Skip parsing dependencies for built-ins (they have no source)
-        let (dependencies, import_records) =
-            if module.url.starts_with("node:") || module.url.starts_with("otter:") {
+        let (dependencies, import_records) = if module.url.starts_with("otter:") {
                 (Vec::new(), Vec::new())
             } else {
                 // Parse dependencies based on module type (ESM or CommonJS)
@@ -270,7 +269,7 @@ impl ModuleGraph {
         // Now recursively load dependencies
         // If any dependency tries to import us, we're already in the graph
         // Note: We continue on resolution errors to support optional dependencies
-        // (common in Node.js ecosystem where packages use try/catch around require)
+        // (packages may use try/catch around dynamic imports)
         for dep in &dependencies {
             let dep_context = if importer_type.is_commonjs() {
                 ImportContext::CJS
@@ -283,7 +282,6 @@ impl ModuleGraph {
 
             if let Err(_e) = result {
                 // Don't fail - dependency might be optional (try/catch in source)
-                // This is common in Node.js ecosystem (e.g., pnpapi, fsevents)
             }
         }
 

@@ -6,7 +6,7 @@ description = "Otter JavaScript engine"
 license = "MIT"
 repository = "https://github.com/octofhir/otter"
 homepage = "https://github.com/octofhir/otter"
-keywords = ["typescript", "javascript", "runtime", "engine", "jsc"]
+keywords = ["typescript", "javascript", "runtime", "engine", "vm"]
 categories = ["development-tools", "compilers"]
 readme = "README.md"
 

@@ -1,4 +1,6 @@
 //! Event loop implementation
+//!
+//! Async-only event loop with tokio integration for HTTP server support.
 
 use crate::microtask::MicrotaskQueue;
 use crate::timer::{Immediate, ImmediateId, Timer, TimerCallback, TimerHeapEntry, TimerId};
@@ -7,6 +9,38 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use serde_json::Value as JsonValue;
+use tokio::task::JoinHandle;
+
+/// HTTP event for server request dispatch
+#[derive(Debug, Clone)]
+pub struct HttpEvent {
+    /// Server ID that received the request
+    pub server_id: u64,
+    /// Request ID for this specific request
+    pub request_id: u64,
+}
+
+/// WebSocket event for server dispatch
+#[derive(Debug, Clone)]
+pub enum WsEvent {
+    Open { server_id: u64, socket_id: u64, data: Option<JsonValue>, remote_addr: Option<String> },
+    Message { server_id: u64, socket_id: u64, data: Vec<u8>, is_text: bool },
+    Close { server_id: u64, socket_id: u64, code: u16, reason: String },
+    Drain { server_id: u64, socket_id: u64 },
+    Ping { server_id: u64, socket_id: u64, data: Vec<u8> },
+    Pong { server_id: u64, socket_id: u64, data: Vec<u8> },
+    Error { server_id: u64, socket_id: u64, message: String },
+}
+
+/// Active server count - shared between event loop and HTTP extension
+pub type ActiveServerCount = Arc<AtomicU64>;
+
+/// HTTP event dispatcher callback type
+pub type HttpDispatcher = Box<dyn Fn(u64, u64) + Send + Sync>;
+/// WebSocket event dispatcher callback type
+pub type WsDispatcher = Box<dyn Fn(WsEvent) + Send + Sync>;
 
 /// HTML5 spec: timers nested more than this level get clamped to MIN_TIMEOUT_MS
 const MAX_TIMER_NESTING_LEVEL: u32 = 5;
@@ -44,10 +78,28 @@ pub struct EventLoop {
     executing_timer_ids: Mutex<HashSet<u64>>,
     /// Tracks IDs of immediates currently being executed (for clearImmediate in callbacks)
     executing_immediate_ids: Mutex<HashSet<u64>>,
+
+    // === HTTP support fields ===
+    /// HTTP events receiver (from HTTP server)
+    http_events_rx: Mutex<Option<mpsc::UnboundedReceiver<HttpEvent>>>,
+    /// Active HTTP servers count
+    active_http_servers: Arc<AtomicU64>,
+    /// HTTP event dispatcher callback
+    http_dispatcher: Mutex<Option<HttpDispatcher>>,
+    /// WebSocket events receiver (from WS server)
+    ws_events_rx: Mutex<Option<mpsc::UnboundedReceiver<WsEvent>>>,
+    /// WebSocket event dispatcher callback
+    ws_dispatcher: Mutex<Option<WsDispatcher>>,
+
+    // === Async operations support ===
+    /// Pending async operations count
+    pending_async_ops: Arc<AtomicU64>,
+    /// Handles for spawned async tasks (for cancellation if needed)
+    async_task_handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl EventLoop {
-    /// Create new event loop
+    /// Create a new event loop
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             timers: Mutex::new(HashMap::new()),
@@ -59,7 +111,37 @@ impl EventLoop {
             running: AtomicBool::new(false),
             executing_timer_ids: Mutex::new(HashSet::new()),
             executing_immediate_ids: Mutex::new(HashSet::new()),
+            // HTTP support
+            http_events_rx: Mutex::new(None),
+            active_http_servers: Arc::new(AtomicU64::new(0)),
+            http_dispatcher: Mutex::new(None),
+            ws_events_rx: Mutex::new(None),
+            ws_dispatcher: Mutex::new(None),
+            // Async ops support
+            pending_async_ops: Arc::new(AtomicU64::new(0)),
+            async_task_handles: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Get the pending async ops counter (for sharing with async op handlers)
+    pub fn get_pending_async_ops_count(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.pending_async_ops)
+    }
+
+    /// Check if there are pending async operations
+    pub fn has_pending_async_ops(&self) -> bool {
+        self.pending_async_ops.load(Ordering::Relaxed) > 0
+    }
+
+    /// Register a spawned async task handle
+    pub fn register_async_task(&self, handle: JoinHandle<()>) {
+        self.async_task_handles.lock().push(handle);
+    }
+
+    /// Clean up completed task handles
+    fn cleanup_completed_tasks(&self) {
+        let mut handles = self.async_task_handles.lock();
+        handles.retain(|h| !h.is_finished());
     }
 
     /// Schedule a one-shot timeout (setTimeout)
@@ -165,7 +247,7 @@ impl EventLoop {
         {
             let executing = self.executing_timer_ids.lock();
             if executing.contains(&id.0) {
-                // Mark cancelled via the timer's flag
+                // Mark canceled via the timer's flag
                 if let Some(timer) = self.timers.lock().get(&id.0) {
                     timer.cancelled.store(true, Ordering::SeqCst);
                     return true;
@@ -279,36 +361,14 @@ impl EventLoop {
         self.microtasks.enqueue(task);
     }
 
-    /// Run the event loop until all tasks complete
-    pub fn run_until_complete(&self) {
-        self.running.store(true, Ordering::Release);
-
-        while self.running.load(Ordering::Acquire) {
-            // 1. Run all microtasks first (highest priority)
-            self.drain_microtasks();
-
-            // 2. Run ready timers
-            self.run_timers();
-
-            // 3. Run immediates
-            self.run_immediates();
-
-            // 4. Check if we should exit
-            if !self.has_pending_tasks() {
-                break;
-            }
-
-            // 5. Sleep until next timer if no immediate work
-            if self.microtasks.is_empty()
-                && self.immediates.lock().is_empty()
-                && let Some(wait) = self.time_until_next_timer()
-            {
-                std::thread::sleep(wait.min(Duration::from_millis(10)));
-            }
-        }
-
-        self.running.store(false, Ordering::Release);
+    /// Get access to the microtask queue
+    ///
+    /// This allows external code to enqueue microtasks for promise callbacks.
+    pub fn microtask_queue(&self) -> &MicrotaskQueue {
+        &self.microtasks
     }
+
+
 
     /// Check if there are pending tasks that keep the loop alive
     pub fn has_pending_tasks(&self) -> bool {
@@ -352,7 +412,7 @@ impl EventLoop {
     fn run_timers(&self) {
         let now = Instant::now();
 
-        // Collect due timer IDs from heap
+        // Collect due timer IDs from a heap
         let mut due_ids = Vec::new();
         {
             let mut heap = self.timer_heap.lock();
@@ -551,6 +611,205 @@ impl EventLoop {
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
     }
+
+    // === HTTP support methods ===
+
+    /// Set the HTTP events receiver channel
+    pub fn set_http_receiver(&self, rx: mpsc::UnboundedReceiver<HttpEvent>) {
+        *self.http_events_rx.lock() = Some(rx);
+    }
+
+    /// Set the HTTP event dispatcher callback
+    ///
+    /// The callback receives (server_id, request_id) and should call the JS handler
+    pub fn set_http_dispatcher<F>(&self, dispatcher: F)
+    where
+        F: Fn(u64, u64) + Send + Sync + 'static,
+    {
+        *self.http_dispatcher.lock() = Some(Box::new(dispatcher));
+    }
+
+    /// Set the WebSocket events receiver channel
+    pub fn set_ws_receiver(&self, rx: mpsc::UnboundedReceiver<WsEvent>) {
+        *self.ws_events_rx.lock() = Some(rx);
+    }
+
+    /// Set the WebSocket event dispatcher callback
+    pub fn set_ws_dispatcher<F>(&self, dispatcher: F)
+    where
+        F: Fn(WsEvent) + Send + Sync + 'static,
+    {
+        *self.ws_dispatcher.lock() = Some(Box::new(dispatcher));
+    }
+
+    /// Get the active HTTP servers counter
+    ///
+    /// This is shared with the HTTP extension to track when servers start/stop
+    pub fn get_active_server_count(&self) -> ActiveServerCount {
+        Arc::clone(&self.active_http_servers)
+    }
+
+    /// Check if there are active HTTP servers
+    pub fn has_active_http_servers(&self) -> bool {
+        self.active_http_servers.load(Ordering::Relaxed) > 0
+    }
+
+    /// Poll HTTP events and dispatch them
+    ///
+    /// Collects all pending events first, then dispatches them to avoid
+    /// holding locks during JS execution.
+    fn poll_http_events(&self) {
+        // Collect pending events without holding lock during dispatch
+        let events: Vec<HttpEvent> = {
+            let mut rx_guard = self.http_events_rx.lock();
+            if let Some(rx) = rx_guard.as_mut() {
+                let mut events = Vec::with_capacity(16); // Pre-allocate for common case
+                while let Ok(event) = rx.try_recv() {
+                    events.push(event);
+                }
+                events
+            } else {
+                return;
+            }
+        };
+
+        if events.is_empty() {
+            return;
+        }
+
+        // Dispatch each event and run microtasks after
+        for event in events {
+            // Get dispatcher for each event (allows it to be changed during execution)
+            let dispatcher = self.http_dispatcher.lock();
+            if let Some(ref dispatch_fn) = *dispatcher {
+                dispatch_fn(event.server_id, event.request_id);
+            } else {
+                break;
+            }
+            // Drop lock before running microtasks
+            drop(dispatcher);
+            // Run microtasks after each dispatch for proper Promise resolution
+            self.drain_microtasks();
+        }
+    }
+
+    /// Poll WebSocket events and dispatch them
+    fn poll_ws_events(&self) {
+        let events: Vec<WsEvent> = {
+            let mut rx_guard = self.ws_events_rx.lock();
+            if let Some(rx) = rx_guard.as_mut() {
+                let mut events = Vec::with_capacity(16);
+                while let Ok(event) = rx.try_recv() {
+                    events.push(event);
+                }
+                events
+            } else {
+                return;
+            }
+        };
+
+        if events.is_empty() {
+            return;
+        }
+
+        for event in events {
+            let dispatcher = self.ws_dispatcher.lock();
+            if let Some(ref dispatch_fn) = *dispatcher {
+                dispatch_fn(event);
+            } else {
+                break;
+            }
+            drop(dispatcher);
+            self.drain_microtasks();
+        }
+    }
+
+    /// Take all pending HTTP events (for external dispatch)
+    ///
+    /// Returns collected events and clears the queue. This is used when
+    /// the runtime needs to dispatch events with access to VmContext.
+    pub fn take_http_events(&self) -> Vec<HttpEvent> {
+        let mut rx_guard = self.http_events_rx.lock();
+        if let Some(rx) = rx_guard.as_mut() {
+            let mut events = Vec::with_capacity(16);
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            events
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Take all pending WebSocket events
+    pub fn take_ws_events(&self) -> Vec<WsEvent> {
+        let mut rx_guard = self.ws_events_rx.lock();
+        if let Some(rx) = rx_guard.as_mut() {
+            let mut events = Vec::with_capacity(16);
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            events
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Run the event loop asynchronously with tokio
+    ///
+    /// This version supports HTTP server events and integrates with tokio for I/O.
+    /// Use this when running HTTP servers or other async operations.
+    pub async fn run_until_complete_async(&self) {
+        self.running.store(true, Ordering::Release);
+
+        loop {
+            if !self.running.load(Ordering::Acquire) {
+                break;
+            }
+
+            // 1. Poll HTTP events (non-blocking)
+            self.poll_http_events();
+            // 1b. Poll WebSocket events (non-blocking)
+            self.poll_ws_events();
+
+            // 2. Run all microtasks first (highest priority)
+            self.drain_microtasks();
+
+            // 3. Run ready timers
+            self.run_timers();
+
+            // 4. Run immediates
+            self.run_immediates();
+
+            // 5. Clean up completed async task handles
+            self.cleanup_completed_tasks();
+
+            // 6. Check if we should exit
+            let has_tasks = self.has_pending_tasks();
+            let has_servers = self.has_active_http_servers();
+            let has_async_ops = self.has_pending_async_ops();
+
+            if !has_tasks && !has_servers && !has_async_ops {
+                break;
+            }
+
+            // 6. Yield to tokio for I/O operations
+            // This allows HTTP server tasks and other async ops to progress
+            tokio::task::yield_now().await;
+
+            // 7. Small sleep if nothing is immediately ready to prevent busy-loop
+            if self.microtasks.is_empty()
+                && self.immediates.lock().is_empty()
+                && !has_servers
+                && let Some(wait) = self.time_until_next_timer()
+            {
+                // Use tokio sleep instead of std::thread::sleep for async compatibility
+                tokio::time::sleep(wait.min(Duration::from_millis(10))).await;
+            }
+        }
+
+        self.running.store(false, Ordering::Release);
+    }
 }
 
 impl Default for EventLoop {
@@ -566,6 +825,16 @@ impl Default for EventLoop {
             running: AtomicBool::new(false),
             executing_timer_ids: Mutex::new(HashSet::new()),
             executing_immediate_ids: Mutex::new(HashSet::new()),
+            // HTTP support
+            http_events_rx: Mutex::new(None),
+            active_http_servers: Arc::new(AtomicU64::new(0)),
+            http_dispatcher: Mutex::new(None),
+            // WebSocket support
+            ws_events_rx: Mutex::new(None),
+            ws_dispatcher: Mutex::new(None),
+            // Async ops support
+            pending_async_ops: Arc::new(AtomicU64::new(0)),
+            async_task_handles: Mutex::new(Vec::new()),
         }
     }
 }
@@ -582,8 +851,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    #[test]
-    fn test_set_timeout() {
+    #[tokio::test]
+    async fn test_set_timeout() {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
 
@@ -595,12 +864,12 @@ mod tests {
             Duration::from_millis(10),
         );
 
-        event_loop.run_until_complete();
+        event_loop.run_until_complete_async().await;
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
-    #[test]
-    fn test_clear_timeout() {
+    #[tokio::test]
+    async fn test_clear_timeout() {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
 
@@ -614,13 +883,13 @@ mod tests {
 
         event_loop.clear_timeout(id);
         // Give it a moment to verify it doesn't fire
-        std::thread::sleep(Duration::from_millis(150));
+        tokio::time::sleep(Duration::from_millis(150)).await;
 
         assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
-    #[test]
-    fn test_microtask() {
+    #[tokio::test]
+    async fn test_microtask() {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
 
@@ -629,12 +898,12 @@ mod tests {
             counter_clone.fetch_add(1, Ordering::Relaxed);
         });
 
-        event_loop.run_until_complete();
+        event_loop.run_until_complete_async().await;
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
-    #[test]
-    fn test_set_immediate() {
+    #[tokio::test]
+    async fn test_set_immediate() {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
 
@@ -646,12 +915,12 @@ mod tests {
             true,
         );
 
-        event_loop.run_until_complete();
+        event_loop.run_until_complete_async().await;
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
-    #[test]
-    fn test_clear_immediate() {
+    #[tokio::test]
+    async fn test_clear_immediate() {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
 
@@ -664,13 +933,13 @@ mod tests {
         );
 
         event_loop.clear_immediate(id);
-        event_loop.run_until_complete();
+        event_loop.run_until_complete_async().await;
 
         assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
-    #[test]
-    fn test_immediate_fires_after_timeout() {
+    #[tokio::test]
+    async fn test_immediate_fires_after_timeout() {
         // Per Node.js semantics: timers phase runs before check (immediate) phase
         let order = Arc::new(Mutex::new(Vec::new()));
 
@@ -695,15 +964,15 @@ mod tests {
             true,
         );
 
-        event_loop.run_until_complete();
+        event_loop.run_until_complete_async().await;
 
         let result = order.lock();
         // Timers run before immediates (Node.js semantics)
         assert_eq!(*result, vec!["timeout", "immediate"]);
     }
 
-    #[test]
-    fn test_microtask_fires_before_immediate() {
+    #[tokio::test]
+    async fn test_microtask_fires_before_immediate() {
         let order = Arc::new(Mutex::new(Vec::new()));
 
         let order1 = order.clone();
@@ -724,14 +993,14 @@ mod tests {
             order2.lock().push("microtask");
         });
 
-        event_loop.run_until_complete();
+        event_loop.run_until_complete_async().await;
 
         let result = order.lock();
         assert_eq!(*result, vec!["microtask", "immediate"]);
     }
 
-    #[test]
-    fn test_unrefed_timer_does_not_keep_loop_alive() {
+    #[tokio::test]
+    async fn test_unrefed_timer_does_not_keep_loop_alive() {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
 
@@ -747,7 +1016,7 @@ mod tests {
         );
 
         // Event loop should exit immediately since timer is unrefed
-        event_loop.run_until_complete();
+        event_loop.run_until_complete_async().await;
 
         // Timer should not have fired
         assert_eq!(counter.load(Ordering::Relaxed), 0);
@@ -756,8 +1025,8 @@ mod tests {
         event_loop.clear_timer(id);
     }
 
-    #[test]
-    fn test_set_interval() {
+    #[tokio::test]
+    async fn test_set_interval() {
         let counter = Arc::new(AtomicUsize::new(0));
         let event_loop = EventLoop::new();
 
@@ -786,14 +1055,14 @@ mod tests {
         *id_holder.lock() = Some(id);
 
         // Run the event loop
-        event_loop.run_until_complete();
+        event_loop.run_until_complete_async().await;
 
         // Should have fired exactly 3 times
         assert_eq!(counter.load(Ordering::Relaxed), 3);
     }
 
-    #[test]
-    fn test_clear_interval() {
+    #[tokio::test]
+    async fn test_clear_interval() {
         let counter = Arc::new(AtomicUsize::new(0));
         let event_loop = EventLoop::new();
 
@@ -816,7 +1085,7 @@ mod tests {
 
         *id_holder.lock() = Some(id);
 
-        event_loop.run_until_complete();
+        event_loop.run_until_complete_async().await;
 
         // Should have fired exactly once (cleared after first fire)
         assert_eq!(counter.load(Ordering::Relaxed), 1);

@@ -40,6 +40,10 @@ pub enum VmError {
     /// Bytecode error
     #[error("Bytecode error: {0}")]
     Bytecode(#[from] otter_vm_bytecode::BytecodeError),
+
+    /// Execution was interrupted (timeout/cancellation)
+    #[error("Execution interrupted")]
+    Interrupted,
 }
 
 /// A thrown JavaScript value
@@ -83,6 +87,11 @@ impl VmError {
     /// Create an internal error
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::InternalError(msg.into())
+    }
+
+    /// Create an interrupted error (for timeout/cancellation)
+    pub fn interrupted() -> Self {
+        Self::Interrupted
     }
 }
 

@@ -11,6 +11,14 @@ categories = ["development-tools", "compilers"]
 readme = "README.md"
 
 [dependencies]
+# VM crates (re-exported for convenience)
+otter-vm-runtime = { path = "../otter-vm-runtime" }
+otter-vm-core = { path = "../otter-vm-core" }
+otter-vm-compiler = { path = "../otter-vm-compiler" }
+otter-vm-bytecode = { path = "../otter-vm-bytecode" }
+otter-vm-builtins = { path = "../otter-vm-builtins" }
+
+# Own dependencies
 tokio = { version = "1", features = ["rt", "sync", "fs"] }
 reqwest = { version = "0.13", features = ["rustls"], default-features = false }
 oxc_resolver = "11.16"
@@ -18,7 +26,6 @@ dirs = "6.0"
 md5 = "0.8"
 regex = "1"
 thiserror.workspace = true
-dunce = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

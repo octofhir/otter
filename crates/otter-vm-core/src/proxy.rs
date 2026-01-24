@@ -12,8 +12,8 @@
 
 use crate::object::JsObject;
 use crate::value::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A JavaScript Proxy object
 ///

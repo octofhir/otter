@@ -10,9 +10,11 @@ const port = parseInt(process.env.PORT || "3001");
 const server = await Otter.serve({
     port,
     hostname: "0.0.0.0",
-    fetch(req: Request): Response {
-        const url = new URL(req.url);
-        const pathname = url.pathname;
+    fetch(req) {
+        const url = req.url || '';
+        const schemeIndex = url.indexOf('://');
+        const pathStart = schemeIndex >= 0 ? url.indexOf('/', schemeIndex + 3) : url.indexOf('/');
+        const pathname = pathStart >= 0 ? url.slice(pathStart).split('?')[0] : '/';
 
         if (pathname === "/") {
             return new Response("Hello, World!");

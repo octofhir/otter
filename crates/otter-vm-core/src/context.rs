@@ -3,11 +3,14 @@
 //! The context holds per-execution state: registers, call stack, locals.
 
 use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::async_context::SavedFrame;
 use crate::error::{VmError, VmResult};
 use crate::object::JsObject;
-use crate::value::Value;
+use crate::value::{UpvalueCell, Value};
 
 /// Maximum call stack depth
 const MAX_STACK_DEPTH: usize = 10000;
@@ -20,18 +23,28 @@ const MAX_REGISTERS: usize = 256;
 pub struct CallFrame {
     /// Function index in the module
     pub function_index: u32,
+    /// The module this function belongs to
+    pub module: std::sync::Arc<otter_vm_bytecode::Module>,
     /// Program counter (instruction index)
     pub pc: usize,
     /// Base register index
     pub register_base: usize,
     /// Local variables
     pub locals: Vec<Value>,
+    /// Captured upvalues (heap-allocated cells for shared mutable access)
+    pub upvalues: Vec<UpvalueCell>,
     /// Return register (where to put the result)
     pub return_register: Option<u8>,
     /// Source location for error reporting
     pub source_location: Option<SourceLocation>,
     /// The `this` value for this call frame
     pub this_value: Value,
+    /// Whether this call is a `new`/constructor invocation
+    pub is_construct: bool,
+    /// Whether this is an async function (return value should be wrapped in Promise)
+    pub is_async: bool,
+    /// Unique frame ID for tracking open upvalues
+    pub frame_id: usize,
 }
 
 /// Source location for error reporting
@@ -59,12 +72,30 @@ pub struct VmContext {
     global: Arc<JsObject>,
     /// Exception state
     exception: Option<Value>,
+    /// Try/catch handler stack (catch pc + frame depth)
+    try_stack: Vec<TryHandler>,
     /// Is context running
     running: bool,
     /// Pending arguments for next call
     pending_args: Vec<Value>,
     /// Pending `this` value for next call
     pending_this: Option<Value>,
+    /// Pending upvalues for next call (captured closure cells)
+    pending_upvalues: Vec<UpvalueCell>,
+    /// Open upvalues: maps (frame_id, local_idx) to the cell.
+    /// When a closure captures a local, we create/reuse a cell here.
+    /// Multiple closures in the same frame share the same cell.
+    open_upvalues: HashMap<(usize, u16), UpvalueCell>,
+    /// Next frame ID counter (monotonically increasing)
+    next_frame_id: usize,
+    /// Interrupt flag for timeout/cancellation support
+    interrupt_flag: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone)]
+struct TryHandler {
+    catch_pc: usize,
+    frame_depth: usize,
 }
 
 impl VmContext {
@@ -75,10 +106,44 @@ impl VmContext {
             call_stack: Vec::with_capacity(64),
             global,
             exception: None,
+            try_stack: Vec::new(),
             running: false,
             pending_args: Vec::new(),
             pending_this: None,
+            pending_upvalues: Vec::new(),
+            open_upvalues: HashMap::new(),
+            next_frame_id: 0,
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Get the interrupt flag for external timeout/cancellation
+    ///
+    /// Call `flag.store(true, Ordering::Relaxed)` to interrupt execution.
+    /// The VM will check this flag periodically and return an error if set.
+    pub fn interrupt_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.interrupt_flag)
+    }
+
+    /// Set a custom interrupt flag (for sharing across contexts)
+    pub fn set_interrupt_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.interrupt_flag = flag;
+    }
+
+    /// Check if execution was interrupted
+    #[inline]
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupt_flag.load(Ordering::Relaxed)
+    }
+
+    /// Request interruption of execution
+    pub fn interrupt(&self) {
+        self.interrupt_flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Clear the interrupt flag
+    pub fn clear_interrupt(&self) {
+        self.interrupt_flag.store(false, Ordering::Relaxed);
     }
 
     /// Get a register value
@@ -108,13 +173,19 @@ impl VmContext {
     }
 
     /// Set a local variable
+    /// If this local has been captured by a closure, also update the shared cell
     #[inline]
     pub fn set_local(&mut self, index: u16, value: Value) -> VmResult<()> {
         let frame = self
             .current_frame_mut()
             .ok_or_else(|| VmError::internal("no call frame"))?;
         if (index as usize) < frame.locals.len() {
-            frame.locals[index as usize] = value;
+            frame.locals[index as usize] = value.clone();
+            // If this local has been captured, update the cell too
+            let frame_id = frame.frame_id;
+            if let Some(cell) = self.open_upvalues.get(&(frame_id, index)) {
+                cell.set(value);
+            }
             Ok(())
         } else {
             Err(VmError::internal(format!(
@@ -127,6 +198,34 @@ impl VmContext {
     /// Get global object
     pub fn global(&self) -> &Arc<JsObject> {
         &self.global
+    }
+
+    /// Push a try handler for the current frame.
+    pub fn push_try(&mut self, catch_pc: usize) {
+        self.try_stack.push(TryHandler {
+            catch_pc,
+            frame_depth: self.call_stack.len(),
+        });
+    }
+
+    /// Pop the most recently pushed try handler.
+    pub fn pop_try(&mut self) {
+        self.try_stack.pop();
+    }
+
+    /// Pop the most recent try handler if it belongs to the current frame.
+    pub fn pop_try_for_current_frame(&mut self) {
+        if let Some(top) = self.try_stack.last()
+            && top.frame_depth == self.call_stack.len()
+        {
+            self.try_stack.pop();
+        }
+    }
+
+    /// Pop and return the nearest try handler.
+    pub fn take_nearest_try(&mut self) -> Option<(usize, usize)> {
+        let handler = self.try_stack.pop()?;
+        Some((handler.frame_depth, handler.catch_pc))
     }
 
     /// Get global variable
@@ -145,8 +244,11 @@ impl VmContext {
     pub fn push_frame(
         &mut self,
         function_index: u32,
+        module: std::sync::Arc<otter_vm_bytecode::Module>,
         local_count: u16,
         return_register: Option<u8>,
+        is_construct: bool,
+        is_async: bool,
     ) -> VmResult<()> {
         if self.call_stack.len() >= MAX_STACK_DEPTH {
             return Err(VmError::StackOverflow);
@@ -176,14 +278,26 @@ impl VmContext {
         // Take pending this value (defaults to undefined)
         let this_value = self.take_pending_this();
 
+        // Take pending upvalues (captured closure cells)
+        let upvalues = self.take_pending_upvalues();
+
+        // Assign a unique frame ID
+        let frame_id = self.next_frame_id;
+        self.next_frame_id += 1;
+
         self.call_stack.push(CallFrame {
             function_index,
+            module,
             pc: 0,
             register_base,
             locals,
+            upvalues,
             return_register,
             source_location: None,
             this_value,
+            is_construct,
+            is_async,
+            frame_id,
         });
 
         Ok(())
@@ -191,6 +305,12 @@ impl VmContext {
 
     /// Pop the current call frame
     pub fn pop_frame(&mut self) -> Option<CallFrame> {
+        if let Some(frame) = self.call_stack.last() {
+            // Clean up open upvalues for this frame
+            // (cells are already synced via set_local updates)
+            let frame_id = frame.frame_id;
+            self.open_upvalues.retain(|(fid, _), _| *fid != frame_id);
+        }
         self.call_stack.pop()
     }
 
@@ -256,6 +376,11 @@ impl VmContext {
         self.exception = None;
     }
 
+    /// Take and clear exception value
+    pub fn take_exception(&mut self) -> Option<Value> {
+        self.exception.take()
+    }
+
     /// Set pending arguments for next function call
     pub fn set_pending_args(&mut self, args: Vec<Value>) {
         self.pending_args = args;
@@ -274,6 +399,100 @@ impl VmContext {
     /// Take pending `this` value (defaults to undefined)
     pub fn take_pending_this(&mut self) -> Value {
         self.pending_this.take().unwrap_or_else(Value::undefined)
+    }
+
+    /// Set pending upvalues for next function call (captured closure cells)
+    pub fn set_pending_upvalues(&mut self, upvalues: Vec<UpvalueCell>) {
+        self.pending_upvalues = upvalues;
+    }
+
+    /// Take pending upvalues (transfers ownership)
+    pub fn take_pending_upvalues(&mut self) -> Vec<UpvalueCell> {
+        std::mem::take(&mut self.pending_upvalues)
+    }
+
+    /// Get an upvalue value from the current call frame
+    #[inline]
+    pub fn get_upvalue(&self, index: u16) -> VmResult<Value> {
+        let frame = self
+            .current_frame()
+            .ok_or_else(|| VmError::internal("no call frame"))?;
+        let cell = frame
+            .upvalues
+            .get(index as usize)
+            .ok_or_else(|| VmError::internal(format!("upvalue index {} out of bounds", index)))?;
+        Ok(cell.get())
+    }
+
+    /// Get an upvalue cell from the current call frame (for capturing)
+    #[inline]
+    pub fn get_upvalue_cell(&self, index: u16) -> VmResult<&UpvalueCell> {
+        let frame = self
+            .current_frame()
+            .ok_or_else(|| VmError::internal("no call frame"))?;
+        frame
+            .upvalues
+            .get(index as usize)
+            .ok_or_else(|| VmError::internal(format!("upvalue index {} out of bounds", index)))
+    }
+
+    /// Set an upvalue in the current call frame
+    #[inline]
+    pub fn set_upvalue(&mut self, index: u16, value: Value) -> VmResult<()> {
+        let frame = self
+            .current_frame()
+            .ok_or_else(|| VmError::internal("no call frame"))?;
+        let cell = frame
+            .upvalues
+            .get(index as usize)
+            .ok_or_else(|| VmError::internal(format!("upvalue index {} out of bounds", index)))?;
+        cell.set(value);
+        Ok(())
+    }
+
+    /// Get or create an open upvalue cell for a local variable in the current frame.
+    /// If the cell already exists, return the existing one (shared between closures).
+    pub fn get_or_create_open_upvalue(&mut self, local_idx: u16) -> VmResult<UpvalueCell> {
+        let frame = self
+            .current_frame()
+            .ok_or_else(|| VmError::internal("no call frame"))?;
+        let frame_id = frame.frame_id;
+        let key = (frame_id, local_idx);
+
+        if let Some(cell) = self.open_upvalues.get(&key) {
+            return Ok(cell.clone());
+        }
+
+        // Create a new cell with the current local value
+        let value = self.get_local(local_idx)?.clone();
+        let cell = UpvalueCell::new(value);
+        self.open_upvalues.insert(key, cell.clone());
+        Ok(cell)
+    }
+
+    /// Close an upvalue: sync the local variable's current value to the cell
+    /// and remove from open upvalues map. Called when exiting a scope where
+    /// the local was captured.
+    pub fn close_upvalue(&mut self, local_idx: u16) -> VmResult<()> {
+        let frame = self
+            .current_frame()
+            .ok_or_else(|| VmError::internal("no call frame"))?;
+        let frame_id = frame.frame_id;
+        let key = (frame_id, local_idx);
+
+        if let Some(cell) = self.open_upvalues.get(&key) {
+            // Sync the current local value into the cell
+            let value = self.get_local(local_idx)?.clone();
+            cell.set(value);
+        }
+        // Remove from open upvalues (the closures keep their own clones of the cell)
+        self.open_upvalues.remove(&key);
+        Ok(())
+    }
+
+    /// Clean up all open upvalues for a frame that's being popped
+    pub fn close_all_upvalues_for_frame(&mut self, frame_id: usize) {
+        self.open_upvalues.retain(|(fid, _), _| *fid != frame_id);
     }
 
     /// Get the `this` value of the current call frame
@@ -300,6 +519,97 @@ impl VmContext {
             .rev()
             .filter_map(|frame| frame.source_location.clone())
             .collect()
+    }
+
+    // ==================== Async Context Save/Restore ====================
+
+    /// Save all call frames as SavedFrames for async suspension
+    ///
+    /// This captures the complete call stack state so we can restore it later.
+    /// Includes both locals and registers for each frame.
+    pub fn save_frames(&self) -> Vec<SavedFrame> {
+        self.call_stack
+            .iter()
+            .map(|frame| {
+                // Extract registers for this frame (256 registers per frame)
+                let reg_start = frame.register_base;
+                let reg_end = (reg_start + MAX_REGISTERS).min(self.registers.len());
+                let frame_registers = self.registers[reg_start..reg_end].to_vec();
+
+                SavedFrame::new(
+                    frame.function_index,
+                    Arc::clone(&frame.module),
+                    frame.pc,
+                    frame.locals.clone(),
+                    frame_registers,
+                    frame.upvalues.clone(),
+                    frame.return_register,
+                    frame.this_value.clone(),
+                    frame.is_construct,
+                    frame.is_async,
+                    frame.frame_id,
+                )
+            })
+            .collect()
+    }
+
+    /// Restore call frames from SavedFrames after async resumption
+    ///
+    /// This replaces the current call stack with the saved state.
+    /// Restores both locals and registers for each frame.
+    pub fn restore_frames(&mut self, saved_frames: Vec<SavedFrame>) -> VmResult<()> {
+        // Clear current call stack
+        self.call_stack.clear();
+
+        // Ensure we have enough registers for all frames
+        let max_registers_needed = saved_frames.len() * MAX_REGISTERS;
+        if max_registers_needed > self.registers.len() {
+            self.registers.resize(max_registers_needed, Value::undefined());
+        }
+
+        // Restore each frame
+        for (i, saved) in saved_frames.into_iter().enumerate() {
+            let register_base = i * MAX_REGISTERS;
+
+            // Restore registers for this frame
+            for (j, reg) in saved.registers.into_iter().enumerate() {
+                if register_base + j < self.registers.len() {
+                    self.registers[register_base + j] = reg;
+                }
+            }
+
+            self.call_stack.push(CallFrame {
+                function_index: saved.function_index,
+                module: saved.module,
+                pc: saved.pc,
+                register_base,
+                locals: saved.locals,
+                upvalues: saved.upvalues,
+                return_register: saved.return_register,
+                source_location: None,
+                this_value: saved.this_value,
+                is_construct: saved.is_construct,
+                is_async: saved.is_async,
+                frame_id: saved.frame_id,
+            });
+
+            // Update next_frame_id to be greater than any restored frame
+            if saved.frame_id >= self.next_frame_id {
+                self.next_frame_id = saved.frame_id + 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get mutable access to the call stack (for advanced manipulation)
+    pub fn call_stack_mut(&mut self) -> &mut Vec<CallFrame> {
+        &mut self.call_stack
+    }
+
+    /// Get the call stack (for inspection)
+    pub fn call_stack(&self) -> &[CallFrame] {
+        &self.call_stack
     }
 }
 
@@ -331,13 +641,19 @@ impl SharedContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otter_vm_bytecode::Module;
+
+    fn dummy_module() -> Arc<Module> {
+        Arc::new(Module::builder("test.js").build())
+    }
 
     #[test]
     fn test_context_registers() {
         let global = Arc::new(JsObject::new(None));
         let mut ctx = VmContext::new(global);
 
-        ctx.push_frame(0, 0, None).unwrap();
+        ctx.push_frame(0, dummy_module(), 0, None, false, false)
+            .unwrap();
         ctx.set_register(0, Value::int32(42));
 
         assert_eq!(ctx.get_register(0).as_int32(), Some(42));
@@ -348,7 +664,8 @@ mod tests {
         let global = Arc::new(JsObject::new(None));
         let mut ctx = VmContext::new(global);
 
-        ctx.push_frame(0, 3, None).unwrap();
+        ctx.push_frame(0, dummy_module(), 3, None, false, false)
+            .unwrap();
         ctx.set_local(0, Value::int32(1)).unwrap();
         ctx.set_local(1, Value::int32(2)).unwrap();
         ctx.set_local(2, Value::int32(3)).unwrap();
@@ -362,14 +679,16 @@ mod tests {
     fn test_stack_overflow() {
         let global = Arc::new(JsObject::new(None));
         let mut ctx = VmContext::new(global);
+        let module = dummy_module();
 
         // Push frames until overflow
         for i in 0..MAX_STACK_DEPTH {
-            ctx.push_frame(i as u32, 0, None).unwrap();
+            ctx.push_frame(i as u32, Arc::clone(&module), 0, None, false, false)
+                .unwrap();
         }
 
         // Next push should fail
-        let result = ctx.push_frame(0, 0, None);
+        let result = ctx.push_frame(0, module, 0, None, false, false);
         assert!(matches!(result, Err(VmError::StackOverflow)));
     }
 
@@ -378,7 +697,8 @@ mod tests {
         let global = Arc::new(JsObject::new(None));
         let mut ctx = VmContext::new(global);
 
-        ctx.push_frame(0, 0, None).unwrap();
+        ctx.push_frame(0, dummy_module(), 0, None, false, false)
+            .unwrap();
         assert_eq!(ctx.pc(), 0);
 
         ctx.advance_pc();

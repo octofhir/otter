@@ -18,6 +18,15 @@ use crate::scope::ResolvedBinding;
 pub struct Compiler {
     /// Code generator
     codegen: CodeGen,
+    /// Loop control stack (for `break`/`continue` patching)
+    loop_stack: Vec<LoopControl>,
+}
+
+#[derive(Default)]
+struct LoopControl {
+    break_jumps: Vec<usize>,
+    continue_jumps: Vec<usize>,
+    continue_target: Option<usize>,
 }
 
 impl Compiler {
@@ -25,6 +34,7 @@ impl Compiler {
     pub fn new() -> Self {
         Self {
             codegen: CodeGen::new(),
+            loop_stack: Vec::new(),
         }
     }
 
@@ -113,6 +123,32 @@ impl Compiler {
                 Ok(())
             }
 
+            Statement::TryStatement(try_stmt) => self.compile_try_statement(try_stmt),
+
+            Statement::BreakStatement(break_stmt) => {
+                if break_stmt.label.is_some() {
+                    return Err(CompileError::unsupported("Labeled break"));
+                }
+                let Some(loop_ctl) = self.loop_stack.last_mut() else {
+                    return Err(CompileError::syntax("break outside of loop", 0, 0));
+                };
+                let jump_idx = self.codegen.emit_jump();
+                loop_ctl.break_jumps.push(jump_idx);
+                Ok(())
+            }
+
+            Statement::ContinueStatement(continue_stmt) => {
+                if continue_stmt.label.is_some() {
+                    return Err(CompileError::unsupported("Labeled continue"));
+                }
+                let Some(loop_ctl) = self.loop_stack.last_mut() else {
+                    return Err(CompileError::syntax("continue outside of loop", 0, 0));
+                };
+                let jump_idx = self.codegen.emit_jump();
+                loop_ctl.continue_jumps.push(jump_idx);
+                Ok(())
+            }
+
             Statement::ThrowStatement(throw_stmt) => {
                 let src = self.compile_expression(&throw_stmt.argument)?;
                 self.codegen.emit(Instruction::Throw { src });
@@ -154,7 +190,15 @@ impl Compiler {
                 Err(CompileError::unsupported("TSNamespaceExportDeclaration"))
             }
 
-            _ => Err(CompileError::unsupported("Unknown statement type")),
+            // Common JS features
+            Statement::ClassDeclaration(class_decl) => self.compile_class_declaration(class_decl),
+            Statement::SwitchStatement(_) => Err(CompileError::unsupported("SwitchStatement")),
+            Statement::DoWhileStatement(_) => Err(CompileError::unsupported("DoWhileStatement")),
+            Statement::ForInStatement(_) => Err(CompileError::unsupported("ForInStatement")),
+            Statement::LabeledStatement(_) => Err(CompileError::unsupported("LabeledStatement")),
+            Statement::WithStatement(_) => Err(CompileError::unsupported("WithStatement")),
+
+            _ => Err(CompileError::unsupported("UnknownStatement")),
         }
     }
 
@@ -267,7 +311,7 @@ impl Compiler {
                     }
                 }
                 Declaration::ClassDeclaration(class) => {
-                    // TODO: Add class compilation when we have class support
+                    self.compile_class_declaration(class)?;
                     if let Some(id) = &class.id {
                         let name = id.name.to_string();
                         self.codegen.add_export(ExportRecord::Named {
@@ -275,7 +319,6 @@ impl Compiler {
                             exported: name,
                         });
                     }
-                    return Err(CompileError::unsupported("Class declarations"));
                 }
                 _ => return Err(CompileError::unsupported("Export declaration type")),
             }
@@ -310,11 +353,60 @@ impl Compiler {
                 self.codegen.current.flags.is_async = func.r#async;
 
                 // Declare parameters
+                let mut param_defaults: Vec<(u16, &Expression)> = Vec::new();
                 for param in &func.params.items {
-                    if let BindingPattern::BindingIdentifier(ident) = &param.pattern {
-                        self.codegen.declare_variable(&ident.name, false)?;
-                        self.codegen.current.param_count += 1;
+                    match &param.pattern {
+                        BindingPattern::BindingIdentifier(ident) => {
+                            let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                            self.codegen.current.param_count += 1;
+                            if let Some(init) = &param.initializer {
+                                param_defaults.push((local_idx, init));
+                            }
+                        }
+                        // Legacy / non-standard representation; keep for forward-compat.
+                        BindingPattern::AssignmentPattern(assign) => {
+                            let BindingPattern::BindingIdentifier(ident) = &assign.left else {
+                                return Err(CompileError::unsupported(
+                                    "Complex parameter patterns",
+                                ));
+                            };
+                            let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                            self.codegen.current.param_count += 1;
+                            param_defaults.push((local_idx, &assign.right));
+                        }
+                        _ => return Err(CompileError::unsupported("Complex parameter patterns")),
                     }
+                }
+
+                // Emit default parameter initializers (if arg === undefined).
+                for (local_idx, default_expr) in param_defaults {
+                    let cur = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::GetLocal {
+                        dst: cur,
+                        idx: LocalIndex(local_idx),
+                    });
+                    let undef = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::LoadUndefined { dst: undef });
+                    let cond = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::StrictEq {
+                        dst: cond,
+                        lhs: cur,
+                        rhs: undef,
+                    });
+                    let jump_skip = self.codegen.emit_jump_if_false(cond);
+                    self.codegen.free_reg(cond);
+                    self.codegen.free_reg(undef);
+                    self.codegen.free_reg(cur);
+
+                    let value = self.compile_expression(default_expr)?;
+                    self.codegen.emit(Instruction::SetLocal {
+                        idx: LocalIndex(local_idx),
+                        src: value,
+                    });
+                    self.codegen.free_reg(value);
+
+                    let end_offset = self.codegen.current_index() as i32 - jump_skip as i32;
+                    self.codegen.patch_jump(jump_skip, end_offset);
                 }
 
                 // Compile function body
@@ -352,8 +444,35 @@ impl Compiler {
                     .add_export(ExportRecord::Default { local: name });
             }
 
-            ExportDefaultDeclarationKind::ClassDeclaration(_) => {
-                return Err(CompileError::unsupported("Class declarations"));
+            ExportDefaultDeclarationKind::ClassDeclaration(class_decl) => {
+                // `export default class {}` may be anonymous. Lower it to a local binding and export it.
+                let name = class_decl
+                    .id
+                    .as_ref()
+                    .map(|id| id.name.to_string())
+                    .unwrap_or_else(|| "__default__".to_string());
+
+                self.codegen.declare_variable(&name, false)?;
+
+                let ctor = self.compile_class_declaration_value(class_decl)?;
+
+                if let Some(ResolvedBinding::Local(idx)) = self.codegen.resolve_variable(&name) {
+                    self.codegen.emit(Instruction::SetLocal {
+                        idx: LocalIndex(idx),
+                        src: ctor,
+                    });
+                    if self.codegen.current.name.as_deref() == Some("main") {
+                        let name_idx = self.codegen.add_string(&name);
+                        self.codegen.emit(Instruction::SetGlobal {
+                            name: name_idx,
+                            src: ctor,
+                        });
+                    }
+                }
+
+                self.codegen.free_reg(ctor);
+                self.codegen
+                    .add_export(ExportRecord::Default { local: name });
             }
 
             _ => {
@@ -379,6 +498,184 @@ impl Compiler {
         }
 
         Ok(())
+    }
+
+    fn compile_class_declaration(&mut self, class_decl: &oxc_ast::ast::Class) -> CompileResult<()> {
+        if class_decl.r#type != ClassType::ClassDeclaration {
+            return Err(CompileError::internal("expected ClassDeclaration"));
+        }
+        let Some(id) = &class_decl.id else {
+            return Err(CompileError::syntax(
+                "Class declaration requires a name",
+                0,
+                0,
+            ));
+        };
+
+        let name = id.name.to_string();
+
+        // Declare class binding in current scope.
+        self.codegen.declare_variable(&name, false)?;
+
+        let ctor = self.compile_class_declaration_value(class_decl)?;
+
+        if let Some(ResolvedBinding::Local(idx)) = self.codegen.resolve_variable(&name) {
+            self.codegen.emit(Instruction::SetLocal {
+                idx: LocalIndex(idx),
+                src: ctor,
+            });
+            if self.codegen.current.name.as_deref() == Some("main") {
+                let name_idx = self.codegen.add_string(&name);
+                self.codegen.emit(Instruction::SetGlobal {
+                    name: name_idx,
+                    src: ctor,
+                });
+            }
+        }
+
+        self.codegen.free_reg(ctor);
+        Ok(())
+    }
+
+    fn compile_class_expression(
+        &mut self,
+        class_expr: &oxc_ast::ast::Class,
+    ) -> CompileResult<Register> {
+        if class_expr.r#type != ClassType::ClassExpression {
+            return Err(CompileError::internal("expected ClassExpression"));
+        }
+        self.compile_class_parts(class_expr.super_class.as_ref(), &class_expr.body)
+    }
+
+    fn compile_class_declaration_value(
+        &mut self,
+        class_decl: &oxc_ast::ast::Class,
+    ) -> CompileResult<Register> {
+        if class_decl.r#type != ClassType::ClassDeclaration {
+            return Err(CompileError::internal("expected ClassDeclaration"));
+        }
+        self.compile_class_parts(class_decl.super_class.as_ref(), &class_decl.body)
+    }
+
+    fn compile_class_parts(
+        &mut self,
+        super_class: Option<&Expression>,
+        body: &ClassBody,
+    ) -> CompileResult<Register> {
+        if super_class.is_some() {
+            return Err(CompileError::unsupported("Class extends"));
+        }
+
+        // Find an explicit constructor, if present.
+        let mut constructor: Option<&oxc_ast::ast::Function> = None;
+        for elem in &body.body {
+            match elem {
+                ClassElement::MethodDefinition(method) => {
+                    if matches!(method.kind, MethodDefinitionKind::Constructor) {
+                        if method.r#static {
+                            return Err(CompileError::syntax(
+                                "Class constructor cannot be static",
+                                0,
+                                0,
+                            ));
+                        }
+                        if constructor.is_some() {
+                            return Err(CompileError::syntax(
+                                "Class can only have one constructor",
+                                0,
+                                0,
+                            ));
+                        }
+                        constructor = Some(&method.value);
+                    }
+                }
+                ClassElement::TSIndexSignature(_) => {
+                    // TypeScript-only; erase.
+                }
+                _ => return Err(CompileError::unsupported("Class element")),
+            }
+        }
+
+        // Compile constructor (or a default empty constructor).
+        let ctor = if let Some(func) = constructor {
+            self.compile_function_expression(func)?
+        } else {
+            self.compile_empty_function()
+        };
+
+        // Get prototype object for instance methods: ctor.prototype
+        let proto = self.codegen.alloc_reg();
+        let proto_key = self.codegen.add_string("prototype");
+        self.codegen.emit(Instruction::GetPropConst {
+            dst: proto,
+            obj: ctor,
+            name: proto_key,
+        });
+
+        for elem in &body.body {
+            let ClassElement::MethodDefinition(method) = elem else {
+                continue;
+            };
+
+            if matches!(method.kind, MethodDefinitionKind::Constructor) {
+                continue;
+            }
+
+            let target = if method.r#static { ctor } else { proto };
+            let func_reg = self.compile_function_expression(&method.value)?;
+
+            // Compile the property key
+            let key_reg = self.compile_property_key(&method.key)?;
+
+            // Emit the appropriate instruction based on method kind
+            match method.kind {
+                MethodDefinitionKind::Method => {
+                    self.codegen.emit(Instruction::SetProp {
+                        obj: target,
+                        key: key_reg,
+                        val: func_reg,
+                    });
+                }
+                MethodDefinitionKind::Get => {
+                    self.codegen.emit(Instruction::DefineGetter {
+                        obj: target,
+                        key: key_reg,
+                        func: func_reg,
+                    });
+                }
+                MethodDefinitionKind::Set => {
+                    self.codegen.emit(Instruction::DefineSetter {
+                        obj: target,
+                        key: key_reg,
+                        func: func_reg,
+                    });
+                }
+                MethodDefinitionKind::Constructor => unreachable!(),
+            }
+
+            self.codegen.free_reg(func_reg);
+            self.codegen.free_reg(key_reg);
+        }
+
+        self.codegen.free_reg(proto);
+        Ok(ctor)
+    }
+
+    fn compile_empty_function(&mut self) -> Register {
+        let saved_loop_stack = std::mem::take(&mut self.loop_stack);
+
+        self.codegen.enter_function(None);
+        self.codegen.emit(Instruction::ReturnUndefined);
+        let func_idx = self.codegen.exit_function();
+
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::Closure {
+            dst,
+            func: otter_vm_bytecode::FunctionIndex(func_idx),
+        });
+
+        self.loop_stack = saved_loop_stack;
+        dst
     }
 
     /// Compile an export all declaration
@@ -623,6 +920,16 @@ impl Compiler {
                             idx: LocalIndex(local_idx),
                             src: reg,
                         });
+                        // Our VM does not yet support upvalue capture across function contexts.
+                        // Publishing top-level declarations onto `globalThis` keeps builtins and
+                        // nested functions usable (they resolve missing bindings via GetGlobal).
+                        if self.codegen.current.name.as_deref() == Some("main") {
+                            let name_idx = self.codegen.add_string(&ident.name);
+                            self.codegen.emit(Instruction::SetGlobal {
+                                name: name_idx,
+                                src: reg,
+                            });
+                        }
                         self.codegen.free_reg(reg);
                     }
                 }
@@ -669,6 +976,10 @@ impl Compiler {
     /// Compile a while statement
     fn compile_while_statement(&mut self, while_stmt: &WhileStatement) -> CompileResult<()> {
         let loop_start = self.codegen.current_index();
+        self.loop_stack.push(LoopControl {
+            continue_target: Some(loop_start),
+            ..Default::default()
+        });
 
         // Compile condition
         let cond = self.compile_expression(&while_stmt.test)?;
@@ -687,6 +998,19 @@ impl Compiler {
         // Patch jump to end
         let end_offset = self.codegen.current_index() as i32 - jump_end as i32;
         self.codegen.patch_jump(jump_end, end_offset);
+
+        let break_target = self.codegen.current_index();
+        let loop_ctl = self.loop_stack.pop().expect("loop stack underflow");
+        for jump in loop_ctl.break_jumps {
+            let offset = break_target as i32 - jump as i32;
+            self.codegen.patch_jump(jump, offset);
+        }
+        if let Some(continue_target) = loop_ctl.continue_target {
+            for jump in loop_ctl.continue_jumps {
+                let offset = continue_target as i32 - jump as i32;
+                self.codegen.patch_jump(jump, offset);
+            }
+        }
 
         Ok(())
     }
@@ -712,6 +1036,10 @@ impl Compiler {
         }
 
         let loop_start = self.codegen.current_index();
+        self.loop_stack.push(LoopControl {
+            continue_target: Some(loop_start),
+            ..Default::default()
+        });
 
         // Compile test
         let jump_end = if let Some(test) = &for_stmt.test {
@@ -727,7 +1055,11 @@ impl Compiler {
         self.compile_statement(&for_stmt.body)?;
 
         // Compile update
+        let update_start = self.codegen.current_index();
         if let Some(update) = &for_stmt.update {
+            if let Some(loop_ctl) = self.loop_stack.last_mut() {
+                loop_ctl.continue_target = Some(update_start);
+            }
             let reg = self.compile_expression(update)?;
             self.codegen.free_reg(reg);
         }
@@ -742,6 +1074,19 @@ impl Compiler {
         if let Some(jump_end) = jump_end {
             let end_offset = self.codegen.current_index() as i32 - jump_end as i32;
             self.codegen.patch_jump(jump_end, end_offset);
+        }
+
+        let break_target = self.codegen.current_index();
+        let loop_ctl = self.loop_stack.pop().expect("loop stack underflow");
+        for jump in loop_ctl.break_jumps {
+            let offset = break_target as i32 - jump as i32;
+            self.codegen.patch_jump(jump, offset);
+        }
+        if let Some(continue_target) = loop_ctl.continue_target {
+            for jump in loop_ctl.continue_jumps {
+                let offset = continue_target as i32 - jump as i32;
+                self.codegen.patch_jump(jump, offset);
+            }
         }
 
         self.codegen.exit_scope();
@@ -767,15 +1112,44 @@ impl Compiler {
         // Allocate registers for value and done
         let value_reg = self.codegen.alloc_reg();
         let done_reg = self.codegen.alloc_reg();
+        let result_reg = self.codegen.alloc_reg();
+
+        let next_name = self.codegen.add_string("next");
+        let done_name = self.codegen.add_string("done");
+        let value_name = self.codegen.add_string("value");
 
         // Loop start
         let loop_start = self.codegen.current_index();
+        self.loop_stack.push(LoopControl {
+            continue_target: Some(loop_start),
+            ..Default::default()
+        });
 
-        // IteratorNext: {value, done} = iterator.next()
-        self.codegen.emit(Instruction::IteratorNext {
+        // result = iterator.next()
+        // (Lowered to CallMethod so `next` can be a JS function.)
+        let frame = self.codegen.alloc_fresh_block(1);
+        self.codegen.emit(Instruction::Move {
+            dst: frame,
+            src: iterator,
+        });
+        self.codegen.emit(Instruction::CallMethod {
+            dst: result_reg,
+            obj: frame,
+            method: next_name,
+            argc: 0,
+        });
+        self.codegen.free_reg(frame);
+
+        // done = result.done; value = result.value
+        self.codegen.emit(Instruction::GetPropConst {
+            dst: done_reg,
+            obj: result_reg,
+            name: done_name,
+        });
+        self.codegen.emit(Instruction::GetPropConst {
             dst: value_reg,
-            done: done_reg,
-            iter: iterator,
+            obj: result_reg,
+            name: value_name,
         });
 
         // JumpIfTrue done -> end
@@ -795,6 +1169,48 @@ impl Compiler {
                                 idx: LocalIndex(local_idx),
                                 src: value_reg,
                             });
+                        }
+                        BindingPattern::ArrayPattern(array_pat) => {
+                            // Minimal support for `for (const [a, b] of iter) { ... }`
+                            // by indexing into the yielded value.
+                            if array_pat.rest.is_some() {
+                                return Err(CompileError::unsupported(
+                                    "Array rest in for-of destructuring",
+                                ));
+                            }
+
+                            for (i, elem) in array_pat.elements.iter().enumerate() {
+                                let Some(elem_pat) = elem else { continue };
+                                let BindingPattern::BindingIdentifier(ident) = elem_pat else {
+                                    return Err(CompileError::unsupported(
+                                        "Complex destructuring in for-of",
+                                    ));
+                                };
+
+                                let local_idx =
+                                    self.codegen.declare_variable(&ident.name, is_const)?;
+
+                                let idx_reg = self.codegen.alloc_reg();
+                                self.codegen.emit(Instruction::LoadInt32 {
+                                    dst: idx_reg,
+                                    value: i as i32,
+                                });
+
+                                let elem_reg = self.codegen.alloc_reg();
+                                self.codegen.emit(Instruction::GetElem {
+                                    dst: elem_reg,
+                                    arr: value_reg,
+                                    idx: idx_reg,
+                                });
+
+                                self.codegen.emit(Instruction::SetLocal {
+                                    idx: LocalIndex(local_idx),
+                                    src: elem_reg,
+                                });
+
+                                self.codegen.free_reg(elem_reg);
+                                self.codegen.free_reg(idx_reg);
+                            }
                         }
                         _ => {
                             // Destructuring patterns in for-of
@@ -828,12 +1244,89 @@ impl Compiler {
         let end_offset = self.codegen.current_index() as i32 - jump_end as i32;
         self.codegen.patch_jump(jump_end, end_offset);
 
+        let break_target = self.codegen.current_index();
+        let loop_ctl = self.loop_stack.pop().expect("loop stack underflow");
+        for jump in loop_ctl.break_jumps {
+            let offset = break_target as i32 - jump as i32;
+            self.codegen.patch_jump(jump, offset);
+        }
+        if let Some(continue_target) = loop_ctl.continue_target {
+            for jump in loop_ctl.continue_jumps {
+                let offset = continue_target as i32 - jump as i32;
+                self.codegen.patch_jump(jump, offset);
+            }
+        }
+
         // Clean up registers
         self.codegen.free_reg(done_reg);
         self.codegen.free_reg(value_reg);
+        self.codegen.free_reg(result_reg);
         self.codegen.free_reg(iterator);
 
         self.codegen.exit_scope();
+        Ok(())
+    }
+
+    fn compile_try_statement(&mut self, try_stmt: &TryStatement) -> CompileResult<()> {
+        if try_stmt.finalizer.is_some() {
+            return Err(CompileError::unsupported("try/finally"));
+        }
+        let Some(handler) = &try_stmt.handler else {
+            return Err(CompileError::unsupported("try without catch"));
+        };
+
+        // Emit try start (patch catch offset later)
+        let try_start = self.codegen.current_index();
+        self.codegen.emit(Instruction::TryStart {
+            catch_offset: JumpOffset(0),
+        });
+
+        // Compile try block
+        for stmt in &try_stmt.block.body {
+            self.compile_statement(stmt)?;
+        }
+
+        // Normal completion pops the handler
+        self.codegen.emit(Instruction::TryEnd);
+
+        // Jump over catch
+        let jump_over_catch = self.codegen.emit_jump();
+
+        // Patch try_start to jump into catch block
+        let catch_start = self.codegen.current_index();
+        let catch_offset = catch_start as i32 - try_start as i32;
+        self.codegen.patch_jump(try_start, catch_offset);
+
+        // Catch block begins: load exception into a register, bind param, then run body
+        self.codegen.enter_scope();
+
+        let exc_reg = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::Catch { dst: exc_reg });
+
+        if let Some(param) = &handler.param {
+            match &param.pattern {
+                BindingPattern::BindingIdentifier(ident) => {
+                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                    self.codegen.emit(Instruction::SetLocal {
+                        idx: LocalIndex(local_idx),
+                        src: exc_reg,
+                    });
+                }
+                _ => return Err(CompileError::unsupported("Complex catch parameter pattern")),
+            }
+        }
+
+        for stmt in &handler.body.body {
+            self.compile_statement(stmt)?;
+        }
+
+        self.codegen.free_reg(exc_reg);
+        self.codegen.exit_scope();
+
+        // Patch jump over catch
+        let end_offset = self.codegen.current_index() as i32 - jump_over_catch as i32;
+        self.codegen.patch_jump(jump_over_catch, end_offset);
+
         Ok(())
     }
 
@@ -842,6 +1335,8 @@ impl Compiler {
         let name = func.id.as_ref().map(|id| id.name.to_string());
         let is_async = func.r#async;
         let is_generator = func.generator;
+
+        let saved_loop_stack = std::mem::take(&mut self.loop_stack);
 
         // Declare function in current scope
         if let Some(ref n) = name {
@@ -853,12 +1348,25 @@ impl Compiler {
         self.codegen.current.flags.is_async = is_async;
         self.codegen.current.flags.is_generator = is_generator;
 
-        // Declare parameters
+        // Declare parameters and collect defaults
+        let mut param_defaults: Vec<(u16, &Expression)> = Vec::new();
         for param in &func.params.items {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
-                    self.codegen.declare_variable(&ident.name, false)?;
+                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                     self.codegen.current.param_count += 1;
+                    if let Some(init) = &param.initializer {
+                        param_defaults.push((local_idx, init));
+                    }
+                }
+                // Legacy / non-standard representation; keep for forward-compat.
+                BindingPattern::AssignmentPattern(assign) => {
+                    let BindingPattern::BindingIdentifier(ident) = &assign.left else {
+                        return Err(CompileError::unsupported("Complex parameter patterns"));
+                    };
+                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                    self.codegen.current.param_count += 1;
+                    param_defaults.push((local_idx, &assign.right));
                 }
                 _ => return Err(CompileError::unsupported("Complex parameter patterns")),
             }
@@ -872,6 +1380,37 @@ impl Compiler {
             } else {
                 return Err(CompileError::unsupported("Complex rest parameter pattern"));
             }
+        }
+
+        // Emit default parameter initializers (if arg === undefined).
+        for (local_idx, default_expr) in param_defaults {
+            let cur = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::GetLocal {
+                dst: cur,
+                idx: LocalIndex(local_idx),
+            });
+            let undef = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::LoadUndefined { dst: undef });
+            let cond = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::StrictEq {
+                dst: cond,
+                lhs: cur,
+                rhs: undef,
+            });
+            let jump_skip = self.codegen.emit_jump_if_false(cond);
+            self.codegen.free_reg(cond);
+            self.codegen.free_reg(undef);
+            self.codegen.free_reg(cur);
+
+            let value = self.compile_expression(default_expr)?;
+            self.codegen.emit(Instruction::SetLocal {
+                idx: LocalIndex(local_idx),
+                src: value,
+            });
+            self.codegen.free_reg(value);
+
+            let end_offset = self.codegen.current_index() as i32 - jump_skip as i32;
+            self.codegen.patch_jump(jump_skip, end_offset);
         }
 
         // Compile function body
@@ -912,9 +1451,17 @@ impl Compiler {
                 idx: LocalIndex(idx),
                 src: dst,
             });
+            if self.codegen.current.name.as_deref() == Some("main") {
+                let name_idx = self.codegen.add_string(&n);
+                self.codegen.emit(Instruction::SetGlobal {
+                    name: name_idx,
+                    src: dst,
+                });
+            }
             self.codegen.free_reg(dst);
         }
 
+        self.loop_stack = saved_loop_stack;
         Ok(())
     }
 
@@ -927,17 +1474,32 @@ impl Compiler {
         let is_async = func.r#async;
         let is_generator = func.generator;
 
+        let saved_loop_stack = std::mem::take(&mut self.loop_stack);
+
         // Enter function context
         self.codegen.enter_function(name);
         self.codegen.current.flags.is_async = is_async;
         self.codegen.current.flags.is_generator = is_generator;
 
-        // Declare parameters
+        // Declare parameters and collect defaults
+        let mut param_defaults: Vec<(u16, &Expression)> = Vec::new();
         for param in &func.params.items {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
-                    self.codegen.declare_variable(&ident.name, false)?;
+                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                     self.codegen.current.param_count += 1;
+                    if let Some(init) = &param.initializer {
+                        param_defaults.push((local_idx, init));
+                    }
+                }
+                // Legacy / non-standard representation; keep for forward-compat.
+                BindingPattern::AssignmentPattern(assign) => {
+                    let BindingPattern::BindingIdentifier(ident) = &assign.left else {
+                        return Err(CompileError::unsupported("Complex parameter patterns"));
+                    };
+                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                    self.codegen.current.param_count += 1;
+                    param_defaults.push((local_idx, &assign.right));
                 }
                 _ => return Err(CompileError::unsupported("Complex parameter patterns")),
             }
@@ -951,6 +1513,37 @@ impl Compiler {
             } else {
                 return Err(CompileError::unsupported("Complex rest parameter pattern"));
             }
+        }
+
+        // Emit default parameter initializers (if arg === undefined).
+        for (local_idx, default_expr) in param_defaults {
+            let cur = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::GetLocal {
+                dst: cur,
+                idx: LocalIndex(local_idx),
+            });
+            let undef = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::LoadUndefined { dst: undef });
+            let cond = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::StrictEq {
+                dst: cond,
+                lhs: cur,
+                rhs: undef,
+            });
+            let jump_skip = self.codegen.emit_jump_if_false(cond);
+            self.codegen.free_reg(cond);
+            self.codegen.free_reg(undef);
+            self.codegen.free_reg(cur);
+
+            let value = self.compile_expression(default_expr)?;
+            self.codegen.emit(Instruction::SetLocal {
+                idx: LocalIndex(local_idx),
+                src: value,
+            });
+            self.codegen.free_reg(value);
+
+            let end_offset = self.codegen.current_index() as i32 - jump_skip as i32;
+            self.codegen.patch_jump(jump_skip, end_offset);
         }
 
         // Compile function body
@@ -985,6 +1578,7 @@ impl Compiler {
             });
         }
 
+        self.loop_stack = saved_loop_stack;
         Ok(dst)
     }
 
@@ -995,17 +1589,32 @@ impl Compiler {
     ) -> CompileResult<Register> {
         let is_async = arrow.r#async;
 
+        let saved_loop_stack = std::mem::take(&mut self.loop_stack);
+
         // Enter function context
         self.codegen.enter_function(None);
         self.codegen.current.flags.is_arrow = true;
         self.codegen.current.flags.is_async = is_async;
 
-        // Declare parameters
+        // Declare parameters and collect defaults
+        let mut param_defaults: Vec<(u16, &Expression)> = Vec::new();
         for param in &arrow.params.items {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
-                    self.codegen.declare_variable(&ident.name, false)?;
+                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                     self.codegen.current.param_count += 1;
+                    if let Some(init) = &param.initializer {
+                        param_defaults.push((local_idx, init));
+                    }
+                }
+                // Legacy / non-standard representation; keep for forward-compat.
+                BindingPattern::AssignmentPattern(assign) => {
+                    let BindingPattern::BindingIdentifier(ident) = &assign.left else {
+                        return Err(CompileError::unsupported("Complex parameter patterns"));
+                    };
+                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                    self.codegen.current.param_count += 1;
+                    param_defaults.push((local_idx, &assign.right));
                 }
                 _ => return Err(CompileError::unsupported("Complex parameter patterns")),
             }
@@ -1019,6 +1628,37 @@ impl Compiler {
             } else {
                 return Err(CompileError::unsupported("Complex rest parameter pattern"));
             }
+        }
+
+        // Emit default parameter initializers (if arg === undefined).
+        for (local_idx, default_expr) in param_defaults {
+            let cur = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::GetLocal {
+                dst: cur,
+                idx: LocalIndex(local_idx),
+            });
+            let undef = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::LoadUndefined { dst: undef });
+            let cond = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::StrictEq {
+                dst: cond,
+                lhs: cur,
+                rhs: undef,
+            });
+            let jump_skip = self.codegen.emit_jump_if_false(cond);
+            self.codegen.free_reg(cond);
+            self.codegen.free_reg(undef);
+            self.codegen.free_reg(cur);
+
+            let value = self.compile_expression(default_expr)?;
+            self.codegen.emit(Instruction::SetLocal {
+                idx: LocalIndex(local_idx),
+                src: value,
+            });
+            self.codegen.free_reg(value);
+
+            let end_offset = self.codegen.current_index() as i32 - jump_skip as i32;
+            self.codegen.patch_jump(jump_skip, end_offset);
         }
 
         // Compile body
@@ -1057,6 +1697,7 @@ impl Compiler {
             });
         }
 
+        self.loop_stack = saved_loop_stack;
         Ok(dst)
     }
 
@@ -1107,6 +1748,8 @@ impl Compiler {
 
             Expression::BinaryExpression(binary) => self.compile_binary_expression(binary),
 
+            Expression::LogicalExpression(logical) => self.compile_logical_expression(logical),
+
             Expression::UnaryExpression(unary) => self.compile_unary_expression(unary),
 
             Expression::AssignmentExpression(assign) => self.compile_assignment_expression(assign),
@@ -1143,6 +1786,19 @@ impl Compiler {
 
             Expression::YieldExpression(yield_expr) => self.compile_yield_expression(yield_expr),
 
+            Expression::ChainExpression(chain) => self.compile_chain_expression(chain),
+
+            Expression::MetaProperty(meta) => {
+                // Minimal support: `new.target` -> undefined (enough for current shims).
+                if meta.meta.name == "new" && meta.property.name == "target" {
+                    let dst = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::LoadUndefined { dst });
+                    Ok(dst)
+                } else {
+                    Err(CompileError::unsupported("MetaProperty"))
+                }
+            }
+
             // TypeScript expressions - type erasure (compile inner expression, ignore type)
             Expression::TSAsExpression(expr) => self.compile_expression(&expr.expression),
 
@@ -1156,8 +1812,291 @@ impl Compiler {
                 self.compile_expression(&expr.expression)
             }
 
-            _ => Err(CompileError::unsupported("Unknown expression type")),
+            // Common JS features
+            Expression::RegExpLiteral(lit) => self.compile_regexp_literal(lit),
+            Expression::TemplateLiteral(template) => self.compile_template_literal(template),
+            Expression::ThisExpression(_) => {
+                let dst = self.codegen.alloc_reg();
+                self.codegen.emit(Instruction::LoadThis { dst });
+                Ok(dst)
+            }
+            Expression::Super(_) => Err(CompileError::unsupported("Super")),
+            Expression::ClassExpression(class_expr) => self.compile_class_expression(class_expr),
+
+            _ => Err(CompileError::unsupported(format!(
+                "UnknownExpression: {:?}",
+                expr
+            ))),
         }
+    }
+
+    fn compile_chain_expression(
+        &mut self,
+        chain: &oxc_ast::ast::ChainExpression,
+    ) -> CompileResult<Register> {
+        use oxc_ast::ast::ChainElement;
+
+        match &chain.expression {
+            ChainElement::StaticMemberExpression(member) => {
+                if member.optional {
+                    self.compile_optional_static_member_expression(member)
+                } else {
+                    self.compile_static_member_expression(member)
+                }
+            }
+            ChainElement::ComputedMemberExpression(member) => {
+                if member.optional {
+                    self.compile_optional_computed_member_expression(member)
+                } else {
+                    self.compile_computed_member_expression(member)
+                }
+            }
+            _ => Err(CompileError::unsupported("ChainExpression")),
+        }
+    }
+
+    fn compile_optional_static_member_expression(
+        &mut self,
+        member: &oxc_ast::ast::StaticMemberExpression,
+    ) -> CompileResult<Register> {
+        let obj = self.compile_expression(&member.object)?;
+
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::LoadUndefined { dst });
+
+        let jump_idx = self.codegen.current_index();
+        self.codegen.emit(Instruction::JumpIfNullish {
+            src: obj,
+            offset: JumpOffset(0),
+        });
+
+        let name_idx = self.codegen.add_string(&member.property.name);
+        self.codegen.emit(Instruction::GetPropConst {
+            dst,
+            obj,
+            name: name_idx,
+        });
+
+        let end_offset = self.codegen.current_index() as i32 - jump_idx as i32;
+        self.codegen.patch_jump(jump_idx, end_offset);
+
+        self.codegen.free_reg(obj);
+        Ok(dst)
+    }
+
+    fn compile_optional_computed_member_expression(
+        &mut self,
+        member: &oxc_ast::ast::ComputedMemberExpression,
+    ) -> CompileResult<Register> {
+        let obj = self.compile_expression(&member.object)?;
+
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::LoadUndefined { dst });
+
+        let jump_idx = self.codegen.current_index();
+        self.codegen.emit(Instruction::JumpIfNullish {
+            src: obj,
+            offset: JumpOffset(0),
+        });
+
+        let key = self.compile_expression(&member.expression)?;
+        self.codegen.emit(Instruction::GetProp { dst, obj, key });
+        self.codegen.free_reg(key);
+
+        let end_offset = self.codegen.current_index() as i32 - jump_idx as i32;
+        self.codegen.patch_jump(jump_idx, end_offset);
+
+        self.codegen.free_reg(obj);
+        Ok(dst)
+    }
+
+    /// Compile a regular expression literal (`/pattern/flags`).
+    ///
+    /// For now this lowers to a call to the global `RegExp(pattern, flags)` constructor.
+    fn compile_regexp_literal(
+        &mut self,
+        lit: &oxc_ast::ast::RegExpLiteral,
+    ) -> CompileResult<Register> {
+        // Load global RegExp and call it with (pattern, flags). Call convention requires
+        // `func` and args to be in contiguous registers.
+        let func_tmp = self.codegen.alloc_reg();
+        let name_idx = self.codegen.add_string("RegExp");
+        self.codegen.emit(Instruction::GetGlobal {
+            dst: func_tmp,
+            name: name_idx,
+        });
+
+        let pattern = lit.regex.pattern.text.as_str();
+        let flags = lit.regex.flags.to_string();
+
+        let pattern_tmp = self.codegen.alloc_reg();
+        let pattern_idx = self.codegen.add_string(pattern);
+        self.codegen.emit(Instruction::LoadConst {
+            dst: pattern_tmp,
+            idx: pattern_idx,
+        });
+
+        let flags_tmp = self.codegen.alloc_reg();
+        let flags_idx = self.codegen.add_string(&flags);
+        self.codegen.emit(Instruction::LoadConst {
+            dst: flags_tmp,
+            idx: flags_idx,
+        });
+
+        let frame = self.codegen.alloc_fresh_block(3);
+        let arg1 = Register(frame.0 + 1);
+        let arg2 = Register(frame.0 + 2);
+        self.codegen.emit(Instruction::Move {
+            dst: frame,
+            src: func_tmp,
+        });
+        self.codegen.emit(Instruction::Move {
+            dst: arg1,
+            src: pattern_tmp,
+        });
+        self.codegen.emit(Instruction::Move {
+            dst: arg2,
+            src: flags_tmp,
+        });
+
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::Call {
+            dst,
+            func: frame,
+            argc: 2,
+        });
+
+        self.codegen.free_reg(func_tmp);
+        self.codegen.free_reg(pattern_tmp);
+        self.codegen.free_reg(flags_tmp);
+        self.codegen.free_reg(frame);
+        self.codegen.free_reg(arg1);
+        self.codegen.free_reg(arg2);
+
+        Ok(dst)
+    }
+
+    /// Compile a template literal (`\`hello ${name}!\``).
+    ///
+    /// Template literals are lowered to string concatenation:
+    /// - `\`hello\`` -> "hello"
+    /// - `\`hello ${x}!\`` -> "hello " + String(x) + "!"
+    fn compile_template_literal(
+        &mut self,
+        template: &oxc_ast::ast::TemplateLiteral,
+    ) -> CompileResult<Register> {
+        // Template with no expressions - just return the single string part
+        if template.expressions.is_empty() {
+            let dst = self.codegen.alloc_reg();
+            if let Some(quasi) = template.quasis.first() {
+                let raw = quasi.value.raw.as_str();
+                // Convert escape sequences in template literals
+                let cooked = Self::cook_template_string(raw);
+                let str_idx = self.codegen.add_string(&cooked);
+                self.codegen
+                    .emit(Instruction::LoadConst { dst, idx: str_idx });
+            } else {
+                // Empty template
+                let str_idx = self.codegen.add_string("");
+                self.codegen
+                    .emit(Instruction::LoadConst { dst, idx: str_idx });
+            }
+            return Ok(dst);
+        }
+
+        // Template with expressions - build via concatenation
+        // Pattern: quasi[0] + expr[0] + quasi[1] + expr[1] + ... + quasi[n]
+        let mut result: Option<Register> = None;
+
+        for (i, quasi) in template.quasis.iter().enumerate() {
+            // Add the string part if non-empty
+            let raw = quasi.value.raw.as_str();
+            if !raw.is_empty() {
+                let cooked = Self::cook_template_string(raw);
+                let str_reg = self.codegen.alloc_reg();
+                let str_idx = self.codegen.add_string(&cooked);
+                self.codegen.emit(Instruction::LoadConst {
+                    dst: str_reg,
+                    idx: str_idx,
+                });
+
+                result = Some(match result {
+                    None => str_reg,
+                    Some(acc) => {
+                        let dst = self.codegen.alloc_reg();
+                        self.codegen.emit(Instruction::Add {
+                            dst,
+                            lhs: acc,
+                            rhs: str_reg,
+                        });
+                        self.codegen.free_reg(acc);
+                        self.codegen.free_reg(str_reg);
+                        dst
+                    }
+                });
+            }
+
+            // Add the expression if there's one at this position
+            if i < template.expressions.len() {
+                let expr_reg = self.compile_expression(&template.expressions[i])?;
+
+                result = Some(match result {
+                    None => expr_reg,
+                    Some(acc) => {
+                        let dst = self.codegen.alloc_reg();
+                        self.codegen.emit(Instruction::Add {
+                            dst,
+                            lhs: acc,
+                            rhs: expr_reg,
+                        });
+                        self.codegen.free_reg(acc);
+                        self.codegen.free_reg(expr_reg);
+                        dst
+                    }
+                });
+            }
+        }
+
+        // If template was completely empty, return empty string
+        Ok(result.unwrap_or_else(|| {
+            let dst = self.codegen.alloc_reg();
+            let str_idx = self.codegen.add_string("");
+            self.codegen
+                .emit(Instruction::LoadConst { dst, idx: str_idx });
+            dst
+        }))
+    }
+
+    /// Convert template literal raw string to cooked string.
+    /// Handles escape sequences like \n, \t, etc.
+    fn cook_template_string(raw: &str) -> String {
+        let mut result = String::with_capacity(raw.len());
+        let mut chars = raw.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('n') => result.push('\n'),
+                    Some('r') => result.push('\r'),
+                    Some('t') => result.push('\t'),
+                    Some('\\') => result.push('\\'),
+                    Some('`') => result.push('`'),
+                    Some('$') => result.push('$'),
+                    Some('"') => result.push('"'),
+                    Some('\'') => result.push('\''),
+                    Some('0') => result.push('\0'),
+                    Some(other) => {
+                        // For other escapes, just keep the character
+                        result.push(other);
+                    }
+                    None => result.push('\\'),
+                }
+            } else {
+                result.push(c);
+            }
+        }
+
+        result
     }
 
     /// Compile an await expression
@@ -1216,8 +2155,13 @@ impl Compiler {
                     name: name_idx,
                 });
             }
-            Some(ResolvedBinding::Upvalue { .. }) => {
-                return Err(CompileError::unsupported("Upvalues"));
+            Some(ResolvedBinding::Upvalue { index, depth }) => {
+                // Register this upvalue and get its index in the current function's upvalues array
+                let upvalue_idx = self.codegen.register_upvalue(index, depth);
+                self.codegen.emit(Instruction::GetUpvalue {
+                    dst,
+                    idx: LocalIndex(upvalue_idx),
+                });
             }
             None => {
                 let name_idx = self.codegen.add_string(name);
@@ -1257,6 +2201,7 @@ impl Compiler {
             BinaryOperator::ShiftLeft => Instruction::Shl { dst, lhs, rhs },
             BinaryOperator::ShiftRight => Instruction::Shr { dst, lhs, rhs },
             BinaryOperator::ShiftRightZeroFill => Instruction::Ushr { dst, lhs, rhs },
+            BinaryOperator::Instanceof => Instruction::InstanceOf { dst, lhs, rhs },
             _ => {
                 return Err(CompileError::unsupported(format!(
                     "Binary operator: {:?}",
@@ -1272,13 +2217,80 @@ impl Compiler {
         Ok(dst)
     }
 
+    /// Compile a logical expression (`&&`, `||`, `??`) with short-circuiting.
+    fn compile_logical_expression(
+        &mut self,
+        logical: &oxc_ast::ast::LogicalExpression,
+    ) -> CompileResult<Register> {
+        let lhs = self.compile_expression(&logical.left)?;
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::Move { dst, src: lhs });
+        self.codegen.free_reg(lhs);
+
+        let short_circuit_jump = match logical.operator {
+            LogicalOperator::And => self.codegen.emit_jump_if_false(dst),
+            LogicalOperator::Or => self.codegen.emit_jump_if_true(dst),
+            LogicalOperator::Coalesce => {
+                let idx = self.codegen.current_index();
+                self.codegen.emit(Instruction::JumpIfNotNullish {
+                    src: dst,
+                    offset: JumpOffset(0),
+                });
+                idx
+            }
+        };
+
+        let rhs = self.compile_expression(&logical.right)?;
+        self.codegen.emit(Instruction::Move { dst, src: rhs });
+        self.codegen.free_reg(rhs);
+
+        let end_offset = self.codegen.current_index() as i32 - short_circuit_jump as i32;
+        self.codegen.patch_jump(short_circuit_jump, end_offset);
+
+        Ok(dst)
+    }
+
     /// Compile a unary expression
     fn compile_unary_expression(&mut self, unary: &UnaryExpression) -> CompileResult<Register> {
+        if unary.operator == UnaryOperator::Delete {
+            // `delete` only has effect on property references; other forms return true.
+            let dst = self.codegen.alloc_reg();
+
+            return match &unary.argument {
+                Expression::StaticMemberExpression(member) => {
+                    let obj = self.compile_expression(&member.object)?;
+                    let key = self.codegen.alloc_reg();
+                    let idx = self.codegen.add_string(&member.property.name);
+                    self.codegen.emit(Instruction::LoadConst { dst: key, idx });
+                    self.codegen.emit(Instruction::DeleteProp { dst, obj, key });
+                    self.codegen.free_reg(key);
+                    self.codegen.free_reg(obj);
+                    Ok(dst)
+                }
+                Expression::ComputedMemberExpression(member) => {
+                    let obj = self.compile_expression(&member.object)?;
+                    let key = self.compile_expression(&member.expression)?;
+                    self.codegen.emit(Instruction::DeleteProp { dst, obj, key });
+                    self.codegen.free_reg(key);
+                    self.codegen.free_reg(obj);
+                    Ok(dst)
+                }
+                _ => {
+                    // Still evaluate argument for side effects
+                    let arg = self.compile_expression(&unary.argument)?;
+                    self.codegen.free_reg(arg);
+                    self.codegen.emit(Instruction::LoadTrue { dst });
+                    Ok(dst)
+                }
+            };
+        }
+
         let src = self.compile_expression(&unary.argument)?;
         let dst = self.codegen.alloc_reg();
 
         let instruction = match unary.operator {
             UnaryOperator::UnaryNegation => Instruction::Neg { dst, src },
+            UnaryOperator::UnaryPlus => Instruction::ToNumber { dst, src },
             UnaryOperator::LogicalNot => Instruction::Not { dst, src },
             UnaryOperator::BitwiseNot => Instruction::BitNot { dst, src },
             UnaryOperator::Typeof => Instruction::TypeOf { dst, src },
@@ -1319,8 +2331,13 @@ impl Compiler {
                             src: value,
                         });
                     }
-                    Some(ResolvedBinding::Upvalue { .. }) => {
-                        return Err(CompileError::unsupported("Upvalue assignment"));
+                    Some(ResolvedBinding::Upvalue { index, depth }) => {
+                        // Register this upvalue and get its index in the current function's upvalues array
+                        let upvalue_idx = self.codegen.register_upvalue(index, depth);
+                        self.codegen.emit(Instruction::SetUpvalue {
+                            idx: LocalIndex(upvalue_idx),
+                            src: value,
+                        });
                     }
                 }
             }
@@ -1358,6 +2375,11 @@ impl Compiler {
             return self.compile_method_call(call, member);
         }
 
+        // Check for computed member call (obj[key]())
+        if let Expression::ComputedMemberExpression(member) = &call.callee {
+            return self.compile_computed_method_call(call, member);
+        }
+
         // Compile callee
         let func = self.compile_expression(&call.callee)?;
 
@@ -1372,36 +2394,39 @@ impl Compiler {
             self.compile_call_with_spread(call, func)
         } else {
             // Regular call without spread
-            // Arguments MUST be at func+1, func+2, ... for the Call instruction
             let argc = call.arguments.len() as u8;
-
-            // Reserve registers for arguments right after func
-            let mut reserved = Vec::with_capacity(call.arguments.len());
-            for _ in 0..call.arguments.len() {
-                reserved.push(self.codegen.alloc_reg());
+            // Call convention requires `func` and args to be in contiguous registers.
+            let mut arg_tmps = Vec::with_capacity(call.arguments.len());
+            for arg in &call.arguments {
+                arg_tmps.push(self.compile_expression(arg.to_expression())?);
             }
 
-            // Compile each argument and move to its designated register
-            for (i, arg) in call.arguments.iter().enumerate() {
-                let temp = self.compile_expression(arg.to_expression())?;
-                let target = Register(func.0 + 1 + i as u8);
-                if temp.0 != target.0 {
-                    self.codegen.emit(Instruction::Move {
-                        dst: target,
-                        src: temp,
-                    });
-                    self.codegen.free_reg(temp);
-                }
+            let frame = self.codegen.alloc_fresh_block(1 + argc);
+            self.codegen.emit(Instruction::Move {
+                dst: frame,
+                src: func,
+            });
+            for (i, tmp) in arg_tmps.iter().copied().enumerate() {
+                let target = Register(frame.0 + 1 + i as u8);
+                self.codegen.emit(Instruction::Move {
+                    dst: target,
+                    src: tmp,
+                });
             }
 
-            // Allocate dst register (will be after all args)
             let dst = self.codegen.alloc_reg();
-            self.codegen.emit(Instruction::Call { dst, func, argc });
+            self.codegen.emit(Instruction::Call {
+                dst,
+                func: frame,
+                argc,
+            });
 
-            // Free func and reserved arg registers
             self.codegen.free_reg(func);
-            for reg in reserved {
-                self.codegen.free_reg(reg);
+            for tmp in arg_tmps {
+                self.codegen.free_reg(tmp);
+            }
+            for i in 0..(1 + argc) {
+                self.codegen.free_reg(Register(frame.0 + i));
             }
 
             Ok(dst)
@@ -1441,39 +2466,163 @@ impl Compiler {
         } else {
             // Regular method call without spread
             let argc = call.arguments.len() as u8;
-
-            // Reserve registers for arguments right after obj
-            let mut reserved = Vec::with_capacity(call.arguments.len());
-            for _ in 0..call.arguments.len() {
-                reserved.push(self.codegen.alloc_reg());
+            // CallMethod convention requires receiver and args to be in contiguous registers.
+            let mut arg_tmps = Vec::with_capacity(call.arguments.len());
+            for arg in &call.arguments {
+                arg_tmps.push(self.compile_expression(arg.to_expression())?);
             }
 
-            // Compile each argument and move to its designated register
-            for (i, arg) in call.arguments.iter().enumerate() {
-                let temp = self.compile_expression(arg.to_expression())?;
-                let target = Register(obj.0 + 1 + i as u8);
-                if temp.0 != target.0 {
-                    self.codegen.emit(Instruction::Move {
-                        dst: target,
-                        src: temp,
-                    });
-                    self.codegen.free_reg(temp);
-                }
+            let frame = self.codegen.alloc_fresh_block(1 + argc);
+            self.codegen.emit(Instruction::Move {
+                dst: frame,
+                src: obj,
+            });
+            for (i, tmp) in arg_tmps.iter().copied().enumerate() {
+                let target = Register(frame.0 + 1 + i as u8);
+                self.codegen.emit(Instruction::Move {
+                    dst: target,
+                    src: tmp,
+                });
             }
 
-            // Allocate dst register
             let dst = self.codegen.alloc_reg();
             self.codegen.emit(Instruction::CallMethod {
                 dst,
-                obj,
+                obj: frame,
                 method: method_idx,
                 argc,
             });
 
-            // Free obj and reserved arg registers
             self.codegen.free_reg(obj);
-            for reg in reserved {
-                self.codegen.free_reg(reg);
+            for tmp in arg_tmps {
+                self.codegen.free_reg(tmp);
+            }
+            for i in 0..(1 + argc) {
+                self.codegen.free_reg(Register(frame.0 + i));
+            }
+
+            Ok(dst)
+        }
+    }
+
+    /// Compile a computed method call (obj[key](...))
+    fn compile_computed_method_call(
+        &mut self,
+        call: &CallExpression,
+        member: &oxc_ast::ast::ComputedMemberExpression,
+    ) -> CompileResult<Register> {
+        // Compile the object (receiver)
+        let obj = self.compile_expression(&member.object)?;
+
+        // Compile the key
+        let key = self.compile_expression(&member.expression)?;
+
+        // Check for spread arguments (fallback to regular call in that case)
+        let has_spread = call
+            .arguments
+            .iter()
+            .any(|arg| matches!(arg, Argument::SpreadElement(_)));
+
+        if has_spread {
+            // For spread with computed method call, use CallMethodComputedSpread
+            // Build spread array first
+            let args_arr = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::NewArray {
+                dst: args_arr,
+                len: 0,
+            });
+
+            for arg in &call.arguments {
+                match arg {
+                    Argument::SpreadElement(spread) => {
+                        let spread_val = self.compile_expression(&spread.argument)?;
+                        self.codegen.emit(Instruction::Spread {
+                            dst: args_arr,
+                            src: spread_val,
+                        });
+                        self.codegen.free_reg(spread_val);
+                    }
+                    _ => {
+                        let arg_val = self.compile_expression(arg.to_expression())?;
+
+                        // Get current length to use as index
+                        let len_name = self.codegen.add_string("length");
+                        let len_reg = self.codegen.alloc_reg();
+                        self.codegen.emit(Instruction::GetPropConst {
+                            dst: len_reg,
+                            obj: args_arr,
+                            name: len_name,
+                        });
+
+                        // Set element at current length
+                        self.codegen.emit(Instruction::SetElem {
+                            arr: args_arr,
+                            idx: len_reg,
+                            val: arg_val,
+                        });
+
+                        self.codegen.free_reg(len_reg);
+                        self.codegen.free_reg(arg_val);
+                    }
+                }
+            }
+
+            let dst = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::CallMethodComputedSpread {
+                dst,
+                obj,
+                key,
+                spread: args_arr,
+            });
+
+            self.codegen.free_reg(obj);
+            self.codegen.free_reg(key);
+            self.codegen.free_reg(args_arr);
+
+            Ok(dst)
+        } else {
+            // Regular computed method call without spread
+            let argc = call.arguments.len() as u8;
+
+            // Compile arguments into temporary registers
+            let mut arg_tmps = Vec::with_capacity(call.arguments.len());
+            for arg in &call.arguments {
+                arg_tmps.push(self.compile_expression(arg.to_expression())?);
+            }
+
+            // CallMethodComputed requires: obj, key, arg1, arg2, ... (contiguous)
+            let frame = self.codegen.alloc_fresh_block(2 + argc);
+            self.codegen.emit(Instruction::Move {
+                dst: frame,
+                src: obj,
+            });
+            self.codegen.emit(Instruction::Move {
+                dst: Register(frame.0 + 1),
+                src: key,
+            });
+            for (i, tmp) in arg_tmps.iter().copied().enumerate() {
+                let target = Register(frame.0 + 2 + i as u8);
+                self.codegen.emit(Instruction::Move {
+                    dst: target,
+                    src: tmp,
+                });
+            }
+
+            let dst = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::CallMethodComputed {
+                dst,
+                obj: frame,
+                key: Register(frame.0 + 1),
+                argc,
+            });
+
+            self.codegen.free_reg(obj);
+            self.codegen.free_reg(key);
+            for tmp in arg_tmps {
+                self.codegen.free_reg(tmp);
+            }
+            for i in 0..(2 + argc) {
+                self.codegen.free_reg(Register(frame.0 + i));
             }
 
             Ok(dst)
@@ -1553,38 +2702,102 @@ impl Compiler {
         // Compile callee (constructor)
         let func = self.compile_expression(&new_expr.callee)?;
 
-        // Check if we have any spread arguments
-        let has_spread = new_expr
+        let spread_pos = new_expr
             .arguments
             .iter()
-            .any(|arg| matches!(arg, Argument::SpreadElement(_)));
+            .position(|arg| matches!(arg, Argument::SpreadElement(_)));
 
-        if has_spread {
-            // For now, spread in new expressions is not supported
-            // This would require a ConstructSpread instruction
-            return Err(CompileError::unsupported("Spread in new expressions"));
+        if let Some(spread_pos) = spread_pos {
+            // Support `new Ctor(a, b, ...args)` (single spread; must be last).
+            if spread_pos + 1 != new_expr.arguments.len() {
+                return Err(CompileError::unsupported(
+                    "Spread in new expressions (must be last)",
+                ));
+            }
+
+            let argc = spread_pos as u8;
+            // ConstructSpread convention requires `func` and regular args to be contiguous.
+            let mut arg_tmps = Vec::with_capacity(argc as usize);
+            for arg in new_expr.arguments.iter().take(spread_pos) {
+                arg_tmps.push(self.compile_expression(arg.to_expression())?);
+            }
+
+            // Compile spread array
+            let spread = match &new_expr.arguments[spread_pos] {
+                Argument::SpreadElement(spread) => self.compile_expression(&spread.argument)?,
+                _ => unreachable!(),
+            };
+
+            let frame = self.codegen.alloc_fresh_block(1 + argc);
+            self.codegen.emit(Instruction::Move {
+                dst: frame,
+                src: func,
+            });
+            for (i, tmp) in arg_tmps.iter().copied().enumerate() {
+                let target = Register(frame.0 + 1 + i as u8);
+                self.codegen.emit(Instruction::Move {
+                    dst: target,
+                    src: tmp,
+                });
+            }
+
+            let dst = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::ConstructSpread {
+                dst,
+                func: frame,
+                argc,
+                spread,
+            });
+
+            self.codegen.free_reg(func);
+            for tmp in arg_tmps {
+                self.codegen.free_reg(tmp);
+            }
+            for i in 0..(1 + argc) {
+                self.codegen.free_reg(Register(frame.0 + i));
+            }
+            self.codegen.free_reg(spread);
+
+            Ok(dst)
+        } else {
+            // Regular construct without spread
+            let argc = new_expr.arguments.len() as u8;
+            // Construct convention requires `func` and args to be contiguous.
+            let mut arg_tmps = Vec::with_capacity(new_expr.arguments.len());
+            for arg in &new_expr.arguments {
+                arg_tmps.push(self.compile_expression(arg.to_expression())?);
+            }
+
+            let frame = self.codegen.alloc_fresh_block(1 + argc);
+            self.codegen.emit(Instruction::Move {
+                dst: frame,
+                src: func,
+            });
+            for (i, tmp) in arg_tmps.iter().copied().enumerate() {
+                let target = Register(frame.0 + 1 + i as u8);
+                self.codegen.emit(Instruction::Move {
+                    dst: target,
+                    src: tmp,
+                });
+            }
+
+            let dst = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::Construct {
+                dst,
+                func: frame,
+                argc,
+            });
+
+            self.codegen.free_reg(func);
+            for tmp in arg_tmps {
+                self.codegen.free_reg(tmp);
+            }
+            for i in 0..(1 + argc) {
+                self.codegen.free_reg(Register(frame.0 + i));
+            }
+
+            Ok(dst)
         }
-
-        // Compile arguments
-        let argc = new_expr.arguments.len() as u8;
-        let mut arg_regs = Vec::with_capacity(new_expr.arguments.len());
-
-        for arg in &new_expr.arguments {
-            let reg = self.compile_expression(arg.to_expression())?;
-            arg_regs.push(reg);
-        }
-
-        // Free argument registers
-        for reg in arg_regs.iter().rev() {
-            self.codegen.free_reg(*reg);
-        }
-
-        let dst = self.codegen.alloc_reg();
-        self.codegen
-            .emit(Instruction::Construct { dst, func, argc });
-        self.codegen.free_reg(func);
-
-        Ok(dst)
     }
 
     /// Compile an update expression (i++, ++i, i--, --i)
@@ -1684,8 +2897,13 @@ impl Compiler {
                     src,
                 });
             }
-            Some(ResolvedBinding::Upvalue { .. }) => {
-                return Err(CompileError::unsupported("Upvalues"));
+            Some(ResolvedBinding::Upvalue { index, depth }) => {
+                // Register this upvalue and get its index in the current function's upvalues array
+                let upvalue_idx = self.codegen.register_upvalue(index, depth);
+                self.codegen.emit(Instruction::SetUpvalue {
+                    idx: LocalIndex(upvalue_idx),
+                    src,
+                });
             }
             None => {
                 // Undeclared variable - treat as global
@@ -1738,24 +2956,117 @@ impl Compiler {
         for prop in &obj.properties {
             match prop {
                 ObjectPropertyKind::ObjectProperty(prop) => {
-                    let key = match &prop.key {
-                        PropertyKey::StaticIdentifier(ident) => {
-                            self.codegen.add_string(&ident.name)
-                        }
-                        PropertyKey::StringLiteral(lit) => self.codegen.add_string(&lit.value),
-                        _ => return Err(CompileError::unsupported("Computed property keys")),
-                    };
+                    match prop.kind {
+                        PropertyKind::Init => {
+                            // Fast path: non-computed static keys
+                            if !prop.computed {
+                                let key = match &prop.key {
+                                    PropertyKey::StaticIdentifier(ident) => {
+                                        Some(self.codegen.add_string(&ident.name))
+                                    }
+                                    PropertyKey::StringLiteral(lit) => {
+                                        Some(self.codegen.add_string(&lit.value))
+                                    }
+                                    _ => None,
+                                };
 
-                    let value = self.compile_expression(&prop.value)?;
-                    self.codegen.emit(Instruction::SetPropConst {
-                        obj: dst,
-                        name: key,
-                        val: value,
-                    });
-                    self.codegen.free_reg(value);
+                                if let Some(key) = key {
+                                    let value = self.compile_expression(&prop.value)?;
+                                    self.codegen.emit(Instruction::SetPropConst {
+                                        obj: dst,
+                                        name: key,
+                                        val: value,
+                                    });
+                                    self.codegen.free_reg(value);
+                                    continue;
+                                }
+                            }
+
+                            // Computed key: obj[key] = value
+                            let key_reg = self.compile_property_key(&prop.key)?;
+                            let value = self.compile_expression(&prop.value)?;
+                            self.codegen.emit(Instruction::SetProp {
+                                obj: dst,
+                                key: key_reg,
+                                val: value,
+                            });
+                            self.codegen.free_reg(value);
+                            self.codegen.free_reg(key_reg);
+                        }
+                        PropertyKind::Get => {
+                            // Use native DefineGetter instruction
+                            let key_reg = self.compile_property_key(&prop.key)?;
+                            let func_reg = self.compile_expression(&prop.value)?;
+
+                            self.codegen.emit(Instruction::DefineGetter {
+                                obj: dst,
+                                key: key_reg,
+                                func: func_reg,
+                            });
+
+                            self.codegen.free_reg(func_reg);
+                            self.codegen.free_reg(key_reg);
+                        }
+                        PropertyKind::Set => {
+                            // Use native DefineSetter instruction
+                            let key_reg = self.compile_property_key(&prop.key)?;
+                            let func_reg = self.compile_expression(&prop.value)?;
+
+                            self.codegen.emit(Instruction::DefineSetter {
+                                obj: dst,
+                                key: key_reg,
+                                func: func_reg,
+                            });
+
+                            self.codegen.free_reg(func_reg);
+                            self.codegen.free_reg(key_reg);
+                        }
+                    }
                 }
                 ObjectPropertyKind::SpreadProperty(_) => {
-                    return Err(CompileError::unsupported("Object spread"));
+                    let ObjectPropertyKind::SpreadProperty(spread) = prop else {
+                        unreachable!();
+                    };
+
+                    // Lower `{ ...a }` into `__Object_assign(dst, a)`.
+                    // This is close enough for our current shims/builtins.
+                    let src = self.compile_expression(&spread.argument)?;
+
+                    let func_tmp = self.codegen.alloc_reg();
+                    let name_idx = self.codegen.add_string("__Object_assign");
+                    self.codegen.emit(Instruction::GetGlobal {
+                        dst: func_tmp,
+                        name: name_idx,
+                    });
+
+                    // Call convention requires `func` and args to be contiguous.
+                    let frame = self.codegen.alloc_fresh_block(3);
+                    let arg1 = Register(frame.0 + 1);
+                    let arg2 = Register(frame.0 + 2);
+
+                    self.codegen.emit(Instruction::Move {
+                        dst: frame,
+                        src: func_tmp,
+                    });
+                    self.codegen.emit(Instruction::Move {
+                        dst: arg1,
+                        src: dst,
+                    });
+                    self.codegen.emit(Instruction::Move { dst: arg2, src });
+
+                    let call_dst = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::Call {
+                        dst: call_dst,
+                        func: frame,
+                        argc: 2,
+                    });
+
+                    self.codegen.free_reg(call_dst);
+                    self.codegen.free_reg(func_tmp);
+                    self.codegen.free_reg(src);
+                    self.codegen.free_reg(frame);
+                    self.codegen.free_reg(arg1);
+                    self.codegen.free_reg(arg2);
                 }
             }
         }
@@ -1763,26 +3074,112 @@ impl Compiler {
         Ok(dst)
     }
 
+    fn compile_property_key(&mut self, key: &PropertyKey) -> CompileResult<Register> {
+        match key {
+            PropertyKey::StaticIdentifier(ident) => {
+                let dst = self.codegen.alloc_reg();
+                let idx = self.codegen.add_string(&ident.name);
+                self.codegen.emit(Instruction::LoadConst { dst, idx });
+                Ok(dst)
+            }
+            PropertyKey::PrivateIdentifier(_) => {
+                Err(CompileError::unsupported("PrivateIdentifier"))
+            }
+            PropertyKey::StringLiteral(lit) => {
+                let dst = self.codegen.alloc_reg();
+                let idx = self.codegen.add_string(&lit.value);
+                self.codegen.emit(Instruction::LoadConst { dst, idx });
+                Ok(dst)
+            }
+            PropertyKey::NumericLiteral(lit) => {
+                // Lower numeric keys to numbers; SetProp will coerce to index/string.
+                let dst = self.codegen.alloc_reg();
+                let value = lit.value;
+                if value.fract() == 0.0 && value >= i32::MIN as f64 && value <= i32::MAX as f64 {
+                    self.codegen.emit(Instruction::LoadInt32 {
+                        dst,
+                        value: value as i32,
+                    });
+                } else {
+                    let idx = self.codegen.add_number(value);
+                    self.codegen.emit(Instruction::LoadConst { dst, idx });
+                }
+                Ok(dst)
+            }
+            // Common case for `[ident]` (e.g. `[Symbol.iterator]` via a local binding)
+            PropertyKey::Identifier(ident) => self.compile_identifier(&ident.name),
+            PropertyKey::StaticMemberExpression(member) => {
+                self.compile_static_member_expression(member)
+            }
+            PropertyKey::ComputedMemberExpression(member) => {
+                self.compile_computed_member_expression(member)
+            }
+            _ => Err(CompileError::unsupported(
+                "Computed property key expression",
+            )),
+        }
+    }
+
     /// Compile an array expression
     fn compile_array_expression(&mut self, arr: &ArrayExpression) -> CompileResult<Register> {
-        let len = arr.elements.len() as u16;
-        let dst = self.codegen.alloc_reg();
-        self.codegen.emit(Instruction::NewArray { dst, len });
+        let has_spread = arr
+            .elements
+            .iter()
+            .any(|e| matches!(e, ArrayExpressionElement::SpreadElement(_)));
 
-        for (i, elem) in arr.elements.iter().enumerate() {
+        let dst = self.codegen.alloc_reg();
+
+        if !has_spread {
+            let len = arr.elements.len() as u16;
+            self.codegen.emit(Instruction::NewArray { dst, len });
+
+            for (i, elem) in arr.elements.iter().enumerate() {
+                match elem {
+                    ArrayExpressionElement::Elision(_) => {
+                        // Skip - already undefined
+                    }
+                    _ => {
+                        let value = self.compile_expression(elem.to_expression())?;
+                        let idx_reg = self.codegen.alloc_reg();
+                        self.codegen.emit(Instruction::LoadInt32 {
+                            dst: idx_reg,
+                            value: i as i32,
+                        });
+                        self.codegen.emit(Instruction::SetElem {
+                            arr: dst,
+                            idx: idx_reg,
+                            val: value,
+                        });
+                        self.codegen.free_reg(idx_reg);
+                        self.codegen.free_reg(value);
+                    }
+                }
+            }
+
+            return Ok(dst);
+        }
+
+        // With spread: build dynamically using `length` and `Spread` instruction.
+        self.codegen.emit(Instruction::NewArray { dst, len: 0 });
+        let length_key = self.codegen.add_string("length");
+
+        for elem in &arr.elements {
             match elem {
-                ArrayExpressionElement::SpreadElement(_) => {
-                    return Err(CompileError::unsupported("Array spread"));
+                ArrayExpressionElement::SpreadElement(spread) => {
+                    let src = self.compile_expression(&spread.argument)?;
+                    self.codegen.emit(Instruction::Spread { dst, src });
+                    self.codegen.free_reg(src);
                 }
                 ArrayExpressionElement::Elision(_) => {
-                    // Skip - already undefined
+                    // TODO: elision should advance length; skip for now
                 }
                 _ => {
                     let value = self.compile_expression(elem.to_expression())?;
                     let idx_reg = self.codegen.alloc_reg();
-                    self.codegen.emit(Instruction::LoadInt32 {
+                    self.codegen.emit(Instruction::GetPropConst {
                         dst: idx_reg,
-                        value: i as i32,
+                        obj: dst,
+                        name: length_key,
                     });
                     self.codegen.emit(Instruction::SetElem {
                         arr: dst,
@@ -1816,7 +3213,6 @@ impl Compiler {
         self.codegen.patch_jump(jump_else, else_offset);
 
         // Compile alternate into same register
-        self.codegen.free_reg(result);
         let alt = self.compile_expression(&cond.alternate)?;
 
         // Move to result register if different
@@ -2404,5 +3800,17 @@ mod tests {
 
         // 1 main function + 1 createUser function
         assert_eq!(module.functions.len(), 2);
+    }
+
+    #[test]
+    fn test_shim_builtins_js_compiles() {
+        let builtins = include_str!("../../otter-vm-builtins/src/builtins.js");
+        Compiler::new().compile(builtins, "builtins.js").unwrap();
+    }
+
+    #[test]
+    fn test_shim_fetch_js_compiles() {
+        let fetch = include_str!("../../otter-vm-builtins/src/fetch.js");
+        Compiler::new().compile(fetch, "fetch.js").unwrap();
     }
 }

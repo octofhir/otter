@@ -2,13 +2,17 @@
 //!
 //! Provides Object.keys(), Object.values(), Object.entries(), Object.assign(), Object.hasOwn(),
 //! Object.freeze(), Object.isFrozen(), Object.seal(), Object.isSealed(),
-//! Object.preventExtensions(), Object.isExtensible()
+//! Object.preventExtensions(), Object.isExtensible(), Object.defineProperty(), Object.create(),
+//! Object.is()
 
 use otter_macros::dive;
+use otter_vm_core::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
+use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value as VmValue;
 use otter_vm_runtime::{Op, op_native, op_sync};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::sync::Arc;
 
 /// Object constructor and methods
 pub struct ObjectBuiltin;
@@ -32,6 +36,9 @@ pub fn ops() -> Vec<Op> {
             native_object_prevent_extensions,
         ),
         op_native("__Object_isExtensible", native_object_is_extensible),
+        op_native("__Object_defineProperty", native_object_define_property),
+        op_native("__Object_create", native_object_create),
+        op_native("__Object_is", native_object_is),
     ]
 }
 
@@ -90,6 +97,253 @@ fn native_object_is_extensible(args: &[VmValue]) -> Result<VmValue, String> {
         .ok_or("Object.isExtensible requires an argument")?;
     let is_extensible = obj.as_object().map(|o| o.is_extensible()).unwrap_or(false); // Non-objects are not extensible
     Ok(VmValue::boolean(is_extensible))
+}
+
+/// Convert a value to a PropertyKey
+fn to_property_key(value: &VmValue) -> PropertyKey {
+    if let Some(n) = value.as_number()
+        && n.fract() == 0.0
+        && n >= 0.0
+        && n <= u32::MAX as f64
+    {
+        return PropertyKey::Index(n as u32);
+    }
+    if let Some(s) = value.as_string() {
+        return PropertyKey::String(Arc::clone(s));
+    }
+    if let Some(sym) = value.as_symbol() {
+        return PropertyKey::Symbol(sym.id);
+    }
+    // Fallback: convert to string
+    let s = if value.is_undefined() {
+        "undefined"
+    } else if value.is_null() {
+        "null"
+    } else if let Some(b) = value.as_boolean() {
+        if b { "true" } else { "false" }
+    } else if let Some(n) = value.as_number() {
+        // Handle numeric strings
+        return PropertyKey::String(JsString::intern(&n.to_string()));
+    } else {
+        "[object]"
+    };
+    PropertyKey::String(JsString::intern(s))
+}
+
+/// Object.defineProperty(obj, prop, descriptor) - native implementation
+fn native_object_define_property(args: &[VmValue]) -> Result<VmValue, String> {
+    let obj_val = args
+        .first()
+        .ok_or("Object.defineProperty requires an object")?;
+    let key_val = args
+        .get(1)
+        .ok_or("Object.defineProperty requires a property key")?;
+    let descriptor = args
+        .get(2)
+        .ok_or("Object.defineProperty requires a descriptor")?;
+
+    // First argument must be an object
+    let obj = obj_val
+        .as_object()
+        .ok_or("Object.defineProperty requires the first argument to be an object")?;
+
+    let key = to_property_key(key_val);
+
+    let Some(attr_obj) = descriptor.as_object() else {
+        return Err("Property descriptor must be an object".to_string());
+    };
+
+    // Helper to read boolean fields
+    let read_bool = |name: &str, default: bool| -> bool {
+        attr_obj
+            .get(&name.into())
+            .and_then(|v| v.as_boolean())
+            .unwrap_or(default)
+    };
+
+    // Check for accessor descriptor (get/set)
+    let get = attr_obj.get(&"get".into());
+    let set = attr_obj.get(&"set".into());
+
+    if get.is_some() || set.is_some() {
+        // Accessor descriptor
+        let enumerable = read_bool("enumerable", false);
+        let configurable = read_bool("configurable", false);
+
+        // Get existing accessor if any (for partial updates)
+        let existing = obj.get_own_property_descriptor(&key);
+        let (mut existing_get, mut existing_set) = match existing {
+            Some(PropertyDescriptor::Accessor { get, set, .. }) => (get, set),
+            _ => (None, None),
+        };
+
+        let get = get
+            .filter(|v| !v.is_undefined())
+            .or_else(|| existing_get.take());
+        let set = set
+            .filter(|v| !v.is_undefined())
+            .or_else(|| existing_set.take());
+
+        let attrs = PropertyAttributes {
+            writable: false,
+            enumerable,
+            configurable,
+        };
+
+        obj.define_property(
+            key,
+            PropertyDescriptor::Accessor {
+                get,
+                set,
+                attributes: attrs,
+            },
+        );
+    } else {
+        // Data descriptor
+        let value = attr_obj
+            .get(&"value".into())
+            .unwrap_or(VmValue::undefined());
+        let writable = read_bool("writable", false);
+        let enumerable = read_bool("enumerable", false);
+        let configurable = read_bool("configurable", false);
+
+        let attrs = PropertyAttributes {
+            writable,
+            enumerable,
+            configurable,
+        };
+
+        obj.define_property(key, PropertyDescriptor::data_with_attrs(value, attrs));
+    }
+
+    // Return the object (per spec)
+    Ok(obj_val.clone())
+}
+
+/// Object.create(proto, propertiesObject?) - native implementation
+fn native_object_create(args: &[VmValue]) -> Result<VmValue, String> {
+    let proto_val = args
+        .first()
+        .ok_or("Object.create requires a prototype argument")?;
+
+    // Prototype must be object or null
+    let prototype = if proto_val.is_null() {
+        None
+    } else if let Some(proto_obj) = proto_val.as_object() {
+        Some(Arc::clone(proto_obj))
+    } else {
+        return Err("Object prototype may only be an Object or null".to_string());
+    };
+
+    let new_obj = Arc::new(JsObject::new(prototype));
+
+    // Handle optional properties object (second argument)
+    if let Some(props_val) = args.get(1) {
+        if !props_val.is_undefined() {
+            let props = props_val
+                .as_object()
+                .ok_or("Properties argument must be an object")?;
+
+            // For each enumerable own property of props, call defineProperty
+            for key in props.own_keys() {
+                if let Some(descriptor) = props.get(&key) {
+                    if let Some(attr_obj) = descriptor.as_object() {
+                        // Helper to read boolean fields
+                        let read_bool = |name: &str, default: bool| -> bool {
+                            attr_obj
+                                .get(&name.into())
+                                .and_then(|v| v.as_boolean())
+                                .unwrap_or(default)
+                        };
+
+                        let get = attr_obj.get(&"get".into());
+                        let set = attr_obj.get(&"set".into());
+
+                        if get.is_some() || set.is_some() {
+                            let enumerable = read_bool("enumerable", false);
+                            let configurable = read_bool("configurable", false);
+
+                            let attrs = PropertyAttributes {
+                                writable: false,
+                                enumerable,
+                                configurable,
+                            };
+
+                            new_obj.define_property(
+                                key,
+                                PropertyDescriptor::Accessor {
+                                    get: get.filter(|v| !v.is_undefined()),
+                                    set: set.filter(|v| !v.is_undefined()),
+                                    attributes: attrs,
+                                },
+                            );
+                        } else {
+                            let value = attr_obj
+                                .get(&"value".into())
+                                .unwrap_or(VmValue::undefined());
+                            let writable = read_bool("writable", false);
+                            let enumerable = read_bool("enumerable", false);
+                            let configurable = read_bool("configurable", false);
+
+                            let attrs = PropertyAttributes {
+                                writable,
+                                enumerable,
+                                configurable,
+                            };
+
+                            new_obj
+                                .define_property(key, PropertyDescriptor::data_with_attrs(value, attrs));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(VmValue::object(new_obj))
+}
+
+/// Object.is(value1, value2) - SameValue algorithm
+fn native_object_is(args: &[VmValue]) -> Result<VmValue, String> {
+    let v1 = args.first().cloned().unwrap_or(VmValue::undefined());
+    let v2 = args.get(1).cloned().unwrap_or(VmValue::undefined());
+
+    // SameValue algorithm:
+    // 1. NaN === NaN is true
+    // 2. +0 !== -0 (different from ===)
+    // 3. Otherwise, same as ===
+
+    let result = if let (Some(n1), Some(n2)) = (v1.as_number(), v2.as_number()) {
+        if n1.is_nan() && n2.is_nan() {
+            // NaN is same as NaN
+            true
+        } else if n1 == 0.0 && n2 == 0.0 {
+            // Check sign: 1.0/+0.0 = +inf, 1.0/-0.0 = -inf
+            (1.0_f64 / n1).is_sign_positive() == (1.0_f64 / n2).is_sign_positive()
+        } else {
+            n1 == n2
+        }
+    } else if v1.is_undefined() && v2.is_undefined() {
+        true
+    } else if v1.is_null() && v2.is_null() {
+        true
+    } else if let (Some(b1), Some(b2)) = (v1.as_boolean(), v2.as_boolean()) {
+        b1 == b2
+    } else if let (Some(s1), Some(s2)) = (v1.as_string(), v2.as_string()) {
+        s1.as_str() == s2.as_str()
+    } else if let (Some(sym1), Some(sym2)) = (v1.as_symbol(), v2.as_symbol()) {
+        sym1.id == sym2.id
+    } else if let (Some(o1), Some(o2)) = (v1.as_object(), v2.as_object()) {
+        // Same reference check
+        Arc::ptr_eq(o1, o2)
+    } else if let (Some(f1), Some(f2)) = (v1.as_function(), v2.as_function()) {
+        // Same closure check
+        Arc::ptr_eq(&f1.module, &f2.module) && f1.function_index == f2.function_index
+    } else {
+        false
+    };
+
+    Ok(VmValue::boolean(result))
 }
 
 // ============================================================================

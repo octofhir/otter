@@ -32,7 +32,47 @@ use crate::promise::JsPromise;
 use crate::proxy::JsProxy;
 use crate::shared_buffer::SharedArrayBuffer;
 use crate::string::JsString;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
+
+/// Heap-allocated cell for mutable upvalues (closures)
+///
+/// When a closure captures a local variable that may be mutated,
+/// we store it in an UpvalueCell. Multiple closures can share
+/// the same cell, enabling the counter pattern:
+///
+/// ```javascript
+/// function counter() {
+///     let count = 0;
+///     return () => ++count;  // Increments shared count
+/// }
+/// ```
+#[derive(Clone)]
+pub struct UpvalueCell(Rc<RefCell<Value>>);
+
+impl UpvalueCell {
+    /// Create a new upvalue cell with the given value
+    pub fn new(value: Value) -> Self {
+        Self(Rc::new(RefCell::new(value)))
+    }
+
+    /// Get the current value from the cell
+    pub fn get(&self) -> Value {
+        self.0.borrow().clone()
+    }
+
+    /// Set a new value in the cell
+    pub fn set(&self, value: Value) {
+        *self.0.borrow_mut() = value;
+    }
+}
+
+impl std::fmt::Debug for UpvalueCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UpvalueCell({:?})", self.0.borrow())
+    }
+}
 
 // NaN-boxing constants
 const QUIET_NAN: u64 = 0x7FF8_0000_0000_0000;
@@ -91,7 +131,7 @@ pub enum HeapRef {
     /// SharedArrayBuffer (can be shared between workers)
     SharedArrayBuffer(Arc<SharedArrayBuffer>),
     /// Native function (implemented in Rust)
-    NativeFunction(NativeFn),
+    NativeFunction(Arc<NativeFunctionObject>),
 }
 
 impl std::fmt::Debug for HeapRef {
@@ -117,10 +157,21 @@ impl std::fmt::Debug for HeapRef {
 pub struct Closure {
     /// Function index in the module
     pub function_index: u32,
-    /// Captured upvalues
-    pub upvalues: Vec<Value>,
+    /// Reference to the module containing this function
+    pub module: Arc<otter_vm_bytecode::Module>,
+    /// Captured upvalues (heap-allocated cells for shared mutable access)
+    pub upvalues: Vec<UpvalueCell>,
     /// Is this an async function
     pub is_async: bool,
+    /// Function object for properties like `.prototype`
+    pub object: Arc<JsObject>,
+}
+
+/// A native function with an attached object for properties.
+#[derive(Clone)]
+pub struct NativeFunctionObject {
+    pub func: NativeFn,
+    pub object: Arc<JsObject>,
 }
 
 /// A JavaScript Symbol
@@ -187,8 +238,13 @@ impl Value {
             };
         }
 
-        // Check if it fits in i32 for optimization
-        if n.fract() == 0.0 && n >= i32::MIN as f64 && n <= i32::MAX as f64 {
+        // Check if it fits in i32 for optimization, but preserve -0.0
+        // Use 1.0/n to distinguish +0 (gives +inf) from -0 (gives -inf)
+        if n.fract() == 0.0
+            && n >= i32::MIN as f64
+            && n <= i32::MAX as f64
+            && (n != 0.0 || (1.0_f64 / n).is_sign_positive())
+        {
             return Self::int32(n as i32);
         }
 
@@ -305,10 +361,12 @@ impl Value {
         F: Fn(&[Value]) -> Result<Value, String> + Send + Sync + 'static,
     {
         let func: NativeFn = Arc::new(f);
+        let object = Arc::new(JsObject::new(None));
+        let native = Arc::new(NativeFunctionObject { func, object });
         // Use a dummy pointer for NaN-boxing (the actual function is in heap_ref)
         Self {
             bits: TAG_POINTER,
-            heap_ref: Some(HeapRef::NativeFunction(func)),
+            heap_ref: Some(HeapRef::NativeFunction(native)),
         }
     }
 
@@ -464,6 +522,8 @@ impl Value {
     pub fn as_object(&self) -> Option<&Arc<JsObject>> {
         match &self.heap_ref {
             Some(HeapRef::Object(o)) => Some(o),
+            Some(HeapRef::Function(f)) => Some(&f.object),
+            Some(HeapRef::NativeFunction(n)) => Some(&n.object),
             _ => None,
         }
     }
@@ -487,7 +547,7 @@ impl Value {
     /// Get as native function
     pub fn as_native_function(&self) -> Option<&NativeFn> {
         match &self.heap_ref {
-            Some(HeapRef::NativeFunction(f)) => Some(f),
+            Some(HeapRef::NativeFunction(f)) => Some(&f.func),
             _ => None,
         }
     }
@@ -562,6 +622,8 @@ impl Value {
 
     /// Get the type name (for typeof)
     pub fn type_of(&self) -> &'static str {
+        use crate::object::PropertyKey;
+
         match self.bits {
             TAG_UNDEFINED => "undefined",
             TAG_NULL => "object", // typeof null === "object" (historical bug)
@@ -573,9 +635,16 @@ impl Value {
                 Some(HeapRef::Function(_) | HeapRef::NativeFunction(_)) => "function",
                 Some(HeapRef::Symbol(_)) => "symbol",
                 Some(HeapRef::BigInt(_)) => "bigint",
+                Some(HeapRef::Object(obj)) => {
+                    // Check if it's a bound function (has __boundFunction__ property)
+                    if obj.get(&PropertyKey::string("__boundFunction__")).is_some() {
+                        "function"
+                    } else {
+                        "object"
+                    }
+                }
                 Some(
-                    HeapRef::Object(_)
-                    | HeapRef::Array(_)
+                    HeapRef::Array(_)
                     | HeapRef::Promise(_)
                     | HeapRef::Proxy(_)
                     | HeapRef::Generator(_)

@@ -14,6 +14,7 @@
 // Allow unsafe for NaN-boxing and GC operations
 // All unsafe code must have SAFETY comments
 
+pub mod async_context;
 pub mod context;
 pub mod error;
 pub mod gc;
@@ -29,6 +30,7 @@ pub mod string;
 pub mod structured_clone;
 pub mod value;
 
+pub use async_context::{AsyncContext, SavedFrame, VmExecutionResult};
 pub use context::VmContext;
 pub use error::{VmError, VmResult};
 pub use generator::{GeneratorContext, GeneratorState, IteratorResult, JsGenerator};

@@ -15,3 +15,20 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 iana-time-zone = "0.1"
 regex = "1.11"
+
+# HTTP client and server
+url = "2.5"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+hyper = { version = "1.6", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-auto"] }
+http-body-util = "0.1"
+bytes = "1.10"
+tokio = { version = "1.49", features = ["rt", "sync", "net", "time", "macros"] }
+dashmap = "6.1"
+http = "1.3"
+tokio-tungstenite = "0.28"
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+futures-util = "0.3"
+socket2 = "0.5"

@@ -248,13 +248,18 @@ mod tests {
 
     #[test]
     fn test_function_not_cloneable() {
+        use crate::object::JsObject;
         use crate::value::Closure;
+        use otter_vm_bytecode::Module;
 
         let mut cloner = StructuredCloner::new();
+        let dummy_module = Arc::new(Module::builder("test.js").build());
         let func = Value::function(Arc::new(Closure {
             function_index: 0,
+            module: dummy_module,
             upvalues: vec![],
             is_async: false,
+            object: Arc::new(JsObject::new(None)),
         }));
 
         let result = cloner.clone(&func);

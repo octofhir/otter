@@ -105,8 +105,8 @@ pub struct Extension {
     name: String,
     /// Operations provided by this extension
     ops: Vec<Op>,
-    /// JavaScript setup code (runs after ops are registered)
-    js: Option<String>,
+    /// JavaScript setup code chunks (run after ops are registered, in insertion order)
+    js: Vec<String>,
     /// Dependencies (names of other extensions that must be loaded first)
     deps: Vec<String>,
 }
@@ -117,7 +117,7 @@ impl Extension {
         Self {
             name: name.into(),
             ops: Vec::new(),
-            js: None,
+            js: Vec::new(),
             deps: Vec::new(),
         }
     }
@@ -130,7 +130,7 @@ impl Extension {
 
     /// Add JavaScript setup code (builder pattern)
     pub fn with_js(mut self, js: impl Into<String>) -> Self {
-        self.js = Some(js.into());
+        self.js.push(js.into());
         self
     }
 
@@ -156,8 +156,8 @@ impl Extension {
     }
 
     /// Get JavaScript setup code
-    pub fn js(&self) -> Option<&str> {
-        self.js.as_deref()
+    pub fn js(&self) -> &[String] {
+        &self.js
     }
 
     /// Get dependencies
@@ -195,6 +195,13 @@ where
 ///     Ok(serde_json::json!({"status": "ok"}))
 /// })
 /// ```
+///
+/// # Note on Capabilities
+///
+/// The handler is called on the main thread BEFORE spawning the async task.
+/// This allows permission checks (e.g., `capabilities_context::can_net()`) to work
+/// because they run while `CapabilitiesGuard` is active on the main thread.
+/// The returned future is then spawned to tokio.
 pub fn op_async<F, Fut>(name: impl Into<String>, handler: F) -> Op
 where
     F: Fn(&[JsonValue]) -> Fut + Send + Sync + 'static,
@@ -204,9 +211,10 @@ where
     Op {
         name: name.into(),
         handler: OpHandler::Async(Arc::new(move |args: &[JsonValue]| {
-            let args = args.to_vec();
-            let handler = Arc::clone(&handler);
-            Box::pin(async move { handler(&args).await })
+            // IMPORTANT: Call handler on main thread, not inside async block!
+            // This allows permission checks to access thread-local CapabilitiesGuard.
+            let future = handler(args);
+            Box::pin(future)
         })),
     }
 }
@@ -325,7 +333,12 @@ impl ExtensionRegistry {
     pub fn all_js(&self) -> Vec<&str> {
         self.load_order
             .iter()
-            .filter_map(|name| self.extensions.get(name)?.js())
+            .flat_map(|name| {
+                self.extensions
+                    .get(name)
+                    .into_iter()
+                    .flat_map(|ext| ext.js().iter().map(|s| s.as_str()))
+            })
             .collect()
     }
 
@@ -368,8 +381,8 @@ mod tests {
 
         assert_eq!(ext.name(), "test");
         assert_eq!(ext.ops().len(), 1);
-        assert!(ext.js().is_some());
-        assert_eq!(ext.js().unwrap(), "console.log('test loaded');");
+        assert_eq!(ext.js().len(), 1);
+        assert_eq!(ext.js()[0], "console.log('test loaded');");
     }
 
     #[test]

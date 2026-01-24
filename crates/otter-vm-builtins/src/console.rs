@@ -320,11 +320,52 @@ fn format_value(value: &Value) -> String {
         n.to_string()
     } else if let Some(s) = value.as_string() {
         s.as_str().to_string()
+    } else if value.is_function() {
+        "[Function]".to_string()
+    } else if value.is_native_function() {
+        "[native function]".to_string()
+    } else if value.is_symbol() {
+        if let Some(sym) = value.as_symbol() {
+            if let Some(desc) = &sym.description {
+                format!("Symbol({})", desc)
+            } else {
+                "Symbol()".to_string()
+            }
+        } else {
+            "Symbol()".to_string()
+        }
+    } else if value.is_promise() {
+        "[Promise]".to_string()
+    } else if let Some(arr) = value.as_array() {
+        format_array(arr)
     } else if let Some(obj) = value.as_object() {
-        // Format object
         format_object(obj)
     } else {
         "[unknown]".to_string()
+    }
+}
+
+fn format_array(arr: &std::sync::Arc<otter_vm_core::object::JsObject>) -> String {
+    let len = arr.array_length();
+    if len == 0 {
+        return "[]".to_string();
+    }
+
+    let max_display = 100;
+    let display_len = std::cmp::min(len, max_display);
+
+    let items: Vec<String> = (0..display_len)
+        .map(|i| {
+            arr.get(&otter_vm_core::object::PropertyKey::Index(i as u32))
+                .map(|v| format_value(&v))
+                .unwrap_or_else(|| "undefined".to_string())
+        })
+        .collect();
+
+    if len > max_display {
+        format!("[ {}, ... {} more ]", items.join(", "), len - max_display)
+    } else {
+        format!("[ {} ]", items.join(", "))
     }
 }
 
@@ -336,7 +377,11 @@ fn format_object(obj: &std::sync::Arc<otter_vm_core::object::JsObject>) -> Strin
         return "{}".to_string();
     }
 
-    let pairs: Vec<String> = keys
+    let max_keys = 50;
+    let display_keys: Vec<_> = keys.iter().take(max_keys).collect();
+    let has_more = keys.len() > max_keys;
+
+    let pairs: Vec<String> = display_keys
         .iter()
         .filter_map(|key| {
             let key_str = match key {
@@ -344,12 +389,22 @@ fn format_object(obj: &std::sync::Arc<otter_vm_core::object::JsObject>) -> Strin
                 PropertyKey::Index(i) => i.to_string(),
                 PropertyKey::Symbol(s) => format!("[Symbol({})]", s),
             };
-            obj.get(key)
-                .map(|v| format!("{}: {}", key_str, format_value(&v)))
+            obj.get(key).map(|v| {
+                let value_str = if v.is_object() && !v.is_function() && !v.is_native_function() {
+                    "[Object]".to_string()
+                } else {
+                    format_value(&v)
+                };
+                format!("{}: {}", key_str, value_str)
+            })
         })
         .collect();
 
-    format!("{{ {} }}", pairs.join(", "))
+    if has_more {
+        format!("{{ {}, ... {} more }}", pairs.join(", "), keys.len() - max_keys)
+    } else {
+        format!("{{ {} }}", pairs.join(", "))
+    }
 }
 
 fn format_table(value: &Value) -> String {

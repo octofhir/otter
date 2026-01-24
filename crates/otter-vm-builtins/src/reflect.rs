@@ -29,12 +29,18 @@ pub fn ops() -> Vec<Op> {
         op_native("__Reflect_has", native_reflect_has),
         op_native("__Reflect_deleteProperty", native_reflect_delete_property),
         op_native("__Reflect_ownKeys", native_reflect_own_keys),
-        op_native("__Reflect_getOwnPropertyDescriptor", native_reflect_get_own_property_descriptor),
+        op_native(
+            "__Reflect_getOwnPropertyDescriptor",
+            native_reflect_get_own_property_descriptor,
+        ),
         op_native("__Reflect_defineProperty", native_reflect_define_property),
         op_native("__Reflect_getPrototypeOf", native_reflect_get_prototype_of),
         op_native("__Reflect_setPrototypeOf", native_reflect_set_prototype_of),
         op_native("__Reflect_isExtensible", native_reflect_is_extensible),
-        op_native("__Reflect_preventExtensions", native_reflect_prevent_extensions),
+        op_native(
+            "__Reflect_preventExtensions",
+            native_reflect_prevent_extensions,
+        ),
     ]
 }
 
@@ -82,10 +88,13 @@ fn get_target_object(value: &VmValue) -> Result<Arc<JsObject>, String> {
             .ok_or_else(|| "Cannot perform operation on a revoked proxy".to_string());
     }
 
-    value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| "Reflect method requires an object target".to_string())
+    value.as_object().cloned().ok_or_else(|| {
+        format!(
+            "Reflect method requires an object target (got {}: {:?})",
+            value.type_of(),
+            value
+        )
+    })
 }
 
 // ============================================================================
@@ -118,10 +127,7 @@ fn native_reflect_set(args: &[VmValue]) -> Result<VmValue, String> {
     let property_key = args
         .get(1)
         .ok_or("Reflect.set requires a propertyKey argument")?;
-    let value = args
-        .get(2)
-        .cloned()
-        .unwrap_or(VmValue::undefined());
+    let value = args.get(2).cloned().unwrap_or(VmValue::undefined());
     // receiver is optional (args[3])
 
     let obj = get_target_object(target)?;
@@ -235,11 +241,69 @@ fn native_reflect_define_property(args: &[VmValue]) -> Result<VmValue, String> {
     let obj = get_target_object(target)?;
     let key = to_property_key(property_key);
 
-    // Get value from descriptor
-    if let Some(attr_obj) = attributes.as_object()
-        && let Some(value) = attr_obj.get(&"value".into())
-    {
-        obj.set(key, value);
+    let Some(attr_obj) = attributes.as_object() else {
+        return Err("Reflect.defineProperty requires attributes to be an object".to_string());
+    };
+
+    // Helper to read boolean fields with default true (the common case for builtins)
+    let read_bool = |name: &str, default: bool| -> bool {
+        attr_obj
+            .get(&name.into())
+            .and_then(|v| v.as_boolean())
+            .unwrap_or(default)
+    };
+
+    let enumerable = read_bool("enumerable", true);
+    let configurable = read_bool("configurable", true);
+    let writable = read_bool("writable", true);
+
+    // Accessor descriptor: { get?, set? }
+    let get = attr_obj.get(&"get".into());
+    let set = attr_obj.get(&"set".into());
+    if get.is_some() || set.is_some() {
+        use otter_vm_core::object::{PropertyAttributes, PropertyDescriptor};
+
+        let existing = obj.get_own_property_descriptor(&key);
+        let (mut existing_get, mut existing_set) = match existing {
+            Some(PropertyDescriptor::Accessor { get, set, .. }) => (get, set),
+            _ => (None, None),
+        };
+
+        let get = get
+            .filter(|v| !v.is_undefined())
+            .or_else(|| existing_get.take());
+        let set = set
+            .filter(|v| !v.is_undefined())
+            .or_else(|| existing_set.take());
+
+        let attrs = PropertyAttributes {
+            writable: false,
+            enumerable,
+            configurable,
+        };
+
+        let ok = obj.define_property(
+            key,
+            PropertyDescriptor::Accessor {
+                get,
+                set,
+                attributes: attrs,
+            },
+        );
+        return Ok(VmValue::boolean(ok));
+    }
+
+    // Data descriptor: { value, writable?, enumerable?, configurable? }
+    if let Some(value) = attr_obj.get(&"value".into()) {
+        use otter_vm_core::object::{PropertyAttributes, PropertyDescriptor};
+
+        let attrs = PropertyAttributes {
+            writable,
+            enumerable,
+            configurable,
+        };
+        let ok = obj.define_property(key, PropertyDescriptor::data_with_attrs(value, attrs));
+        return Ok(VmValue::boolean(ok));
     }
 
     Ok(VmValue::boolean(true))
@@ -316,11 +380,9 @@ mod tests {
         let obj = Arc::new(JsObject::new(None));
         obj.set("x".into(), VmValue::number(42.0));
 
-        let result = native_reflect_get(&[
-            VmValue::object(obj),
-            VmValue::string(JsString::intern("x")),
-        ])
-        .unwrap();
+        let result =
+            native_reflect_get(&[VmValue::object(obj), VmValue::string(JsString::intern("x"))])
+                .unwrap();
 
         assert_eq!(result.as_number(), Some(42.0));
     }
@@ -365,11 +427,9 @@ mod tests {
         .unwrap();
         assert_eq!(result.as_boolean(), Some(true));
 
-        let result = native_reflect_has(&[
-            VmValue::object(obj),
-            VmValue::string(JsString::intern("y")),
-        ])
-        .unwrap();
+        let result =
+            native_reflect_has(&[VmValue::object(obj), VmValue::string(JsString::intern("y"))])
+                .unwrap();
         assert_eq!(result.as_boolean(), Some(false));
     }
 

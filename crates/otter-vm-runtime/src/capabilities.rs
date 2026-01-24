@@ -6,7 +6,7 @@
 //! # Example
 //!
 //! ```
-//! use otter_engine::capabilities::{Capabilities, CapabilitiesBuilder};
+//! use otter_vm_runtime::capabilities::{Capabilities, CapabilitiesBuilder};
 //! use std::path::PathBuf;
 //!
 //! // Default: everything denied

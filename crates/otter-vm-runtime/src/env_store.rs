@@ -14,7 +14,7 @@
 //! # Example
 //!
 //! ```
-//! use otter_engine::env_store::{IsolatedEnvStore, EnvStoreBuilder};
+//! use otter_vm_runtime::env_store::{IsolatedEnvStore, EnvStoreBuilder};
 //!
 //! // Secure by default - nothing accessible
 //! let store = IsolatedEnvStore::default();

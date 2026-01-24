@@ -198,6 +198,12 @@ impl FunctionBuilder {
         self
     }
 
+    /// Set all upvalue captures
+    pub fn upvalues(mut self, upvalues: Vec<UpvalueCapture>) -> Self {
+        self.upvalues = upvalues;
+        self
+    }
+
     /// Set all instructions
     pub fn instructions(mut self, instructions: Vec<Instruction>) -> Self {
         self.instructions = instructions;

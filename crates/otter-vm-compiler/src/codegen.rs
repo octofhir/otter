@@ -2,6 +2,7 @@
 
 use otter_vm_bytecode::{
     ConstantIndex, ConstantPool, Function, Instruction, JumpOffset, Module, Register,
+    UpvalueCapture,
     function::{FunctionBuilder, FunctionFlags},
     module::{ExportRecord, ImportRecord},
 };
@@ -16,27 +17,73 @@ pub struct RegisterAllocator {
     next: u8,
     /// Maximum register used
     max: u8,
+    /// Free-list of registers that can be reused.
+    free: Vec<u8>,
+    /// Tracks which registers are currently allocated.
+    in_use: Vec<bool>,
 }
 
 impl RegisterAllocator {
     /// Create a new register allocator
     pub fn new() -> Self {
-        Self { next: 0, max: 0 }
+        Self {
+            next: 0,
+            max: 0,
+            free: Vec::new(),
+            in_use: vec![false; 256],
+        }
     }
 
     /// Allocate a register
     pub fn alloc(&mut self) -> Register {
-        let reg = Register(self.next);
-        self.next += 1;
+        if let Some(id) = self.free.pop() {
+            debug_assert!(!self.in_use[id as usize], "register {id} already in use");
+            self.in_use[id as usize] = true;
+            Register(id)
+        } else {
+            let reg = Register(self.next);
+            debug_assert!(
+                !self.in_use[reg.0 as usize],
+                "register {} already in use",
+                reg.0
+            );
+            self.in_use[reg.0 as usize] = true;
+            self.next = self
+                .next
+                .checked_add(1)
+                .expect("register allocation overflow");
+            self.max = self.max.max(self.next);
+            reg
+        }
+    }
+
+    /// Allocate a contiguous block of new registers (does not use the free-list).
+    ///
+    /// This is used for the calling convention where `func`, `func+1..func+argc`
+    /// must be contiguous.
+    pub fn alloc_fresh_block(&mut self, count: u8) -> Register {
+        let base = self.next;
+        for id in base..base.saturating_add(count) {
+            debug_assert!(!self.in_use[id as usize], "register {id} already in use");
+            self.in_use[id as usize] = true;
+        }
+        self.next = self
+            .next
+            .checked_add(count)
+            .expect("register allocation overflow");
         self.max = self.max.max(self.next);
-        reg
+        Register(base)
     }
 
     /// Free a register
-    pub fn free(&mut self, _reg: Register) {
-        if self.next > 0 {
-            self.next -= 1;
-        }
+    pub fn free(&mut self, reg: Register) {
+        debug_assert!(
+            self.in_use[reg.0 as usize],
+            "freeing register {} that is not in use",
+            reg.0
+        );
+        self.in_use[reg.0 as usize] = false;
+        self.free.push(reg.0);
     }
 
     /// Get current position (for restoring later)
@@ -46,7 +93,11 @@ impl RegisterAllocator {
 
     /// Restore to a previous position
     pub fn restore(&mut self, pos: u8) {
+        for id in pos..self.next {
+            self.in_use[id as usize] = false;
+        }
         self.next = pos;
+        self.free.clear();
     }
 
     /// Get maximum registers used
@@ -76,6 +127,8 @@ pub struct FunctionContext {
     pub flags: FunctionFlags,
     /// Number of parameters
     pub param_count: u8,
+    /// Captured upvalues from parent scopes
+    pub upvalues: Vec<UpvalueCapture>,
 }
 
 impl FunctionContext {
@@ -91,6 +144,7 @@ impl FunctionContext {
             scopes,
             flags: FunctionFlags::default(),
             param_count: 0,
+            upvalues: Vec::new(),
         }
     }
 
@@ -111,6 +165,7 @@ impl FunctionContext {
             Instruction::JumpIfTrue { offset: o, .. } => *o = JumpOffset(offset),
             Instruction::JumpIfFalse { offset: o, .. } => *o = JumpOffset(offset),
             Instruction::JumpIfNullish { offset: o, .. } => *o = JumpOffset(offset),
+            Instruction::TryStart { catch_offset: o } => *o = JumpOffset(offset),
             _ => panic!("Not a jump instruction"),
         }
     }
@@ -123,6 +178,7 @@ impl FunctionContext {
             .local_count(self.scopes.local_count())
             .register_count(self.registers.max_used())
             .flags(self.flags)
+            .upvalues(self.upvalues)
             .instructions(self.instructions)
             .build()
     }
@@ -178,6 +234,11 @@ impl CodeGen {
     /// Allocate a register
     pub fn alloc_reg(&mut self) -> Register {
         self.current.registers.alloc()
+    }
+
+    /// Allocate a contiguous block of new registers (does not use the free-list).
+    pub fn alloc_fresh_block(&mut self, count: u8) -> Register {
+        self.current.registers.alloc_fresh_block(count)
     }
 
     /// Free a register
@@ -246,8 +307,85 @@ impl CodeGen {
     }
 
     /// Resolve a variable
+    /// First searches the current function's scope, then traverses parent functions
     pub fn resolve_variable(&self, name: &str) -> Option<ResolvedBinding> {
-        self.current.scopes.resolve(name)
+        // First try to resolve in current function's scope chain
+        if let Some(binding) = self.current.scopes.resolve(name) {
+            // Only return immediately for Local bindings
+            // For Global, we need to check parent functions first
+            match &binding {
+                ResolvedBinding::Local(_) | ResolvedBinding::Upvalue { .. } => {
+                    return Some(binding);
+                }
+                ResolvedBinding::Global(_) => {
+                    // Don't return yet - check parent functions first
+                }
+            }
+        }
+
+        // Search parent function contexts
+        // depth starts at 1 because we're looking at the first parent
+        for (depth, parent_ctx) in self.func_stack.iter().rev().enumerate() {
+            if let Some(binding) = parent_ctx.scopes.resolve(name) {
+                match binding {
+                    ResolvedBinding::Local(idx) => {
+                        // Variable is in a parent function's local scope
+                        return Some(ResolvedBinding::Upvalue {
+                            index: idx,
+                            depth: depth + 1, // +1 because we're looking at parents
+                        });
+                    }
+                    ResolvedBinding::Upvalue {
+                        index,
+                        depth: inner_depth,
+                    } => {
+                        // Variable is already an upvalue in parent (transitive capture)
+                        return Some(ResolvedBinding::Upvalue {
+                            index,
+                            depth: depth + 1 + inner_depth,
+                        });
+                    }
+                    ResolvedBinding::Global(_) => {
+                        // Continue searching other parents
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Not found in any parent - must be global
+        Some(ResolvedBinding::Global(name.to_string()))
+    }
+
+    /// Register an upvalue and return its index in the current function's upvalue array.
+    /// This method checks if the upvalue is already registered and returns the existing index,
+    /// or adds a new upvalue capture and returns the new index.
+    pub fn register_upvalue(&mut self, parent_local_index: u16, depth: usize) -> u16 {
+        // For depth=1, capture directly from parent's local
+        // For depth>1, we'd need transitive captures through parent upvalues
+        // For now, we only support depth=1 (immediate parent)
+
+        let capture = if depth == 1 {
+            UpvalueCapture::Local(otter_vm_bytecode::LocalIndex(parent_local_index))
+        } else {
+            // For deeper captures, we need to register the upvalue in the parent first
+            // and then capture from parent's upvalue. This is complex, so for now
+            // we'll treat it as capturing from local at depth 1 (simplified).
+            // TODO: Implement proper transitive upvalue capture
+            UpvalueCapture::Local(otter_vm_bytecode::LocalIndex(parent_local_index))
+        };
+
+        // Check if we already captured this exact upvalue
+        for (i, existing) in self.current.upvalues.iter().enumerate() {
+            if *existing == capture {
+                return i as u16;
+            }
+        }
+
+        // Add new upvalue capture
+        let idx = self.current.upvalues.len() as u16;
+        self.current.upvalues.push(capture);
+        idx
     }
 
     /// Start compiling a new function

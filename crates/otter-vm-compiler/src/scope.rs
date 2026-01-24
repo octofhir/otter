@@ -76,17 +76,20 @@ impl ScopeChain {
 
     /// Declare a variable in current scope
     pub fn declare(&mut self, name: &str, is_const: bool) -> Option<u16> {
-        let scope = self.current_scope_mut()?;
+        let current_idx = self.current?;
 
         // Check for redeclaration
-        if scope.bindings.contains_key(name) {
+        if self.scopes[current_idx].bindings.contains_key(name) {
             return None; // Already declared
         }
 
-        let index = scope.next_local;
-        scope.next_local += 1;
+        // Allocate local indices at the function-scope level so they remain valid
+        // after exiting block scopes.
+        let function_scope_idx = self.current_function_scope_index()?;
+        let index = self.scopes[function_scope_idx].next_local;
+        self.scopes[function_scope_idx].next_local += 1;
 
-        scope.bindings.insert(
+        self.scopes[current_idx].bindings.insert(
             name.to_string(),
             Binding {
                 index,
@@ -97,6 +100,17 @@ impl ScopeChain {
         );
 
         Some(index)
+    }
+
+    fn current_function_scope_index(&self) -> Option<usize> {
+        let mut scope_idx = self.current?;
+        loop {
+            let scope = &self.scopes[scope_idx];
+            if scope.is_function {
+                return Some(scope_idx);
+            }
+            scope_idx = scope.parent?;
+        }
     }
 
     /// Resolve a variable
@@ -131,6 +145,37 @@ impl ScopeChain {
         }
     }
 
+    /// Mark a binding as captured by a closure.
+    /// Returns the local index if found, None if not found.
+    pub fn mark_captured(&mut self, name: &str) -> Option<u16> {
+        let mut scope_idx = self.current?;
+
+        loop {
+            let scope = &mut self.scopes[scope_idx];
+
+            if let Some(binding) = scope.bindings.get_mut(name) {
+                binding.is_captured = true;
+                return Some(binding.index);
+            }
+
+            // Check parent scope
+            scope_idx = scope.parent?;
+        }
+    }
+
+    /// Get all captured bindings in the current scope (for emitting CloseUpvalue)
+    pub fn captured_bindings_in_current_scope(&self) -> Vec<u16> {
+        let Some(idx) = self.current else {
+            return Vec::new();
+        };
+        self.scopes[idx]
+            .bindings
+            .values()
+            .filter(|b| b.is_captured)
+            .map(|b| b.index)
+            .collect()
+    }
+
     /// Get current scope
     pub fn current_scope(&self) -> Option<&Scope> {
         self.current.map(|i| &self.scopes[i])
@@ -143,20 +188,9 @@ impl ScopeChain {
 
     /// Get number of locals in current function scope
     pub fn local_count(&self) -> u16 {
-        let mut scope_idx = self.current;
-        let mut count = 0u16;
-
-        while let Some(idx) = scope_idx {
-            let scope = &self.scopes[idx];
-            count = count.saturating_add(scope.next_local);
-
-            if scope.is_function {
-                break;
-            }
-            scope_idx = scope.parent;
-        }
-
-        count
+        self.current_function_scope_index()
+            .map(|idx| self.scopes[idx].next_local)
+            .unwrap_or(0)
     }
 }
 
@@ -210,7 +244,7 @@ mod tests {
         // y is in current scope
         assert!(matches!(
             chain.resolve("y"),
-            Some(ResolvedBinding::Local(0))
+            Some(ResolvedBinding::Local(1))
         ));
         // x is in parent scope but same function
         assert!(matches!(

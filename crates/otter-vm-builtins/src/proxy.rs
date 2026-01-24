@@ -30,17 +30,11 @@ pub fn ops() -> Vec<Op> {
 /// Create a new proxy
 /// Args: [target, handler]
 fn native_proxy_create(args: &[VmValue]) -> Result<VmValue, String> {
-    let target = args
-        .first()
-        .ok_or("Proxy requires a target argument")?;
-    let handler = args
-        .get(1)
-        .ok_or("Proxy requires a handler argument")?;
+    let target = args.first().ok_or("Proxy requires a target argument")?;
+    let handler = args.get(1).ok_or("Proxy requires a handler argument")?;
 
     // Validate target is an object (not null/undefined/primitive)
-    let target_obj = target
-        .as_object()
-        .ok_or("Proxy target must be an object")?;
+    let target_obj = target.as_object().ok_or("Proxy target must be an object")?;
 
     // Validate handler is an object (not null/undefined/primitive)
     let handler_obj = handler
@@ -62,9 +56,7 @@ fn native_proxy_revocable(args: &[VmValue]) -> Result<VmValue, String> {
         .get(1)
         .ok_or("Proxy.revocable requires a handler argument")?;
 
-    let target_obj = target
-        .as_object()
-        .ok_or("Proxy target must be an object")?;
+    let target_obj = target.as_object().ok_or("Proxy target must be an object")?;
 
     let handler_obj = handler
         .as_object()
@@ -92,13 +84,9 @@ fn native_proxy_revocable(args: &[VmValue]) -> Result<VmValue, String> {
 /// Args: [proxy]
 /// Returns: target object or undefined if revoked
 fn native_proxy_get_target(args: &[VmValue]) -> Result<VmValue, String> {
-    let proxy_val = args
-        .first()
-        .ok_or("Missing proxy argument")?;
+    let proxy_val = args.first().ok_or("Missing proxy argument")?;
 
-    let proxy = proxy_val
-        .as_proxy()
-        .ok_or("Argument must be a proxy")?;
+    let proxy = proxy_val.as_proxy().ok_or("Argument must be a proxy")?;
 
     match proxy.target() {
         Some(target) => Ok(VmValue::object(Arc::clone(target))),
@@ -110,13 +98,9 @@ fn native_proxy_get_target(args: &[VmValue]) -> Result<VmValue, String> {
 /// Args: [proxy]
 /// Returns: handler object or throws if revoked
 fn native_proxy_get_handler(args: &[VmValue]) -> Result<VmValue, String> {
-    let proxy_val = args
-        .first()
-        .ok_or("Missing proxy argument")?;
+    let proxy_val = args.first().ok_or("Missing proxy argument")?;
 
-    let proxy = proxy_val
-        .as_proxy()
-        .ok_or("Argument must be a proxy")?;
+    let proxy = proxy_val.as_proxy().ok_or("Argument must be a proxy")?;
 
     match proxy.handler() {
         Some(handler) => Ok(VmValue::object(Arc::clone(handler))),
@@ -128,13 +112,9 @@ fn native_proxy_get_handler(args: &[VmValue]) -> Result<VmValue, String> {
 /// Args: [proxy]
 /// Returns: boolean
 fn native_proxy_is_revoked(args: &[VmValue]) -> Result<VmValue, String> {
-    let proxy_val = args
-        .first()
-        .ok_or("Missing proxy argument")?;
+    let proxy_val = args.first().ok_or("Missing proxy argument")?;
 
-    let proxy = proxy_val
-        .as_proxy()
-        .ok_or("Argument must be a proxy")?;
+    let proxy = proxy_val.as_proxy().ok_or("Argument must be a proxy")?;
 
     Ok(VmValue::boolean(proxy.is_revoked()))
 }
@@ -148,11 +128,8 @@ mod tests {
         let target = Arc::new(JsObject::new(None));
         let handler = Arc::new(JsObject::new(None));
 
-        let result = native_proxy_create(&[
-            VmValue::object(target),
-            VmValue::object(handler),
-        ])
-        .unwrap();
+        let result =
+            native_proxy_create(&[VmValue::object(target), VmValue::object(handler)]).unwrap();
 
         assert!(result.is_proxy());
         assert!(!result.as_proxy().unwrap().is_revoked());
@@ -161,10 +138,7 @@ mod tests {
     #[test]
     fn test_proxy_create_invalid_target() {
         let handler = Arc::new(JsObject::new(None));
-        let result = native_proxy_create(&[
-            VmValue::number(42.0),
-            VmValue::object(handler),
-        ]);
+        let result = native_proxy_create(&[VmValue::number(42.0), VmValue::object(handler)]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("target must be an object"));
     }
@@ -174,11 +148,8 @@ mod tests {
         let target = Arc::new(JsObject::new(None));
         let handler = Arc::new(JsObject::new(None));
 
-        let result = native_proxy_revocable(&[
-            VmValue::object(target),
-            VmValue::object(handler),
-        ])
-        .unwrap();
+        let result =
+            native_proxy_revocable(&[VmValue::object(target), VmValue::object(handler)]).unwrap();
 
         assert!(result.is_object());
         let obj = result.as_object().unwrap();

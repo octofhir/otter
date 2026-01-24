@@ -1038,6 +1038,9 @@ async fn run_event_loop_with_events(
     const MAX_IDLE_CYCLES_SCRIPT: u32 = 5;
     const MAX_IDLE_CYCLES_SERVER: u32 = 100;
 
+    const MAX_HTTP_EVENTS_PER_TICK: usize = 256;
+    const MAX_NET_EVENTS_PER_TICK: usize = 256;
+
     loop {
         let has_active_http = active_http_servers.load(Ordering::Relaxed) > 0;
         let has_active_net = active_net_servers.load(Ordering::Relaxed) > 0;
@@ -1049,18 +1052,28 @@ async fn run_event_loop_with_events(
             break;
         }
 
-        // Process all pending HTTP events (non-blocking hot path)
+        // Process pending HTTP events (non-blocking hot path, batched for fairness)
         let mut processed = 0usize;
-        while let Ok(ev) = http_event_rx.try_recv() {
+        let mut http_processed = 0usize;
+        while http_processed < MAX_HTTP_EVENTS_PER_TICK {
+            let Ok(ev) = http_event_rx.try_recv() else {
+                break;
+            };
             dispatch_http_event_fast(ctx, ev.server_id, ev.request_id);
-            processed += 1;
+            http_processed += 1;
         }
+        processed += http_processed;
 
-        // Process all pending net events
-        while let Ok(ev) = net_event_rx.try_recv() {
+        // Process pending net events (batched for fairness)
+        let mut net_processed = 0usize;
+        while net_processed < MAX_NET_EVENTS_PER_TICK {
+            let Ok(ev) = net_event_rx.try_recv() else {
+                break;
+            };
             dispatch_net_event(ctx, &ev);
-            processed += 1;
+            net_processed += 1;
         }
+        processed += net_processed;
 
         // Poll JavaScript event loop (promises, timers, async ops)
         // IMPORTANT: We must check the return value - if events were processed,

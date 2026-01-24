@@ -25,7 +25,9 @@ pub mod boolean;
 pub mod console;
 pub mod date;
 pub mod error;
+pub mod fetch;
 pub mod function;
+pub mod http;
 pub mod iterator;
 pub mod json;
 pub mod map;
@@ -44,6 +46,9 @@ pub mod temporal;
 pub use array::ArrayBuiltin;
 pub use console::{ConsoleAdapter, LogLevel, StdConsole};
 pub use object::ObjectBuiltin;
+
+// Re-export CapabilitiesGuard from otter-vm-runtime for convenience
+pub use otter_vm_runtime::CapabilitiesGuard;
 
 use otter_vm_runtime::Extension;
 
@@ -91,8 +96,37 @@ pub fn create_builtins_extension_with_console<A: ConsoleAdapter>(adapter: A) -> 
     ops.extend(symbol::ops());
     ops.extend(temporal::ops());
     ops.extend(console::console_ops_with_adapter(adapter));
+    ops.extend(fetch::ops());
 
     Extension::new("builtins")
+        .with_js(include_str!("console_shim.js"))
         .with_ops(ops)
         .with_js(include_str!("builtins.js"))
+        .with_js(fetch::JS_SHIM)
+}
+
+/// Create HTTP server extension
+///
+/// This extension requires an event channel and active server counter
+/// that integrate with the event loop.
+///
+/// # Example
+/// ```ignore
+/// use otter_vm_builtins::create_http_extension;
+/// use tokio::sync::mpsc;
+///
+/// let (event_tx, event_rx) = mpsc::unbounded_channel();
+/// let (ws_event_tx, ws_event_rx) = mpsc::unbounded_channel();
+/// let ext = create_http_extension(event_tx, ws_event_tx, event_loop.get_active_server_count());
+/// event_loop.set_http_receiver(event_rx);
+/// event_loop.set_ws_receiver(ws_event_rx);
+/// ```
+pub fn create_http_extension(
+    event_tx: tokio::sync::mpsc::UnboundedSender<otter_vm_runtime::HttpEvent>,
+    ws_event_tx: tokio::sync::mpsc::UnboundedSender<otter_vm_runtime::WsEvent>,
+    active_count: otter_vm_runtime::ActiveServerCount,
+) -> Extension {
+    Extension::new("http")
+        .with_ops(http::ops(event_tx, ws_event_tx, active_count))
+        .with_js(http::JS_SHIM)
 }

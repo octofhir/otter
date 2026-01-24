@@ -71,6 +71,15 @@ impl PropertyAttributes {
         }
     }
 
+    /// Default accessor property attributes (enumerable, configurable, no writable)
+    pub const fn accessor() -> Self {
+        Self {
+            writable: false, // Not applicable to accessors, but kept for structural consistency
+            enumerable: true,
+            configurable: true,
+        }
+    }
+
     /// Non-writable, non-enumerable, non-configurable
     pub const fn frozen() -> Self {
         Self {
@@ -211,6 +220,12 @@ impl JsObject {
             if (*i as usize) < elements.len() {
                 return Some(elements[*i as usize].clone());
             }
+            drop(elements);
+            // For non-arrays, also try string property lookup
+            let string_key = PropertyKey::String(crate::string::JsString::intern(&i.to_string()));
+            if let Some(desc) = self.properties.read().get(&string_key) {
+                return desc.value().cloned();
+            }
         }
 
         // Check prototype chain
@@ -218,6 +233,22 @@ impl JsObject {
             return proto.get(key);
         }
 
+        None
+    }
+
+    /// Get own property descriptor (does not walk prototype chain).
+    pub fn get_own_property_descriptor(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        self.properties.read().get(key).cloned()
+    }
+
+    /// Lookup property descriptor (walks prototype chain).
+    pub fn lookup_property_descriptor(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        if let Some(desc) = self.properties.read().get(key) {
+            return Some(desc.clone());
+        }
+        if let Some(proto) = self.prototype.read().as_ref() {
+            return proto.lookup_property_descriptor(key);
+        }
         None
     }
 
@@ -244,7 +275,11 @@ impl JsObject {
                 elements[idx] = value;
                 return true;
             }
-            return false;
+            drop(elements);
+            drop(flags);
+            // For non-arrays, fall through to store as string property
+            let string_key = PropertyKey::String(crate::string::JsString::intern(&i.to_string()));
+            return self.set(string_key, value);
         }
 
         // Check if property exists and is writable

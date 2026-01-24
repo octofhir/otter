@@ -1417,6 +1417,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2112,11 +2113,15 @@ name = "otter-engine"
 version = "0.1.3"
 dependencies = [
  "dirs",
- "dunce",
  "md5",
+ "otter-vm-builtins",
+ "otter-vm-bytecode",
+ "otter-vm-compiler",
+ "otter-vm-core",
+ "otter-vm-runtime",
  "oxc_resolver",
  "regex",
- "reqwest",
+ "reqwest 0.13.1",
  "serde",
  "serde_json",
  "tempfile",
@@ -2188,7 +2193,7 @@ dependencies = [
  "pin-project-lite",
  "pkcs8",
  "rand_core 0.6.4",
- "reqwest",
+ "reqwest 0.13.1",
  "ring",
  "rsa",
  "rustls",
@@ -2225,7 +2230,7 @@ dependencies = [
  "indicatif",
  "libc",
  "rayon",
- "reqwest",
+ "reqwest 0.13.1",
  "semver",
  "serde",
  "serde_json",
@@ -2293,15 +2298,30 @@ dependencies = [
 name = "otter-vm-builtins"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "chrono-tz",
+ "dashmap",
+ "futures-util",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "iana-time-zone",
  "otter-macros",
  "otter-vm-core",
  "otter-vm-runtime",
  "regex",
+ "reqwest 0.12.28",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "url",
 ]
 
 [[package]]
@@ -2351,6 +2371,7 @@ dependencies = [
 name = "otter-vm-runtime"
 version = "0.1.0"
 dependencies = [
+ "dunce",
  "otter-vm-bytecode",
  "otter-vm-compiler",
  "otter-vm-core",
@@ -2377,10 +2398,6 @@ dependencies = [
  "otter-node",
  "otter-pm",
  "otter-sql",
- "otter-vm-builtins",
- "otter-vm-compiler",
- "otter-vm-core",
- "otter-vm-runtime",
  "serde",
  "serde_json",
  "strsim",
@@ -3169,6 +3186,47 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
 name = "reqwest"
+version = "0.12.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
+dependencies = [
+ "base64",
+ "bytes",
+ "futures-core",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "js-sys",
+ "log",
+ "percent-encoding",
+ "pin-project-lite",
+ "quinn",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tower-service",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-streams",
+ "web-sys",
+ "webpki-roots",
+]
+
+[[package]]
+name = "reqwest"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04e9018c9d814e5f30cc16a0f03271aeab3571e609612d9fe78c1aa8d11c2f62"
@@ -3311,6 +3369,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -3586,6 +3645,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8bbf91e5a4d6315eee45e704372590b30e260ee83af6639d64557f51b067776"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "serde_urlencoded"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
+dependencies = [
+ "form_urlencoded",
+ "itoa",
+ "ryu",
+ "serde",
 ]
 
 [[package]]
@@ -4518,6 +4589,15 @@ name = "webpki-root-certs"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36a29fc0408b113f68cf32637857ab740edfafdf460c326cd2afaa2d84cc05dc"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12bed680863276c63889429bfd6cab3b99943659923822de1c8a39c49e4d722c"
 dependencies = [
  "rustls-pki-types",
 ]

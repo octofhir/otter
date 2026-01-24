@@ -73,7 +73,7 @@ start_otter() {
         return 1
     fi
 
-    PORT=$OTTER_PORT "$OTTER_BIN" run "$SCRIPT_DIR/server-otter.ts" --allow-net --timeout 0 &
+    PORT=$OTTER_PORT "$OTTER_BIN" run --allow-net --timeout 0 "$SCRIPT_DIR/server-otter.ts" &
     OTTER_PID=$!
     sleep 2
 

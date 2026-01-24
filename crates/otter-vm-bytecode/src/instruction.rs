@@ -42,6 +42,8 @@ pub enum Opcode {
     SetGlobal = 0x15,
     /// Load `this` value: dst = this
     LoadThis = 0x16,
+    /// Close upvalue: move local to heap cell when leaving scope
+    CloseUpvalue = 0x17,
 
     // ==================== Arithmetic ====================
     /// Addition: dst = lhs + rhs
@@ -108,6 +110,8 @@ pub enum Opcode {
     InstanceOf = 0x59,
     /// in operator: dst = lhs in rhs
     In = 0x5A,
+    /// ToNumber conversion: dst = +src
+    ToNumber = 0x5B,
 
     // ==================== Objects ====================
     /// Get property: dst = obj\[key\]
@@ -124,6 +128,10 @@ pub enum Opcode {
     NewObject = 0x65,
     /// Define property on object
     DefineProperty = 0x66,
+    /// Define getter on object: Object.defineProperty(obj, key, {get: fn})
+    DefineGetter = 0x67,
+    /// Define setter on object: Object.defineProperty(obj, key, {set: fn})
+    DefineSetter = 0x68,
 
     // ==================== Arrays ====================
     /// Create empty array: dst = \[\]
@@ -152,6 +160,8 @@ pub enum Opcode {
     ReturnUndefined = 0x86,
     /// Call with spread arguments: dst = func(...spread_arr)
     CallSpread = 0x87,
+    /// Construct with spread arguments: dst = new func(...spread_arr)
+    ConstructSpread = 0x88,
 
     // ==================== Control Flow ====================
     /// Unconditional jump
@@ -242,6 +252,7 @@ impl Opcode {
             0x14 => Some(Self::GetGlobal),
             0x15 => Some(Self::SetGlobal),
             0x16 => Some(Self::LoadThis),
+            0x17 => Some(Self::CloseUpvalue),
 
             0x20 => Some(Self::Add),
             0x21 => Some(Self::Sub),
@@ -275,6 +286,7 @@ impl Opcode {
             0x58 => Some(Self::TypeOf),
             0x59 => Some(Self::InstanceOf),
             0x5A => Some(Self::In),
+            0x5B => Some(Self::ToNumber),
 
             0x60 => Some(Self::GetProp),
             0x61 => Some(Self::SetProp),
@@ -283,6 +295,8 @@ impl Opcode {
             0x64 => Some(Self::DeleteProp),
             0x65 => Some(Self::NewObject),
             0x66 => Some(Self::DefineProperty),
+            0x67 => Some(Self::DefineGetter),
+            0x68 => Some(Self::DefineSetter),
 
             0x70 => Some(Self::NewArray),
             0x71 => Some(Self::GetElem),
@@ -297,6 +311,7 @@ impl Opcode {
             0x85 => Some(Self::Return),
             0x86 => Some(Self::ReturnUndefined),
             0x87 => Some(Self::CallSpread),
+            0x88 => Some(Self::ConstructSpread),
 
             0x90 => Some(Self::Jump),
             0x91 => Some(Self::JumpIfTrue),
@@ -361,6 +376,7 @@ impl Opcode {
             Self::GetGlobal => "GetGlobal",
             Self::SetGlobal => "SetGlobal",
             Self::LoadThis => "LoadThis",
+            Self::CloseUpvalue => "CloseUpvalue",
             // Arithmetic
             Self::Add => "Add",
             Self::Sub => "Sub",
@@ -394,6 +410,7 @@ impl Opcode {
             Self::TypeOf => "TypeOf",
             Self::InstanceOf => "InstanceOf",
             Self::In => "In",
+            Self::ToNumber => "ToNumber",
             // Objects
             Self::GetProp => "GetProp",
             Self::SetProp => "SetProp",
@@ -402,6 +419,8 @@ impl Opcode {
             Self::DeleteProp => "DeleteProp",
             Self::NewObject => "NewObject",
             Self::DefineProperty => "DefineProperty",
+            Self::DefineGetter => "DefineGetter",
+            Self::DefineSetter => "DefineSetter",
             // Arrays
             Self::NewArray => "NewArray",
             Self::GetElem => "GetElem",
@@ -416,6 +435,7 @@ impl Opcode {
             Self::Return => "Return",
             Self::ReturnUndefined => "ReturnUndefined",
             Self::CallSpread => "CallSpread",
+            Self::ConstructSpread => "ConstructSpread",
             // Control flow
             Self::Jump => "Jump",
             Self::JumpIfTrue => "JumpIfTrue",
@@ -512,6 +532,12 @@ pub enum Instruction {
     /// Load `this` value into register
     LoadThis {
         dst: Register,
+    },
+    /// Close upvalue: sync local variable value to its upvalue cell when leaving scope.
+    /// This ensures any closures that captured this variable see the final value.
+    CloseUpvalue {
+        /// Index of the local variable to close
+        local_idx: LocalIndex,
     },
 
     // Arithmetic
@@ -657,6 +683,11 @@ pub enum Instruction {
         lhs: Register,
         rhs: Register,
     },
+    /// ToNumber conversion
+    ToNumber {
+        dst: Register,
+        src: Register,
+    },
 
     // Objects
     GetProp {
@@ -691,6 +722,18 @@ pub enum Instruction {
         obj: Register,
         key: Register,
         val: Register,
+    },
+    /// Define getter on object
+    DefineGetter {
+        obj: Register,
+        key: Register,
+        func: Register,
+    },
+    /// Define setter on object
+    DefineSetter {
+        obj: Register,
+        key: Register,
+        func: Register,
     },
 
     // Arrays
@@ -729,6 +772,14 @@ pub enum Instruction {
         method: ConstantIndex,
         argc: u8,
     },
+    /// Call method with computed property key: dst = obj[key](...args)
+    /// Registers: obj, key, arg1, arg2, ... (contiguous)
+    CallMethodComputed {
+        dst: Register,
+        obj: Register,
+        key: Register,
+        argc: u8,
+    },
     TailCall {
         func: Register,
         argc: u8,
@@ -749,6 +800,24 @@ pub enum Instruction {
         /// Number of regular (non-spread) arguments
         argc: u8,
         /// Register containing the array to spread
+        spread: Register,
+    },
+    /// Construct with spread: dst = new func(args..., ...spread_arr)
+    ConstructSpread {
+        dst: Register,
+        func: Register,
+        /// Number of regular (non-spread) arguments
+        argc: u8,
+        /// Register containing the array to spread
+        spread: Register,
+    },
+    /// Call method with computed key and spread: dst = obj[key](...spread_arr)
+    /// The spread array contains all arguments
+    CallMethodComputedSpread {
+        dst: Register,
+        obj: Register,
+        key: Register,
+        /// Register containing the array of arguments to spread
         spread: Register,
     },
 

@@ -215,6 +215,11 @@ impl Module {
     pub fn function(&self, index: u32) -> Option<&Function> {
         self.functions.get(index as usize)
     }
+
+    /// Number of functions in this module
+    pub fn function_count(&self) -> usize {
+        self.functions.len()
+    }
 }
 
 /// Builder for creating modules

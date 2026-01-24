@@ -5,16 +5,12 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::sync::Arc;
 use tracing_subscriber::filter::EnvFilter;
 
-use otter_vm_builtins::create_builtins_extension;
-use otter_vm_compiler::Compiler;
-use otter_vm_core::object::{JsObject, PropertyKey};
-use otter_vm_core::runtime::VmRuntime;
-use otter_vm_core::value::Value;
-use otter_vm_runtime::{ExtensionRegistry, OpHandler};
+// Use otter-engine as the single entry point
+use otter_engine::{CapabilitiesBuilder, EngineBuilder, PropertyKey, Value};
 
+mod commands;
 mod config;
 
 #[derive(Parser)]
@@ -43,6 +39,34 @@ struct Cli {
     /// Config file path
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+
+    /// Allow all permissions
+    #[arg(long = "allow-all", short = 'A', global = true)]
+    allow_all: bool,
+
+    /// Allow network access
+    #[arg(long = "allow-net", global = true)]
+    allow_net: bool,
+
+    /// Allow file system read
+    #[arg(long = "allow-read", global = true)]
+    allow_read: bool,
+
+    /// Allow file system write
+    #[arg(long = "allow-write", global = true)]
+    allow_write: bool,
+
+    /// Allow environment variable access
+    #[arg(long = "allow-env", global = true)]
+    allow_env: bool,
+
+    /// Allow subprocess execution
+    #[arg(long = "allow-run", global = true)]
+    allow_run: bool,
+
+    /// Execution timeout in seconds (0 = no timeout)
+    #[arg(long, global = true, default_value = "30")]
+    timeout: u64,
 }
 
 #[derive(Subcommand)]
@@ -52,10 +76,73 @@ enum Commands {
         /// The script file to run
         file: PathBuf,
     },
-    /// Show runtime information
-    Info,
+    /// Interactive REPL
+    Repl,
+    /// Run test files
+    Test {
+        /// Test files or directories (defaults to current directory)
+        #[arg(default_value = ".")]
+        paths: Vec<PathBuf>,
+
+        /// Filter tests by name pattern
+        #[arg(long, short = 'f')]
+        filter: Option<String>,
+    },
+    /// Type check without running
+    Check {
+        /// Files to check
+        files: Vec<PathBuf>,
+    },
+    /// Build/bundle a project
+    Build {
+        /// Entry point file
+        entry: PathBuf,
+
+        /// Output file
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Install dependencies
+    Install {
+        /// Packages to install (if not provided, installs from package.json)
+        #[arg()]
+        packages: Vec<String>,
+
+        /// Save as dev dependency
+        #[arg(long, short = 'D')]
+        save_dev: bool,
+    },
+    /// Add a package
+    Add {
+        /// Package name (optionally with version: package@version)
+        package: String,
+
+        /// Save as dev dependency
+        #[arg(long, short = 'D')]
+        dev: bool,
+    },
+    /// Remove a package
+    Remove {
+        /// Package name to remove
+        package: String,
+    },
+    /// Execute a package binary
+    Exec {
+        /// Package binary to run
+        command: String,
+
+        /// Arguments to pass
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
     /// Initialize a new project
     Init,
+    /// Show runtime information
+    Info {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -67,27 +154,46 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Handle --eval flag
-    if let Some(code) = cli.eval {
-        return run_code(&code, "<eval>");
+    if let Some(ref code) = cli.eval {
+        return run_code(code, "<eval>", &cli).await;
     }
 
     // Handle direct file argument (otter script.js)
-    if let Some(file) = cli.file {
-        return run_file(&file);
+    if let Some(ref file) = cli.file {
+        return run_file(file, &cli).await;
     }
 
-    match cli.command {
-        Some(Commands::Run { file }) => run_file(&file),
-        Some(Commands::Info) => {
-            println!("Otter Runtime");
-            println!("Version: {}", env!("CARGO_PKG_VERSION"));
-            println!("VM: otter-vm-core");
-            println!("Platform: {}", std::env::consts::OS);
-            println!("Arch: {}", std::env::consts::ARCH);
+    match &cli.command {
+        Some(Commands::Run { file }) => run_file(file, &cli).await,
+        Some(Commands::Repl) => run_repl(&cli).await,
+        Some(Commands::Test { paths, filter }) => run_tests(paths, filter.as_deref(), &cli).await,
+        Some(Commands::Check { files }) => {
+            // Type checking stub - tsgo integration pending
+            println!("Type checking: {:?}", files);
+            println!("Note: Type checking integration (tsgo) is being ported to the new VM.");
             Ok(())
         }
+        Some(Commands::Build { entry, output }) => {
+            // Build stub - bundling pending
+            println!("Building: {}", entry.display());
+            if let Some(out) = output {
+                println!("Output: {}", out.display());
+            }
+            println!("Note: Bundling is being ported to the new VM.");
+            Ok(())
+        }
+        Some(Commands::Install { packages, save_dev }) => {
+            commands::install::run(packages, *save_dev).await
+        }
+        Some(Commands::Add { package, dev }) => commands::add::run(package, *dev).await,
+        Some(Commands::Remove { package }) => commands::remove::run(package).await,
+        Some(Commands::Exec { command, args }) => commands::exec::run(command, args).await,
         Some(Commands::Init) => {
-            init_project()?;
+            commands::init::run()?;
+            Ok(())
+        }
+        Some(Commands::Info { json }) => {
+            commands::info::run(*json);
             Ok(())
         }
         None => {
@@ -99,210 +205,442 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Build capabilities from CLI flags
+fn build_capabilities(cli: &Cli) -> otter_engine::Capabilities {
+    if cli.allow_all {
+        CapabilitiesBuilder::new()
+            .allow_net_all()
+            .allow_read_all()
+            .allow_write_all()
+            .allow_env_all()
+            .build()
+    } else {
+        let mut builder = CapabilitiesBuilder::new();
+        if cli.allow_net {
+            builder = builder.allow_net_all();
+        }
+        if cli.allow_read {
+            builder = builder.allow_read_all();
+        }
+        if cli.allow_write {
+            builder = builder.allow_write_all();
+        }
+        if cli.allow_env {
+            builder = builder.allow_env_all();
+        }
+        builder.build()
+    }
+}
+
 /// Run a JavaScript file
-fn run_file(path: &PathBuf) -> Result<()> {
+async fn run_file(path: &PathBuf, cli: &Cli) -> Result<()> {
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read file: {}", path.display()))?;
 
     let source_url = path.to_string_lossy();
-    run_code(&source, &source_url)
+    run_code(&source, &source_url, cli).await
 }
 
-/// Run JavaScript code
-fn run_code(source: &str, source_url: &str) -> Result<()> {
-    // Create extension registry with builtins
-    let mut registry = ExtensionRegistry::new();
-    let builtins = create_builtins_extension();
-    registry
-        .register(builtins)
-        .map_err(|e| anyhow::anyhow!("Failed to register builtins: {}", e))?;
+/// Run JavaScript code using EngineBuilder
+async fn run_code(source: &str, _source_url: &str, cli: &Cli) -> Result<()> {
+    use std::sync::atomic::Ordering;
 
-    // Create the VM runtime
-    let runtime = VmRuntime::new();
+    let caps = build_capabilities(cli);
 
-    // Create a context with builtins set up
-    let mut ctx = runtime.create_context();
+    // Create engine with builtins (EngineBuilder handles all setup)
+    let mut engine = EngineBuilder::new()
+        .capabilities(caps)
+        .with_http() // Enable Otter.serve()
+        .build();
 
-    // Wire up extension ops as global native functions
-    setup_extension_globals(&mut ctx, &registry);
+    // Set up timeout if specified (0 = no timeout)
+    let timeout_handle = if cli.timeout > 0 {
+        let interrupt_flag = engine.interrupt_flag();
+        let timeout_secs = cli.timeout;
+        Some(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
+            interrupt_flag.store(true, Ordering::Relaxed);
+        }))
+    } else {
+        None
+    };
 
-    // Run extension JS setup code (this creates Object, console, etc.)
-    run_extension_js(&registry, &runtime, &mut ctx)?;
+    // Execute code
+    let result = engine.eval(source).await;
 
-    // Compile user code
-    let compiler = Compiler::new();
-    let module = compiler
-        .compile(source, source_url)
-        .map_err(|e| anyhow::anyhow!("Compilation error: {:?}", e))?;
-
-    // Execute the module
-    let result = runtime
-        .execute_module_with_context(&module, &mut ctx)
-        .map_err(|e| anyhow::anyhow!("Runtime error: {:?}", e))?;
-
-    // Print result if it's not undefined
-    if !result.is_undefined() {
-        println!("{}", format_value(&result));
+    // Cancel timeout task if still running
+    if let Some(handle) = timeout_handle {
+        handle.abort();
     }
 
-    Ok(())
-}
-
-/// Set up extension ops as global functions
-fn setup_extension_globals(
-    ctx: &mut otter_vm_core::context::VmContext,
-    registry: &ExtensionRegistry,
-) {
-    for op_name in registry.op_names() {
-        if let Some(handler) = registry.get_op(op_name) {
-            let handler = handler.clone();
-            let native_fn = move |args: &[Value]| -> Result<Value, String> {
-                match &handler {
-                    OpHandler::Native(f) => f(args),
-                    OpHandler::Sync(f) => {
-                        // Convert VmValue to JsonValue
-                        let json_args: Vec<serde_json::Value> =
-                            args.iter().map(|v| vm_value_to_json(v)).collect();
-
-                        // Call the handler
-                        let result = f(&json_args)?;
-
-                        // Convert JsonValue back to VmValue
-                        Ok(json_to_vm_value(&result))
-                    }
-                    OpHandler::Async(_) => {
-                        // Async ops not yet supported in sync context
-                        Err("Async operations not supported in sync context".to_string())
-                    }
-                }
-            };
-            ctx.set_global(op_name, Value::native_function(native_fn));
+    match result {
+        Ok(value) => {
+            // Print result if it's not undefined
+            if !value.is_undefined() {
+                println!("{}", format_value(&value));
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("interrupted") || err_str.contains("Interrupted") {
+                Err(anyhow::anyhow!(
+                    "Execution timed out after {} seconds",
+                    cli.timeout
+                ))
+            } else {
+                Err(anyhow::anyhow!("{}", e))
+            }
         }
     }
 }
 
-/// Run extension JS setup code
-fn run_extension_js(
-    registry: &ExtensionRegistry,
-    runtime: &VmRuntime,
-    ctx: &mut otter_vm_core::context::VmContext,
-) -> Result<()> {
-    for js_code in registry.all_js() {
-        let compiler = Compiler::new();
-        match compiler.compile(js_code, "<builtin>") {
-            Ok(module) => {
-                runtime
-                    .execute_module_with_context(&module, ctx)
-                    .map_err(|e| anyhow::anyhow!("Failed to execute builtin JS: {:?}", e))?;
+/// Run interactive REPL
+async fn run_repl(cli: &Cli) -> Result<()> {
+    use std::io::{self, BufRead, Write};
+
+    println!("Otter {} - TypeScript Runtime", env!("CARGO_PKG_VERSION"));
+    println!("Type .help for help, .exit to exit\n");
+
+    let caps = build_capabilities(cli);
+    let mut engine = EngineBuilder::new().capabilities(caps).with_http().build();
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+
+    let mut multiline_buffer = String::new();
+    let mut in_multiline = false;
+
+    loop {
+        // Print prompt
+        let prompt = if in_multiline { "...> " } else { "otter> " };
+        print!("{}", prompt);
+        stdout.flush()?;
+
+        // Read line
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Error reading input: {}", e);
+                break;
+            }
+        }
+
+        let line = line.trim_end();
+
+        // Handle empty input
+        if line.is_empty() && !in_multiline {
+            continue;
+        }
+
+        // Handle REPL commands
+        if line.starts_with('.') && !in_multiline {
+            match line {
+                ".exit" | ".quit" | ".q" => break,
+                ".help" | ".h" => {
+                    print_repl_help();
+                    continue;
+                }
+                ".clear" | ".cls" => {
+                    print!("\x1B[2J\x1B[1;1H");
+                    stdout.flush()?;
+                    continue;
+                }
+                ".multiline" | ".m" => {
+                    in_multiline = true;
+                    println!("Entering multiline mode. Type .end to execute, .cancel to abort.");
+                    continue;
+                }
+                ".end" => {
+                    if in_multiline {
+                        let code = std::mem::take(&mut multiline_buffer);
+                        in_multiline = false;
+                        eval_repl_line(&mut engine, &code).await;
+                    }
+                    continue;
+                }
+                ".cancel" => {
+                    multiline_buffer.clear();
+                    in_multiline = false;
+                    println!("Multiline input cancelled.");
+                    continue;
+                }
+                _ => {
+                    println!(
+                        "Unknown command: {}. Type .help for available commands.",
+                        line
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // Handle multiline mode
+        if in_multiline {
+            multiline_buffer.push_str(line);
+            multiline_buffer.push('\n');
+            continue;
+        }
+
+        // Evaluate single line
+        eval_repl_line(&mut engine, line).await;
+    }
+
+    println!("\nGoodbye!");
+    Ok(())
+}
+
+async fn eval_repl_line(engine: &mut otter_engine::Otter, line: &str) {
+    match engine.eval(line).await {
+        Ok(value) => {
+            if !value.is_undefined() {
+                println!("{}", format_value(&value));
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+        }
+    }
+}
+
+fn print_repl_help() {
+    println!("REPL Commands:");
+    println!("  .help, .h      Show this help message");
+    println!("  .exit, .q      Exit the REPL");
+    println!("  .clear, .cls   Clear the screen");
+    println!("  .multiline, .m Enter multiline mode");
+    println!("  .end           Execute multiline input");
+    println!("  .cancel        Cancel multiline input");
+    println!();
+    println!("You can type any JavaScript or TypeScript expression.");
+}
+
+/// Run test files
+async fn run_tests(paths: &[PathBuf], filter: Option<&str>, cli: &Cli) -> Result<()> {
+    let test_files = find_test_files(paths)?;
+
+    if test_files.is_empty() {
+        println!("No test files found.");
+        return Ok(());
+    }
+
+    println!("Running {} test file(s)...\n", test_files.len());
+
+    let mut total_passed = 0;
+    let mut total_failed = 0;
+    let mut total_skipped = 0;
+
+    for file in &test_files {
+        match run_test_file(file, filter, cli).await {
+            Ok((passed, failed, skipped)) => {
+                total_passed += passed;
+                total_failed += failed;
+                total_skipped += skipped;
             }
             Err(e) => {
-                // Log warning but continue - builtins may use unsupported features
-                tracing::warn!(
-                    "Could not compile builtin JS (some features may be unavailable): {:?}",
-                    e
-                );
+                eprintln!("Error running {}: {}", file.display(), e);
+                total_failed += 1;
             }
         }
     }
+
+    println!();
+    if total_failed > 0 {
+        println!(
+            "Result: {} passed, {} failed, {} skipped",
+            total_passed, total_failed, total_skipped
+        );
+        std::process::exit(1);
+    } else {
+        println!("Result: {} passed, {} skipped", total_passed, total_skipped);
+    }
+
     Ok(())
 }
 
-/// Convert VM Value to JSON Value
-fn vm_value_to_json(value: &Value) -> serde_json::Value {
-    use serde_json::json;
+fn find_test_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
 
-    if value.is_undefined() {
-        return json!(null);
-    }
-
-    if value.is_null() {
-        return json!(null);
-    }
-
-    if let Some(b) = value.as_boolean() {
-        return json!(b);
-    }
-
-    if let Some(n) = value.as_number() {
-        if n.is_nan() || n.is_infinite() {
-            return json!(null);
-        }
-        return json!(n);
-    }
-
-    if let Some(s) = value.as_string() {
-        return json!(s.as_str());
-    }
-
-    if let Some(obj) = value.as_object() {
-        // Check if array
-        if obj.is_array() {
-            let len = obj
-                .get(&PropertyKey::string("length"))
-                .and_then(|v| v.as_int32())
-                .unwrap_or(0) as usize;
-
-            let mut arr = Vec::with_capacity(len);
-            for i in 0..len {
-                if let Some(elem) = obj.get(&PropertyKey::Index(i as u32)) {
-                    arr.push(vm_value_to_json(&elem));
-                } else {
-                    arr.push(json!(null));
-                }
+    for path in paths {
+        if path.is_file() {
+            if is_test_file(path) {
+                files.push(path.clone());
             }
-            return serde_json::Value::Array(arr);
+        } else if path.is_dir() {
+            find_test_files_in_dir(path, &mut files)?;
         }
-
-        // Regular object
-        let mut map = serde_json::Map::new();
-        for key in obj.own_keys() {
-            if let Some(val) = obj.get(&key) {
-                let key_str = match key {
-                    PropertyKey::String(s) => s.as_str().to_string(),
-                    PropertyKey::Index(i) => i.to_string(),
-                    PropertyKey::Symbol(_) => continue,
-                };
-                map.insert(key_str, vm_value_to_json(&val));
-            }
-        }
-        return serde_json::Value::Object(map);
     }
 
-    json!(null)
+    files.sort();
+    Ok(files)
 }
 
-/// Convert JSON Value to VM Value
-fn json_to_vm_value(json: &serde_json::Value) -> Value {
-    use otter_vm_core::string::JsString;
+fn find_test_files_in_dir(dir: &PathBuf, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
 
-    match json {
-        serde_json::Value::Null => Value::null(),
-        serde_json::Value::Bool(b) => Value::boolean(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
-                    Value::int32(i as i32)
-                } else {
-                    Value::number(i as f64)
-                }
+        // Skip node_modules and hidden directories
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name == "node_modules" || name.starts_with('.') {
+                continue;
+            }
+            find_test_files_in_dir(&path, files)?;
+        } else if is_test_file(&path) {
+            files.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn is_test_file(path: &std::path::Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+    // Match patterns like *.test.ts, *.spec.ts, *_test.ts
+    name.ends_with(".test.ts")
+        || name.ends_with(".test.js")
+        || name.ends_with(".spec.ts")
+        || name.ends_with(".spec.js")
+        || name.ends_with("_test.ts")
+        || name.ends_with("_test.js")
+}
+
+async fn run_test_file(
+    path: &PathBuf,
+    filter: Option<&str>,
+    cli: &Cli,
+) -> Result<(usize, usize, usize)> {
+    println!("  {}", path.display());
+
+    let source = std::fs::read_to_string(path)?;
+    let caps = build_capabilities(cli);
+
+    let mut engine = EngineBuilder::new().capabilities(caps).with_http().build();
+
+    // Inject test framework
+    let filter_json = match filter {
+        Some(f) => format!("\"{}\"", f),
+        None => "null".to_string(),
+    };
+
+    let test_harness = format!(
+        r#"
+globalThis.__otter_tests = [];
+globalThis.__otter_results = {{ passed: 0, failed: 0, skipped: 0 }};
+globalThis.__otter_filter = {filter_json};
+
+globalThis.describe = function(name, fn) {{
+    fn();
+}};
+
+globalThis.it = globalThis.test = function(name, fn) {{
+    const filter = globalThis.__otter_filter;
+    if (filter && !name.includes(filter)) {{
+        globalThis.__otter_results.skipped++;
+        return;
+    }}
+    globalThis.__otter_tests.push({{ name, fn }});
+}};
+
+globalThis.expect = function(actual) {{
+    return {{
+        toBe: function(expected) {{
+            if (actual !== expected) {{
+                throw new Error("Expected " + JSON.stringify(expected) + " but got " + JSON.stringify(actual));
+            }}
+        }},
+        toEqual: function(expected) {{
+            if (JSON.stringify(actual) !== JSON.stringify(expected)) {{
+                throw new Error("Expected " + JSON.stringify(expected) + " but got " + JSON.stringify(actual));
+            }}
+        }},
+        toBeTruthy: function() {{
+            if (!actual) {{
+                throw new Error("Expected truthy but got " + JSON.stringify(actual));
+            }}
+        }},
+        toBeFalsy: function() {{
+            if (actual) {{
+                throw new Error("Expected falsy but got " + JSON.stringify(actual));
+            }}
+        }},
+        toThrow: function(message) {{
+            let threw = false;
+            try {{
+                if (typeof actual === 'function') actual();
+            }} catch (e) {{
+                threw = true;
+                if (message && !e.message.includes(message)) {{
+                    throw new Error("Expected error containing '" + message + "' but got '" + e.message + "'");
+                }}
+            }}
+            if (!threw) {{
+                throw new Error("Expected function to throw");
+            }}
+        }},
+        not: {{
+            toBe: function(expected) {{
+                if (actual === expected) {{
+                    throw new Error("Expected not to be " + JSON.stringify(expected));
+                }}
+            }},
+            toEqual: function(expected) {{
+                if (JSON.stringify(actual) === JSON.stringify(expected)) {{
+                    throw new Error("Expected not to equal " + JSON.stringify(expected));
+                }}
+            }},
+        }}
+    }};
+}};
+
+// Load test file
+{source}
+
+// Run tests synchronously for now
+for (const test of globalThis.__otter_tests) {{
+    try {{
+        test.fn();
+        globalThis.__otter_results.passed++;
+        console.log("    ✓ " + test.name);
+    }} catch (e) {{
+        globalThis.__otter_results.failed++;
+        console.log("    ✗ " + test.name);
+        console.log("      " + e.message);
+    }}
+}}
+
+globalThis.__otter_results;
+"#
+    );
+
+    match engine.eval(&test_harness).await {
+        Ok(result) => {
+            // Try to extract results from the returned object
+            if let Some(obj) = result.as_object() {
+                let passed = obj
+                    .get(&PropertyKey::string("passed"))
+                    .and_then(|v| v.as_int32())
+                    .unwrap_or(0) as usize;
+                let failed = obj
+                    .get(&PropertyKey::string("failed"))
+                    .and_then(|v| v.as_int32())
+                    .unwrap_or(0) as usize;
+                let skipped = obj
+                    .get(&PropertyKey::string("skipped"))
+                    .and_then(|v| v.as_int32())
+                    .unwrap_or(0) as usize;
+                Ok((passed, failed, skipped))
             } else {
-                Value::number(n.as_f64().unwrap_or(f64::NAN))
+                Ok((0, 1, 0))
             }
         }
-        serde_json::Value::String(s) => Value::string(JsString::intern(s)),
-        serde_json::Value::Array(arr) => {
-            let obj = Arc::new(JsObject::array(arr.len()));
-            for (i, elem) in arr.iter().enumerate() {
-                obj.set(PropertyKey::Index(i as u32), json_to_vm_value(elem));
-            }
-            Value::object(obj)
-        }
-        serde_json::Value::Object(map) => {
-            let obj = Arc::new(JsObject::new(None));
-            for (key, val) in map {
-                obj.set(PropertyKey::string(key), json_to_vm_value(val));
-            }
-            Value::object(obj)
+        Err(e) => {
+            eprintln!("    Error: {}", e);
+            Ok((0, 1, 0))
         }
     }
 }
@@ -359,45 +697,4 @@ fn format_value(value: &Value) -> String {
     }
 
     "[unknown]".to_string()
-}
-
-/// Initialize a new project
-fn init_project() -> Result<()> {
-    use std::fs;
-
-    // Create package.json
-    let package_json = r#"{
-  "name": "my-otter-project",
-  "version": "1.0.0",
-  "main": "index.js",
-  "scripts": {
-    "start": "otter run index.js"
-  }
-}
-"#;
-
-    // Create index.js
-    let index_js = r#"// Welcome to Otter!
-console.log("Hello from Otter!");
-
-const sum = (a, b) => a + b;
-console.log("2 + 3 =", sum(2, 3));
-"#;
-
-    if !std::path::Path::new("package.json").exists() {
-        fs::write("package.json", package_json)?;
-        println!("Created package.json");
-    } else {
-        println!("package.json already exists, skipping");
-    }
-
-    if !std::path::Path::new("index.js").exists() {
-        fs::write("index.js", index_js)?;
-        println!("Created index.js");
-    } else {
-        println!("index.js already exists, skipping");
-    }
-
-    println!("\nProject initialized! Run 'otter run index.js' to start.");
-    Ok(())
 }

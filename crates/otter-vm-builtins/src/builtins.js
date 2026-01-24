@@ -49,7 +49,148 @@ globalThis.Object = {
     isExtensible: function(obj) {
         return __Object_isExtensible(obj);
     },
+    // Object.defineProperty(obj, prop, descriptor)
+    defineProperty: function(obj, prop, descriptor) {
+        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+            throw new TypeError('Object.defineProperty called on non-object');
+        }
+        if (descriptor === null || typeof descriptor !== 'object') {
+            throw new TypeError('Property description must be an object');
+        }
+        return __Object_defineProperty(obj, prop, descriptor);
+    },
+    // Object.defineProperties(obj, props)
+    defineProperties: function(obj, props) {
+        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+            throw new TypeError('Object.defineProperties called on non-object');
+        }
+        const keys = Object.keys(props);
+        for (const key of keys) {
+            Object.defineProperty(obj, key, props[key]);
+        }
+        return obj;
+    },
+    // Object.create(proto, propertiesObject?)
+    create: function(proto, propertiesObject) {
+        if (proto !== null && typeof proto !== 'object' && typeof proto !== 'function') {
+            throw new TypeError('Object prototype may only be an Object or null');
+        }
+        return __Object_create(proto, propertiesObject);
+    },
+    // Object.is(value1, value2) - SameValue algorithm
+    is: function(value1, value2) {
+        return __Object_is(value1, value2);
+    },
+    // Object.fromEntries(iterable)
+    fromEntries: function(iterable) {
+        if (iterable === null || iterable === undefined) {
+            throw new TypeError('Object.fromEntries requires an iterable argument');
+        }
+        const obj = {};
+        for (const entry of iterable) {
+            if (entry === null || typeof entry !== 'object') {
+                throw new TypeError('Iterator value is not an entry object');
+            }
+            const key = entry[0];
+            const value = entry[1];
+            obj[key] = value;
+        }
+        return obj;
+    },
+    // Object.getOwnPropertyNames(obj)
+    getOwnPropertyNames: function(obj) {
+        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+            throw new TypeError('Object.getOwnPropertyNames called on non-object');
+        }
+        return Reflect.ownKeys(obj).filter(k => typeof k === 'string');
+    },
+    // Object.getOwnPropertySymbols(obj)
+    getOwnPropertySymbols: function(obj) {
+        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+            throw new TypeError('Object.getOwnPropertySymbols called on non-object');
+        }
+        return Reflect.ownKeys(obj).filter(k => typeof k === 'symbol');
+    },
+    // Object.getOwnPropertyDescriptor(obj, prop)
+    getOwnPropertyDescriptor: function(obj, prop) {
+        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+            throw new TypeError('Object.getOwnPropertyDescriptor called on non-object');
+        }
+        return Reflect.getOwnPropertyDescriptor(obj, prop);
+    },
+    // Object.getOwnPropertyDescriptors(obj)
+    getOwnPropertyDescriptors: function(obj) {
+        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+            throw new TypeError('Object.getOwnPropertyDescriptors called on non-object');
+        }
+        const result = {};
+        const keys = Reflect.ownKeys(obj);
+        for (const key of keys) {
+            result[key] = Reflect.getOwnPropertyDescriptor(obj, key);
+        }
+        return result;
+    },
+    // Object.getPrototypeOf(obj)
+    getPrototypeOf: function(obj) {
+        if (obj === null || obj === undefined) {
+            throw new TypeError('Cannot convert undefined or null to object');
+        }
+        // Convert primitives to objects
+        if (typeof obj !== 'object' && typeof obj !== 'function') {
+            obj = Object(obj);
+        }
+        return Reflect.getPrototypeOf(obj);
+    },
+    // Object.setPrototypeOf(obj, proto)
+    setPrototypeOf: function(obj, proto) {
+        if (obj === null || obj === undefined) {
+            throw new TypeError('Object.setPrototypeOf called on null or undefined');
+        }
+        if (proto !== null && typeof proto !== 'object') {
+            throw new TypeError('Object prototype may only be an Object or null');
+        }
+        if (typeof obj !== 'object' && typeof obj !== 'function') {
+            return obj; // Per spec, return obj unchanged for primitives
+        }
+        Reflect.setPrototypeOf(obj, proto);
+        return obj;
+    },
 };
+
+// Object.prototype methods
+const _objectPrototype = {
+    hasOwnProperty: function(prop) {
+        return Object.hasOwn(this, prop);
+    },
+    isPrototypeOf: function(obj) {
+        if (obj === null || obj === undefined) {
+            return false;
+        }
+        let proto = Reflect.getPrototypeOf(obj);
+        while (proto !== null) {
+            if (proto === this) {
+                return true;
+            }
+            proto = Reflect.getPrototypeOf(proto);
+        }
+        return false;
+    },
+    propertyIsEnumerable: function(prop) {
+        const desc = Reflect.getOwnPropertyDescriptor(this, prop);
+        return desc !== undefined && desc.enumerable === true;
+    },
+    valueOf: function() {
+        return this;
+    },
+    toLocaleString: function() {
+        if (this === null || this === undefined) {
+            throw new TypeError('Cannot call toLocaleString on null or undefined');
+        }
+        return String(this);
+    },
+};
+
+Object.prototype = _objectPrototype;
 
 // Array built-in wrapper
 globalThis.Array = {
@@ -418,7 +559,14 @@ globalThis.JSON = {
 
 // String built-in wrapper
 globalThis.String = function(value) {
-    return value === undefined ? '' : String(value);
+    // Avoid recursion: this function replaces the global `String`.
+    // Use JS ToString-like semantics instead of calling `String(...)`.
+    if (value === undefined) return '';
+    if (value === null) return 'null';
+    if (typeof value === 'symbol') {
+        throw new TypeError('Cannot convert a Symbol value to a string');
+    }
+    return '' + value;
 };
 
 String.fromCharCode = function(...codes) {
@@ -938,12 +1086,17 @@ Array.prototype = {
 
     // Symbol.iterator - enables for-of loops
     [_symbolIterator]: function() {
-        const arr = this;
-        let index = 0;
+        // NOTE: The VM currently does not support upvalue capture in nested functions.
+        // Keep iterators stateful via `this` instead of closing over locals.
         return {
-            next: () => {
-                if (index < arr.length) {
-                    return { value: arr[index++], done: false };
+            _arr: this,
+            _index: 0,
+            next: function() {
+                const i = this._index;
+                const arr = this._arr;
+                if (i < arr.length) {
+                    this._index = i + 1;
+                    return { value: arr[i], done: false };
                 }
                 return { value: undefined, done: true };
             },
@@ -1428,7 +1581,15 @@ Error.captureStackTrace = function(targetObject, constructorOpt) {
 // Symbol for internal use in call/apply
 const _fnSymbol = Symbol('__fn__');
 
-Function.prototype = {
+// Define Function constructor first
+globalThis.Function = function Function(...args) {
+    // The Function constructor creates a new function from strings
+    // This is a security-sensitive operation; for now we throw
+    throw new Error('Function constructor is not supported');
+};
+
+// Now set up Function.prototype
+globalThis.Function.prototype = {
     // Function.prototype.call(thisArg, ...args)
     call: function(thisArg, ...args) {
         const fn = this;
@@ -1478,47 +1639,47 @@ Function.prototype = {
         return result;
     },
 
-    // Function.prototype.bind(thisArg, ...boundArgs)
-    bind: function(thisArg, ...boundArgs) {
+    // Function.prototype.bind(thisArg, a0, a1, a2, a3, a4, a5, a6, a7)
+    // Creates a bound function using native __Function_createBound
+    // Supports up to 8 bound arguments (common use cases)
+    bind: function(thisArg, a0, a1, a2, a3, a4, a5, a6, a7) {
         const fn = this;
 
-        // Create a bound function wrapper
-        const bound = function(...args) {
-            // Check if called as constructor (new bound())
-            // For simplicity, we don't fully support constructor behavior yet
+        if (typeof fn !== 'function') {
+            throw new TypeError('Bind must be called on a function');
+        }
 
-            // Combine bound args with call args
-            const allArgs = [...boundArgs, ...args];
+        // Collect non-undefined bound args
+        const boundArgs = [];
+        if (a0 !== undefined) boundArgs[boundArgs.length] = a0;
+        if (a1 !== undefined) boundArgs[boundArgs.length] = a1;
+        if (a2 !== undefined) boundArgs[boundArgs.length] = a2;
+        if (a3 !== undefined) boundArgs[boundArgs.length] = a3;
+        if (a4 !== undefined) boundArgs[boundArgs.length] = a4;
+        if (a5 !== undefined) boundArgs[boundArgs.length] = a5;
+        if (a6 !== undefined) boundArgs[boundArgs.length] = a6;
+        if (a7 !== undefined) boundArgs[boundArgs.length] = a7;
 
-            // If thisArg is null/undefined for non-strict mode, use globalThis
-            let effectiveThis = thisArg;
-            if (effectiveThis === null || effectiveThis === undefined) {
-                effectiveThis = globalThis;
-            }
-
-            // Convert primitives to objects
-            if (typeof effectiveThis !== 'object' && typeof effectiveThis !== 'function') {
-                effectiveThis = Object(effectiveThis);
-            }
-
-            // Call original function with bound this
-            effectiveThis[_fnSymbol] = fn;
-            const result = effectiveThis[_fnSymbol](...allArgs);
-            delete effectiveThis[_fnSymbol];
-
-            return result;
-        };
-
-        // Set length property (original length - bound args, min 0)
-        const originalLength = fn.length || 0;
-        const newLength = Math.max(0, originalLength - boundArgs.length);
-        Object.defineProperty(bound, 'length', { value: newLength, writable: false });
-
-        // Set name property
-        const originalName = fn.name || '';
-        Object.defineProperty(bound, 'name', { value: 'bound ' + originalName, writable: false });
-
-        return bound;
+        // Use native bound function creation
+        if (boundArgs.length === 0) {
+            return __Function_createBound(fn, thisArg);
+        } else if (boundArgs.length === 1) {
+            return __Function_createBound(fn, thisArg, boundArgs[0]);
+        } else if (boundArgs.length === 2) {
+            return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1]);
+        } else if (boundArgs.length === 3) {
+            return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2]);
+        } else if (boundArgs.length === 4) {
+            return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2], boundArgs[3]);
+        } else if (boundArgs.length === 5) {
+            return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2], boundArgs[3], boundArgs[4]);
+        } else if (boundArgs.length === 6) {
+            return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2], boundArgs[3], boundArgs[4], boundArgs[5]);
+        } else if (boundArgs.length === 7) {
+            return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2], boundArgs[3], boundArgs[4], boundArgs[5], boundArgs[6]);
+        } else {
+            return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2], boundArgs[3], boundArgs[4], boundArgs[5], boundArgs[6], boundArgs[7]);
+        }
     },
 
     // Function.prototype.toString()
@@ -1536,16 +1697,6 @@ Function.prototype = {
         return __Function_getLength(this);
     },
 };
-
-// Also expose as globalThis.Function (constructor - simplified)
-globalThis.Function = function Function(...args) {
-    // The Function constructor creates a new function from strings
-    // This is a security-sensitive operation; for now we throw
-    throw new Error('Function constructor is not supported');
-};
-
-// Assign prototype to our Function constructor
-globalThis.Function.prototype = Function.prototype;
 
 // Console built-in
 globalThis.console = {
@@ -1616,11 +1767,16 @@ globalThis.Map = function Map(iterable) {
 
         keys: function() {
             const keysArr = __Map_keys(this._internal);
-            let index = 0;
             return {
+                _arr: keysArr,
+                _index: 0,
                 next: () => {
-                    if (index < keysArr.length) {
-                        return { value: keysArr[index++], done: false };
+                    // Avoid closing over locals (no upvalue capture in the VM yet).
+                    const i = this._index;
+                    const arr = this._arr;
+                    if (i < arr.length) {
+                        this._index = i + 1;
+                        return { value: arr[i], done: false };
                     }
                     return { value: undefined, done: true };
                 },
@@ -1630,11 +1786,16 @@ globalThis.Map = function Map(iterable) {
 
         values: function() {
             const valuesArr = __Map_values(this._internal);
-            let index = 0;
             return {
+                _arr: valuesArr,
+                _index: 0,
                 next: () => {
-                    if (index < valuesArr.length) {
-                        return { value: valuesArr[index++], done: false };
+                    // Avoid closing over locals (no upvalue capture in the VM yet).
+                    const i = this._index;
+                    const arr = this._arr;
+                    if (i < arr.length) {
+                        this._index = i + 1;
+                        return { value: arr[i], done: false };
                     }
                     return { value: undefined, done: true };
                 },
@@ -1644,11 +1805,16 @@ globalThis.Map = function Map(iterable) {
 
         entries: function() {
             const entriesArr = __Map_entries(this._internal);
-            let index = 0;
             return {
+                _arr: entriesArr,
+                _index: 0,
                 next: () => {
-                    if (index < entriesArr.length) {
-                        return { value: entriesArr[index++], done: false };
+                    // Avoid closing over locals (no upvalue capture in the VM yet).
+                    const i = this._index;
+                    const arr = this._arr;
+                    if (i < arr.length) {
+                        this._index = i + 1;
+                        return { value: arr[i], done: false };
                     }
                     return { value: undefined, done: true };
                 },
@@ -2208,11 +2374,12 @@ Promise.withResolvers = function() {
 };
 
 // queueMicrotask global (used by Promise)
+// Synchronous execution fallback - a proper implementation should use
+// the event loop's microtask queue via a native function.
 if (typeof globalThis.queueMicrotask === 'undefined') {
     globalThis.queueMicrotask = function(callback) {
-        // Fallback: execute immediately (not spec-compliant but functional)
-        // The real implementation should use the event loop's microtask queue
-        Promise.resolve().then(callback);
+        // Simply execute synchronously (not spec-compliant but avoids recursion)
+        callback();
     };
 }
 

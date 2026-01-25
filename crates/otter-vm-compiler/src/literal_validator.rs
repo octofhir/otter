@@ -474,12 +474,7 @@ impl LiteralValidator {
                                         start_pos + position as u32,
                                         start_pos + position as u32 + 1,
                                     ));
-                                } else {
-                                    eprintln!(
-                                        "DEBUG: Accepting legacy octal escape '\\{}' (strict={})",
-                                        next_ch, self.strict_mode
-                                    );
-                                }
+                                } 
                                 // In non-strict mode, consume the octal digits
                                 self.consume_octal_digits(&mut chars);
                             }

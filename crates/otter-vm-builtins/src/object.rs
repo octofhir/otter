@@ -39,6 +39,7 @@ pub fn ops() -> Vec<Op> {
         op_native("__Object_defineProperty", native_object_define_property),
         op_native("__Object_create", native_object_create),
         op_native("__Object_is", native_object_is),
+        op_native("__Object_rest", native_object_rest),
     ]
 }
 
@@ -291,8 +292,10 @@ fn native_object_create(args: &[VmValue]) -> Result<VmValue, String> {
                                 configurable,
                             };
 
-                            new_obj
-                                .define_property(key, PropertyDescriptor::data_with_attrs(value, attrs));
+                            new_obj.define_property(
+                                key,
+                                PropertyDescriptor::data_with_attrs(value, attrs),
+                            );
                         }
                     }
                 }
@@ -546,4 +549,84 @@ mod tests {
         // Now not extensible
         assert!(!obj.is_extensible());
     }
+
+    #[test]
+    fn test_native_object_rest() {
+        use otter_vm_core::object::JsObject;
+        use std::sync::Arc;
+
+        let obj = Arc::new(JsObject::new(None));
+        obj.set("a".into(), VmValue::int32(1));
+        obj.set("b".into(), VmValue::int32(2));
+        obj.set("c".into(), VmValue::int32(3));
+
+        let excluded = Arc::new(JsObject::new_array());
+        excluded.set_index(0, VmValue::string(JsString::intern("a")));
+        excluded.set_index(1, VmValue::string(JsString::intern("b")));
+
+        let args = vec![VmValue::object(obj), VmValue::object(excluded)];
+        let result = native_object_rest(&args).unwrap();
+        let result_obj = result.as_object().unwrap();
+
+        assert_eq!(result_obj.own_keys().len(), 1);
+        assert_eq!(
+            result_obj.get(&PropertyKey::String(JsString::intern("c"))),
+            Some(VmValue::int32(3))
+        );
+    }
+}
+
+/// Object rest helper: copy own enumerable properties from source excluding keys in excluded_keys_array
+fn native_object_rest(args: &[VmValue]) -> Result<VmValue, String> {
+    let source = args.first().ok_or("Object rest requires a source object")?;
+    let excluded_keys_val = args
+        .get(1)
+        .ok_or("Object rest requires an excluded keys array")?;
+
+    // If source is null or undefined, throw TypeError (spec requires ObjectCoerce)
+    if source.is_nullish() {
+        return Err("Cannot destructure null or undefined".to_string());
+    }
+
+    // Coerce to object
+    let source_obj = source
+        .as_object()
+        .cloned()
+        .or_else(|| {
+            // Primitive coercion (simplified for now)
+            None
+        })
+        .ok_or("Source must be an object")?;
+
+    let excluded_keys_obj = excluded_keys_val
+        .as_object()
+        .ok_or("Excluded keys must be an array")?;
+
+    // Build a set of excluded keys for efficient lookup
+    let mut excluded = std::collections::HashSet::new();
+    // Assuming excluded_keys_obj is an array (has length and integer keys)
+    if let Some(len_val) = excluded_keys_obj.get(&PropertyKey::String(JsString::intern("length"))) {
+        if let Some(len) = len_val.as_number() {
+            for i in 0..(len as u32) {
+                if let Some(key_val) = excluded_keys_obj.get(&PropertyKey::Index(i)) {
+                    excluded.insert(to_property_key(&key_val));
+                }
+            }
+        }
+    }
+
+    let new_obj = Arc::new(JsObject::new(Some(Arc::new(JsObject::new(None))))); // Should probably use Object.prototype
+
+    for key in source_obj.own_keys() {
+        // Only enumerable own properties
+        if let Some(desc) = source_obj.get_own_property_descriptor(&key) {
+            if desc.enumerable() && !excluded.contains(&key) {
+                if let Some(val) = source_obj.get(&key) {
+                    new_obj.set(key, val);
+                }
+            }
+        }
+    }
+
+    Ok(VmValue::object(new_obj))
 }

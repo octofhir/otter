@@ -55,7 +55,32 @@ impl Compiler {
 
     /// Set strict mode for literal validation
     pub fn set_strict_mode(&mut self, strict_mode: bool) {
+        self.codegen.current.flags.is_strict = strict_mode;
         self.literal_validator.set_strict_mode(strict_mode);
+    }
+
+    fn check_identifier_early_error(&self, name: &str) -> CompileResult<()> {
+        let is_strict =
+            self.codegen.current.flags.is_strict || self.literal_validator.is_strict_mode();
+        if is_strict {
+            if name == "eval" || name == "arguments" {
+                return Err(CompileError::Parse(format!(
+                    "Assignment to '{}' is not allowed in strict mode",
+                    name
+                )));
+            }
+            if name == "yield" {
+                return Err(CompileError::Parse(
+                    "Identifier 'yield' is a reserved word in strict mode".to_string(),
+                ));
+            }
+        }
+        if self.codegen.current.flags.is_generator && name == "yield" {
+            return Err(CompileError::Parse(
+                "Identifier 'yield' is a reserved word in generator functions".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Get the current strict mode setting
@@ -468,6 +493,7 @@ impl Compiler {
                 for param in &func.params.items {
                     match &param.pattern {
                         BindingPattern::BindingIdentifier(ident) => {
+                            self.check_identifier_early_error(&ident.name)?;
                             let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                             self.codegen.current.param_count += 1;
                             if let Some(init) = &param.initializer {
@@ -481,6 +507,7 @@ impl Compiler {
                                     "Complex parameter patterns",
                                 ));
                             };
+                            self.check_identifier_early_error(&ident.name)?;
                             let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                             self.codegen.current.param_count += 1;
                             param_defaults.push((local_idx, &assign.right));
@@ -1050,6 +1077,7 @@ impl Compiler {
         for declarator in &decl.declarations {
             match &declarator.id {
                 BindingPattern::BindingIdentifier(ident) => {
+                    self.check_identifier_early_error(&ident.name)?;
                     let local_idx = self.codegen.declare_variable_with_kind(&ident.name, kind)?;
 
                     if let Some(init) = &declarator.init {
@@ -1310,76 +1338,29 @@ impl Compiler {
         // Assign value to the left side
         match &for_of_stmt.left {
             ForStatementLeft::VariableDeclaration(decl) => {
-                // For variable declarations like `const x` or `let x`
+                // For variable declarations like `const x`, `let [a, b]`, `var { x, y }`
                 let is_const = decl.kind == VariableDeclarationKind::Const;
                 if let Some(declarator) = decl.declarations.first() {
-                    match &declarator.id {
-                        BindingPattern::BindingIdentifier(ident) => {
-                            // Declare the variable and set its value
-                            let local_idx = self.codegen.declare_variable(&ident.name, is_const)?;
-                            self.codegen.emit(Instruction::SetLocal {
-                                idx: LocalIndex(local_idx),
-                                src: value_reg,
-                            });
-                        }
-                        BindingPattern::ArrayPattern(array_pat) => {
-                            // Minimal support for `for (const [a, b] of iter) { ... }`
-                            // by indexing into the yielded value.
-                            if array_pat.rest.is_some() {
-                                return Err(CompileError::unsupported(
-                                    "Array rest in for-of destructuring",
-                                ));
-                            }
-
-                            for (i, elem) in array_pat.elements.iter().enumerate() {
-                                let Some(elem_pat) = elem else { continue };
-                                let BindingPattern::BindingIdentifier(ident) = elem_pat else {
-                                    return Err(CompileError::unsupported(
-                                        "Complex destructuring in for-of",
-                                    ));
-                                };
-
-                                let local_idx =
-                                    self.codegen.declare_variable(&ident.name, is_const)?;
-
-                                let idx_reg = self.codegen.alloc_reg();
-                                self.codegen.emit(Instruction::LoadInt32 {
-                                    dst: idx_reg,
-                                    value: i as i32,
-                                });
-
-                                let elem_reg = self.codegen.alloc_reg();
-                                self.codegen.emit(Instruction::GetElem {
-                                    dst: elem_reg,
-                                    arr: value_reg,
-                                    idx: idx_reg,
-                                });
-
-                                self.codegen.emit(Instruction::SetLocal {
-                                    idx: LocalIndex(local_idx),
-                                    src: elem_reg,
-                                });
-
-                                self.codegen.free_reg(elem_reg);
-                                self.codegen.free_reg(idx_reg);
-                            }
-                        }
-                        _ => {
-                            // Destructuring patterns in for-of
-                            return Err(CompileError::unsupported(
-                                "Destructuring in for-of not yet supported",
-                            ));
-                        }
+                    // Early error: Initializer is not allowed in for-of/for-in loop heads
+                    if declarator.init.is_some() {
+                        return Err(CompileError::Parse(
+                            "for-of loop variable declaration may not have an initializer"
+                                .to_string(),
+                        ));
                     }
+                    // Use the recursive binding initialization helper
+                    self.compile_binding_init(&declarator.id, value_reg, is_const)?;
                 }
             }
-            _ => {
-                // Assignment to existing variable
-                // For simple identifiers, we can handle them
-                // Complex assignment targets (destructuring, member access) need more work
-                return Err(CompileError::unsupported(
-                    "Complex for-of left-hand side not yet supported",
-                ));
+            left => {
+                if let Some(target) = left.as_assignment_target() {
+                    // Assignment to existing variable(s)
+                    self.compile_assignment_target_init(target, value_reg)?;
+                } else {
+                    return Err(CompileError::unsupported(
+                        "Unsupported for-of left-hand side",
+                    ));
+                }
             }
         }
 
@@ -1419,6 +1400,648 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compile binding pattern initialization - recursively handles nested destructuring
+    /// source_reg contains the value to destructure, is_const determines Variable kind
+    fn compile_binding_init(
+        &mut self,
+        pattern: &BindingPattern,
+        source_reg: Register,
+        is_const: bool,
+    ) -> CompileResult<()> {
+        self.enter_depth()?;
+        let result = self.compile_binding_init_inner(pattern, source_reg, is_const);
+        self.exit_depth();
+        result
+    }
+
+    fn compile_binding_init_inner(
+        &mut self,
+        pattern: &BindingPattern,
+        source_reg: Register,
+        is_const: bool,
+    ) -> CompileResult<()> {
+        match pattern {
+            BindingPattern::BindingIdentifier(ident) => {
+                self.check_identifier_early_error(&ident.name)?;
+                let local_idx = self.codegen.declare_variable(&ident.name, is_const)?;
+                self.codegen.emit(Instruction::SetLocal {
+                    idx: LocalIndex(local_idx),
+                    src: source_reg,
+                });
+            }
+            BindingPattern::ArrayPattern(array_pat) => {
+                // Handle regular elements
+                for (i, elem) in array_pat.elements.iter().enumerate() {
+                    let Some(elem_pat) = elem else { continue };
+
+                    // Get element from array
+                    let idx_reg = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::LoadInt32 {
+                        dst: idx_reg,
+                        value: i as i32,
+                    });
+
+                    let elem_reg = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::GetElem {
+                        dst: elem_reg,
+                        arr: source_reg,
+                        idx: idx_reg,
+                    });
+                    self.codegen.free_reg(idx_reg);
+
+                    // Recursively handle the element pattern
+                    self.compile_binding_init_inner(elem_pat, elem_reg, is_const)?;
+                    self.codegen.free_reg(elem_reg);
+                }
+
+                // Handle rest element: [..., ...rest]
+                if let Some(rest_elem) = &array_pat.rest {
+                    // Call Array.prototype.slice(startIndex) to get remaining elements
+                    let start_idx = array_pat.elements.len();
+
+                    // Prepare arguments: source_reg.slice(start_idx)
+                    let frame = self.codegen.alloc_fresh_block(2);
+                    self.codegen.emit(Instruction::Move {
+                        dst: frame,
+                        src: source_reg,
+                    });
+                    let start_reg = Register(frame.0 + 1);
+                    self.codegen.emit(Instruction::LoadInt32 {
+                        dst: start_reg,
+                        value: start_idx as i32,
+                    });
+
+                    let slice_name = self.codegen.add_string("slice");
+                    let rest_reg = self.codegen.alloc_reg();
+                    let ic_index = self.codegen.alloc_ic();
+                    self.codegen.emit(Instruction::CallMethod {
+                        dst: rest_reg,
+                        obj: frame,
+                        method: slice_name,
+                        argc: 1,
+                        ic_index,
+                    });
+                    self.codegen.free_reg(frame);
+
+                    // Recursively handle the rest binding
+                    self.compile_binding_init_inner(&rest_elem.argument, rest_reg, is_const)?;
+                    self.codegen.free_reg(rest_reg);
+                }
+            }
+            BindingPattern::ObjectPattern(obj_pat) => {
+                let mut excluded_keys = Vec::new();
+                for prop in &obj_pat.properties {
+                    let prop_reg = self.codegen.alloc_reg();
+                    let key_reg = if prop.computed {
+                        let kr = self.compile_property_key(&prop.key)?;
+                        let ic_index = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::GetProp {
+                            dst: prop_reg,
+                            obj: source_reg,
+                            key: kr,
+                            ic_index,
+                        });
+                        kr
+                    } else {
+                        let key_name = match &prop.key {
+                            PropertyKey::StaticIdentifier(ident) => ident.name.to_string(),
+                            PropertyKey::Identifier(ident) => ident.name.to_string(),
+                            PropertyKey::StringLiteral(lit) => lit.value.to_string(),
+                            PropertyKey::NumericLiteral(lit) => lit.value.to_string(),
+                            _ => {
+                                return Err(CompileError::unsupported(
+                                    "Unsupported non-computed property key in binding pattern",
+                                ));
+                            }
+                        };
+                        let key_idx = self.codegen.add_string(&key_name);
+                        let ic_index = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::GetPropConst {
+                            dst: prop_reg,
+                            obj: source_reg,
+                            name: key_idx,
+                            ic_index,
+                        });
+
+                        // For rest, we need the key as a register
+                        let kr = self.codegen.alloc_reg();
+                        self.codegen.emit(Instruction::LoadConst {
+                            dst: kr,
+                            idx: key_idx,
+                        });
+                        kr
+                    };
+
+                    if obj_pat.rest.is_some() {
+                        excluded_keys.push(key_reg);
+                    } else {
+                        self.codegen.free_reg(key_reg);
+                    }
+
+                    self.compile_binding_init_inner(&prop.value, prop_reg, is_const)?;
+                    self.codegen.free_reg(prop_reg);
+                }
+
+                if let Some(rest) = &obj_pat.rest {
+                    let excluded_array = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::NewArray {
+                        dst: excluded_array,
+                        len: excluded_keys.len() as u16,
+                    });
+
+                    for (i, key_reg) in excluded_keys.iter().enumerate() {
+                        let idx_reg = self.codegen.alloc_reg();
+                        self.codegen.emit(Instruction::LoadInt32 {
+                            dst: idx_reg,
+                            value: i as i32,
+                        });
+                        self.codegen.emit(Instruction::SetElem {
+                            arr: excluded_array,
+                            idx: idx_reg,
+                            val: *key_reg,
+                        });
+                        self.codegen.free_reg(idx_reg);
+                        self.codegen.free_reg(*key_reg);
+                    }
+
+                    let rest_reg = self.codegen.alloc_reg();
+                    let rest_helper = self.codegen.add_string("__Object_rest");
+                    let ic_index = self.codegen.alloc_ic();
+
+                    // Load __Object_rest from global
+                    let func_reg = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::GetGlobal {
+                        dst: func_reg,
+                        name: rest_helper,
+                        ic_index,
+                    });
+
+                    // Arguments for __Object_rest(source, excluded_array)
+                    let frame = self.codegen.alloc_fresh_block(3);
+                    self.codegen.emit(Instruction::Move {
+                        dst: frame,
+                        src: func_reg,
+                    });
+                    self.codegen.emit(Instruction::Move {
+                        dst: Register(frame.0 + 1),
+                        src: source_reg,
+                    });
+                    self.codegen.emit(Instruction::Move {
+                        dst: Register(frame.0 + 2),
+                        src: excluded_array,
+                    });
+
+                    self.codegen.emit(Instruction::Call {
+                        dst: rest_reg,
+                        func: frame,
+                        argc: 2,
+                    });
+
+                    self.codegen.free_reg(func_reg);
+                    self.codegen.free_reg(excluded_array);
+                    // frame registers are freed implicitly by the block allocator if handled by codegen,
+                    // but here we just used it. Codegen might not have explicit free_block.
+                    // Actually, alloc_fresh_block just returns a start register.
+                    // I should probably just use alloc_reg multiple times if I'm not sure.
+                    // But compiler uses alloc_fresh_block in other places.
+
+                    self.compile_binding_init_inner(&rest.argument, rest_reg, is_const)?;
+                    self.codegen.free_reg(rest_reg);
+                }
+            }
+            BindingPattern::AssignmentPattern(assign_pat) => {
+                // Handle default value
+                // Check if source_reg is undefined
+                let undefined_reg = self.codegen.alloc_reg();
+                self.codegen
+                    .emit(Instruction::LoadUndefined { dst: undefined_reg });
+
+                let is_undef = self.codegen.alloc_reg();
+                self.codegen.emit(Instruction::StrictEq {
+                    dst: is_undef,
+                    lhs: source_reg,
+                    rhs: undefined_reg,
+                });
+
+                let jump_skip = self.codegen.emit_jump_if_false(is_undef);
+                self.codegen.free_reg(is_undef);
+                self.codegen.free_reg(undefined_reg);
+
+                // Evaluate and use default value
+                let default_val = self.compile_expression(&assign_pat.right)?;
+                self.codegen.emit(Instruction::Move {
+                    dst: source_reg,
+                    src: default_val,
+                });
+                self.codegen.free_reg(default_val);
+
+                // Patch jump to skip default
+                let end_offset = self.codegen.current_index() as i32 - jump_skip as i32;
+                self.codegen.patch_jump(jump_skip, end_offset);
+
+                // Recursively handle the left pattern
+                self.compile_binding_init_inner(&assign_pat.left, source_reg, is_const)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile assignment target initialization - for for-of loops without variable declarations
+    fn compile_assignment_target_init(
+        &mut self,
+        target: &AssignmentTarget,
+        source_reg: Register,
+    ) -> CompileResult<()> {
+        self.enter_depth()?;
+        let result = self.compile_assignment_target_init_inner(target, source_reg);
+        self.exit_depth();
+        result
+    }
+
+    fn compile_assignment_target_init_inner(
+        &mut self,
+        target: &AssignmentTarget,
+        source_reg: Register,
+    ) -> CompileResult<()> {
+        match target {
+            AssignmentTarget::AssignmentTargetIdentifier(ident) => {
+                self.check_identifier_early_error(&ident.name)?;
+                match self.codegen.resolve_variable(&ident.name) {
+                    Some(ResolvedBinding::Local(idx)) => {
+                        self.codegen.emit(Instruction::SetLocal {
+                            idx: LocalIndex(idx),
+                            src: source_reg,
+                        });
+                    }
+                    Some(ResolvedBinding::Global(_)) | None => {
+                        let name_idx = self.codegen.add_string(&ident.name);
+                        let ic_index = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::SetGlobal {
+                            name: name_idx,
+                            src: source_reg,
+                            ic_index,
+                        });
+                    }
+                    Some(ResolvedBinding::Upvalue { index, depth }) => {
+                        let upvalue_idx = self.codegen.register_upvalue(index, depth);
+                        self.codegen.emit(Instruction::SetUpvalue {
+                            idx: LocalIndex(upvalue_idx),
+                            src: source_reg,
+                        });
+                    }
+                }
+            }
+            AssignmentTarget::StaticMemberExpression(member) => {
+                let obj = self.compile_expression(&member.object)?;
+                let name_idx = self.codegen.add_string(&member.property.name);
+                let ic_index = self.codegen.alloc_ic();
+                self.codegen.emit(Instruction::SetPropConst {
+                    obj,
+                    name: name_idx,
+                    val: source_reg,
+                    ic_index,
+                });
+                self.codegen.free_reg(obj);
+            }
+            AssignmentTarget::ComputedMemberExpression(member) => {
+                let obj = self.compile_expression(&member.object)?;
+                let key = self.compile_expression(&member.expression)?;
+                let ic_index = self.codegen.alloc_ic();
+                self.codegen.emit(Instruction::SetProp {
+                    obj,
+                    key,
+                    val: source_reg,
+                    ic_index,
+                });
+                self.codegen.free_reg(key);
+                self.codegen.free_reg(obj);
+            }
+            AssignmentTarget::ArrayAssignmentTarget(array_target) => {
+                for (i, elem) in array_target.elements.iter().enumerate() {
+                    let Some(elem_maybe_default) = elem else {
+                        continue;
+                    };
+
+                    // Get element from array
+                    let idx_reg = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::LoadInt32 {
+                        dst: idx_reg,
+                        value: i as i32,
+                    });
+
+                    let elem_reg = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::GetElem {
+                        dst: elem_reg,
+                        arr: source_reg,
+                        idx: idx_reg,
+                    });
+                    self.codegen.free_reg(idx_reg);
+
+                    if let Some(target) = elem_maybe_default.as_assignment_target() {
+                        self.compile_assignment_target_init_inner(target, elem_reg)?;
+                    } else if let AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(def) =
+                        elem_maybe_default
+                    {
+                        // Check for undefined and use default
+                        let undefined_reg = self.codegen.alloc_reg();
+                        self.codegen
+                            .emit(Instruction::LoadUndefined { dst: undefined_reg });
+                        let is_undef = self.codegen.alloc_reg();
+                        self.codegen.emit(Instruction::StrictEq {
+                            dst: is_undef,
+                            lhs: elem_reg,
+                            rhs: undefined_reg,
+                        });
+                        let jump_skip = self.codegen.emit_jump_if_false(is_undef);
+                        self.codegen.free_reg(is_undef);
+                        self.codegen.free_reg(undefined_reg);
+
+                        let default_val = self.compile_expression(&def.init)?;
+                        self.codegen.emit(Instruction::Move {
+                            dst: elem_reg,
+                            src: default_val,
+                        });
+                        self.codegen.free_reg(default_val);
+
+                        let end_offset = self.codegen.current_index() as i32 - jump_skip as i32;
+                        self.codegen.patch_jump(jump_skip, end_offset);
+
+                        self.compile_assignment_target_init_inner(&def.binding, elem_reg)?;
+                    }
+                    self.codegen.free_reg(elem_reg);
+                }
+
+                if let Some(rest) = &array_target.rest {
+                    // Similar to BindingRestElement
+                    let start_idx = array_target.elements.len();
+                    let frame = self.codegen.alloc_fresh_block(2);
+                    self.codegen.emit(Instruction::Move {
+                        dst: frame,
+                        src: source_reg,
+                    });
+                    let start_reg = Register(frame.0 + 1);
+                    self.codegen.emit(Instruction::LoadInt32 {
+                        dst: start_reg,
+                        value: start_idx as i32,
+                    });
+
+                    let slice_name = self.codegen.add_string("slice");
+                    let rest_reg = self.codegen.alloc_reg();
+                    let ic_index = self.codegen.alloc_ic();
+                    self.codegen.emit(Instruction::CallMethod {
+                        dst: rest_reg,
+                        obj: frame,
+                        method: slice_name,
+                        argc: 1,
+                        ic_index,
+                    });
+                    self.codegen.free_reg(frame);
+
+                    self.compile_assignment_target_init_inner(&rest.target, rest_reg)?;
+                    self.codegen.free_reg(rest_reg);
+                }
+            }
+            AssignmentTarget::ObjectAssignmentTarget(obj_target) => {
+                let mut excluded_keys = Vec::new();
+                for prop in &obj_target.properties {
+                    match prop {
+                        AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(ident) => {
+                            self.check_identifier_early_error(&ident.binding.name)?;
+                            let key_idx = self.codegen.add_string(&ident.binding.name);
+                            let prop_reg = self.codegen.alloc_reg();
+                            let ic_index = self.codegen.alloc_ic();
+                            self.codegen.emit(Instruction::GetPropConst {
+                                dst: prop_reg,
+                                obj: source_reg,
+                                name: key_idx,
+                                ic_index,
+                            });
+
+                            if obj_target.rest.is_some() {
+                                let key_reg = self.codegen.alloc_reg();
+                                self.codegen.emit(Instruction::LoadConst {
+                                    dst: key_reg,
+                                    idx: key_idx,
+                                });
+                                excluded_keys.push(key_reg);
+                            }
+
+                            if let Some(init) = &ident.init {
+                                // Default value
+                                let undefined_reg = self.codegen.alloc_reg();
+                                self.codegen
+                                    .emit(Instruction::LoadUndefined { dst: undefined_reg });
+                                let is_undef = self.codegen.alloc_reg();
+                                self.codegen.emit(Instruction::StrictEq {
+                                    dst: is_undef,
+                                    lhs: prop_reg,
+                                    rhs: undefined_reg,
+                                });
+                                let jump_skip = self.codegen.emit_jump_if_false(is_undef);
+                                self.codegen.free_reg(is_undef);
+                                self.codegen.free_reg(undefined_reg);
+
+                                let default_val = self.compile_expression(init)?;
+                                self.codegen.emit(Instruction::Move {
+                                    dst: prop_reg,
+                                    src: default_val,
+                                });
+                                self.codegen.free_reg(default_val);
+
+                                let end_offset =
+                                    self.codegen.current_index() as i32 - jump_skip as i32;
+                                self.codegen.patch_jump(jump_skip, end_offset);
+                            }
+
+                            // Manual assignment for IdentifierReference
+                            match self.codegen.resolve_variable(&ident.binding.name) {
+                                Some(ResolvedBinding::Local(idx)) => {
+                                    self.codegen.emit(Instruction::SetLocal {
+                                        idx: LocalIndex(idx),
+                                        src: prop_reg,
+                                    });
+                                }
+                                Some(ResolvedBinding::Global(_)) | None => {
+                                    let name_idx = self.codegen.add_string(&ident.binding.name);
+                                    let ic_index_set = self.codegen.alloc_ic();
+                                    self.codegen.emit(Instruction::SetGlobal {
+                                        name: name_idx,
+                                        src: prop_reg,
+                                        ic_index: ic_index_set,
+                                    });
+                                }
+                                Some(ResolvedBinding::Upvalue { index, depth }) => {
+                                    let upvalue_idx = self.codegen.register_upvalue(index, depth);
+                                    self.codegen.emit(Instruction::SetUpvalue {
+                                        idx: LocalIndex(upvalue_idx),
+                                        src: prop_reg,
+                                    });
+                                }
+                            }
+                            self.codegen.free_reg(prop_reg);
+                        }
+                        AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                            let prop_reg = self.codegen.alloc_reg();
+                            let key_reg = if p.computed {
+                                let kr = self.compile_property_key(&p.name)?;
+                                let ic_index = self.codegen.alloc_ic();
+                                self.codegen.emit(Instruction::GetProp {
+                                    dst: prop_reg,
+                                    obj: source_reg,
+                                    key: kr,
+                                    ic_index,
+                                });
+                                kr
+                            } else {
+                                let key_name = match &p.name {
+                                    PropertyKey::StaticIdentifier(ident) => ident.name.to_string(),
+                                    PropertyKey::Identifier(ident) => ident.name.to_string(),
+                                    PropertyKey::StringLiteral(lit) => lit.value.to_string(),
+                                    PropertyKey::NumericLiteral(lit) => lit.value.to_string(),
+                                    _ => {
+                                        return Err(CompileError::unsupported(
+                                            "Unsupported property key in assignment pattern",
+                                        ));
+                                    }
+                                };
+                                let key_idx = self.codegen.add_string(&key_name);
+                                let ic_index = self.codegen.alloc_ic();
+                                self.codegen.emit(Instruction::GetPropConst {
+                                    dst: prop_reg,
+                                    obj: source_reg,
+                                    name: key_idx,
+                                    ic_index,
+                                });
+
+                                let kr = self.codegen.alloc_reg();
+                                self.codegen.emit(Instruction::LoadConst {
+                                    dst: kr,
+                                    idx: key_idx,
+                                });
+                                kr
+                            };
+
+                            if obj_target.rest.is_some() {
+                                excluded_keys.push(key_reg);
+                            } else {
+                                self.codegen.free_reg(key_reg);
+                            }
+
+                            match &p.binding {
+                                AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(def) => {
+                                    // Check for undefined and use default
+                                    let undefined_reg = self.codegen.alloc_reg();
+                                    self.codegen
+                                        .emit(Instruction::LoadUndefined { dst: undefined_reg });
+                                    let is_undef = self.codegen.alloc_reg();
+                                    self.codegen.emit(Instruction::StrictEq {
+                                        dst: is_undef,
+                                        lhs: prop_reg,
+                                        rhs: undefined_reg,
+                                    });
+                                    let jump_skip = self.codegen.emit_jump_if_false(is_undef);
+                                    self.codegen.free_reg(is_undef);
+                                    self.codegen.free_reg(undefined_reg);
+
+                                    let default_val = self.compile_expression(&def.init)?;
+                                    self.codegen.emit(Instruction::Move {
+                                        dst: prop_reg,
+                                        src: default_val,
+                                    });
+                                    self.codegen.free_reg(default_val);
+
+                                    let end_offset =
+                                        self.codegen.current_index() as i32 - jump_skip as i32;
+                                    self.codegen.patch_jump(jump_skip, end_offset);
+
+                                    self.compile_assignment_target_init_inner(
+                                        &def.binding,
+                                        prop_reg,
+                                    )?;
+                                }
+                                other => {
+                                    if let Some(target) = other.as_assignment_target() {
+                                        self.compile_assignment_target_init_inner(
+                                            target, prop_reg,
+                                        )?;
+                                    } else {
+                                        return Err(CompileError::unsupported(
+                                            "Unsupported AssignmentTargetMaybeDefault variant",
+                                        ));
+                                    }
+                                }
+                            }
+                            self.codegen.free_reg(prop_reg);
+                        }
+                    }
+                }
+
+                if let Some(rest) = &obj_target.rest {
+                    let excluded_array = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::NewArray {
+                        dst: excluded_array,
+                        len: excluded_keys.len() as u16,
+                    });
+
+                    for (i, key_reg) in excluded_keys.iter().enumerate() {
+                        let idx_reg = self.codegen.alloc_reg();
+                        self.codegen.emit(Instruction::LoadInt32 {
+                            dst: idx_reg,
+                            value: i as i32,
+                        });
+                        self.codegen.emit(Instruction::SetElem {
+                            arr: excluded_array,
+                            idx: idx_reg,
+                            val: *key_reg,
+                        });
+                        self.codegen.free_reg(idx_reg);
+                        self.codegen.free_reg(*key_reg);
+                    }
+
+                    let rest_reg = self.codegen.alloc_reg();
+                    let rest_helper = self.codegen.add_string("__Object_rest");
+                    let ic_index = self.codegen.alloc_ic();
+
+                    // Load __Object_rest from global
+                    let func_reg = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::GetGlobal {
+                        dst: func_reg,
+                        name: rest_helper,
+                        ic_index,
+                    });
+
+                    let frame = self.codegen.alloc_fresh_block(3);
+                    self.codegen.emit(Instruction::Move {
+                        dst: frame,
+                        src: func_reg,
+                    });
+                    self.codegen.emit(Instruction::Move {
+                        dst: Register(frame.0 + 1),
+                        src: source_reg,
+                    });
+                    self.codegen.emit(Instruction::Move {
+                        dst: Register(frame.0 + 2),
+                        src: excluded_array,
+                    });
+
+                    self.codegen.emit(Instruction::Call {
+                        dst: rest_reg,
+                        func: frame,
+                        argc: 2,
+                    });
+
+                    self.codegen.free_reg(func_reg);
+                    self.codegen.free_reg(excluded_array);
+
+                    self.compile_assignment_target_init_inner(&rest.target, rest_reg)?;
+                    self.codegen.free_reg(rest_reg);
+                }
+            }
+            _ => return Err(CompileError::unsupported("Unsupported assignment target")),
+        }
+        Ok(())
+    }
+
     fn compile_for_in_statement(&mut self, _for_in_stmt: &ForInStatement) -> CompileResult<()> {
         // Stub: Treat as runtime error for now, but allow compilation to succeed
         let msg = self
@@ -1427,7 +2050,6 @@ impl Compiler {
         let reg = self.codegen.alloc_reg();
         self.codegen
             .emit(Instruction::LoadConst { dst: reg, idx: msg });
-        self.codegen.emit(Instruction::Throw { src: reg });
         self.codegen.free_reg(reg);
         Ok(())
     }
@@ -1471,6 +2093,7 @@ impl Compiler {
         if let Some(param) = &handler.param {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
+                    self.check_identifier_early_error(&ident.name)?;
                     let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                     self.codegen.emit(Instruction::SetLocal {
                         idx: LocalIndex(local_idx),
@@ -1518,6 +2141,7 @@ impl Compiler {
         for param in &func.params.items {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
+                    self.check_identifier_early_error(&ident.name)?;
                     let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                     self.codegen.current.param_count += 1;
                     if let Some(init) = &param.initializer {
@@ -1529,6 +2153,7 @@ impl Compiler {
                     let BindingPattern::BindingIdentifier(ident) = &assign.left else {
                         return Err(CompileError::unsupported("Complex parameter patterns"));
                     };
+                    self.check_identifier_early_error(&ident.name)?;
                     let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                     self.codegen.current.param_count += 1;
                     param_defaults.push((local_idx, &assign.right));
@@ -1540,6 +2165,7 @@ impl Compiler {
         // Check for rest parameter at function level
         if let Some(rest) = &func.params.rest {
             if let BindingPattern::BindingIdentifier(ident) = &rest.rest.argument {
+                self.check_identifier_early_error(&ident.name)?;
                 self.codegen.declare_variable(&ident.name, false)?;
                 self.codegen.current.flags.has_rest = true;
             } else {
@@ -1672,6 +2298,7 @@ impl Compiler {
         for param in &func.params.items {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
+                    self.check_identifier_early_error(&ident.name)?;
                     let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                     self.codegen.current.param_count += 1;
                     if let Some(init) = &param.initializer {
@@ -1683,6 +2310,7 @@ impl Compiler {
                     let BindingPattern::BindingIdentifier(ident) = &assign.left else {
                         return Err(CompileError::unsupported("Complex parameter patterns"));
                     };
+                    self.check_identifier_early_error(&ident.name)?;
                     let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                     self.codegen.current.param_count += 1;
                     param_defaults.push((local_idx, &assign.right));
@@ -1694,6 +2322,7 @@ impl Compiler {
         // Check for rest parameter at function level
         if let Some(rest) = &func.params.rest {
             if let BindingPattern::BindingIdentifier(ident) = &rest.rest.argument {
+                self.check_identifier_early_error(&ident.name)?;
                 self.codegen.declare_variable(&ident.name, false)?;
                 self.codegen.current.flags.has_rest = true;
             } else {
@@ -1806,6 +2435,7 @@ impl Compiler {
         for param in &arrow.params.items {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
+                    self.check_identifier_early_error(&ident.name)?;
                     let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                     self.codegen.current.param_count += 1;
                     if let Some(init) = &param.initializer {
@@ -1817,6 +2447,7 @@ impl Compiler {
                     let BindingPattern::BindingIdentifier(ident) = &assign.left else {
                         return Err(CompileError::unsupported("Complex parameter patterns"));
                     };
+                    self.check_identifier_early_error(&ident.name)?;
                     let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                     self.codegen.current.param_count += 1;
                     param_defaults.push((local_idx, &assign.right));
@@ -1828,6 +2459,7 @@ impl Compiler {
         // Check for rest parameter at function level
         if let Some(rest) = &arrow.params.rest {
             if let BindingPattern::BindingIdentifier(ident) = &rest.rest.argument {
+                self.check_identifier_early_error(&ident.name)?;
                 self.codegen.declare_variable(&ident.name, false)?;
                 self.codegen.current.flags.has_rest = true;
             } else {
@@ -2039,6 +2671,16 @@ impl Compiler {
             Expression::YieldExpression(yield_expr) => self.compile_yield_expression(yield_expr),
 
             Expression::ChainExpression(chain) => self.compile_chain_expression(chain),
+            Expression::SequenceExpression(seq) => {
+                let mut last_reg = None;
+                for expr in &seq.expressions {
+                    if let Some(reg) = last_reg {
+                        self.codegen.free_reg(reg);
+                    }
+                    last_reg = Some(self.compile_expression(expr)?);
+                }
+                last_reg.ok_or_else(|| CompileError::unsupported("Empty sequence expression"))
+            }
 
             Expression::MetaProperty(meta) => {
                 // Minimal support: `new.target` -> undefined (enough for current shims).
@@ -2425,6 +3067,7 @@ impl Compiler {
 
     /// Compile an identifier reference
     fn compile_identifier(&mut self, name: &str) -> CompileResult<Register> {
+        self.check_identifier_early_error(name)?;
         let dst = self.codegen.alloc_reg();
 
         match self.codegen.resolve_variable(name) {
@@ -3444,39 +4087,15 @@ impl Compiler {
             PropertyKey::PrivateIdentifier(_) => {
                 Err(CompileError::unsupported("PrivateIdentifier"))
             }
-            PropertyKey::StringLiteral(lit) => {
-                let dst = self.codegen.alloc_reg();
-                let units = Self::decode_lone_surrogates(lit.value.as_str(), lit.lone_surrogates);
-                let idx = self.codegen.add_string_units(units);
-                self.codegen.emit(Instruction::LoadConst { dst, idx });
-                Ok(dst)
-            }
-            PropertyKey::NumericLiteral(lit) => {
-                // Lower numeric keys to numbers; SetProp will coerce to index/string.
-                let dst = self.codegen.alloc_reg();
-                let value = lit.value;
-                if value.fract() == 0.0 && value >= i32::MIN as f64 && value <= i32::MAX as f64 {
-                    self.codegen.emit(Instruction::LoadInt32 {
-                        dst,
-                        value: value as i32,
-                    });
+            other => {
+                if let Some(expr) = other.as_expression() {
+                    self.compile_expression(expr)
                 } else {
-                    let idx = self.codegen.add_number(value);
-                    self.codegen.emit(Instruction::LoadConst { dst, idx });
+                    Err(CompileError::unsupported(
+                        "Unsupported property key variant",
+                    ))
                 }
-                Ok(dst)
             }
-            // Common case for `[ident]` (e.g. `[Symbol.iterator]` via a local binding)
-            PropertyKey::Identifier(ident) => self.compile_identifier(&ident.name),
-            PropertyKey::StaticMemberExpression(member) => {
-                self.compile_static_member_expression(member)
-            }
-            PropertyKey::ComputedMemberExpression(member) => {
-                self.compile_computed_member_expression(member)
-            }
-            _ => Err(CompileError::unsupported(
-                "Computed property key expression",
-            )),
         }
     }
 

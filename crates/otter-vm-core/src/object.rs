@@ -181,6 +181,15 @@ impl PropertyDescriptor {
             }
         }
     }
+
+    /// Check if enumerable
+    pub fn enumerable(&self) -> bool {
+        match self {
+            Self::Data { attributes, .. } | Self::Accessor { attributes, .. } => {
+                attributes.enumerable
+            }
+        }
+    }
 }
 
 /// Internal property storage entry
@@ -232,9 +241,7 @@ impl JsObject {
     pub fn new(prototype: Option<Arc<JsObject>>) -> Self {
         Self {
             shape: RwLock::new(Shape::root()),
-            inline_properties: RwLock::new([
-                None, None, None, None,
-            ]),
+            inline_properties: RwLock::new([None, None, None, None]),
             overflow_properties: RwLock::new(Vec::new()),
             prototype: RwLock::new(prototype),
             elements: RwLock::new(Vec::new()),
@@ -260,11 +267,15 @@ impl JsObject {
     pub fn get_by_offset(&self, offset: usize) -> Option<Value> {
         if offset < INLINE_PROPERTY_COUNT {
             let inline = self.inline_properties.read();
-            inline[offset].as_ref().and_then(|e| e.desc.value().cloned())
+            inline[offset]
+                .as_ref()
+                .and_then(|e| e.desc.value().cloned())
         } else {
             let overflow = self.overflow_properties.read();
             let overflow_idx = offset - INLINE_PROPERTY_COUNT;
-            overflow.get(overflow_idx).and_then(|e| e.desc.value().cloned())
+            overflow
+                .get(overflow_idx)
+                .and_then(|e| e.desc.value().cloned())
         }
     }
 
@@ -289,7 +300,10 @@ impl JsObject {
             let mut inline = self.inline_properties.write();
             if let Some(entry) = inline[offset].as_mut() {
                 if entry.desc.is_writable() {
-                    if let PropertyDescriptor::Data { value: ref mut v, .. } = entry.desc {
+                    if let PropertyDescriptor::Data {
+                        value: ref mut v, ..
+                    } = entry.desc
+                    {
                         *v = value;
                         return true;
                     }
@@ -301,7 +315,10 @@ impl JsObject {
             let overflow_idx = offset - INLINE_PROPERTY_COUNT;
             if let Some(entry) = overflow.get_mut(overflow_idx) {
                 if entry.desc.is_writable() {
-                    if let PropertyDescriptor::Data { value: ref mut v, .. } = entry.desc {
+                    if let PropertyDescriptor::Data {
+                        value: ref mut v, ..
+                    } = entry.desc
+                    {
                         *v = value;
                         return true;
                     }
@@ -817,7 +834,9 @@ impl JsObject {
     }
 
     /// Get inline properties storage (for GC tracing)
-    pub(crate) fn get_inline_properties_storage(&self) -> &RwLock<[Option<PropertyEntry>; INLINE_PROPERTY_COUNT]> {
+    pub(crate) fn get_inline_properties_storage(
+        &self,
+    ) -> &RwLock<[Option<PropertyEntry>; INLINE_PROPERTY_COUNT]> {
         &self.inline_properties
     }
 

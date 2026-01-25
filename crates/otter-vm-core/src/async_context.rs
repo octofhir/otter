@@ -25,7 +25,7 @@ pub struct AsyncContext {
     /// The promise we're currently awaiting
     pub awaited_promise: Arc<JsPromise>,
     /// Register where the await result should be stored
-    pub resume_register: u8,
+    pub resume_register: u16,
     /// Whether the VM was running before suspension
     pub was_running: bool,
 }
@@ -36,7 +36,7 @@ impl AsyncContext {
         frames: Vec<SavedFrame>,
         result_promise: Arc<JsPromise>,
         awaited_promise: Arc<JsPromise>,
-        resume_register: u8,
+        resume_register: u16,
         was_running: bool,
     ) -> Self {
         Self {
@@ -68,7 +68,7 @@ pub struct SavedFrame {
     /// Captured upvalues (heap-allocated cells)
     pub upvalues: Vec<UpvalueCell>,
     /// Return register (where to put the result)
-    pub return_register: Option<u8>,
+    pub return_register: Option<u16>,
     /// The `this` value for this call frame
     pub this_value: Value,
     /// Whether this call is a `new`/constructor invocation
@@ -88,7 +88,7 @@ impl SavedFrame {
         locals: Vec<Value>,
         registers: Vec<Value>,
         upvalues: Vec<UpvalueCell>,
-        return_register: Option<u8>,
+        return_register: Option<u16>,
         this_value: Value,
         is_construct: bool,
         is_async: bool,

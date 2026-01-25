@@ -139,16 +139,176 @@ impl Trace for crate::value::Value {
 // Implement Trace for JsObject
 impl Trace for crate::object::JsObject {
     fn trace(&self, tracer: &mut dyn Tracer) {
-        // Trace all property values
-        for key in self.own_keys() {
-            if let Some(value) = self.get(&key) {
-                tracer.mark_value(&value);
+        // Trace the current shape
+        tracer.mark(self.shape().as_ref());
+
+        // Trace all property values directly from storage (Data or Accessor)
+        // This is more efficient than own_keys() + get().
+        use crate::object::PropertyDescriptor;
+        {
+            let properties = self.get_properties_storage();
+            let props = properties.read();
+            for entry in props.iter() {
+                match &entry.desc {
+                    PropertyDescriptor::Data { value, .. } => {
+                        tracer.mark_value(value);
+                    }
+                    PropertyDescriptor::Accessor { get, set, .. } => {
+                        if let Some(v) = get {
+                            tracer.mark_value(v);
+                        }
+                        if let Some(v) = set {
+                            tracer.mark_value(v);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Trace indexed elements (missing in previous implementation!)
+        {
+            let elements = self.get_elements_storage();
+            let elems = elements.read();
+            for value in elems.iter() {
+                tracer.mark_value(value);
             }
         }
 
         // Trace prototype
         if let Some(proto) = self.prototype() {
             tracer.mark(proto.as_ref());
+        }
+    }
+}
+
+// Implement Trace for Shape
+impl Trace for crate::shape::Shape {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        self.trace(tracer);
+    }
+}
+
+// Implement Trace for Closure
+impl Trace for crate::value::Closure {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        // Trace captured upvalues
+        for cell in &self.upvalues {
+            cell.trace(tracer);
+        }
+
+        // Trace the associated function object
+        tracer.mark(self.object.as_ref());
+    }
+}
+
+// Implement Trace for UpvalueCell
+impl Trace for crate::value::UpvalueCell {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        tracer.mark_value(&self.get());
+    }
+}
+
+// Implement Trace for CallFrame
+impl Trace for crate::context::CallFrame {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        // Trace locals
+        for value in &self.locals {
+            tracer.mark_value(value);
+        }
+
+        // Trace captured upvalues
+        for cell in &self.upvalues {
+            cell.trace(tracer);
+        }
+
+        // Trace the `this` value
+        tracer.mark_value(&self.this_value);
+    }
+}
+
+// Implement Trace for VmContext
+impl Trace for crate::context::VmContext {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        // Trace global object
+        tracer.mark(self.global().as_ref());
+
+        // Trace registers
+        for value in self.registers_to_trace().iter() {
+            tracer.mark_value(value);
+        }
+
+        // Trace call stack
+        for frame in self.call_stack().iter() {
+            frame.trace(tracer);
+        }
+
+        // Trace exception if any
+        if let Some(exc) = self.exception() {
+            tracer.mark_value(exc);
+        }
+
+        // Trace pending call state
+        for arg in self.pending_args_to_trace().iter() {
+            tracer.mark_value(arg);
+        }
+
+        if let Some(this) = self.pending_this_to_trace() {
+            tracer.mark_value(this);
+        }
+
+        for cell in self.pending_upvalues_to_trace().iter() {
+            cell.trace(tracer);
+        }
+
+        // Trace open upvalues
+        for cell in self.open_upvalues_to_trace().values() {
+            cell.trace(tracer);
+        }
+    }
+}
+
+// Implement Trace for SavedFrame
+impl Trace for crate::async_context::SavedFrame {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        for val in &self.locals {
+            tracer.mark_value(val);
+        }
+        for val in &self.registers {
+            tracer.mark_value(val);
+        }
+        for cell in &self.upvalues {
+            cell.trace(tracer);
+        }
+        tracer.mark_value(&self.this_value);
+    }
+}
+
+// Implement Trace for AsyncContext
+impl Trace for crate::async_context::AsyncContext {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        for frame in &self.frames {
+            frame.trace(tracer);
+        }
+        tracer.mark(self.result_promise.as_ref());
+        tracer.mark(self.awaited_promise.as_ref());
+    }
+}
+
+// Implement Trace for InlineCache
+impl Trace for otter_vm_bytecode::function::InlineCache {
+    fn trace(&self, _tracer: &mut dyn Tracer) {
+        // Caches stores raw pointers (u64) and offsets.
+        // We don't trace them here as the transition tree and objects
+        // keep the Shapes alive.
+    }
+}
+
+// Implement Trace for bytecode Function (to mark feedback vector)
+impl Trace for otter_vm_bytecode::function::Function {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        let feedback = self.feedback_vector.read();
+        for ic in feedback.iter() {
+            ic.trace(tracer);
         }
     }
 }

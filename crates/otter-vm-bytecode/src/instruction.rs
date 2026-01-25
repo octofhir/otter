@@ -524,10 +524,14 @@ pub enum Instruction {
     GetGlobal {
         dst: Register,
         name: ConstantIndex,
+        /// Index into the feedback vector for Inline Cache
+        ic_index: u16,
     },
     SetGlobal {
         name: ConstantIndex,
         src: Register,
+        /// Index into the feedback vector for Inline Cache
+        ic_index: u16,
     },
     /// Load `this` value into register
     LoadThis {
@@ -694,21 +698,29 @@ pub enum Instruction {
         dst: Register,
         obj: Register,
         key: Register,
+        /// Index into the feedback vector for Inline Cache
+        ic_index: u16,
     },
     SetProp {
         obj: Register,
         key: Register,
         val: Register,
+        /// Index into the feedback vector for Inline Cache
+        ic_index: u16,
     },
     GetPropConst {
         dst: Register,
         obj: Register,
         name: ConstantIndex,
+        /// Index into the feedback vector for Inline Cache
+        ic_index: u16,
     },
     SetPropConst {
         obj: Register,
         name: ConstantIndex,
         val: Register,
+        /// Index into the feedback vector for Inline Cache
+        ic_index: u16,
     },
     DeleteProp {
         dst: Register,
@@ -771,6 +783,8 @@ pub enum Instruction {
         obj: Register,
         method: ConstantIndex,
         argc: u8,
+        /// Index into the feedback vector for Inline Cache
+        ic_index: u16,
     },
     /// Call method with computed property key: dst = obj[key](...args)
     /// Registers: obj, key, arg1, arg2, ... (contiguous)
@@ -779,6 +793,8 @@ pub enum Instruction {
         obj: Register,
         key: Register,
         argc: u8,
+        /// Index into the feedback vector for Inline Cache
+        ic_index: u16,
     },
     TailCall {
         func: Register,
@@ -819,6 +835,8 @@ pub enum Instruction {
         key: Register,
         /// Register containing the array of arguments to spread
         spread: Register,
+        /// Index into the feedback vector for Inline Cache
+        ic_index: u16,
     },
 
     // Control flow

@@ -4,8 +4,8 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::async_context::SavedFrame;
 use crate::error::{VmError, VmResult};
@@ -13,10 +13,10 @@ use crate::object::JsObject;
 use crate::value::{UpvalueCell, Value};
 
 /// Maximum call stack depth
-const MAX_STACK_DEPTH: usize = 10000;
+const MAX_STACK_DEPTH: usize = 1000;
 
 /// Maximum number of registers per function
-const MAX_REGISTERS: usize = 256;
+const MAX_REGISTERS: usize = 65536;
 
 /// A call stack frame
 #[derive(Debug)]
@@ -34,7 +34,7 @@ pub struct CallFrame {
     /// Captured upvalues (heap-allocated cells for shared mutable access)
     pub upvalues: Vec<UpvalueCell>,
     /// Return register (where to put the result)
-    pub return_register: Option<u8>,
+    pub return_register: Option<u16>,
     /// Source location for error reporting
     pub source_location: Option<SourceLocation>,
     /// The `this` value for this call frame
@@ -148,14 +148,14 @@ impl VmContext {
 
     /// Get a register value
     #[inline]
-    pub fn get_register(&self, index: u8) -> &Value {
+    pub fn get_register(&self, index: u16) -> &Value {
         let frame = self.current_frame().expect("no call frame");
         &self.registers[frame.register_base + index as usize]
     }
 
     /// Set a register value
     #[inline]
-    pub fn set_register(&mut self, index: u8, value: Value) {
+    pub fn set_register(&mut self, index: u16, value: Value) {
         let base = self.current_frame().expect("no call frame").register_base;
         self.registers[base + index as usize] = value;
     }
@@ -246,7 +246,7 @@ impl VmContext {
         function_index: u32,
         module: std::sync::Arc<otter_vm_bytecode::Module>,
         local_count: u16,
-        return_register: Option<u8>,
+        return_register: Option<u16>,
         is_construct: bool,
         is_async: bool,
     ) -> VmResult<()> {
@@ -564,7 +564,8 @@ impl VmContext {
         // Ensure we have enough registers for all frames
         let max_registers_needed = saved_frames.len() * MAX_REGISTERS;
         if max_registers_needed > self.registers.len() {
-            self.registers.resize(max_registers_needed, Value::undefined());
+            self.registers
+                .resize(max_registers_needed, Value::undefined());
         }
 
         // Restore each frame
@@ -610,6 +611,44 @@ impl VmContext {
     /// Get the call stack (for inspection)
     pub fn call_stack(&self) -> &[CallFrame] {
         &self.call_stack
+    }
+
+    pub fn registers_to_trace(&self) -> &[Value] {
+        &self.registers
+    }
+
+    pub fn pending_args_to_trace(&self) -> &[Value] {
+        &self.pending_args
+    }
+
+    pub fn pending_this_to_trace(&self) -> Option<&Value> {
+        self.pending_this.as_ref()
+    }
+
+    pub fn pending_upvalues_to_trace(&self) -> &[UpvalueCell] {
+        &self.pending_upvalues
+    }
+
+    pub fn open_upvalues_to_trace(&self) -> &HashMap<(usize, u16), UpvalueCell> {
+        &self.open_upvalues
+    }
+
+    /// Teardown the context and break reference cycles
+    pub fn teardown(&mut self) {
+        // Break the globalThis cycle
+        use crate::object::PropertyKey;
+        self.global
+            .set(PropertyKey::string("globalThis"), Value::undefined());
+
+        // Also clear other properties of global to help break other cycles
+        // Since we don't have a cycle-collecting GC, this is a best-effort approach
+        // to free as much memory as possible.
+        let keys = self.global.own_keys();
+        for key in keys {
+            // Check if it's configurable before trying to delete/clear?
+            // For now just try to set to undefined to release references
+            self.global.set(key, Value::undefined());
+        }
     }
 }
 

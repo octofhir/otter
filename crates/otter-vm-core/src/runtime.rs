@@ -93,8 +93,9 @@ impl VmRuntime {
     pub fn execute_module(&self, module: &Module) -> VmResult<Value> {
         let mut ctx = self.create_context();
         let mut interpreter = Interpreter::new();
-
-        interpreter.execute(module, &mut ctx)
+        let result = interpreter.execute(module, &mut ctx);
+        ctx.teardown();
+        result
     }
 
     /// Execute a module with an existing context

@@ -15,7 +15,9 @@
 pub mod codegen;
 pub mod compiler;
 pub mod error;
+pub mod literal_validator;
 pub mod scope;
 
 pub use compiler::Compiler;
 pub use error::{CompileError, CompileResult};
+pub use literal_validator::{LiteralValidator, ValidationContext, SourceLocation, EcmaVersion};

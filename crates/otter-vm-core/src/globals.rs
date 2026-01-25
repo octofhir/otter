@@ -202,8 +202,15 @@ fn global_parse_float(args: &[Value]) -> Result<Value, String> {
     }
 
     // Find the longest valid prefix that parses as a number
-    // Try progressively shorter prefixes until one parses
-    for end in (1..=trimmed.len()).rev() {
+    // Try progressively shorter prefixes until one parses.
+    // We collect char indices to ensure we only slice at valid char boundaries.
+    let mut indices: Vec<usize> = trimmed.char_indices().map(|(i, _)| i).collect();
+    indices.push(trimmed.len());
+
+    for &end in indices.iter().rev() {
+        if end == 0 {
+            continue;
+        }
         let prefix = &trimmed[..end];
         if let Ok(n) = prefix.parse::<f64>() {
             return Ok(Value::number(n));

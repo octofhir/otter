@@ -14,11 +14,11 @@ use crate::scope::{ResolvedBinding, ScopeChain};
 #[derive(Debug)]
 pub struct RegisterAllocator {
     /// Next available register
-    next: u8,
+    next: u16,
     /// Maximum register used
-    max: u8,
+    max: u16,
     /// Free-list of registers that can be reused.
-    free: Vec<u8>,
+    free: Vec<u16>,
     /// Tracks which registers are currently allocated.
     in_use: Vec<bool>,
 }
@@ -30,7 +30,7 @@ impl RegisterAllocator {
             next: 0,
             max: 0,
             free: Vec::new(),
-            in_use: vec![false; 256],
+            in_use: vec![false; 65536],
         }
     }
 
@@ -63,13 +63,13 @@ impl RegisterAllocator {
     /// must be contiguous.
     pub fn alloc_fresh_block(&mut self, count: u8) -> Register {
         let base = self.next;
-        for id in base..base.saturating_add(count) {
+        for id in base..base.saturating_add(count as u16) {
             debug_assert!(!self.in_use[id as usize], "register {id} already in use");
             self.in_use[id as usize] = true;
         }
         self.next = self
             .next
-            .checked_add(count)
+            .checked_add(count as u16)
             .expect("register allocation overflow");
         self.max = self.max.max(self.next);
         Register(base)
@@ -87,12 +87,12 @@ impl RegisterAllocator {
     }
 
     /// Get current position (for restoring later)
-    pub fn position(&self) -> u8 {
+    pub fn position(&self) -> u16 {
         self.next
     }
 
     /// Restore to a previous position
-    pub fn restore(&mut self, pos: u8) {
+    pub fn restore(&mut self, pos: u16) {
         for id in pos..self.next {
             self.in_use[id as usize] = false;
         }
@@ -101,7 +101,7 @@ impl RegisterAllocator {
     }
 
     /// Get maximum registers used
-    pub fn max_used(&self) -> u8 {
+    pub fn max_used(&self) -> u16 {
         self.max
     }
 }
@@ -129,6 +129,8 @@ pub struct FunctionContext {
     pub param_count: u8,
     /// Captured upvalues from parent scopes
     pub upvalues: Vec<UpvalueCapture>,
+    /// Number of Inline Cache slots
+    pub ic_count: u16,
 }
 
 impl FunctionContext {
@@ -145,6 +147,7 @@ impl FunctionContext {
             flags: FunctionFlags::default(),
             param_count: 0,
             upvalues: Vec::new(),
+            ic_count: 0,
         }
     }
 
@@ -165,7 +168,9 @@ impl FunctionContext {
             Instruction::JumpIfTrue { offset: o, .. } => *o = JumpOffset(offset),
             Instruction::JumpIfFalse { offset: o, .. } => *o = JumpOffset(offset),
             Instruction::JumpIfNullish { offset: o, .. } => *o = JumpOffset(offset),
+            Instruction::JumpIfNotNullish { offset: o, .. } => *o = JumpOffset(offset),
             Instruction::TryStart { catch_offset: o } => *o = JumpOffset(offset),
+            Instruction::ForInNext { offset: o, .. } => *o = JumpOffset(offset),
             _ => panic!("Not a jump instruction"),
         }
     }
@@ -180,6 +185,7 @@ impl FunctionContext {
             .flags(self.flags)
             .upvalues(self.upvalues)
             .instructions(self.instructions)
+            .feedback_vector_size(self.ic_count as usize)
             .build()
     }
 }
@@ -229,6 +235,13 @@ impl CodeGen {
     /// Emit an instruction
     pub fn emit(&mut self, instruction: Instruction) {
         self.current.emit(instruction);
+    }
+
+    /// Allocate an IC index
+    pub fn alloc_ic(&mut self) -> u16 {
+        let id = self.current.ic_count;
+        self.current.ic_count += 1;
+        id
     }
 
     /// Allocate a register

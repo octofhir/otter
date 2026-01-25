@@ -41,6 +41,33 @@ pub enum CompileError {
     /// Invalid assignment target
     #[error("Invalid assignment target")]
     InvalidAssignmentTarget,
+
+    /// Early error detected during parsing/validation
+    #[error("Early error at {location}: {message}")]
+    EarlyError {
+        /// Error message
+        message: String,
+        /// Source location
+        location: String,
+    },
+
+    /// Legacy syntax error in strict mode
+    #[error("Legacy syntax not allowed in strict mode at {location}: {message}")]
+    LegacySyntax {
+        /// Error message
+        message: String,
+        /// Source location
+        location: String,
+    },
+
+    /// Invalid literal syntax
+    #[error("Invalid literal syntax at {location}: {message}")]
+    InvalidLiteral {
+        /// Error message
+        message: String,
+        /// Source location
+        location: String,
+    },
 }
 
 impl CompileError {
@@ -60,6 +87,30 @@ impl CompileError {
     /// Create an internal error
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
+    }
+
+    /// Create an early error
+    pub fn early_error(message: impl Into<String>, line: u32, column: u32) -> Self {
+        Self::EarlyError {
+            message: message.into(),
+            location: format!("{}:{}", line, column),
+        }
+    }
+
+    /// Create a legacy syntax error
+    pub fn legacy_syntax(message: impl Into<String>, line: u32, column: u32) -> Self {
+        Self::LegacySyntax {
+            message: message.into(),
+            location: format!("{}:{}", line, column),
+        }
+    }
+
+    /// Create an invalid literal error
+    pub fn invalid_literal(message: impl Into<String>, line: u32, column: u32) -> Self {
+        Self::InvalidLiteral {
+            message: message.into(),
+            location: format!("{}:{}", line, column),
+        }
     }
 }
 

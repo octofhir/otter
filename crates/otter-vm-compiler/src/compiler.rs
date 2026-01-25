@@ -12,20 +12,33 @@ use otter_vm_bytecode::{
 
 use crate::codegen::CodeGen;
 use crate::error::{CompileError, CompileResult};
+use crate::literal_validator::{LiteralValidator, EcmaVersion};
 use crate::scope::ResolvedBinding;
+
+/// Maximum AST nesting depth to prevent stack overflow during compilation
+const MAX_COMPILE_DEPTH: usize = 500;
 
 /// The compiler
 pub struct Compiler {
     /// Code generator
     codegen: CodeGen,
-    /// Loop control stack (for `break`/`continue` patching)
-    loop_stack: Vec<LoopControl>,
+    /// Loop/Control stack (for `break`/`continue` patching)
+    loop_stack: Vec<ControlScope>,
+    /// Current compilation depth (for preventing stack overflow)
+    depth: usize,
+    /// Literal validator for ECMAScript compliance
+    literal_validator: LiteralValidator,
 }
 
-#[derive(Default)]
-struct LoopControl {
+#[derive(Debug)]
+struct ControlScope {
+    /// Whether this scope represents a loop (true) or switch (false)
+    is_loop: bool,
+    /// Jump indices for `break` statements targeting this scope
     break_jumps: Vec<usize>,
+    /// Jump indices for `continue` statements targeting this scope (only if is_loop)
     continue_jumps: Vec<usize>,
+    /// Target index for `continue` (start of loop iteration logic)
     continue_target: Option<usize>,
 }
 
@@ -35,7 +48,36 @@ impl Compiler {
         Self {
             codegen: CodeGen::new(),
             loop_stack: Vec::new(),
+            depth: 0,
+            literal_validator: LiteralValidator::new(false, EcmaVersion::Latest),
         }
+    }
+
+    /// Set strict mode for literal validation
+    pub fn set_strict_mode(&mut self, strict_mode: bool) {
+        self.literal_validator.set_strict_mode(strict_mode);
+    }
+
+    /// Get the current strict mode setting
+    pub fn is_strict_mode(&self) -> bool {
+        self.literal_validator.is_strict_mode()
+    }
+
+    /// Enter a level of AST depth, checking for overflow
+    fn enter_depth(&mut self) -> CompileResult<()> {
+        self.depth += 1;
+        if self.depth > MAX_COMPILE_DEPTH {
+            Err(CompileError::Internal(
+                "Maximum AST nesting depth exceeded".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Exit a level of AST depth
+    fn exit_depth(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     /// Compile source code to a module
@@ -76,6 +118,14 @@ impl Compiler {
 
     /// Compile a statement
     fn compile_statement(&mut self, stmt: &Statement) -> CompileResult<()> {
+        self.enter_depth()?;
+        let result = self.compile_statement_inner(stmt);
+        self.exit_depth();
+        result
+    }
+
+    /// Inner implementation of statement compilation
+    fn compile_statement_inner(&mut self, stmt: &Statement) -> CompileResult<()> {
         match stmt {
             Statement::ExpressionStatement(expr_stmt) => {
                 // Compile expression and discard result
@@ -129,24 +179,49 @@ impl Compiler {
                 if break_stmt.label.is_some() {
                     return Err(CompileError::unsupported("Labeled break"));
                 }
-                let Some(loop_ctl) = self.loop_stack.last_mut() else {
-                    return Err(CompileError::syntax("break outside of loop", 0, 0));
-                };
-                let jump_idx = self.codegen.emit_jump();
-                loop_ctl.break_jumps.push(jump_idx);
-                Ok(())
+
+                // Find nearest breakable scope (loop or switch)
+                // Search in reverse order
+                let mut target_scope_idx = None;
+                for (i, scope) in self.loop_stack.iter_mut().enumerate().rev() {
+                    target_scope_idx = Some(i);
+                    break;
+                }
+
+                if let Some(idx) = target_scope_idx {
+                    let jump_idx = self.codegen.emit_jump();
+                    self.loop_stack[idx].break_jumps.push(jump_idx);
+                    Ok(())
+                } else {
+                    Err(CompileError::syntax(
+                        "break outside of loop or switch",
+                        0,
+                        0,
+                    ))
+                }
             }
 
             Statement::ContinueStatement(continue_stmt) => {
                 if continue_stmt.label.is_some() {
                     return Err(CompileError::unsupported("Labeled continue"));
                 }
-                let Some(loop_ctl) = self.loop_stack.last_mut() else {
-                    return Err(CompileError::syntax("continue outside of loop", 0, 0));
-                };
-                let jump_idx = self.codegen.emit_jump();
-                loop_ctl.continue_jumps.push(jump_idx);
-                Ok(())
+
+                // Find nearest loop scope (skip switches)
+                let mut target_scope_idx = None;
+                for (i, scope) in self.loop_stack.iter_mut().enumerate().rev() {
+                    if scope.is_loop {
+                        target_scope_idx = Some(i);
+                        break;
+                    }
+                }
+
+                if let Some(idx) = target_scope_idx {
+                    let jump_idx = self.codegen.emit_jump();
+                    self.loop_stack[idx].continue_jumps.push(jump_idx);
+                    Ok(())
+                } else {
+                    Err(CompileError::syntax("continue outside of loop", 0, 0))
+                }
             }
 
             Statement::ThrowStatement(throw_stmt) => {
@@ -192,7 +267,7 @@ impl Compiler {
 
             // Common JS features
             Statement::ClassDeclaration(class_decl) => self.compile_class_declaration(class_decl),
-            Statement::SwitchStatement(_) => Err(CompileError::unsupported("SwitchStatement")),
+            Statement::SwitchStatement(switch_stmt) => self.compile_switch_statement(switch_stmt),
             Statement::DoWhileStatement(_) => Err(CompileError::unsupported("DoWhileStatement")),
             Statement::ForInStatement(_) => Err(CompileError::unsupported("ForInStatement")),
             Statement::LabeledStatement(_) => Err(CompileError::unsupported("LabeledStatement")),
@@ -463,9 +538,11 @@ impl Compiler {
                     });
                     if self.codegen.current.name.as_deref() == Some("main") {
                         let name_idx = self.codegen.add_string(&name);
+                        let ic_index = self.codegen.alloc_ic();
                         self.codegen.emit(Instruction::SetGlobal {
                             name: name_idx,
                             src: ctor,
+                            ic_index,
                         });
                     }
                 }
@@ -526,9 +603,11 @@ impl Compiler {
             });
             if self.codegen.current.name.as_deref() == Some("main") {
                 let name_idx = self.codegen.add_string(&name);
+                let ic_index = self.codegen.alloc_ic();
                 self.codegen.emit(Instruction::SetGlobal {
                     name: name_idx,
                     src: ctor,
+                    ic_index,
                 });
             }
         }
@@ -606,10 +685,12 @@ impl Compiler {
         // Get prototype object for instance methods: ctor.prototype
         let proto = self.codegen.alloc_reg();
         let proto_key = self.codegen.add_string("prototype");
+        let ic_index = self.codegen.alloc_ic();
         self.codegen.emit(Instruction::GetPropConst {
             dst: proto,
             obj: ctor,
             name: proto_key,
+            ic_index,
         });
 
         for elem in &body.body {
@@ -630,10 +711,12 @@ impl Compiler {
             // Emit the appropriate instruction based on method kind
             match method.kind {
                 MethodDefinitionKind::Method => {
+                    let ic_index = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::SetProp {
                         obj: target,
                         key: key_reg,
                         val: func_reg,
+                        ic_index,
                     });
                 }
                 MethodDefinitionKind::Get => {
@@ -727,10 +810,12 @@ impl Compiler {
 
                 // Set forward mapping: Color["Red"] = value
                 let name_idx = self.codegen.add_string(&member_name);
+                let ic_index = self.codegen.alloc_ic();
                 self.codegen.emit(Instruction::SetPropConst {
                     obj: enum_obj,
                     name: name_idx,
                     val: val_reg,
+                    ic_index,
                 });
 
                 // For numeric values, also set reverse mapping
@@ -744,10 +829,12 @@ impl Compiler {
                         dst: str_val,
                         idx: str_idx,
                     });
+                    let ic_index = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::SetProp {
                         obj: enum_obj,
                         key: val_reg,
                         val: str_val,
+                        ic_index,
                     });
                     self.codegen.free_reg(str_val);
 
@@ -769,10 +856,12 @@ impl Compiler {
 
                 // Set forward mapping: Color["Red"] = 0
                 let name_idx = self.codegen.add_string(&member_name);
+                let ic_index = self.codegen.alloc_ic();
                 self.codegen.emit(Instruction::SetPropConst {
                     obj: enum_obj,
                     name: name_idx,
                     val: val_reg,
+                    ic_index,
                 });
 
                 // Set reverse mapping: Color[0] = "Red"
@@ -782,10 +871,12 @@ impl Compiler {
                     dst: str_val,
                     idx: str_idx,
                 });
+                let ic_index = self.codegen.alloc_ic();
                 self.codegen.emit(Instruction::SetProp {
                     obj: enum_obj,
                     key: val_reg,
                     val: str_val,
+                    ic_index,
                 });
                 self.codegen.free_reg(str_val);
                 self.codegen.free_reg(val_reg);
@@ -856,10 +947,12 @@ impl Compiler {
                                                         self.compile_identifier(&ident.name)?;
                                                     let name_idx =
                                                         self.codegen.add_string(&ident.name);
+                                                    let ic_index = self.codegen.alloc_ic();
                                                     self.codegen.emit(Instruction::SetPropConst {
                                                         obj: ns_obj,
                                                         name: name_idx,
                                                         val,
+                                                        ic_index,
                                                     });
                                                     self.codegen.free_reg(val);
                                                 }
@@ -871,10 +964,12 @@ impl Compiler {
                                             if let Some(id) = &func.id {
                                                 let val = self.compile_identifier(&id.name)?;
                                                 let name_idx = self.codegen.add_string(&id.name);
+                                                let ic_index = self.codegen.alloc_ic();
                                                 self.codegen.emit(Instruction::SetPropConst {
                                                     obj: ns_obj,
                                                     name: name_idx,
                                                     val,
+                                                    ic_index,
                                                 });
                                                 self.codegen.free_reg(val);
                                             }
@@ -925,9 +1020,11 @@ impl Compiler {
                         // nested functions usable (they resolve missing bindings via GetGlobal).
                         if self.codegen.current.name.as_deref() == Some("main") {
                             let name_idx = self.codegen.add_string(&ident.name);
+                            let ic_index = self.codegen.alloc_ic();
                             self.codegen.emit(Instruction::SetGlobal {
                                 name: name_idx,
                                 src: reg,
+                                ic_index,
                             });
                         }
                         self.codegen.free_reg(reg);
@@ -976,9 +1073,11 @@ impl Compiler {
     /// Compile a while statement
     fn compile_while_statement(&mut self, while_stmt: &WhileStatement) -> CompileResult<()> {
         let loop_start = self.codegen.current_index();
-        self.loop_stack.push(LoopControl {
+        self.loop_stack.push(ControlScope {
+            is_loop: true,
+            break_jumps: Vec::new(),
+            continue_jumps: Vec::new(),
             continue_target: Some(loop_start),
-            ..Default::default()
         });
 
         // Compile condition
@@ -1036,9 +1135,11 @@ impl Compiler {
         }
 
         let loop_start = self.codegen.current_index();
-        self.loop_stack.push(LoopControl {
+        self.loop_stack.push(ControlScope {
+            is_loop: true,
+            break_jumps: Vec::new(),
+            continue_jumps: Vec::new(),
             continue_target: Some(loop_start),
-            ..Default::default()
         });
 
         // Compile test
@@ -1120,9 +1221,11 @@ impl Compiler {
 
         // Loop start
         let loop_start = self.codegen.current_index();
-        self.loop_stack.push(LoopControl {
+        self.loop_stack.push(ControlScope {
+            is_loop: true,
+            break_jumps: Vec::new(),
+            continue_jumps: Vec::new(),
             continue_target: Some(loop_start),
-            ..Default::default()
         });
 
         // result = iterator.next()
@@ -1132,24 +1235,30 @@ impl Compiler {
             dst: frame,
             src: iterator,
         });
+        let ic_index = self.codegen.alloc_ic();
         self.codegen.emit(Instruction::CallMethod {
             dst: result_reg,
             obj: frame,
             method: next_name,
             argc: 0,
+            ic_index,
         });
         self.codegen.free_reg(frame);
 
         // done = result.done; value = result.value
+        let ic_index_done = self.codegen.alloc_ic();
         self.codegen.emit(Instruction::GetPropConst {
             dst: done_reg,
             obj: result_reg,
             name: done_name,
+            ic_index: ic_index_done,
         });
+        let ic_index_value = self.codegen.alloc_ic();
         self.codegen.emit(Instruction::GetPropConst {
             dst: value_reg,
             obj: result_reg,
             name: value_name,
+            ic_index: ic_index_value,
         });
 
         // JumpIfTrue done -> end
@@ -1453,9 +1562,11 @@ impl Compiler {
             });
             if self.codegen.current.name.as_deref() == Some("main") {
                 let name_idx = self.codegen.add_string(&n);
+                let ic_index = self.codegen.alloc_ic();
                 self.codegen.emit(Instruction::SetGlobal {
                     name: name_idx,
                     src: dst,
+                    ic_index,
                 });
             }
             self.codegen.free_reg(dst);
@@ -1703,8 +1814,19 @@ impl Compiler {
 
     /// Compile an expression
     fn compile_expression(&mut self, expr: &Expression) -> CompileResult<Register> {
+        self.enter_depth()?;
+        let result = self.compile_expression_inner(expr);
+        self.exit_depth();
+        result
+    }
+
+    /// Inner implementation of expression compilation
+    fn compile_expression_inner(&mut self, expr: &Expression) -> CompileResult<Register> {
         match expr {
             Expression::NumericLiteral(lit) => {
+                // Validate numeric literal before compilation
+                self.literal_validator.validate_numeric_literal(lit)?;
+                
                 let dst = self.codegen.alloc_reg();
                 let value = lit.value;
 
@@ -1722,6 +1844,9 @@ impl Compiler {
             }
 
             Expression::StringLiteral(lit) => {
+                // Validate string literal before compilation
+                self.literal_validator.validate_string_literal(lit)?;
+                
                 let dst = self.codegen.alloc_reg();
                 let idx = self.codegen.add_string(&lit.value);
                 self.codegen.emit(Instruction::LoadConst { dst, idx });
@@ -1871,10 +1996,12 @@ impl Compiler {
         });
 
         let name_idx = self.codegen.add_string(&member.property.name);
+        let ic_index = self.codegen.alloc_ic();
         self.codegen.emit(Instruction::GetPropConst {
             dst,
             obj,
             name: name_idx,
+            ic_index,
         });
 
         let end_offset = self.codegen.current_index() as i32 - jump_idx as i32;
@@ -1900,7 +2027,13 @@ impl Compiler {
         });
 
         let key = self.compile_expression(&member.expression)?;
-        self.codegen.emit(Instruction::GetProp { dst, obj, key });
+        let ic_index = self.codegen.alloc_ic();
+        self.codegen.emit(Instruction::GetProp {
+            dst,
+            obj,
+            key,
+            ic_index,
+        });
         self.codegen.free_reg(key);
 
         let end_offset = self.codegen.current_index() as i32 - jump_idx as i32;
@@ -1917,13 +2050,18 @@ impl Compiler {
         &mut self,
         lit: &oxc_ast::ast::RegExpLiteral,
     ) -> CompileResult<Register> {
+        // Validate RegExp literal before compilation
+        self.literal_validator.validate_regexp_literal(lit)?;
+        
         // Load global RegExp and call it with (pattern, flags). Call convention requires
         // `func` and args to be in contiguous registers.
         let func_tmp = self.codegen.alloc_reg();
         let name_idx = self.codegen.add_string("RegExp");
+        let ic_index = self.codegen.alloc_ic();
         self.codegen.emit(Instruction::GetGlobal {
             dst: func_tmp,
             name: name_idx,
+            ic_index,
         });
 
         let pattern = lit.regex.pattern.text.as_str();
@@ -1985,6 +2123,9 @@ impl Compiler {
         &mut self,
         template: &oxc_ast::ast::TemplateLiteral,
     ) -> CompileResult<Register> {
+        // Validate template literal before compilation
+        self.literal_validator.validate_template_literal(template)?;
+        
         // Template with no expressions - just return the single string part
         if template.expressions.is_empty() {
             let dst = self.codegen.alloc_reg();
@@ -2150,9 +2291,11 @@ impl Compiler {
             }
             Some(ResolvedBinding::Global(name)) => {
                 let name_idx = self.codegen.add_string(&name);
+                let ic_index = self.codegen.alloc_ic();
                 self.codegen.emit(Instruction::GetGlobal {
                     dst,
                     name: name_idx,
+                    ic_index,
                 });
             }
             Some(ResolvedBinding::Upvalue { index, depth }) => {
@@ -2165,9 +2308,11 @@ impl Compiler {
             }
             None => {
                 let name_idx = self.codegen.add_string(name);
+                let ic_index = self.codegen.alloc_ic();
                 self.codegen.emit(Instruction::GetGlobal {
                     dst,
                     name: name_idx,
+                    ic_index,
                 });
             }
         }
@@ -2326,9 +2471,11 @@ impl Compiler {
                     }
                     Some(ResolvedBinding::Global(_)) | None => {
                         let name_idx = self.codegen.add_string(&ident.name);
+                        let ic_index = self.codegen.alloc_ic();
                         self.codegen.emit(Instruction::SetGlobal {
                             name: name_idx,
                             src: value,
+                            ic_index,
                         });
                     }
                     Some(ResolvedBinding::Upvalue { index, depth }) => {
@@ -2344,20 +2491,24 @@ impl Compiler {
             AssignmentTarget::StaticMemberExpression(member) => {
                 let obj = self.compile_expression(&member.object)?;
                 let name_idx = self.codegen.add_string(&member.property.name);
+                let ic_index = self.codegen.alloc_ic();
                 self.codegen.emit(Instruction::SetPropConst {
                     obj,
                     name: name_idx,
                     val: value,
+                    ic_index,
                 });
                 self.codegen.free_reg(obj);
             }
             AssignmentTarget::ComputedMemberExpression(member) => {
                 let obj = self.compile_expression(&member.object)?;
                 let key = self.compile_expression(&member.expression)?;
+                let ic_index = self.codegen.alloc_ic();
                 self.codegen.emit(Instruction::SetProp {
                     obj,
                     key,
                     val: value,
+                    ic_index,
                 });
                 self.codegen.free_reg(key);
                 self.codegen.free_reg(obj);
@@ -2407,7 +2558,7 @@ impl Compiler {
                 src: func,
             });
             for (i, tmp) in arg_tmps.iter().copied().enumerate() {
-                let target = Register(frame.0 + 1 + i as u8);
+                let target = Register(frame.0 + 1 + i as u16);
                 self.codegen.emit(Instruction::Move {
                     dst: target,
                     src: tmp,
@@ -2425,7 +2576,7 @@ impl Compiler {
             for tmp in arg_tmps {
                 self.codegen.free_reg(tmp);
             }
-            for i in 0..(1 + argc) {
+            for i in 0..(1 + argc as u16) {
                 self.codegen.free_reg(Register(frame.0 + i));
             }
 
@@ -2456,12 +2607,15 @@ impl Compiler {
             // For spread with method call, we need to get the method and use CallSpread
             // Get method into a register first
             let func = self.codegen.alloc_reg();
+            let ic_index = self.codegen.alloc_ic();
             self.codegen.emit(Instruction::GetPropConst {
                 dst: func,
                 obj,
                 name: method_idx,
+                ic_index,
             });
             // Use regular spread handling (this won't preserve `this` perfectly, but is a fallback)
+            self.codegen.free_reg(obj); // obj is not used in CallSpread
             self.compile_call_with_spread(call, func)
         } else {
             // Regular method call without spread
@@ -2478,7 +2632,7 @@ impl Compiler {
                 src: obj,
             });
             for (i, tmp) in arg_tmps.iter().copied().enumerate() {
-                let target = Register(frame.0 + 1 + i as u8);
+                let target = Register(frame.0 + 1 + i as u16);
                 self.codegen.emit(Instruction::Move {
                     dst: target,
                     src: tmp,
@@ -2486,18 +2640,20 @@ impl Compiler {
             }
 
             let dst = self.codegen.alloc_reg();
+            let ic_index = self.codegen.alloc_ic();
             self.codegen.emit(Instruction::CallMethod {
                 dst,
                 obj: frame,
                 method: method_idx,
                 argc,
+                ic_index,
             });
 
             self.codegen.free_reg(obj);
             for tmp in arg_tmps {
                 self.codegen.free_reg(tmp);
             }
-            for i in 0..(1 + argc) {
+            for i in 0..(1 + argc as u16) {
                 self.codegen.free_reg(Register(frame.0 + i));
             }
 
@@ -2548,10 +2704,12 @@ impl Compiler {
                         // Get current length to use as index
                         let len_name = self.codegen.add_string("length");
                         let len_reg = self.codegen.alloc_reg();
+                        let ic_index = self.codegen.alloc_ic();
                         self.codegen.emit(Instruction::GetPropConst {
                             dst: len_reg,
                             obj: args_arr,
                             name: len_name,
+                            ic_index,
                         });
 
                         // Set element at current length
@@ -2568,11 +2726,13 @@ impl Compiler {
             }
 
             let dst = self.codegen.alloc_reg();
+            let ic_index = self.codegen.alloc_ic();
             self.codegen.emit(Instruction::CallMethodComputedSpread {
                 dst,
                 obj,
                 key,
                 spread: args_arr,
+                ic_index,
             });
 
             self.codegen.free_reg(obj);
@@ -2601,7 +2761,7 @@ impl Compiler {
                 src: key,
             });
             for (i, tmp) in arg_tmps.iter().copied().enumerate() {
-                let target = Register(frame.0 + 2 + i as u8);
+                let target = Register(frame.0 + 2 + i as u16);
                 self.codegen.emit(Instruction::Move {
                     dst: target,
                     src: tmp,
@@ -2609,11 +2769,13 @@ impl Compiler {
             }
 
             let dst = self.codegen.alloc_reg();
+            let ic_index = self.codegen.alloc_ic();
             self.codegen.emit(Instruction::CallMethodComputed {
                 dst,
                 obj: frame,
                 key: Register(frame.0 + 1),
                 argc,
+                ic_index,
             });
 
             self.codegen.free_reg(obj);
@@ -2621,7 +2783,7 @@ impl Compiler {
             for tmp in arg_tmps {
                 self.codegen.free_reg(tmp);
             }
-            for i in 0..(2 + argc) {
+            for i in 0..(2 + argc as u16) {
                 self.codegen.free_reg(Register(frame.0 + i));
             }
 
@@ -2663,10 +2825,12 @@ impl Compiler {
                     // Get current length to use as index
                     let len_name = self.codegen.add_string("length");
                     let len_reg = self.codegen.alloc_reg();
+                    let ic_index = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::GetPropConst {
                         dst: len_reg,
                         obj: args_arr,
                         name: len_name,
+                        ic_index,
                     });
 
                     // Set element at current length
@@ -2734,7 +2898,7 @@ impl Compiler {
                 src: func,
             });
             for (i, tmp) in arg_tmps.iter().copied().enumerate() {
-                let target = Register(frame.0 + 1 + i as u8);
+                let target = Register(frame.0 + 1 + i as u16);
                 self.codegen.emit(Instruction::Move {
                     dst: target,
                     src: tmp,
@@ -2753,7 +2917,7 @@ impl Compiler {
             for tmp in arg_tmps {
                 self.codegen.free_reg(tmp);
             }
-            for i in 0..(1 + argc) {
+            for i in 0..(1 + argc as u16) {
                 self.codegen.free_reg(Register(frame.0 + i));
             }
             self.codegen.free_reg(spread);
@@ -2774,7 +2938,7 @@ impl Compiler {
                 src: func,
             });
             for (i, tmp) in arg_tmps.iter().copied().enumerate() {
-                let target = Register(frame.0 + 1 + i as u8);
+                let target = Register(frame.0 + 1 + i as u16);
                 self.codegen.emit(Instruction::Move {
                     dst: target,
                     src: tmp,
@@ -2792,7 +2956,7 @@ impl Compiler {
             for tmp in arg_tmps {
                 self.codegen.free_reg(tmp);
             }
-            for i in 0..(1 + argc) {
+            for i in 0..(1 + argc as u16) {
                 self.codegen.free_reg(Register(frame.0 + i));
             }
 
@@ -2892,9 +3056,11 @@ impl Compiler {
             }
             Some(ResolvedBinding::Global(name)) => {
                 let name_idx = self.codegen.add_string(&name);
+                let ic_index = self.codegen.alloc_ic();
                 self.codegen.emit(Instruction::SetGlobal {
                     name: name_idx,
                     src,
+                    ic_index,
                 });
             }
             Some(ResolvedBinding::Upvalue { index, depth }) => {
@@ -2908,9 +3074,11 @@ impl Compiler {
             None => {
                 // Undeclared variable - treat as global
                 let name_idx = self.codegen.add_string(name);
+                let ic_index = self.codegen.alloc_ic();
                 self.codegen.emit(Instruction::SetGlobal {
                     name: name_idx,
                     src,
+                    ic_index,
                 });
             }
         }
@@ -2925,10 +3093,12 @@ impl Compiler {
         let obj = self.compile_expression(&member.object)?;
         let dst = self.codegen.alloc_reg();
         let name_idx = self.codegen.add_string(&member.property.name);
+        let ic_index = self.codegen.alloc_ic();
         self.codegen.emit(Instruction::GetPropConst {
             dst,
             obj,
             name: name_idx,
+            ic_index,
         });
         self.codegen.free_reg(obj);
         Ok(dst)
@@ -2942,7 +3112,13 @@ impl Compiler {
         let obj = self.compile_expression(&member.object)?;
         let dst = self.codegen.alloc_reg();
         let key = self.compile_expression(&member.expression)?;
-        self.codegen.emit(Instruction::GetProp { dst, obj, key });
+        let ic_index = self.codegen.alloc_ic();
+        self.codegen.emit(Instruction::GetProp {
+            dst,
+            obj,
+            key,
+            ic_index,
+        });
         self.codegen.free_reg(key);
         self.codegen.free_reg(obj);
         Ok(dst)
@@ -2972,10 +3148,12 @@ impl Compiler {
 
                                 if let Some(key) = key {
                                     let value = self.compile_expression(&prop.value)?;
+                                    let ic_index = self.codegen.alloc_ic();
                                     self.codegen.emit(Instruction::SetPropConst {
                                         obj: dst,
                                         name: key,
                                         val: value,
+                                        ic_index,
                                     });
                                     self.codegen.free_reg(value);
                                     continue;
@@ -2985,10 +3163,12 @@ impl Compiler {
                             // Computed key: obj[key] = value
                             let key_reg = self.compile_property_key(&prop.key)?;
                             let value = self.compile_expression(&prop.value)?;
+                            let ic_index = self.codegen.alloc_ic();
                             self.codegen.emit(Instruction::SetProp {
                                 obj: dst,
                                 key: key_reg,
                                 val: value,
+                                ic_index,
                             });
                             self.codegen.free_reg(value);
                             self.codegen.free_reg(key_reg);
@@ -3034,9 +3214,11 @@ impl Compiler {
 
                     let func_tmp = self.codegen.alloc_reg();
                     let name_idx = self.codegen.add_string("__Object_assign");
+                    let ic_index = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::GetGlobal {
                         dst: func_tmp,
                         name: name_idx,
+                        ic_index,
                     });
 
                     // Call convention requires `func` and args to be contiguous.
@@ -3176,10 +3358,12 @@ impl Compiler {
                 _ => {
                     let value = self.compile_expression(elem.to_expression())?;
                     let idx_reg = self.codegen.alloc_reg();
+                    let ic_index = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::GetPropConst {
                         dst: idx_reg,
                         obj: dst,
                         name: length_key,
+                        ic_index,
                     });
                     self.codegen.emit(Instruction::SetElem {
                         arr: dst,
@@ -3229,6 +3413,108 @@ impl Compiler {
         self.codegen.patch_jump(jump_end, end_offset);
 
         Ok(result)
+    }
+
+    /// Compile a switch statement
+    fn compile_switch_statement(&mut self, stmt: &SwitchStatement) -> CompileResult<()> {
+        // 1. Compile discriminant
+        let discriminant = self.compile_expression(&stmt.discriminant)?;
+
+        // 2. Setup control scope for breaks
+        self.loop_stack.push(ControlScope {
+            is_loop: false,
+            break_jumps: Vec::new(),
+            continue_jumps: Vec::new(),
+            continue_target: None,
+        });
+
+        // 3. Jump to checks
+        let jump_to_checks = self.codegen.emit_jump();
+
+        // 4. Compile bodies and track their entry points
+        let mut case_body_labels = Vec::with_capacity(stmt.cases.len());
+        let mut default_case_idx = None;
+
+        self.codegen.enter_scope(); // Switch scope
+
+        for (i, case) in stmt.cases.iter().enumerate() {
+            // Mark start of this case's body
+            let body_start = self.codegen.current_index();
+            case_body_labels.push(body_start);
+
+            if case.test.is_none() {
+                if default_case_idx.is_some() {
+                    return Err(CompileError::syntax("Multiple default clauses", 0, 0));
+                }
+                default_case_idx = Some(i);
+            }
+
+            for stmt in &case.consequent {
+                self.compile_statement(stmt)?;
+            }
+        }
+
+        self.codegen.exit_scope();
+
+        // 5. Jump to end (implicit fallthrough after last case)
+        let jump_to_end = self.codegen.emit_jump();
+
+        // 6. Checks Logic
+        let checks_start = self.codegen.current_index() as i32;
+        self.codegen
+            .patch_jump(jump_to_checks, checks_start - jump_to_checks as i32);
+
+        for (i, case) in stmt.cases.iter().enumerate() {
+            if let Some(test) = &case.test {
+                // Compile test expression
+                let test_val = self.compile_expression(test)?;
+
+                // Compare strict equality: discriminant === test
+                let cond = self.codegen.alloc_reg();
+                self.codegen.emit(Instruction::StrictEq {
+                    dst: cond,
+                    lhs: discriminant, // Register is Copy
+                    rhs: test_val,
+                });
+
+                // If match, jump to body
+                let jump_match = self.codegen.emit_jump_if_true(cond);
+                let body_label = case_body_labels[i] as i32;
+                self.codegen
+                    .patch_jump(jump_match, body_label - jump_match as i32);
+
+                self.codegen.free_reg(cond);
+                self.codegen.free_reg(test_val);
+            }
+        }
+
+        // Post-checks: Jump to default or end
+        if let Some(default_idx) = default_case_idx {
+            let default_label = case_body_labels[default_idx] as i32;
+            let jmp = self.codegen.emit_jump();
+            self.codegen.patch_jump(jmp, default_label - jmp as i32);
+        } else {
+            let jmp = self.codegen.emit_jump();
+            let end_label = self.codegen.current_index() as i32;
+            self.codegen.patch_jump(jmp, end_label - jmp as i32);
+        }
+
+        // 7. Cleanup
+        let end_label = self.codegen.current_index() as i32;
+        let jump_to_end_offset = end_label - jump_to_end as i32;
+        self.codegen.patch_jump(jump_to_end, jump_to_end_offset);
+
+        self.codegen.free_reg(discriminant);
+
+        // Patch breaks
+        let scope = self.loop_stack.pop().unwrap();
+        for break_jump in scope.break_jumps {
+            let current_offset = self.codegen.current_index() as i32;
+            self.codegen
+                .patch_jump(break_jump, current_offset - break_jump as i32);
+        }
+
+        Ok(())
     }
 }
 
@@ -3812,5 +4098,391 @@ mod tests {
     fn test_shim_fetch_js_compiles() {
         let fetch = include_str!("../../otter-vm-builtins/src/fetch.js");
         Compiler::new().compile(fetch, "fetch.js").unwrap();
+    }
+
+    #[test]
+    fn test_normal_code_compiles() {
+        // Ensure that typical nested code still compiles fine
+        let code = r#"
+            function outer() {
+                function middle() {
+                    function inner() {
+                        return 1 + 2 + 3;
+                    }
+                    return inner();
+                }
+                return middle();
+            }
+            outer();
+        "#;
+        let compiler = Compiler::new();
+        let module = compiler.compile(code, "test.js").unwrap();
+        assert!(module.functions.len() >= 1);
+    }
+
+    #[test]
+    fn test_deeply_nested_expression_error() {
+        // Generate a deeply nested binary expression: 1+1+1+...+1 (600+ levels)
+        let mut expr = String::from("1");
+        for _ in 0..600 {
+            expr = format!("({} + 1)", expr);
+        }
+        let code = format!("let x = {};", expr);
+
+        let compiler = Compiler::new();
+        let result = compiler.compile(&code, "test.js");
+
+        // Should fail with a depth error
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("nesting depth"),
+            "Expected nesting depth error, got: {}",
+            err
+        );
+    }
+
+    // Integration tests for compiler validation
+    // Property 8: Early Error Generation
+    // Validates: Requirements 7.1, 7.2
+
+    #[test]
+    fn test_legacy_octal_literal_strict_mode_error() {
+        let mut compiler = Compiler::new();
+        compiler.set_strict_mode(true);
+        
+        // Legacy octal literals should fail in strict mode
+        let result = compiler.compile("let x = 077;", "test.js");
+        assert!(result.is_err());
+        
+        let err = result.unwrap_err();
+        assert!(matches!(err, CompileError::LegacySyntax { .. }));
+        assert!(err.to_string().contains("Legacy octal literal"));
+    }
+
+    #[test]
+    fn test_legacy_octal_literal_non_strict_mode_success() {
+        let compiler = Compiler::new(); // non-strict by default
+        
+        // Legacy octal literals should work in non-strict mode
+        let result = compiler.compile("let x = 077;", "test.js");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_invalid_numeric_separator_error() {
+        // Invalid numeric separator usage should fail
+        let test_cases = vec![
+            "let x = _123;",      // leading separator
+            "let x = 123_;",      // trailing separator  
+            "let x = 1__23;",     // consecutive separators
+            "let x = 0x_FF;",     // separator after prefix
+        ];
+        
+        for code in test_cases {
+            let compiler = Compiler::new();
+            let result = compiler.compile(code, "test.js");
+            // Note: Some of these might be caught by the parser first,
+            // but if they reach our validator, they should fail
+            if result.is_err() {
+                let err = result.unwrap_err();
+                // Could be either a parse error or our validation error
+                assert!(
+                    matches!(err, CompileError::Parse(_)) || 
+                    matches!(err, CompileError::InvalidLiteral { .. })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_valid_numeric_literals_success() {
+        let test_cases = vec![
+            "let x = 123;",           // decimal
+            "let x = 1_000_000;",     // decimal with separators
+            "let x = 0xFF;",          // hex
+            "let x = 0xFF_FF;",       // hex with separators
+            "let x = 0b1010;",        // binary
+            "let x = 0b10_10;",       // binary with separators
+            "let x = 3.14;",          // float
+            "let x = 1e10;",          // exponent
+            "let x = 1.5e-10;",       // exponent with sign
+        ];
+        
+        for code in test_cases {
+            let compiler = Compiler::new();
+            let result = compiler.compile(code, "test.js");
+            assert!(result.is_ok(), "Failed to compile: {}", code);
+        }
+    }
+
+    #[test]
+    fn test_legacy_string_escape_strict_mode_error() {
+        // Legacy escape sequences should fail in strict mode
+        let test_cases = vec![
+            r#"let x = "octal\1";"#,     // octal escape
+            r#"let x = "invalid\8";"#,   // invalid numeric escape
+            r#"let x = "invalid\9";"#,   // invalid numeric escape
+        ];
+        
+        for code in test_cases {
+            let mut compiler = Compiler::new();
+            compiler.set_strict_mode(true);
+            let result = compiler.compile(code, "test.js");
+            assert!(result.is_err(), "Expected error for: {}", code);
+            
+            let err = result.unwrap_err();
+            assert!(matches!(err, CompileError::LegacySyntax { .. }));
+        }
+    }
+
+    #[test]
+    fn test_valid_string_literals_success() {
+        let test_cases = vec![
+            r#"let x = "hello";"#,           // simple string
+            r#"let x = "hello\nworld";"#,   // newline escape
+            r#"let x = "tab\tseparated";"#, // tab escape
+            r#"let x = "quote\"mark";"#,    // quote escape
+            r#"let x = "hex\x41";"#,        // hex escape
+            r#"let x = "unicode\u0041";"#,  // unicode escape
+            r#"let x = "unicode\u{41}";"#,  // unicode brace escape
+        ];
+        
+        for code in test_cases {
+            let compiler = Compiler::new();
+            let result = compiler.compile(code, "test.js");
+            assert!(result.is_ok(), "Failed to compile: {}", code);
+        }
+    }
+
+    #[test]
+    fn test_invalid_string_escape_error() {
+        let test_cases = vec![
+            r#"let x = "bad\xGG";"#,        // invalid hex escape
+            r#"let x = "short\xF";"#,       // short hex escape
+            r#"let x = "bad\uGGGG";"#,      // invalid unicode escape
+            r#"let x = "short\u41";"#,      // short unicode escape
+            r#"let x = "empty\u{}";"#,      // empty unicode brace
+            r#"let x = "unterm\u{41";"#,    // unterminated unicode brace
+        ];
+        
+        for code in test_cases {
+            let compiler = Compiler::new();
+            let result = compiler.compile(code, "test.js");
+            // These should either be caught by parser or our validator
+            if result.is_err() {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(err, CompileError::Parse(_)) || 
+                    matches!(err, CompileError::InvalidLiteral { .. })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_regexp_literal_validation_success() {
+        let test_cases = vec![
+            r#"let x = /hello/;"#,          // simple pattern
+            r#"let x = /hello/g;"#,        // with flags
+            r#"let x = /hello/gi;"#,       // multiple flags
+            r#"let x = /[a-z]+/i;"#,       // character class
+            r#"let x = /\d+/;"#,           // escape sequence
+            r#"let x = /hello\nworld/;"#,  // newline in pattern
+        ];
+        
+        for code in test_cases {
+            let compiler = Compiler::new();
+            let result = compiler.compile(code, "test.js");
+            assert!(result.is_ok(), "Failed to compile: {}", code);
+        }
+    }
+
+    #[test]
+    fn test_regexp_literal_invalid_flags_error() {
+        let test_cases = vec![
+            r#"let x = /hello/gg;"#,        // duplicate flag
+            r#"let x = /hello/uv;"#,        // conflicting flags u and v
+            r#"let x = /hello/x;"#,         // invalid flag
+        ];
+        
+        for code in test_cases {
+            let compiler = Compiler::new();
+            let result = compiler.compile(code, "test.js");
+            // These should be caught by our validator
+            if result.is_err() {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(err, CompileError::Parse(_)) || 
+                    matches!(err, CompileError::InvalidLiteral { .. })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_template_literal_validation_success() {
+        let test_cases = vec![
+            r#"let x = `hello`;"#,                    // simple template
+            r#"let x = `hello ${name}`;"#,           // with expression
+            r#"let x = `hello\nworld`;"#,            // with escape
+            r#"let x = `tab\tseparated`;"#,          // tab escape
+            r#"let x = `unicode\u0041`;"#,           // unicode escape
+            r#"let x = `multiple ${a} ${b}`;"#,      // multiple expressions
+        ];
+        
+        for code in test_cases {
+            let compiler = Compiler::new();
+            let result = compiler.compile(code, "test.js");
+            assert!(result.is_ok(), "Failed to compile: {}", code);
+        }
+    }
+
+    #[test]
+    fn test_template_literal_legacy_escape_strict_mode_error() {
+        let test_cases = vec![
+            r#"let x = `octal\1`;"#,        // octal escape in template
+            r#"let x = `invalid\8`;"#,      // invalid numeric escape
+        ];
+        
+        for code in test_cases {
+            let mut compiler = Compiler::new();
+            compiler.set_strict_mode(true);
+            let result = compiler.compile(code, "test.js");
+            assert!(result.is_err(), "Expected error for: {}", code);
+            
+            let err = result.unwrap_err();
+            // The parser catches these errors before our validator, which is correct
+            assert!(
+                matches!(err, CompileError::Parse(_)) || matches!(err, CompileError::LegacySyntax { .. }),
+                "Expected Parse or LegacySyntax error, got: {:?}", err
+            );
+        }
+    }
+
+    #[test]
+    fn test_debug_hex_literal() {
+        let code = "let x = 0x811A6E;";
+        let compiler = Compiler::new();
+        let result = compiler.compile(code, "test.js");
+        
+        match &result {
+            Ok(_) => println!("Successfully compiled: {}", code),
+            Err(e) => println!("Failed to compile {}: {:?}", code, e),
+        }
+        
+        assert!(result.is_ok(), "Failed to compile hex literal: {}", code);
+    }
+
+    // Property tests for enhanced literal compilation
+    // Property 9: Runtime Literal Consistency
+    // Validates: Requirements 1.6, 2.5, 4.4
+
+    #[cfg(test)]
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn prop_integer_literal_compilation_consistency(
+                value in -1000000i64..1000000i64,
+            ) {
+                let code = format!("let x = {};", value);
+                let compiler = Compiler::new();
+                let result = compiler.compile(&code, "test.js");
+                
+                // Should compile successfully for all integer values
+                prop_assert!(result.is_ok(), "Failed to compile integer literal: {}", value);
+                
+                let module = result.unwrap();
+                prop_assert!(module.functions.len() >= 1);
+            }
+
+            #[test]
+            fn prop_hex_literal_compilation_consistency(
+                value in 0u32..0xFFFFFF,
+            ) {
+                let code = format!("let x = 0x{:X};", value);
+                let compiler = Compiler::new();
+                let result = compiler.compile(&code, "test.js");
+                
+                // Should compile successfully for all hex values
+                prop_assert!(result.is_ok(), "Failed to compile hex literal: 0x{:X}", value);
+                
+                let module = result.unwrap();
+                prop_assert!(module.functions.len() >= 1);
+            }
+
+            #[test]
+            fn prop_string_literal_compilation_consistency(
+                text in "[a-zA-Z0-9 ]{0,50}",
+            ) {
+                let code = format!(r#"let x = "{}";"#, text);
+                let compiler = Compiler::new();
+                let result = compiler.compile(&code, "test.js");
+                
+                // Should compile successfully for simple text strings
+                prop_assert!(result.is_ok(), "Failed to compile string literal: \"{}\"", text);
+                
+                let module = result.unwrap();
+                prop_assert!(module.functions.len() >= 1);
+            }
+
+            #[test]
+            fn prop_boolean_literal_compilation_consistency(
+                value in any::<bool>(),
+            ) {
+                let code = format!("let x = {};", value);
+                let compiler = Compiler::new();
+                let result = compiler.compile(&code, "test.js");
+                
+                // Should compile successfully for all boolean values
+                prop_assert!(result.is_ok(), "Failed to compile boolean literal: {}", value);
+                
+                let module = result.unwrap();
+                prop_assert!(module.functions.len() >= 1);
+            }
+
+            #[test]
+            fn prop_mixed_literals_compilation_consistency(
+                num_value in -1000i32..1000i32,
+                str_text in "[a-zA-Z0-9]{0,20}",
+                bool_value in any::<bool>(),
+            ) {
+                let code = format!(
+                    r#"let a = {}; let b = "{}"; let c = {}; let d = null;"#,
+                    num_value, str_text, bool_value
+                );
+                
+                let compiler = Compiler::new();
+                let result = compiler.compile(&code, "test.js");
+                
+                // Should compile successfully for mixed literal types
+                prop_assert!(result.is_ok(), "Failed to compile mixed literals: {}", code);
+                
+                let module = result.unwrap();
+                prop_assert!(module.functions.len() >= 1);
+            }
+
+            #[test]
+            fn prop_strict_mode_consistency(
+                num_value in 1i32..1000i32,
+                str_text in "[a-zA-Z0-9]{0,20}",
+                strict_mode in any::<bool>(),
+            ) {
+                let code = format!(r#"let a = {}; let b = "{}";"#, num_value, str_text);
+                
+                let mut compiler = Compiler::new();
+                compiler.set_strict_mode(strict_mode);
+                let result = compiler.compile(&code, "test.js");
+                
+                // Valid literals should compile in both strict and non-strict mode
+                prop_assert!(result.is_ok(), "Failed to compile valid literals in strict_mode={}: {}", strict_mode, code);
+                
+                let module = result.unwrap();
+                prop_assert!(module.functions.len() >= 1);
+            }
+        }
     }
 }

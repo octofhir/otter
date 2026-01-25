@@ -71,12 +71,56 @@ fn main() {
     // Run tests
     println!("\nRunning tests...");
 
-    let results = if let Some(ref subdir) = args.subdir {
-        println!("Subdirectory: {}", subdir);
-        runner.run_dir(subdir)
-    } else {
-        runner.run_all()
+    // Run tests
+    println!("\nRunning tests...");
+
+    let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let results_clone = results.clone();
+    let total_tests = std::sync::atomic::AtomicUsize::new(0);
+    let passed_tests = std::sync::atomic::AtomicUsize::new(0);
+
+    let callback = move |result: otter_test262::TestResult| {
+        let total = total_tests.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+        match result.outcome {
+            otter_test262::TestOutcome::Pass => {
+                passed_tests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            otter_test262::TestOutcome::Fail | otter_test262::TestOutcome::Crash => {
+                // Print failures immediately
+                println!(
+                    "\n{}: {} - {:?}",
+                    "FAIL".red().bold(),
+                    result.path,
+                    result.error
+                );
+            }
+            _ => {}
+        }
+
+        // Simple progress indication every 100 tests
+        if total % 100 == 0 {
+            use std::io::Write;
+            print!(".");
+            std::io::stdout().flush().unwrap();
+        }
+
+        results_clone.lock().unwrap().push(result);
     };
+
+    if let Some(ref subdir) = args.subdir {
+        println!("Subdirectory: {}", subdir);
+        runner.run_dir_with_callback(subdir, callback);
+    } else {
+        runner.run_all_with_callback(callback);
+    };
+
+    println!(); // Newline after progress dots
+
+    let results = std::sync::Arc::try_unwrap(results)
+        .unwrap()
+        .into_inner()
+        .unwrap();
 
     // Limit results if needed
     let results: Vec<_> = if let Some(max) = args.max_tests {

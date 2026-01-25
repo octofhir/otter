@@ -145,7 +145,8 @@ impl Interpreter {
         let prev_stack_depth = ctx.stack_depth();
 
         // Get function info
-        let func_info = closure.module
+        let func_info = closure
+            .module
             .function(closure.function_index)
             .ok_or_else(|| VmError::internal("function not found"))?;
 
@@ -204,7 +205,8 @@ impl Interpreter {
                         break value;
                     }
                     // Handle return from nested call
-                    let return_reg = ctx.current_frame()
+                    let return_reg = ctx
+                        .current_frame()
                         .and_then(|f| f.return_register)
                         .unwrap_or(0);
                     ctx.pop_frame();
@@ -244,7 +246,10 @@ impl Interpreter {
                 }
                 Ok(InstructionResult::Throw(error)) => {
                     ctx.set_running(was_running);
-                    return Err(VmError::internal(format!("Uncaught exception: {:?}", error)));
+                    return Err(VmError::internal(format!(
+                        "Uncaught exception: {:?}",
+                        error
+                    )));
                 }
                 Err(e) => {
                     ctx.set_running(was_running);
@@ -261,7 +266,7 @@ impl Interpreter {
     fn capture_async_context(
         &self,
         ctx: &VmContext,
-        resume_register: u8,
+        resume_register: u16,
         awaited_promise: Arc<JsPromise>,
         result_promise: Arc<JsPromise>,
     ) -> AsyncContext {
@@ -395,7 +400,7 @@ impl Interpreter {
                                 "callee not found (func_index={}, function_count={})",
                                 func_index,
                                 call_module.function_count()
-                            ))
+                            ));
                         }
                     };
 
@@ -781,7 +786,11 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::GetGlobal { dst, name } => {
+            Instruction::GetGlobal {
+                dst,
+                name,
+                ic_index,
+            } => {
                 let name_const = module
                     .constants
                     .get(name.0)
@@ -791,12 +800,72 @@ impl Interpreter {
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
 
+                // IC Fast Path
+                let cached_value = {
+                    let global_obj = ctx.global();
+                    let frame = ctx
+                        .current_frame()
+                        .ok_or_else(|| VmError::internal("no frame"))?;
+                    let func = frame
+                        .module
+                        .function(frame.function_index)
+                        .ok_or_else(|| VmError::internal("no function"))?;
+                    let feedback = func.feedback_vector.read();
+                    if let Some(otter_vm_bytecode::function::InlineCache::Monomorphic(
+                        shape_addr,
+                        offset,
+                    )) = feedback.get(*ic_index as usize)
+                    {
+                        if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr {
+                            global_obj.get_by_offset(*offset)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(value) = cached_value {
+                    ctx.set_register(dst.0, value);
+                    return Ok(InstructionResult::Continue);
+                }
+
                 let value = ctx.get_global(name_str).unwrap_or_else(Value::undefined);
+
+                // Update IC
+                {
+                    let global_obj = ctx.global().clone();
+                    let key = PropertyKey::string(name_str);
+                    if let Some(offset) = global_obj.shape().get_offset(&key) {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        let func = frame
+                            .module
+                            .function(frame.function_index)
+                            .ok_or_else(|| VmError::internal("no function"))?;
+                        let mut feedback = func.feedback_vector.write();
+                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                            if let otter_vm_bytecode::function::InlineCache::Uninitialized = ic {
+                                *ic = otter_vm_bytecode::function::InlineCache::Monomorphic(
+                                    std::sync::Arc::as_ptr(&global_obj.shape()) as u64,
+                                    offset,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 ctx.set_register(dst.0, value);
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::SetGlobal { name, src } => {
+            Instruction::SetGlobal {
+                name,
+                src,
+                ic_index,
+            } => {
                 let name_const = module
                     .constants
                     .get(name.0)
@@ -805,9 +874,58 @@ impl Interpreter {
                 let name_str = name_const
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
+                let val_val = ctx.get_register(src.0).clone();
 
-                let value = ctx.get_register(src.0).clone();
-                ctx.set_global(name_str, value);
+                // IC Fast Path
+                {
+                    let global_obj = ctx.global().clone();
+                    let frame = ctx
+                        .current_frame()
+                        .ok_or_else(|| VmError::internal("no frame"))?;
+                    let func = frame
+                        .module
+                        .function(frame.function_index)
+                        .ok_or_else(|| VmError::internal("no function"))?;
+                    let feedback = func.feedback_vector.read();
+                    if let Some(otter_vm_bytecode::function::InlineCache::Monomorphic(
+                        shape_addr,
+                        offset,
+                    )) = feedback.get(*ic_index as usize)
+                    {
+                        if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr {
+                            if global_obj.set_by_offset(*offset, val_val.clone()) {
+                                return Ok(InstructionResult::Continue);
+                            }
+                        }
+                    }
+                }
+
+                ctx.set_global(name_str, val_val.clone());
+
+                // Update IC
+                {
+                    let global_obj = ctx.global().clone();
+                    let key = PropertyKey::string(name_str);
+                    if let Some(offset) = global_obj.shape().get_offset(&key) {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        let func = frame
+                            .module
+                            .function(frame.function_index)
+                            .ok_or_else(|| VmError::internal("no function"))?;
+                        let mut feedback = func.feedback_vector.write();
+                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                            if let otter_vm_bytecode::function::InlineCache::Uninitialized = ic {
+                                *ic = otter_vm_bytecode::function::InlineCache::Monomorphic(
+                                    std::sync::Arc::as_ptr(&global_obj.shape()) as u64,
+                                    offset,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 Ok(InstructionResult::Continue)
             }
 
@@ -1050,10 +1168,16 @@ impl Interpreter {
                 };
 
                 let mut current = Some(left_obj);
+                let mut depth = 0;
+                const MAX_PROTO_DEPTH: usize = 100;
                 while let Some(obj) = current {
                     if Arc::ptr_eq(&obj, &target_proto) {
                         ctx.set_register(dst.0, Value::boolean(true));
                         return Ok(InstructionResult::Continue);
+                    }
+                    depth += 1;
+                    if depth > MAX_PROTO_DEPTH {
+                        break;
                     }
                     current = obj.prototype();
                 }
@@ -1187,7 +1311,7 @@ impl Interpreter {
                 if let Some(native_fn) = func_value.as_native_function() {
                     // Collect arguments
                     let mut args = Vec::with_capacity(*argc as usize);
-                    for i in 0..*argc {
+                    for i in 0..(*argc as u16) {
                         let arg = ctx.get_register(func.0 + 1 + i).clone();
                         args.push(arg);
                     }
@@ -1234,7 +1358,7 @@ impl Interpreter {
                         }
 
                         // Add call-time arguments
-                        for i in 0..*argc {
+                        for i in 0..(*argc as u16) {
                             all_args.push(ctx.get_register(func.0 + 1 + i).clone());
                         }
 
@@ -1260,36 +1384,22 @@ impl Interpreter {
                                 upvalues: closure.upvalues.clone(),
                             });
                         } else {
-                            return Err(VmError::type_error("bound function target is not callable"));
+                            return Err(VmError::type_error(
+                                "bound function target is not callable",
+                            ));
                         }
                     }
                 }
 
-                // Regular closure call
-                let closure = func_value
-                    .as_function()
-                    .ok_or_else(|| VmError::type_error("not a function"))?;
-
                 // Copy arguments from caller registers (func+1, func+2, ...)
                 // to prepare for the new frame
                 let mut args = Vec::with_capacity(*argc as usize);
-                for i in 0..*argc {
+                for i in 0..(*argc as u16) {
                     let arg = ctx.get_register(func.0 + 1 + i).clone();
                     args.push(arg);
                 }
 
-                // Store args in context for new frame to pick up
-                ctx.set_pending_args(args);
-
-                Ok(InstructionResult::Call {
-                    func_index: closure.function_index,
-                    module: Arc::clone(&closure.module),
-                    argc: *argc,
-                    return_reg: dst.0,
-                    is_construct: false,
-                    is_async: closure.is_async,
-                    upvalues: closure.upvalues.clone(),
-                })
+                self.handle_call_value(ctx, &func_value, Value::undefined(), args, dst.0)
             }
 
             Instruction::Construct { dst, func, argc } => {
@@ -1307,7 +1417,7 @@ impl Interpreter {
 
                     // Copy arguments from caller registers
                     let mut args = Vec::with_capacity(*argc as usize);
-                    for i in 0..*argc {
+                    for i in 0..(*argc as u16) {
                         let arg = ctx.get_register(func.0 + 1 + i).clone();
                         args.push(arg);
                     }
@@ -1340,6 +1450,7 @@ impl Interpreter {
                 obj,
                 method,
                 argc,
+                ic_index,
             } => {
                 let receiver = ctx.get_register(obj.0).clone();
                 let method_const = module
@@ -1350,26 +1461,54 @@ impl Interpreter {
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
 
+                // IC Fast Path
+                let cached_method = if let Some(obj_ref) = receiver.as_object() {
+                    let frame = ctx
+                        .current_frame()
+                        .ok_or_else(|| VmError::internal("no frame"))?;
+                    let func = frame
+                        .module
+                        .function(frame.function_index)
+                        .ok_or_else(|| VmError::internal("no function"))?;
+                    let feedback = func.feedback_vector.read();
+                    if let Some(otter_vm_bytecode::function::InlineCache::Monomorphic(
+                        shape_addr,
+                        offset,
+                    )) = feedback.get(*ic_index as usize)
+                    {
+                        if std::sync::Arc::as_ptr(&obj_ref.shape()) as u64 == *shape_addr {
+                            obj_ref.get_by_offset(*offset)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(method_value) = cached_method {
+                    // Direct call handling - collect args first
+                    let mut args = Vec::with_capacity(*argc as usize);
+                    for i in 0..(*argc as u16) {
+                        args.push(ctx.get_register(obj.0 + 1 + i).clone());
+                    }
+                    return self.handle_call_value(ctx, &method_value, receiver, args, dst.0);
+                }
+
                 // Get the method from the receiver.
                 // For primitives/functions, emulate `ToObject` lookup by consulting the corresponding
                 // prototype object (e.g. `String.prototype`) but keep `this` as the primitive.
-                // NOTE: Functions are checked BEFORE as_object() because as_object() also succeeds
-                // for functions, but we want to look up methods from Function.prototype.
                 let method_value = if receiver.is_function() || receiver.is_native_function() {
-                    // Function methods from Function.prototype
-                    let Some(function_obj) = ctx
+                    let function_obj = ctx
                         .get_global("Function")
                         .and_then(|v| v.as_object().cloned())
-                    else {
-                        return Err(VmError::type_error("Function is not defined"));
-                    };
-                    let Some(proto) = function_obj
+                        .ok_or_else(|| VmError::type_error("Function is not defined"))?;
+                    let proto = function_obj
                         .get(&PropertyKey::string("prototype"))
                         .and_then(|v| v.as_object().cloned())
-                    else {
-                        return Err(VmError::type_error("Function.prototype is not defined"));
-                    };
-                    // First check the function's own properties, then prototype
+                        .ok_or_else(|| VmError::type_error("Function.prototype is not defined"))?;
                     if let Some(obj_ref) = receiver.as_object() {
                         obj_ref
                             .get(&PropertyKey::string(method_name))
@@ -1385,69 +1524,50 @@ impl Interpreter {
                         .get(&PropertyKey::string(method_name))
                         .unwrap_or_else(Value::undefined)
                 } else if receiver.is_string() {
-                    let Some(string_obj) = ctx
+                    let string_obj = ctx
                         .get_global("String")
                         .and_then(|v| v.as_object().cloned())
-                    else {
-                        return Err(VmError::type_error("String is not defined"));
-                    };
-                    let Some(proto) = string_obj
+                        .ok_or_else(|| VmError::type_error("String is not defined"))?;
+                    let proto = string_obj
                         .get(&PropertyKey::string("prototype"))
                         .and_then(|v| v.as_object().cloned())
-                    else {
-                        return Err(VmError::type_error("String.prototype is not defined"));
-                    };
+                        .ok_or_else(|| VmError::type_error("String.prototype is not defined"))?;
                     proto
                         .get(&PropertyKey::string(method_name))
                         .unwrap_or_else(Value::undefined)
                 } else if receiver.is_promise() {
-                    // Promise methods from Promise.prototype
-                    let Some(promise_obj) = ctx
+                    let promise_obj = ctx
                         .get_global("Promise")
                         .and_then(|v| v.as_object().cloned())
-                    else {
-                        return Err(VmError::type_error("Promise is not defined"));
-                    };
-                    let Some(proto) = promise_obj
+                        .ok_or_else(|| VmError::type_error("Promise is not defined"))?;
+                    let proto = promise_obj
                         .get(&PropertyKey::string("prototype"))
                         .and_then(|v| v.as_object().cloned())
-                    else {
-                        return Err(VmError::type_error("Promise.prototype is not defined"));
-                    };
+                        .ok_or_else(|| VmError::type_error("Promise.prototype is not defined"))?;
                     proto
                         .get(&PropertyKey::string(method_name))
                         .unwrap_or_else(Value::undefined)
                 } else if receiver.is_number() {
-                    // Number methods from Number.prototype
-                    let Some(number_obj) = ctx
+                    let number_obj = ctx
                         .get_global("Number")
                         .and_then(|v| v.as_object().cloned())
-                    else {
-                        return Err(VmError::type_error("Number is not defined"));
-                    };
-                    let Some(proto) = number_obj
+                        .ok_or_else(|| VmError::type_error("Number is not defined"))?;
+                    let proto = number_obj
                         .get(&PropertyKey::string("prototype"))
                         .and_then(|v| v.as_object().cloned())
-                    else {
-                        return Err(VmError::type_error("Number.prototype is not defined"));
-                    };
+                        .ok_or_else(|| VmError::type_error("Number.prototype is not defined"))?;
                     proto
                         .get(&PropertyKey::string(method_name))
                         .unwrap_or_else(Value::undefined)
                 } else if receiver.is_boolean() {
-                    // Boolean methods from Boolean.prototype
-                    let Some(boolean_obj) = ctx
+                    let boolean_obj = ctx
                         .get_global("Boolean")
                         .and_then(|v| v.as_object().cloned())
-                    else {
-                        return Err(VmError::type_error("Boolean is not defined"));
-                    };
-                    let Some(proto) = boolean_obj
+                        .ok_or_else(|| VmError::type_error("Boolean is not defined"))?;
+                    let proto = boolean_obj
                         .get(&PropertyKey::string("prototype"))
                         .and_then(|v| v.as_object().cloned())
-                    else {
-                        return Err(VmError::type_error("Boolean.prototype is not defined"));
-                    };
+                        .ok_or_else(|| VmError::type_error("Boolean.prototype is not defined"))?;
                     proto
                         .get(&PropertyKey::string(method_name))
                         .unwrap_or_else(Value::undefined)
@@ -1455,116 +1575,35 @@ impl Interpreter {
                     return Err(VmError::type_error("Cannot read property of non-object"));
                 };
 
-                // Check if it's a native function
-                if let Some(native_fn) = method_value.as_native_function() {
-                    // Collect arguments
-                    let mut args = Vec::with_capacity(*argc as usize);
-                    for i in 0..*argc {
-                        let arg = ctx.get_register(obj.0 + 1 + i).clone();
-                        args.push(arg);
-                    }
-
-                    // Call the native function directly
-                    let result = native_fn(&args).map_err(VmError::type_error)?;
-                    ctx.set_register(dst.0, result);
-                    return Ok(InstructionResult::Continue);
-                }
-
-                // Regular closure call with `this` binding
-                let closure = method_value
-                    .as_function()
-                    .ok_or_else(|| VmError::type_error("not a function"))?;
-
-                // Copy arguments from caller registers
                 let mut args = Vec::with_capacity(*argc as usize);
-                for i in 0..*argc {
-                    let arg = ctx.get_register(obj.0 + 1 + i).clone();
-                    args.push(arg);
+                for i in 0..(*argc as u16) {
+                    args.push(ctx.get_register(obj.0 + 1 + i).clone());
                 }
 
-                // Store args and `this` value in context for new frame
-                ctx.set_pending_args(args);
-                ctx.set_pending_this(receiver);
-
-                Ok(InstructionResult::Call {
-                    func_index: closure.function_index,
-                    module: Arc::clone(&closure.module),
-                    argc: *argc,
-                    return_reg: dst.0,
-                    is_construct: false,
-                    is_async: closure.is_async,
-                    upvalues: closure.upvalues.clone(),
-                })
-            }
-
-            Instruction::CallMethodComputed {
-                dst,
-                obj,
-                key,
-                argc,
-            } => {
-                let receiver = ctx.get_register(obj.0).clone();
-                let key_value = ctx.get_register(key.0).clone();
-
-                // Convert key to PropertyKey
-                let prop_key = if let Some(s) = key_value.as_string() {
-                    PropertyKey::String(Arc::clone(s))
-                } else if let Some(n) = key_value.as_number() {
-                    if n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64 {
-                        PropertyKey::Index(n as u32)
-                    } else {
-                        PropertyKey::String(JsString::intern(&n.to_string()))
+                // Update IC if method was found on the object itself
+                if let Some(obj_ref) = receiver.as_object() {
+                    let key = PropertyKey::string(method_name);
+                    if let Some(offset) = obj_ref.shape().get_offset(&key) {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        let func = frame
+                            .module
+                            .function(frame.function_index)
+                            .ok_or_else(|| VmError::internal("no function"))?;
+                        let mut feedback = func.feedback_vector.write();
+                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                            if let otter_vm_bytecode::function::InlineCache::Uninitialized = ic {
+                                *ic = otter_vm_bytecode::function::InlineCache::Monomorphic(
+                                    std::sync::Arc::as_ptr(&obj_ref.shape()) as u64,
+                                    offset,
+                                );
+                            }
+                        }
                     }
-                } else if let Some(sym) = key_value.as_symbol() {
-                    PropertyKey::Symbol(sym.id)
-                } else {
-                    PropertyKey::String(JsString::intern("undefined"))
-                };
-
-                // Get the method from the receiver
-                let method_value = if let Some(obj_ref) = receiver.as_object() {
-                    obj_ref.get(&prop_key).unwrap_or_else(Value::undefined)
-                } else {
-                    return Err(VmError::type_error("Cannot read property of non-object"));
-                };
-
-                // Check if it's a native function
-                if let Some(native_fn) = method_value.as_native_function() {
-                    let mut args = Vec::with_capacity(*argc as usize);
-                    for i in 0..*argc {
-                        let arg = ctx.get_register(obj.0 + 2 + i).clone();
-                        args.push(arg);
-                    }
-                    let result = native_fn(&args).map_err(VmError::type_error)?;
-                    ctx.set_register(dst.0, result);
-                    return Ok(InstructionResult::Continue);
                 }
 
-                // Regular closure call with `this` binding
-                let closure = method_value
-                    .as_function()
-                    .ok_or_else(|| VmError::type_error("not a function"))?;
-
-                // Copy arguments from caller registers
-                let mut args = Vec::with_capacity(*argc as usize);
-                for i in 0..*argc {
-                    let arg = ctx.get_register(obj.0 + 2 + i).clone();
-                    args.push(arg);
-                }
-
-                // Store args and `this` value in context for new frame
-                ctx.set_pending_args(args);
-                ctx.set_pending_this(receiver);
-
-                Ok(InstructionResult::Call {
-                    func_index: closure.function_index,
-                    module: Arc::clone(&closure.module),
-                    argc: *argc,
-                    return_reg: dst.0,
-                    is_construct: false,
-                    is_async: closure.is_async,
-                    upvalues: closure.upvalues.clone(),
-                })
+                self.handle_call_value(ctx, &method_value, receiver, args, dst.0)
             }
 
             Instruction::Return { src } => {
@@ -1573,91 +1612,6 @@ impl Interpreter {
             }
 
             Instruction::ReturnUndefined => Ok(InstructionResult::Return(Value::undefined())),
-
-            Instruction::CallMethodComputedSpread {
-                dst,
-                obj,
-                key,
-                spread,
-            } => {
-                let receiver = ctx.get_register(obj.0).clone();
-                let key_value = ctx.get_register(key.0).clone();
-                let spread_arr = ctx.get_register(spread.0).clone();
-
-                // Convert key to PropertyKey
-                let prop_key = if let Some(s) = key_value.as_string() {
-                    PropertyKey::String(Arc::clone(s))
-                } else if let Some(n) = key_value.as_number() {
-                    if n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64 {
-                        PropertyKey::Index(n as u32)
-                    } else {
-                        PropertyKey::String(JsString::intern(&n.to_string()))
-                    }
-                } else if let Some(sym) = key_value.as_symbol() {
-                    PropertyKey::Symbol(sym.id)
-                } else {
-                    PropertyKey::String(JsString::intern("undefined"))
-                };
-
-                // Get the method from the receiver
-                let method_value = if let Some(obj_ref) = receiver.as_object() {
-                    obj_ref.get(&prop_key).unwrap_or_else(Value::undefined)
-                } else {
-                    return Err(VmError::type_error("Cannot read property of non-object"));
-                };
-
-                // Spread the array into args
-                let mut args = Vec::new();
-                if let Some(arr_obj) = spread_arr.as_object() {
-                    let len = arr_obj
-                        .get(&PropertyKey::string("length"))
-                        .and_then(|v| v.as_int32())
-                        .unwrap_or(0) as u32;
-
-                    for i in 0..len {
-                        if let Some(elem) = arr_obj.get(&PropertyKey::Index(i)) {
-                            args.push(elem);
-                        } else {
-                            args.push(Value::undefined());
-                        }
-                    }
-                } else if let Some(arr) = spread_arr.as_array() {
-                    let len = arr.array_length();
-                    for i in 0..len {
-                        if let Some(elem) = arr.get(&PropertyKey::Index(i as u32)) {
-                            args.push(elem);
-                        } else {
-                            args.push(Value::undefined());
-                        }
-                    }
-                }
-
-                // Check if it's a native function
-                if let Some(native_fn) = method_value.as_native_function() {
-                    let result = native_fn(&args).map_err(VmError::type_error)?;
-                    ctx.set_register(dst.0, result);
-                    return Ok(InstructionResult::Continue);
-                }
-
-                // Regular closure call with `this` binding
-                let closure = method_value
-                    .as_function()
-                    .ok_or_else(|| VmError::type_error("not a function"))?;
-
-                // Store args and `this` value in context for new frame
-                ctx.set_pending_args(args.clone());
-                ctx.set_pending_this(receiver);
-
-                Ok(InstructionResult::Call {
-                    func_index: closure.function_index,
-                    module: Arc::clone(&closure.module),
-                    argc: args.len() as u8,
-                    return_reg: dst.0,
-                    is_construct: false,
-                    is_async: closure.is_async,
-                    upvalues: closure.upvalues.clone(),
-                })
-            }
 
             Instruction::CallSpread {
                 dst,
@@ -1670,7 +1624,7 @@ impl Interpreter {
 
                 // Collect regular arguments first
                 let mut args = Vec::with_capacity(*argc as usize);
-                for i in 0..*argc {
+                for i in 0..(*argc as u16) {
                     let arg = ctx.get_register(func.0 + 1 + i).clone();
                     args.push(arg);
                 }
@@ -1733,7 +1687,7 @@ impl Interpreter {
 
                 // Collect regular arguments first
                 let mut args = Vec::with_capacity(*argc as usize);
-                for i in 0..*argc {
+                for i in 0..(*argc as u16) {
                     let arg = ctx.get_register(func.0 + 1 + i).clone();
                     args.push(arg);
                 }
@@ -1853,8 +1807,13 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::GetPropConst { dst, obj, name } => {
-                let object = ctx.get_register(obj.0);
+            Instruction::GetPropConst {
+                dst,
+                obj,
+                name,
+                ic_index,
+            } => {
+                let object = ctx.get_register(obj.0).clone();
                 let name_const = module
                     .constants
                     .get(name.0)
@@ -1862,6 +1821,53 @@ impl Interpreter {
                 let name_str = name_const
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
+
+                // IC Fast Path
+                if let Some(obj_ref) = object.as_object() {
+                    // Array .length fast path
+                    if obj_ref.is_array() && name_str == "length" {
+                        ctx.set_register(dst.0, Value::int32(obj_ref.array_length() as i32));
+                        return Ok(InstructionResult::Continue);
+                    }
+
+                    let mut cached_val = None;
+                    {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        let func = frame
+                            .module
+                            .function(frame.function_index)
+                            .ok_or_else(|| VmError::internal("no function"))?;
+                        let feedback = func.feedback_vector.read();
+                        if let Some(ic) = feedback.get(*ic_index as usize) {
+                            use otter_vm_bytecode::function::InlineCache;
+                            let obj_shape_ptr = std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
+
+                            match ic {
+                                InlineCache::Monomorphic(shape_addr, offset) => {
+                                    if obj_shape_ptr == *shape_addr {
+                                        cached_val = obj_ref.get_by_offset(*offset);
+                                    }
+                                }
+                                InlineCache::Polymorphic(count, entries) => {
+                                    for i in 0..(*count as usize) {
+                                        if obj_shape_ptr == entries[i].0 {
+                                            cached_val = obj_ref.get_by_offset(entries[i].1);
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    if let Some(val) = cached_val {
+                        ctx.set_register(dst.0, val);
+                        return Ok(InstructionResult::Continue);
+                    }
+                }
 
                 // Special handling for functions - look up from Function.prototype
                 if object.is_function() || object.is_native_function() {
@@ -1922,8 +1928,54 @@ impl Interpreter {
                             }
                         }
                         _ => {
-                            // Fast path for data properties (including array indices/length via `get`),
-                            // and for non-existent properties.
+                            // Slow path: full lookup and IC update
+                            if let Some(offset) = obj.shape().get_offset(&key) {
+                                let frame = ctx
+                                    .current_frame()
+                                    .ok_or_else(|| VmError::internal("no frame"))?;
+                                let func = frame
+                                    .module
+                                    .function(frame.function_index)
+                                    .ok_or_else(|| VmError::internal("no function"))?;
+                                let mut feedback = func.feedback_vector.write();
+                                if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                    use otter_vm_bytecode::function::InlineCache;
+                                    let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+
+                                    match ic {
+                                        InlineCache::Uninitialized => {
+                                            *ic = InlineCache::Monomorphic(shape_ptr, offset);
+                                        }
+                                        InlineCache::Monomorphic(old_shape, old_offset) => {
+                                            if *old_shape != shape_ptr {
+                                                let mut entries = [(0u64, 0usize); 4];
+                                                entries[0] = (*old_shape, *old_offset);
+                                                entries[1] = (shape_ptr, offset);
+                                                *ic = InlineCache::Polymorphic(2, entries);
+                                            }
+                                        }
+                                        InlineCache::Polymorphic(count, entries) => {
+                                            let mut found = false;
+                                            for i in 0..(*count as usize) {
+                                                if entries[i].0 == shape_ptr {
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                            if !found {
+                                                if (*count as usize) < 4 {
+                                                    entries[*count as usize] = (shape_ptr, offset);
+                                                    *count += 1;
+                                                } else {
+                                                    *ic = InlineCache::Megamorphic;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+
                             let value = obj.get(&key).unwrap_or_else(Value::undefined);
                             ctx.set_register(dst.0, value);
                             Ok(InstructionResult::Continue)
@@ -1935,8 +1987,13 @@ impl Interpreter {
                 }
             }
 
-            Instruction::SetPropConst { obj, name, val } => {
-                let object = ctx.get_register(obj.0);
+            Instruction::SetPropConst {
+                obj,
+                name,
+                val,
+                ic_index,
+            } => {
+                let object = ctx.get_register(obj.0).clone();
                 let name_const = module
                     .constants
                     .get(name.0)
@@ -1944,13 +2001,135 @@ impl Interpreter {
                 let name_str = name_const
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
-                let value = ctx.get_register(val.0).clone();
+                let val_val = ctx.get_register(val.0).clone();
 
                 if let Some(obj) = object.as_object() {
-                    obj.set(PropertyKey::string(name_str), value);
-                }
+                    let key = PropertyKey::string(name_str);
 
-                Ok(InstructionResult::Continue)
+                    // IC Fast Path
+                    let mut cached = false;
+                    {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        let func = frame
+                            .module
+                            .function(frame.function_index)
+                            .ok_or_else(|| VmError::internal("no function"))?;
+                        let feedback = func.feedback_vector.read();
+                        if let Some(ic) = feedback.get(*ic_index as usize) {
+                            use otter_vm_bytecode::function::InlineCache;
+                            let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+
+                            match ic {
+                                InlineCache::Monomorphic(shape_addr, offset) => {
+                                    if obj_shape_ptr == *shape_addr {
+                                        if obj.set_by_offset(*offset, val_val.clone()) {
+                                            cached = true;
+                                        }
+                                    }
+                                }
+                                InlineCache::Polymorphic(count, entries) => {
+                                    for i in 0..(*count as usize) {
+                                        if obj_shape_ptr == entries[i].0 {
+                                            if obj.set_by_offset(entries[i].1, val_val.clone()) {
+                                                cached = true;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    if cached {
+                        return Ok(InstructionResult::Continue);
+                    }
+
+                    match obj.lookup_property_descriptor(&key) {
+                        Some(crate::object::PropertyDescriptor::Accessor { set, .. }) => {
+                            let Some(setter) = set else {
+                                return Ok(InstructionResult::Continue);
+                            };
+
+                            if let Some(native_fn) = setter.as_native_function() {
+                                native_fn(&[val_val]).map_err(VmError::type_error)?;
+                                Ok(InstructionResult::Continue)
+                            } else if let Some(closure) = setter.as_function() {
+                                ctx.set_pending_args(vec![val_val]);
+                                ctx.set_pending_this(object.clone());
+                                Ok(InstructionResult::Call {
+                                    func_index: closure.function_index,
+                                    module: Arc::clone(&closure.module),
+                                    argc: 1,
+                                    return_reg: 0, // Setter return value is ignored
+                                    is_construct: false,
+                                    is_async: closure.is_async,
+                                    upvalues: closure.upvalues.clone(),
+                                })
+                            } else {
+                                Err(VmError::type_error("setter is not a function"))
+                            }
+                        }
+                        _ => {
+                            // Slow path: update IC
+                            obj.set(key, val_val);
+                            if let Some(offset) =
+                                obj.shape().get_offset(&PropertyKey::string(name_str))
+                            {
+                                let frame = ctx
+                                    .current_frame()
+                                    .ok_or_else(|| VmError::internal("no frame"))?;
+                                let func = frame
+                                    .module
+                                    .function(frame.function_index)
+                                    .ok_or_else(|| VmError::internal("no function"))?;
+                                let mut feedback = func.feedback_vector.write();
+                                if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                    use otter_vm_bytecode::function::InlineCache;
+                                    let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+
+                                    match ic {
+                                        InlineCache::Uninitialized => {
+                                            *ic = InlineCache::Monomorphic(shape_ptr, offset);
+                                        }
+                                        InlineCache::Monomorphic(old_shape, old_offset) => {
+                                            if *old_shape != shape_ptr {
+                                                let mut entries = [(0u64, 0usize); 4];
+                                                entries[0] = (*old_shape, *old_offset);
+                                                entries[1] = (shape_ptr, offset);
+                                                *ic = InlineCache::Polymorphic(2, entries);
+                                            }
+                                        }
+                                        InlineCache::Polymorphic(count, entries) => {
+                                            let mut found = false;
+                                            for i in 0..(*count as usize) {
+                                                if entries[i].0 == shape_ptr {
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                            if !found {
+                                                if (*count as usize) < 4 {
+                                                    entries[*count as usize] = (shape_ptr, offset);
+                                                    *count += 1;
+                                                } else {
+                                                    *ic = InlineCache::Megamorphic;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Ok(InstructionResult::Continue)
+                        }
+                    }
+                } else {
+                    Ok(InstructionResult::Continue)
+                }
             }
 
             Instruction::DeleteProp { dst, obj, key } => {
@@ -1982,12 +2161,56 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::GetProp { dst, obj, key } => {
-                let object = ctx.get_register(obj.0);
-                let key_value = ctx.get_register(key.0);
+            Instruction::GetProp {
+                dst,
+                obj,
+                key,
+                ic_index,
+            } => {
+                let object = ctx.get_register(obj.0).clone();
+                let key_value = ctx.get_register(key.0).clone();
 
                 if let Some(obj) = object.as_object() {
                     let receiver = object.clone();
+
+                    // IC Fast Path
+                    let mut cached_val = None;
+                    {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        let func = frame
+                            .module
+                            .function(frame.function_index)
+                            .ok_or_else(|| VmError::internal("no function"))?;
+                        let feedback = func.feedback_vector.read();
+                        if let Some(ic) = feedback.get(*ic_index as usize) {
+                            use otter_vm_bytecode::function::InlineCache;
+                            let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+
+                            match ic {
+                                InlineCache::Monomorphic(shape_addr, offset) => {
+                                    if obj_shape_ptr == *shape_addr {
+                                        cached_val = obj.get_by_offset(*offset);
+                                    }
+                                }
+                                InlineCache::Polymorphic(count, entries) => {
+                                    for i in 0..(*count as usize) {
+                                        if obj_shape_ptr == entries[i].0 {
+                                            cached_val = obj.get_by_offset(entries[i].1);
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    if let Some(val) = cached_val {
+                        ctx.set_register(dst.0, val);
+                        return Ok(InstructionResult::Continue);
+                    }
 
                     // Convert key to property key
                     let key = if let Some(n) = key_value.as_int32() {
@@ -1997,7 +2220,7 @@ impl Interpreter {
                     } else if let Some(sym) = key_value.as_symbol() {
                         PropertyKey::Symbol(sym.id)
                     } else {
-                        let key_str = self.to_string(key_value);
+                        let key_str = self.to_string(&key_value);
                         PropertyKey::string(&key_str)
                     };
 
@@ -2029,6 +2252,55 @@ impl Interpreter {
                             }
                         }
                         _ => {
+                            // Slow Path (Full lookup)
+                            if let Some(offset) = obj.shape().get_offset(&key) {
+                                // Update IC to Monomorphic
+                                let frame = ctx
+                                    .current_frame()
+                                    .ok_or_else(|| VmError::internal("no frame"))?;
+                                let func = frame
+                                    .module
+                                    .function(frame.function_index)
+                                    .ok_or_else(|| VmError::internal("no function"))?;
+                                let mut feedback = func.feedback_vector.write();
+                                if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                    use otter_vm_bytecode::function::InlineCache;
+                                    let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+
+                                    match ic {
+                                        InlineCache::Uninitialized => {
+                                            *ic = InlineCache::Monomorphic(shape_ptr, offset);
+                                        }
+                                        InlineCache::Monomorphic(old_shape, old_offset) => {
+                                            if *old_shape != shape_ptr {
+                                                let mut entries = [(0u64, 0usize); 4];
+                                                entries[0] = (*old_shape, *old_offset);
+                                                entries[1] = (shape_ptr, offset);
+                                                *ic = InlineCache::Polymorphic(2, entries);
+                                            }
+                                        }
+                                        InlineCache::Polymorphic(count, entries) => {
+                                            let mut found = false;
+                                            for i in 0..(*count as usize) {
+                                                if entries[i].0 == shape_ptr {
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                            if !found {
+                                                if (*count as usize) < 4 {
+                                                    entries[*count as usize] = (shape_ptr, offset);
+                                                    *count += 1;
+                                                } else {
+                                                    *ic = InlineCache::Megamorphic;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+
                             let value = obj.get(&key).unwrap_or_else(Value::undefined);
                             ctx.set_register(dst.0, value);
                             Ok(InstructionResult::Continue)
@@ -2040,25 +2312,150 @@ impl Interpreter {
                 }
             }
 
-            Instruction::SetProp { obj, key, val } => {
-                let object = ctx.get_register(obj.0);
-                let key_value = ctx.get_register(key.0);
-                let value = ctx.get_register(val.0).clone();
+            Instruction::SetProp {
+                obj,
+                key,
+                val,
+                ic_index,
+            } => {
+                let object = ctx.get_register(obj.0).clone();
+                let key_value = ctx.get_register(key.0).clone();
+                let val_val = ctx.get_register(val.0).clone();
 
                 if let Some(obj) = object.as_object() {
-                    if let Some(n) = key_value.as_int32() {
-                        obj.set(PropertyKey::Index(n as u32), value);
+                    let key = if let Some(n) = key_value.as_int32() {
+                        PropertyKey::Index(n as u32)
                     } else if let Some(s) = key_value.as_string() {
-                        obj.set(PropertyKey::string(s.as_str()), value);
+                        PropertyKey::string(s.as_str())
                     } else if let Some(sym) = key_value.as_symbol() {
-                        obj.set(PropertyKey::Symbol(sym.id), value);
+                        PropertyKey::Symbol(sym.id)
                     } else {
-                        let key_str = self.to_string(key_value);
-                        obj.set(PropertyKey::string(&key_str), value);
-                    }
-                }
+                        let key_str = self.to_string(&key_value);
+                        PropertyKey::string(&key_str)
+                    };
 
-                Ok(InstructionResult::Continue)
+                    // IC Fast Path
+                    let mut cached = false;
+                    {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        let func = frame
+                            .module
+                            .function(frame.function_index)
+                            .ok_or_else(|| VmError::internal("no function"))?;
+                        let feedback = func.feedback_vector.read();
+                        if let Some(ic) = feedback.get(*ic_index as usize) {
+                            use otter_vm_bytecode::function::InlineCache;
+                            let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+
+                            match ic {
+                                InlineCache::Monomorphic(shape_addr, offset) => {
+                                    if obj_shape_ptr == *shape_addr {
+                                        if obj.set_by_offset(*offset, val_val.clone()) {
+                                            cached = true;
+                                        }
+                                    }
+                                }
+                                InlineCache::Polymorphic(count, entries) => {
+                                    for i in 0..(*count as usize) {
+                                        if obj_shape_ptr == entries[i].0 {
+                                            if obj.set_by_offset(entries[i].1, val_val.clone()) {
+                                                cached = true;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    if cached {
+                        return Ok(InstructionResult::Continue);
+                    }
+
+                    match obj.lookup_property_descriptor(&key) {
+                        Some(crate::object::PropertyDescriptor::Accessor { set, .. }) => {
+                            let Some(setter) = set else {
+                                return Ok(InstructionResult::Continue);
+                            };
+
+                            if let Some(native_fn) = setter.as_native_function() {
+                                native_fn(&[val_val]).map_err(VmError::type_error)?;
+                                Ok(InstructionResult::Continue)
+                            } else if let Some(closure) = setter.as_function() {
+                                ctx.set_pending_args(vec![val_val]);
+                                ctx.set_pending_this(object.clone());
+                                Ok(InstructionResult::Call {
+                                    func_index: closure.function_index,
+                                    module: Arc::clone(&closure.module),
+                                    argc: 1,
+                                    return_reg: 0, // Setter return value is ignored
+                                    is_construct: false,
+                                    is_async: closure.is_async,
+                                    upvalues: closure.upvalues.clone(),
+                                })
+                            } else {
+                                Err(VmError::type_error("setter is not a function"))
+                            }
+                        }
+                        _ => {
+                            // Slow path: update IC
+                            obj.set(key.clone(), val_val);
+                            if let Some(offset) = obj.shape().get_offset(&key) {
+                                let frame = ctx
+                                    .current_frame()
+                                    .ok_or_else(|| VmError::internal("no frame"))?;
+                                let func = frame
+                                    .module
+                                    .function(frame.function_index)
+                                    .ok_or_else(|| VmError::internal("no function"))?;
+                                let mut feedback = func.feedback_vector.write();
+                                if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                    use otter_vm_bytecode::function::InlineCache;
+                                    let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+
+                                    match ic {
+                                        InlineCache::Uninitialized => {
+                                            *ic = InlineCache::Monomorphic(shape_ptr, offset);
+                                        }
+                                        InlineCache::Monomorphic(old_shape, old_offset) => {
+                                            if *old_shape != shape_ptr {
+                                                let mut entries = [(0u64, 0usize); 4];
+                                                entries[0] = (*old_shape, *old_offset);
+                                                entries[1] = (shape_ptr, offset);
+                                                *ic = InlineCache::Polymorphic(2, entries);
+                                            }
+                                        }
+                                        InlineCache::Polymorphic(count, entries) => {
+                                            let mut found = false;
+                                            for i in 0..(*count as usize) {
+                                                if entries[i].0 == shape_ptr {
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                            if !found {
+                                                if (*count as usize) < 4 {
+                                                    entries[*count as usize] = (shape_ptr, offset);
+                                                    *count += 1;
+                                                } else {
+                                                    *ic = InlineCache::Megamorphic;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Ok(InstructionResult::Continue)
+                        }
+                    }
+                } else {
+                    Ok(InstructionResult::Continue)
+                }
             }
 
             Instruction::DefineGetter { obj, key, func } => {
@@ -2132,41 +2529,230 @@ impl Interpreter {
             }
 
             Instruction::GetElem { dst, arr, idx } => {
-                let array = ctx.get_register(arr.0);
-                let index = ctx.get_register(idx.0);
+                let array = ctx.get_register(arr.0).clone();
+                let index = ctx.get_register(idx.0).clone();
 
-                let value = if let Some(obj) = array.as_object() {
-                    if let Some(n) = index.as_int32() {
+                if let Some(obj) = array.as_object() {
+                    if obj.is_array() {
+                        if let Some(n) = index.as_int32() {
+                            let idx = n as usize;
+                            let elements = obj.get_elements_storage().read();
+                            if idx < elements.len() {
+                                ctx.set_register(dst.0, elements[idx].clone());
+                                return Ok(InstructionResult::Continue);
+                            }
+                        }
+                    }
+
+                    // Fallback to generic access
+                    let value = if let Some(n) = index.as_int32() {
                         obj.get(&PropertyKey::Index(n as u32))
                             .unwrap_or_else(Value::undefined)
                     } else {
-                        let idx_str = self.to_string(index);
+                        let idx_str = self.to_string(&index);
                         obj.get(&PropertyKey::string(&idx_str))
                             .unwrap_or_else(Value::undefined)
-                    }
+                    };
+                    ctx.set_register(dst.0, value);
                 } else {
-                    Value::undefined()
-                };
-
-                ctx.set_register(dst.0, value);
+                    ctx.set_register(dst.0, Value::undefined());
+                }
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::SetElem { arr, idx, val } => {
-                let array = ctx.get_register(arr.0);
-                let index = ctx.get_register(idx.0);
-                let value = ctx.get_register(val.0).clone();
+                let array = ctx.get_register(arr.0).clone();
+                let index = ctx.get_register(idx.0).clone();
+                let val_val = ctx.get_register(val.0).clone();
 
                 if let Some(obj) = array.as_object() {
+                    if obj.is_array() {
+                        if let Some(n) = index.as_int32() {
+                            let idx = n as usize;
+                            let mut elements = obj.get_elements_storage().write();
+                            if idx < elements.len() {
+                                elements[idx] = val_val;
+                                return Ok(InstructionResult::Continue);
+                            }
+                        }
+                    }
+
+                    // Fallback to generic access
                     if let Some(n) = index.as_int32() {
-                        obj.set(PropertyKey::Index(n as u32), value);
+                        obj.set(PropertyKey::Index(n as u32), val_val);
                     } else {
-                        let idx_str = self.to_string(index);
-                        obj.set(PropertyKey::string(&idx_str), value);
+                        let idx_str = self.to_string(&index);
+                        obj.set(PropertyKey::string(&idx_str), val_val);
+                    }
+                }
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::CallMethodComputed {
+                dst,
+                obj,
+                key,
+                argc,
+                ic_index,
+            } => {
+                let receiver = ctx.get_register(obj.0).clone();
+                let key_value = ctx.get_register(key.0).clone();
+
+                // IC Fast Path
+                // IC Fast Path
+                let cached_method = if let Some(obj) = receiver.as_object() {
+                    let frame = ctx
+                        .current_frame()
+                        .ok_or_else(|| VmError::internal("no frame"))?;
+                    let func = frame
+                        .module
+                        .function(frame.function_index)
+                        .ok_or_else(|| VmError::internal("no function"))?;
+                    let feedback = func.feedback_vector.read();
+                    if let Some(otter_vm_bytecode::function::InlineCache::Monomorphic(
+                        shape_addr,
+                        offset,
+                    )) = feedback.get(*ic_index as usize)
+                    {
+                        if std::sync::Arc::as_ptr(&obj.shape()) as u64 == *shape_addr {
+                            obj.get_by_offset(*offset)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(method_value) = cached_method {
+                    // Collect arguments (args start at obj + 2)
+                    let mut args = Vec::with_capacity(*argc as usize);
+                    for i in 0..(*argc as u16) {
+                        args.push(ctx.get_register(key.0 + 1 + i).clone());
+                    }
+
+                    // Direct call handling
+                    return self.handle_call_value(ctx, &method_value, receiver, args, dst.0);
+                }
+
+                let key = self.value_to_property_key(&key_value);
+                let method_value = if let Some(obj_ref) = receiver.as_object() {
+                    obj_ref.get(&key).unwrap_or_else(Value::undefined)
+                } else {
+                    Value::undefined()
+                };
+
+                // Update IC if method was found on the object itself
+                if let Some(obj) = receiver.as_object() {
+                    if let Some(offset) = obj.shape().get_offset(&key) {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        let func = frame
+                            .module
+                            .function(frame.function_index)
+                            .ok_or_else(|| VmError::internal("no function"))?;
+                        let mut feedback = func.feedback_vector.write();
+                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                            if let otter_vm_bytecode::function::InlineCache::Uninitialized = ic {
+                                *ic = otter_vm_bytecode::function::InlineCache::Monomorphic(
+                                    std::sync::Arc::as_ptr(&obj.shape()) as u64,
+                                    offset,
+                                );
+                            }
+                        }
                     }
                 }
 
-                Ok(InstructionResult::Continue)
+                let mut args = Vec::new();
+                for i in 0..(*argc as u16) {
+                    args.push(ctx.get_register(obj.0 + 2 + i).clone());
+                }
+
+                self.handle_call_value(ctx, &method_value, receiver, args, dst.0)
+            }
+
+            Instruction::CallMethodComputedSpread {
+                dst,
+                obj,
+                key,
+                spread,
+                ic_index,
+            } => {
+                let receiver = ctx.get_register(obj.0).clone();
+                let key_value = ctx.get_register(key.0).clone();
+                let spread_arr = ctx.get_register(spread.0).clone();
+
+                // IC Fast Path
+                let cached_method = if let Some(obj) = receiver.as_object() {
+                    let frame = ctx
+                        .current_frame()
+                        .ok_or_else(|| VmError::internal("no frame"))?;
+                    let func = frame
+                        .module
+                        .function(frame.function_index)
+                        .ok_or_else(|| VmError::internal("no function"))?;
+                    let feedback = func.feedback_vector.read();
+                    if let Some(otter_vm_bytecode::function::InlineCache::Monomorphic(
+                        shape_addr,
+                        offset,
+                    )) = feedback.get(*ic_index as usize)
+                    {
+                        if std::sync::Arc::as_ptr(&obj.shape()) as u64 == *shape_addr {
+                            obj.get_by_offset(*offset)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(method_value) = cached_method {
+                    // Direct call handling
+                    return self.dispatch_method_spread(
+                        ctx,
+                        &method_value,
+                        receiver,
+                        &spread_arr,
+                        dst.0,
+                    );
+                }
+
+                let key = self.value_to_property_key(&key_value);
+                let method_value = if let Some(obj_ref) = receiver.as_object() {
+                    obj_ref.get(&key).unwrap_or_else(Value::undefined)
+                } else {
+                    Value::undefined()
+                };
+
+                // Update IC if method was found on the object itself
+                if let Some(obj) = receiver.as_object() {
+                    if let Some(offset) = obj.shape().get_offset(&key) {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        let func = frame
+                            .module
+                            .function(frame.function_index)
+                            .ok_or_else(|| VmError::internal("no function"))?;
+                        let mut feedback = func.feedback_vector.write();
+                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                            if let otter_vm_bytecode::function::InlineCache::Uninitialized = ic {
+                                *ic = otter_vm_bytecode::function::InlineCache::Monomorphic(
+                                    std::sync::Arc::as_ptr(&obj.shape()) as u64,
+                                    offset,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                self.dispatch_method_spread(ctx, &method_value, receiver, &spread_arr, dst.0)
             }
 
             Instruction::Spread { dst, src } => {
@@ -2300,6 +2886,18 @@ impl Interpreter {
             }
 
             // Catch-all for unimplemented instructions
+            // TODO: Task List
+            // [x] Phase 3 Implementation: GC Integration [x]
+            // - [x] Implement `Trace` for `Shape` [x]
+            // - [x] Implement `Trace` for `InlineCache` and `feedback_vector` [x]
+            // - [x] Update `JsObject::trace` to include Shapes, elements, and keys [x]
+            // - [x] Trace bytecode constants and modules [x]
+            // - [x] Verify GC safety with simulated collections [x]
+            // [/] Phase 4 Implementation: Polymorphic ICs & Array Speedups [/]
+            // - [ ] Extend `InlineCache` to support `Polymorphic` state (up to 4 shapes) [ ]
+            // - [ ] Update Interpreter to handle polymorphic cache hits [ ]
+            // - [ ] Optimize Array indexing (`elements` access bypass) [ ]
+            // - [ ] Verify performance on polymorphic benchmarks [ ]
             _ => Err(VmError::internal(format!(
                 "Unimplemented instruction: {:?}",
                 instruction
@@ -2325,6 +2923,42 @@ impl Interpreter {
         }
     }
 
+    /// Handle a function call value (native or closure)
+    fn handle_call_value(
+        &self,
+        ctx: &mut VmContext,
+        func_value: &Value,
+        this_value: Value,
+        args: Vec<Value>,
+        return_reg: u16,
+    ) -> VmResult<InstructionResult> {
+        // Native function path
+        if let Some(native_fn) = func_value.as_native_function() {
+            // Direct execution
+            let result = native_fn(&args).map_err(VmError::type_error)?;
+            ctx.set_register(return_reg, result);
+            return Ok(InstructionResult::Continue);
+        }
+
+        // Closure path
+        if let Some(closure) = func_value.as_function() {
+            let argc = args.len() as u8;
+            ctx.set_pending_this(this_value);
+            ctx.set_pending_args(args);
+            return Ok(InstructionResult::Call {
+                func_index: closure.function_index,
+                module: Arc::clone(&closure.module),
+                argc,
+                return_reg,
+                is_construct: false,
+                is_async: closure.is_async,
+                upvalues: closure.upvalues.clone(),
+            });
+        }
+
+        Err(VmError::type_error("not a function"))
+    }
+
     /// Add operation (handles string concatenation)
     fn op_add(&self, left: &Value, right: &Value) -> VmResult<Value> {
         // String concatenation
@@ -2343,8 +2977,56 @@ impl Interpreter {
         let right_num = right
             .as_number()
             .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
-
         Ok(Value::number(left_num + right_num))
+    }
+
+    /// Internal method dispatch helper for spread
+    fn dispatch_method_spread(
+        &self,
+        ctx: &mut VmContext,
+        method_value: &Value,
+        receiver: Value,
+        spread_arr: &Value,
+        return_reg: u16,
+    ) -> VmResult<InstructionResult> {
+        // Collect all arguments from the spread array
+        let mut args = Vec::new();
+        if let Some(obj) = spread_arr.as_object() {
+            let len = obj
+                .get(&PropertyKey::string("length"))
+                .and_then(|v| v.as_int32())
+                .unwrap_or(0);
+            for i in 0..len {
+                args.push(
+                    obj.get(&PropertyKey::Index(i as u32))
+                        .unwrap_or_else(Value::undefined),
+                );
+            }
+        }
+
+        if let Some(native_fn) = method_value.as_native_function() {
+            let result = native_fn(&args).map_err(VmError::type_error)?;
+            ctx.set_register(return_reg, result);
+            return Ok(InstructionResult::Continue);
+        }
+
+        if let Some(closure) = method_value.as_function() {
+            let argc = args.len() as u8;
+            ctx.set_pending_args(args);
+            ctx.set_pending_this(receiver);
+
+            return Ok(InstructionResult::Call {
+                func_index: closure.function_index,
+                module: Arc::clone(&closure.module),
+                argc,
+                return_reg,
+                is_construct: false,
+                is_async: closure.is_async,
+                upvalues: closure.upvalues.clone(),
+            });
+        }
+
+        Err(VmError::type_error("method is not a function"))
     }
 
     /// Convert value to string
@@ -2515,7 +3197,6 @@ impl Interpreter {
                     ctx.get_or_create_open_upvalue(idx.0)?
                 }
                 UpvalueCapture::Upvalue(idx) => {
-                    // Capture from parent's upvalue (transitive capture).
                     // The parent's upvalue is already a cell, just clone the Rc.
                     ctx.get_upvalue_cell(idx.0)?.clone()
                 }
@@ -2547,7 +3228,7 @@ enum InstructionResult {
         func_index: u32,
         module: Arc<Module>,
         argc: u8,
-        return_reg: u8,
+        return_reg: u16,
         is_construct: bool,
         is_async: bool,
         upvalues: Vec<UpvalueCell>,
@@ -2555,7 +3236,7 @@ enum InstructionResult {
     /// Suspend execution waiting for Promise
     Suspend {
         promise: Arc<JsPromise>,
-        resume_reg: u8,
+        resume_reg: u16,
     },
     /// Yield from generator
     Yield { value: Value },
@@ -2682,12 +3363,14 @@ mod tests {
                 obj: Register(0),
                 name: ConstantIndex(0),
                 val: Register(1),
+                ic_index: 0,
             })
             // GetPropConst r2, r0, "x"
             .instruction(Instruction::GetPropConst {
                 dst: Register(2),
                 obj: Register(0),
                 name: ConstantIndex(0),
+                ic_index: 0,
             })
             // Return r2
             .instruction(Instruction::Return { src: Register(2) })
@@ -2776,12 +3459,14 @@ mod tests {
                 obj: Register(0),
                 key: Register(2),
                 val: Register(1),
+                ic_index: 0,
             })
             // GetProp r3, r0, r2
             .instruction(Instruction::GetProp {
                 dst: Register(3),
                 obj: Register(0),
                 key: Register(2),
+                ic_index: 0,
             })
             // Return r3
             .instruction(Instruction::Return { src: Register(3) })
@@ -3086,9 +3771,11 @@ mod tests {
                 dst: Register(3),
                 obj: Register(0),
                 name: ConstantIndex(0),
+                ic_index: 0,
             })
             // Return r3
             .instruction(Instruction::Return { src: Register(3) })
+            .feedback_vector_size(1)
             .build();
 
         // Getter function: returns 42
@@ -3139,6 +3826,7 @@ mod tests {
                 obj: Register(0),
                 name: ConstantIndex(1), // "_x"
                 val: Register(1),
+                ic_index: 0,
             })
             // LoadConst r2, "x" (key)
             .instruction(Instruction::LoadConst {
@@ -3166,15 +3854,18 @@ mod tests {
                 obj: Register(0),
                 name: ConstantIndex(0), // "x"
                 val: Register(4),
+                ic_index: 1,
             })
             // GetPropConst r5, r0, "_x" (read back)
             .instruction(Instruction::GetPropConst {
                 dst: Register(5),
                 obj: Register(0),
                 name: ConstantIndex(1), // "_x"
+                ic_index: 2,
             })
             // Return r5
             .instruction(Instruction::Return { src: Register(5) })
+            .feedback_vector_size(3)
             .build();
 
         // Setter function: this._x = arg

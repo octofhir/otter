@@ -1,0 +1,123 @@
+//! Hidden Classes (Shapes) for property access optimization.
+//!
+//! A Shape represents the structure of an object: what properties it has
+//! and at what offsets they are stored. Shapes are shared between objects
+//! with the same structure using a transition tree.
+
+use crate::object::PropertyKey;
+use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
+use std::sync::Arc;
+
+/// A Shape defines the layout of properties in an object.
+pub struct Shape {
+    /// The parent shape from which this shape was transitioned.
+    /// None for the root (empty) shape.
+    pub parent: Option<Arc<Shape>>,
+
+    /// The property key that was added to the parent to create this shape.
+    pub key: Option<PropertyKey>,
+
+    /// The offset of the property in the object's property vector.
+    pub offset: Option<usize>,
+
+    /// Transitions from this shape to child shapes when a new property is added.
+    transitions: RwLock<FxHashMap<PropertyKey, Arc<Shape>>>,
+
+    /// Cache of all property offsets in this shape (inherited + own).
+    /// This is built lazily or during creation for fast lookups.
+    property_map: FxHashMap<PropertyKey, usize>,
+}
+
+impl Shape {
+    /// Trace elements in this shape for GC
+    pub fn trace(&self, tracer: &mut dyn crate::gc::Tracer) {
+        // Trace the property key that created this shape
+        if let Some(key) = &self.key {
+            key.trace(tracer);
+        }
+
+        // Trace the parent shape to keep the transition path alive
+        if let Some(parent) = &self.parent {
+            tracer.mark(parent.as_ref());
+        }
+
+        // Note: transitions are not traced here to avoid infinite recursion
+        // during marking. The transition map is essentially a weak cache
+        // or part of the tree structure.
+    }
+
+    /// Create a new root (empty) shape.
+    pub fn root() -> Arc<Self> {
+        Arc::new(Self {
+            parent: None,
+            key: None,
+            offset: None,
+            transitions: RwLock::new(FxHashMap::default()),
+            property_map: FxHashMap::default(),
+        })
+    }
+
+    /// Find a transition for a given key, or create a new one.
+    pub fn transition(self: &Arc<Self>, key: PropertyKey) -> Arc<Self> {
+        // Check if transition already exists
+        {
+            let transitions = self.transitions.read();
+            if let Some(shape) = transitions.get(&key) {
+                return Arc::clone(shape);
+            }
+        }
+
+        // Create new transition
+        let mut transitions = self.transitions.write();
+
+        // Double-check after acquiring write lock
+        if let Some(shape) = transitions.get(&key) {
+            return Arc::clone(shape);
+        }
+
+        let next_offset = self.offset.map(|o| o + 1).unwrap_or(0);
+
+        let mut next_property_map = self.property_map.clone();
+        next_property_map.insert(key.clone(), next_offset);
+
+        let new_shape = Arc::new(Self {
+            parent: Some(Arc::clone(self)),
+            key: Some(key.clone()),
+            offset: Some(next_offset),
+            transitions: RwLock::new(FxHashMap::default()),
+            property_map: next_property_map,
+        });
+
+        transitions.insert(key, Arc::clone(&new_shape));
+        new_shape
+    }
+
+    /// Get the offset of a property key in this shape.
+    pub fn get_offset(&self, key: &PropertyKey) -> Option<usize> {
+        self.property_map.get(key).copied()
+    }
+
+    /// Get all own property keys in this shape.
+    pub fn own_keys(&self) -> Vec<PropertyKey> {
+        let keys: Vec<_> = self.property_map.keys().cloned().collect();
+        // In a more advanced implementation, we might want to preserve insertion order.
+        // For now, sorting or returning as is.
+        keys
+    }
+
+    /// Get the number of properties defined in this shape.
+    pub fn property_count(&self) -> usize {
+        self.property_map.len()
+    }
+}
+
+impl std::fmt::Debug for Shape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shape")
+            .field("key", &self.key)
+            .field("offset", &self.offset)
+            .field("property_count", &self.property_count())
+            .finish()
+    }
+}

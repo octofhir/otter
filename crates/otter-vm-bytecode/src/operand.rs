@@ -2,27 +2,27 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Virtual register (0-255)
+/// Virtual register (0-65535)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
-pub struct Register(pub u8);
+pub struct Register(pub u16);
 
 impl Register {
     /// Create a new register
     #[inline]
-    pub const fn new(index: u8) -> Self {
+    pub const fn new(index: u16) -> Self {
         Self(index)
     }
 
     /// Get register index
     #[inline]
-    pub const fn index(self) -> u8 {
+    pub const fn index(self) -> u16 {
         self.0
     }
 }
 
-impl From<u8> for Register {
-    fn from(index: u8) -> Self {
+impl From<u16> for Register {
+    fn from(index: u16) -> Self {
         Self(index)
     }
 }

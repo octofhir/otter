@@ -41,8 +41,28 @@ pub enum UpvalueCapture {
     Upvalue(LocalIndex),
 }
 
+/// State of an Inline Cache (IC)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InlineCache {
+    /// Initial state: no information cached
+    Uninitialized,
+    /// Monomorphic state: single shape and offset cached
+    /// (ShapeId (u64 address for now), Offset)
+    Monomorphic(u64, usize),
+    /// Polymorphic state: multiple shapes and offsets cached (up to 4)
+    Polymorphic(u8, [(u64, usize); 4]),
+    /// Megamorphic state: too many shapes seen, fallback to slow path
+    Megamorphic,
+}
+
+impl Default for InlineCache {
+    fn default() -> Self {
+        Self::Uninitialized
+    }
+}
+
 /// A bytecode function
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Function {
     /// Function name (empty for anonymous)
     pub name: Option<String>,
@@ -54,7 +74,7 @@ pub struct Function {
     pub local_count: u16,
 
     /// Number of registers needed
-    pub register_count: u8,
+    pub register_count: u16,
 
     /// Function flags
     pub flags: FunctionFlags,
@@ -64,6 +84,9 @@ pub struct Function {
 
     /// Bytecode instructions
     pub instructions: Vec<Instruction>,
+
+    /// Feedback vector for Inline Caches (mutable at runtime)
+    pub feedback_vector: parking_lot::RwLock<Vec<InlineCache>>,
 
     /// Source location mapping (instruction index -> source offset)
     pub source_map: Option<SourceMap>,
@@ -117,16 +140,35 @@ impl Function {
     }
 }
 
+impl Clone for Function {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            param_count: self.param_count,
+            local_count: self.local_count,
+            register_count: self.register_count,
+            flags: self.flags,
+            upvalues: self.upvalues.clone(),
+            instructions: self.instructions.clone(),
+            feedback_vector: parking_lot::RwLock::new(self.feedback_vector.read().clone()),
+            source_map: self.source_map.clone(),
+            param_names: self.param_names.clone(),
+            local_names: self.local_names.clone(),
+        }
+    }
+}
+
 /// Builder for creating functions
 #[derive(Debug, Default)]
 pub struct FunctionBuilder {
     name: Option<String>,
     param_count: u8,
     local_count: u16,
-    register_count: u8,
+    register_count: u16,
     flags: FunctionFlags,
     upvalues: Vec<UpvalueCapture>,
     instructions: Vec<Instruction>,
+    feedback_vector: Vec<InlineCache>,
     source_map: Option<SourceMap>,
     param_names: Vec<String>,
     local_names: Vec<String>,
@@ -157,7 +199,7 @@ impl FunctionBuilder {
     }
 
     /// Set register count
-    pub fn register_count(mut self, count: u8) -> Self {
+    pub fn register_count(mut self, count: u16) -> Self {
         self.register_count = count;
         self
     }
@@ -216,6 +258,12 @@ impl FunctionBuilder {
         self
     }
 
+    /// Set feedback vector size
+    pub fn feedback_vector_size(mut self, size: usize) -> Self {
+        self.feedback_vector = vec![InlineCache::Uninitialized; size];
+        self
+    }
+
     /// Set source map
     pub fn source_map(mut self, source_map: SourceMap) -> Self {
         self.source_map = Some(source_map);
@@ -244,6 +292,7 @@ impl FunctionBuilder {
             flags: self.flags,
             upvalues: self.upvalues,
             instructions: self.instructions,
+            feedback_vector: parking_lot::RwLock::new(self.feedback_vector),
             source_map: self.source_map,
             param_names: self.param_names,
             local_names: self.local_names,

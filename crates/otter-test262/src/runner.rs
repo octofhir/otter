@@ -135,10 +135,34 @@ impl Test262Runner {
         tests.par_iter().map(|path| self.run_test(path)).collect()
     }
 
+    /// Run all tests with a callback
+    pub fn run_all_with_callback<F>(&self, callback: F)
+    where
+        F: Fn(TestResult) + Sync + Send,
+    {
+        let tests = self.list_tests();
+        tests.par_iter().for_each(|path| {
+            let result = self.run_test(path);
+            callback(result);
+        });
+    }
+
     /// Run tests in a specific directory
     pub fn run_dir(&self, subdir: &str) -> Vec<TestResult> {
         let tests = self.list_tests_dir(subdir);
         tests.par_iter().map(|path| self.run_test(path)).collect()
+    }
+
+    /// Run tests in a specific directory with a callback
+    pub fn run_dir_with_callback<F>(&self, subdir: &str, callback: F)
+    where
+        F: Fn(TestResult) + Sync + Send,
+    {
+        let tests = self.list_tests_dir(subdir);
+        tests.par_iter().for_each(|path| {
+            let result = self.run_test(path);
+            callback(result);
+        });
     }
 
     /// Run a single test
@@ -205,12 +229,35 @@ impl Test262Runner {
         // Build test source with harness
         let mut test_source = String::new();
 
-        // Add harness files
+        // Add default harness files (sta.js and assert.js)
+        // These are required by almost all tests but not always explicitly included
+        let mut includes = vec!["sta.js".to_string(), "assert.js".to_string()];
+
+        // Add explicitly requested harness files
         for include in &metadata.includes {
-            let harness_path = self.test_dir.join("harness").join(include);
-            if let Ok(harness_content) = fs::read_to_string(&harness_path) {
-                test_source.push_str(&harness_content);
-                test_source.push('\n');
+            if !includes.contains(include) {
+                includes.push(include.clone());
+            }
+        }
+
+        // Add harness files to source
+        for include in includes {
+            let harness_path = self.test_dir.join("harness").join(&include);
+            match fs::read_to_string(&harness_path) {
+                Ok(harness_content) => {
+                    test_source.push_str(&harness_content);
+                    test_source.push('\n');
+                }
+                Err(e) => {
+                    // Only warn for explicit includes failing
+                    if metadata.includes.contains(&include) {
+                        eprintln!(
+                            "Warning: Failed to read harness file {}: {}",
+                            harness_path.display(),
+                            e
+                        );
+                    }
+                }
             }
         }
 

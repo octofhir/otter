@@ -12,7 +12,7 @@ use otter_vm_bytecode::{
 
 use crate::codegen::CodeGen;
 use crate::error::{CompileError, CompileResult};
-use crate::literal_validator::{LiteralValidator, EcmaVersion};
+use crate::literal_validator::{EcmaVersion, LiteralValidator};
 use crate::scope::ResolvedBinding;
 
 /// Maximum AST nesting depth to prevent stack overflow during compilation
@@ -110,6 +110,17 @@ impl Compiler {
 
     /// Compile a program
     fn compile_program(&mut self, program: &Program) -> CompileResult<()> {
+        // Set strict mode from program
+        let is_strict = program.source_type.is_strict()
+            || program
+                .directives
+                .iter()
+                .any(|d| d.directive.as_str() == "use strict");
+
+        if is_strict {
+            self.set_strict_mode(true);
+        }
+
         for stmt in &program.body {
             self.compile_statement(stmt)?;
         }
@@ -163,6 +174,7 @@ impl Compiler {
             Statement::ForStatement(for_stmt) => self.compile_for_statement(for_stmt),
 
             Statement::ForOfStatement(for_of_stmt) => self.compile_for_of_statement(for_of_stmt),
+            Statement::ForInStatement(for_in_stmt) => self.compile_for_in_statement(for_in_stmt),
 
             Statement::FunctionDeclaration(func) => self.compile_function_declaration(func),
 
@@ -269,7 +281,6 @@ impl Compiler {
             Statement::ClassDeclaration(class_decl) => self.compile_class_declaration(class_decl),
             Statement::SwitchStatement(switch_stmt) => self.compile_switch_statement(switch_stmt),
             Statement::DoWhileStatement(_) => Err(CompileError::unsupported("DoWhileStatement")),
-            Statement::ForInStatement(_) => Err(CompileError::unsupported("ForInStatement")),
             Statement::LabeledStatement(_) => Err(CompileError::unsupported("LabeledStatement")),
             Statement::WithStatement(_) => Err(CompileError::unsupported("WithStatement")),
 
@@ -1376,6 +1387,19 @@ impl Compiler {
         Ok(())
     }
 
+    fn compile_for_in_statement(&mut self, _for_in_stmt: &ForInStatement) -> CompileResult<()> {
+        // Stub: Treat as runtime error for now, but allow compilation to succeed
+        let msg = self
+            .codegen
+            .add_string("ForInStatement not yet implemented in runtime");
+        let reg = self.codegen.alloc_reg();
+        self.codegen
+            .emit(Instruction::LoadConst { dst: reg, idx: msg });
+        self.codegen.emit(Instruction::Throw { src: reg });
+        self.codegen.free_reg(reg);
+        Ok(())
+    }
+
     fn compile_try_statement(&mut self, try_stmt: &TryStatement) -> CompileResult<()> {
         if try_stmt.finalizer.is_some() {
             return Err(CompileError::unsupported("try/finally"));
@@ -1524,9 +1548,22 @@ impl Compiler {
 
         // Compile function body
         if let Some(body) = &func.body {
+            let saved_strict = self.is_strict_mode();
+            let has_use_strict = body
+                .directives
+                .iter()
+                .any(|d| d.directive.as_str() == "use strict");
+
+            if has_use_strict {
+                eprintln!("DEBUG: Enabling strict mode for function body");
+                self.set_strict_mode(true);
+            }
+
             for stmt in &body.statements {
                 self.compile_statement(stmt)?;
             }
+
+            self.set_strict_mode(saved_strict);
         }
 
         // Ensure return
@@ -1826,7 +1863,7 @@ impl Compiler {
             Expression::NumericLiteral(lit) => {
                 // Validate numeric literal before compilation
                 self.literal_validator.validate_numeric_literal(lit)?;
-                
+
                 let dst = self.codegen.alloc_reg();
                 let value = lit.value;
 
@@ -1846,9 +1883,20 @@ impl Compiler {
             Expression::StringLiteral(lit) => {
                 // Validate string literal before compilation
                 self.literal_validator.validate_string_literal(lit)?;
-                
+
                 let dst = self.codegen.alloc_reg();
-                let idx = self.codegen.add_string(&lit.value);
+                let units = Self::decode_lone_surrogates(lit.value.as_str(), lit.lone_surrogates);
+                let idx = self.codegen.add_string_units(units);
+                self.codegen.emit(Instruction::LoadConst { dst, idx });
+                Ok(dst)
+            }
+
+            Expression::BigIntLiteral(lit) => {
+                // For now, validation is done by parser, but we could add stricter checks here
+                // Note: lit.value is the BigInt value as a string (e.g. "100")
+
+                let dst = self.codegen.alloc_reg();
+                let idx = self.codegen.add_bigint(lit.value.to_string());
                 self.codegen.emit(Instruction::LoadConst { dst, idx });
                 Ok(dst)
             }
@@ -2052,7 +2100,7 @@ impl Compiler {
     ) -> CompileResult<Register> {
         // Validate RegExp literal before compilation
         self.literal_validator.validate_regexp_literal(lit)?;
-        
+
         // Load global RegExp and call it with (pattern, flags). Call convention requires
         // `func` and args to be in contiguous registers.
         let func_tmp = self.codegen.alloc_reg();
@@ -2125,15 +2173,13 @@ impl Compiler {
     ) -> CompileResult<Register> {
         // Validate template literal before compilation
         self.literal_validator.validate_template_literal(template)?;
-        
+
         // Template with no expressions - just return the single string part
         if template.expressions.is_empty() {
             let dst = self.codegen.alloc_reg();
             if let Some(quasi) = template.quasis.first() {
-                let raw = quasi.value.raw.as_str();
-                // Convert escape sequences in template literals
-                let cooked = Self::cook_template_string(raw);
-                let str_idx = self.codegen.add_string(&cooked);
+                let units = Self::template_element_units(quasi);
+                let str_idx = self.codegen.add_string_units(units);
                 self.codegen
                     .emit(Instruction::LoadConst { dst, idx: str_idx });
             } else {
@@ -2151,11 +2197,10 @@ impl Compiler {
 
         for (i, quasi) in template.quasis.iter().enumerate() {
             // Add the string part if non-empty
-            let raw = quasi.value.raw.as_str();
-            if !raw.is_empty() {
-                let cooked = Self::cook_template_string(raw);
+            let units = Self::template_element_units(quasi);
+            if !units.is_empty() {
                 let str_reg = self.codegen.alloc_reg();
-                let str_idx = self.codegen.add_string(&cooked);
+                let str_idx = self.codegen.add_string_units(units);
                 self.codegen.emit(Instruction::LoadConst {
                     dst: str_reg,
                     idx: str_idx,
@@ -2208,36 +2253,57 @@ impl Compiler {
         }))
     }
 
-    /// Convert template literal raw string to cooked string.
-    /// Handles escape sequences like \n, \t, etc.
-    fn cook_template_string(raw: &str) -> String {
-        let mut result = String::with_capacity(raw.len());
-        let mut chars = raw.chars().peekable();
+    /// Convert a template element's cooked value to UTF-16 code units.
+    fn template_element_units(quasi: &oxc_ast::ast::TemplateElement) -> Vec<u16> {
+        let cooked = quasi
+            .value
+            .cooked
+            .as_ref()
+            .map(|v| v.as_str())
+            .unwrap_or("");
+        Self::decode_lone_surrogates(cooked, quasi.lone_surrogates)
+    }
 
-        while let Some(c) = chars.next() {
-            if c == '\\' {
-                match chars.next() {
-                    Some('n') => result.push('\n'),
-                    Some('r') => result.push('\r'),
-                    Some('t') => result.push('\t'),
-                    Some('\\') => result.push('\\'),
-                    Some('`') => result.push('`'),
-                    Some('$') => result.push('$'),
-                    Some('"') => result.push('"'),
-                    Some('\'') => result.push('\''),
-                    Some('0') => result.push('\0'),
-                    Some(other) => {
-                        // For other escapes, just keep the character
-                        result.push(other);
+    /// Decode a cooked string with lone-surrogate encoding into UTF-16 units.
+    fn decode_lone_surrogates(value: &str, has_lone: bool) -> Vec<u16> {
+        if !has_lone {
+            return value.encode_utf16().collect();
+        }
+
+        let mut units = Vec::with_capacity(value.len());
+        let mut chars = value.chars().peekable();
+        let mut buf = [0u16; 2];
+
+        while let Some(ch) = chars.next() {
+            if ch == '\u{FFFD}' {
+                let mut hex = String::new();
+                for _ in 0..4 {
+                    if let Some(next) = chars.next() {
+                        hex.push(next);
+                    } else {
+                        break;
                     }
-                    None => result.push('\\'),
+                }
+
+                if hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    if let Ok(code) = u16::from_str_radix(&hex, 16) {
+                        units.push(code);
+                        continue;
+                    }
+                }
+
+                units.push(0xFFFD);
+                for ch in hex.chars() {
+                    let encoded = ch.encode_utf16(&mut buf);
+                    units.extend_from_slice(encoded);
                 }
             } else {
-                result.push(c);
+                let encoded = ch.encode_utf16(&mut buf);
+                units.extend_from_slice(encoded);
             }
         }
 
-        result
+        units
     }
 
     /// Compile an await expression
@@ -3141,7 +3207,11 @@ impl Compiler {
                                         Some(self.codegen.add_string(&ident.name))
                                     }
                                     PropertyKey::StringLiteral(lit) => {
-                                        Some(self.codegen.add_string(&lit.value))
+                                        let units = Self::decode_lone_surrogates(
+                                            lit.value.as_str(),
+                                            lit.lone_surrogates,
+                                        );
+                                        Some(self.codegen.add_string_units(units))
                                     }
                                     _ => None,
                                 };
@@ -3269,7 +3339,8 @@ impl Compiler {
             }
             PropertyKey::StringLiteral(lit) => {
                 let dst = self.codegen.alloc_reg();
-                let idx = self.codegen.add_string(&lit.value);
+                let units = Self::decode_lone_surrogates(lit.value.as_str(), lit.lone_surrogates);
+                let idx = self.codegen.add_string_units(units);
                 self.codegen.emit(Instruction::LoadConst { dst, idx });
                 Ok(dst)
             }
@@ -4150,11 +4221,11 @@ mod tests {
     fn test_legacy_octal_literal_strict_mode_error() {
         let mut compiler = Compiler::new();
         compiler.set_strict_mode(true);
-        
+
         // Legacy octal literals should fail in strict mode
         let result = compiler.compile("let x = 077;", "test.js");
         assert!(result.is_err());
-        
+
         let err = result.unwrap_err();
         assert!(matches!(err, CompileError::LegacySyntax { .. }));
         assert!(err.to_string().contains("Legacy octal literal"));
@@ -4163,7 +4234,7 @@ mod tests {
     #[test]
     fn test_legacy_octal_literal_non_strict_mode_success() {
         let compiler = Compiler::new(); // non-strict by default
-        
+
         // Legacy octal literals should work in non-strict mode
         let result = compiler.compile("let x = 077;", "test.js");
         assert!(result.is_ok());
@@ -4173,12 +4244,12 @@ mod tests {
     fn test_invalid_numeric_separator_error() {
         // Invalid numeric separator usage should fail
         let test_cases = vec![
-            "let x = _123;",      // leading separator
-            "let x = 123_;",      // trailing separator  
-            "let x = 1__23;",     // consecutive separators
-            "let x = 0x_FF;",     // separator after prefix
+            "let x = _123;",  // leading separator
+            "let x = 123_;",  // trailing separator
+            "let x = 1__23;", // consecutive separators
+            "let x = 0x_FF;", // separator after prefix
         ];
-        
+
         for code in test_cases {
             let compiler = Compiler::new();
             let result = compiler.compile(code, "test.js");
@@ -4188,8 +4259,8 @@ mod tests {
                 let err = result.unwrap_err();
                 // Could be either a parse error or our validation error
                 assert!(
-                    matches!(err, CompileError::Parse(_)) || 
-                    matches!(err, CompileError::InvalidLiteral { .. })
+                    matches!(err, CompileError::Parse(_))
+                        || matches!(err, CompileError::InvalidLiteral { .. })
                 );
             }
         }
@@ -4198,17 +4269,17 @@ mod tests {
     #[test]
     fn test_valid_numeric_literals_success() {
         let test_cases = vec![
-            "let x = 123;",           // decimal
-            "let x = 1_000_000;",     // decimal with separators
-            "let x = 0xFF;",          // hex
-            "let x = 0xFF_FF;",       // hex with separators
-            "let x = 0b1010;",        // binary
-            "let x = 0b10_10;",       // binary with separators
-            "let x = 3.14;",          // float
-            "let x = 1e10;",          // exponent
-            "let x = 1.5e-10;",       // exponent with sign
+            "let x = 123;",       // decimal
+            "let x = 1_000_000;", // decimal with separators
+            "let x = 0xFF;",      // hex
+            "let x = 0xFF_FF;",   // hex with separators
+            "let x = 0b1010;",    // binary
+            "let x = 0b10_10;",   // binary with separators
+            "let x = 3.14;",      // float
+            "let x = 1e10;",      // exponent
+            "let x = 1.5e-10;",   // exponent with sign
         ];
-        
+
         for code in test_cases {
             let compiler = Compiler::new();
             let result = compiler.compile(code, "test.js");
@@ -4220,17 +4291,17 @@ mod tests {
     fn test_legacy_string_escape_strict_mode_error() {
         // Legacy escape sequences should fail in strict mode
         let test_cases = vec![
-            r#"let x = "octal\1";"#,     // octal escape
-            r#"let x = "invalid\8";"#,   // invalid numeric escape
-            r#"let x = "invalid\9";"#,   // invalid numeric escape
+            r#"let x = "octal\1";"#,   // octal escape
+            r#"let x = "invalid\8";"#, // invalid numeric escape
+            r#"let x = "invalid\9";"#, // invalid numeric escape
         ];
-        
+
         for code in test_cases {
             let mut compiler = Compiler::new();
             compiler.set_strict_mode(true);
             let result = compiler.compile(code, "test.js");
             assert!(result.is_err(), "Expected error for: {}", code);
-            
+
             let err = result.unwrap_err();
             assert!(matches!(err, CompileError::LegacySyntax { .. }));
         }
@@ -4239,7 +4310,7 @@ mod tests {
     #[test]
     fn test_valid_string_literals_success() {
         let test_cases = vec![
-            r#"let x = "hello";"#,           // simple string
+            r#"let x = "hello";"#,          // simple string
             r#"let x = "hello\nworld";"#,   // newline escape
             r#"let x = "tab\tseparated";"#, // tab escape
             r#"let x = "quote\"mark";"#,    // quote escape
@@ -4247,7 +4318,7 @@ mod tests {
             r#"let x = "unicode\u0041";"#,  // unicode escape
             r#"let x = "unicode\u{41}";"#,  // unicode brace escape
         ];
-        
+
         for code in test_cases {
             let compiler = Compiler::new();
             let result = compiler.compile(code, "test.js");
@@ -4258,14 +4329,14 @@ mod tests {
     #[test]
     fn test_invalid_string_escape_error() {
         let test_cases = vec![
-            r#"let x = "bad\xGG";"#,        // invalid hex escape
-            r#"let x = "short\xF";"#,       // short hex escape
-            r#"let x = "bad\uGGGG";"#,      // invalid unicode escape
-            r#"let x = "short\u41";"#,      // short unicode escape
-            r#"let x = "empty\u{}";"#,      // empty unicode brace
-            r#"let x = "unterm\u{41";"#,    // unterminated unicode brace
+            r#"let x = "bad\xGG";"#,     // invalid hex escape
+            r#"let x = "short\xF";"#,    // short hex escape
+            r#"let x = "bad\uGGGG";"#,   // invalid unicode escape
+            r#"let x = "short\u41";"#,   // short unicode escape
+            r#"let x = "empty\u{}";"#,   // empty unicode brace
+            r#"let x = "unterm\u{41";"#, // unterminated unicode brace
         ];
-        
+
         for code in test_cases {
             let compiler = Compiler::new();
             let result = compiler.compile(code, "test.js");
@@ -4273,8 +4344,8 @@ mod tests {
             if result.is_err() {
                 let err = result.unwrap_err();
                 assert!(
-                    matches!(err, CompileError::Parse(_)) || 
-                    matches!(err, CompileError::InvalidLiteral { .. })
+                    matches!(err, CompileError::Parse(_))
+                        || matches!(err, CompileError::InvalidLiteral { .. })
                 );
             }
         }
@@ -4283,14 +4354,14 @@ mod tests {
     #[test]
     fn test_regexp_literal_validation_success() {
         let test_cases = vec![
-            r#"let x = /hello/;"#,          // simple pattern
-            r#"let x = /hello/g;"#,        // with flags
-            r#"let x = /hello/gi;"#,       // multiple flags
-            r#"let x = /[a-z]+/i;"#,       // character class
-            r#"let x = /\d+/;"#,           // escape sequence
-            r#"let x = /hello\nworld/;"#,  // newline in pattern
+            r#"let x = /hello/;"#,        // simple pattern
+            r#"let x = /hello/g;"#,       // with flags
+            r#"let x = /hello/gi;"#,      // multiple flags
+            r#"let x = /[a-z]+/i;"#,      // character class
+            r#"let x = /\d+/;"#,          // escape sequence
+            r#"let x = /hello\nworld/;"#, // newline in pattern
         ];
-        
+
         for code in test_cases {
             let compiler = Compiler::new();
             let result = compiler.compile(code, "test.js");
@@ -4301,11 +4372,11 @@ mod tests {
     #[test]
     fn test_regexp_literal_invalid_flags_error() {
         let test_cases = vec![
-            r#"let x = /hello/gg;"#,        // duplicate flag
-            r#"let x = /hello/uv;"#,        // conflicting flags u and v
-            r#"let x = /hello/x;"#,         // invalid flag
+            r#"let x = /hello/gg;"#, // duplicate flag
+            r#"let x = /hello/uv;"#, // conflicting flags u and v
+            r#"let x = /hello/x;"#,  // invalid flag
         ];
-        
+
         for code in test_cases {
             let compiler = Compiler::new();
             let result = compiler.compile(code, "test.js");
@@ -4313,8 +4384,8 @@ mod tests {
             if result.is_err() {
                 let err = result.unwrap_err();
                 assert!(
-                    matches!(err, CompileError::Parse(_)) || 
-                    matches!(err, CompileError::InvalidLiteral { .. })
+                    matches!(err, CompileError::Parse(_))
+                        || matches!(err, CompileError::InvalidLiteral { .. })
                 );
             }
         }
@@ -4323,14 +4394,14 @@ mod tests {
     #[test]
     fn test_template_literal_validation_success() {
         let test_cases = vec![
-            r#"let x = `hello`;"#,                    // simple template
-            r#"let x = `hello ${name}`;"#,           // with expression
-            r#"let x = `hello\nworld`;"#,            // with escape
-            r#"let x = `tab\tseparated`;"#,          // tab escape
-            r#"let x = `unicode\u0041`;"#,           // unicode escape
-            r#"let x = `multiple ${a} ${b}`;"#,      // multiple expressions
+            r#"let x = `hello`;"#,              // simple template
+            r#"let x = `hello ${name}`;"#,      // with expression
+            r#"let x = `hello\nworld`;"#,       // with escape
+            r#"let x = `tab\tseparated`;"#,     // tab escape
+            r#"let x = `unicode\u0041`;"#,      // unicode escape
+            r#"let x = `multiple ${a} ${b}`;"#, // multiple expressions
         ];
-        
+
         for code in test_cases {
             let compiler = Compiler::new();
             let result = compiler.compile(code, "test.js");
@@ -4341,21 +4412,23 @@ mod tests {
     #[test]
     fn test_template_literal_legacy_escape_strict_mode_error() {
         let test_cases = vec![
-            r#"let x = `octal\1`;"#,        // octal escape in template
-            r#"let x = `invalid\8`;"#,      // invalid numeric escape
+            r#"let x = `octal\1`;"#,   // octal escape in template
+            r#"let x = `invalid\8`;"#, // invalid numeric escape
         ];
-        
+
         for code in test_cases {
             let mut compiler = Compiler::new();
             compiler.set_strict_mode(true);
             let result = compiler.compile(code, "test.js");
             assert!(result.is_err(), "Expected error for: {}", code);
-            
+
             let err = result.unwrap_err();
             // The parser catches these errors before our validator, which is correct
             assert!(
-                matches!(err, CompileError::Parse(_)) || matches!(err, CompileError::LegacySyntax { .. }),
-                "Expected Parse or LegacySyntax error, got: {:?}", err
+                matches!(err, CompileError::Parse(_))
+                    || matches!(err, CompileError::LegacySyntax { .. }),
+                "Expected Parse or LegacySyntax error, got: {:?}",
+                err
             );
         }
     }
@@ -4365,12 +4438,12 @@ mod tests {
         let code = "let x = 0x811A6E;";
         let compiler = Compiler::new();
         let result = compiler.compile(code, "test.js");
-        
+
         match &result {
             Ok(_) => println!("Successfully compiled: {}", code),
             Err(e) => println!("Failed to compile {}: {:?}", code, e),
         }
-        
+
         assert!(result.is_ok(), "Failed to compile hex literal: {}", code);
     }
 
@@ -4391,10 +4464,10 @@ mod tests {
                 let code = format!("let x = {};", value);
                 let compiler = Compiler::new();
                 let result = compiler.compile(&code, "test.js");
-                
+
                 // Should compile successfully for all integer values
                 prop_assert!(result.is_ok(), "Failed to compile integer literal: {}", value);
-                
+
                 let module = result.unwrap();
                 prop_assert!(module.functions.len() >= 1);
             }
@@ -4406,10 +4479,10 @@ mod tests {
                 let code = format!("let x = 0x{:X};", value);
                 let compiler = Compiler::new();
                 let result = compiler.compile(&code, "test.js");
-                
+
                 // Should compile successfully for all hex values
                 prop_assert!(result.is_ok(), "Failed to compile hex literal: 0x{:X}", value);
-                
+
                 let module = result.unwrap();
                 prop_assert!(module.functions.len() >= 1);
             }
@@ -4421,10 +4494,10 @@ mod tests {
                 let code = format!(r#"let x = "{}";"#, text);
                 let compiler = Compiler::new();
                 let result = compiler.compile(&code, "test.js");
-                
+
                 // Should compile successfully for simple text strings
                 prop_assert!(result.is_ok(), "Failed to compile string literal: \"{}\"", text);
-                
+
                 let module = result.unwrap();
                 prop_assert!(module.functions.len() >= 1);
             }
@@ -4436,10 +4509,10 @@ mod tests {
                 let code = format!("let x = {};", value);
                 let compiler = Compiler::new();
                 let result = compiler.compile(&code, "test.js");
-                
+
                 // Should compile successfully for all boolean values
                 prop_assert!(result.is_ok(), "Failed to compile boolean literal: {}", value);
-                
+
                 let module = result.unwrap();
                 prop_assert!(module.functions.len() >= 1);
             }
@@ -4454,13 +4527,13 @@ mod tests {
                     r#"let a = {}; let b = "{}"; let c = {}; let d = null;"#,
                     num_value, str_text, bool_value
                 );
-                
+
                 let compiler = Compiler::new();
                 let result = compiler.compile(&code, "test.js");
-                
+
                 // Should compile successfully for mixed literal types
                 prop_assert!(result.is_ok(), "Failed to compile mixed literals: {}", code);
-                
+
                 let module = result.unwrap();
                 prop_assert!(module.functions.len() >= 1);
             }
@@ -4472,14 +4545,14 @@ mod tests {
                 strict_mode in any::<bool>(),
             ) {
                 let code = format!(r#"let a = {}; let b = "{}";"#, num_value, str_text);
-                
+
                 let mut compiler = Compiler::new();
                 compiler.set_strict_mode(strict_mode);
                 let result = compiler.compile(&code, "test.js");
-                
+
                 // Valid literals should compile in both strict and non-strict mode
                 prop_assert!(result.is_ok(), "Failed to compile valid literals in strict_mode={}: {}", strict_mode, code);
-                
+
                 let module = result.unwrap();
                 prop_assert!(module.functions.len() >= 1);
             }

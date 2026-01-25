@@ -63,24 +63,7 @@ impl Test262Runner {
             runtime: Arc::new(VmRuntime::new()),
             filter: None,
             skip_features: vec![
-                // Skip features we don't support yet
-                "async-iteration".to_string(),
-                "BigInt".to_string(),
-                "class-fields-private".to_string(),
-                "class-methods-private".to_string(),
-                "class-static-fields-private".to_string(),
-                "class-static-methods-private".to_string(),
-                "decorators".to_string(),
-                "import-assertions".to_string(),
-                "import-attributes".to_string(),
-                "regexp-lookbehind".to_string(),
-                "regexp-named-groups".to_string(),
-                "regexp-unicode-property-escapes".to_string(),
-                "SharedArrayBuffer".to_string(),
-                "Atomics".to_string(),
-                "WeakRef".to_string(),
-                "FinalizationRegistry".to_string(),
-                "Temporal".to_string(),
+                // User requested to run ALL tests, so we empty this list
             ],
         }
     }
@@ -205,26 +188,30 @@ impl Test262Runner {
         }
 
         // Skip module tests for now
-        if metadata.is_module() {
-            return TestResult {
-                path: relative_path,
-                outcome: TestOutcome::Skip,
-                duration: start.elapsed(),
-                error: Some("Module tests not yet supported".to_string()),
-                features: metadata.features.clone(),
-            };
-        }
+        // Skip module tests for now
+        // User requested to run ALL tests
+        // if metadata.is_module() {
+        //    return TestResult {
+        //        path: relative_path,
+        //        outcome: TestOutcome::Skip,
+        //        duration: start.elapsed(),
+        //        error: Some("Module tests not yet supported".to_string()),
+        //        features: metadata.features.clone(),
+        //    };
+        // }
 
         // Skip async tests for now
-        if metadata.is_async() {
-            return TestResult {
-                path: relative_path,
-                outcome: TestOutcome::Skip,
-                duration: start.elapsed(),
-                error: Some("Async tests not yet supported".to_string()),
-                features: metadata.features.clone(),
-            };
-        }
+        // Skip async tests for now
+        // User requested to run ALL tests
+        // if metadata.is_async() {
+        //    return TestResult {
+        //        path: relative_path,
+        //        outcome: TestOutcome::Skip,
+        //        duration: start.elapsed(),
+        //        error: Some("Async tests not yet supported".to_string()),
+        //        features: metadata.features.clone(),
+        //    };
+        // }
 
         // Build test source with harness
         let mut test_source = String::new();

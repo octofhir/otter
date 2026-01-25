@@ -8,7 +8,7 @@ use otter_vm_gc::object::tags;
 use otter_vm_gc::{GcHeader, GcObject};
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Global string intern table
 static STRING_TABLE: std::sync::LazyLock<DashMap<u64, Arc<JsString>>> =
@@ -32,11 +32,12 @@ impl StringTable {
 
     /// Intern a string in this table
     pub fn intern(&self, s: &str) -> Arc<JsString> {
-        let hash = JsString::compute_hash(s);
+        let units: Vec<u16> = s.encode_utf16().collect();
+        let hash = JsString::compute_hash_units(&units);
 
         // Check if already interned
         if let Some(existing) = self.strings.get(&hash)
-            && existing.data.as_ref() == s
+            && existing.data.as_ref() == units.as_slice()
         {
             return existing.clone();
         }
@@ -44,7 +45,8 @@ impl StringTable {
         // Create new interned string
         let js_str = Arc::new(JsString {
             header: GcHeader::new(tags::STRING),
-            data: Arc::from(s),
+            data: units.into(),
+            utf8: OnceLock::new(),
             hash,
         });
 
@@ -54,8 +56,28 @@ impl StringTable {
 
     /// Check if a string is interned in this table
     pub fn is_interned(&self, s: &str) -> bool {
-        let hash = JsString::compute_hash(s);
+        let units: Vec<u16> = s.encode_utf16().collect();
+        let hash = JsString::compute_hash_units(&units);
         self.strings.contains_key(&hash)
+    }
+
+    /// Intern a UTF-16 string in this table
+    pub fn intern_utf16(&self, units: &[u16]) -> Arc<JsString> {
+        let hash = JsString::compute_hash_units(units);
+        if let Some(existing) = self.strings.get(&hash)
+            && existing.data.as_ref() == units
+        {
+            return existing.clone();
+        }
+
+        let js_str = Arc::new(JsString {
+            header: GcHeader::new(tags::STRING),
+            data: Arc::from(units),
+            utf8: OnceLock::new(),
+            hash,
+        });
+        self.strings.insert(hash, js_str.clone());
+        js_str
     }
 
     /// Get the number of interned strings
@@ -82,7 +104,9 @@ pub struct JsString {
     /// GC header for garbage collection
     header: GcHeader,
     /// The actual string data
-    data: Arc<str>,
+    data: Arc<[u16]>,
+    /// Cached UTF-8 representation (lossy for lone surrogates)
+    utf8: OnceLock<Arc<str>>,
     /// Precomputed hash for fast lookup
     hash: u64,
 }
@@ -90,11 +114,12 @@ pub struct JsString {
 impl JsString {
     /// Create or retrieve an interned string (using global table)
     pub fn intern(s: &str) -> Arc<Self> {
-        let hash = Self::compute_hash(s);
+        let units: Vec<u16> = s.encode_utf16().collect();
+        let hash = Self::compute_hash_units(&units);
 
         // Check if already interned
         if let Some(existing) = STRING_TABLE.get(&hash)
-            && existing.data.as_ref() == s
+            && existing.data.as_ref() == units.as_slice()
         {
             return existing.clone();
         }
@@ -102,7 +127,8 @@ impl JsString {
         // Create new interned string
         let js_str = Arc::new(Self {
             header: GcHeader::new(tags::STRING),
-            data: Arc::from(s),
+            data: units.into(),
+            utf8: OnceLock::new(),
             hash,
         });
 
@@ -111,14 +137,40 @@ impl JsString {
     }
 
     /// Create a string without interning (for temporary strings)
-    pub fn new(s: impl Into<Arc<str>>) -> Self {
-        let data: Arc<str> = s.into();
-        let hash = Self::compute_hash(&data);
+    pub fn new(s: impl AsRef<str>) -> Self {
+        let units: Vec<u16> = s.as_ref().encode_utf16().collect();
+        Self::from_utf16_units(units)
+    }
+
+    /// Create a string from UTF-16 code units without interning
+    pub fn from_utf16_units(units: Vec<u16>) -> Self {
+        let hash = Self::compute_hash_units(&units);
         Self {
             header: GcHeader::new(tags::STRING),
-            data,
+            data: units.into(),
+            utf8: OnceLock::new(),
             hash,
         }
+    }
+
+    /// Create or retrieve an interned string from UTF-16 code units
+    pub fn intern_utf16(units: &[u16]) -> Arc<Self> {
+        let hash = Self::compute_hash_units(units);
+        if let Some(existing) = STRING_TABLE.get(&hash)
+            && existing.data.as_ref() == units
+        {
+            return existing.clone();
+        }
+
+        let js_str = Arc::new(Self {
+            header: GcHeader::new(tags::STRING),
+            data: Arc::from(units),
+            utf8: OnceLock::new(),
+            hash,
+        });
+
+        STRING_TABLE.insert(hash, js_str.clone());
+        js_str
     }
 
     /// Get the GC header
@@ -129,12 +181,22 @@ impl JsString {
     /// Get the string as a str slice
     #[inline]
     pub fn as_str(&self) -> &str {
+        let cached = self.utf8.get_or_init(|| {
+            let s = String::from_utf16_lossy(&self.data);
+            Arc::<str>::from(s)
+        });
+        cached.as_ref()
+    }
+
+    /// Get the UTF-16 code units
+    #[inline]
+    pub fn as_utf16(&self) -> &[u16] {
         &self.data
     }
 
     /// Get the length in UTF-16 code units (for JS compatibility)
     pub fn len_utf16(&self) -> usize {
-        self.data.encode_utf16().count()
+        self.data.len()
     }
 
     /// Get the length in bytes
@@ -157,65 +219,63 @@ impl JsString {
 
     /// Concatenate two strings
     pub fn concat(&self, other: &JsString) -> Arc<Self> {
-        let mut result = String::with_capacity(self.len() + other.len());
-        result.push_str(&self.data);
-        result.push_str(&other.data);
-        Self::intern(&result)
+        let mut units = Vec::with_capacity(self.data.len() + other.data.len());
+        units.extend_from_slice(&self.data);
+        units.extend_from_slice(&other.data);
+        Self::intern_utf16(&units)
     }
 
     /// Get character at index (UTF-16 code unit)
     pub fn char_at(&self, index: usize) -> Option<char> {
-        self.data.encode_utf16().nth(index).and_then(|c| {
-            // Handle surrogate pairs
-            char::from_u32(c as u32)
-        })
+        self.data
+            .get(index)
+            .and_then(|unit| char::from_u32(*unit as u32))
     }
 
     /// Get substring (character-based)
     pub fn substring(&self, start: usize, end: usize) -> Arc<Self> {
-        let chars: Vec<char> = self.data.chars().collect();
+        let s = self.as_str();
+        let chars: Vec<char> = s.chars().collect();
         let start = start.min(chars.len());
         let end = end.min(chars.len()).max(start);
-        let s: String = chars[start..end].iter().collect();
-        Self::intern(&s)
+        let result: String = chars[start..end].iter().collect();
+        Self::intern(&result)
     }
 
     /// Get substring with UTF-16 semantics (for JS String.prototype.substring)
     ///
     /// JavaScript strings use UTF-16 internally, so indices are in UTF-16 code units.
     pub fn substring_utf16(&self, start: usize, end: usize) -> Arc<Self> {
-        let utf16: Vec<u16> = self.data.encode_utf16().collect();
-        let start = start.min(utf16.len());
-        let end = end.min(utf16.len()).max(start);
-        let slice = &utf16[start..end];
-        let result = String::from_utf16_lossy(slice);
-        Self::intern(&result)
+        let start = start.min(self.data.len());
+        let end = end.min(self.data.len()).max(start);
+        let slice = &self.data[start..end];
+        Self::intern_utf16(slice)
     }
 
     /// Concatenate using a string table instead of global intern
     pub fn concat_with_table(&self, other: &JsString, table: &StringTable) -> Arc<Self> {
-        let mut result = String::with_capacity(self.len() + other.len());
-        result.push_str(&self.data);
-        result.push_str(&other.data);
-        table.intern(&result)
+        let mut units = Vec::with_capacity(self.data.len() + other.data.len());
+        units.extend_from_slice(&self.data);
+        units.extend_from_slice(&other.data);
+        table.intern_utf16(&units)
     }
 
-    fn compute_hash(s: &str) -> u64 {
+    fn compute_hash_units(units: &[u16]) -> u64 {
         let mut hasher = FxHasher::default();
-        s.hash(&mut hasher);
+        units.hash(&mut hasher);
         hasher.finish()
     }
 }
 
 impl std::fmt::Debug for JsString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "JsString({:?})", self.data)
+        write!(f, "JsString({:?})", self.as_str())
     }
 }
 
 impl std::fmt::Display for JsString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.data)
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -240,6 +300,12 @@ impl Hash for JsString {
 
 impl AsRef<str> for JsString {
     fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<[u16]> for JsString {
+    fn as_ref(&self) -> &[u16] {
         &self.data
     }
 }
@@ -252,7 +318,7 @@ impl GcObject for JsString {
 
     fn trace(&self, _tracer: &mut dyn FnMut(*const GcHeader)) {
         // Strings don't contain references to other GC objects
-        // The Arc<str> data is managed by Rust's reference counting
+        // The Arc<[u16]> data is managed by Rust's reference counting
     }
 }
 

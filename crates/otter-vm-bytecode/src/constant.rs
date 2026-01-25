@@ -1,15 +1,14 @@
 //! Constant pool for bytecode modules
 
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 /// A constant value in the constant pool
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Constant {
     /// 64-bit floating point number
     Number(f64),
-    /// String value (interned)
-    String(Arc<str>),
+    /// String value (UTF-16 code units)
+    String(Vec<u16>),
     /// BigInt value
     BigInt(Box<str>),
     /// Regular expression
@@ -19,8 +18,8 @@ pub enum Constant {
         /// The regex flags (e.g., "gi")
         flags: Box<str>,
     },
-    /// Template literal parts
-    TemplateLiteral(Vec<Arc<str>>),
+    /// Template literal parts (UTF-16 code units)
+    TemplateLiteral(Vec<Vec<u16>>),
 }
 
 impl Constant {
@@ -30,10 +29,16 @@ impl Constant {
         Self::Number(n)
     }
 
-    /// Create a string constant
+    /// Create a string constant from UTF-16 units
     #[inline]
-    pub fn string(s: impl Into<Arc<str>>) -> Self {
-        Self::String(s.into())
+    pub fn string(units: impl Into<Vec<u16>>) -> Self {
+        Self::String(units.into())
+    }
+
+    /// Create a string constant from UTF-8 text
+    #[inline]
+    pub fn string_from_str(s: &str) -> Self {
+        Self::String(s.encode_utf16().collect())
     }
 
     /// Create a BigInt constant
@@ -74,9 +79,9 @@ impl Constant {
 
     /// Get as string if this is a string constant
     #[inline]
-    pub fn as_string(&self) -> Option<&str> {
+    pub fn as_string(&self) -> Option<&[u16]> {
         match self {
-            Self::String(s) => Some(s),
+            Self::String(s) => Some(s.as_slice()),
             _ => None,
         }
     }
@@ -126,10 +131,16 @@ impl ConstantPool {
         self.add(Constant::number(n))
     }
 
-    /// Add a string constant
+    /// Add a string constant from UTF-8 text
     #[inline]
-    pub fn add_string(&mut self, s: impl Into<Arc<str>>) -> u32 {
-        self.add(Constant::string(s))
+    pub fn add_string(&mut self, s: &str) -> u32 {
+        self.add(Constant::string_from_str(s))
+    }
+
+    /// Add a UTF-16 string constant
+    #[inline]
+    pub fn add_string_units(&mut self, units: Vec<u16>) -> u32 {
+        self.add(Constant::string(units))
     }
 
     /// Get a constant by index
@@ -195,7 +206,7 @@ mod tests {
         pool.add_string("test");
         pool.add_number(123.0);
 
-        assert_eq!(pool.get(0), Some(&Constant::String("test".into())));
+        assert_eq!(pool.get(0), Some(&Constant::string_from_str("test")));
         assert_eq!(pool.get(1), Some(&Constant::Number(123.0)));
         assert_eq!(pool.get(2), None);
     }

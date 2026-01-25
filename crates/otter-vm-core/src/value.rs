@@ -30,6 +30,7 @@ use crate::generator::JsGenerator;
 use crate::object::JsObject;
 use crate::promise::JsPromise;
 use crate::proxy::JsProxy;
+use crate::regexp::JsRegExp;
 use crate::shared_buffer::SharedArrayBuffer;
 use crate::string::JsString;
 use std::cell::RefCell;
@@ -132,6 +133,8 @@ pub enum HeapRef {
     SharedArrayBuffer(Arc<SharedArrayBuffer>),
     /// Native function (implemented in Rust)
     NativeFunction(Arc<NativeFunctionObject>),
+    /// RegExp
+    RegExp(Arc<JsRegExp>),
 }
 
 impl std::fmt::Debug for HeapRef {
@@ -148,6 +151,7 @@ impl std::fmt::Debug for HeapRef {
             HeapRef::Generator(g) => f.debug_tuple("Generator").field(g).finish(),
             HeapRef::SharedArrayBuffer(s) => f.debug_tuple("SharedArrayBuffer").field(s).finish(),
             HeapRef::NativeFunction(_) => f.debug_tuple("NativeFunction").finish(),
+            HeapRef::RegExp(r) => f.debug_tuple("RegExp").field(r).finish(),
         }
     }
 }
@@ -297,6 +301,14 @@ impl Value {
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::Promise(promise)),
+        }
+    }
+
+    pub fn regex(regex: Arc<JsRegExp>) -> Self {
+        let ptr = Arc::as_ptr(&regex) as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::RegExp(regex)),
         }
     }
 
@@ -472,6 +484,12 @@ impl Value {
         matches!(&self.heap_ref, Some(HeapRef::Symbol(_)))
     }
 
+    /// Check if value is a BigInt
+    #[inline]
+    pub fn is_bigint(&self) -> bool {
+        matches!(&self.heap_ref, Some(HeapRef::BigInt(_)))
+    }
+
     /// Check if this is a NaN-boxed value (vs regular double)
     #[inline]
     fn is_nan_boxed(&self) -> bool {
@@ -576,6 +594,14 @@ impl Value {
         }
     }
 
+    /// Get as regex
+    pub fn as_regex(&self) -> Option<&Arc<JsRegExp>> {
+        match &self.heap_ref {
+            Some(HeapRef::RegExp(r)) => Some(r),
+            _ => None,
+        }
+    }
+
     /// Get as SharedArrayBuffer
     pub fn as_shared_array_buffer(&self) -> Option<&Arc<SharedArrayBuffer>> {
         match &self.heap_ref {
@@ -635,6 +661,7 @@ impl Value {
                 Some(HeapRef::Function(_) | HeapRef::NativeFunction(_)) => "function",
                 Some(HeapRef::Symbol(_)) => "symbol",
                 Some(HeapRef::BigInt(_)) => "bigint",
+                Some(HeapRef::RegExp(_)) => "object",
                 Some(HeapRef::Object(obj)) => {
                     // Check if it's a bound function (has __boundFunction__ property)
                     if obj.get(&PropertyKey::string("__boundFunction__")).is_some() {
@@ -679,6 +706,7 @@ impl std::fmt::Debug for Value {
                 Some(HeapRef::NativeFunction(_)) => write!(f, "[NativeFunction]"),
                 Some(HeapRef::Promise(p)) => write!(f, "{:?}", p),
                 Some(HeapRef::Proxy(p)) => write!(f, "{:?}", p),
+                Some(HeapRef::RegExp(r)) => write!(f, "/{}/{}", r.pattern, r.flags),
                 Some(HeapRef::Generator(g)) => write!(f, "{:?}", g),
                 Some(HeapRef::Symbol(s)) => {
                     if let Some(desc) = &s.description {
@@ -718,7 +746,14 @@ impl PartialEq for Value {
 
         // Strings: compare contents
         if let (Some(a), Some(b)) = (self.as_string(), other.as_string()) {
-            return a.as_str() == b.as_str();
+            return a == b;
+        }
+
+        // BigInt equality
+        if let (Some(HeapRef::BigInt(a)), Some(HeapRef::BigInt(b))) =
+            (self.heap_ref(), other.heap_ref())
+        {
+            return a.value == b.value;
         }
 
         false

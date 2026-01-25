@@ -10,6 +10,7 @@ use crate::error::{VmError, VmResult};
 use crate::generator::JsGenerator;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::promise::{JsPromise, PromiseState};
+use crate::regexp::JsRegExp;
 use crate::string::JsString;
 use crate::value::{Closure, UpvalueCell, Value};
 
@@ -748,7 +749,7 @@ impl Interpreter {
                     .get(idx.0)
                     .ok_or_else(|| VmError::internal("constant not found"))?;
 
-                let value = self.constant_to_value(constant)?;
+                let value = self.constant_to_value(ctx, constant)?;
                 ctx.set_register(dst.0, value);
                 Ok(InstructionResult::Continue)
             }
@@ -831,12 +832,14 @@ impl Interpreter {
                     return Ok(InstructionResult::Continue);
                 }
 
-                let value = ctx.get_global(name_str).unwrap_or_else(Value::undefined);
+                let value = ctx
+                    .get_global_utf16(name_str)
+                    .unwrap_or_else(Value::undefined);
 
                 // Update IC
                 {
                     let global_obj = ctx.global().clone();
-                    let key = PropertyKey::string(name_str);
+                    let key = Self::utf16_key(name_str);
                     if let Some(offset) = global_obj.shape().get_offset(&key) {
                         let frame = ctx
                             .current_frame()
@@ -900,12 +903,12 @@ impl Interpreter {
                     }
                 }
 
-                ctx.set_global(name_str, val_val.clone());
+                ctx.set_global_utf16(name_str, val_val.clone());
 
                 // Update IC
                 {
                     let global_obj = ctx.global().clone();
-                    let key = PropertyKey::string(name_str);
+                    let key = Self::utf16_key(name_str);
                     if let Some(offset) = global_obj.shape().get_offset(&key) {
                         let frame = ctx
                             .current_frame()
@@ -1028,8 +1031,21 @@ impl Interpreter {
             }
 
             Instruction::Neg { dst, src } => {
-                let value = ctx
-                    .get_register(src.0)
+                let val = ctx.get_register(src.0);
+                if let Some(crate::value::HeapRef::BigInt(b)) = val.heap_ref() {
+                    let s = &b.value;
+                    let result_s = if s.starts_with('-') {
+                        s[1..].to_string()
+                    } else if s == "0" {
+                        "0".to_string()
+                    } else {
+                        format!("-{}", s)
+                    };
+                    ctx.set_register(dst.0, Value::bigint(result_s));
+                    return Ok(InstructionResult::Continue);
+                }
+
+                let value = val
                     .as_number()
                     .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
 
@@ -1511,17 +1527,17 @@ impl Interpreter {
                         .ok_or_else(|| VmError::type_error("Function.prototype is not defined"))?;
                     if let Some(obj_ref) = receiver.as_object() {
                         obj_ref
-                            .get(&PropertyKey::string(method_name))
-                            .or_else(|| proto.get(&PropertyKey::string(method_name)))
+                            .get(&Self::utf16_key(method_name))
+                            .or_else(|| proto.get(&Self::utf16_key(method_name)))
                             .unwrap_or_else(Value::undefined)
                     } else {
                         proto
-                            .get(&PropertyKey::string(method_name))
+                            .get(&Self::utf16_key(method_name))
                             .unwrap_or_else(Value::undefined)
                     }
                 } else if let Some(obj_ref) = receiver.as_object() {
                     obj_ref
-                        .get(&PropertyKey::string(method_name))
+                        .get(&Self::utf16_key(method_name))
                         .unwrap_or_else(Value::undefined)
                 } else if receiver.is_string() {
                     let string_obj = ctx
@@ -1533,7 +1549,7 @@ impl Interpreter {
                         .and_then(|v| v.as_object().cloned())
                         .ok_or_else(|| VmError::type_error("String.prototype is not defined"))?;
                     proto
-                        .get(&PropertyKey::string(method_name))
+                        .get(&Self::utf16_key(method_name))
                         .unwrap_or_else(Value::undefined)
                 } else if receiver.is_promise() {
                     let promise_obj = ctx
@@ -1545,7 +1561,7 @@ impl Interpreter {
                         .and_then(|v| v.as_object().cloned())
                         .ok_or_else(|| VmError::type_error("Promise.prototype is not defined"))?;
                     proto
-                        .get(&PropertyKey::string(method_name))
+                        .get(&Self::utf16_key(method_name))
                         .unwrap_or_else(Value::undefined)
                 } else if receiver.is_number() {
                     let number_obj = ctx
@@ -1557,7 +1573,7 @@ impl Interpreter {
                         .and_then(|v| v.as_object().cloned())
                         .ok_or_else(|| VmError::type_error("Number.prototype is not defined"))?;
                     proto
-                        .get(&PropertyKey::string(method_name))
+                        .get(&Self::utf16_key(method_name))
                         .unwrap_or_else(Value::undefined)
                 } else if receiver.is_boolean() {
                     let boolean_obj = ctx
@@ -1569,7 +1585,7 @@ impl Interpreter {
                         .and_then(|v| v.as_object().cloned())
                         .ok_or_else(|| VmError::type_error("Boolean.prototype is not defined"))?;
                     proto
-                        .get(&PropertyKey::string(method_name))
+                        .get(&Self::utf16_key(method_name))
                         .unwrap_or_else(Value::undefined)
                 } else {
                     return Err(VmError::type_error("Cannot read property of non-object"));
@@ -1582,7 +1598,7 @@ impl Interpreter {
 
                 // Update IC if method was found on the object itself
                 if let Some(obj_ref) = receiver.as_object() {
-                    let key = PropertyKey::string(method_name);
+                    let key = Self::utf16_key(method_name);
                     if let Some(offset) = obj_ref.shape().get_offset(&key) {
                         let frame = ctx
                             .current_frame()
@@ -1825,7 +1841,7 @@ impl Interpreter {
                 // IC Fast Path
                 if let Some(obj_ref) = object.as_object() {
                     // Array .length fast path
-                    if obj_ref.is_array() && name_str == "length" {
+                    if obj_ref.is_array() && Self::utf16_eq_ascii(name_str, "length") {
                         ctx.set_register(dst.0, Value::int32(obj_ref.array_length() as i32));
                         return Ok(InstructionResult::Continue);
                     }
@@ -1871,7 +1887,7 @@ impl Interpreter {
 
                 // Special handling for functions - look up from Function.prototype
                 if object.is_function() || object.is_native_function() {
-                    let key = PropertyKey::string(name_str);
+                    let key = Self::utf16_key(name_str);
                     // First check the function's own object properties
                     if let Some(obj_ref) = object.as_object() {
                         if let Some(value) = obj_ref.get(&key) {
@@ -1899,7 +1915,7 @@ impl Interpreter {
 
                 if let Some(obj) = object.as_object() {
                     let receiver = object.clone();
-                    let key = PropertyKey::string(name_str);
+                    let key = Self::utf16_key(name_str);
                     match obj.lookup_property_descriptor(&key) {
                         Some(crate::object::PropertyDescriptor::Accessor { get, .. }) => {
                             let Some(getter) = get else {
@@ -2004,7 +2020,7 @@ impl Interpreter {
                 let val_val = ctx.get_register(val.0).clone();
 
                 if let Some(obj) = object.as_object() {
-                    let key = PropertyKey::string(name_str);
+                    let key = Self::utf16_key(name_str);
 
                     // IC Fast Path
                     let mut cached = false;
@@ -2076,8 +2092,7 @@ impl Interpreter {
                         _ => {
                             // Slow path: update IC
                             obj.set(key, val_val);
-                            if let Some(offset) =
-                                obj.shape().get_offset(&PropertyKey::string(name_str))
+                            if let Some(offset) = obj.shape().get_offset(&Self::utf16_key(name_str))
                             {
                                 let frame = ctx
                                     .current_frame()
@@ -2906,17 +2921,37 @@ impl Interpreter {
     }
 
     /// Convert a bytecode constant to a Value
-    fn constant_to_value(&self, constant: &otter_vm_bytecode::Constant) -> VmResult<Value> {
+    fn constant_to_value(
+        &self,
+        ctx: &mut VmContext,
+        constant: &otter_vm_bytecode::Constant,
+    ) -> VmResult<Value> {
         use otter_vm_bytecode::Constant;
 
         match constant {
             Constant::Number(n) => Ok(Value::number(*n)),
             Constant::String(s) => {
-                let js_str = Arc::new(JsString::new(s.clone()));
+                let js_str = JsString::intern_utf16(s);
                 Ok(Value::string(js_str))
             }
-            Constant::BigInt(_) => Err(VmError::internal("BigInt not yet supported")),
-            Constant::RegExp { .. } => Err(VmError::internal("RegExp not yet supported")),
+            Constant::BigInt(s) => Ok(Value::bigint(s.to_string())),
+            Constant::RegExp { pattern, flags } => {
+                // Get RegExp prototype
+                let global = ctx.global();
+                let regexp_ctor = global
+                    .get(&PropertyKey::string("RegExp"))
+                    .unwrap_or_else(Value::undefined);
+                let proto = if let Some(ctor) = regexp_ctor.as_object() {
+                    ctor.get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object().cloned())
+                } else {
+                    None
+                };
+
+                let js_regex =
+                    Arc::new(JsRegExp::new(pattern.to_string(), flags.to_string(), proto));
+                Ok(Value::regex(js_regex))
+            }
             Constant::TemplateLiteral(_) => {
                 Err(VmError::internal("Template literals not yet supported"))
             }
@@ -3205,6 +3240,20 @@ impl Interpreter {
         }
 
         Ok(captured)
+    }
+
+    fn utf16_key(units: &[u16]) -> PropertyKey {
+        PropertyKey::from_js_string(JsString::intern_utf16(units))
+    }
+
+    fn utf16_eq_ascii(units: &[u16], ascii: &str) -> bool {
+        if units.len() != ascii.len() {
+            return false;
+        }
+        units
+            .iter()
+            .zip(ascii.as_bytes().iter())
+            .all(|(unit, byte)| *unit == *byte as u16)
     }
 }
 

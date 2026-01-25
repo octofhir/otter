@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::async_context::SavedFrame;
 use crate::error::{VmError, VmResult};
 use crate::object::JsObject;
+use crate::string::JsString;
 use crate::value::{UpvalueCell, Value};
 
 /// Maximum call stack depth
@@ -234,10 +235,24 @@ impl VmContext {
         self.global.get(&PropertyKey::string(name))
     }
 
+    /// Get global variable by UTF-16 code units
+    pub fn get_global_utf16(&self, units: &[u16]) -> Option<Value> {
+        use crate::object::PropertyKey;
+        let key = PropertyKey::from_js_string(JsString::intern_utf16(units));
+        self.global.get(&key)
+    }
+
     /// Set global variable
     pub fn set_global(&self, name: &str, value: Value) {
         use crate::object::PropertyKey;
         self.global.set(PropertyKey::string(name), value);
+    }
+
+    /// Set global variable by UTF-16 code units
+    pub fn set_global_utf16(&self, units: &[u16], value: Value) {
+        use crate::object::PropertyKey;
+        let key = PropertyKey::from_js_string(JsString::intern_utf16(units));
+        self.global.set(key, value);
     }
 
     /// Push a new call frame

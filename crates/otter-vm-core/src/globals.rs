@@ -8,7 +8,8 @@
 
 use std::sync::Arc;
 
-use crate::object::{JsObject, PropertyKey};
+use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
+use crate::regexp::JsRegExp;
 use crate::string::JsString;
 use crate::value::Value;
 
@@ -67,6 +68,263 @@ pub fn setup_global_object(global: &Arc<JsObject>) {
         PropertyKey::string("decodeURIComponent"),
         Value::native_function(global_decode_uri_component),
     );
+
+    // Standard built-in objects
+    setup_builtin_constructors(global);
+}
+
+/// Set up standard built-in constructors and their prototypes
+fn setup_builtin_constructors(global: &Arc<JsObject>) {
+    let builtins = [
+        "Object",
+        "Function",
+        "Array",
+        "String",
+        "Number",
+        "Boolean",
+        "RegExp",
+        "Error",
+        "TypeError",
+        "ReferenceError",
+        "SyntaxError",
+        "RangeError",
+        "URIError",
+        "EvalError",
+        "BigInt",
+        "Test262Error",
+    ];
+
+    for name in builtins {
+        let proto = Arc::new(JsObject::new(None));
+        // Create constructor based on type
+        let ctor = if name == "Boolean" {
+            Value::native_function(|args| {
+                let b = if let Some(val) = args.get(0) {
+                    to_boolean(val)
+                } else {
+                    false // to_boolean(undefined) is false
+                };
+                Ok(Value::boolean(b))
+            })
+        } else if name == "RegExp" {
+            Value::native_function(|args| {
+                let pattern = args
+                    .get(0)
+                    .map(|v| to_string(v))
+                    .unwrap_or_else(|| "".to_string());
+                let flags = args
+                    .get(1)
+                    .map(|v| to_string(v))
+                    .unwrap_or_else(|| "".to_string());
+
+                // Get RegExp.prototype from new.target or default?
+                // For now, simpler: create with None (default)
+                // Actually if called as function, RegExp acts as constructor (ES6 NewTarget logic needed?)
+                // OtterVM might not support new.target fully yet or it's implicitly constructor.
+
+                // Construct RegExp object
+                let regex = Arc::new(JsRegExp::new(
+                    pattern, flags,
+                    None, // TODO: Link to proper prototype if needed explicitly, but JsObject::new(None) usually fine?
+                         // No, JsObject::new(None) creates object with Object.prototype (or null?).
+                         // We want RegExp.prototype.
+                         // But we are inside setup_builtin_constructors loop, 'proto' variable is the prototype we are building!
+                         // But we want instances to have THAT prototype.
+                         // We can't access 'proto' here inside closure easily if we move it?
+                         // Actually 'proto' is Arc, we can clone it into closure.
+                ));
+                Ok(Value::regex(regex))
+            })
+        } else if name == "BigInt" {
+            Value::native_function(|args| {
+                if let Some(val) = args.get(0) {
+                    if let Some(n) = val.as_number() {
+                        if n.is_nan() || n.is_infinite() {
+                            return Err("RangeError: invalid BigInt".to_string());
+                        }
+                        if n.trunc() != n {
+                            return Err("RangeError: The number cannot be converted to a BigInt because it is not an integer".to_string());
+                        }
+                        return Ok(Value::bigint(format!("{:.0}", n)));
+                    }
+                    if val.is_string() {
+                        let s = to_string(val);
+                        return Ok(Value::bigint(s));
+                    }
+                    if val.is_boolean() {
+                        return Ok(Value::bigint(if val.to_boolean() {
+                            "1".to_string()
+                        } else {
+                            "0".to_string()
+                        }));
+                    }
+                    // Fallback
+                    let s = to_string(val);
+                    Ok(Value::bigint(s))
+                } else {
+                    Err("TypeError: Cannot convert undefined to a BigInt".to_string())
+                }
+            })
+        } else {
+            Value::native_function(|args| {
+                // If called as a constructor (which we assume for now for these builtins),
+                // and arguments are present, we might want to set properties.
+                // For Error types, setting 'message' is crucial.
+                if let Some(msg) = args.get(0) {
+                    let obj = JsObject::new(None);
+                    obj.set(PropertyKey::string("message"), msg.clone());
+                    return Ok(Value::object(Arc::new(obj)));
+                }
+                Ok(Value::undefined())
+            })
+        };
+
+        // Add basic toString to prototypes
+        if name == "Object" {
+            proto.set(
+                PropertyKey::string("toString"),
+                Value::native_function(|_| Ok(Value::string(JsString::intern("[object Object]")))),
+            );
+        } else if name == "Function" {
+            proto.set(
+                PropertyKey::string("toString"),
+                Value::native_function(|_| {
+                    Ok(Value::string(JsString::intern(
+                        "function () { [native code] }",
+                    )))
+                }),
+            );
+        } else if name == "String" {
+            proto.set(
+                PropertyKey::string("toString"),
+                Value::native_function(|args| {
+                    if let Some(this_val) = args.get(0) {
+                        return Ok(Value::string(JsString::intern(&to_string(this_val))));
+                    }
+                    Ok(Value::string(JsString::intern("")))
+                }),
+            );
+        }
+
+        if let Some(ctor_obj) = ctor.as_object() {
+            ctor_obj.set(
+                PropertyKey::string("prototype"),
+                Value::object(proto.clone()),
+            );
+            proto.set(PropertyKey::string("constructor"), ctor.clone());
+
+            // Add static methods to constructors
+            if name == "String" {
+                ctor_obj.set(
+                    PropertyKey::string("fromCharCode"),
+                    Value::native_function(|args| {
+                        let mut result = String::new();
+                        for arg in args {
+                            let n = if let Some(n) = arg.as_number() {
+                                n
+                            } else if let Some(s) = arg.as_string() {
+                                // Basic ToNumber for strings (decimal only for now)
+                                s.as_str().parse::<f64>().unwrap_or(f64::NAN)
+                            } else {
+                                // Default to 0 for others (simplified)
+                                0.0
+                            };
+
+                            if !n.is_nan() {
+                                if let Some(c) = std::char::from_u32(n as u32) {
+                                    result.push(c);
+                                }
+                            }
+                        }
+                        Ok(Value::string(JsString::intern(&result)))
+                    }),
+                );
+            }
+        }
+
+        // Add more prototype methods
+        if name == "String" {
+            proto.set(
+                PropertyKey::string("indexOf"),
+                Value::native_function(|args| {
+                    if let (Some(this_val), Some(search_val)) = (args.get(0), args.get(1)) {
+                        let this_str = to_string(this_val);
+                        let search_str = to_string(search_val);
+                        if let Some(pos) = this_str.find(&search_str) {
+                            return Ok(Value::number(pos as f64));
+                        }
+                    }
+                    Ok(Value::number(-1.0))
+                }),
+            );
+            proto.set(
+                PropertyKey::string("valueOf"),
+                Value::native_function(|args| {
+                    if let Some(this_val) = args.get(0) {
+                        return Ok(this_val.clone());
+                    }
+                    Ok(Value::undefined())
+                }),
+            );
+        } else if name == "RegExp" {
+            proto.set(
+                PropertyKey::string("test"),
+                Value::native_function(|_args| {
+                    Ok(Value::boolean(true)) // Placeholder: test usually returns boolean
+                }),
+            );
+            proto.set(
+                PropertyKey::string("exec"),
+                Value::native_function(|args| {
+                    let this_val_opt = args.get(0);
+                    let regex = this_val_opt.and_then(|v| v.as_regex()).ok_or_else(|| {
+                        "TypeError: RegExp.prototype.exec called on incompatible receiver"
+                            .to_string()
+                    })?;
+
+                    let input_str = if let Some(val) = args.get(1) {
+                        to_string(val)
+                    } else {
+                        "undefined".to_string()
+                    };
+
+                    if let Some((index, matches)) = regex.exec(&input_str) {
+                        // Create result array
+                        let arr = JsObject::array(matches.len());
+                        for (i, m) in matches.iter().enumerate() {
+                            let val = m
+                                .as_ref()
+                                .map(|s| Value::string(JsString::intern(s)))
+                                .unwrap_or(Value::undefined());
+                            arr.set(PropertyKey::Index(i as u32), val);
+                        }
+                        arr.set(PropertyKey::string("index"), Value::number(index as f64));
+                        arr.set(
+                            PropertyKey::string("input"),
+                            Value::string(JsString::intern(&input_str)),
+                        );
+                        arr.set(PropertyKey::string("groups"), Value::undefined());
+
+                        Ok(Value::array(Arc::new(arr)))
+                    } else {
+                        Ok(Value::null())
+                    }
+                }),
+            );
+        } else if name == "Object" {
+            proto.set(
+                PropertyKey::string("valueOf"),
+                Value::native_function(|args| {
+                    if let Some(this_val) = args.get(0) {
+                        return Ok(this_val.clone());
+                    }
+                    Ok(Value::undefined())
+                }),
+            );
+        }
+
+        global.define_property(PropertyKey::string(name), PropertyDescriptor::data(ctor));
+    }
 }
 
 // =============================================================================
@@ -367,6 +625,22 @@ fn to_number(value: &Value) -> f64 {
 }
 
 /// Convert a Value to a string (ToString abstract operation)
+fn to_boolean(value: &Value) -> bool {
+    if let Some(b) = value.as_boolean() {
+        return b;
+    }
+    if value.is_undefined() || value.is_null() {
+        return false;
+    }
+    if let Some(n) = value.as_number() {
+        return n != 0.0 && !n.is_nan();
+    }
+    if let Some(s) = value.as_string() {
+        return !s.as_str().is_empty();
+    }
+    true // Objects are true
+}
+
 fn to_string(value: &Value) -> String {
     if let Some(s) = value.as_string() {
         return s.as_str().to_string();

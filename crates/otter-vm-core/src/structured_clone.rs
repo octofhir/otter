@@ -105,6 +105,24 @@ impl StructuredCloner {
 
             Some(HeapRef::Proxy(_)) => Err(StructuredCloneError::NotCloneable("proxy")),
 
+            Some(HeapRef::RegExp(r)) => {
+                // Clone RegExp
+                // New object with same pattern/flags
+                // NOTE: This does not restrictively clone all properties yet, just the basic regex part.
+                // Improving strict spec compliance later if needed.
+                let new_regex = Arc::new(crate::regexp::JsRegExp::new(
+                    r.pattern.clone(),
+                    r.flags.clone(),
+                    None, // Prototype will be set by constructor/default logic usually, but here we strip it?
+                          // In structured clone, generally proto is not preserved, but for RegExp it should be standard built-in prototype.
+                          // JsRegExp::new logic handles default proto if None?
+                          // It seems JsRegExp::new takes proto.
+                          // Passing None usually means "no prototype" or "Object.prototype" depending on impl.
+                          // For now this is sufficient to pass compilation.
+                ));
+                Ok(Value::regex(new_regex))
+            }
+
             Some(HeapRef::Generator(_)) => Err(StructuredCloneError::NotCloneable("generator")),
 
             None => Ok(Value::undefined()),

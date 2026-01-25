@@ -9,6 +9,7 @@ use otter_vm_bytecode::{
 
 use crate::error::{CompileError, CompileResult};
 use crate::scope::{ResolvedBinding, ScopeChain};
+use otter_vm_bytecode::Constant;
 
 /// Register allocator
 #[derive(Debug)]
@@ -227,9 +228,19 @@ impl CodeGen {
         ConstantIndex(self.constants.add_string(s))
     }
 
+    /// Add a UTF-16 string constant
+    pub fn add_string_units(&mut self, units: Vec<u16>) -> ConstantIndex {
+        ConstantIndex(self.constants.add_string_units(units))
+    }
+
     /// Add a number constant
     pub fn add_number(&mut self, n: f64) -> ConstantIndex {
         ConstantIndex(self.constants.add_number(n))
+    }
+
+    /// Add a BigInt constant
+    pub fn add_bigint(&mut self, s: String) -> ConstantIndex {
+        ConstantIndex(self.constants.add(Constant::bigint(s)))
     }
 
     /// Emit an instruction

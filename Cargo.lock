@@ -1833,6 +1833,7 @@ dependencies = [
  "otter-vm-bytecode",
  "otter-vm-gc",
  "parking_lot",
+ "regex",
  "rustc-hash",
  "thiserror 2.0.17",
 ]

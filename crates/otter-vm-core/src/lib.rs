@@ -16,6 +16,7 @@
 
 pub mod async_context;
 pub mod context;
+pub mod drop_guard;
 pub mod error;
 pub mod gc;
 pub mod generator;
@@ -33,7 +34,9 @@ pub mod structured_clone;
 pub mod value;
 
 pub use async_context::{AsyncContext, SavedFrame, VmExecutionResult};
-pub use context::VmContext;
+pub use context::{
+    VmContext, DEFAULT_MAX_NATIVE_DEPTH, DEFAULT_MAX_STACK_DEPTH, INTERRUPT_CHECK_INTERVAL,
+};
 pub use error::{VmError, VmResult};
 pub use generator::{GeneratorContext, GeneratorState, IteratorResult, JsGenerator};
 pub use interpreter::Interpreter;

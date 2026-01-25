@@ -22,7 +22,7 @@ pub mod operand;
 
 pub use constant::{Constant, ConstantPool};
 pub use error::BytecodeError;
-pub use function::{Function, UpvalueCapture};
+pub use function::{Function, InlineCacheState, InstructionMetadata, TypeFlags, UpvalueCapture};
 pub use instruction::{Instruction, Opcode};
 pub use module::Module;
 pub use operand::{ConstantIndex, FunctionIndex, JumpOffset, LocalIndex, Register};

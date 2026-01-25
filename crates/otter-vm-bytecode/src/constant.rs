@@ -1,6 +1,8 @@
 //! Constant pool for bytecode modules
 
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
 
 /// A constant value in the constant pool
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -85,12 +87,45 @@ impl Constant {
             _ => None,
         }
     }
+
+    /// Compute a hash for deduplication purposes.
+    ///
+    /// This implements custom hashing because f64 doesn't implement Hash.
+    /// For NaN values, we use a fixed hash.
+    fn hash_for_dedup<H: Hasher>(&self, state: &mut H) {
+        // Discriminant first
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Number(n) => {
+                // Handle NaN specially: all NaN values hash the same
+                // Use bit representation for consistent hashing
+                n.to_bits().hash(state);
+            }
+            Self::String(s) => {
+                s.hash(state);
+            }
+            Self::BigInt(s) => {
+                s.hash(state);
+            }
+            Self::RegExp { pattern, flags } => {
+                pattern.hash(state);
+                flags.hash(state);
+            }
+            Self::TemplateLiteral(parts) => {
+                parts.hash(state);
+            }
+        }
+    }
 }
 
-/// Constant pool with deduplication
+/// Constant pool with O(1) hash-based deduplication
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConstantPool {
     constants: Vec<Constant>,
+    /// Hash-based deduplication index: hash -> list of indices with that hash
+    /// We use a list because different constants can have the same hash (collision).
+    #[serde(skip)]
+    dedup_index: FxHashMap<u64, Vec<u32>>,
 }
 
 impl ConstantPool {
@@ -98,6 +133,7 @@ impl ConstantPool {
     pub fn new() -> Self {
         Self {
             constants: Vec::new(),
+            dedup_index: FxHashMap::default(),
         }
     }
 
@@ -105,24 +141,48 @@ impl ConstantPool {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             constants: Vec::with_capacity(capacity),
+            dedup_index: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
         }
+    }
+
+    /// Compute hash of a constant for deduplication
+    #[inline]
+    fn hash_constant(constant: &Constant) -> u64 {
+        let mut hasher = rustc_hash::FxHasher::default();
+        constant.hash_for_dedup(&mut hasher);
+        hasher.finish()
     }
 
     /// Add a constant to the pool, returns its index
     ///
-    /// Deduplicates identical constants to save space.
+    /// Deduplicates identical constants using O(1) hash-based lookup.
     pub fn add(&mut self, constant: Constant) -> u32 {
-        // Check for existing identical constant
-        for (idx, existing) in self.constants.iter().enumerate() {
-            if *existing == constant {
-                return idx as u32;
+        let hash = Self::hash_constant(&constant);
+
+        // Check if we have any constants with this hash
+        if let Some(indices) = self.dedup_index.get(&hash) {
+            // Check for exact match among hash collisions
+            for &idx in indices {
+                if self.constants[idx as usize] == constant {
+                    return idx;
+                }
             }
         }
 
         // Add new constant
         let idx = self.constants.len() as u32;
         self.constants.push(constant);
+        self.dedup_index.entry(hash).or_default().push(idx);
         idx
+    }
+
+    /// Rebuild the dedup index after deserialization
+    pub fn rebuild_dedup_index(&mut self) {
+        self.dedup_index.clear();
+        for (idx, constant) in self.constants.iter().enumerate() {
+            let hash = Self::hash_constant(constant);
+            self.dedup_index.entry(hash).or_default().push(idx as u32);
+        }
     }
 
     /// Add a number constant

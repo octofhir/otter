@@ -650,6 +650,9 @@ impl Value {
                 !n.is_nan() && n != 0.0
             }
             _ => {
+                if let Some(HeapRef::BigInt(b)) = &self.heap_ref {
+                    return b.value != "0";
+                }
                 // Strings: empty string is false
                 if let Some(s) = self.as_string() {
                     !s.is_empty()

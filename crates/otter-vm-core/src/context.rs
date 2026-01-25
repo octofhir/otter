@@ -5,7 +5,7 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::async_context::SavedFrame;
 use crate::error::{VmError, VmResult};
@@ -16,11 +16,17 @@ use crate::value::{UpvalueCell, Value};
 #[cfg(feature = "profiling")]
 use otter_profiler::RuntimeStats;
 
-/// Maximum call stack depth
-const MAX_STACK_DEPTH: usize = 1000;
+/// Default maximum call stack depth (matches RuntimeConfig default)
+pub const DEFAULT_MAX_STACK_DEPTH: usize = 10000;
+
+/// Default maximum native call depth to prevent Rust stack overflow
+pub const DEFAULT_MAX_NATIVE_DEPTH: usize = 100;
 
 /// Maximum number of registers per function
 const MAX_REGISTERS: usize = 65536;
+
+/// Interval for interrupt checking in hot loops (every N instructions)
+pub const INTERRUPT_CHECK_INTERVAL: u32 = 1000;
 
 /// A call stack frame
 #[derive(Debug)]
@@ -94,6 +100,14 @@ pub struct VmContext {
     next_frame_id: usize,
     /// Interrupt flag for timeout/cancellation support
     interrupt_flag: Arc<AtomicBool>,
+    /// Maximum call stack depth (configurable)
+    max_stack_depth: usize,
+    /// Current native call depth (for protecting against Rust stack overflow)
+    native_call_depth: AtomicUsize,
+    /// Maximum native call depth
+    max_native_depth: usize,
+    /// Instruction counter for periodic interrupt checking
+    instruction_count: u32,
     /// Optional profiling stats (enabled with 'profiling' feature)
     #[cfg(feature = "profiling")]
     profiling_stats: Option<Arc<RuntimeStats>>,
@@ -108,6 +122,15 @@ struct TryHandler {
 impl VmContext {
     /// Create a new context with a global object
     pub fn new(global: Arc<JsObject>) -> Self {
+        Self::with_config(global, DEFAULT_MAX_STACK_DEPTH, DEFAULT_MAX_NATIVE_DEPTH)
+    }
+
+    /// Create a new context with custom stack limits
+    pub fn with_config(
+        global: Arc<JsObject>,
+        max_stack_depth: usize,
+        max_native_depth: usize,
+    ) -> Self {
         Self {
             registers: vec![Value::undefined(); MAX_REGISTERS],
             call_stack: Vec::with_capacity(64),
@@ -121,8 +144,73 @@ impl VmContext {
             open_upvalues: HashMap::new(),
             next_frame_id: 0,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
+            max_stack_depth,
+            native_call_depth: AtomicUsize::new(0),
+            max_native_depth,
+            instruction_count: 0,
             #[cfg(feature = "profiling")]
             profiling_stats: None,
+        }
+    }
+
+    /// Set the maximum stack depth
+    pub fn set_max_stack_depth(&mut self, depth: usize) {
+        self.max_stack_depth = depth;
+    }
+
+    /// Get the maximum stack depth
+    pub fn max_stack_depth(&self) -> usize {
+        self.max_stack_depth
+    }
+
+    /// Set the maximum native call depth
+    pub fn set_max_native_depth(&mut self, depth: usize) {
+        self.max_native_depth = depth;
+    }
+
+    /// Get the maximum native call depth
+    pub fn max_native_depth(&self) -> usize {
+        self.max_native_depth
+    }
+
+    /// Increment native call depth and check for overflow
+    ///
+    /// Returns an error if the native call depth exceeds the maximum.
+    /// Call this before invoking native functions from the interpreter.
+    #[inline]
+    pub fn enter_native_call(&self) -> VmResult<()> {
+        let depth = self.native_call_depth.fetch_add(1, Ordering::Relaxed);
+        if depth >= self.max_native_depth {
+            self.native_call_depth.fetch_sub(1, Ordering::Relaxed);
+            return Err(VmError::StackOverflow);
+        }
+        Ok(())
+    }
+
+    /// Decrement native call depth
+    ///
+    /// Call this after a native function returns.
+    #[inline]
+    pub fn exit_native_call(&self) {
+        self.native_call_depth.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Get current native call depth
+    pub fn native_call_depth(&self) -> usize {
+        self.native_call_depth.load(Ordering::Relaxed)
+    }
+
+    /// Check and increment instruction count for periodic interrupt checking
+    ///
+    /// Returns true if interrupt check should be performed (every INTERRUPT_CHECK_INTERVAL instructions).
+    #[inline]
+    pub fn should_check_interrupt(&mut self) -> bool {
+        self.instruction_count += 1;
+        if self.instruction_count >= INTERRUPT_CHECK_INTERVAL {
+            self.instruction_count = 0;
+            true
+        } else {
+            false
         }
     }
 
@@ -307,7 +395,7 @@ impl VmContext {
         is_construct: bool,
         is_async: bool,
     ) -> VmResult<()> {
-        if self.call_stack.len() >= MAX_STACK_DEPTH {
+        if self.call_stack.len() >= self.max_stack_depth {
             return Err(VmError::StackOverflow);
         }
 
@@ -722,40 +810,61 @@ impl VmContext {
     pub fn teardown(&mut self) {
         // Break the globalThis cycle first
         use crate::object::PropertyKey;
-        // println!("DEBUG: VmContext::teardown start");
 
         self.global
             .set(PropertyKey::string("globalThis"), Value::undefined());
 
         // FORCE clear all properties to break reference cycles.
-        // We access internal storage directly to bypass `configurable: false` and `frozen` checks.
-        // This is crucial because some objects (like the test runner's $262 or globalThis)
-        // create reference cycles that prevent cleanup in our defined-GC-less runtime.
+        // We use DropGuard to iteratively destroy objects and prevent stack overflow.
+        use crate::drop_guard::DropGuard;
+        let mut guard = DropGuard::new();
 
-        // Collect values to drop OUTSIDE the lock to prevent potential deadlocks or long pauses
-        let mut values_to_drop = Vec::new();
-
+        // Clear inline properties
         {
-            // println!("DEBUG: Acquiring properties lock");
-            let mut properties = self.global.get_properties_storage().write();
-            // println!("DEBUG: Acquired properties lock, clearing {} entries", properties.len());
-            for entry in properties.iter_mut() {
+            let mut inline = self.global.get_inline_properties_storage().write();
+            for slot in inline.iter_mut() {
+                if let Some(entry) = slot.take() {
+                    match entry.desc {
+                        crate::object::PropertyDescriptor::Data { value, .. } => {
+                            if value.is_object() {
+                                guard.push(value);
+                            }
+                        }
+                        crate::object::PropertyDescriptor::Accessor { get, set, .. } => {
+                            if let Some(v) = get {
+                                if v.is_object() {
+                                    guard.push(v);
+                                }
+                            }
+                            if let Some(v) = set {
+                                if v.is_object() {
+                                    guard.push(v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clear overflow properties
+        {
+            let mut overflow = self.global.get_overflow_properties_storage().write();
+            for entry in overflow.iter_mut() {
                 // Determine if we can modify the value in place
                 if let Some(val) = entry.desc.value_mut() {
                     let mut temp = Value::undefined();
                     std::mem::swap(val, &mut temp);
-                    values_to_drop.push(temp);
+                    if temp.is_object() {
+                        guard.push(temp);
+                    }
                 } else {
                     // Accessor property - replace with data descriptor
-                    // We can't easily extract the getter/setter values to drop them later safely
-                    // without destructuring the enum, but let's try to just overwrite safely.
-                    // For now, just overwriting is likely safe enough as Accessors usually contain Functions
-                    // which don't have side-effects on drop.
                     entry.desc = crate::object::PropertyDescriptor::data(Value::undefined());
                 }
             }
+            overflow.clear();
         }
-        // println!("DEBUG: Released properties lock");
 
         // Clear array elements too if any
         {
@@ -763,14 +872,68 @@ impl VmContext {
             for val in elements.iter_mut() {
                 let mut temp = Value::undefined();
                 std::mem::swap(val, &mut temp);
-                values_to_drop.push(temp);
+                if temp.is_object() {
+                    guard.push(temp);
+                }
             }
+            elements.clear();
         }
 
-        // Drop all values outside of locks
-        // println!("DEBUG: Dropping {} values", values_to_drop.len());
-        drop(values_to_drop);
-        // println!("DEBUG: VmContext::teardown end");
+        // Harvest registers
+        for val in self.registers.iter_mut() {
+            let mut temp = Value::undefined();
+            std::mem::swap(val, &mut temp);
+            if temp.is_object() {
+                guard.push(temp);
+            }
+        }
+        self.registers.clear();
+
+        // Harvest pending args
+        for val in self.pending_args.iter_mut() {
+            let mut temp = Value::undefined();
+            std::mem::swap(val, &mut temp);
+            if temp.is_object() {
+                guard.push(temp);
+            }
+        }
+        self.pending_args.clear();
+
+        // Harvest call stack
+        for frame in self.call_stack.iter_mut() {
+            for val in frame.locals.iter_mut() {
+                let mut temp = Value::undefined();
+                std::mem::swap(val, &mut temp);
+                if temp.is_object() {
+                    guard.push(temp);
+                }
+            }
+            frame.locals.clear();
+
+            // Upvalues in frame are cells, we need to clear them too?
+            // UpvalueCell holds a shared Value.
+            // We should process them.
+            // But UpvalueCell is internal... let's see contexts.rs imports.
+        }
+        self.call_stack.clear();
+
+        // Harvest open upvalues
+        for cell in self.open_upvalues.values_mut() {
+            // UpvalueCell is complex (ref counted).
+            // Ideally we extract the value if we are the last one?
+            // Or just set it to undefined?
+            // cell.set(Value::undefined()) will drop the old value.
+            // We want to capture that old value.
+            // UpvalueCell::get() clones.
+            let val = cell.get();
+            cell.set(Value::undefined());
+            if val.is_object() {
+                guard.push(val);
+            }
+        }
+        self.open_upvalues.clear();
+
+        guard.run();
     }
 }
 
@@ -845,11 +1008,13 @@ mod tests {
     #[test]
     fn test_stack_overflow() {
         let global = Arc::new(JsObject::new(None));
-        let mut ctx = VmContext::new(global);
+        // Use a small max_stack_depth for testing
+        let test_max_depth = 100;
+        let mut ctx = VmContext::with_config(global, test_max_depth, DEFAULT_MAX_NATIVE_DEPTH);
         let module = dummy_module();
 
         // Push frames until overflow
-        for i in 0..MAX_STACK_DEPTH {
+        for i in 0..test_max_depth {
             ctx.push_frame(i as u32, Arc::clone(&module), 0, None, false, false)
                 .unwrap();
         }
@@ -857,6 +1022,24 @@ mod tests {
         // Next push should fail
         let result = ctx.push_frame(0, module, 0, None, false, false);
         assert!(matches!(result, Err(VmError::StackOverflow)));
+    }
+
+    #[test]
+    fn test_native_call_depth() {
+        let global = Arc::new(JsObject::new(None));
+        let ctx = VmContext::with_config(global, DEFAULT_MAX_STACK_DEPTH, 3);
+
+        // Should be able to enter 3 native calls
+        assert!(ctx.enter_native_call().is_ok());
+        assert!(ctx.enter_native_call().is_ok());
+        assert!(ctx.enter_native_call().is_ok());
+
+        // Fourth should fail
+        assert!(ctx.enter_native_call().is_err());
+
+        // Exit one, then should be able to enter again
+        ctx.exit_native_call();
+        assert!(ctx.enter_native_call().is_ok());
     }
 
     #[test]

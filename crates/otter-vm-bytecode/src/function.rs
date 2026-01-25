@@ -41,25 +41,118 @@ pub enum UpvalueCapture {
     Upvalue(LocalIndex),
 }
 
-/// State of an Inline Cache (IC)
+/// State of an Inline Cache (IC) for property access
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InlineCache {
+pub enum InlineCacheState {
     /// Initial state: no information cached
     Uninitialized,
     /// Monomorphic state: single shape and offset cached
-    /// (ShapeId (u64 address for now), Offset)
-    Monomorphic(u64, usize),
+    Monomorphic {
+        /// The shape identifier of the cached object
+        shape_id: u64,
+        /// The offset into the object's properties
+        offset: u32,
+    },
     /// Polymorphic state: multiple shapes and offsets cached (up to 4)
-    Polymorphic(u8, [(u64, usize); 4]),
+    Polymorphic {
+        /// Number of cached entries (1-4)
+        count: u8,
+        /// Array of (shape_id, offset) pairs
+        entries: [(u64, u32); 4],
+    },
     /// Megamorphic state: too many shapes seen, fallback to slow path
     Megamorphic,
 }
 
-impl Default for InlineCache {
+impl Default for InlineCacheState {
     fn default() -> Self {
         Self::Uninitialized
     }
 }
+
+/// Type flags for value type observations (used for type feedback)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeFlags {
+    /// Has seen undefined
+    pub seen_undefined: bool,
+    /// Has seen null
+    pub seen_null: bool,
+    /// Has seen boolean
+    pub seen_boolean: bool,
+    /// Has seen int32 (small integer)
+    pub seen_int32: bool,
+    /// Has seen number (float64)
+    pub seen_number: bool,
+    /// Has seen string
+    pub seen_string: bool,
+    /// Has seen object
+    pub seen_object: bool,
+    /// Has seen function
+    pub seen_function: bool,
+}
+
+impl TypeFlags {
+    /// Check if this is monomorphic (only one type seen)
+    pub fn is_monomorphic(&self) -> bool {
+        let count = self.seen_undefined as u8
+            + self.seen_null as u8
+            + self.seen_boolean as u8
+            + self.seen_int32 as u8
+            + self.seen_number as u8
+            + self.seen_string as u8
+            + self.seen_object as u8
+            + self.seen_function as u8;
+        count == 1
+    }
+
+    /// Check if this is polymorphic (2-4 types seen)
+    pub fn is_polymorphic(&self) -> bool {
+        let count = self.seen_undefined as u8
+            + self.seen_null as u8
+            + self.seen_boolean as u8
+            + self.seen_int32 as u8
+            + self.seen_number as u8
+            + self.seen_string as u8
+            + self.seen_object as u8
+            + self.seen_function as u8;
+        count >= 2 && count <= 4
+    }
+}
+
+/// Metadata for a single IC slot (instruction-level profiling)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstructionMetadata {
+    /// Inline cache state for property access
+    pub ic_state: InlineCacheState,
+    /// Hit count for this IC site
+    pub hit_count: u32,
+    /// Type observations for values at this site
+    pub type_observations: TypeFlags,
+}
+
+impl InstructionMetadata {
+    /// Create a new uninitialized metadata entry
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a cache hit
+    #[inline]
+    pub fn record_hit(&mut self) {
+        self.hit_count = self.hit_count.saturating_add(1);
+    }
+
+    /// Transition IC to monomorphic state
+    pub fn transition_to_monomorphic(&mut self, shape_id: u64, offset: u32) {
+        self.ic_state = InlineCacheState::Monomorphic { shape_id, offset };
+    }
+
+    /// Transition IC to megamorphic state
+    pub fn transition_to_megamorphic(&mut self) {
+        self.ic_state = InlineCacheState::Megamorphic;
+    }
+}
+
 
 /// A bytecode function
 #[derive(Debug, Serialize, Deserialize)]
@@ -86,7 +179,7 @@ pub struct Function {
     pub instructions: Vec<Instruction>,
 
     /// Feedback vector for Inline Caches (mutable at runtime)
-    pub feedback_vector: parking_lot::RwLock<Vec<InlineCache>>,
+    pub feedback_vector: parking_lot::RwLock<Vec<InlineCacheState>>,
 
     /// Source location mapping (instruction index -> source offset)
     pub source_map: Option<SourceMap>,
@@ -168,7 +261,7 @@ pub struct FunctionBuilder {
     flags: FunctionFlags,
     upvalues: Vec<UpvalueCapture>,
     instructions: Vec<Instruction>,
-    feedback_vector: Vec<InlineCache>,
+    feedback_vector: Vec<InlineCacheState>,
     source_map: Option<SourceMap>,
     param_names: Vec<String>,
     local_names: Vec<String>,
@@ -260,7 +353,7 @@ impl FunctionBuilder {
 
     /// Set feedback vector size
     pub fn feedback_vector_size(mut self, size: usize) -> Self {
-        self.feedback_vector = vec![InlineCache::Uninitialized; size];
+        self.feedback_vector = vec![InlineCacheState::Uninitialized; size];
         self
     }
 

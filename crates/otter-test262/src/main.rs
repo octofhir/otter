@@ -237,12 +237,16 @@ async fn main() {
 
     // Run tests
     println!("\nRunning tests...");
+    use std::io::Write;
+    std::io::stdout().flush().unwrap();
+
     let mut tests = if let Some(ref subdir) = args.subdir {
         println!("Subdirectory: {}", subdir);
         runner.list_tests_dir(subdir)
     } else {
         runner.list_tests()
     };
+
 
     if let Some(max) = args.max_tests {
         tests.truncate(max);

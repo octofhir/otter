@@ -86,7 +86,11 @@ impl VmRuntime {
         // TODO: Proper cloning with prototype chain
         let global = Arc::new(JsObject::new(None));
         globals::setup_global_object(&global);
-        VmContext::new(global)
+        VmContext::with_config(
+            global,
+            self.config.max_stack_depth,
+            crate::context::DEFAULT_MAX_NATIVE_DEPTH,
+        )
     }
 
     /// Execute a module

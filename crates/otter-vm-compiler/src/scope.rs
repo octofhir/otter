@@ -2,13 +2,31 @@
 
 use std::collections::HashMap;
 
+/// Variable declaration kind
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariableKind {
+    /// var declaration (hoisted, function-scoped, re-declarable)
+    Var,
+    /// let declaration (block-scoped, non-re-declarable)
+    Let,
+    /// const declaration (block-scoped, non-re-declarable, immutable)
+    Const,
+}
+
+impl VariableKind {
+    /// Check if this variable can be reassigned
+    pub fn is_const(&self) -> bool {
+        matches!(self, Self::Const)
+    }
+}
+
 /// A variable binding
 #[derive(Debug, Clone)]
 pub struct Binding {
     /// Local variable index
     pub index: u16,
-    /// Is this a const binding
-    pub is_const: bool,
+    /// Variable kind
+    pub kind: VariableKind,
     /// Is this captured by a closure
     pub is_captured: bool,
     /// Variable name
@@ -75,12 +93,17 @@ impl ScopeChain {
     }
 
     /// Declare a variable in current scope
-    pub fn declare(&mut self, name: &str, is_const: bool) -> Option<u16> {
+    pub fn declare(&mut self, name: &str, kind: VariableKind) -> Option<u16> {
         let current_idx = self.current?;
 
         // Check for redeclaration
-        if self.scopes[current_idx].bindings.contains_key(name) {
-            return None; // Already declared
+        if let Some(existing) = self.scopes[current_idx].bindings.get(name) {
+            // Only allow redeclaration if both are `var`
+            if existing.kind == VariableKind::Var && kind == VariableKind::Var {
+                return Some(existing.index);
+            }
+            // Otherwise it's an error
+            return None;
         }
 
         // Allocate local indices at the function-scope level so they remain valid
@@ -93,7 +116,7 @@ impl ScopeChain {
             name.to_string(),
             Binding {
                 index,
-                is_const,
+                kind,
                 is_captured: false,
                 name: name.to_string(),
             },
@@ -219,8 +242,8 @@ mod tests {
         let mut chain = ScopeChain::new();
         chain.enter(true); // function scope
 
-        chain.declare("x", false);
-        chain.declare("y", true);
+        chain.declare("x", VariableKind::Let);
+        chain.declare("y", VariableKind::Const);
 
         assert!(matches!(
             chain.resolve("x"),
@@ -236,10 +259,10 @@ mod tests {
     fn test_nested_scopes() {
         let mut chain = ScopeChain::new();
         chain.enter(true); // function scope
-        chain.declare("x", false);
+        chain.declare("x", VariableKind::Let);
 
         chain.enter(false); // block scope
-        chain.declare("y", false);
+        chain.declare("y", VariableKind::Let);
 
         // y is in current scope
         assert!(matches!(

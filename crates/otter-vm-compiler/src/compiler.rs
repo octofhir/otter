@@ -1038,12 +1038,19 @@ impl Compiler {
 
     /// Compile a variable declaration
     fn compile_variable_declaration(&mut self, decl: &VariableDeclaration) -> CompileResult<()> {
-        let is_const = decl.kind == VariableDeclarationKind::Const;
+        use crate::scope::VariableKind;
+
+        let kind = match decl.kind {
+            VariableDeclarationKind::Var => VariableKind::Var,
+            VariableDeclarationKind::Let => VariableKind::Let,
+            VariableDeclarationKind::Const => VariableKind::Const,
+            _ => VariableKind::Let, // Default to Let for any future kinds
+        };
 
         for declarator in &decl.declarations {
             match &declarator.id {
                 BindingPattern::BindingIdentifier(ident) => {
-                    let local_idx = self.codegen.declare_variable(&ident.name, is_const)?;
+                    let local_idx = self.codegen.declare_variable_with_kind(&ident.name, kind)?;
 
                     if let Some(init) = &declarator.init {
                         let reg = self.compile_expression(init)?;

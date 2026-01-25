@@ -14,6 +14,9 @@ use crate::regexp::JsRegExp;
 use crate::string::JsString;
 use crate::value::{Closure, UpvalueCell, Value};
 
+use num_bigint::BigInt as NumBigInt;
+use num_traits::{One, Zero};
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 /// The bytecode interpreter
@@ -21,6 +24,11 @@ pub struct Interpreter {
     /// Current module being executed
     #[allow(dead_code)]
     current_module: Option<Arc<Module>>,
+}
+
+enum Numeric {
+    Number(f64),
+    BigInt(NumBigInt),
 }
 
 impl Interpreter {
@@ -133,7 +141,7 @@ impl Interpreter {
     ) -> VmResult<Value> {
         // Check if it's a native function
         if let Some(native_fn) = func.as_native_function() {
-            return native_fn(args).map_err(VmError::type_error);
+            return self.call_native_fn(ctx, native_fn, args);
         }
 
         // Regular closure call
@@ -237,6 +245,30 @@ impl Interpreter {
                         is_async,
                     )?;
                 }
+                Ok(InstructionResult::TailCall {
+                    func_index,
+                    module,
+                    argc: _,
+                    return_reg,
+                    is_async,
+                    upvalues,
+                }) => {
+                    // Tail call: pop current frame and push new one
+                    ctx.pop_frame();
+                    let local_count = module
+                        .function(func_index)
+                        .ok_or_else(|| VmError::internal("function not found"))?
+                        .local_count;
+                    ctx.set_pending_upvalues(upvalues);
+                    ctx.push_frame(
+                        func_index,
+                        module,
+                        local_count,
+                        Some(return_reg),
+                        false,
+                        is_async,
+                    )?;
+                }
                 Ok(InstructionResult::Suspend { .. }) => {
                     // Can't handle suspension in direct call, return undefined
                     break Value::undefined();
@@ -286,9 +318,13 @@ impl Interpreter {
         ctx: &mut VmContext,
         result_promise: Arc<JsPromise>,
     ) -> VmExecutionResult {
+        // Cache module Arc - only refresh when frame changes
+        let mut cached_module: Option<Arc<Module>> = None;
+        let mut cached_frame_id: usize = usize::MAX;
+
         loop {
-            // Check for interrupt (timeout/cancellation)
-            if ctx.is_interrupted() {
+            // Periodic interrupt check for responsive timeouts
+            if ctx.should_check_interrupt() && ctx.is_interrupted() {
                 ctx.set_running(false);
                 return VmExecutionResult::Error("Execution interrupted".to_string());
             }
@@ -297,9 +333,16 @@ impl Interpreter {
                 Some(f) => f,
                 None => return VmExecutionResult::Error("no frame".to_string()),
             };
-            // Use the frame's module (closures carry their own module reference)
-            let current_module = Arc::clone(&frame.module);
-            let func = match current_module.function(frame.function_index) {
+
+            // Only clone Arc when frame changes (avoids atomic ops on hot path)
+            if frame.frame_id != cached_frame_id {
+                cached_module = Some(Arc::clone(&frame.module));
+                cached_frame_id = frame.frame_id;
+            }
+
+            // Get reference to cached module (avoids clone on hot path)
+            let module_ref = cached_module.as_ref().unwrap();
+            let func = match module_ref.function(frame.function_index) {
                 Some(f) => f,
                 None => return VmExecutionResult::Error("function not found".to_string()),
             };
@@ -312,6 +355,8 @@ impl Interpreter {
                     return VmExecutionResult::Complete(Value::undefined());
                 }
                 ctx.pop_frame();
+                // Invalidate cache since frame changed
+                cached_frame_id = usize::MAX;
                 continue;
             }
 
@@ -320,15 +365,38 @@ impl Interpreter {
             // Record instruction execution for profiling
             ctx.record_instruction();
 
+            // Clone module Arc for execute_instruction (required since it takes ownership)
+            let current_module = Arc::clone(module_ref);
+
             // Execute the instruction
-            match self.execute_instruction(instruction, Arc::clone(&current_module), ctx) {
-                Ok(InstructionResult::Continue) => {
+            let instruction_result = match self.execute_instruction(instruction, current_module, ctx)
+            {
+                Ok(result) => result,
+                Err(err) => match err {
+                    VmError::TypeError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
+                    }
+                    VmError::RangeError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "RangeError", &message))
+                    }
+                    VmError::ReferenceError(message) => InstructionResult::Throw(
+                        self.make_error(ctx, "ReferenceError", &message),
+                    ),
+                    VmError::SyntaxError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
+                    }
+                    other => return VmExecutionResult::Error(other.to_string()),
+                },
+            };
+
+            match instruction_result {
+                InstructionResult::Continue => {
                     ctx.advance_pc();
                 }
-                Ok(InstructionResult::Jump(offset)) => {
+                InstructionResult::Jump(offset) => {
                     ctx.jump(offset);
                 }
-                Ok(InstructionResult::Return(value)) => {
+                InstructionResult::Return(value) => {
                     if ctx.stack_depth() == 1 {
                         ctx.set_running(false);
                         return VmExecutionResult::Complete(value);
@@ -347,6 +415,8 @@ impl Interpreter {
                         )
                     };
                     ctx.pop_frame();
+                    // Invalidate cache since frame changed
+                    cached_frame_id = usize::MAX;
 
                     if let Some(reg) = return_reg {
                         let value = if is_construct && !value.is_object() {
@@ -360,13 +430,15 @@ impl Interpreter {
                         ctx.set_register(reg, value);
                     }
                 }
-                Ok(InstructionResult::Throw(value)) => {
+                InstructionResult::Throw(value) => {
                     // Unwind to nearest try handler if present
                     if let Some((target_depth, catch_pc)) = ctx.take_nearest_try() {
                         // Pop frames above the handler
                         while ctx.stack_depth() > target_depth {
                             ctx.pop_frame();
                         }
+                        // Invalidate cache since frames changed
+                        cached_frame_id = usize::MAX;
 
                         // Jump to catch block in the handler frame
                         let frame = match ctx.current_frame_mut() {
@@ -386,7 +458,7 @@ impl Interpreter {
                         self.to_string(&value)
                     ));
                 }
-                Ok(InstructionResult::Call {
+                InstructionResult::Call {
                     func_index,
                     module: call_module,
                     argc: _,
@@ -394,7 +466,7 @@ impl Interpreter {
                     is_construct,
                     is_async,
                     upvalues,
-                }) => {
+                } => {
                     ctx.advance_pc(); // Advance before pushing new frame
 
                     let callee = match call_module.function(func_index) {
@@ -459,10 +531,75 @@ impl Interpreter {
                         return VmExecutionResult::Error(e.to_string());
                     }
                 }
-                Ok(InstructionResult::Suspend {
+                InstructionResult::TailCall {
+                    func_index,
+                    module: call_module,
+                    argc: _,
+                    return_reg,
+                    is_async,
+                    upvalues,
+                } => {
+                    // Tail call optimization: pop current frame before pushing new one
+                    ctx.pop_frame();
+                    // Invalidate cache since frame changed
+                    cached_frame_id = usize::MAX;
+
+                    let callee = match call_module.function(func_index) {
+                        Some(f) => f,
+                        None => {
+                            return VmExecutionResult::Error(format!(
+                                "callee not found (func_index={}, function_count={})",
+                                func_index,
+                                call_module.function_count()
+                            ));
+                        }
+                    };
+
+                    let local_count = callee.local_count;
+                    let has_rest = callee.flags.has_rest;
+                    let param_count = callee.param_count as usize;
+
+                    // Handle rest parameters
+                    if has_rest {
+                        let mut args = ctx.take_pending_args();
+                        let rest_args: Vec<Value> = if args.len() > param_count {
+                            args.drain(param_count..).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let rest_arr = Arc::new(JsObject::array(rest_args.len()));
+                        if let Some(array_obj) =
+                            ctx.get_global("Array").and_then(|v| v.as_object().cloned())
+                            && let Some(array_proto) = array_obj
+                                .get(&PropertyKey::string("prototype"))
+                                .and_then(|v| v.as_object().cloned())
+                        {
+                            rest_arr.set_prototype(Some(array_proto));
+                        }
+                        for (i, arg) in rest_args.into_iter().enumerate() {
+                            rest_arr.set(PropertyKey::Index(i as u32), arg);
+                        }
+                        args.push(Value::object(rest_arr));
+                        ctx.set_pending_args(args);
+                    }
+
+                    ctx.set_pending_upvalues(upvalues);
+
+                    if let Err(e) = ctx.push_frame(
+                        func_index,
+                        call_module,
+                        local_count,
+                        Some(return_reg),
+                        false,
+                        is_async,
+                    ) {
+                        return VmExecutionResult::Error(e.to_string());
+                    }
+                }
+                InstructionResult::Suspend {
                     promise,
                     resume_reg,
-                }) => {
+                } => {
                     // Advance PC before suspension so we resume at the next instruction
                     ctx.advance_pc();
 
@@ -492,7 +629,7 @@ impl Interpreter {
                         }
                     }
                 }
-                Ok(InstructionResult::Yield { value }) => {
+                InstructionResult::Yield { value } => {
                     // Generator yielded a value
                     let result = Arc::new(JsObject::new(None));
                     result.set(PropertyKey::string("value"), value);
@@ -500,28 +637,35 @@ impl Interpreter {
                     ctx.advance_pc();
                     return VmExecutionResult::Complete(Value::object(result));
                 }
-                Err(e) => {
-                    ctx.set_running(false);
-                    return VmExecutionResult::Error(e.to_string());
-                }
             }
         }
     }
 
     /// Main execution loop
     fn run_loop(&mut self, ctx: &mut VmContext) -> VmResult<Value> {
+        // Cache module Arc - only refresh when frame changes
+        let mut cached_module: Option<Arc<Module>> = None;
+        let mut cached_frame_id: usize = usize::MAX;
+
         loop {
-            // Check for interrupt (timeout/cancellation)
-            if ctx.is_interrupted() {
+            // Periodic interrupt check for responsive timeouts
+            if ctx.should_check_interrupt() && ctx.is_interrupted() {
                 return Err(VmError::interrupted());
             }
 
             let frame = ctx
                 .current_frame()
                 .ok_or_else(|| VmError::internal("no frame"))?;
-            // Use the frame's module (closures carry their own module reference)
-            let current_module = Arc::clone(&frame.module);
-            let func = current_module
+
+            // Only clone Arc when frame changes (avoids atomic ops on hot path)
+            if frame.frame_id != cached_frame_id {
+                cached_module = Some(Arc::clone(&frame.module));
+                cached_frame_id = frame.frame_id;
+            }
+
+            // Get reference to cached module (avoids clone on hot path for func lookup)
+            let module_ref = cached_module.as_ref().unwrap();
+            let func = module_ref
                 .function(frame.function_index)
                 .ok_or_else(|| VmError::internal("function not found"))?;
 
@@ -532,6 +676,8 @@ impl Interpreter {
                     return Ok(Value::undefined());
                 }
                 ctx.pop_frame();
+                // Invalidate cache since frame changed
+                cached_frame_id = usize::MAX;
                 continue;
             }
 
@@ -540,8 +686,31 @@ impl Interpreter {
             // Record instruction execution for profiling
             ctx.record_instruction();
 
+            // Clone module Arc for execute_instruction (required since it takes ownership)
+            let current_module = Arc::clone(module_ref);
+
             // Execute the instruction
-            match self.execute_instruction(instruction, Arc::clone(&current_module), ctx)? {
+            let instruction_result = match self.execute_instruction(instruction, current_module, ctx)
+            {
+                Ok(result) => result,
+                Err(err) => match err {
+                    VmError::TypeError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
+                    }
+                    VmError::RangeError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "RangeError", &message))
+                    }
+                    VmError::ReferenceError(message) => InstructionResult::Throw(
+                        self.make_error(ctx, "ReferenceError", &message),
+                    ),
+                    VmError::SyntaxError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
+                    }
+                    other => return Err(other),
+                },
+            };
+
+            match instruction_result {
                 InstructionResult::Continue => {
                     ctx.advance_pc();
                 }
@@ -565,6 +734,8 @@ impl Interpreter {
                         )
                     };
                     ctx.pop_frame();
+                    // Invalidate cache since frame changed
+                    cached_frame_id = usize::MAX;
 
                     if let Some(reg) = return_reg {
                         let value = if is_construct && !value.is_object() {
@@ -586,6 +757,8 @@ impl Interpreter {
                         while ctx.stack_depth() > target_depth {
                             ctx.pop_frame();
                         }
+                        // Invalidate cache since frames changed
+                        cached_frame_id = usize::MAX;
 
                         // Jump to catch block in the handler frame
                         let frame = ctx
@@ -668,6 +841,68 @@ impl Interpreter {
                         local_count,
                         Some(return_reg),
                         is_construct,
+                        is_async,
+                    )?;
+                }
+                InstructionResult::TailCall {
+                    func_index,
+                    module: call_module,
+                    argc: _,
+                    return_reg,
+                    is_async,
+                    upvalues,
+                } => {
+                    // Tail call optimization: pop current frame before pushing new one
+                    // This prevents stack growth for recursive tail calls
+                    ctx.pop_frame();
+                    // Invalidate cache since frame changed
+                    cached_frame_id = usize::MAX;
+
+                    let callee = call_module.function(func_index).ok_or_else(|| {
+                        VmError::internal(format!(
+                            "callee not found (func_index={}, function_count={})",
+                            func_index,
+                            call_module.function_count()
+                        ))
+                    })?;
+
+                    let local_count = callee.local_count;
+                    let has_rest = callee.flags.has_rest;
+                    let param_count = callee.param_count as usize;
+
+                    // Handle rest parameters (same as regular call)
+                    if has_rest {
+                        let mut args = ctx.take_pending_args();
+                        let rest_args: Vec<Value> = if args.len() > param_count {
+                            args.drain(param_count..).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let rest_arr = Arc::new(JsObject::array(rest_args.len()));
+                        if let Some(array_obj) =
+                            ctx.get_global("Array").and_then(|v| v.as_object().cloned())
+                            && let Some(array_proto) = array_obj
+                                .get(&PropertyKey::string("prototype"))
+                                .and_then(|v| v.as_object().cloned())
+                        {
+                            rest_arr.set_prototype(Some(array_proto));
+                        }
+                        for (i, arg) in rest_args.into_iter().enumerate() {
+                            rest_arr.set(PropertyKey::Index(i as u32), arg);
+                        }
+                        args.push(Value::object(rest_arr));
+                        ctx.set_pending_args(args);
+                    }
+
+                    ctx.set_pending_upvalues(upvalues);
+
+                    // Push new frame (reusing the stack slot we just freed)
+                    ctx.push_frame(
+                        func_index,
+                        call_module,
+                        local_count,
+                        Some(return_reg),
+                        false, // tail calls are never construct
                         is_async,
                     )?;
                 }
@@ -818,13 +1053,13 @@ impl Interpreter {
                         .function(frame.function_index)
                         .ok_or_else(|| VmError::internal("no function"))?;
                     let feedback = func.feedback_vector.read();
-                    if let Some(otter_vm_bytecode::function::InlineCache::Monomorphic(
-                        shape_addr,
+                    if let Some(otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                        shape_id: shape_addr,
                         offset,
-                    )) = feedback.get(*ic_index as usize)
+                    }) = feedback.get(*ic_index as usize)
                     {
                         if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr {
-                            global_obj.get_by_offset(*offset)
+                            global_obj.get_by_offset(*offset as usize)
                         } else {
                             None
                         }
@@ -862,11 +1097,11 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let mut feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCache::Uninitialized = ic {
-                                *ic = otter_vm_bytecode::function::InlineCache::Monomorphic(
-                                    std::sync::Arc::as_ptr(&global_obj.shape()) as u64,
-                                    offset,
-                                );
+                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic {
+                                *ic = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                    shape_id: std::sync::Arc::as_ptr(&global_obj.shape()) as u64,
+                                    offset: offset as u32,
+                                };
                             }
                         }
                     }
@@ -902,13 +1137,13 @@ impl Interpreter {
                         .function(frame.function_index)
                         .ok_or_else(|| VmError::internal("no function"))?;
                     let feedback = func.feedback_vector.read();
-                    if let Some(otter_vm_bytecode::function::InlineCache::Monomorphic(
-                        shape_addr,
+                    if let Some(otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                        shape_id: shape_addr,
                         offset,
-                    )) = feedback.get(*ic_index as usize)
+                    }) = feedback.get(*ic_index as usize)
                     {
                         if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr {
-                            if global_obj.set_by_offset(*offset, val_val.clone()) {
+                            if global_obj.set_by_offset(*offset as usize, val_val.clone()) {
                                 return Ok(InstructionResult::Continue);
                             }
                         }
@@ -931,11 +1166,11 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let mut feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCache::Uninitialized = ic {
-                                *ic = otter_vm_bytecode::function::InlineCache::Monomorphic(
-                                    std::sync::Arc::as_ptr(&global_obj.shape()) as u64,
-                                    offset,
-                                );
+                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic {
+                                *ic = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                    shape_id: std::sync::Arc::as_ptr(&global_obj.shape()) as u64,
+                                    offset: offset as u32,
+                                };
                             }
                         }
                     }
@@ -968,46 +1203,132 @@ impl Interpreter {
             }
 
             Instruction::Sub { dst, lhs, rhs } => {
-                let left = self.coerce_number(ctx.get_register(lhs.0))?;
-                let right = self.coerce_number(ctx.get_register(rhs.0))?;
+                let left_value = ctx.get_register(lhs.0);
+                let right_value = ctx.get_register(rhs.0);
+                let left_bigint = self.bigint_value(left_value)?;
+                let right_bigint = self.bigint_value(right_value)?;
+
+                if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
+                    let result = left_bigint - right_bigint;
+                    ctx.set_register(dst.0, Value::bigint(result.to_string()));
+                    return Ok(InstructionResult::Continue);
+                }
+
+                if left_value.is_bigint() || right_value.is_bigint() {
+                    return Err(VmError::type_error(
+                        "Cannot mix BigInt and other types",
+                    ));
+                }
+
+                let left = self.coerce_number(left_value)?;
+                let right = self.coerce_number(right_value)?;
 
                 ctx.set_register(dst.0, Value::number(left - right));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Inc { dst, src } => {
-                let val = self.coerce_number(ctx.get_register(src.0))?;
+                let value = ctx.get_register(src.0);
+                if let Some(bigint) = self.bigint_value(value)? {
+                    let result = bigint + NumBigInt::one();
+                    ctx.set_register(dst.0, Value::bigint(result.to_string()));
+                    return Ok(InstructionResult::Continue);
+                }
 
+                let val = self.coerce_number(value)?;
                 ctx.set_register(dst.0, Value::number(val + 1.0));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Dec { dst, src } => {
-                let val = self.coerce_number(ctx.get_register(src.0))?;
+                let value = ctx.get_register(src.0);
+                if let Some(bigint) = self.bigint_value(value)? {
+                    let result = bigint - NumBigInt::one();
+                    ctx.set_register(dst.0, Value::bigint(result.to_string()));
+                    return Ok(InstructionResult::Continue);
+                }
 
+                let val = self.coerce_number(value)?;
                 ctx.set_register(dst.0, Value::number(val - 1.0));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Mul { dst, lhs, rhs } => {
-                let left = self.coerce_number(ctx.get_register(lhs.0))?;
-                let right = self.coerce_number(ctx.get_register(rhs.0))?;
+                let left_value = ctx.get_register(lhs.0);
+                let right_value = ctx.get_register(rhs.0);
+                let left_bigint = self.bigint_value(left_value)?;
+                let right_bigint = self.bigint_value(right_value)?;
+
+                if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
+                    let result = left_bigint * right_bigint;
+                    ctx.set_register(dst.0, Value::bigint(result.to_string()));
+                    return Ok(InstructionResult::Continue);
+                }
+
+                if left_value.is_bigint() || right_value.is_bigint() {
+                    return Err(VmError::type_error(
+                        "Cannot mix BigInt and other types",
+                    ));
+                }
+
+                let left = self.coerce_number(left_value)?;
+                let right = self.coerce_number(right_value)?;
 
                 ctx.set_register(dst.0, Value::number(left * right));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Div { dst, lhs, rhs } => {
-                let left = self.coerce_number(ctx.get_register(lhs.0))?;
-                let right = self.coerce_number(ctx.get_register(rhs.0))?;
+                let left_value = ctx.get_register(lhs.0);
+                let right_value = ctx.get_register(rhs.0);
+                let left_bigint = self.bigint_value(left_value)?;
+                let right_bigint = self.bigint_value(right_value)?;
+
+                if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
+                    if right_bigint.is_zero() {
+                        return Err(VmError::range_error("Division by zero"));
+                    }
+                    let result = left_bigint / right_bigint;
+                    ctx.set_register(dst.0, Value::bigint(result.to_string()));
+                    return Ok(InstructionResult::Continue);
+                }
+
+                if left_value.is_bigint() || right_value.is_bigint() {
+                    return Err(VmError::type_error(
+                        "Cannot mix BigInt and other types",
+                    ));
+                }
+
+                let left = self.coerce_number(left_value)?;
+                let right = self.coerce_number(right_value)?;
 
                 ctx.set_register(dst.0, Value::number(left / right));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Mod { dst, lhs, rhs } => {
-                let left = self.coerce_number(ctx.get_register(lhs.0))?;
-                let right = self.coerce_number(ctx.get_register(rhs.0))?;
+                let left_value = ctx.get_register(lhs.0);
+                let right_value = ctx.get_register(rhs.0);
+                let left_bigint = self.bigint_value(left_value)?;
+                let right_bigint = self.bigint_value(right_value)?;
+
+                if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
+                    if right_bigint.is_zero() {
+                        return Err(VmError::range_error("Division by zero"));
+                    }
+                    let result = left_bigint % right_bigint;
+                    ctx.set_register(dst.0, Value::bigint(result.to_string()));
+                    return Ok(InstructionResult::Continue);
+                }
+
+                if left_value.is_bigint() || right_value.is_bigint() {
+                    return Err(VmError::type_error(
+                        "Cannot mix BigInt and other types",
+                    ));
+                }
+
+                let left = self.coerce_number(left_value)?;
+                let right = self.coerce_number(right_value)?;
 
                 ctx.set_register(dst.0, Value::number(left % right));
                 Ok(InstructionResult::Continue)
@@ -1072,34 +1393,44 @@ impl Interpreter {
             }
 
             Instruction::Lt { dst, lhs, rhs } => {
-                let left = self.coerce_number(ctx.get_register(lhs.0))?;
-                let right = self.coerce_number(ctx.get_register(rhs.0))?;
+                let left = self.to_numeric(ctx.get_register(lhs.0))?;
+                let right = self.to_numeric(ctx.get_register(rhs.0))?;
+                let result = matches!(self.numeric_compare(left, right)?, Some(Ordering::Less));
 
-                ctx.set_register(dst.0, Value::boolean(left < right));
+                ctx.set_register(dst.0, Value::boolean(result));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Le { dst, lhs, rhs } => {
-                let left = self.coerce_number(ctx.get_register(lhs.0))?;
-                let right = self.coerce_number(ctx.get_register(rhs.0))?;
+                let left = self.to_numeric(ctx.get_register(lhs.0))?;
+                let right = self.to_numeric(ctx.get_register(rhs.0))?;
+                let result = matches!(
+                    self.numeric_compare(left, right)?,
+                    Some(Ordering::Less | Ordering::Equal)
+                );
 
-                ctx.set_register(dst.0, Value::boolean(left <= right));
+                ctx.set_register(dst.0, Value::boolean(result));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Gt { dst, lhs, rhs } => {
-                let left = self.coerce_number(ctx.get_register(lhs.0))?;
-                let right = self.coerce_number(ctx.get_register(rhs.0))?;
+                let left = self.to_numeric(ctx.get_register(lhs.0))?;
+                let right = self.to_numeric(ctx.get_register(rhs.0))?;
+                let result = matches!(self.numeric_compare(left, right)?, Some(Ordering::Greater));
 
-                ctx.set_register(dst.0, Value::boolean(left > right));
+                ctx.set_register(dst.0, Value::boolean(result));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Ge { dst, lhs, rhs } => {
-                let left = self.coerce_number(ctx.get_register(lhs.0))?;
-                let right = self.coerce_number(ctx.get_register(rhs.0))?;
+                let left = self.to_numeric(ctx.get_register(lhs.0))?;
+                let right = self.to_numeric(ctx.get_register(rhs.0))?;
+                let result = matches!(
+                    self.numeric_compare(left, right)?,
+                    Some(Ordering::Greater | Ordering::Equal)
+                );
 
-                ctx.set_register(dst.0, Value::boolean(left >= right));
+                ctx.set_register(dst.0, Value::boolean(result));
                 Ok(InstructionResult::Continue)
             }
 
@@ -1334,8 +1665,8 @@ impl Interpreter {
                         args.push(arg);
                     }
 
-                    // Call the native function directly
-                    let result = native_fn(&args).map_err(VmError::type_error)?;
+                    // Call the native function with depth tracking
+                    let result = self.call_native_fn(ctx, native_fn, &args)?;
                     ctx.set_register(dst.0, result);
                     return Ok(InstructionResult::Continue);
                 }
@@ -1384,7 +1715,7 @@ impl Interpreter {
                         if let Some(native_fn) = bound_fn.as_native_function() {
                             // For native functions, we can't set 'this' directly
                             // but most native functions don't use 'this'
-                            let result = native_fn(&all_args).map_err(VmError::type_error)?;
+                            let result = self.call_native_fn(ctx, native_fn, &all_args)?;
                             ctx.set_register(dst.0, result);
                             return Ok(InstructionResult::Continue);
                         } else if let Some(closure) = bound_fn.as_function() {
@@ -1420,6 +1751,51 @@ impl Interpreter {
                 self.handle_call_value(ctx, &func_value, Value::undefined(), args, dst.0)
             }
 
+            Instruction::TailCall { func, argc } => {
+                let func_value = ctx.get_register(func.0).clone();
+
+                // Native functions don't benefit from tail call optimization
+                // (they execute immediately), so just call and return
+                if let Some(native_fn) = func_value.as_native_function() {
+                    let mut args = Vec::with_capacity(*argc as usize);
+                    for i in 0..(*argc as u16) {
+                        let arg = ctx.get_register(func.0 + 1 + i).clone();
+                        args.push(arg);
+                    }
+                    let result = self.call_native_fn(ctx, native_fn, &args)?;
+                    return Ok(InstructionResult::Return(result));
+                }
+
+                // For closures, return TailCall result to reuse the frame
+                if let Some(closure) = func_value.as_function() {
+                    let mut args = Vec::with_capacity(*argc as usize);
+                    for i in 0..(*argc as u16) {
+                        let arg = ctx.get_register(func.0 + 1 + i).clone();
+                        args.push(arg);
+                    }
+
+                    ctx.set_pending_args(args);
+                    ctx.set_pending_this(Value::undefined());
+
+                    // Get the return register from the current frame (where tail call result goes)
+                    let return_reg = ctx
+                        .current_frame()
+                        .and_then(|f| f.return_register)
+                        .unwrap_or(0);
+
+                    return Ok(InstructionResult::TailCall {
+                        func_index: closure.function_index,
+                        module: Arc::clone(&closure.module),
+                        argc: *argc,
+                        return_reg,
+                        is_async: closure.is_async,
+                        upvalues: closure.upvalues.clone(),
+                    });
+                }
+
+                Err(VmError::type_error("not a function"))
+            }
+
             Instruction::Construct { dst, func, argc } => {
                 let func_value = ctx.get_register(func.0).clone();
 
@@ -1430,6 +1806,7 @@ impl Interpreter {
                         args.push(arg);
                     }
 
+                    // Get prototype for new object
                     let ctor_proto = func_value
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
@@ -1437,7 +1814,8 @@ impl Interpreter {
                     let new_obj = Arc::new(JsObject::new(ctor_proto));
                     let new_obj_value = Value::object(new_obj);
 
-                    let result = native_fn(&args).map_err(VmError::type_error)?;
+                    // Call native constructor with depth tracking
+                    let result = self.call_native_fn(ctx, native_fn, &args)?;
                     let final_value = if result.is_object() {
                         result
                     } else {
@@ -1513,13 +1891,13 @@ impl Interpreter {
                         .function(frame.function_index)
                         .ok_or_else(|| VmError::internal("no function"))?;
                     let feedback = func.feedback_vector.read();
-                    if let Some(otter_vm_bytecode::function::InlineCache::Monomorphic(
-                        shape_addr,
+                    if let Some(otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                        shape_id: shape_addr,
                         offset,
-                    )) = feedback.get(*ic_index as usize)
+                    }) = feedback.get(*ic_index as usize)
                     {
                         if std::sync::Arc::as_ptr(&obj_ref.shape()) as u64 == *shape_addr {
-                            obj_ref.get_by_offset(*offset)
+                            obj_ref.get_by_offset(*offset as usize)
                         } else {
                             None
                         }
@@ -1635,11 +2013,11 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let mut feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCache::Uninitialized = ic {
-                                *ic = otter_vm_bytecode::function::InlineCache::Monomorphic(
-                                    std::sync::Arc::as_ptr(&obj_ref.shape()) as u64,
-                                    offset,
-                                );
+                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic {
+                                *ic = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                    shape_id: std::sync::Arc::as_ptr(&obj_ref.shape()) as u64,
+                                    offset: offset as u32,
+                                };
                             }
                         }
                     }
@@ -1934,19 +2312,19 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let feedback = func.feedback_vector.read();
                         if let Some(ic) = feedback.get(*ic_index as usize) {
-                            use otter_vm_bytecode::function::InlineCache;
+                            use otter_vm_bytecode::function::InlineCacheState;
                             let obj_shape_ptr = std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
 
                             match ic {
-                                InlineCache::Monomorphic(shape_addr, offset) => {
-                                    if obj_shape_ptr == *shape_addr {
-                                        cached_val = obj_ref.get_by_offset(*offset);
+                                InlineCacheState::Monomorphic { shape_id, offset } => {
+                                    if obj_shape_ptr == *shape_id {
+                                        cached_val = obj_ref.get_by_offset(*offset as usize);
                                     }
                                 }
-                                InlineCache::Polymorphic(count, entries) => {
+                                InlineCacheState::Polymorphic { count, entries } => {
                                     for i in 0..(*count as usize) {
                                         if obj_shape_ptr == entries[i].0 {
-                                            cached_val = obj_ref.get_by_offset(entries[i].1);
+                                            cached_val = obj_ref.get_by_offset(entries[i].1 as usize);
                                             break;
                                         }
                                     }
@@ -2032,22 +2410,22 @@ impl Interpreter {
                                     .ok_or_else(|| VmError::internal("no function"))?;
                                 let mut feedback = func.feedback_vector.write();
                                 if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                    use otter_vm_bytecode::function::InlineCache;
+                                    use otter_vm_bytecode::function::InlineCacheState;
                                     let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
 
                                     match ic {
-                                        InlineCache::Uninitialized => {
-                                            *ic = InlineCache::Monomorphic(shape_ptr, offset);
+                                        InlineCacheState::Uninitialized => {
+                                            *ic = InlineCacheState::Monomorphic { shape_id: shape_ptr, offset: offset as u32 };
                                         }
-                                        InlineCache::Monomorphic(old_shape, old_offset) => {
+                                        InlineCacheState::Monomorphic { shape_id: old_shape, offset: old_offset } => {
                                             if *old_shape != shape_ptr {
-                                                let mut entries = [(0u64, 0usize); 4];
+                                                let mut entries = [(0u64, 0u32); 4];
                                                 entries[0] = (*old_shape, *old_offset);
-                                                entries[1] = (shape_ptr, offset);
-                                                *ic = InlineCache::Polymorphic(2, entries);
+                                                entries[1] = (shape_ptr, offset as u32);
+                                                *ic = InlineCacheState::Polymorphic { count: 2, entries };
                                             }
                                         }
-                                        InlineCache::Polymorphic(count, entries) => {
+                                        InlineCacheState::Polymorphic { count, entries } => {
                                             let mut found = false;
                                             for i in 0..(*count as usize) {
                                                 if entries[i].0 == shape_ptr {
@@ -2057,10 +2435,10 @@ impl Interpreter {
                                             }
                                             if !found {
                                                 if (*count as usize) < 4 {
-                                                    entries[*count as usize] = (shape_ptr, offset);
+                                                    entries[*count as usize] = (shape_ptr, offset as u32);
                                                     *count += 1;
                                                 } else {
-                                                    *ic = InlineCache::Megamorphic;
+                                                    *ic = InlineCacheState::Megamorphic;
                                                 }
                                             }
                                         }
@@ -2111,21 +2489,21 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let feedback = func.feedback_vector.read();
                         if let Some(ic) = feedback.get(*ic_index as usize) {
-                            use otter_vm_bytecode::function::InlineCache;
+                            use otter_vm_bytecode::function::InlineCacheState;
                             let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
 
                             match ic {
-                                InlineCache::Monomorphic(shape_addr, offset) => {
-                                    if obj_shape_ptr == *shape_addr {
-                                        if obj.set_by_offset(*offset, val_val.clone()) {
+                                InlineCacheState::Monomorphic { shape_id, offset } => {
+                                    if obj_shape_ptr == *shape_id {
+                                        if obj.set_by_offset(*offset as usize, val_val.clone()) {
                                             cached = true;
                                         }
                                     }
                                 }
-                                InlineCache::Polymorphic(count, entries) => {
+                                InlineCacheState::Polymorphic { count, entries } => {
                                     for i in 0..(*count as usize) {
                                         if obj_shape_ptr == entries[i].0 {
-                                            if obj.set_by_offset(entries[i].1, val_val.clone()) {
+                                            if obj.set_by_offset(entries[i].1 as usize, val_val.clone()) {
                                                 cached = true;
                                             }
                                             break;
@@ -2180,22 +2558,22 @@ impl Interpreter {
                                     .ok_or_else(|| VmError::internal("no function"))?;
                                 let mut feedback = func.feedback_vector.write();
                                 if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                    use otter_vm_bytecode::function::InlineCache;
+                                    use otter_vm_bytecode::function::InlineCacheState;
                                     let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
 
                                     match ic {
-                                        InlineCache::Uninitialized => {
-                                            *ic = InlineCache::Monomorphic(shape_ptr, offset);
+                                        InlineCacheState::Uninitialized => {
+                                            *ic = InlineCacheState::Monomorphic { shape_id: shape_ptr, offset: offset as u32 };
                                         }
-                                        InlineCache::Monomorphic(old_shape, old_offset) => {
+                                        InlineCacheState::Monomorphic { shape_id: old_shape, offset: old_offset } => {
                                             if *old_shape != shape_ptr {
-                                                let mut entries = [(0u64, 0usize); 4];
+                                                let mut entries = [(0u64, 0u32); 4];
                                                 entries[0] = (*old_shape, *old_offset);
-                                                entries[1] = (shape_ptr, offset);
-                                                *ic = InlineCache::Polymorphic(2, entries);
+                                                entries[1] = (shape_ptr, offset as u32);
+                                                *ic = InlineCacheState::Polymorphic { count: 2, entries };
                                             }
                                         }
-                                        InlineCache::Polymorphic(count, entries) => {
+                                        InlineCacheState::Polymorphic { count, entries } => {
                                             let mut found = false;
                                             for i in 0..(*count as usize) {
                                                 if entries[i].0 == shape_ptr {
@@ -2205,10 +2583,10 @@ impl Interpreter {
                                             }
                                             if !found {
                                                 if (*count as usize) < 4 {
-                                                    entries[*count as usize] = (shape_ptr, offset);
+                                                    entries[*count as usize] = (shape_ptr, offset as u32);
                                                     *count += 1;
                                                 } else {
-                                                    *ic = InlineCache::Megamorphic;
+                                                    *ic = InlineCacheState::Megamorphic;
                                                 }
                                             }
                                         }
@@ -2322,19 +2700,19 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let feedback = func.feedback_vector.read();
                         if let Some(ic) = feedback.get(*ic_index as usize) {
-                            use otter_vm_bytecode::function::InlineCache;
+                            use otter_vm_bytecode::function::InlineCacheState;
                             let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
 
                             match ic {
-                                InlineCache::Monomorphic(shape_addr, offset) => {
-                                    if obj_shape_ptr == *shape_addr {
-                                        cached_val = obj.get_by_offset(*offset);
+                                InlineCacheState::Monomorphic { shape_id, offset } => {
+                                    if obj_shape_ptr == *shape_id {
+                                        cached_val = obj.get_by_offset(*offset as usize);
                                     }
                                 }
-                                InlineCache::Polymorphic(count, entries) => {
+                                InlineCacheState::Polymorphic { count, entries } => {
                                     for i in 0..(*count as usize) {
                                         if obj_shape_ptr == entries[i].0 {
-                                            cached_val = obj.get_by_offset(entries[i].1);
+                                            cached_val = obj.get_by_offset(entries[i].1 as usize);
                                             break;
                                         }
                                     }
@@ -2401,22 +2779,22 @@ impl Interpreter {
                                     .ok_or_else(|| VmError::internal("no function"))?;
                                 let mut feedback = func.feedback_vector.write();
                                 if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                    use otter_vm_bytecode::function::InlineCache;
+                                    use otter_vm_bytecode::function::InlineCacheState;
                                     let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
 
                                     match ic {
-                                        InlineCache::Uninitialized => {
-                                            *ic = InlineCache::Monomorphic(shape_ptr, offset);
+                                        InlineCacheState::Uninitialized => {
+                                            *ic = InlineCacheState::Monomorphic { shape_id: shape_ptr, offset: offset as u32 };
                                         }
-                                        InlineCache::Monomorphic(old_shape, old_offset) => {
+                                        InlineCacheState::Monomorphic { shape_id: old_shape, offset: old_offset } => {
                                             if *old_shape != shape_ptr {
-                                                let mut entries = [(0u64, 0usize); 4];
+                                                let mut entries = [(0u64, 0u32); 4];
                                                 entries[0] = (*old_shape, *old_offset);
-                                                entries[1] = (shape_ptr, offset);
-                                                *ic = InlineCache::Polymorphic(2, entries);
+                                                entries[1] = (shape_ptr, offset as u32);
+                                                *ic = InlineCacheState::Polymorphic { count: 2, entries };
                                             }
                                         }
-                                        InlineCache::Polymorphic(count, entries) => {
+                                        InlineCacheState::Polymorphic { count, entries } => {
                                             let mut found = false;
                                             for i in 0..(*count as usize) {
                                                 if entries[i].0 == shape_ptr {
@@ -2426,10 +2804,10 @@ impl Interpreter {
                                             }
                                             if !found {
                                                 if (*count as usize) < 4 {
-                                                    entries[*count as usize] = (shape_ptr, offset);
+                                                    entries[*count as usize] = (shape_ptr, offset as u32);
                                                     *count += 1;
                                                 } else {
-                                                    *ic = InlineCache::Megamorphic;
+                                                    *ic = InlineCacheState::Megamorphic;
                                                 }
                                             }
                                         }
@@ -2483,21 +2861,21 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let feedback = func.feedback_vector.read();
                         if let Some(ic) = feedback.get(*ic_index as usize) {
-                            use otter_vm_bytecode::function::InlineCache;
+                            use otter_vm_bytecode::function::InlineCacheState;
                             let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
 
                             match ic {
-                                InlineCache::Monomorphic(shape_addr, offset) => {
-                                    if obj_shape_ptr == *shape_addr {
-                                        if obj.set_by_offset(*offset, val_val.clone()) {
+                                InlineCacheState::Monomorphic { shape_id, offset } => {
+                                    if obj_shape_ptr == *shape_id {
+                                        if obj.set_by_offset(*offset as usize, val_val.clone()) {
                                             cached = true;
                                         }
                                     }
                                 }
-                                InlineCache::Polymorphic(count, entries) => {
+                                InlineCacheState::Polymorphic { count, entries } => {
                                     for i in 0..(*count as usize) {
                                         if obj_shape_ptr == entries[i].0 {
-                                            if obj.set_by_offset(entries[i].1, val_val.clone()) {
+                                            if obj.set_by_offset(entries[i].1 as usize, val_val.clone()) {
                                                 cached = true;
                                             }
                                             break;
@@ -2551,22 +2929,22 @@ impl Interpreter {
                                     .ok_or_else(|| VmError::internal("no function"))?;
                                 let mut feedback = func.feedback_vector.write();
                                 if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                    use otter_vm_bytecode::function::InlineCache;
+                                    use otter_vm_bytecode::function::InlineCacheState;
                                     let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
 
                                     match ic {
-                                        InlineCache::Uninitialized => {
-                                            *ic = InlineCache::Monomorphic(shape_ptr, offset);
+                                        InlineCacheState::Uninitialized => {
+                                            *ic = InlineCacheState::Monomorphic { shape_id: shape_ptr, offset: offset as u32 };
                                         }
-                                        InlineCache::Monomorphic(old_shape, old_offset) => {
+                                        InlineCacheState::Monomorphic { shape_id: old_shape, offset: old_offset } => {
                                             if *old_shape != shape_ptr {
-                                                let mut entries = [(0u64, 0usize); 4];
+                                                let mut entries = [(0u64, 0u32); 4];
                                                 entries[0] = (*old_shape, *old_offset);
-                                                entries[1] = (shape_ptr, offset);
-                                                *ic = InlineCache::Polymorphic(2, entries);
+                                                entries[1] = (shape_ptr, offset as u32);
+                                                *ic = InlineCacheState::Polymorphic { count: 2, entries };
                                             }
                                         }
-                                        InlineCache::Polymorphic(count, entries) => {
+                                        InlineCacheState::Polymorphic { count, entries } => {
                                             let mut found = false;
                                             for i in 0..(*count as usize) {
                                                 if entries[i].0 == shape_ptr {
@@ -2576,10 +2954,10 @@ impl Interpreter {
                                             }
                                             if !found {
                                                 if (*count as usize) < 4 {
-                                                    entries[*count as usize] = (shape_ptr, offset);
+                                                    entries[*count as usize] = (shape_ptr, offset as u32);
                                                     *count += 1;
                                                 } else {
-                                                    *ic = InlineCache::Megamorphic;
+                                                    *ic = InlineCacheState::Megamorphic;
                                                 }
                                             }
                                         }
@@ -2746,13 +3124,13 @@ impl Interpreter {
                         .function(frame.function_index)
                         .ok_or_else(|| VmError::internal("no function"))?;
                     let feedback = func.feedback_vector.read();
-                    if let Some(otter_vm_bytecode::function::InlineCache::Monomorphic(
-                        shape_addr,
+                    if let Some(otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                        shape_id: shape_addr,
                         offset,
-                    )) = feedback.get(*ic_index as usize)
+                    }) = feedback.get(*ic_index as usize)
                     {
                         if std::sync::Arc::as_ptr(&obj.shape()) as u64 == *shape_addr {
-                            obj.get_by_offset(*offset)
+                            obj.get_by_offset(*offset as usize)
                         } else {
                             None
                         }
@@ -2793,11 +3171,11 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let mut feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCache::Uninitialized = ic {
-                                *ic = otter_vm_bytecode::function::InlineCache::Monomorphic(
-                                    std::sync::Arc::as_ptr(&obj.shape()) as u64,
-                                    offset,
-                                );
+                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic {
+                                *ic = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                    shape_id: std::sync::Arc::as_ptr(&obj.shape()) as u64,
+                                    offset: offset as u32,
+                                };
                             }
                         }
                     }
@@ -2832,13 +3210,13 @@ impl Interpreter {
                         .function(frame.function_index)
                         .ok_or_else(|| VmError::internal("no function"))?;
                     let feedback = func.feedback_vector.read();
-                    if let Some(otter_vm_bytecode::function::InlineCache::Monomorphic(
-                        shape_addr,
+                    if let Some(otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                        shape_id: shape_addr,
                         offset,
-                    )) = feedback.get(*ic_index as usize)
+                    }) = feedback.get(*ic_index as usize)
                     {
                         if std::sync::Arc::as_ptr(&obj.shape()) as u64 == *shape_addr {
-                            obj.get_by_offset(*offset)
+                            obj.get_by_offset(*offset as usize)
                         } else {
                             None
                         }
@@ -2879,11 +3257,11 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let mut feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCache::Uninitialized = ic {
-                                *ic = otter_vm_bytecode::function::InlineCache::Monomorphic(
-                                    std::sync::Arc::as_ptr(&obj.shape()) as u64,
-                                    offset,
-                                );
+                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic {
+                                *ic = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                    shape_id: std::sync::Arc::as_ptr(&obj.shape()) as u64,
+                                    offset: offset as u32,
+                                };
                             }
                         }
                     }
@@ -3080,6 +3458,24 @@ impl Interpreter {
         }
     }
 
+    /// Call a native function with depth tracking to prevent Rust stack overflow.
+    ///
+    /// This method tracks the native call depth and returns an error if it exceeds
+    /// the maximum. This prevents JS code that calls native functions recursively
+    /// from overflowing the Rust stack.
+    #[inline]
+    fn call_native_fn(
+        &self,
+        ctx: &VmContext,
+        native_fn: &crate::value::NativeFn,
+        args: &[Value],
+    ) -> VmResult<Value> {
+        ctx.enter_native_call()?;
+        let result = native_fn(args).map_err(VmError::type_error);
+        ctx.exit_native_call();
+        result
+    }
+
     /// Handle a function call value (native or closure)
     fn handle_call_value(
         &self,
@@ -3091,7 +3487,7 @@ impl Interpreter {
     ) -> VmResult<InstructionResult> {
         // Native function path
         if let Some(native_fn) = func_value.as_native_function() {
-            // Direct execution
+            // Direct execution with native depth tracking
             let mut native_args;
             let args_ref = if this_value.is_undefined() || this_value.is_callable() {
                 &args
@@ -3101,7 +3497,7 @@ impl Interpreter {
                 native_args.extend(args);
                 &native_args
             };
-            let result = native_fn(args_ref).map_err(VmError::type_error)?;
+            let result = self.call_native_fn(ctx, native_fn, args_ref)?;
             ctx.set_register(return_reg, result);
             return Ok(InstructionResult::Continue);
         }
@@ -3134,6 +3530,19 @@ impl Interpreter {
             let result = format!("{}{}", left_str, right_str);
             let js_str = Arc::new(JsString::new(result));
             return Ok(Value::string(js_str));
+        }
+
+        let left_bigint = self.bigint_value(left)?;
+        let right_bigint = self.bigint_value(right)?;
+        if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
+            let result = left_bigint + right_bigint;
+            return Ok(Value::bigint(result.to_string()));
+        }
+
+        if left.is_bigint() || right.is_bigint() {
+            return Err(VmError::type_error(
+                "Cannot mix BigInt and other types",
+            ));
         }
 
         // Numeric addition
@@ -3227,6 +3636,13 @@ impl Interpreter {
                     s.as_str().to_string()
                 } else {
                     String::new()
+                }
+            }
+            "bigint" => {
+                if let Some(crate::value::HeapRef::BigInt(b)) = value.heap_ref() {
+                    b.value.clone()
+                } else {
+                    "0".to_string()
                 }
             }
             _ => "[object Object]".to_string(),
@@ -3336,6 +3752,142 @@ impl Interpreter {
             return Err(VmError::type_error("Cannot convert to number"));
         }
         Ok(self.to_number(value))
+    }
+
+    fn bigint_value(&self, value: &Value) -> VmResult<Option<NumBigInt>> {
+        if let Some(crate::value::HeapRef::BigInt(b)) = value.heap_ref() {
+            let bigint = self.parse_bigint_str(&b.value)?;
+            return Ok(Some(bigint));
+        }
+        Ok(None)
+    }
+
+    fn to_numeric(&self, value: &Value) -> VmResult<Numeric> {
+        if let Some(bigint) = self.bigint_value(value)? {
+            return Ok(Numeric::BigInt(bigint));
+        }
+        if value.is_symbol() {
+            return Err(VmError::type_error("Cannot convert to number"));
+        }
+        Ok(Numeric::Number(self.to_number(value)))
+    }
+
+    fn numeric_compare(&self, left: Numeric, right: Numeric) -> VmResult<Option<Ordering>> {
+        match (left, right) {
+            (Numeric::Number(left), Numeric::Number(right)) => {
+                if left.is_nan() || right.is_nan() {
+                    Ok(None)
+                } else {
+                    Ok(left.partial_cmp(&right))
+                }
+            }
+            (Numeric::BigInt(left), Numeric::BigInt(right)) => Ok(Some(left.cmp(&right))),
+            (Numeric::BigInt(left), Numeric::Number(right)) => {
+                Ok(self.compare_bigint_number(&left, right))
+            }
+            (Numeric::Number(left), Numeric::BigInt(right)) => Ok(
+                self.compare_bigint_number(&right, left)
+                    .map(|ordering| ordering.reverse()),
+            ),
+        }
+    }
+
+    fn compare_bigint_number(&self, bigint: &NumBigInt, number: f64) -> Option<Ordering> {
+        if number.is_nan() {
+            return None;
+        }
+        if number.is_infinite() {
+            return Some(if number.is_sign_positive() {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            });
+        }
+        let (numerator, denominator) = self.f64_to_ratio(number);
+        let scaled = bigint * denominator;
+        Some(scaled.cmp(&numerator))
+    }
+
+    fn parse_bigint_str(&self, value: &str) -> VmResult<NumBigInt> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(VmError::type_error("Invalid BigInt"));
+        }
+
+        let (sign, digits) = if let Some(rest) = trimmed.strip_prefix('-') {
+            (true, rest)
+        } else if let Some(rest) = trimmed.strip_prefix('+') {
+            (false, rest)
+        } else {
+            (false, trimmed)
+        };
+
+        let (radix, digits) = if let Some(rest) = digits.strip_prefix("0x") {
+            (16, rest)
+        } else if let Some(rest) = digits.strip_prefix("0X") {
+            (16, rest)
+        } else if let Some(rest) = digits.strip_prefix("0o") {
+            (8, rest)
+        } else if let Some(rest) = digits.strip_prefix("0O") {
+            (8, rest)
+        } else if let Some(rest) = digits.strip_prefix("0b") {
+            (2, rest)
+        } else if let Some(rest) = digits.strip_prefix("0B") {
+            (2, rest)
+        } else {
+            (10, digits)
+        };
+
+        let cleaned: String = digits.chars().filter(|c| *c != '_').collect();
+        if cleaned.is_empty() {
+            return Err(VmError::type_error("Invalid BigInt"));
+        }
+        let mut bigint = NumBigInt::parse_bytes(cleaned.as_bytes(), radix)
+            .ok_or_else(|| VmError::type_error("Invalid BigInt"))?;
+        if sign {
+            bigint = -bigint;
+        }
+        Ok(bigint)
+    }
+
+    fn f64_to_ratio(&self, number: f64) -> (NumBigInt, NumBigInt) {
+        if number == 0.0 {
+            return (NumBigInt::zero(), NumBigInt::one());
+        }
+
+        let bits = number.to_bits();
+        let sign = (bits >> 63) != 0;
+        let exponent = ((bits >> 52) & 0x7ff) as i32;
+        let mantissa = bits & 0x000f_ffff_ffff_ffff;
+
+        let (mut numerator, denominator) = if exponent == 0 {
+            let exp2 = 1 - 1023 - 52;
+            let mut num = NumBigInt::from(mantissa);
+            let mut den = NumBigInt::one();
+            if exp2 >= 0 {
+                num <<= exp2 as usize;
+            } else {
+                den <<= (-exp2) as usize;
+            }
+            (num, den)
+        } else {
+            let significand = (1u64 << 52) | mantissa;
+            let exp2 = exponent - 1023 - 52;
+            let mut num = NumBigInt::from(significand);
+            let mut den = NumBigInt::one();
+            if exp2 >= 0 {
+                num <<= exp2 as usize;
+            } else {
+                den <<= (-exp2) as usize;
+            }
+            (num, den)
+        };
+
+        if sign {
+            numerator = -numerator;
+        }
+
+        (numerator, denominator)
     }
 
     /// Convert a Value to a PropertyKey for object property access
@@ -3472,6 +4024,15 @@ enum InstructionResult {
         argc: u8,
         return_reg: u16,
         is_construct: bool,
+        is_async: bool,
+        upvalues: Vec<UpvalueCell>,
+    },
+    /// Tail call - pop current frame and call function (no stack growth)
+    TailCall {
+        func_index: u32,
+        module: Arc<Module>,
+        argc: u8,
+        return_reg: u16,
         is_async: bool,
         upvalues: Vec<UpvalueCell>,
     },

@@ -484,7 +484,7 @@ impl Otter {
 
     /// Register extension ops as global native functions in context
     fn register_ops_in_context(&self, ctx: &mut VmContext) {
-        let global = ctx.global();
+        let global = ctx.global().clone();
         let pending_ops = self.event_loop.get_pending_async_ops_count();
 
         for op_name in self.extensions.op_names() {
@@ -496,7 +496,7 @@ impl Otter {
         }
 
         // Also register environment access if capabilities allow
-        self.register_env_access(global);
+        self.register_env_access(&global);
 
         let ctx_ptr = ctx as *mut VmContext as usize;
         let vm_ptr = &self.vm as *const VmRuntime as usize;
@@ -539,6 +539,7 @@ impl Otter {
                     .unwrap_or_default();
 
                 unsafe {
+                    let ctx_addr = ctx_ptr;
                     let ctx = &mut *(ctx_ptr as *mut VmContext);
                     let vm = &*(vm_ptr as *const VmRuntime);
                     let compiler = Compiler::new();

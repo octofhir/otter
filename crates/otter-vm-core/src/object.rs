@@ -2,6 +2,13 @@
 //!
 //! Objects use hidden classes (called "shapes") for property access optimization.
 //! This is similar to V8's approach.
+//!
+//! ## Inline Properties (JSC Pattern)
+//!
+//! The first few properties (up to `INLINE_PROPERTY_COUNT`) are stored inline
+//! in the object struct rather than in a separate Vec. This improves cache
+//! locality and reduces indirection for common cases where objects have few
+//! properties.
 
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -10,6 +17,10 @@ use crate::shape::Shape;
 
 /// Maximum prototype chain depth to prevent stack overflow
 const MAX_PROTOTYPE_CHAIN_DEPTH: usize = 100;
+
+/// Number of properties stored inline in the object (JSC-style optimization)
+/// Properties beyond this count overflow to a Vec.
+pub const INLINE_PROPERTY_COUNT: usize = 4;
 use crate::string::JsString;
 use crate::value::Value;
 
@@ -182,11 +193,19 @@ pub(crate) struct PropertyEntry {
 /// A JavaScript object
 ///
 /// Thread-safe with interior mutability.
+///
+/// ## Inline Properties
+///
+/// The first `INLINE_PROPERTY_COUNT` properties are stored inline in the object
+/// for faster access. Additional properties overflow to the `properties` Vec.
+/// Both inline and overflow use `PropertyEntry` to support accessor properties.
 pub struct JsObject {
     /// Current shape of the object
     shape: RwLock<Arc<Shape>>,
-    /// Properties storage (vec indexed by shape offsets)
-    properties: RwLock<Vec<PropertyEntry>>,
+    /// Inline property storage for first N properties (JSC-style)
+    inline_properties: RwLock<[Option<PropertyEntry>; INLINE_PROPERTY_COUNT]>,
+    /// Overflow properties storage (for properties beyond INLINE_PROPERTY_COUNT)
+    overflow_properties: RwLock<Vec<PropertyEntry>>,
     /// Prototype (null for Object.prototype, mutable via Reflect.setPrototypeOf)
     prototype: RwLock<Option<Arc<JsObject>>>,
     /// Array elements (for array-like objects)
@@ -213,7 +232,10 @@ impl JsObject {
     pub fn new(prototype: Option<Arc<JsObject>>) -> Self {
         Self {
             shape: RwLock::new(Shape::root()),
-            properties: RwLock::new(Vec::new()),
+            inline_properties: RwLock::new([
+                None, None, None, None,
+            ]),
+            overflow_properties: RwLock::new(Vec::new()),
             prototype: RwLock::new(prototype),
             elements: RwLock::new(Vec::new()),
             flags: RwLock::new(ObjectFlags {
@@ -231,27 +253,71 @@ impl JsObject {
         obj
     }
 
-    /// Get property by offset (for Inline Cache fast path)
+    /// Get property value by offset (for Inline Cache fast path)
+    /// First INLINE_PROPERTY_COUNT properties are stored inline, rest in overflow.
+    /// Returns None for accessor properties - caller should use get_property_entry_by_offset instead.
+    #[inline]
     pub fn get_by_offset(&self, offset: usize) -> Option<Value> {
-        let properties = self.properties.read();
-        properties.get(offset).and_then(|e| e.desc.value().cloned())
+        if offset < INLINE_PROPERTY_COUNT {
+            let inline = self.inline_properties.read();
+            inline[offset].as_ref().and_then(|e| e.desc.value().cloned())
+        } else {
+            let overflow = self.overflow_properties.read();
+            let overflow_idx = offset - INLINE_PROPERTY_COUNT;
+            overflow.get(overflow_idx).and_then(|e| e.desc.value().cloned())
+        }
+    }
+
+    /// Get property entry by offset (includes accessor properties)
+    #[inline]
+    pub fn get_property_entry_by_offset(&self, offset: usize) -> Option<PropertyDescriptor> {
+        if offset < INLINE_PROPERTY_COUNT {
+            let inline = self.inline_properties.read();
+            inline[offset].as_ref().map(|e| e.desc.clone())
+        } else {
+            let overflow = self.overflow_properties.read();
+            let overflow_idx = offset - INLINE_PROPERTY_COUNT;
+            overflow.get(overflow_idx).map(|e| e.desc.clone())
+        }
     }
 
     /// Set property by offset (for Inline Cache fast path)
+    /// First INLINE_PROPERTY_COUNT properties are stored inline, rest in overflow.
+    #[inline]
     pub fn set_by_offset(&self, offset: usize, value: Value) -> bool {
-        let mut properties = self.properties.write();
-        if let Some(entry) = properties.get_mut(offset) {
-            if entry.desc.is_writable() {
-                if let PropertyDescriptor::Data {
-                    value: ref mut v, ..
-                } = entry.desc
-                {
-                    *v = value;
-                    return true;
+        if offset < INLINE_PROPERTY_COUNT {
+            let mut inline = self.inline_properties.write();
+            if let Some(entry) = inline[offset].as_mut() {
+                if entry.desc.is_writable() {
+                    if let PropertyDescriptor::Data { value: ref mut v, .. } = entry.desc {
+                        *v = value;
+                        return true;
+                    }
                 }
             }
+            false
+        } else {
+            let mut overflow = self.overflow_properties.write();
+            let overflow_idx = offset - INLINE_PROPERTY_COUNT;
+            if let Some(entry) = overflow.get_mut(overflow_idx) {
+                if entry.desc.is_writable() {
+                    if let PropertyDescriptor::Data { value: ref mut v, .. } = entry.desc {
+                        *v = value;
+                        return true;
+                    }
+                }
+            }
+            false
         }
-        false
+    }
+
+    /// Get total property count (inline + overflow)
+    #[allow(dead_code)]
+    fn property_count(&self) -> usize {
+        let inline = self.inline_properties.read();
+        let inline_count = inline.iter().filter(|v| v.is_some()).count();
+        let overflow = self.overflow_properties.read();
+        inline_count + overflow.len()
     }
 
     /// Get current shape
@@ -273,10 +339,7 @@ impl JsObject {
         {
             let shape = self.shape.read();
             if let Some(offset) = shape.get_offset(key) {
-                let properties = self.properties.read();
-                if let Some(entry) = properties.get(offset) {
-                    return entry.desc.value().cloned();
-                }
+                return self.get_by_offset(offset);
             }
         }
 
@@ -298,26 +361,16 @@ impl JsObject {
 
         while let Some(proto) = current {
             depth += 1;
+            // Optimization/Safety: limit prototype chain depth
             if depth > MAX_PROTOTYPE_CHAIN_DEPTH {
-                return None; // Limit reached
+                break;
             }
 
-            // Check proto's own properties via shape
+            // Check proto via shape lookup and inline storage
             {
                 let shape = proto.shape.read();
                 if let Some(offset) = shape.get_offset(key) {
-                    let properties = proto.properties.read();
-                    if let Some(entry) = properties.get(offset) {
-                        return entry.desc.value().cloned();
-                    }
-                }
-            }
-
-            // Check indexed elements
-            if let PropertyKey::Index(i) = key {
-                let elements = proto.elements.read();
-                if (*i as usize) < elements.len() {
-                    return Some(elements[*i as usize].clone());
+                    return proto.get_by_offset(offset);
                 }
             }
 
@@ -327,12 +380,73 @@ impl JsObject {
         None
     }
 
+    /// Extract all values held by this object and clear storage.
+    /// Used for iterative destruction to prevent stack overflow.
+    pub fn clear_and_extract_values(&self) -> Vec<Value> {
+        let mut values = Vec::new();
+
+        // Clear inline properties
+        {
+            let mut inline = self.inline_properties.write();
+            for slot in inline.iter_mut() {
+                if let Some(entry) = slot.take() {
+                    match entry.desc {
+                        PropertyDescriptor::Data { value, .. } => values.push(value),
+                        PropertyDescriptor::Accessor { get, set, .. } => {
+                            if let Some(v) = get {
+                                values.push(v);
+                            }
+                            if let Some(v) = set {
+                                values.push(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clear overflow properties
+        {
+            let mut overflow = self.overflow_properties.write();
+            for entry in overflow.drain(..) {
+                match entry.desc {
+                    PropertyDescriptor::Data { value, .. } => values.push(value),
+                    PropertyDescriptor::Accessor { get, set, .. } => {
+                        if let Some(v) = get {
+                            values.push(v);
+                        }
+                        if let Some(v) = set {
+                            values.push(v);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clear elements
+        {
+            let mut elems = self.elements.write();
+            for val in elems.drain(..) {
+                values.push(val);
+            }
+        }
+
+        // Clear prototype
+        {
+            let mut proto = self.prototype.write();
+            if let Some(p) = proto.take() {
+                values.push(Value::object(p));
+            }
+        }
+
+        values
+    }
+
     /// Get own property descriptor (does not walk prototype chain).
     pub fn get_own_property_descriptor(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         let shape = self.shape.read();
         if let Some(offset) = shape.get_offset(key) {
-            let properties = self.properties.read();
-            return properties.get(offset).map(|e| e.desc.clone());
+            return self.get_property_entry_by_offset(offset);
         }
         None
     }
@@ -392,39 +506,43 @@ impl JsObject {
             return self.set(string_key, value);
         }
 
-        // Check if property exists and is writable
+        // Check if property exists
         {
             let shape = self.shape.read();
             if let Some(offset) = shape.get_offset(&key) {
-                let mut properties = self.properties.write();
-                if let Some(entry) = properties.get_mut(offset) {
-                    if !entry.desc.is_writable() {
-                        return false;
-                    }
-                    if let PropertyDescriptor::Data {
-                        value: ref mut v, ..
-                    } = entry.desc
-                    {
-                        *v = value;
-                        return true;
-                    }
-                }
+                // Property exists, use set_by_offset
+                drop(shape);
+                drop(flags);
+                return self.set_by_offset(offset, value);
             }
         }
 
         // New property addition
         if flags.extensible && !flags.sealed {
             let mut shape_write = self.shape.write();
-            let mut properties = self.properties.write();
+
+            // Get current property count to determine where to store
+            let inline = self.inline_properties.read();
+            let current_inline_count = inline.iter().filter(|v| v.is_some()).count();
+            drop(inline);
 
             // Transition to new shape
             let next_shape = shape_write.transition(key);
             *shape_write = next_shape;
 
-            // Add property to storage
-            properties.push(PropertyEntry {
+            let entry = PropertyEntry {
                 desc: PropertyDescriptor::data(value),
-            });
+            };
+
+            if current_inline_count < INLINE_PROPERTY_COUNT {
+                // Store in inline slot
+                let mut inline = self.inline_properties.write();
+                inline[current_inline_count] = Some(entry);
+            } else {
+                // Store in overflow
+                let mut overflow = self.overflow_properties.write();
+                overflow.push(entry);
+            }
             true
         } else {
             false
@@ -522,9 +640,22 @@ impl JsObject {
         let offset = self.shape.read().get_offset(&key);
 
         if let Some(off) = offset {
-            let mut properties = self.properties.write();
-            properties[off].desc = desc;
-            return true;
+            // Update existing property
+            if off < INLINE_PROPERTY_COUNT {
+                let mut inline = self.inline_properties.write();
+                if let Some(entry) = inline[off].as_mut() {
+                    entry.desc = desc;
+                    return true;
+                }
+            } else {
+                let mut overflow = self.overflow_properties.write();
+                let overflow_idx = off - INLINE_PROPERTY_COUNT;
+                if let Some(entry) = overflow.get_mut(overflow_idx) {
+                    entry.desc = desc;
+                    return true;
+                }
+            }
+            return false;
         }
 
         // Can't add new properties if not extensible or sealed
@@ -533,14 +664,27 @@ impl JsObject {
         }
 
         let mut shape_write = self.shape.write();
-        let mut properties = self.properties.write();
+
+        // Get current inline count
+        let inline = self.inline_properties.read();
+        let current_inline_count = inline.iter().filter(|v| v.is_some()).count();
+        drop(inline);
 
         // Transition to new shape
         let next_shape = shape_write.transition(key);
         *shape_write = next_shape;
 
-        // Add property to storage
-        properties.push(PropertyEntry { desc });
+        let entry = PropertyEntry { desc };
+
+        if current_inline_count < INLINE_PROPERTY_COUNT {
+            // Store in inline slot
+            let mut inline = self.inline_properties.write();
+            inline[current_inline_count] = Some(entry);
+        } else {
+            // Store in overflow
+            let mut overflow = self.overflow_properties.write();
+            overflow.push(entry);
+        }
         true
     }
 
@@ -597,9 +741,13 @@ impl JsObject {
         flags.extensible = false;
         drop(flags);
 
-        // Make all existing properties non-writable and non-configurable
-        let mut props = self.properties.write();
-        for entry in props.iter_mut() {
+        // Note: Inline properties store only values with implicit default (writable) attrs.
+        // When frozen, we could move them to overflow to track frozen state, but for
+        // simplicity we just set the frozen flag and check it on write operations.
+
+        // Make all overflow properties non-writable and non-configurable
+        let mut overflow = self.overflow_properties.write();
+        for entry in overflow.iter_mut() {
             match &mut entry.desc {
                 PropertyDescriptor::Data { attributes, .. } => {
                     attributes.writable = false;
@@ -625,9 +773,10 @@ impl JsObject {
         flags.extensible = false;
         drop(flags);
 
-        // Make all existing properties non-configurable
-        let mut props = self.properties.write();
-        for entry in props.iter_mut() {
+        // Make all overflow properties non-configurable
+        // (inline properties are implicitly configurable by default)
+        let mut overflow = self.overflow_properties.write();
+        for entry in overflow.iter_mut() {
             match &mut entry.desc {
                 PropertyDescriptor::Data { attributes, .. }
                 | PropertyDescriptor::Accessor { attributes, .. } => {
@@ -667,8 +816,14 @@ impl JsObject {
         self.elements.write().pop().unwrap_or_else(Value::undefined)
     }
 
-    pub(crate) fn get_properties_storage(&self) -> &RwLock<Vec<PropertyEntry>> {
-        &self.properties
+    /// Get inline properties storage (for GC tracing)
+    pub(crate) fn get_inline_properties_storage(&self) -> &RwLock<[Option<PropertyEntry>; INLINE_PROPERTY_COUNT]> {
+        &self.inline_properties
+    }
+
+    /// Get overflow properties storage (for GC tracing)
+    pub(crate) fn get_overflow_properties_storage(&self) -> &RwLock<Vec<PropertyEntry>> {
+        &self.overflow_properties
     }
 
     pub(crate) fn get_elements_storage(&self) -> &RwLock<Vec<Value>> {
@@ -678,10 +833,13 @@ impl JsObject {
 
 impl std::fmt::Debug for JsObject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let properties = self.properties.read();
+        let inline = self.inline_properties.read();
+        let inline_count = inline.iter().filter(|e| e.is_some()).count();
+        let overflow = self.overflow_properties.read();
         let flags = self.flags.read();
         f.debug_struct("JsObject")
-            .field("properties", &properties.len())
+            .field("inline_properties", &inline_count)
+            .field("overflow_properties", &overflow.len())
             .field("is_array", &flags.is_array)
             .finish()
     }

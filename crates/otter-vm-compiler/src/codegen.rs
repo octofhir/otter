@@ -8,7 +8,8 @@ use otter_vm_bytecode::{
 };
 
 use crate::error::{CompileError, CompileResult};
-use crate::scope::{ResolvedBinding, ScopeChain};
+use crate::peephole::PeepholeOptimizer;
+use crate::scope::{ResolvedBinding, ScopeChain, VariableKind};
 use otter_vm_bytecode::Constant;
 
 /// Register allocator
@@ -207,6 +208,8 @@ pub struct CodeGen {
     exports: Vec<ExportRecord>,
     /// Whether this is an ES module
     is_esm: bool,
+    /// Whether to run peephole optimization
+    optimize: bool,
 }
 
 impl CodeGen {
@@ -220,7 +223,27 @@ impl CodeGen {
             imports: Vec::new(),
             exports: Vec::new(),
             is_esm: false,
+            optimize: false,
         }
+    }
+
+    /// Create a new code generator with optimization enabled
+    pub fn with_optimization(optimize: bool) -> Self {
+        Self {
+            constants: ConstantPool::new(),
+            functions: Vec::new(),
+            current: FunctionContext::new(Some("main".to_string())),
+            func_stack: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            is_esm: false,
+            optimize,
+        }
+    }
+
+    /// Enable or disable optimization
+    pub fn set_optimize(&mut self, optimize: bool) {
+        self.optimize = optimize;
     }
 
     /// Add a string constant
@@ -319,15 +342,30 @@ impl CodeGen {
         self.current.scopes.exit();
     }
 
-    /// Declare a variable
-    pub fn declare_variable(&mut self, name: &str, is_const: bool) -> CompileResult<u16> {
-        self.current.scopes.declare(name, is_const).ok_or_else(|| {
+    /// Declare a variable with a specific kind
+    pub fn declare_variable_with_kind(
+        &mut self,
+        name: &str,
+        kind: VariableKind,
+    ) -> CompileResult<u16> {
+        self.current.scopes.declare(name, kind).ok_or_else(|| {
             CompileError::syntax(
                 format!("Identifier '{}' has already been declared", name),
                 0,
                 0,
             )
         })
+    }
+
+    /// Declare a variable (is_const: true = Const, false = Let)
+    /// For var declarations, use declare_variable_with_kind with VariableKind::Var
+    pub fn declare_variable(&mut self, name: &str, is_const: bool) -> CompileResult<u16> {
+        let kind = if is_const {
+            VariableKind::Const
+        } else {
+            VariableKind::Let
+        };
+        self.declare_variable_with_kind(name, kind)
     }
 
     /// Resolve a variable
@@ -382,23 +420,30 @@ impl CodeGen {
     }
 
     /// Register an upvalue and return its index in the current function's upvalue array.
-    /// This method checks if the upvalue is already registered and returns the existing index,
-    /// or adds a new upvalue capture and returns the new index.
-    pub fn register_upvalue(&mut self, parent_local_index: u16, depth: usize) -> u16 {
-        // For depth=1, capture directly from parent's local
-        // For depth>1, we'd need transitive captures through parent upvalues
-        // For now, we only support depth=1 (immediate parent)
-
-        let capture = if depth == 1 {
-            UpvalueCapture::Local(otter_vm_bytecode::LocalIndex(parent_local_index))
+    ///
+    /// This method handles both direct captures (depth=1) and transitive captures (depth>1).
+    /// For transitive captures, it ensures all intermediate functions in the scope chain
+    /// have proper upvalue captures.
+    ///
+    /// - `local_index`: The local variable index in the owning function
+    /// - `depth`: How many function scopes up the variable is defined (1 = immediate parent)
+    pub fn register_upvalue(&mut self, local_index: u16, depth: usize) -> u16 {
+        if depth == 1 {
+            // Direct capture from immediate parent's local variable
+            let capture = UpvalueCapture::Local(otter_vm_bytecode::LocalIndex(local_index));
+            self.add_upvalue_to_current(capture)
         } else {
-            // For deeper captures, we need to register the upvalue in the parent first
-            // and then capture from parent's upvalue. This is complex, so for now
-            // we'll treat it as capturing from local at depth 1 (simplified).
-            // TODO: Implement proper transitive upvalue capture
-            UpvalueCapture::Local(otter_vm_bytecode::LocalIndex(parent_local_index))
-        };
+            // Transitive capture: ensure all intermediate parents have upvalues,
+            // then current captures from immediate parent's upvalue
+            let parent_upvalue_idx = self.ensure_transitive_upvalues(local_index, depth);
+            let capture =
+                UpvalueCapture::Upvalue(otter_vm_bytecode::LocalIndex(parent_upvalue_idx));
+            self.add_upvalue_to_current(capture)
+        }
+    }
 
+    /// Add an upvalue capture to the current function, deduplicating if already exists.
+    fn add_upvalue_to_current(&mut self, capture: UpvalueCapture) -> u16 {
         // Check if we already captured this exact upvalue
         for (i, existing) in self.current.upvalues.iter().enumerate() {
             if *existing == capture {
@@ -410,6 +455,65 @@ impl CodeGen {
         let idx = self.current.upvalues.len() as u16;
         self.current.upvalues.push(capture);
         idx
+    }
+
+    /// Add an upvalue capture to a specific function in the stack, deduplicating if already exists.
+    fn add_upvalue_to_func(&mut self, func_stack_idx: usize, capture: UpvalueCapture) -> u16 {
+        let func = &mut self.func_stack[func_stack_idx];
+
+        // Check if already captured
+        for (i, existing) in func.upvalues.iter().enumerate() {
+            if *existing == capture {
+                return i as u16;
+            }
+        }
+
+        // Add new upvalue
+        let idx = func.upvalues.len() as u16;
+        func.upvalues.push(capture);
+        idx
+    }
+
+    /// Ensure all intermediate functions have upvalues for transitive capture.
+    ///
+    /// For a variable at depth D (where D > 1):
+    /// - The variable is defined in func_stack[len - D]
+    /// - Each function from func_stack[len - D + 1] to func_stack[len - 1] needs an upvalue
+    /// - Returns the upvalue index in the immediate parent (func_stack[len - 1])
+    ///
+    /// Example: func_stack = [outer, middle, inner], current=innermost, depth=3
+    /// - Variable is in outer (func_stack[0])
+    /// - middle (func_stack[1]) needs Local upvalue for outer's local
+    /// - inner (func_stack[2]) needs Upvalue for middle's upvalue
+    /// - innermost (current) needs Upvalue for inner's upvalue
+    fn ensure_transitive_upvalues(&mut self, local_index: u16, depth: usize) -> u16 {
+        let stack_len = self.func_stack.len();
+
+        // owner_idx = len - depth: the function that owns the local variable
+        // first_capturer = owner_idx + 1: the first function that needs an upvalue
+        let owner_idx = stack_len.saturating_sub(depth);
+        let first_capturer = owner_idx + 1;
+
+        // Safety check
+        if first_capturer > stack_len {
+            panic!(
+                "Invalid depth {} for stack length {} (owner_idx={}, first_capturer={})",
+                depth, stack_len, owner_idx, first_capturer
+            );
+        }
+
+        // Add Local capture to first capturer (captures directly from owner's local)
+        let local_capture = UpvalueCapture::Local(otter_vm_bytecode::LocalIndex(local_index));
+        let mut prev_idx = self.add_upvalue_to_func(first_capturer, local_capture);
+
+        // Add Upvalue captures to subsequent functions in the chain
+        for func_idx in (first_capturer + 1)..stack_len {
+            let upvalue_capture = UpvalueCapture::Upvalue(otter_vm_bytecode::LocalIndex(prev_idx));
+            prev_idx = self.add_upvalue_to_func(func_idx, upvalue_capture);
+        }
+
+        // Return the upvalue index in the immediate parent (func_stack[len-1])
+        prev_idx
     }
 
     /// Start compiling a new function
@@ -467,6 +571,14 @@ impl CodeGen {
         let main = self.current.build();
         let entry_point = self.functions.len() as u32;
         self.functions.push(main);
+
+        // Run peephole optimization if enabled
+        if self.optimize {
+            let mut optimizer = PeepholeOptimizer::new();
+            for func in &mut self.functions {
+                optimizer.optimize(&mut func.instructions);
+            }
+        }
 
         let mut builder = Module::builder(source_url)
             .constants(self.constants)

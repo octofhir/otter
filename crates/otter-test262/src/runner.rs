@@ -100,7 +100,8 @@ impl Test262Runner {
 
     /// Collect test files from a directory
     fn collect_tests(&self, test_path: &Path) -> Vec<PathBuf> {
-        WalkDir::new(test_path)
+        let mut count = 0;
+        let res: Vec<PathBuf> = WalkDir::new(test_path)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().map(|s| s == "js").unwrap_or(false))
@@ -113,7 +114,15 @@ impl Test262Runner {
                     true
                 }
             })
-            .collect()
+            .inspect(|_| {
+                count += 1;
+                if count % 1000 == 0 {
+                    println!("DEBUG: Found {} tests so far...", count);
+                }
+            })
+            .collect();
+        println!("DEBUG: collect_tests finished, found {}", res.len());
+        res
     }
 
     /// Run all tests
@@ -155,26 +164,32 @@ impl Test262Runner {
     {
         let tests = self.list_tests_dir(subdir);
         for path in tests {
-            let result = self.run_test(&path).await;
+            let relative_path = path
+                .strip_prefix(&self.test_dir)
+                .unwrap_or(&path)
+                .to_path_buf();
+            let result = self.run_test(&relative_path).await;
             callback(result);
         }
     }
 
     /// Run a single test
     pub async fn run_test(&self, path: &Path) -> TestResult {
+        let relative_path = path.strip_prefix(&self.test_dir).unwrap_or(path);
+
+        use std::io::Write;
+        std::io::stdout().flush().unwrap();
+
         let start = Instant::now();
-        let relative_path = path
-            .strip_prefix(&self.test_dir)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
+        let relative_path_str = relative_path.to_string_lossy().to_string();
 
         // Read test file
+        // path is already full path from collect_tests
         let content = match fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
                 return TestResult {
-                    path: relative_path,
+                    path: relative_path_str,
                     outcome: TestOutcome::Crash,
                     duration: start.elapsed(),
                     error: Some(format!("Failed to read file: {}", e)),
@@ -186,11 +201,13 @@ impl Test262Runner {
         // Parse metadata
         let metadata = TestMetadata::parse(&content).unwrap_or_default();
 
+        // println!("DEBUG: Starting test {}", relative_path);
+
         // Check if we should skip this test
         for feature in &metadata.features {
             if self.skip_features.contains(feature) {
                 return TestResult {
-                    path: relative_path,
+                    path: relative_path_str,
                     outcome: TestOutcome::Skip,
                     duration: start.elapsed(),
                     error: Some(format!("Skipped feature: {}", feature)),
@@ -247,11 +264,11 @@ impl Test262Runner {
 
         // Run the test
         let result = self
-            .execute_test(&test_source, &metadata, &relative_path)
+            .execute_test(&test_source, &metadata, &relative_path_str)
             .await;
 
         TestResult {
-            path: relative_path,
+            path: relative_path_str,
             outcome: result.0,
             duration: start.elapsed(),
             error: result.1,

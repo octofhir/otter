@@ -142,13 +142,36 @@ impl Trace for crate::object::JsObject {
         // Trace the current shape
         tracer.mark(self.shape().as_ref());
 
-        // Trace all property values directly from storage (Data or Accessor)
-        // This is more efficient than own_keys() + get().
         use crate::object::PropertyDescriptor;
+
+        // Trace inline property values (first INLINE_PROPERTY_COUNT)
         {
-            let properties = self.get_properties_storage();
-            let props = properties.read();
-            for entry in props.iter() {
+            let inline = self.get_inline_properties_storage();
+            let inline_props = inline.read();
+            for slot in inline_props.iter() {
+                if let Some(entry) = slot {
+                    match &entry.desc {
+                        PropertyDescriptor::Data { value, .. } => {
+                            tracer.mark_value(value);
+                        }
+                        PropertyDescriptor::Accessor { get, set, .. } => {
+                            if let Some(v) = get {
+                                tracer.mark_value(v);
+                            }
+                            if let Some(v) = set {
+                                tracer.mark_value(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Trace overflow property values (Data or Accessor)
+        {
+            let overflow = self.get_overflow_properties_storage();
+            let overflow_props = overflow.read();
+            for entry in overflow_props.iter() {
                 match &entry.desc {
                     PropertyDescriptor::Data { value, .. } => {
                         tracer.mark_value(value);
@@ -165,7 +188,7 @@ impl Trace for crate::object::JsObject {
             }
         }
 
-        // Trace indexed elements (missing in previous implementation!)
+        // Trace indexed elements
         {
             let elements = self.get_elements_storage();
             let elems = elements.read();
@@ -294,8 +317,8 @@ impl Trace for crate::async_context::AsyncContext {
     }
 }
 
-// Implement Trace for InlineCache
-impl Trace for otter_vm_bytecode::function::InlineCache {
+// Implement Trace for InlineCacheState
+impl Trace for otter_vm_bytecode::function::InlineCacheState {
     fn trace(&self, _tracer: &mut dyn Tracer) {
         // Caches stores raw pointers (u64) and offsets.
         // We don't trace them here as the transition tree and objects

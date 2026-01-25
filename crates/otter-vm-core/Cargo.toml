@@ -5,13 +5,18 @@ edition = "2024"
 description = "Core VM execution engine for Otter"
 license = "MIT"
 
+[features]
+default = []
+profiling = ["dep:otter-profiler"]
+
 [dependencies]
 otter-vm-bytecode = { path = "../otter-vm-bytecode" }
 otter-vm-gc = { path = "../otter-vm-gc" }
+otter-profiler = { path = "../otter-profiler", optional = true }
 thiserror.workspace = true
 parking_lot = "0.12"
 dashmap = "6"
 rustc-hash = "2"
-regex = "1.12.2"
+regress = { version = "0.10.5", features = ["utf16"] }
 
 [dev-dependencies]

@@ -1,16 +1,20 @@
-use crate::object::JsObject;
-use regex::Regex;
+use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
+use crate::string::JsString;
+use crate::value::Value;
+use regress::{Flags, Regex};
 use std::sync::Arc;
 
 /// JavaScript RegExp object
 #[derive(Debug)]
 pub struct JsRegExp {
     /// The Ordinary Object part (properties like lastIndex)
-    pub object: JsObject,
+    pub object: Arc<JsObject>,
     /// The regex pattern
     pub pattern: String,
     /// The regex flags
     pub flags: String,
+    /// Whether this regex uses Unicode (u or v flags)
+    pub unicode: bool,
     /// The compiled Rust regex (if compilation succeeded)
     pub native_regex: Option<Regex>,
 }
@@ -18,48 +22,84 @@ pub struct JsRegExp {
 impl JsRegExp {
     /// Create a new JsRegExp
     pub fn new(pattern: String, flags: String, proto: Option<Arc<JsObject>>) -> Self {
-        let object = JsObject::new(proto);
-        // Attempt to compile regex.
-        // Rust regex syntax is different from JS (e.g. no lookaround, backrefs limited).
-        // For simple cases it works.
-        // TODO: Transform JS pattern to Rust pattern if needed (escape tweaks?).
-        let mut rust_pattern = pattern.clone();
-        // Fix for annexB "non-empty-class-ranges" test: [--\d]
-        // We replace "[--" with "[\-\-" to escape the hyphens for Rust regex.
-        // Note: JS "[--" means [ (literal), - (literal), - (literal).
-        if rust_pattern.contains("[--") {
-            rust_pattern = rust_pattern.replace("[--", "[\\-\\-\\");
-        }
-
-        let native_regex_res = Regex::new(&rust_pattern);
-        if let Err(e) = &native_regex_res {
-            eprintln!(
-                "Failed to compile regex '{}' (original '{}'): {}",
-                rust_pattern, pattern, e
+        let object = Arc::new(JsObject::new(proto));
+        let source = if pattern.is_empty() {
+            "(?:)".to_string()
+        } else {
+            pattern.clone()
+        };
+        object.define_property(
+            PropertyKey::string("lastIndex"),
+            PropertyDescriptor::data_with_attrs(
+                Value::number(0.0),
+                PropertyAttributes {
+                    writable: true,
+                    enumerable: false,
+                    configurable: false,
+                },
+            ),
+        );
+        object.define_property(
+            PropertyKey::string("source"),
+            PropertyDescriptor::data_with_attrs(
+                Value::string(JsString::intern(&source)),
+                PropertyAttributes {
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            ),
+        );
+        object.define_property(
+            PropertyKey::string("flags"),
+            PropertyDescriptor::data_with_attrs(
+                Value::string(JsString::intern(&flags)),
+                PropertyAttributes {
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            ),
+        );
+        let flag_attrs = PropertyAttributes {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        };
+        let flag_prop = |name: &str, enabled: bool| {
+            object.define_property(
+                PropertyKey::string(name),
+                PropertyDescriptor::data_with_attrs(Value::boolean(enabled), flag_attrs),
             );
-        }
-        let native_regex = native_regex_res.ok();
+        };
+        flag_prop("global", flags.contains('g'));
+        flag_prop("ignoreCase", flags.contains('i'));
+        flag_prop("multiline", flags.contains('m'));
+        flag_prop("dotAll", flags.contains('s'));
+        flag_prop("sticky", flags.contains('y'));
+        flag_prop("unicode", flags.contains('u'));
+        flag_prop("unicodeSets", flags.contains('v'));
+        flag_prop("hasIndices", flags.contains('d'));
+        let parsed_flags = Flags::from(flags.as_str());
+        let unicode = parsed_flags.unicode || parsed_flags.unicode_sets;
+        let native_regex = Regex::with_flags(&pattern, parsed_flags).ok();
 
         Self {
             object,
             pattern,
             flags,
+            unicode,
             native_regex,
         }
     }
 
     /// Execute the regex on a string
-    pub fn exec(&self, input: &str) -> Option<(usize, Vec<Option<String>>)> {
-        if let Some(re) = &self.native_regex {
-            if let Some(captures) = re.captures(input) {
-                let start_index = captures.get(0).map(|m| m.start()).unwrap_or(0);
-                let mut results = Vec::new();
-                for i in 0..captures.len() {
-                    results.push(captures.get(i).map(|m| m.as_str().to_string()));
-                }
-                return Some((start_index, results));
-            }
+    pub fn exec(&self, input: &JsString, start: usize) -> Option<regress::Match> {
+        let re = self.native_regex.as_ref()?;
+        if self.unicode {
+            re.find_from_utf16(input.as_utf16(), start).next()
+        } else {
+            re.find_from_ucs2(input.as_utf16(), start).next()
         }
-        None
     }
 }

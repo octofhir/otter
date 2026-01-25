@@ -7,7 +7,7 @@
 use crate::object::PropertyKey;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 /// A Shape defines the layout of properties in an object.
 pub struct Shape {
@@ -22,7 +22,8 @@ pub struct Shape {
     pub offset: Option<usize>,
 
     /// Transitions from this shape to child shapes when a new property is added.
-    transitions: RwLock<FxHashMap<PropertyKey, Arc<Shape>>>,
+    /// Use Weak to break cycles: Child -> Parent (Arc), Parent -> Child (Weak)
+    transitions: RwLock<FxHashMap<PropertyKey, Weak<Shape>>>,
 
     /// Cache of all property offsets in this shape (inherited + own).
     /// This is built lazily or during creation for fast lookups.
@@ -42,9 +43,7 @@ impl Shape {
             tracer.mark(parent.as_ref());
         }
 
-        // Note: transitions are not traced here to avoid infinite recursion
-        // during marking. The transition map is essentially a weak cache
-        // or part of the tree structure.
+        // Note: transitions are not traced directly for GC as they are weak
     }
 
     /// Create a new root (empty) shape.
@@ -63,8 +62,10 @@ impl Shape {
         // Check if transition already exists
         {
             let transitions = self.transitions.read();
-            if let Some(shape) = transitions.get(&key) {
-                return Arc::clone(shape);
+            if let Some(weak_shape) = transitions.get(&key) {
+                if let Some(shape) = weak_shape.upgrade() {
+                    return shape;
+                }
             }
         }
 
@@ -72,8 +73,10 @@ impl Shape {
         let mut transitions = self.transitions.write();
 
         // Double-check after acquiring write lock
-        if let Some(shape) = transitions.get(&key) {
-            return Arc::clone(shape);
+        if let Some(weak_shape) = transitions.get(&key) {
+            if let Some(shape) = weak_shape.upgrade() {
+                return shape;
+            }
         }
 
         let next_offset = self.offset.map(|o| o + 1).unwrap_or(0);
@@ -89,7 +92,7 @@ impl Shape {
             property_map: next_property_map,
         });
 
-        transitions.insert(key, Arc::clone(&new_shape));
+        transitions.insert(key, Arc::downgrade(&new_shape));
         new_shape
     }
 

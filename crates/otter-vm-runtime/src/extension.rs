@@ -89,6 +89,7 @@ impl OpHandler {
 }
 
 /// A single operation definition
+#[derive(Clone)]
 pub struct Op {
     /// Operation name (used to register as global function)
     pub name: String,
@@ -100,6 +101,7 @@ pub struct Op {
 ///
 /// An extension groups related operations and optional JavaScript setup code.
 /// Extensions can declare dependencies on other extensions.
+#[derive(Clone)]
 pub struct Extension {
     /// Extension name (unique identifier)
     name: String,
@@ -107,6 +109,8 @@ pub struct Extension {
     ops: Vec<Op>,
     /// JavaScript setup code chunks (run after ops are registered, in insertion order)
     js: Vec<String>,
+    /// Pre-compiled JS chunks (if any)
+    compiled_js: Vec<Arc<otter_vm_bytecode::Module>>,
     /// Dependencies (names of other extensions that must be loaded first)
     deps: Vec<String>,
 }
@@ -118,6 +122,7 @@ impl Extension {
             name: name.into(),
             ops: Vec::new(),
             js: Vec::new(),
+            compiled_js: Vec::new(),
             deps: Vec::new(),
         }
     }
@@ -137,6 +142,12 @@ impl Extension {
     /// Add dependencies (builder pattern)
     pub fn with_deps(mut self, deps: Vec<String>) -> Self {
         self.deps = deps;
+        self
+    }
+
+    /// Add pre-compiled JS module (builder pattern)
+    pub fn with_compiled_js(mut self, module: Arc<otter_vm_bytecode::Module>) -> Self {
+        self.compiled_js.push(module);
         self
     }
 
@@ -163,6 +174,29 @@ impl Extension {
     /// Get dependencies
     pub fn deps(&self) -> &[String] {
         &self.deps
+    }
+
+    /// Pre-compile all JS chunks
+    pub fn pre_compile(&mut self) -> Result<(), String> {
+        // Skip compilation if already done matching JS chunks
+        if !self.compiled_js.is_empty() && self.compiled_js.len() == self.js.len() {
+            return Ok(());
+        }
+
+        self.compiled_js.clear();
+        for js in &self.js {
+            let compiler = otter_vm_compiler::Compiler::new();
+            let module = compiler.compile(js, "setup.js").map_err(|e| {
+                format!("Failed to compile extension JS for '{}': {}", self.name, e)
+            })?;
+            self.compiled_js.push(Arc::new(module));
+        }
+        Ok(())
+    }
+
+    /// Get pre-compiled JS modules
+    pub fn compiled_js(&self) -> &[Arc<otter_vm_bytecode::Module>] {
+        &self.compiled_js
     }
 }
 
@@ -271,6 +305,14 @@ impl ExtensionRegistry {
         }
     }
 
+    /// Pre-compile all extensions in the registry
+    pub fn pre_compile_all(&mut self) -> Result<(), String> {
+        for ext in self.extensions.values_mut() {
+            ext.pre_compile()?;
+        }
+        Ok(())
+    }
+
     /// Register an extension
     ///
     /// Returns error if:
@@ -338,6 +380,19 @@ impl ExtensionRegistry {
                     .get(name)
                     .into_iter()
                     .flat_map(|ext| ext.js().iter().map(|s| s.as_str()))
+            })
+            .collect()
+    }
+
+    /// Get all pre-compiled JS modules in load order
+    pub fn all_compiled_js(&self) -> Vec<Arc<otter_vm_bytecode::Module>> {
+        self.load_order
+            .iter()
+            .flat_map(|name| {
+                self.extensions
+                    .get(name)
+                    .into_iter()
+                    .flat_map(|ext| ext.compiled_js().iter().cloned())
             })
             .collect()
     }

@@ -5,11 +5,16 @@ edition = "2024"
 description = "Runtime for Otter VM"
 license = "MIT"
 
+[features]
+default = []
+profiling = ["dep:otter-profiler", "otter-vm-core/profiling"]
+
 [dependencies]
 otter-vm-core = { path = "../otter-vm-core" }
 otter-vm-gc = { path = "../otter-vm-gc" }
 otter-vm-bytecode = { path = "../otter-vm-bytecode" }
 otter-vm-compiler = { path = "../otter-vm-compiler" }
+otter-profiler = { path = "../otter-profiler", optional = true }
 dunce = "1"
 oxc_resolver = "11"
 parking_lot = "0.12"

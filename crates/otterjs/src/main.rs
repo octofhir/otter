@@ -67,6 +67,10 @@ struct Cli {
     /// Execution timeout in seconds (0 = no timeout)
     #[arg(long, global = true, default_value = "30")]
     timeout: u64,
+
+    /// Show profiling information (memory usage)
+    #[arg(long, global = true)]
+    profile: bool,
 }
 
 #[derive(Subcommand)]
@@ -244,6 +248,29 @@ async fn run_file(path: &PathBuf, cli: &Cli) -> Result<()> {
 /// Run JavaScript code using EngineBuilder
 async fn run_code(source: &str, _source_url: &str, cli: &Cli) -> Result<()> {
     use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+
+    // Start timing
+    let start_time = Instant::now();
+
+    // Initialize memory tracking if profiling is enabled
+    let mut profiler = if cli.profile {
+        let pid = Pid::from_u32(std::process::id());
+        let mut sys = System::new_with_specifics(
+            RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
+        );
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::everything(),
+        );
+        let initial_rss = sys.process(pid).map(|p| p.memory()).unwrap_or(0);
+        let initial_virt = sys.process(pid).map(|p| p.virtual_memory()).unwrap_or(0);
+        Some((sys, pid, initial_rss, initial_virt, start_time))
+    } else {
+        None
+    };
 
     let caps = build_capabilities(cli);
 
@@ -279,6 +306,55 @@ async fn run_code(source: &str, _source_url: &str, cli: &Cli) -> Result<()> {
             if !value.is_undefined() {
                 println!("{}", format_value(&value));
             }
+
+            // Print detailed profiling stats
+            if let Some((ref mut sys, pid, initial_rss, initial_virt, start)) = profiler {
+                let elapsed = start.elapsed();
+                sys.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&[pid]),
+                    true,
+                    ProcessRefreshKind::everything(),
+                );
+
+                let current_rss = sys.process(pid).map(|p| p.memory()).unwrap_or(0);
+                let current_virt = sys.process(pid).map(|p| p.virtual_memory()).unwrap_or(0);
+
+                println!();
+                println!("╭─────────────────────────────────────╮");
+                println!("│       Otter Profiling Report        │");
+                println!("├─────────────────────────────────────┤");
+                println!("│ Execution Time                      │");
+                println!(
+                    "│   Total:     {:>10.2} ms          │",
+                    elapsed.as_secs_f64() * 1000.0
+                );
+                println!("├─────────────────────────────────────┤");
+                println!("│ Memory Usage (RSS)                  │");
+                println!(
+                    "│   Initial:   {:>10.2} MB          │",
+                    initial_rss as f64 / 1024.0 / 1024.0
+                );
+                println!(
+                    "│   Current:   {:>10.2} MB          │",
+                    current_rss as f64 / 1024.0 / 1024.0
+                );
+                println!(
+                    "│   Delta:     {:>+10.2} MB          │",
+                    (current_rss as i64 - initial_rss as i64) as f64 / 1024.0 / 1024.0
+                );
+                println!("├─────────────────────────────────────┤");
+                println!("│ Virtual Memory                      │");
+                println!(
+                    "│   Initial:   {:>10.2} MB          │",
+                    initial_virt as f64 / 1024.0 / 1024.0
+                );
+                println!(
+                    "│   Current:   {:>10.2} MB          │",
+                    current_virt as f64 / 1024.0 / 1024.0
+                );
+                println!("╰─────────────────────────────────────╯");
+            }
+
             Ok(())
         }
         Err(e) => {

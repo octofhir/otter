@@ -13,156 +13,191 @@ const _symbolSplit = __Symbol_getWellKnown('split');
 const _symbolSpecies = __Symbol_getWellKnown('species');
 const _symbolUnscopables = __Symbol_getWellKnown('unscopables');
 
+// eval built-in (global eval only)
+globalThis.eval = function eval(code) {
+    if (typeof code !== 'string') {
+        return code;
+    }
+
+    const result = __otter_eval(code);
+    if (result && result.ok === false) {
+        const message = result.message || '';
+        switch (result.errorType) {
+            case 'SyntaxError':
+                throw new SyntaxError(message);
+            case 'ReferenceError':
+                throw new ReferenceError(message);
+            case 'RangeError':
+                throw new RangeError(message);
+            case 'TypeError':
+                throw new TypeError(message);
+            default:
+                throw new Error(message);
+        }
+    }
+    return result ? result.value : undefined;
+};
+
 // Object built-in wrapper
-globalThis.Object = {
-    keys: function(obj) {
-        return __Object_keys(obj);
-    },
-    values: function(obj) {
-        return __Object_values(obj);
-    },
-    entries: function(obj) {
-        return __Object_entries(obj);
-    },
-    assign: function(target, ...sources) {
-        return __Object_assign(target, ...sources);
-    },
-    hasOwn: function(obj, key) {
-        return __Object_hasOwn(obj, key);
-    },
-    // Object mutability methods (native ops)
-    freeze: function(obj) {
-        return __Object_freeze(obj);
-    },
-    isFrozen: function(obj) {
-        return __Object_isFrozen(obj);
-    },
-    seal: function(obj) {
-        return __Object_seal(obj);
-    },
-    isSealed: function(obj) {
-        return __Object_isSealed(obj);
-    },
-    preventExtensions: function(obj) {
-        return __Object_preventExtensions(obj);
-    },
-    isExtensible: function(obj) {
-        return __Object_isExtensible(obj);
-    },
-    // Object.defineProperty(obj, prop, descriptor)
-    defineProperty: function(obj, prop, descriptor) {
-        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
-            throw new TypeError('Object.defineProperty called on non-object');
+// Object built-in wrapper
+globalThis.Object = function (value) {
+    if (value === undefined || value === null) {
+        return {};
+    }
+    if (typeof value === 'object' || typeof value === 'function') {
+        return value;
+    }
+    // TODO: Coerce primitives to objects
+    return value;
+};
+
+Object.keys = function (obj) {
+    return __Object_keys(obj);
+};
+Object.values = function (obj) {
+    return __Object_values(obj);
+};
+Object.entries = function (obj) {
+    return __Object_entries(obj);
+};
+Object.assign = function (target, ...sources) {
+    return __Object_assign(target, ...sources);
+};
+Object.hasOwn = function (obj, key) {
+    return __Object_hasOwn(obj, key);
+};
+// Object mutability methods (native ops)
+Object.freeze = function (obj) {
+    return __Object_freeze(obj);
+};
+Object.isFrozen = function (obj) {
+    return __Object_isFrozen(obj);
+};
+Object.seal = function (obj) {
+    return __Object_seal(obj);
+};
+Object.isSealed = function (obj) {
+    return __Object_isSealed(obj);
+};
+Object.preventExtensions = function (obj) {
+    return __Object_preventExtensions(obj);
+};
+Object.isExtensible = function (obj) {
+    return __Object_isExtensible(obj);
+};
+// Object.defineProperty(obj, prop, descriptor)
+Object.defineProperty = function (obj, prop, descriptor) {
+    if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+        throw new TypeError('Object.defineProperty called on non-object');
+    }
+    if (descriptor === null || typeof descriptor !== 'object') {
+        throw new TypeError('Property description must be an object');
+    }
+    return __Object_defineProperty(obj, prop, descriptor);
+};
+// Object.defineProperties(obj, props)
+Object.defineProperties = function (obj, props) {
+    if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+        throw new TypeError('Object.defineProperties called on non-object');
+    }
+    const keys = Object.keys(props);
+    for (const key of keys) {
+        Object.defineProperty(obj, key, props[key]);
+    }
+    return obj;
+};
+// Object.create(proto, propertiesObject?)
+Object.create = function (proto, propertiesObject) {
+    if (proto !== null && typeof proto !== 'object' && typeof proto !== 'function') {
+        throw new TypeError('Object prototype may only be an Object or null');
+    }
+    return __Object_create(proto, propertiesObject);
+};
+// Object.is(value1, value2) - SameValue algorithm
+Object.is = function (value1, value2) {
+    return __Object_is(value1, value2);
+};
+// Object.fromEntries(iterable)
+Object.fromEntries = function (iterable) {
+    if (iterable === null || iterable === undefined) {
+        throw new TypeError('Object.fromEntries requires an iterable argument');
+    }
+    const obj = {};
+    for (const entry of iterable) {
+        if (entry === null || typeof entry !== 'object') {
+            throw new TypeError('Iterator value is not an entry object');
         }
-        if (descriptor === null || typeof descriptor !== 'object') {
-            throw new TypeError('Property description must be an object');
-        }
-        return __Object_defineProperty(obj, prop, descriptor);
-    },
-    // Object.defineProperties(obj, props)
-    defineProperties: function(obj, props) {
-        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
-            throw new TypeError('Object.defineProperties called on non-object');
-        }
-        const keys = Object.keys(props);
-        for (const key of keys) {
-            Object.defineProperty(obj, key, props[key]);
-        }
-        return obj;
-    },
-    // Object.create(proto, propertiesObject?)
-    create: function(proto, propertiesObject) {
-        if (proto !== null && typeof proto !== 'object' && typeof proto !== 'function') {
-            throw new TypeError('Object prototype may only be an Object or null');
-        }
-        return __Object_create(proto, propertiesObject);
-    },
-    // Object.is(value1, value2) - SameValue algorithm
-    is: function(value1, value2) {
-        return __Object_is(value1, value2);
-    },
-    // Object.fromEntries(iterable)
-    fromEntries: function(iterable) {
-        if (iterable === null || iterable === undefined) {
-            throw new TypeError('Object.fromEntries requires an iterable argument');
-        }
-        const obj = {};
-        for (const entry of iterable) {
-            if (entry === null || typeof entry !== 'object') {
-                throw new TypeError('Iterator value is not an entry object');
-            }
-            const key = entry[0];
-            const value = entry[1];
-            obj[key] = value;
-        }
-        return obj;
-    },
-    // Object.getOwnPropertyNames(obj)
-    getOwnPropertyNames: function(obj) {
-        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
-            throw new TypeError('Object.getOwnPropertyNames called on non-object');
-        }
-        return Reflect.ownKeys(obj).filter(k => typeof k === 'string');
-    },
-    // Object.getOwnPropertySymbols(obj)
-    getOwnPropertySymbols: function(obj) {
-        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
-            throw new TypeError('Object.getOwnPropertySymbols called on non-object');
-        }
-        return Reflect.ownKeys(obj).filter(k => typeof k === 'symbol');
-    },
-    // Object.getOwnPropertyDescriptor(obj, prop)
-    getOwnPropertyDescriptor: function(obj, prop) {
-        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
-            throw new TypeError('Object.getOwnPropertyDescriptor called on non-object');
-        }
-        return Reflect.getOwnPropertyDescriptor(obj, prop);
-    },
-    // Object.getOwnPropertyDescriptors(obj)
-    getOwnPropertyDescriptors: function(obj) {
-        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
-            throw new TypeError('Object.getOwnPropertyDescriptors called on non-object');
-        }
-        const result = {};
-        const keys = Reflect.ownKeys(obj);
-        for (const key of keys) {
-            result[key] = Reflect.getOwnPropertyDescriptor(obj, key);
-        }
-        return result;
-    },
-    // Object.getPrototypeOf(obj)
-    getPrototypeOf: function(obj) {
-        if (obj === null || obj === undefined) {
-            throw new TypeError('Cannot convert undefined or null to object');
-        }
-        // Convert primitives to objects
-        if (typeof obj !== 'object' && typeof obj !== 'function') {
-            obj = Object(obj);
-        }
-        return Reflect.getPrototypeOf(obj);
-    },
-    // Object.setPrototypeOf(obj, proto)
-    setPrototypeOf: function(obj, proto) {
-        if (obj === null || obj === undefined) {
-            throw new TypeError('Object.setPrototypeOf called on null or undefined');
-        }
-        if (proto !== null && typeof proto !== 'object') {
-            throw new TypeError('Object prototype may only be an Object or null');
-        }
-        if (typeof obj !== 'object' && typeof obj !== 'function') {
-            return obj; // Per spec, return obj unchanged for primitives
-        }
-        Reflect.setPrototypeOf(obj, proto);
-        return obj;
-    },
+        const key = entry[0];
+        const value = entry[1];
+        obj[key] = value;
+    }
+    return obj;
+};
+// Object.getOwnPropertyNames(obj)
+Object.getOwnPropertyNames = function (obj) {
+    if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+        throw new TypeError('Object.getOwnPropertyNames called on non-object');
+    }
+    return Reflect.ownKeys(obj).filter(k => typeof k === 'string');
+};
+// Object.getOwnPropertySymbols(obj)
+Object.getOwnPropertySymbols = function (obj) {
+    if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+        throw new TypeError('Object.getOwnPropertySymbols called on non-object');
+    }
+    return Reflect.ownKeys(obj).filter(k => typeof k === 'symbol');
+};
+// Object.getOwnPropertyDescriptor(obj, prop)
+Object.getOwnPropertyDescriptor = function (obj, prop) {
+    if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+        throw new TypeError('Object.getOwnPropertyDescriptor called on non-object');
+    }
+    return Reflect.getOwnPropertyDescriptor(obj, prop);
+};
+// Object.getOwnPropertyDescriptors(obj)
+Object.getOwnPropertyDescriptors = function (obj) {
+    if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+        throw new TypeError('Object.getOwnPropertyDescriptors called on non-object');
+    }
+    const result = {};
+    const keys = Reflect.ownKeys(obj);
+    for (const key of keys) {
+        result[key] = Reflect.getOwnPropertyDescriptor(obj, key);
+    }
+    return result;
+};
+// Object.getPrototypeOf(obj)
+Object.getPrototypeOf = function (obj) {
+    if (obj === null || obj === undefined) {
+        throw new TypeError('Cannot convert undefined or null to object');
+    }
+    // Convert primitives to objects
+    if (typeof obj !== 'object' && typeof obj !== 'function') {
+        obj = Object(obj);
+    }
+    return Reflect.getPrototypeOf(obj);
+};
+// Object.setPrototypeOf(obj, proto)
+Object.setPrototypeOf = function (obj, proto) {
+    if (obj === null || obj === undefined) {
+        throw new TypeError('Object.setPrototypeOf called on null or undefined');
+    }
+    if (proto !== null && typeof proto !== 'object') {
+        throw new TypeError('Object prototype may only be an Object or null');
+    }
+    if (typeof obj !== 'object' && typeof obj !== 'function') {
+        return obj; // Per spec, return obj unchanged for primitives
+    }
+    Reflect.setPrototypeOf(obj, proto);
+    return obj;
 };
 
 // Object.prototype methods
 const _objectPrototype = {
-    hasOwnProperty: function(prop) {
+    hasOwnProperty: function (prop) {
         return Object.hasOwn(this, prop);
     },
-    isPrototypeOf: function(obj) {
+    isPrototypeOf: function (obj) {
         if (obj === null || obj === undefined) {
             return false;
         }
@@ -175,14 +210,14 @@ const _objectPrototype = {
         }
         return false;
     },
-    propertyIsEnumerable: function(prop) {
+    propertyIsEnumerable: function (prop) {
         const desc = Reflect.getOwnPropertyDescriptor(this, prop);
         return desc !== undefined && desc.enumerable === true;
     },
-    valueOf: function() {
+    valueOf: function () {
         return this;
     },
-    toLocaleString: function() {
+    toLocaleString: function () {
         if (this === null || this === undefined) {
             throw new TypeError('Cannot call toLocaleString on null or undefined');
         }
@@ -193,16 +228,25 @@ const _objectPrototype = {
 Object.prototype = _objectPrototype;
 
 // Array built-in wrapper
-globalThis.Array = {
-    isArray: function(val) {
-        return __Array_isArray(val);
-    },
-    from: function(arrayLike) {
-        return __Array_from(arrayLike);
-    },
-    of: function(...items) {
-        return __Array_of(items);
-    },
+globalThis.Array = function (...args) {
+    if (args.length === 1 && typeof args[0] === 'number') {
+        const len = args[0];
+        // Create array of given length
+        const arr = [];
+        arr.length = len;
+        return arr;
+    }
+    return [...args];
+};
+
+Array.isArray = function (val) {
+    return __Array_isArray(val);
+};
+Array.from = function (arrayLike) {
+    return __Array_from(arrayLike);
+};
+Array.of = function (...items) {
+    return __Array_of(items);
 };
 
 // Math built-in
@@ -218,72 +262,68 @@ globalThis.Math = {
     SQRT2: 1.4142135623730951,
 
     // Basic
-    abs: function(x) { return __Math_abs(x); },
-    ceil: function(x) { return __Math_ceil(x); },
-    floor: function(x) { return __Math_floor(x); },
-    round: function(x) { return __Math_round(x); },
-    trunc: function(x) { return __Math_trunc(x); },
-    sign: function(x) { return __Math_sign(x); },
+    abs: function (x) { return __Math_abs(x); },
+    ceil: function (x) { return __Math_ceil(x); },
+    floor: function (x) { return __Math_floor(x); },
+    round: function (x) { return __Math_round(x); },
+    trunc: function (x) { return __Math_trunc(x); },
+    sign: function (x) { return __Math_sign(x); },
 
     // Roots and Powers
-    sqrt: function(x) { return __Math_sqrt(x); },
-    cbrt: function(x) { return __Math_cbrt(x); },
-    pow: function(base, exp) { return __Math_pow(base, exp); },
-    hypot: function(...values) { return __Math_hypot(...values); },
+    sqrt: function (x) { return __Math_sqrt(x); },
+    cbrt: function (x) { return __Math_cbrt(x); },
+    pow: function (base, exp) { return __Math_pow(base, exp); },
+    hypot: function (...values) { return __Math_hypot(...values); },
 
     // Exponentials and Logarithms
-    exp: function(x) { return __Math_exp(x); },
-    expm1: function(x) { return __Math_expm1(x); },
-    log: function(x) { return __Math_log(x); },
-    log1p: function(x) { return __Math_log1p(x); },
-    log2: function(x) { return __Math_log2(x); },
-    log10: function(x) { return __Math_log10(x); },
+    exp: function (x) { return __Math_exp(x); },
+    expm1: function (x) { return __Math_expm1(x); },
+    log: function (x) { return __Math_log(x); },
+    log1p: function (x) { return __Math_log1p(x); },
+    log2: function (x) { return __Math_log2(x); },
+    log10: function (x) { return __Math_log10(x); },
 
     // Trigonometry
-    sin: function(x) { return __Math_sin(x); },
-    cos: function(x) { return __Math_cos(x); },
-    tan: function(x) { return __Math_tan(x); },
-    asin: function(x) { return __Math_asin(x); },
-    acos: function(x) { return __Math_acos(x); },
-    atan: function(x) { return __Math_atan(x); },
-    atan2: function(y, x) { return __Math_atan2(y, x); },
+    sin: function (x) { return __Math_sin(x); },
+    cos: function (x) { return __Math_cos(x); },
+    tan: function (x) { return __Math_tan(x); },
+    asin: function (x) { return __Math_asin(x); },
+    acos: function (x) { return __Math_acos(x); },
+    atan: function (x) { return __Math_atan(x); },
+    atan2: function (y, x) { return __Math_atan2(y, x); },
 
     // Hyperbolic
-    sinh: function(x) { return __Math_sinh(x); },
-    cosh: function(x) { return __Math_cosh(x); },
-    tanh: function(x) { return __Math_tanh(x); },
-    asinh: function(x) { return __Math_asinh(x); },
-    acosh: function(x) { return __Math_acosh(x); },
-    atanh: function(x) { return __Math_atanh(x); },
+    sinh: function (x) { return __Math_sinh(x); },
+    cosh: function (x) { return __Math_cosh(x); },
+    tanh: function (x) { return __Math_tanh(x); },
+    asinh: function (x) { return __Math_asinh(x); },
+    acosh: function (x) { return __Math_acosh(x); },
+    atanh: function (x) { return __Math_atanh(x); },
 
     // Min/Max/Random
-    min: function(...values) { return __Math_min(...values); },
-    max: function(...values) { return __Math_max(...values); },
-    random: function() { return __Math_random(); },
+    min: function (...values) { return __Math_min(...values); },
+    max: function (...values) { return __Math_max(...values); },
+    random: function () { return __Math_random(); },
 
     // Special
-    clz32: function(x) { return __Math_clz32(x); },
-    imul: function(a, b) { return __Math_imul(a, b); },
-    fround: function(x) { return __Math_fround(x); },
-    f16round: function(x) { return __Math_f16round(x); },
+    clz32: function (x) { return __Math_clz32(x); },
+    imul: function (a, b) { return __Math_imul(a, b); },
+    fround: function (x) { return __Math_fround(x); },
+    f16round: function (x) { return __Math_f16round(x); },
 };
 
 // JSON built-in
 globalThis.JSON = {
-    parse: function(text, reviver) {
+    parse: function (text, reviver) {
         const result = __JSON_parse(text);
-        // Parse the result string back to JS value
-        // Note: For now, we return the parsed value directly
-        // Full reviver support would need deep iteration
         if (reviver === undefined) {
-            return JSON.parseValue(result);
+            return result;
         }
         // With reviver, apply it to each value
-        const parsed = JSON.parseValue(result);
-        return JSON.applyReviver(parsed, '', reviver);
+        return JSON.applyReviver(result, '', reviver);
     },
 
-    stringify: function(value, replacer, space) {
+    stringify: function (value, replacer, space) {
         // Convert value to JSON string representation for native code
         const jsonStr = JSON.stringifyValue(value, replacer);
         if (jsonStr === undefined) {
@@ -294,13 +334,13 @@ globalThis.JSON = {
     },
 
     // ES2024+ JSON.rawJSON(string)
-    rawJSON: function(string) {
+    rawJSON: function (string) {
         const result = __JSON_rawJSON(String(string));
         return JSON.parseValue(result);
     },
 
     // ES2024+ JSON.isRawJSON(value)
-    isRawJSON: function(value) {
+    isRawJSON: function (value) {
         if (value === null || typeof value !== 'object') {
             return false;
         }
@@ -308,7 +348,7 @@ globalThis.JSON = {
     },
 
     // Helper: Parse JSON string to JS value (recursive)
-    parseValue: function(str) {
+    parseValue: function (str) {
         if (str === 'null') return null;
         if (str === 'true') return true;
         if (str === 'false') return false;
@@ -338,7 +378,7 @@ globalThis.JSON = {
     },
 
     // Helper: Parse JSON string literal
-    parseString: function(str) {
+    parseString: function (str) {
         // Remove quotes and unescape
         let result = '';
         let i = 1; // Skip opening quote
@@ -372,7 +412,7 @@ globalThis.JSON = {
     },
 
     // Helper: Parse JSON array
-    parseArray: function(str) {
+    parseArray: function (str) {
         const result = [];
         const inner = str.slice(1, -1).trim();
         if (inner === '') return result;
@@ -417,7 +457,7 @@ globalThis.JSON = {
     },
 
     // Helper: Parse JSON object
-    parseObject: function(str) {
+    parseObject: function (str) {
         const result = {};
         const inner = str.slice(1, -1).trim();
         if (inner === '') return result;
@@ -471,7 +511,7 @@ globalThis.JSON = {
     },
 
     // Helper: Stringify value to JSON string
-    stringifyValue: function(value, replacer) {
+    stringifyValue: function (value, replacer) {
         if (value === undefined) return undefined;
         if (value === null) return 'null';
         if (typeof value === 'boolean') return value ? 'true' : 'false';
@@ -523,7 +563,7 @@ globalThis.JSON = {
     },
 
     // Helper: Escape string for JSON
-    escapeString: function(str) {
+    escapeString: function (str) {
         let result = '"';
         for (let i = 0; i < str.length; i++) {
             const c = str.charCodeAt(i);
@@ -541,7 +581,7 @@ globalThis.JSON = {
     },
 
     // Helper: Apply reviver to parsed value
-    applyReviver: function(value, key, reviver) {
+    applyReviver: function (value, key, reviver) {
         if (value !== null && typeof value === 'object') {
             if (Array.isArray(value)) {
                 for (let i = 0; i < value.length; i++) {
@@ -558,7 +598,7 @@ globalThis.JSON = {
 };
 
 // String built-in wrapper
-globalThis.String = function(value) {
+globalThis.String = function (value) {
     // Avoid recursion: this function replaces the global `String`.
     // Use JS ToString-like semantics instead of calling `String(...)`.
     if (value === undefined) return '';
@@ -569,123 +609,144 @@ globalThis.String = function(value) {
     return '' + value;
 };
 
-String.fromCharCode = function(...codes) {
+String.fromCharCode = function (...codes) {
     return __String_fromCharCode(...codes);
 };
 
-String.fromCodePoint = function(...codePoints) {
+String.fromCodePoint = function (...codePoints) {
     return __String_fromCodePoint(...codePoints);
 };
 
 // String.prototype methods
 String.prototype = {
-    charAt: function(index) {
+    charAt: function (index) {
         return __String_charAt(this, index);
     },
-    charCodeAt: function(index) {
+    charCodeAt: function (index) {
         return __String_charCodeAt(this, index);
     },
-    codePointAt: function(pos) {
+    codePointAt: function (pos) {
         return __String_codePointAt(this, pos);
     },
-    concat: function(...strings) {
+    concat: function (...strings) {
         return __String_concat(this, ...strings);
     },
-    includes: function(searchString, position) {
+    includes: function (searchString, position) {
         return __String_includes(this, searchString, position);
     },
-    indexOf: function(searchValue, fromIndex) {
+    indexOf: function (searchValue, fromIndex) {
         return __String_indexOf(this, searchValue, fromIndex);
     },
-    lastIndexOf: function(searchValue, fromIndex) {
+    lastIndexOf: function (searchValue, fromIndex) {
         return __String_lastIndexOf(this, searchValue, fromIndex);
     },
-    slice: function(start, end) {
+    match: function (regexp) {
+        if (regexp !== null && regexp !== undefined && regexp[_symbolMatch] !== undefined) {
+            return regexp[_symbolMatch](this);
+        }
+        const re = RegExp(regexp);
+        return re[_symbolMatch](this);
+    },
+    matchAll: function (regexp) {
+        if (regexp !== null && regexp !== undefined && regexp[_symbolMatchAll] !== undefined) {
+            return regexp[_symbolMatchAll](this);
+        }
+        const re = RegExp(regexp);
+        return re[_symbolMatchAll](this);
+    },
+    search: function (regexp) {
+        if (regexp !== null && regexp !== undefined && regexp[_symbolSearch] !== undefined) {
+            return regexp[_symbolSearch](this);
+        }
+        const re = RegExp(regexp);
+        return re[_symbolSearch](this);
+    },
+    slice: function (start, end) {
         return __String_slice(this, start, end);
     },
-    substring: function(start, end) {
+    substring: function (start, end) {
         return __String_substring(this, start, end);
     },
-    split: function(separator, limit) {
+    split: function (separator, limit) {
         return __String_split(this, separator, limit);
     },
-    toLowerCase: function() {
+    toLowerCase: function () {
         return __String_toLowerCase(this);
     },
-    toUpperCase: function() {
+    toUpperCase: function () {
         return __String_toUpperCase(this);
     },
-    toLocaleLowerCase: function(locales) {
+    toLocaleLowerCase: function (locales) {
         return __String_toLocaleLowerCase(this, locales);
     },
-    toLocaleUpperCase: function(locales) {
+    toLocaleUpperCase: function (locales) {
         return __String_toLocaleUpperCase(this, locales);
     },
-    trim: function() {
+    trim: function () {
         return __String_trim(this);
     },
-    trimStart: function() {
+    trimStart: function () {
         return __String_trimStart(this);
     },
-    trimEnd: function() {
+    trimEnd: function () {
         return __String_trimEnd(this);
     },
-    trimLeft: function() {
+    trimLeft: function () {
         // Alias for trimStart
         return __String_trimStart(this);
     },
-    trimRight: function() {
+    trimRight: function () {
         // Alias for trimEnd
         return __String_trimEnd(this);
     },
-    replace: function(searchValue, replaceValue) {
+    replace: function (searchValue, replaceValue) {
         return __String_replace(this, searchValue, replaceValue);
     },
-    replaceAll: function(searchValue, replaceValue) {
+    replaceAll: function (searchValue, replaceValue) {
         return __String_replaceAll(this, searchValue, replaceValue);
     },
-    startsWith: function(searchString, position) {
+    startsWith: function (searchString, position) {
         return __String_startsWith(this, searchString, position);
     },
-    endsWith: function(searchString, endPosition) {
+    endsWith: function (searchString, endPosition) {
         return __String_endsWith(this, searchString, endPosition);
     },
-    repeat: function(count) {
+    repeat: function (count) {
         return __String_repeat(this, count);
     },
-    padStart: function(targetLength, padString) {
+    padStart: function (targetLength, padString) {
         return __String_padStart(this, targetLength, padString);
     },
-    padEnd: function(targetLength, padString) {
+    padEnd: function (targetLength, padString) {
         return __String_padEnd(this, targetLength, padString);
     },
-    at: function(index) {
+    at: function (index) {
         return __String_at(this, index);
     },
-    normalize: function(form) {
+    normalize: function (form) {
         return __String_normalize(this, form);
     },
-    isWellFormed: function() {
+    isWellFormed: function () {
         return __String_isWellFormed(this);
     },
-    toWellFormed: function() {
+    toWellFormed: function () {
         return __String_toWellFormed(this);
     },
-    localeCompare: function(compareString, locales, options) {
+    localeCompare: function (compareString, locales, options) {
         return __String_localeCompare(this, compareString, locales, options);
     },
     get length() {
         return __String_length(this);
     },
-    toString: function() {
+    toString: function () {
         return this;
     },
-    valueOf: function() {
+    valueOf: function () {
         return this;
     },
 
     // Symbol.iterator - enables for-of loops over strings
-    [_symbolIterator]: function() {
+    [_symbolIterator]: function () {
         const str = String(this);
         let index = 0;
         return {
@@ -699,13 +760,13 @@ String.prototype = {
                 }
                 return { value: undefined, done: true };
             },
-            [_symbolIterator]: function() { return this; }
+            [_symbolIterator]: function () { return this; }
         };
     },
 };
 
 // Number built-in wrapper
-globalThis.Number = function(value) {
+globalThis.Number = function (value) {
     if (value === undefined) return 0;
     return +value; // Coerce to number
 };
@@ -721,54 +782,54 @@ Number.POSITIVE_INFINITY = Infinity;
 Number.NEGATIVE_INFINITY = -Infinity;
 
 // Number static methods
-Number.isFinite = function(value) {
+Number.isFinite = function (value) {
     return __Number_isFinite(value);
 };
 
-Number.isInteger = function(value) {
+Number.isInteger = function (value) {
     return __Number_isInteger(value);
 };
 
-Number.isNaN = function(value) {
+Number.isNaN = function (value) {
     return __Number_isNaN(value);
 };
 
-Number.isSafeInteger = function(value) {
+Number.isSafeInteger = function (value) {
     return __Number_isSafeInteger(value);
 };
 
-Number.parseFloat = function(string) {
+Number.parseFloat = function (string) {
     return __Number_parseFloat(string);
 };
 
-Number.parseInt = function(string, radix) {
+Number.parseInt = function (string, radix) {
     return __Number_parseInt(string, radix);
 };
 
 // Number.prototype methods
 Number.prototype = {
-    toFixed: function(digits) {
+    toFixed: function (digits) {
         return __Number_toFixed(this, digits);
     },
-    toExponential: function(fractionDigits) {
+    toExponential: function (fractionDigits) {
         return __Number_toExponential(this, fractionDigits);
     },
-    toPrecision: function(precision) {
+    toPrecision: function (precision) {
         return __Number_toPrecision(this, precision);
     },
-    toString: function(radix) {
+    toString: function (radix) {
         return __Number_toString(this, radix);
     },
-    toLocaleString: function(locales, options) {
+    toLocaleString: function (locales, options) {
         return __Number_toLocaleString(this, locales, options);
     },
-    valueOf: function() {
+    valueOf: function () {
         return __Number_valueOf(this);
     },
 };
 
 // Boolean built-in wrapper
-globalThis.Boolean = function(value) {
+globalThis.Boolean = function (value) {
     // ToBoolean conversion
     if (value === undefined || value === null) return false;
     if (typeof value === 'boolean') return value;
@@ -779,16 +840,16 @@ globalThis.Boolean = function(value) {
 
 // Boolean.prototype methods
 Boolean.prototype = {
-    valueOf: function() {
+    valueOf: function () {
         return __Boolean_valueOf(this);
     },
-    toString: function() {
+    toString: function () {
         return __Boolean_toString(this);
     },
 };
 
 // RegExp built-in
-globalThis.RegExp = function(pattern, flags) {
+globalThis.RegExp = function (pattern, flags) {
     // Handle RegExp argument
     if (pattern && typeof pattern === 'object' && pattern._pattern !== undefined) {
         if (flags === undefined) {
@@ -800,111 +861,121 @@ globalThis.RegExp = function(pattern, flags) {
     const _pattern = pattern === undefined ? '' : String(pattern);
     const _flags = flags === undefined ? '' : String(flags);
 
-    return {
-        _pattern,
-        _flags,
-        get source() { return __RegExp_source(this._pattern); },
-        get flags() { return __RegExp_flags(this._pattern, this._flags); },
-        get global() { return __RegExp_global(this._pattern, this._flags); },
-        get ignoreCase() { return __RegExp_ignoreCase(this._pattern, this._flags); },
-        get multiline() { return __RegExp_multiline(this._pattern, this._flags); },
-        get dotAll() { return __RegExp_dotAll(this._pattern, this._flags); },
-        get sticky() { return __RegExp_sticky(this._pattern, this._flags); },
-        get unicode() { return __RegExp_unicode(this._pattern, this._flags); },
-        get unicodeSets() { return __RegExp_unicodeSets(this._pattern, this._flags); },
-        get hasIndices() { return __RegExp_hasIndices(this._pattern, this._flags); },
-        lastIndex: 0,
-        test: function(string) {
-            return __RegExp_test(this._pattern, this._flags, string);
-        },
-        exec: function(string) {
-            const result = __RegExp_exec(this._pattern, this._flags, string);
-            if (result === null) return null;
+    const re = Object.create(RegExp.prototype);
+    re._pattern = _pattern;
+    re._flags = _flags;
+    Object.defineProperty(re, "lastIndex", {
+        value: 0,
+        writable: true,
+        enumerable: false,
+        configurable: false,
+    });
+    return re;
+};
+
+RegExp.prototype = {
+    get source() { return __RegExp_source(this._pattern); },
+    get flags() { return __RegExp_flags(this._pattern, this._flags); },
+    get global() { return __RegExp_global(this._pattern, this._flags); },
+    get ignoreCase() { return __RegExp_ignoreCase(this._pattern, this._flags); },
+    get multiline() { return __RegExp_multiline(this._pattern, this._flags); },
+    get dotAll() { return __RegExp_dotAll(this._pattern, this._flags); },
+    get sticky() { return __RegExp_sticky(this._pattern, this._flags); },
+    get unicode() { return __RegExp_unicode(this._pattern, this._flags); },
+    get unicodeSets() { return __RegExp_unicodeSets(this._pattern, this._flags); },
+    get hasIndices() { return __RegExp_hasIndices(this._pattern, this._flags); },
+    test: function (string) {
+        return __RegExp_test(this._pattern, this._flags, string);
+    },
+    exec: function (string) {
+        const result = __RegExp_exec(this._pattern, this._flags, string);
+        if (result === null) return null;
+        const parsed = JSON.parse(result);
+        const arr = parsed.matches;
+        arr.index = parsed.index;
+        arr.input = parsed.input;
+        arr.groups = undefined; // TODO: named capture groups
+        return arr;
+    },
+    toString: function () {
+        return __RegExp_toString(this._pattern, this._flags);
+    },
+    // Symbol.match
+    [_symbolMatch]: function (string) {
+        const result = __RegExp_match(this._pattern, this._flags, string);
+        if (result === null) return null;
+        if (typeof result === 'string') {
+            // Global match returns JSON array of strings
+            if (result.startsWith('[')) {
+                return JSON.parse(result);
+            }
+            // Non-global match returns exec-style result
             const parsed = JSON.parse(result);
             const arr = parsed.matches;
             arr.index = parsed.index;
             arr.input = parsed.input;
-            arr.groups = undefined; // TODO: named capture groups
+            arr.groups = undefined;
             return arr;
-        },
-        toString: function() {
-            return __RegExp_toString(this._pattern, this._flags);
-        },
-        // Symbol.match
-        [Symbol.match]: function(string) {
-            const result = __RegExp_match(this._pattern, this._flags, string);
-            if (result === null) return null;
-            if (typeof result === 'string') {
-                // Global match returns JSON array of strings
-                if (result.startsWith('[')) {
-                    return JSON.parse(result);
+        }
+        return result;
+    },
+    // Symbol.matchAll
+    [_symbolMatchAll]: function (string) {
+        const result = __RegExp_matchAll(this._pattern, this._flags, string);
+        const matches = JSON.parse(result);
+        let index = 0;
+        return {
+            next: function () {
+                if (index >= matches.length) {
+                    return { done: true, value: undefined };
                 }
-                // Non-global match returns exec-style result
-                const parsed = JSON.parse(result);
-                const arr = parsed.matches;
-                arr.index = parsed.index;
-                arr.input = parsed.input;
+                const m = matches[index++];
+                const arr = m.matches;
+                arr.index = m.index;
                 arr.groups = undefined;
-                return arr;
-            }
-            return result;
-        },
-        // Symbol.matchAll
-        [Symbol.matchAll]: function(string) {
-            const result = __RegExp_matchAll(this._pattern, this._flags, string);
-            const matches = JSON.parse(result);
-            let index = 0;
-            return {
-                next: function() {
-                    if (index >= matches.length) {
-                        return { done: true, value: undefined };
-                    }
-                    const m = matches[index++];
-                    const arr = m.matches;
-                    arr.index = m.index;
-                    arr.groups = undefined;
-                    return { done: false, value: arr };
-                },
-                [Symbol.iterator]: function() { return this; }
-            };
-        },
-        // Symbol.replace
-        [Symbol.replace]: function(string, replacement) {
-            return __RegExp_replace(this._pattern, this._flags, string, replacement);
-        },
-        // Symbol.search
-        [Symbol.search]: function(string) {
-            return __RegExp_search(this._pattern, this._flags, string);
-        },
-        // Symbol.split
-        [Symbol.split]: function(string, limit) {
-            const result = __RegExp_split(this._pattern, this._flags, string, limit);
-            return JSON.parse(result);
-        },
-    };
+                return { done: false, value: arr };
+            },
+            [_symbolIterator]: function () { return this; }
+        };
+    },
+    // Symbol.replace
+    [_symbolReplace]: function (string, replacement) {
+        return __RegExp_replace(this._pattern, this._flags, string, replacement);
+    },
+    // Symbol.search
+    [_symbolSearch]: function (string) {
+        return __RegExp_search(this._pattern, this._flags, string);
+    },
+    // Symbol.split
+    [_symbolSplit]: function (string, limit) {
+        const result = __RegExp_split(this._pattern, this._flags, string, limit);
+        return JSON.parse(result);
+    },
 };
 
+RegExp.prototype.constructor = RegExp;
+
 // RegExp.escape (ES2026)
-RegExp.escape = function(string) {
+RegExp.escape = function (string) {
     return __RegExp_escape(string);
 };
 
 // Array.prototype methods (simplified - real impl needs prototype chain)
 Array.prototype = {
     // === Mutating Methods ===
-    push: function(...items) {
+    push: function (...items) {
         return __Array_push(this, items);
     },
-    pop: function() {
+    pop: function () {
         return __Array_pop(this);
     },
-    shift: function() {
+    shift: function () {
         return __Array_shift(this);
     },
-    unshift: function(...items) {
+    unshift: function (...items) {
         return __Array_unshift(this, items);
     },
-    splice: function(start, deleteCount, ...items) {
+    splice: function (start, deleteCount, ...items) {
         return __Array_splice({
             arr: this,
             start: start,
@@ -912,14 +983,14 @@ Array.prototype = {
             items: items.length > 0 ? items : null
         });
     },
-    reverse: function() {
+    reverse: function () {
         return __Array_reverse(this);
     },
-    sort: function(compareFn) {
+    sort: function (compareFn) {
         // Note: compareFn not supported in JSON ops - lexicographic sort only
         return __Array_sort(this);
     },
-    fill: function(value, start, end) {
+    fill: function (value, start, end) {
         return __Array_fill({
             arr: this,
             value: value,
@@ -927,7 +998,7 @@ Array.prototype = {
             end: end
         });
     },
-    copyWithin: function(target, start, end) {
+    copyWithin: function (target, start, end) {
         return __Array_copyWithin({
             arr: this,
             target: target,
@@ -937,16 +1008,16 @@ Array.prototype = {
     },
 
     // === Non-Mutating Methods ===
-    slice: function(start, end) {
+    slice: function (start, end) {
         return __Array_slice({ arr: this, start: start, end: end });
     },
-    concat: function(...items) {
+    concat: function (...items) {
         return __Array_concat(this, items);
     },
-    flat: function(depth) {
+    flat: function (depth) {
         return __Array_flat({ arr: this, depth: depth });
     },
-    flatMap: function(callback, thisArg) {
+    flatMap: function (callback, thisArg) {
         // Execute callback in JS, pass results to native
         const mapped = [];
         for (let i = 0; i < this.length; i++) {
@@ -956,69 +1027,69 @@ Array.prototype = {
     },
 
     // === Search Methods ===
-    indexOf: function(searchElement, fromIndex) {
+    indexOf: function (searchElement, fromIndex) {
         return __Array_indexOf(this, searchElement);
     },
-    lastIndexOf: function(searchElement, fromIndex) {
+    lastIndexOf: function (searchElement, fromIndex) {
         return __Array_lastIndexOf(this, searchElement);
     },
-    includes: function(searchElement, fromIndex) {
+    includes: function (searchElement, fromIndex) {
         return __Array_includes(this, searchElement);
     },
-    find: function(predicate, thisArg) {
+    find: function (predicate, thisArg) {
         const results = [];
         for (let i = 0; i < this.length; i++) {
             results.push(!!predicate.call(thisArg, this[i], i, this));
         }
         return __Array_find({ arr: this, results: results });
     },
-    findIndex: function(predicate, thisArg) {
+    findIndex: function (predicate, thisArg) {
         const results = [];
         for (let i = 0; i < this.length; i++) {
             results.push(!!predicate.call(thisArg, this[i], i, this));
         }
         return __Array_findIndex({ arr: this, results: results });
     },
-    findLast: function(predicate, thisArg) {
+    findLast: function (predicate, thisArg) {
         const results = [];
         for (let i = 0; i < this.length; i++) {
             results.push(!!predicate.call(thisArg, this[i], i, this));
         }
         return __Array_findLast({ arr: this, results: results });
     },
-    findLastIndex: function(predicate, thisArg) {
+    findLastIndex: function (predicate, thisArg) {
         const results = [];
         for (let i = 0; i < this.length; i++) {
             results.push(!!predicate.call(thisArg, this[i], i, this));
         }
         return __Array_findLastIndex({ arr: this, results: results });
     },
-    at: function(index) {
+    at: function (index) {
         return __Array_at(this, index);
     },
 
     // === Iteration Methods ===
-    forEach: function(callback, thisArg) {
+    forEach: function (callback, thisArg) {
         for (let i = 0; i < this.length; i++) {
             callback.call(thisArg, this[i], i, this);
         }
         return __Array_forEach(this);
     },
-    map: function(callback, thisArg) {
+    map: function (callback, thisArg) {
         const results = [];
         for (let i = 0; i < this.length; i++) {
             results.push(callback.call(thisArg, this[i], i, this));
         }
         return __Array_map({ results: results });
     },
-    filter: function(predicate, thisArg) {
+    filter: function (predicate, thisArg) {
         const results = [];
         for (let i = 0; i < this.length; i++) {
             results.push(!!predicate.call(thisArg, this[i], i, this));
         }
         return __Array_filter({ arr: this, results: results });
     },
-    reduce: function(callback, initialValue) {
+    reduce: function (callback, initialValue) {
         let accumulator = initialValue !== undefined ? initialValue : this[0];
         const startIndex = initialValue !== undefined ? 0 : 1;
         for (let i = startIndex; i < this.length; i++) {
@@ -1026,7 +1097,7 @@ Array.prototype = {
         }
         return __Array_reduce({ result: accumulator });
     },
-    reduceRight: function(callback, initialValue) {
+    reduceRight: function (callback, initialValue) {
         let accumulator = initialValue !== undefined ? initialValue : this[this.length - 1];
         const startIndex = initialValue !== undefined ? this.length - 1 : this.length - 2;
         for (let i = startIndex; i >= 0; i--) {
@@ -1034,14 +1105,14 @@ Array.prototype = {
         }
         return __Array_reduceRight({ result: accumulator });
     },
-    every: function(predicate, thisArg) {
+    every: function (predicate, thisArg) {
         const results = [];
         for (let i = 0; i < this.length; i++) {
             results.push(!!predicate.call(thisArg, this[i], i, this));
         }
         return __Array_every(results);
     },
-    some: function(predicate, thisArg) {
+    some: function (predicate, thisArg) {
         const results = [];
         for (let i = 0; i < this.length; i++) {
             results.push(!!predicate.call(thisArg, this[i], i, this));
@@ -1050,10 +1121,10 @@ Array.prototype = {
     },
 
     // === Conversion Methods ===
-    join: function(separator) {
+    join: function (separator) {
         return __Array_join(this, separator);
     },
-    toString: function() {
+    toString: function () {
         return __Array_toString(this);
     },
     get length() {
@@ -1061,14 +1132,14 @@ Array.prototype = {
     },
 
     // === ES2023 Immutable Methods ===
-    toReversed: function() {
+    toReversed: function () {
         return __Array_toReversed(this);
     },
-    toSorted: function(compareFn) {
+    toSorted: function (compareFn) {
         // Note: compareFn not supported in JSON ops - lexicographic sort only
         return __Array_toSorted(this);
     },
-    toSpliced: function(start, deleteCount, ...items) {
+    toSpliced: function (start, deleteCount, ...items) {
         return __Array_toSpliced({
             arr: this,
             start: start,
@@ -1076,7 +1147,7 @@ Array.prototype = {
             items: items.length > 0 ? items : null
         });
     },
-    with: function(index, value) {
+    with: function (index, value) {
         return __Array_with({
             arr: this,
             index: index,
@@ -1085,13 +1156,13 @@ Array.prototype = {
     },
 
     // Symbol.iterator - enables for-of loops
-    [_symbolIterator]: function() {
+    [_symbolIterator]: function () {
         // NOTE: The VM currently does not support upvalue capture in nested functions.
         // Keep iterators stateful via `this` instead of closing over locals.
         return {
             _arr: this,
             _index: 0,
-            next: function() {
+            next: function () {
                 const i = this._index;
                 const arr = this._arr;
                 if (i < arr.length) {
@@ -1100,13 +1171,13 @@ Array.prototype = {
                 }
                 return { value: undefined, done: true };
             },
-            [_symbolIterator]: function() { return this; }
+            [_symbolIterator]: function () { return this; }
         };
     },
 };
 
 // Date built-in
-globalThis.Date = function(year, month, date, hours, minutes, seconds, ms) {
+globalThis.Date = function (year, month, date, hours, minutes, seconds, ms) {
     // Internal timestamp storage
     let _timestamp;
 
@@ -1134,122 +1205,122 @@ globalThis.Date = function(year, month, date, hours, minutes, seconds, ms) {
 
     return {
         _timestamp,
-        getFullYear: function() { return __Date_getFullYear(this._timestamp); },
-        getMonth: function() { return __Date_getMonth(this._timestamp); },
-        getDate: function() { return __Date_getDate(this._timestamp); },
-        getDay: function() { return __Date_getDay(this._timestamp); },
-        getHours: function() { return __Date_getHours(this._timestamp); },
-        getMinutes: function() { return __Date_getMinutes(this._timestamp); },
-        getSeconds: function() { return __Date_getSeconds(this._timestamp); },
-        getMilliseconds: function() { return __Date_getMilliseconds(this._timestamp); },
-        getUTCFullYear: function() { return __Date_getUTCFullYear(this._timestamp); },
-        getUTCMonth: function() { return __Date_getUTCMonth(this._timestamp); },
-        getUTCDate: function() { return __Date_getUTCDate(this._timestamp); },
-        getUTCDay: function() { return __Date_getUTCDay(this._timestamp); },
-        getUTCHours: function() { return __Date_getUTCHours(this._timestamp); },
-        getUTCMinutes: function() { return __Date_getUTCMinutes(this._timestamp); },
-        getUTCSeconds: function() { return __Date_getUTCSeconds(this._timestamp); },
-        getUTCMilliseconds: function() { return __Date_getUTCMilliseconds(this._timestamp); },
-        getTime: function() { return __Date_getTime(this._timestamp); },
-        getTimezoneOffset: function() { return __Date_getTimezoneOffset(); },
-        setFullYear: function(y, m, d) { this._timestamp = __Date_setFullYear(this._timestamp, y, m, d); return this._timestamp; },
-        setMonth: function(m, d) { this._timestamp = __Date_setMonth(this._timestamp, m, d); return this._timestamp; },
-        setDate: function(d) { this._timestamp = __Date_setDate(this._timestamp, d); return this._timestamp; },
-        setHours: function(h, m, s, ms) { this._timestamp = __Date_setHours(this._timestamp, h, m, s, ms); return this._timestamp; },
-        setMinutes: function(m, s, ms) { this._timestamp = __Date_setMinutes(this._timestamp, m, s, ms); return this._timestamp; },
-        setSeconds: function(s, ms) { this._timestamp = __Date_setSeconds(this._timestamp, s, ms); return this._timestamp; },
-        setMilliseconds: function(ms) { this._timestamp = __Date_setMilliseconds(this._timestamp, ms); return this._timestamp; },
-        setTime: function(t) { this._timestamp = __Date_setTime(this._timestamp, t); return this._timestamp; },
-        setUTCFullYear: function(y, m, d) { this._timestamp = __Date_setUTCFullYear(this._timestamp, y, m, d); return this._timestamp; },
-        setUTCMonth: function(m, d) { this._timestamp = __Date_setUTCMonth(this._timestamp, m, d); return this._timestamp; },
-        setUTCDate: function(d) { this._timestamp = __Date_setUTCDate(this._timestamp, d); return this._timestamp; },
-        setUTCHours: function(h, m, s, ms) { this._timestamp = __Date_setUTCHours(this._timestamp, h, m, s, ms); return this._timestamp; },
-        setUTCMinutes: function(m, s, ms) { this._timestamp = __Date_setUTCMinutes(this._timestamp, m, s, ms); return this._timestamp; },
-        setUTCSeconds: function(s, ms) { this._timestamp = __Date_setUTCSeconds(this._timestamp, s, ms); return this._timestamp; },
-        setUTCMilliseconds: function(ms) { this._timestamp = __Date_setUTCMilliseconds(this._timestamp, ms); return this._timestamp; },
-        toString: function() { return __Date_toString(this._timestamp); },
-        toDateString: function() { return __Date_toDateString(this._timestamp); },
-        toTimeString: function() { return __Date_toTimeString(this._timestamp); },
-        toISOString: function() { return __Date_toISOString(this._timestamp); },
-        toUTCString: function() { return __Date_toUTCString(this._timestamp); },
-        toJSON: function() { return __Date_toJSON(this._timestamp); },
-        toLocaleDateString: function() { return __Date_toLocaleDateString(this._timestamp); },
-        toLocaleTimeString: function() { return __Date_toLocaleTimeString(this._timestamp); },
-        toLocaleString: function() { return __Date_toLocaleString(this._timestamp); },
-        valueOf: function() { return __Date_valueOf(this._timestamp); },
+        getFullYear: function () { return __Date_getFullYear(this._timestamp); },
+        getMonth: function () { return __Date_getMonth(this._timestamp); },
+        getDate: function () { return __Date_getDate(this._timestamp); },
+        getDay: function () { return __Date_getDay(this._timestamp); },
+        getHours: function () { return __Date_getHours(this._timestamp); },
+        getMinutes: function () { return __Date_getMinutes(this._timestamp); },
+        getSeconds: function () { return __Date_getSeconds(this._timestamp); },
+        getMilliseconds: function () { return __Date_getMilliseconds(this._timestamp); },
+        getUTCFullYear: function () { return __Date_getUTCFullYear(this._timestamp); },
+        getUTCMonth: function () { return __Date_getUTCMonth(this._timestamp); },
+        getUTCDate: function () { return __Date_getUTCDate(this._timestamp); },
+        getUTCDay: function () { return __Date_getUTCDay(this._timestamp); },
+        getUTCHours: function () { return __Date_getUTCHours(this._timestamp); },
+        getUTCMinutes: function () { return __Date_getUTCMinutes(this._timestamp); },
+        getUTCSeconds: function () { return __Date_getUTCSeconds(this._timestamp); },
+        getUTCMilliseconds: function () { return __Date_getUTCMilliseconds(this._timestamp); },
+        getTime: function () { return __Date_getTime(this._timestamp); },
+        getTimezoneOffset: function () { return __Date_getTimezoneOffset(); },
+        setFullYear: function (y, m, d) { this._timestamp = __Date_setFullYear(this._timestamp, y, m, d); return this._timestamp; },
+        setMonth: function (m, d) { this._timestamp = __Date_setMonth(this._timestamp, m, d); return this._timestamp; },
+        setDate: function (d) { this._timestamp = __Date_setDate(this._timestamp, d); return this._timestamp; },
+        setHours: function (h, m, s, ms) { this._timestamp = __Date_setHours(this._timestamp, h, m, s, ms); return this._timestamp; },
+        setMinutes: function (m, s, ms) { this._timestamp = __Date_setMinutes(this._timestamp, m, s, ms); return this._timestamp; },
+        setSeconds: function (s, ms) { this._timestamp = __Date_setSeconds(this._timestamp, s, ms); return this._timestamp; },
+        setMilliseconds: function (ms) { this._timestamp = __Date_setMilliseconds(this._timestamp, ms); return this._timestamp; },
+        setTime: function (t) { this._timestamp = __Date_setTime(this._timestamp, t); return this._timestamp; },
+        setUTCFullYear: function (y, m, d) { this._timestamp = __Date_setUTCFullYear(this._timestamp, y, m, d); return this._timestamp; },
+        setUTCMonth: function (m, d) { this._timestamp = __Date_setUTCMonth(this._timestamp, m, d); return this._timestamp; },
+        setUTCDate: function (d) { this._timestamp = __Date_setUTCDate(this._timestamp, d); return this._timestamp; },
+        setUTCHours: function (h, m, s, ms) { this._timestamp = __Date_setUTCHours(this._timestamp, h, m, s, ms); return this._timestamp; },
+        setUTCMinutes: function (m, s, ms) { this._timestamp = __Date_setUTCMinutes(this._timestamp, m, s, ms); return this._timestamp; },
+        setUTCSeconds: function (s, ms) { this._timestamp = __Date_setUTCSeconds(this._timestamp, s, ms); return this._timestamp; },
+        setUTCMilliseconds: function (ms) { this._timestamp = __Date_setUTCMilliseconds(this._timestamp, ms); return this._timestamp; },
+        toString: function () { return __Date_toString(this._timestamp); },
+        toDateString: function () { return __Date_toDateString(this._timestamp); },
+        toTimeString: function () { return __Date_toTimeString(this._timestamp); },
+        toISOString: function () { return __Date_toISOString(this._timestamp); },
+        toUTCString: function () { return __Date_toUTCString(this._timestamp); },
+        toJSON: function () { return __Date_toJSON(this._timestamp); },
+        toLocaleDateString: function () { return __Date_toLocaleDateString(this._timestamp); },
+        toLocaleTimeString: function () { return __Date_toLocaleTimeString(this._timestamp); },
+        toLocaleString: function () { return __Date_toLocaleString(this._timestamp); },
+        valueOf: function () { return __Date_valueOf(this._timestamp); },
     };
 };
 
-Date.now = function() { return __Date_now(); };
-Date.parse = function(s) { return __Date_parse(s); };
-Date.UTC = function(y, m, d, h, min, s, ms) { return __Date_UTC(y, m, d, h, min, s, ms); };
+Date.now = function () { return __Date_now(); };
+Date.parse = function (s) { return __Date_parse(s); };
+Date.UTC = function (y, m, d, h, min, s, ms) { return __Date_UTC(y, m, d, h, min, s, ms); };
 
 // Temporal API (Stage 3, Chrome 144+ / Firefox 139+)
 globalThis.Temporal = {
     Now: {
-        instant: function() { return Temporal.Instant.fromEpochNanoseconds(__Temporal_Now_instant()); },
-        timeZoneId: function() { return __Temporal_Now_timeZoneId(); },
-        zonedDateTimeISO: function(tz) { return Temporal.ZonedDateTime.from(__Temporal_Now_zonedDateTimeISO(tz)); },
-        plainDateTimeISO: function(tz) { return Temporal.PlainDateTime.from(__Temporal_Now_plainDateTimeISO(tz)); },
-        plainDateISO: function(tz) { return Temporal.PlainDate.from(__Temporal_Now_plainDateISO(tz)); },
-        plainTimeISO: function(tz) { return Temporal.PlainTime.from(__Temporal_Now_plainTimeISO(tz)); },
+        instant: function () { return Temporal.Instant.fromEpochNanoseconds(__Temporal_Now_instant()); },
+        timeZoneId: function () { return __Temporal_Now_timeZoneId(); },
+        zonedDateTimeISO: function (tz) { return Temporal.ZonedDateTime.from(__Temporal_Now_zonedDateTimeISO(tz)); },
+        plainDateTimeISO: function (tz) { return Temporal.PlainDateTime.from(__Temporal_Now_plainDateTimeISO(tz)); },
+        plainDateISO: function (tz) { return Temporal.PlainDate.from(__Temporal_Now_plainDateISO(tz)); },
+        plainTimeISO: function (tz) { return Temporal.PlainTime.from(__Temporal_Now_plainTimeISO(tz)); },
     },
 
     Instant: {
-        from: function(thing) {
+        from: function (thing) {
             const s = __Temporal_Instant_from(String(thing));
             return Temporal.Instant._create(s);
         },
-        fromEpochSeconds: function(secs) {
+        fromEpochSeconds: function (secs) {
             const s = __Temporal_Instant_fromEpochSeconds(secs);
             return Temporal.Instant._create(s);
         },
-        fromEpochMilliseconds: function(ms) {
+        fromEpochMilliseconds: function (ms) {
             const s = __Temporal_Instant_fromEpochMilliseconds(ms);
             return Temporal.Instant._create(s);
         },
-        fromEpochMicroseconds: function(us) {
+        fromEpochMicroseconds: function (us) {
             const s = __Temporal_Instant_fromEpochMicroseconds(String(us));
             return Temporal.Instant._create(s);
         },
-        fromEpochNanoseconds: function(ns) {
+        fromEpochNanoseconds: function (ns) {
             const s = __Temporal_Instant_fromEpochNanoseconds(String(ns));
             return Temporal.Instant._create(s);
         },
-        compare: function(one, two) {
+        compare: function (one, two) {
             return one.epochNanoseconds === two.epochNanoseconds ? 0 :
-                   BigInt(one.epochNanoseconds) < BigInt(two.epochNanoseconds) ? -1 : 1;
+                BigInt(one.epochNanoseconds) < BigInt(two.epochNanoseconds) ? -1 : 1;
         },
-        _create: function(epochNanoseconds) {
+        _create: function (epochNanoseconds) {
             return {
                 _ns: epochNanoseconds,
                 get epochSeconds() { return __Temporal_Instant_epochSeconds(this._ns); },
                 get epochMilliseconds() { return __Temporal_Instant_epochMilliseconds(this._ns); },
                 get epochMicroseconds() { return __Temporal_Instant_epochMicroseconds(this._ns); },
                 get epochNanoseconds() { return __Temporal_Instant_epochNanoseconds(this._ns); },
-                add: function(d) { return Temporal.Instant._create(__Temporal_Instant_add(this._ns, d.total('nanoseconds'))); },
-                subtract: function(d) { return Temporal.Instant._create(__Temporal_Instant_subtract(this._ns, d.total('nanoseconds'))); },
-                until: function(other) { return Temporal.Duration.from('PT' + (__Temporal_Instant_until(this._ns, other._ns) / 1e9) + 'S'); },
-                since: function(other) { return Temporal.Duration.from('PT' + (__Temporal_Instant_since(this._ns, other._ns) / 1e9) + 'S'); },
-                round: function(opts) { return Temporal.Instant._create(__Temporal_Instant_round(this._ns, opts?.smallestUnit || opts)); },
-                equals: function(other) { return __Temporal_Instant_equals(this._ns, other._ns); },
-                toString: function() { return __Temporal_Instant_toString(this._ns); },
-                toJSON: function() { return __Temporal_Instant_toJSON(this._ns); },
-                valueOf: function() { throw new TypeError('Temporal.Instant cannot be converted to primitive'); },
-                toZonedDateTimeISO: function(tz) { return Temporal.ZonedDateTime.from(__Temporal_Instant_toZonedDateTimeISO(this._ns, tz)); },
+                add: function (d) { return Temporal.Instant._create(__Temporal_Instant_add(this._ns, d.total('nanoseconds'))); },
+                subtract: function (d) { return Temporal.Instant._create(__Temporal_Instant_subtract(this._ns, d.total('nanoseconds'))); },
+                until: function (other) { return Temporal.Duration.from('PT' + (__Temporal_Instant_until(this._ns, other._ns) / 1e9) + 'S'); },
+                since: function (other) { return Temporal.Duration.from('PT' + (__Temporal_Instant_since(this._ns, other._ns) / 1e9) + 'S'); },
+                round: function (opts) { return Temporal.Instant._create(__Temporal_Instant_round(this._ns, opts?.smallestUnit || opts)); },
+                equals: function (other) { return __Temporal_Instant_equals(this._ns, other._ns); },
+                toString: function () { return __Temporal_Instant_toString(this._ns); },
+                toJSON: function () { return __Temporal_Instant_toJSON(this._ns); },
+                valueOf: function () { throw new TypeError('Temporal.Instant cannot be converted to primitive'); },
+                toZonedDateTimeISO: function (tz) { return Temporal.ZonedDateTime.from(__Temporal_Instant_toZonedDateTimeISO(this._ns, tz)); },
             };
         },
     },
 
     PlainDate: {
-        from: function(thing) {
+        from: function (thing) {
             const s = __Temporal_PlainDate_from(String(thing));
             return Temporal.PlainDate._create(s);
         },
-        compare: function(one, two) {
+        compare: function (one, two) {
             return __Temporal_PlainDate_compare(one._s, two._s);
         },
-        _create: function(s) {
+        _create: function (s) {
             return {
                 _s: s,
                 get year() { return __Temporal_PlainDate_year(this._s); },
@@ -1263,30 +1334,30 @@ globalThis.Temporal = {
                 get daysInYear() { return __Temporal_PlainDate_daysInYear(this._s); },
                 get monthsInYear() { return __Temporal_PlainDate_monthsInYear(this._s); },
                 get inLeapYear() { return __Temporal_PlainDate_inLeapYear(this._s); },
-                add: function(d) { return Temporal.PlainDate._create(__Temporal_PlainDate_add(this._s, typeof d === 'object' ? d.days || 0 : d)); },
-                subtract: function(d) { return Temporal.PlainDate._create(__Temporal_PlainDate_subtract(this._s, typeof d === 'object' ? d.days || 0 : d)); },
-                until: function(other) { return { days: __Temporal_PlainDate_until(this._s, other._s) }; },
-                since: function(other) { return { days: __Temporal_PlainDate_since(this._s, other._s) }; },
-                with: function(fields) { return Temporal.PlainDate._create(__Temporal_PlainDate_with(this._s, fields?.year, fields?.month, fields?.day)); },
-                equals: function(other) { return __Temporal_PlainDate_equals(this._s, other._s); },
-                toString: function() { return __Temporal_PlainDate_toString(this._s); },
-                toJSON: function() { return __Temporal_PlainDate_toJSON(this._s); },
-                toPlainDateTime: function(t) { return Temporal.PlainDateTime.from(__Temporal_PlainDate_toPlainDateTime(this._s, t?._s || t)); },
-                toPlainYearMonth: function() { return Temporal.PlainYearMonth.from(__Temporal_PlainDate_toPlainYearMonth(this._s)); },
-                toPlainMonthDay: function() { return Temporal.PlainMonthDay.from(__Temporal_PlainDate_toPlainMonthDay(this._s)); },
+                add: function (d) { return Temporal.PlainDate._create(__Temporal_PlainDate_add(this._s, typeof d === 'object' ? d.days || 0 : d)); },
+                subtract: function (d) { return Temporal.PlainDate._create(__Temporal_PlainDate_subtract(this._s, typeof d === 'object' ? d.days || 0 : d)); },
+                until: function (other) { return { days: __Temporal_PlainDate_until(this._s, other._s) }; },
+                since: function (other) { return { days: __Temporal_PlainDate_since(this._s, other._s) }; },
+                with: function (fields) { return Temporal.PlainDate._create(__Temporal_PlainDate_with(this._s, fields?.year, fields?.month, fields?.day)); },
+                equals: function (other) { return __Temporal_PlainDate_equals(this._s, other._s); },
+                toString: function () { return __Temporal_PlainDate_toString(this._s); },
+                toJSON: function () { return __Temporal_PlainDate_toJSON(this._s); },
+                toPlainDateTime: function (t) { return Temporal.PlainDateTime.from(__Temporal_PlainDate_toPlainDateTime(this._s, t?._s || t)); },
+                toPlainYearMonth: function () { return Temporal.PlainYearMonth.from(__Temporal_PlainDate_toPlainYearMonth(this._s)); },
+                toPlainMonthDay: function () { return Temporal.PlainMonthDay.from(__Temporal_PlainDate_toPlainMonthDay(this._s)); },
             };
         },
     },
 
     PlainTime: {
-        from: function(thing) {
+        from: function (thing) {
             const s = __Temporal_PlainTime_from(String(thing));
             return Temporal.PlainTime._create(s);
         },
-        compare: function(one, two) {
+        compare: function (one, two) {
             return __Temporal_PlainTime_compare(one._s, two._s);
         },
-        _create: function(s) {
+        _create: function (s) {
             return {
                 _s: s,
                 get hour() { return __Temporal_PlainTime_hour(this._s); },
@@ -1295,29 +1366,29 @@ globalThis.Temporal = {
                 get millisecond() { return __Temporal_PlainTime_millisecond(this._s); },
                 get microsecond() { return __Temporal_PlainTime_microsecond(this._s); },
                 get nanosecond() { return __Temporal_PlainTime_nanosecond(this._s); },
-                add: function(d) { return Temporal.PlainTime._create(__Temporal_PlainTime_add(this._s, d)); },
-                subtract: function(d) { return Temporal.PlainTime._create(__Temporal_PlainTime_subtract(this._s, d)); },
-                until: function(other) { return { nanoseconds: __Temporal_PlainTime_until(this._s, other._s) }; },
-                since: function(other) { return { nanoseconds: __Temporal_PlainTime_since(this._s, other._s) }; },
-                with: function(fields) { return Temporal.PlainTime._create(__Temporal_PlainTime_with(this._s, fields?.hour, fields?.minute, fields?.second, fields?.nanosecond)); },
-                round: function(opts) { return Temporal.PlainTime._create(__Temporal_PlainTime_round(this._s, opts?.smallestUnit || opts)); },
-                equals: function(other) { return __Temporal_PlainTime_equals(this._s, other._s); },
-                toString: function() { return __Temporal_PlainTime_toString(this._s); },
-                toJSON: function() { return __Temporal_PlainTime_toJSON(this._s); },
-                toPlainDateTime: function(d) { return Temporal.PlainDateTime.from(__Temporal_PlainTime_toPlainDateTime(this._s, d?._s || d)); },
+                add: function (d) { return Temporal.PlainTime._create(__Temporal_PlainTime_add(this._s, d)); },
+                subtract: function (d) { return Temporal.PlainTime._create(__Temporal_PlainTime_subtract(this._s, d)); },
+                until: function (other) { return { nanoseconds: __Temporal_PlainTime_until(this._s, other._s) }; },
+                since: function (other) { return { nanoseconds: __Temporal_PlainTime_since(this._s, other._s) }; },
+                with: function (fields) { return Temporal.PlainTime._create(__Temporal_PlainTime_with(this._s, fields?.hour, fields?.minute, fields?.second, fields?.nanosecond)); },
+                round: function (opts) { return Temporal.PlainTime._create(__Temporal_PlainTime_round(this._s, opts?.smallestUnit || opts)); },
+                equals: function (other) { return __Temporal_PlainTime_equals(this._s, other._s); },
+                toString: function () { return __Temporal_PlainTime_toString(this._s); },
+                toJSON: function () { return __Temporal_PlainTime_toJSON(this._s); },
+                toPlainDateTime: function (d) { return Temporal.PlainDateTime.from(__Temporal_PlainTime_toPlainDateTime(this._s, d?._s || d)); },
             };
         },
     },
 
     PlainDateTime: {
-        from: function(thing) {
+        from: function (thing) {
             const s = __Temporal_PlainDateTime_from(String(thing));
             return Temporal.PlainDateTime._create(s);
         },
-        compare: function(one, two) {
+        compare: function (one, two) {
             return __Temporal_PlainDateTime_compare(one._s, two._s);
         },
-        _create: function(s) {
+        _create: function (s) {
             return {
                 _s: s,
                 get year() { return __Temporal_PlainDateTime_year(this._s); },
@@ -1327,28 +1398,28 @@ globalThis.Temporal = {
                 get minute() { return __Temporal_PlainDateTime_minute(this._s); },
                 get second() { return __Temporal_PlainDateTime_second(this._s); },
                 get millisecond() { return __Temporal_PlainDateTime_millisecond(this._s); },
-                add: function(d) { return Temporal.PlainDateTime._create(__Temporal_PlainDateTime_add(this._s, typeof d === 'object' ? d.days || 0 : d)); },
-                subtract: function(d) { return Temporal.PlainDateTime._create(__Temporal_PlainDateTime_subtract(this._s, typeof d === 'object' ? d.days || 0 : d)); },
-                with: function(fields) { return Temporal.PlainDateTime._create(__Temporal_PlainDateTime_with(this._s, fields?.year, fields?.month, fields?.day, fields?.hour, fields?.minute, fields?.second)); },
-                equals: function(other) { return __Temporal_PlainDateTime_equals(this._s, other._s); },
-                toString: function() { return __Temporal_PlainDateTime_toString(this._s); },
-                toJSON: function() { return __Temporal_PlainDateTime_toJSON(this._s); },
-                toPlainDate: function() { return Temporal.PlainDate.from(__Temporal_PlainDateTime_toPlainDate(this._s)); },
-                toPlainTime: function() { return Temporal.PlainTime.from(__Temporal_PlainDateTime_toPlainTime(this._s)); },
-                toZonedDateTime: function(tz) { return Temporal.ZonedDateTime.from(__Temporal_PlainDateTime_toZonedDateTime(this._s, tz)); },
+                add: function (d) { return Temporal.PlainDateTime._create(__Temporal_PlainDateTime_add(this._s, typeof d === 'object' ? d.days || 0 : d)); },
+                subtract: function (d) { return Temporal.PlainDateTime._create(__Temporal_PlainDateTime_subtract(this._s, typeof d === 'object' ? d.days || 0 : d)); },
+                with: function (fields) { return Temporal.PlainDateTime._create(__Temporal_PlainDateTime_with(this._s, fields?.year, fields?.month, fields?.day, fields?.hour, fields?.minute, fields?.second)); },
+                equals: function (other) { return __Temporal_PlainDateTime_equals(this._s, other._s); },
+                toString: function () { return __Temporal_PlainDateTime_toString(this._s); },
+                toJSON: function () { return __Temporal_PlainDateTime_toJSON(this._s); },
+                toPlainDate: function () { return Temporal.PlainDate.from(__Temporal_PlainDateTime_toPlainDate(this._s)); },
+                toPlainTime: function () { return Temporal.PlainTime.from(__Temporal_PlainDateTime_toPlainTime(this._s)); },
+                toZonedDateTime: function (tz) { return Temporal.ZonedDateTime.from(__Temporal_PlainDateTime_toZonedDateTime(this._s, tz)); },
             };
         },
     },
 
     PlainYearMonth: {
-        from: function(thing) {
+        from: function (thing) {
             const s = __Temporal_PlainYearMonth_from(String(thing));
             return Temporal.PlainYearMonth._create(s);
         },
-        compare: function(one, two) {
+        compare: function (one, two) {
             return __Temporal_PlainYearMonth_compare(one._s, two._s);
         },
-        _create: function(s) {
+        _create: function (s) {
             return {
                 _s: s,
                 get year() { return __Temporal_PlainYearMonth_year(this._s); },
@@ -1358,44 +1429,44 @@ globalThis.Temporal = {
                 get daysInYear() { return __Temporal_PlainYearMonth_daysInYear(this._s); },
                 get monthsInYear() { return __Temporal_PlainYearMonth_monthsInYear(this._s); },
                 get inLeapYear() { return __Temporal_PlainYearMonth_inLeapYear(this._s); },
-                add: function(d) { return Temporal.PlainYearMonth._create(__Temporal_PlainYearMonth_add(this._s, typeof d === 'object' ? d.months || 0 : d)); },
-                subtract: function(d) { return Temporal.PlainYearMonth._create(__Temporal_PlainYearMonth_subtract(this._s, typeof d === 'object' ? d.months || 0 : d)); },
-                equals: function(other) { return __Temporal_PlainYearMonth_equals(this._s, other._s); },
-                toString: function() { return __Temporal_PlainYearMonth_toString(this._s); },
-                toJSON: function() { return __Temporal_PlainYearMonth_toJSON(this._s); },
-                toPlainDate: function(day) { return Temporal.PlainDate.from(__Temporal_PlainYearMonth_toPlainDate(this._s, day?.day || day)); },
+                add: function (d) { return Temporal.PlainYearMonth._create(__Temporal_PlainYearMonth_add(this._s, typeof d === 'object' ? d.months || 0 : d)); },
+                subtract: function (d) { return Temporal.PlainYearMonth._create(__Temporal_PlainYearMonth_subtract(this._s, typeof d === 'object' ? d.months || 0 : d)); },
+                equals: function (other) { return __Temporal_PlainYearMonth_equals(this._s, other._s); },
+                toString: function () { return __Temporal_PlainYearMonth_toString(this._s); },
+                toJSON: function () { return __Temporal_PlainYearMonth_toJSON(this._s); },
+                toPlainDate: function (day) { return Temporal.PlainDate.from(__Temporal_PlainYearMonth_toPlainDate(this._s, day?.day || day)); },
             };
         },
     },
 
     PlainMonthDay: {
-        from: function(thing) {
+        from: function (thing) {
             const s = __Temporal_PlainMonthDay_from(String(thing));
             return Temporal.PlainMonthDay._create(s);
         },
-        _create: function(s) {
+        _create: function (s) {
             return {
                 _s: s,
                 get month() { return __Temporal_PlainMonthDay_month(this._s); },
                 get monthCode() { return __Temporal_PlainMonthDay_monthCode(this._s); },
                 get day() { return __Temporal_PlainMonthDay_day(this._s); },
-                equals: function(other) { return __Temporal_PlainMonthDay_equals(this._s, other._s); },
-                toString: function() { return __Temporal_PlainMonthDay_toString(this._s); },
-                toJSON: function() { return __Temporal_PlainMonthDay_toJSON(this._s); },
-                toPlainDate: function(year) { return Temporal.PlainDate.from(__Temporal_PlainMonthDay_toPlainDate(this._s, year?.year || year)); },
+                equals: function (other) { return __Temporal_PlainMonthDay_equals(this._s, other._s); },
+                toString: function () { return __Temporal_PlainMonthDay_toString(this._s); },
+                toJSON: function () { return __Temporal_PlainMonthDay_toJSON(this._s); },
+                toPlainDate: function (year) { return Temporal.PlainDate.from(__Temporal_PlainMonthDay_toPlainDate(this._s, year?.year || year)); },
             };
         },
     },
 
     ZonedDateTime: {
-        from: function(thing) {
+        from: function (thing) {
             const s = __Temporal_ZonedDateTime_from(String(thing));
             return Temporal.ZonedDateTime._create(s);
         },
-        compare: function(one, two) {
+        compare: function (one, two) {
             return __Temporal_ZonedDateTime_compare(one._s, two._s);
         },
-        _create: function(s) {
+        _create: function (s) {
             return {
                 _s: s,
                 get year() { return __Temporal_ZonedDateTime_year(this._s); },
@@ -1410,30 +1481,30 @@ globalThis.Temporal = {
                 get epochSeconds() { return __Temporal_ZonedDateTime_epochSeconds(this._s); },
                 get epochMilliseconds() { return __Temporal_ZonedDateTime_epochMilliseconds(this._s); },
                 get epochNanoseconds() { return __Temporal_ZonedDateTime_epochNanoseconds(this._s); },
-                add: function(d) { return Temporal.ZonedDateTime._create(__Temporal_ZonedDateTime_add(this._s, typeof d === 'object' ? d.days || 0 : d)); },
-                subtract: function(d) { return Temporal.ZonedDateTime._create(__Temporal_ZonedDateTime_subtract(this._s, typeof d === 'object' ? d.days || 0 : d)); },
-                with: function(fields) { return Temporal.ZonedDateTime._create(__Temporal_ZonedDateTime_with(this._s, fields?.year, fields?.month, fields?.day)); },
-                withTimeZone: function(tz) { return Temporal.ZonedDateTime._create(__Temporal_ZonedDateTime_withTimeZone(this._s, tz)); },
-                equals: function(other) { return __Temporal_ZonedDateTime_equals(this._s, other._s); },
-                toString: function() { return __Temporal_ZonedDateTime_toString(this._s); },
-                toJSON: function() { return __Temporal_ZonedDateTime_toJSON(this._s); },
-                toInstant: function() { return Temporal.Instant._create(__Temporal_ZonedDateTime_toInstant(this._s)); },
-                toPlainDateTime: function() { return Temporal.PlainDateTime.from(__Temporal_ZonedDateTime_toPlainDateTime(this._s)); },
-                toPlainDate: function() { return Temporal.PlainDate.from(__Temporal_ZonedDateTime_toPlainDate(this._s)); },
-                toPlainTime: function() { return Temporal.PlainTime.from(__Temporal_ZonedDateTime_toPlainTime(this._s)); },
+                add: function (d) { return Temporal.ZonedDateTime._create(__Temporal_ZonedDateTime_add(this._s, typeof d === 'object' ? d.days || 0 : d)); },
+                subtract: function (d) { return Temporal.ZonedDateTime._create(__Temporal_ZonedDateTime_subtract(this._s, typeof d === 'object' ? d.days || 0 : d)); },
+                with: function (fields) { return Temporal.ZonedDateTime._create(__Temporal_ZonedDateTime_with(this._s, fields?.year, fields?.month, fields?.day)); },
+                withTimeZone: function (tz) { return Temporal.ZonedDateTime._create(__Temporal_ZonedDateTime_withTimeZone(this._s, tz)); },
+                equals: function (other) { return __Temporal_ZonedDateTime_equals(this._s, other._s); },
+                toString: function () { return __Temporal_ZonedDateTime_toString(this._s); },
+                toJSON: function () { return __Temporal_ZonedDateTime_toJSON(this._s); },
+                toInstant: function () { return Temporal.Instant._create(__Temporal_ZonedDateTime_toInstant(this._s)); },
+                toPlainDateTime: function () { return Temporal.PlainDateTime.from(__Temporal_ZonedDateTime_toPlainDateTime(this._s)); },
+                toPlainDate: function () { return Temporal.PlainDate.from(__Temporal_ZonedDateTime_toPlainDate(this._s)); },
+                toPlainTime: function () { return Temporal.PlainTime.from(__Temporal_ZonedDateTime_toPlainTime(this._s)); },
             };
         },
     },
 
     Duration: {
-        from: function(thing) {
+        from: function (thing) {
             const s = __Temporal_Duration_from(String(thing));
             return Temporal.Duration._create(s);
         },
-        compare: function(one, two) {
+        compare: function (one, two) {
             return __Temporal_Duration_compare(one._s, two._s);
         },
-        _create: function(s) {
+        _create: function (s) {
             return {
                 _s: s,
                 get years() { return __Temporal_Duration_years(this._s); },
@@ -1448,14 +1519,14 @@ globalThis.Temporal = {
                 get nanoseconds() { return __Temporal_Duration_nanoseconds(this._s); },
                 get sign() { return __Temporal_Duration_sign(this._s); },
                 get blank() { return __Temporal_Duration_blank(this._s); },
-                negated: function() { return Temporal.Duration._create(__Temporal_Duration_negated(this._s)); },
-                abs: function() { return Temporal.Duration._create(__Temporal_Duration_abs(this._s)); },
-                add: function(other) { return Temporal.Duration._create(__Temporal_Duration_add(this._s, other._s || String(other))); },
-                subtract: function(other) { return Temporal.Duration._create(__Temporal_Duration_subtract(this._s, other._s || String(other))); },
-                round: function(opts) { return Temporal.Duration._create(__Temporal_Duration_round(this._s, opts)); },
-                total: function(unit) { return __Temporal_Duration_total(this._s, unit); },
-                toString: function() { return __Temporal_Duration_toString(this._s); },
-                toJSON: function() { return __Temporal_Duration_toJSON(this._s); },
+                negated: function () { return Temporal.Duration._create(__Temporal_Duration_negated(this._s)); },
+                abs: function () { return Temporal.Duration._create(__Temporal_Duration_abs(this._s)); },
+                add: function (other) { return Temporal.Duration._create(__Temporal_Duration_add(this._s, other._s || String(other))); },
+                subtract: function (other) { return Temporal.Duration._create(__Temporal_Duration_subtract(this._s, other._s || String(other))); },
+                round: function (opts) { return Temporal.Duration._create(__Temporal_Duration_round(this._s, opts)); },
+                total: function (unit) { return __Temporal_Duration_total(this._s, unit); },
+                toString: function () { return __Temporal_Duration_toString(this._s); },
+                toJSON: function () { return __Temporal_Duration_toJSON(this._s); },
             };
         },
     },
@@ -1504,12 +1575,12 @@ globalThis.Symbol.keyFor = (symbol) => {
 // Symbol.prototype
 globalThis.Symbol.prototype = {
     // Symbol.prototype.toString()
-    toString: function() {
+    toString: function () {
         return __Symbol_toString(this);
     },
 
     // Symbol.prototype.valueOf()
-    valueOf: function() {
+    valueOf: function () {
         return __Symbol_valueOf(this);
     },
 
@@ -1524,14 +1595,14 @@ globalThis.Symbol.prototype = {
     },
 
     // Symbol.prototype[Symbol.toPrimitive]
-    [_symbolToPrimitive]: function(_hint) {
+    [_symbolToPrimitive]: function (_hint) {
         return __Symbol_valueOf(this);
     },
 };
 
 // Error built-in
 function _createErrorClass(name) {
-    const ErrorClass = function(message) {
+    const ErrorClass = function (message) {
         // Capture stack trace (simplified - would need VM support for full trace)
         const stack = _captureStackTrace();
         const err = __Error_create(name, message, stack);
@@ -1548,7 +1619,7 @@ function _createErrorClass(name) {
         get stack() {
             return __Error_getStack(this);
         },
-        toString: function() {
+        toString: function () {
             return __Error_toString(this);
         },
     };
@@ -1572,7 +1643,7 @@ globalThis.URIError = _createErrorClass('URIError');
 globalThis.EvalError = _createErrorClass('EvalError');
 
 // Error.captureStackTrace (V8 compatibility)
-Error.captureStackTrace = function(targetObject, constructorOpt) {
+Error.captureStackTrace = function (targetObject, constructorOpt) {
     const stack = _captureStackTrace();
     __Error_setStack(targetObject, stack || '');
 };
@@ -1591,7 +1662,7 @@ globalThis.Function = function Function(...args) {
 // Now set up Function.prototype
 globalThis.Function.prototype = {
     // Function.prototype.call(thisArg, ...args)
-    call: function(thisArg, ...args) {
+    call: function (thisArg, ...args) {
         const fn = this;
 
         // If thisArg is null/undefined, use globalThis
@@ -1613,7 +1684,7 @@ globalThis.Function.prototype = {
     },
 
     // Function.prototype.apply(thisArg, argsArray)
-    apply: function(thisArg, argsArray) {
+    apply: function (thisArg, argsArray) {
         const fn = this;
 
         // Handle null/undefined argsArray
@@ -1642,7 +1713,7 @@ globalThis.Function.prototype = {
     // Function.prototype.bind(thisArg, a0, a1, a2, a3, a4, a5, a6, a7)
     // Creates a bound function using native __Function_createBound
     // Supports up to 8 bound arguments (common use cases)
-    bind: function(thisArg, a0, a1, a2, a3, a4, a5, a6, a7) {
+    bind: function (thisArg, a0, a1, a2, a3, a4, a5, a6, a7) {
         const fn = this;
 
         if (typeof fn !== 'function') {
@@ -1683,7 +1754,7 @@ globalThis.Function.prototype = {
     },
 
     // Function.prototype.toString()
-    toString: function() {
+    toString: function () {
         return __Function_toString(this);
     },
 
@@ -1700,26 +1771,26 @@ globalThis.Function.prototype = {
 
 // Console built-in
 globalThis.console = {
-    log: function(...args) { return __console_log(...args); },
-    error: function(...args) { return __console_error(...args); },
-    warn: function(...args) { return __console_warn(...args); },
-    info: function(...args) { return __console_info(...args); },
-    debug: function(...args) { return __console_debug(...args); },
-    trace: function(...args) { return __console_trace(...args); },
-    time: function(label) { return __console_time(label); },
-    timeEnd: function(label) { return __console_timeEnd(label); },
-    timeLog: function(label, ...args) { return __console_timeLog(label, ...args); },
-    assert: function(condition, ...args) { return __console_assert(condition, ...args); },
-    clear: function() { return __console_clear(); },
-    count: function(label) { return __console_count(label); },
-    countReset: function(label) { return __console_countReset(label); },
-    table: function(data, columns) { return __console_table(data, columns); },
-    dir: function(obj, options) { return __console_dir(obj, options); },
-    dirxml: function(...args) { return __console_dirxml(...args); },
+    log: function (...args) { return __console_log(...args); },
+    error: function (...args) { return __console_error(...args); },
+    warn: function (...args) { return __console_warn(...args); },
+    info: function (...args) { return __console_info(...args); },
+    debug: function (...args) { return __console_debug(...args); },
+    trace: function (...args) { return __console_trace(...args); },
+    time: function (label) { return __console_time(label); },
+    timeEnd: function (label) { return __console_timeEnd(label); },
+    timeLog: function (label, ...args) { return __console_timeLog(label, ...args); },
+    assert: function (condition, ...args) { return __console_assert(condition, ...args); },
+    clear: function () { return __console_clear(); },
+    count: function (label) { return __console_count(label); },
+    countReset: function (label) { return __console_countReset(label); },
+    table: function (data, columns) { return __console_table(data, columns); },
+    dir: function (obj, options) { return __console_dir(obj, options); },
+    dirxml: function (...args) { return __console_dirxml(...args); },
     // Group methods (simplified - just log for now)
-    group: function(...args) { return __console_log(...args); },
-    groupCollapsed: function(...args) { return __console_log(...args); },
-    groupEnd: function() {},
+    group: function (...args) { return __console_log(...args); },
+    groupCollapsed: function (...args) { return __console_log(...args); },
+    groupEnd: function () { },
 };
 
 // Map built-in (ES2026)
@@ -1744,28 +1815,28 @@ globalThis.Map = function Map(iterable) {
             return __Map_size(this._internal);
         },
 
-        get: function(key) {
+        get: function (key) {
             return __Map_get(this._internal, key);
         },
 
-        set: function(key, value) {
+        set: function (key, value) {
             __Map_set(this._internal, key, value);
             return this;
         },
 
-        has: function(key) {
+        has: function (key) {
             return __Map_has(this._internal, key);
         },
 
-        delete: function(key) {
+        delete: function (key) {
             return __Map_delete(this._internal, key);
         },
 
-        clear: function() {
+        clear: function () {
             __Map_clear(this._internal);
         },
 
-        keys: function() {
+        keys: function () {
             const keysArr = __Map_keys(this._internal);
             return {
                 _arr: keysArr,
@@ -1780,11 +1851,11 @@ globalThis.Map = function Map(iterable) {
                     }
                     return { value: undefined, done: true };
                 },
-                [_symbolIterator]: function() { return this; }
+                [_symbolIterator]: function () { return this; }
             };
         },
 
-        values: function() {
+        values: function () {
             const valuesArr = __Map_values(this._internal);
             return {
                 _arr: valuesArr,
@@ -1799,11 +1870,11 @@ globalThis.Map = function Map(iterable) {
                     }
                     return { value: undefined, done: true };
                 },
-                [_symbolIterator]: function() { return this; }
+                [_symbolIterator]: function () { return this; }
             };
         },
 
-        entries: function() {
+        entries: function () {
             const entriesArr = __Map_entries(this._internal);
             return {
                 _arr: entriesArr,
@@ -1818,11 +1889,11 @@ globalThis.Map = function Map(iterable) {
                     }
                     return { value: undefined, done: true };
                 },
-                [_symbolIterator]: function() { return this; }
+                [_symbolIterator]: function () { return this; }
             };
         },
 
-        forEach: function(callback, thisArg) {
+        forEach: function (callback, thisArg) {
             const entries = __Map_entries(this._internal);
             for (let i = 0; i < entries.length; i++) {
                 const entry = entries[i];
@@ -1830,7 +1901,7 @@ globalThis.Map = function Map(iterable) {
             }
         },
 
-        [_symbolIterator]: function() {
+        [_symbolIterator]: function () {
             return this.entries();
         },
 
@@ -1841,7 +1912,7 @@ globalThis.Map = function Map(iterable) {
 };
 
 // Map.groupBy (ES2024)
-Map.groupBy = function(iterable, keySelector) {
+Map.groupBy = function (iterable, keySelector) {
     const map = new Map();
     let index = 0;
     for (const item of iterable) {
@@ -1872,20 +1943,20 @@ globalThis.WeakMap = function WeakMap(iterable) {
     return {
         _internal: map,
 
-        get: function(key) {
+        get: function (key) {
             return __WeakMap_get(this._internal, key);
         },
 
-        set: function(key, value) {
+        set: function (key, value) {
             __WeakMap_set(this._internal, key, value);
             return this;
         },
 
-        has: function(key) {
+        has: function (key) {
             return __WeakMap_has(this._internal, key);
         },
 
-        delete: function(key) {
+        delete: function (key) {
             return __WeakMap_delete(this._internal, key);
         },
 
@@ -1915,24 +1986,24 @@ globalThis.Set = function Set(iterable) {
             return __Set_size(this._internal);
         },
 
-        add: function(value) {
+        add: function (value) {
             __Set_add(this._internal, value);
             return this;
         },
 
-        has: function(value) {
+        has: function (value) {
             return __Set_has(this._internal, value);
         },
 
-        delete: function(value) {
+        delete: function (value) {
             return __Set_delete(this._internal, value);
         },
 
-        clear: function() {
+        clear: function () {
             __Set_clear(this._internal);
         },
 
-        values: function() {
+        values: function () {
             const valuesArr = __Set_values(this._internal);
             let index = 0;
             return {
@@ -1942,16 +2013,16 @@ globalThis.Set = function Set(iterable) {
                     }
                     return { value: undefined, done: true };
                 },
-                [_symbolIterator]: function() { return this; }
+                [_symbolIterator]: function () { return this; }
             };
         },
 
-        keys: function() {
+        keys: function () {
             // keys() is an alias for values() in Set
             return this.values();
         },
 
-        entries: function() {
+        entries: function () {
             const entriesArr = __Set_entries(this._internal);
             let index = 0;
             return {
@@ -1961,11 +2032,11 @@ globalThis.Set = function Set(iterable) {
                     }
                     return { value: undefined, done: true };
                 },
-                [_symbolIterator]: function() { return this; }
+                [_symbolIterator]: function () { return this; }
             };
         },
 
-        forEach: function(callback, thisArg) {
+        forEach: function (callback, thisArg) {
             const values = __Set_values(this._internal);
             for (let i = 0; i < values.length; i++) {
                 const value = values[i];
@@ -1974,35 +2045,35 @@ globalThis.Set = function Set(iterable) {
         },
 
         // ES2025 Set methods
-        union: function(other) {
+        union: function (other) {
             return Set._fromInternal(__Set_union(this._internal, other._internal));
         },
 
-        intersection: function(other) {
+        intersection: function (other) {
             return Set._fromInternal(__Set_intersection(this._internal, other._internal));
         },
 
-        difference: function(other) {
+        difference: function (other) {
             return Set._fromInternal(__Set_difference(this._internal, other._internal));
         },
 
-        symmetricDifference: function(other) {
+        symmetricDifference: function (other) {
             return Set._fromInternal(__Set_symmetricDifference(this._internal, other._internal));
         },
 
-        isSubsetOf: function(other) {
+        isSubsetOf: function (other) {
             return __Set_isSubsetOf(this._internal, other._internal);
         },
 
-        isSupersetOf: function(other) {
+        isSupersetOf: function (other) {
             return __Set_isSupersetOf(this._internal, other._internal);
         },
 
-        isDisjointFrom: function(other) {
+        isDisjointFrom: function (other) {
             return __Set_isDisjointFrom(this._internal, other._internal);
         },
 
-        [_symbolIterator]: function() {
+        [_symbolIterator]: function () {
             return this.values();
         },
 
@@ -2013,15 +2084,15 @@ globalThis.Set = function Set(iterable) {
 };
 
 // Helper to create Set from internal representation
-Set._fromInternal = function(internal) {
+Set._fromInternal = function (internal) {
     const set = {
         _internal: internal,
         get size() { return __Set_size(this._internal); },
-        add: function(value) { __Set_add(this._internal, value); return this; },
-        has: function(value) { return __Set_has(this._internal, value); },
-        delete: function(value) { return __Set_delete(this._internal, value); },
-        clear: function() { __Set_clear(this._internal); },
-        values: function() {
+        add: function (value) { __Set_add(this._internal, value); return this; },
+        has: function (value) { return __Set_has(this._internal, value); },
+        delete: function (value) { return __Set_delete(this._internal, value); },
+        clear: function () { __Set_clear(this._internal); },
+        values: function () {
             const valuesArr = __Set_values(this._internal);
             let index = 0;
             return {
@@ -2031,11 +2102,11 @@ Set._fromInternal = function(internal) {
                     }
                     return { value: undefined, done: true };
                 },
-                [_symbolIterator]: function() { return this; }
+                [_symbolIterator]: function () { return this; }
             };
         },
-        keys: function() { return this.values(); },
-        entries: function() {
+        keys: function () { return this.values(); },
+        entries: function () {
             const entriesArr = __Set_entries(this._internal);
             let index = 0;
             return {
@@ -2045,23 +2116,23 @@ Set._fromInternal = function(internal) {
                     }
                     return { value: undefined, done: true };
                 },
-                [_symbolIterator]: function() { return this; }
+                [_symbolIterator]: function () { return this; }
             };
         },
-        forEach: function(callback, thisArg) {
+        forEach: function (callback, thisArg) {
             const values = __Set_values(this._internal);
             for (let i = 0; i < values.length; i++) {
                 callback.call(thisArg, values[i], values[i], this);
             }
         },
-        union: function(other) { return Set._fromInternal(__Set_union(this._internal, other._internal)); },
-        intersection: function(other) { return Set._fromInternal(__Set_intersection(this._internal, other._internal)); },
-        difference: function(other) { return Set._fromInternal(__Set_difference(this._internal, other._internal)); },
-        symmetricDifference: function(other) { return Set._fromInternal(__Set_symmetricDifference(this._internal, other._internal)); },
-        isSubsetOf: function(other) { return __Set_isSubsetOf(this._internal, other._internal); },
-        isSupersetOf: function(other) { return __Set_isSupersetOf(this._internal, other._internal); },
-        isDisjointFrom: function(other) { return __Set_isDisjointFrom(this._internal, other._internal); },
-        [_symbolIterator]: function() { return this.values(); },
+        union: function (other) { return Set._fromInternal(__Set_union(this._internal, other._internal)); },
+        intersection: function (other) { return Set._fromInternal(__Set_intersection(this._internal, other._internal)); },
+        difference: function (other) { return Set._fromInternal(__Set_difference(this._internal, other._internal)); },
+        symmetricDifference: function (other) { return Set._fromInternal(__Set_symmetricDifference(this._internal, other._internal)); },
+        isSubsetOf: function (other) { return __Set_isSubsetOf(this._internal, other._internal); },
+        isSupersetOf: function (other) { return __Set_isSupersetOf(this._internal, other._internal); },
+        isDisjointFrom: function (other) { return __Set_isDisjointFrom(this._internal, other._internal); },
+        [_symbolIterator]: function () { return this.values(); },
         get [_symbolToStringTag]() { return 'Set'; },
     };
     return set;
@@ -2083,16 +2154,16 @@ globalThis.WeakSet = function WeakSet(iterable) {
     return {
         _internal: set,
 
-        add: function(value) {
+        add: function (value) {
             __WeakSet_add(this._internal, value);
             return this;
         },
 
-        has: function(value) {
+        has: function (value) {
             return __WeakSet_has(this._internal, value);
         },
 
-        delete: function(value) {
+        delete: function (value) {
             return __WeakSet_delete(this._internal, value);
         },
 
@@ -2114,7 +2185,7 @@ globalThis.Promise = function Promise(executor) {
     const obj = {
         _internal: _promise,
 
-        then: function(onFulfilled, onRejected) {
+        then: function (onFulfilled, onRejected) {
             const state = __Promise_state(this._internal);
 
             // Create a new promise for chaining
@@ -2181,11 +2252,11 @@ globalThis.Promise = function Promise(executor) {
             return Promise._fromInternal(chainPromise);
         },
 
-        catch: function(onRejected) {
+        catch: function (onRejected) {
             return this.then(undefined, onRejected);
         },
 
-        finally: function(onFinally) {
+        finally: function (onFinally) {
             return this.then(
                 (value) => {
                     if (typeof onFinally === 'function') {
@@ -2227,7 +2298,7 @@ globalThis.Promise = function Promise(executor) {
 };
 
 // Helper to wrap an internal promise
-Promise._fromInternal = function(internal) {
+Promise._fromInternal = function (internal) {
     return {
         _internal: internal,
         then: globalThis.Promise.prototype.then,
@@ -2239,7 +2310,7 @@ Promise._fromInternal = function(internal) {
 
 // Promise.prototype for _fromInternal
 Promise.prototype = {
-    then: function(onFulfilled, onRejected) {
+    then: function (onFulfilled, onRejected) {
         const state = __Promise_state(this._internal);
         const chainPromise = __Promise_create();
 
@@ -2290,11 +2361,11 @@ Promise.prototype = {
         return Promise._fromInternal(chainPromise);
     },
 
-    catch: function(onRejected) {
+    catch: function (onRejected) {
         return this.then(undefined, onRejected);
     },
 
-    finally: function(onFinally) {
+    finally: function (onFinally) {
         return this.then(
             (value) => {
                 if (typeof onFinally === 'function') {
@@ -2319,7 +2390,7 @@ Promise.prototype = {
 };
 
 // Promise.resolve
-Promise.resolve = function(value) {
+Promise.resolve = function (value) {
     // If value is already a Promise, return it
     if (value && value._internal && typeof value.then === 'function') {
         return value;
@@ -2330,41 +2401,41 @@ Promise.resolve = function(value) {
 };
 
 // Promise.reject
-Promise.reject = function(reason) {
+Promise.reject = function (reason) {
     const result = __Promise_reject(reason);
     return Promise._fromInternal(result._internal || result);
 };
 
 // Promise.all
-Promise.all = function(iterable) {
+Promise.all = function (iterable) {
     const arr = Array.isArray(iterable) ? iterable : Array.from(iterable);
     const result = __Promise_all(arr.map(p => p && p._internal ? p._internal : p));
     return Promise._fromInternal(result._internal || result);
 };
 
 // Promise.race
-Promise.race = function(iterable) {
+Promise.race = function (iterable) {
     const arr = Array.isArray(iterable) ? iterable : Array.from(iterable);
     const result = __Promise_race(arr.map(p => p && p._internal ? p._internal : p));
     return Promise._fromInternal(result._internal || result);
 };
 
 // Promise.allSettled
-Promise.allSettled = function(iterable) {
+Promise.allSettled = function (iterable) {
     const arr = Array.isArray(iterable) ? iterable : Array.from(iterable);
     const result = __Promise_allSettled(arr.map(p => p && p._internal ? p._internal : p));
     return Promise._fromInternal(result._internal || result);
 };
 
 // Promise.any
-Promise.any = function(iterable) {
+Promise.any = function (iterable) {
     const arr = Array.isArray(iterable) ? iterable : Array.from(iterable);
     const result = __Promise_any(arr.map(p => p && p._internal ? p._internal : p));
     return Promise._fromInternal(result._internal || result);
 };
 
 // Promise.withResolvers (ES2024)
-Promise.withResolvers = function() {
+Promise.withResolvers = function () {
     const resolvers = __Promise_withResolvers();
     return {
         promise: Promise._fromInternal(resolvers.promise._internal || resolvers.promise),
@@ -2377,7 +2448,7 @@ Promise.withResolvers = function() {
 // Synchronous execution fallback - a proper implementation should use
 // the event loop's microtask queue via a native function.
 if (typeof globalThis.queueMicrotask === 'undefined') {
-    globalThis.queueMicrotask = function(callback) {
+    globalThis.queueMicrotask = function (callback) {
         // Simply execute synchronously (not spec-compliant but avoids recursion)
         callback();
     };
@@ -2387,7 +2458,7 @@ if (typeof globalThis.queueMicrotask === 'undefined') {
 // Proxy built-in
 // ============================================================================
 
-globalThis.Proxy = function(target, handler) {
+globalThis.Proxy = function (target, handler) {
     if (new.target === undefined) {
         throw new TypeError("Constructor Proxy requires 'new'");
     }
@@ -2401,7 +2472,7 @@ globalThis.Proxy = function(target, handler) {
 };
 
 // Proxy.revocable
-Proxy.revocable = function(target, handler) {
+Proxy.revocable = function (target, handler) {
     if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
         throw new TypeError('Proxy target must be an object');
     }
@@ -2417,7 +2488,7 @@ Proxy.revocable = function(target, handler) {
 
 globalThis.Reflect = {
     // Reflect.get(target, propertyKey, receiver?)
-    get: function(target, propertyKey, receiver) {
+    get: function (target, propertyKey, receiver) {
         if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
             throw new TypeError('Reflect.get requires target to be an object');
         }
@@ -2425,7 +2496,7 @@ globalThis.Reflect = {
     },
 
     // Reflect.set(target, propertyKey, value, receiver?)
-    set: function(target, propertyKey, value, receiver) {
+    set: function (target, propertyKey, value, receiver) {
         if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
             throw new TypeError('Reflect.set requires target to be an object');
         }
@@ -2433,7 +2504,7 @@ globalThis.Reflect = {
     },
 
     // Reflect.has(target, propertyKey)
-    has: function(target, propertyKey) {
+    has: function (target, propertyKey) {
         if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
             throw new TypeError('Reflect.has requires target to be an object');
         }
@@ -2441,7 +2512,7 @@ globalThis.Reflect = {
     },
 
     // Reflect.deleteProperty(target, propertyKey)
-    deleteProperty: function(target, propertyKey) {
+    deleteProperty: function (target, propertyKey) {
         if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
             throw new TypeError('Reflect.deleteProperty requires target to be an object');
         }
@@ -2449,7 +2520,7 @@ globalThis.Reflect = {
     },
 
     // Reflect.ownKeys(target)
-    ownKeys: function(target) {
+    ownKeys: function (target) {
         if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
             throw new TypeError('Reflect.ownKeys requires target to be an object');
         }
@@ -2457,7 +2528,7 @@ globalThis.Reflect = {
     },
 
     // Reflect.getOwnPropertyDescriptor(target, propertyKey)
-    getOwnPropertyDescriptor: function(target, propertyKey) {
+    getOwnPropertyDescriptor: function (target, propertyKey) {
         if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
             throw new TypeError('Reflect.getOwnPropertyDescriptor requires target to be an object');
         }
@@ -2465,7 +2536,7 @@ globalThis.Reflect = {
     },
 
     // Reflect.defineProperty(target, propertyKey, attributes)
-    defineProperty: function(target, propertyKey, attributes) {
+    defineProperty: function (target, propertyKey, attributes) {
         if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
             throw new TypeError('Reflect.defineProperty requires target to be an object');
         }
@@ -2473,7 +2544,7 @@ globalThis.Reflect = {
     },
 
     // Reflect.getPrototypeOf(target)
-    getPrototypeOf: function(target) {
+    getPrototypeOf: function (target) {
         if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
             throw new TypeError('Reflect.getPrototypeOf requires target to be an object');
         }
@@ -2481,7 +2552,7 @@ globalThis.Reflect = {
     },
 
     // Reflect.setPrototypeOf(target, prototype)
-    setPrototypeOf: function(target, prototype) {
+    setPrototypeOf: function (target, prototype) {
         if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
             throw new TypeError('Reflect.setPrototypeOf requires target to be an object');
         }
@@ -2492,7 +2563,7 @@ globalThis.Reflect = {
     },
 
     // Reflect.isExtensible(target)
-    isExtensible: function(target) {
+    isExtensible: function (target) {
         if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
             throw new TypeError('Reflect.isExtensible requires target to be an object');
         }
@@ -2500,7 +2571,7 @@ globalThis.Reflect = {
     },
 
     // Reflect.preventExtensions(target)
-    preventExtensions: function(target) {
+    preventExtensions: function (target) {
         if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
             throw new TypeError('Reflect.preventExtensions requires target to be an object');
         }
@@ -2508,7 +2579,7 @@ globalThis.Reflect = {
     },
 
     // Reflect.apply(target, thisArgument, argumentsList)
-    apply: function(target, thisArgument, argumentsList) {
+    apply: function (target, thisArgument, argumentsList) {
         if (typeof target !== 'function') {
             throw new TypeError('Reflect.apply requires target to be a function');
         }
@@ -2519,7 +2590,7 @@ globalThis.Reflect = {
     },
 
     // Reflect.construct(target, argumentsList, newTarget?)
-    construct: function(target, argumentsList, newTarget) {
+    construct: function (target, argumentsList, newTarget) {
         if (typeof target !== 'function') {
             throw new TypeError('Reflect.construct requires target to be a constructor');
         }
@@ -2543,15 +2614,15 @@ globalThis.Reflect = {
 
 // Generator prototype methods (attached to generator instances by the runtime)
 globalThis.GeneratorPrototype = {
-    next: function(value) {
+    next: function (value) {
         return __Generator_next(this, value);
     },
 
-    return: function(value) {
+    return: function (value) {
         return __Generator_return(this, value);
     },
 
-    throw: function(exception) {
+    throw: function (exception) {
         return __Generator_throw(this, exception);
     },
 

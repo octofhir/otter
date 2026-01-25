@@ -6,10 +6,18 @@
 //! - Methods: test, exec, toString
 //! - Symbol methods: match, matchAll, replace, search, split
 
+use dashmap::DashMap;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
 use otter_vm_runtime::{Op, op_native};
-use regex::Regex;
+use regress::{Flags, Regex, escape};
+use std::sync::{Arc, OnceLock};
+
+static REGEX_CACHE: OnceLock<DashMap<(String, String), Arc<Regex>>> = OnceLock::new();
+
+fn get_regex_cache() -> &'static DashMap<(String, String), Arc<Regex>> {
+    REGEX_CACHE.get_or_init(DashMap::new)
+}
 
 /// Get RegExp ops for extension registration
 pub fn ops() -> Vec<Op> {
@@ -56,37 +64,79 @@ fn parse_regex_args(args: &[Value]) -> Option<(String, String)> {
     Some((pattern, flags))
 }
 
-/// Convert JS regex flags to Rust regex pattern prefix
-fn flags_to_rust_prefix(flags: &str) -> String {
-    let mut prefix = String::from("(?");
+fn flags_use_unicode(flags: &str) -> bool {
+    flags.contains('u') || flags.contains('v')
+}
 
-    if flags.contains('i') {
-        prefix.push('i');
-    }
-    if flags.contains('m') {
-        prefix.push('m');
-    }
-    if flags.contains('s') {
-        prefix.push('s');
-    }
-    // x flag for extended (not standard JS but useful)
-    if flags.contains('x') {
-        prefix.push('x');
+/// Build JS regex from pattern and flags using regress.
+fn build_regex(pattern: &str, flags: &str) -> Result<Arc<Regex>, String> {
+    let cache = get_regex_cache();
+    let key = (pattern.to_string(), flags.to_string());
+
+    if let Some(re) = cache.get(&key) {
+        return Ok(re.clone());
     }
 
-    if prefix.len() > 2 {
-        prefix.push(')');
-        prefix
+    let re = Arc::new(
+        Regex::with_flags(pattern, Flags::from(flags))
+            .map_err(|e| format!("Invalid regular expression: {}", e))?,
+    );
+
+    cache.insert(key, re.clone());
+    Ok(re)
+}
+
+fn find_first(
+    regex: &Regex,
+    input: &JsString,
+    flags: &str,
+    start: usize,
+) -> Option<regress::Match> {
+    if flags_use_unicode(flags) {
+        regex.find_from_utf16(input.as_utf16(), start).next()
     } else {
-        String::new()
+        regex.find_from_ucs2(input.as_utf16(), start).next()
     }
 }
 
-/// Build Rust regex from JS pattern and flags
-fn build_regex(pattern: &str, flags: &str) -> Result<Regex, String> {
-    let prefix = flags_to_rust_prefix(flags);
-    let full_pattern = format!("{}{}", prefix, pattern);
-    Regex::new(&full_pattern).map_err(|e| format!("Invalid regular expression: {}", e))
+fn find_all(regex: &Regex, input: &JsString, flags: &str) -> Vec<regress::Match> {
+    let mut matches = Vec::new();
+    let mut start = 0;
+    let len = input.len_utf16();
+
+    while start <= len {
+        let next = find_first(regex, input, flags, start);
+        let Some(mat) = next else { break };
+        let end = mat.end();
+        let begin = mat.start();
+        matches.push(mat);
+        if end == begin {
+            start = end.saturating_add(1);
+        } else {
+            start = end;
+        }
+    }
+
+    matches
+}
+
+fn slice_utf16(input: &JsString, range: std::ops::Range<usize>) -> String {
+    input
+        .substring_utf16(range.start, range.end)
+        .as_str()
+        .to_string()
+}
+
+fn match_to_strings(input: &JsString, mat: &regress::Match) -> Vec<String> {
+    let mut out = Vec::with_capacity(mat.captures.len() + 1);
+    for idx in 0..=mat.captures.len() {
+        if let Some(range) = mat.group(idx) {
+            out.push(slice_utf16(input, range));
+        } else {
+            out.push(String::new());
+        }
+    }
+    out
 }
 
 // =============================================================================
@@ -101,7 +151,7 @@ fn regexp_escape(args: &[Value]) -> Result<Value, String> {
         .and_then(|v| v.as_string())
         .ok_or("RegExp.escape requires a string")?;
 
-    let escaped = regex::escape(s.as_str());
+    let escaped = escape(s.as_str());
     Ok(Value::string(JsString::intern(&escaped)))
 }
 
@@ -221,7 +271,8 @@ fn regexp_test(args: &[Value]) -> Result<Value, String> {
         .ok_or("test requires a string argument")?;
 
     let regex = build_regex(&pattern, &flags)?;
-    Ok(Value::boolean(regex.is_match(input.as_str())))
+    let found = find_first(&regex, input, &flags, 0).is_some();
+    Ok(Value::boolean(found))
 }
 
 /// RegExp.prototype.exec(string) - returns match array or null
@@ -235,25 +286,12 @@ fn regexp_exec(args: &[Value]) -> Result<Value, String> {
 
     let regex = build_regex(&pattern, &flags)?;
 
-    match regex.captures(input.as_str()) {
-        Some(caps) => {
-            // Build result array as JSON string for JS side to parse
-            let mut matches: Vec<String> = Vec::new();
-            for i in 0..caps.len() {
-                if let Some(m) = caps.get(i) {
-                    matches.push(m.as_str().to_string());
-                } else {
-                    matches.push(String::new());
-                }
-            }
-
-            // Get match index
-            let index = caps.get(0).map(|m| m.start()).unwrap_or(0);
-
-            // Return as JSON object for JS to parse
+    match find_first(&regex, input, &flags, 0) {
+        Some(mat) => {
+            let matches = match_to_strings(input, &mat);
             let result = serde_json::json!({
                 "matches": matches,
-                "index": index,
+                "index": mat.start(),
                 "input": input.as_str()
             });
             Ok(Value::string(JsString::intern(&result.to_string())))
@@ -298,9 +336,9 @@ fn regexp_match(args: &[Value]) -> Result<Value, String> {
 
     if is_global {
         // Global: return all matches
-        let matches: Vec<String> = regex
-            .find_iter(input.as_str())
-            .map(|m| m.as_str().to_string())
+        let matches: Vec<String> = find_all(&regex, input, &flags)
+            .into_iter()
+            .map(|m| slice_utf16(input, m.range()))
             .collect();
 
         if matches.is_empty() {
@@ -332,20 +370,11 @@ fn regexp_match_all(args: &[Value]) -> Result<Value, String> {
     let regex = build_regex(&pattern, &flags)?;
 
     let mut all_matches: Vec<serde_json::Value> = Vec::new();
-    for caps in regex.captures_iter(input.as_str()) {
-        let mut matches: Vec<String> = Vec::new();
-        for i in 0..caps.len() {
-            if let Some(m) = caps.get(i) {
-                matches.push(m.as_str().to_string());
-            } else {
-                matches.push(String::new());
-            }
-        }
-        let index = caps.get(0).map(|m| m.start()).unwrap_or(0);
-
+    for mat in find_all(&regex, input, &flags) {
+        let matches = match_to_strings(input, &mat);
         all_matches.push(serde_json::json!({
             "matches": matches,
-            "index": index
+            "index": mat.start()
         }));
     }
 
@@ -378,13 +407,9 @@ fn regexp_replace(args: &[Value]) -> Result<Value, String> {
         .replace("$'", ""); // $' not supported in Rust regex
 
     let result = if is_global {
-        regex
-            .replace_all(input.as_str(), rust_replacement.as_str())
-            .to_string()
+        regex.replace_all(input.as_str(), rust_replacement.as_str())
     } else {
-        regex
-            .replace(input.as_str(), rust_replacement.as_str())
-            .to_string()
+        regex.replace(input.as_str(), rust_replacement.as_str())
     };
 
     Ok(Value::string(JsString::intern(&result)))
@@ -401,8 +426,8 @@ fn regexp_search(args: &[Value]) -> Result<Value, String> {
 
     let regex = build_regex(&pattern, &flags)?;
 
-    match regex.find(input.as_str()) {
-        Some(m) => Ok(Value::int32(m.start() as i32)),
+    match find_first(&regex, input, &flags, 0) {
+        Some(mat) => Ok(Value::int32(mat.start() as i32)),
         None => Ok(Value::int32(-1)),
     }
 }
@@ -418,10 +443,26 @@ fn regexp_split(args: &[Value]) -> Result<Value, String> {
 
     let regex = build_regex(&pattern, &flags)?;
 
-    let parts: Vec<&str> = match limit {
-        Some(lim) => regex.splitn(input.as_str(), lim).collect(),
-        None => regex.split(input.as_str()).collect(),
-    };
+    let mut parts = Vec::new();
+    let mut last_end = 0;
+    let input_len = input.len_utf16();
+
+    for mat in find_all(&regex, input, &flags) {
+        if let Some(lim) = limit {
+            if parts.len() >= lim {
+                break;
+            }
+        }
+        let start = mat.start();
+        if start >= last_end {
+            parts.push(slice_utf16(input, last_end..start));
+        }
+        last_end = mat.end();
+    }
+
+    if limit.map(|l| parts.len() < l).unwrap_or(true) {
+        parts.push(slice_utf16(input, last_end..input_len));
+    }
 
     let result = serde_json::to_string(&parts).unwrap_or_else(|_| "[]".to_string());
     Ok(Value::string(JsString::intern(&result)))

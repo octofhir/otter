@@ -112,6 +112,8 @@ pub enum Opcode {
     In = 0x5A,
     /// ToNumber conversion: dst = +src
     ToNumber = 0x5B,
+    /// typeof identifier name without ReferenceError
+    TypeOfName = 0x5C,
 
     // ==================== Objects ====================
     /// Get property: dst = obj\[key\]
@@ -287,6 +289,7 @@ impl Opcode {
             0x59 => Some(Self::InstanceOf),
             0x5A => Some(Self::In),
             0x5B => Some(Self::ToNumber),
+            0x5C => Some(Self::TypeOfName),
 
             0x60 => Some(Self::GetProp),
             0x61 => Some(Self::SetProp),
@@ -411,6 +414,7 @@ impl Opcode {
             Self::InstanceOf => "InstanceOf",
             Self::In => "In",
             Self::ToNumber => "ToNumber",
+            Self::TypeOfName => "TypeOfName",
             // Objects
             Self::GetProp => "GetProp",
             Self::SetProp => "SetProp",
@@ -676,6 +680,10 @@ pub enum Instruction {
     TypeOf {
         dst: Register,
         src: Register,
+    },
+    TypeOfName {
+        dst: Register,
+        name: ConstantIndex,
     },
     InstanceOf {
         dst: Register,

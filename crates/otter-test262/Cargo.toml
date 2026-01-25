@@ -10,17 +10,23 @@ name = "test262"
 path = "src/main.rs"
 
 [dependencies]
-otter-vm-bytecode = { path = "../otter-vm-bytecode" }
-otter-vm-core = { path = "../otter-vm-core" }
-otter-vm-compiler = { path = "../otter-vm-compiler" }
+otter-engine = { path = "../otter-engine" }
+# Supporting crates (for features not in engine)
+otter-kv = { path = "../otter-kv", version = "0.1.0" }
+otter-pm = { path = "../otter-pm", version = "0.1.1" }
+otter-sql = { path = "../otter-sql", version = "0.1.0" }
+
 thiserror.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
-rayon = "1.10"
 walkdir = "2"
 clap = { version = "4", features = ["derive"] }
 colored = "3"
 indicatif = "0.18"
+tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sysinfo = "0.35"
 
 [dev-dependencies]

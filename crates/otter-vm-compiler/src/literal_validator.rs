@@ -2,6 +2,8 @@
 
 use crate::error::{CompileError, CompileResult};
 use oxc_ast::ast::{NumericLiteral, RegExpLiteral, StringLiteral, TemplateLiteral};
+use oxc_allocator::Allocator;
+use oxc_regular_expression::{LiteralParser, Options as RegExpOptions};
 
 /// ECMAScript version for validation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,7 +409,6 @@ impl LiteralValidator {
 
     /// Validate a string literal
     pub fn validate_string_literal(&self, lit: &StringLiteral) -> CompileResult<()> {
-        eprintln!("DEBUG: validate_string_literal called for {:?}", lit.raw);
         // Get the raw source text to analyze escape sequences
         let raw = match &lit.raw {
             Some(atom) => atom.as_str(),
@@ -465,10 +466,6 @@ impl LiteralValidator {
                                 }
 
                                 if self.strict_mode {
-                                    eprintln!(
-                                        "DEBUG: Rejecting legacy octal escape '\\{}' in strict mode",
-                                        next_ch
-                                    );
                                     return Err(CompileError::legacy_syntax(
                                         format!(
                                             "Legacy octal escape sequence '\\{}' is not allowed in strict mode",
@@ -645,17 +642,53 @@ impl LiteralValidator {
 
     /// Validate a regular expression literal
     pub fn validate_regexp_literal(&self, lit: &RegExpLiteral) -> CompileResult<()> {
-        // Get the pattern and flags
         let pattern = lit.regex.pattern.text.as_str();
-        let flags = lit.regex.flags.to_string();
 
-        // Validate the pattern syntax
-        self.validate_regexp_pattern(pattern, lit.span.start)?;
+        let mut flags_storage: Option<String> = None;
+        let (flags_text, flags_offset) = if let Some(raw) = &lit.raw {
+            let raw_text = raw.as_str();
+            if let Some(last_slash) = raw_text.rfind('/') {
+                let flags = &raw_text[last_slash + 1..];
+                (
+                    if flags.is_empty() { None } else { Some(flags) },
+                    lit.span.start + last_slash as u32 + 1,
+                )
+            } else {
+                (None, lit.span.start + 1 + pattern.len() as u32 + 1)
+            }
+        } else {
+            let flags = lit.regex.flags.to_string();
+            (
+                {
+                    if !flags.is_empty() {
+                        flags_storage = Some(flags);
+                    }
+                    flags_storage.as_deref()
+                },
+                lit.span.start + 1 + pattern.len() as u32 + 1,
+            )
+        };
 
-        // Validate the flags
-        self.validate_regexp_flags(&flags, lit.span.start)?;
+        let allocator = Allocator::default();
+        let parser = LiteralParser::new(
+            &allocator,
+            pattern,
+            flags_text,
+            RegExpOptions {
+                pattern_span_offset: lit.span.start + 1,
+                flags_span_offset: flags_offset,
+            },
+        );
 
-        Ok(())
+        parser.parse().map(|_| ()).map_err(|error| {
+            let offset = error
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.first())
+                .map(|label| label.offset() as u32)
+                .unwrap_or(lit.span.start);
+            CompileError::invalid_literal(error.to_string(), offset, offset + 1)
+        })
     }
 
     /// Validate RegExp pattern syntax

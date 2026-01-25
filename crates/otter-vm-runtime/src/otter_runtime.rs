@@ -16,6 +16,7 @@ use crate::env_store::IsolatedEnvStore;
 use otter_vm_compiler::Compiler;
 use otter_vm_core::async_context::VmExecutionResult;
 use otter_vm_core::context::VmContext;
+use otter_vm_core::error::VmError;
 use otter_vm_core::interpreter::Interpreter;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::promise::JsPromise;
@@ -139,6 +140,11 @@ impl Otter {
         self.extensions.register(ext)
     }
 
+    /// Pre-compile all registered extensions to speed up initialization
+    pub fn compile_extensions(&mut self) -> Result<(), String> {
+        self.extensions.pre_compile_all()
+    }
+
     /// Get HTTP event sender (for creating HTTP extension)
     pub fn http_event_sender(&self) -> mpsc::UnboundedSender<HttpEvent> {
         self.http_tx.clone()
@@ -201,11 +207,21 @@ impl Otter {
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
 
         // 4. Register extension ops as global native functions
-        self.register_ops_in_context(&ctx);
+        self.register_ops_in_context(&mut ctx);
 
-        // 5. Execute setup JS from extensions
-        for js in self.extensions.all_js() {
-            self.execute_js(&mut ctx, js, "setup.js")?;
+        // 5. Execute setup JS from extensions (using pre-compiled modules if available)
+        let compiled_modules = self.extensions.all_compiled_js();
+        if !compiled_modules.is_empty() {
+            for module in compiled_modules {
+                self.vm
+                    .execute_module_with_context(&module, &mut ctx)
+                    .map_err(|e| OtterError::Runtime(e.to_string()))?;
+            }
+        } else {
+            // Fallback to source compilation if no pre-compiled modules
+            for js in self.extensions.all_js() {
+                self.execute_js(&mut ctx, js, "setup.js")?;
+            }
         }
 
         // 6. Wrap code for top-level await support
@@ -213,7 +229,12 @@ impl Otter {
 
         // 7. Compile and execute main code with suspension support
         let result_promise = JsPromise::new();
-        let mut exec_result = self.execute_with_suspension(&mut ctx, &wrapped, "main.js", Arc::clone(&result_promise))?;
+        let mut exec_result = self.execute_with_suspension(
+            &mut ctx,
+            &wrapped,
+            "main.js",
+            Arc::clone(&result_promise),
+        )?;
 
         // 8. Handle execution result with proper async resume loop
         let final_value = loop {
@@ -427,7 +448,7 @@ impl Otter {
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
 
         // Register extension ops as global native functions
-        self.register_ops_in_context(&ctx);
+        self.register_ops_in_context(&mut ctx);
 
         // Execute setup JS from extensions
         for js in self.extensions.all_js() {
@@ -440,8 +461,17 @@ impl Otter {
 
     /// Wrap code for top-level await support
     fn wrap_for_top_level_await(code: &str) -> String {
+        let trimmed = code.trim_start();
+        let has_use_strict =
+            trimmed.starts_with("\"use strict\"") || trimmed.starts_with("'use strict'");
+        let strict_prefix = if has_use_strict {
+            "\"use strict\";\n"
+        } else {
+            ""
+        };
         format!(
             r#"globalThis.__otter_main_promise = (async () => {{
+                {strict_prefix}
                 try {{
                     {code}
                 }} catch (err) {{
@@ -453,7 +483,7 @@ impl Otter {
     }
 
     /// Register extension ops as global native functions in context
-    fn register_ops_in_context(&self, ctx: &VmContext) {
+    fn register_ops_in_context(&self, ctx: &mut VmContext) {
         let global = ctx.global();
         let pending_ops = self.event_loop.get_pending_async_ops_count();
 
@@ -467,6 +497,75 @@ impl Otter {
 
         // Also register environment access if capabilities allow
         self.register_env_access(global);
+
+        let ctx_ptr = ctx as *mut VmContext as usize;
+        let vm_ptr = &self.vm as *const VmRuntime as usize;
+        global.set(
+            PropertyKey::string("__otter_eval"),
+            Value::native_function(move |args| {
+                let result_ok = |value: Value| {
+                    let obj = JsObject::new(None);
+                    obj.set(PropertyKey::string("ok"), Value::boolean(true));
+                    obj.set(PropertyKey::string("value"), value);
+                    Value::object(Arc::new(obj))
+                };
+
+                let result_err = |error_type: &str, message: &str| {
+                    let obj = JsObject::new(None);
+                    obj.set(PropertyKey::string("ok"), Value::boolean(false));
+                    obj.set(
+                        PropertyKey::string("errorType"),
+                        Value::string(JsString::intern(error_type)),
+                    );
+                    obj.set(
+                        PropertyKey::string("message"),
+                        Value::string(JsString::intern(message)),
+                    );
+                    Value::object(Arc::new(obj))
+                };
+
+                let code_value = match args.first() {
+                    Some(value) => value.clone(),
+                    None => return Ok(result_ok(Value::undefined())),
+                };
+
+                if !code_value.is_string() {
+                    return Ok(result_ok(code_value));
+                }
+
+                let code = code_value
+                    .as_string()
+                    .map(|s| s.as_str().to_string())
+                    .unwrap_or_default();
+
+                unsafe {
+                    let ctx = &mut *(ctx_ptr as *mut VmContext);
+                    let vm = &*(vm_ptr as *const VmRuntime);
+                    let compiler = Compiler::new();
+                    let module = match compiler.compile(&code, "eval.js") {
+                        Ok(module) => module,
+                        Err(err) => {
+                            return Ok(result_err("SyntaxError", &err.to_string()));
+                        }
+                    };
+
+                    match vm.execute_module_with_context(&module, ctx) {
+                        Ok(value) => Ok(result_ok(value)),
+                        Err(err) => {
+                            let (error_type, message) = match err {
+                                VmError::TypeError(msg) => ("TypeError", msg),
+                                VmError::ReferenceError(msg) => ("ReferenceError", msg),
+                                VmError::RangeError(msg) => ("RangeError", msg),
+                                VmError::SyntaxError(msg) => ("SyntaxError", msg),
+                                VmError::Exception(ex) => ("Error", ex.message),
+                                other => ("Error", other.to_string()),
+                            };
+                            Ok(result_err(error_type, &message))
+                        }
+                    }
+                }
+            }),
+        );
     }
 
     /// Create a native function wrapper for an op handler
@@ -622,6 +721,51 @@ impl Otter {
             .execute_module_with_context(&module, ctx)
             .map_err(|e| OtterError::Runtime(e.to_string()))
     }
+
+    // ==================== Profiling API ====================
+
+    /// Create a new RuntimeStats instance for profiling
+    ///
+    /// Use this to enable profiling on a VmContext:
+    /// ```ignore
+    /// let stats = otter_profiler::RuntimeStats::new();
+    /// let stats = Arc::new(stats);
+    /// ctx.enable_profiling(Arc::clone(&stats));
+    /// // ... run code ...
+    /// let snapshot = stats.snapshot();
+    /// ```
+    #[cfg(feature = "profiling")]
+    pub fn create_profiling_stats() -> std::sync::Arc<otter_profiler::RuntimeStats> {
+        std::sync::Arc::new(otter_profiler::RuntimeStats::new())
+    }
+
+    /// Create a CpuProfiler for sampling-based CPU profiling
+    #[cfg(feature = "profiling")]
+    pub fn create_cpu_profiler() -> otter_profiler::CpuProfiler {
+        otter_profiler::CpuProfiler::new()
+    }
+
+    /// Create a MemoryProfiler for heap snapshots
+    #[cfg(feature = "profiling")]
+    pub fn create_memory_profiler() -> otter_profiler::MemoryProfiler {
+        otter_profiler::MemoryProfiler::new()
+    }
+
+    /// Create a MemoryProfiler connected to a GcHeap
+    #[cfg(feature = "profiling")]
+    pub fn create_memory_profiler_with_heap(
+        heap: std::sync::Arc<otter_vm_gc::GcHeap>,
+    ) -> otter_profiler::MemoryProfiler {
+        use otter_profiler::{HeapInfo, MemoryProfiler};
+
+        let provider = std::sync::Arc::new(move || HeapInfo {
+            total_allocated: heap.allocated(),
+            objects_by_type: std::collections::HashMap::new(),
+            object_count: 0,
+        });
+
+        MemoryProfiler::with_heap_provider(provider)
+    }
 }
 
 impl Default for Otter {
@@ -725,14 +869,24 @@ fn json_to_value(json: &serde_json::Value) -> Value {
 
 fn ws_event_to_json(event: &WsEvent) -> serde_json::Value {
     match event {
-        WsEvent::Open { server_id, socket_id, data, remote_addr } => serde_json::json!({
+        WsEvent::Open {
+            server_id,
+            socket_id,
+            data,
+            remote_addr,
+        } => serde_json::json!({
             "type": "open",
             "serverId": server_id,
             "socketId": socket_id,
             "data": data,
             "remoteAddress": remote_addr,
         }),
-        WsEvent::Message { server_id, socket_id, data, is_text } => {
+        WsEvent::Message {
+            server_id,
+            socket_id,
+            data,
+            is_text,
+        } => {
             if *is_text {
                 let text = String::from_utf8_lossy(data).to_string();
                 serde_json::json!({
@@ -753,31 +907,51 @@ fn ws_event_to_json(event: &WsEvent) -> serde_json::Value {
                 })
             }
         }
-        WsEvent::Close { server_id, socket_id, code, reason } => serde_json::json!({
+        WsEvent::Close {
+            server_id,
+            socket_id,
+            code,
+            reason,
+        } => serde_json::json!({
             "type": "close",
             "serverId": server_id,
             "socketId": socket_id,
             "code": code,
             "reason": reason,
         }),
-        WsEvent::Drain { server_id, socket_id } => serde_json::json!({
+        WsEvent::Drain {
+            server_id,
+            socket_id,
+        } => serde_json::json!({
             "type": "drain",
             "serverId": server_id,
             "socketId": socket_id,
         }),
-        WsEvent::Ping { server_id, socket_id, data } => serde_json::json!({
+        WsEvent::Ping {
+            server_id,
+            socket_id,
+            data,
+        } => serde_json::json!({
             "type": "ping",
             "serverId": server_id,
             "socketId": socket_id,
             "data": data,
         }),
-        WsEvent::Pong { server_id, socket_id, data } => serde_json::json!({
+        WsEvent::Pong {
+            server_id,
+            socket_id,
+            data,
+        } => serde_json::json!({
             "type": "pong",
             "serverId": server_id,
             "socketId": socket_id,
             "data": data,
         }),
-        WsEvent::Error { server_id, socket_id, message } => serde_json::json!({
+        WsEvent::Error {
+            server_id,
+            socket_id,
+            message,
+        } => serde_json::json!({
             "type": "error",
             "serverId": server_id,
             "socketId": socket_id,

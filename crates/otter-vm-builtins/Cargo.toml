@@ -14,7 +14,7 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 iana-time-zone = "0.1"
-regex = "1.11"
+regress = { version = "0.10.5", features = ["utf16"] }
 
 # HTTP client and server
 url = "2.5"

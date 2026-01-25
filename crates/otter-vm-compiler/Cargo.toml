@@ -13,6 +13,7 @@ oxc_parser = "0.110"
 oxc_ast = "0.110"
 oxc_span = "0.110"
 oxc_syntax = "0.110"
+oxc_regular_expression = "0.110"
 thiserror.workspace = true
 regex = "1.0"
 

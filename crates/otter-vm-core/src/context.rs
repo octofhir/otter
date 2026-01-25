@@ -13,6 +13,9 @@ use crate::object::JsObject;
 use crate::string::JsString;
 use crate::value::{UpvalueCell, Value};
 
+#[cfg(feature = "profiling")]
+use otter_profiler::RuntimeStats;
+
 /// Maximum call stack depth
 const MAX_STACK_DEPTH: usize = 1000;
 
@@ -91,6 +94,9 @@ pub struct VmContext {
     next_frame_id: usize,
     /// Interrupt flag for timeout/cancellation support
     interrupt_flag: Arc<AtomicBool>,
+    /// Optional profiling stats (enabled with 'profiling' feature)
+    #[cfg(feature = "profiling")]
+    profiling_stats: Option<Arc<RuntimeStats>>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +121,8 @@ impl VmContext {
             open_upvalues: HashMap::new(),
             next_frame_id: 0,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "profiling")]
+            profiling_stats: None,
         }
     }
 
@@ -146,6 +154,40 @@ impl VmContext {
     pub fn clear_interrupt(&self) {
         self.interrupt_flag.store(false, Ordering::Relaxed);
     }
+
+    // ==================== Profiling Methods ====================
+
+    /// Enable profiling with the given stats collector
+    #[cfg(feature = "profiling")]
+    pub fn enable_profiling(&mut self, stats: Arc<RuntimeStats>) {
+        self.profiling_stats = Some(stats);
+    }
+
+    /// Disable profiling
+    #[cfg(feature = "profiling")]
+    pub fn disable_profiling(&mut self) {
+        self.profiling_stats = None;
+    }
+
+    /// Get profiling stats if enabled
+    #[cfg(feature = "profiling")]
+    pub fn profiling_stats(&self) -> Option<&Arc<RuntimeStats>> {
+        self.profiling_stats.as_ref()
+    }
+
+    /// Record an instruction execution (only when profiling is enabled)
+    #[cfg(feature = "profiling")]
+    #[inline]
+    pub fn record_instruction(&self) {
+        if let Some(stats) = &self.profiling_stats {
+            stats.record_instruction();
+        }
+    }
+
+    /// No-op when profiling feature is disabled
+    #[cfg(not(feature = "profiling"))]
+    #[inline]
+    pub fn record_instruction(&self) {}
 
     /// Get a register value
     #[inline]
@@ -536,6 +578,34 @@ impl VmContext {
             .collect()
     }
 
+    /// Capture current JS stack for CPU profiling
+    /// Returns frames with function names, files, and line numbers
+    #[cfg(feature = "profiling")]
+    pub fn capture_profiler_stack(&self) -> Vec<otter_profiler::StackFrame> {
+        self.call_stack
+            .iter()
+            .rev()
+            .map(|frame| {
+                let func = frame.module.function(frame.function_index);
+                let func_name = func
+                    .and_then(|f| f.name.clone())
+                    .unwrap_or_else(|| "(anonymous)".to_string());
+                let (file, line, column) = frame
+                    .source_location
+                    .as_ref()
+                    .map(|loc| (Some(loc.file.clone()), Some(loc.line), Some(loc.column)))
+                    .unwrap_or((None, None, None));
+
+                otter_profiler::StackFrame {
+                    function: func_name,
+                    file,
+                    line,
+                    column,
+                }
+            })
+            .collect()
+    }
+
     // ==================== Async Context Save/Restore ====================
 
     /// Save all call frames as SavedFrames for async suspension
@@ -650,20 +720,63 @@ impl VmContext {
 
     /// Teardown the context and break reference cycles
     pub fn teardown(&mut self) {
-        // Break the globalThis cycle
+        // Break the globalThis cycle first
         use crate::object::PropertyKey;
+        // println!("DEBUG: VmContext::teardown start");
+
         self.global
             .set(PropertyKey::string("globalThis"), Value::undefined());
 
-        // Also clear other properties of global to help break other cycles
-        // Since we don't have a cycle-collecting GC, this is a best-effort approach
-        // to free as much memory as possible.
-        let keys = self.global.own_keys();
-        for key in keys {
-            // Check if it's configurable before trying to delete/clear?
-            // For now just try to set to undefined to release references
-            self.global.set(key, Value::undefined());
+        // FORCE clear all properties to break reference cycles.
+        // We access internal storage directly to bypass `configurable: false` and `frozen` checks.
+        // This is crucial because some objects (like the test runner's $262 or globalThis)
+        // create reference cycles that prevent cleanup in our defined-GC-less runtime.
+
+        // Collect values to drop OUTSIDE the lock to prevent potential deadlocks or long pauses
+        let mut values_to_drop = Vec::new();
+
+        {
+            // println!("DEBUG: Acquiring properties lock");
+            let mut properties = self.global.get_properties_storage().write();
+            // println!("DEBUG: Acquired properties lock, clearing {} entries", properties.len());
+            for entry in properties.iter_mut() {
+                // Determine if we can modify the value in place
+                if let Some(val) = entry.desc.value_mut() {
+                    let mut temp = Value::undefined();
+                    std::mem::swap(val, &mut temp);
+                    values_to_drop.push(temp);
+                } else {
+                    // Accessor property - replace with data descriptor
+                    // We can't easily extract the getter/setter values to drop them later safely
+                    // without destructuring the enum, but let's try to just overwrite safely.
+                    // For now, just overwriting is likely safe enough as Accessors usually contain Functions
+                    // which don't have side-effects on drop.
+                    entry.desc = crate::object::PropertyDescriptor::data(Value::undefined());
+                }
+            }
         }
+        // println!("DEBUG: Released properties lock");
+
+        // Clear array elements too if any
+        {
+            let mut elements = self.global.get_elements_storage().write();
+            for val in elements.iter_mut() {
+                let mut temp = Value::undefined();
+                std::mem::swap(val, &mut temp);
+                values_to_drop.push(temp);
+            }
+        }
+
+        // Drop all values outside of locks
+        // println!("DEBUG: Dropping {} values", values_to_drop.len());
+        drop(values_to_drop);
+        // println!("DEBUG: VmContext::teardown end");
+    }
+}
+
+impl Drop for VmContext {
+    fn drop(&mut self) {
+        self.teardown();
     }
 }
 

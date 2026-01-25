@@ -6,11 +6,13 @@
 //! - `JSON.rawJSON(string)` - create raw JSON wrapper (ES2024+)
 //! - `JSON.isRawJSON(value)` - check if value is raw JSON (ES2024+)
 
+use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
 use otter_vm_runtime::{Op, op_native};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use std::sync::Arc;
 
 /// Get JSON ops for extension registration
 pub fn ops() -> Vec<Op> {
@@ -26,14 +28,32 @@ pub fn ops() -> Vec<Op> {
 // Helper functions
 // =============================================================================
 
-/// Convert serde_json::Value to a JS-compatible JSON string
-fn json_value_to_string(value: &JsonValue) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
-}
-
 /// Parse JSON string with optional depth limit to prevent stack overflow
 fn parse_json_safe(text: &str) -> Result<JsonValue, String> {
     serde_json::from_str(text).map_err(|e| format!("SyntaxError: {}", e))
+}
+
+fn json_to_value(value: &JsonValue) -> Value {
+    match value {
+        JsonValue::Null => Value::null(),
+        JsonValue::Bool(b) => Value::boolean(*b),
+        JsonValue::Number(n) => Value::number(n.as_f64().unwrap_or(f64::NAN)),
+        JsonValue::String(s) => Value::string(JsString::intern(s)),
+        JsonValue::Array(items) => {
+            let arr = JsObject::array(items.len());
+            for (index, item) in items.iter().enumerate() {
+                arr.set(PropertyKey::Index(index as u32), json_to_value(item));
+            }
+            Value::array(Arc::new(arr))
+        }
+        JsonValue::Object(map) => {
+            let obj = JsObject::new(None);
+            for (key, value) in map {
+                obj.set(PropertyKey::string(key), json_to_value(value));
+            }
+            Value::object(Arc::new(obj))
+        }
+    }
 }
 
 // =============================================================================
@@ -51,10 +71,7 @@ fn json_parse(args: &[Value]) -> Result<Value, String> {
     // Parse the JSON
     let parsed = parse_json_safe(text.as_str())?;
 
-    // Convert back to JSON string for JS side to handle
-    // The JS wrapper will convert this to actual JS values
-    let result = json_value_to_string(&parsed);
-    Ok(Value::string(JsString::intern(&result)))
+    Ok(json_to_value(&parsed))
 }
 
 /// JSON.stringify(value, replacer?, space?)

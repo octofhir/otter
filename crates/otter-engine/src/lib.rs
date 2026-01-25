@@ -66,7 +66,6 @@ pub use otter_vm_runtime::{
     Extension,
     ExtensionRegistry,
     HttpEvent,
-    WsEvent,
     IsolatedEnvStore,
     // Module loader
     LoadedModule,
@@ -91,6 +90,7 @@ pub use otter_vm_runtime::{
     WorkerError,
     WorkerMessage,
     WorkerPool,
+    WsEvent,
     module_extension,
     op_async,
     op_native,
@@ -265,6 +265,11 @@ impl EngineBuilder {
                 .register_extension(http_ext)
                 .expect("Failed to register HTTP extension");
         }
+
+        // Pre-compile extensions to speed up every eval()
+        runtime
+            .compile_extensions()
+            .expect("Failed to pre-compile extensions");
 
         runtime
     }

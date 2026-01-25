@@ -1,10 +1,29 @@
-//! Test262 harness implementation
-//!
-//! Provides the $262 object and other harness functions required by Test262.
-
-use otter_vm_core::object::PropertyKey;
-use otter_vm_core::{JsObject, Value, VmContext};
+use otter_engine::{Extension, JsObject, PropertyKey, Value, VmContext};
 use std::sync::Arc;
+
+/// Create a Test262 harness extension
+pub fn create_harness_extension() -> Extension {
+    Extension::new("test262")
+        .with_js(include_str!("harness/sta.js"))
+        .with_js(include_str!("harness/assert.js"))
+        .with_js(include_str!("harness/donePrintHandle.js"))
+        .with_ops(vec![
+            otter_engine::op_native("__test262_print", |args| {
+                for arg in args {
+                    println!("{}", format_value(arg));
+                }
+                Ok(Value::undefined())
+            }),
+            otter_engine::op_native("__test262_done", |args| {
+                if let Some(err) = args.first() {
+                    if !err.is_undefined() && !err.is_null() {
+                        return Err(format!("Test failed via $DONE: {:?}", err));
+                    }
+                }
+                Ok(Value::undefined())
+            }),
+        ])
+}
 
 /// Set up the Test262 harness on a context
 pub fn setup_harness(ctx: &mut VmContext) {
@@ -13,24 +32,62 @@ pub fn setup_harness(ctx: &mut VmContext) {
     // Create $262 object
     let obj_262 = Arc::new(JsObject::new(None));
 
-    // $262.createRealm() - Create a new realm (not fully implemented)
-    // $262.detachArrayBuffer() - Detach an ArrayBuffer
-    // $262.evalScript() - Evaluate a script
-    // $262.gc() - Trigger garbage collection
     // $262.global - Reference to the global object
-    // $262.agent - Agent-related functionality
+    obj_262.set(PropertyKey::string("global"), Value::object(global.clone()));
+
+    // $262.gc() - Trigger garbage collection
+    obj_262.set(
+        PropertyKey::string("gc"),
+        Value::native_function(|_args| {
+            // Trigger VM GC if supported
+            Ok(Value::undefined())
+        }),
+    );
 
     global.set(PropertyKey::string("$262"), Value::object(obj_262));
 
     // Set up print function (for test output)
-    // In a real implementation, this would be a native function
-    // For now, we just create a placeholder
+    global.set(
+        PropertyKey::string("print"),
+        Value::native_function(|args| {
+            for arg in args {
+                println!("{}", format_value(arg));
+            }
+            Ok(Value::undefined())
+        }),
+    );
 
     // Set up $DONE for async tests
     // async tests call $DONE() or $DONE(error) when complete
+    global.set(
+        PropertyKey::string("$DONE"),
+        Value::native_function(|args| {
+            if let Some(err) = args.first() {
+                if !err.is_undefined() && !err.is_null() {
+                    // Test failed
+                    return Err(format!("Test failed via $DONE: {:?}", err));
+                }
+            }
+            // Test passed
+            Ok(Value::undefined())
+        }),
+    );
 
     // Set up assert functions
     setup_assert(global);
+}
+
+fn format_value(value: &Value) -> String {
+    if value.is_undefined() {
+        return "undefined".to_string();
+    }
+    if value.is_null() {
+        return "null".to_string();
+    }
+    if let Some(s) = value.as_string() {
+        return s.as_str().to_string();
+    }
+    format!("{:?}", value)
 }
 
 /// Set up assert helpers

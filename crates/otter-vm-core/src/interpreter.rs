@@ -317,6 +317,9 @@ impl Interpreter {
 
             let instruction = &func.instructions[frame.pc];
 
+            // Record instruction execution for profiling
+            ctx.record_instruction();
+
             // Execute the instruction
             match self.execute_instruction(instruction, Arc::clone(&current_module), ctx) {
                 Ok(InstructionResult::Continue) => {
@@ -533,6 +536,9 @@ impl Interpreter {
             }
 
             let instruction = &func.instructions[frame.pc];
+
+            // Record instruction execution for profiling
+            ctx.record_instruction();
 
             // Execute the instruction
             match self.execute_instruction(instruction, Arc::clone(&current_module), ctx)? {
@@ -832,9 +838,15 @@ impl Interpreter {
                     return Ok(InstructionResult::Continue);
                 }
 
-                let value = ctx
-                    .get_global_utf16(name_str)
-                    .unwrap_or_else(Value::undefined);
+                let value = match ctx.get_global_utf16(name_str) {
+                    Some(value) => value,
+                    None => {
+                        let message =
+                            format!("{} is not defined", String::from_utf16_lossy(name_str));
+                        let error = self.make_error(ctx, "ReferenceError", &message);
+                        return Ok(InstructionResult::Throw(error));
+                    }
+                };
 
                 // Update IC
                 {
@@ -940,7 +952,8 @@ impl Interpreter {
 
             Instruction::ToNumber { dst, src } => {
                 let value = ctx.get_register(src.0);
-                ctx.set_register(dst.0, Value::number(self.to_number(value)));
+                let number = self.coerce_number(value)?;
+                ctx.set_register(dst.0, Value::number(number));
                 Ok(InstructionResult::Continue)
             }
 
@@ -955,76 +968,46 @@ impl Interpreter {
             }
 
             Instruction::Sub { dst, lhs, rhs } => {
-                let left = ctx
-                    .get_register(lhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
-                let right = ctx
-                    .get_register(rhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
+                let left = self.coerce_number(ctx.get_register(lhs.0))?;
+                let right = self.coerce_number(ctx.get_register(rhs.0))?;
 
                 ctx.set_register(dst.0, Value::number(left - right));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Inc { dst, src } => {
-                let val = ctx
-                    .get_register(src.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
+                let val = self.coerce_number(ctx.get_register(src.0))?;
 
                 ctx.set_register(dst.0, Value::number(val + 1.0));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Dec { dst, src } => {
-                let val = ctx
-                    .get_register(src.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
+                let val = self.coerce_number(ctx.get_register(src.0))?;
 
                 ctx.set_register(dst.0, Value::number(val - 1.0));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Mul { dst, lhs, rhs } => {
-                let left = ctx
-                    .get_register(lhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
-                let right = ctx
-                    .get_register(rhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
+                let left = self.coerce_number(ctx.get_register(lhs.0))?;
+                let right = self.coerce_number(ctx.get_register(rhs.0))?;
 
                 ctx.set_register(dst.0, Value::number(left * right));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Div { dst, lhs, rhs } => {
-                let left = ctx
-                    .get_register(lhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
-                let right = ctx
-                    .get_register(rhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
+                let left = self.coerce_number(ctx.get_register(lhs.0))?;
+                let right = self.coerce_number(ctx.get_register(rhs.0))?;
 
                 ctx.set_register(dst.0, Value::number(left / right));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Mod { dst, lhs, rhs } => {
-                let left = ctx
-                    .get_register(lhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
-                let right = ctx
-                    .get_register(rhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
+                let left = self.coerce_number(ctx.get_register(lhs.0))?;
+                let right = self.coerce_number(ctx.get_register(rhs.0))?;
 
                 ctx.set_register(dst.0, Value::number(left % right));
                 Ok(InstructionResult::Continue)
@@ -1045,9 +1028,7 @@ impl Interpreter {
                     return Ok(InstructionResult::Continue);
                 }
 
-                let value = val
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
+                let value = self.coerce_number(val)?;
 
                 ctx.set_register(dst.0, Value::number(-value));
                 Ok(InstructionResult::Continue)
@@ -1091,56 +1072,32 @@ impl Interpreter {
             }
 
             Instruction::Lt { dst, lhs, rhs } => {
-                let left = ctx
-                    .get_register(lhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
-                let right = ctx
-                    .get_register(rhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
+                let left = self.coerce_number(ctx.get_register(lhs.0))?;
+                let right = self.coerce_number(ctx.get_register(rhs.0))?;
 
                 ctx.set_register(dst.0, Value::boolean(left < right));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Le { dst, lhs, rhs } => {
-                let left = ctx
-                    .get_register(lhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
-                let right = ctx
-                    .get_register(rhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
+                let left = self.coerce_number(ctx.get_register(lhs.0))?;
+                let right = self.coerce_number(ctx.get_register(rhs.0))?;
 
                 ctx.set_register(dst.0, Value::boolean(left <= right));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Gt { dst, lhs, rhs } => {
-                let left = ctx
-                    .get_register(lhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
-                let right = ctx
-                    .get_register(rhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
+                let left = self.coerce_number(ctx.get_register(lhs.0))?;
+                let right = self.coerce_number(ctx.get_register(rhs.0))?;
 
                 ctx.set_register(dst.0, Value::boolean(left > right));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Ge { dst, lhs, rhs } => {
-                let left = ctx
-                    .get_register(lhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
-                let right = ctx
-                    .get_register(rhs.0)
-                    .as_number()
-                    .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
+                let left = self.coerce_number(ctx.get_register(lhs.0))?;
+                let right = self.coerce_number(ctx.get_register(rhs.0))?;
 
                 ctx.set_register(dst.0, Value::boolean(left >= right));
                 Ok(InstructionResult::Continue)
@@ -1156,6 +1113,25 @@ impl Interpreter {
             // ==================== Type Operations ====================
             Instruction::TypeOf { dst, src } => {
                 let type_name = ctx.get_register(src.0).type_of();
+                let str_value = Value::string(Arc::new(JsString::new(type_name)));
+                ctx.set_register(dst.0, str_value);
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::TypeOfName { dst, name } => {
+                let name_const = module
+                    .constants
+                    .get(name.0)
+                    .ok_or_else(|| VmError::internal("constant not found"))?;
+
+                let name_str = name_const
+                    .as_string()
+                    .ok_or_else(|| VmError::internal("expected string constant"))?;
+
+                let type_name = match ctx.get_global_utf16(name_str) {
+                    Some(value) => value.type_of(),
+                    None => "undefined",
+                };
                 let str_value = Value::string(Arc::new(JsString::new(type_name)));
                 ctx.set_register(dst.0, str_value);
                 Ok(InstructionResult::Continue)
@@ -1199,6 +1175,32 @@ impl Interpreter {
                 }
 
                 ctx.set_register(dst.0, Value::boolean(false));
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::In { dst, lhs, rhs } => {
+                let left = ctx.get_register(lhs.0);
+                let right = ctx.get_register(rhs.0);
+
+                let Some(right_obj) = right.as_object() else {
+                    return Err(VmError::type_error(
+                        "Cannot use 'in' operator to search for property in non-object",
+                    ));
+                };
+
+                let key = if let Some(n) = left.as_int32() {
+                    PropertyKey::Index(n as u32)
+                } else if let Some(s) = left.as_string() {
+                    PropertyKey::from_js_string(Arc::clone(s))
+                } else if let Some(sym) = left.as_symbol() {
+                    PropertyKey::Symbol(sym.id)
+                } else {
+                    let idx_str = self.to_string(left);
+                    PropertyKey::string(&idx_str)
+                };
+
+                let result = right_obj.has(&key);
+                ctx.set_register(dst.0, Value::boolean(result));
                 Ok(InstructionResult::Continue)
             }
 
@@ -1420,6 +1422,30 @@ impl Interpreter {
 
             Instruction::Construct { dst, func, argc } => {
                 let func_value = ctx.get_register(func.0).clone();
+
+                if let Some(native_fn) = func_value.as_native_function() {
+                    let mut args = Vec::with_capacity(*argc as usize);
+                    for i in 0..(*argc as u16) {
+                        let arg = ctx.get_register(func.0 + 1 + i).clone();
+                        args.push(arg);
+                    }
+
+                    let ctor_proto = func_value
+                        .as_object()
+                        .and_then(|o| o.get(&PropertyKey::string("prototype")))
+                        .and_then(|v| v.as_object().cloned());
+                    let new_obj = Arc::new(JsObject::new(ctor_proto));
+                    let new_obj_value = Value::object(new_obj);
+
+                    let result = native_fn(&args).map_err(VmError::type_error)?;
+                    let final_value = if result.is_object() {
+                        result
+                    } else {
+                        new_obj_value
+                    };
+                    ctx.set_register(dst.0, final_value);
+                    return Ok(InstructionResult::Continue);
+                }
 
                 // Check if it's a callable constructor
                 if let Some(closure) = func_value.as_function() {
@@ -1697,10 +1723,6 @@ impl Interpreter {
                 let func_value = ctx.get_register(func.0).clone();
                 let spread_arr = ctx.get_register(spread.0).clone();
 
-                let closure = func_value
-                    .as_function()
-                    .ok_or_else(|| VmError::type_error("not a constructor"))?;
-
                 // Collect regular arguments first
                 let mut args = Vec::with_capacity(*argc as usize);
                 for i in 0..(*argc as u16) {
@@ -1722,6 +1744,28 @@ impl Interpreter {
                         }
                     }
                 }
+
+                if let Some(native_fn) = func_value.as_native_function() {
+                    let ctor_proto = func_value
+                        .as_object()
+                        .and_then(|o| o.get(&PropertyKey::string("prototype")))
+                        .and_then(|v| v.as_object().cloned());
+                    let new_obj = Arc::new(JsObject::new(ctor_proto));
+                    let new_obj_value = Value::object(new_obj);
+
+                    let result = native_fn(&args).map_err(VmError::type_error)?;
+                    let final_value = if result.is_object() {
+                        result
+                    } else {
+                        new_obj_value
+                    };
+                    ctx.set_register(dst.0, final_value);
+                    return Ok(InstructionResult::Continue);
+                }
+
+                let closure = func_value
+                    .as_function()
+                    .ok_or_else(|| VmError::type_error("not a constructor"))?;
 
                 // Create a new object with prototype = ctor.prototype (if any) and bind it as `this`
                 let ctor_proto = func_value
@@ -1837,6 +1881,39 @@ impl Interpreter {
                 let name_str = name_const
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
+
+                if let Some(str_ref) = object.as_string() {
+                    if Self::utf16_eq_ascii(name_str, "length") {
+                        ctx.set_register(dst.0, Value::int32(str_ref.len_utf16() as i32));
+                        return Ok(InstructionResult::Continue);
+                    }
+
+                    if let Some(index) = Self::utf16_to_index(name_str) {
+                        let units = str_ref.as_utf16();
+                        if let Some(unit) = units.get(index as usize) {
+                            let ch = JsString::intern_utf16(&[*unit]);
+                            ctx.set_register(dst.0, Value::string(ch));
+                        } else {
+                            ctx.set_register(dst.0, Value::undefined());
+                        }
+                        return Ok(InstructionResult::Continue);
+                    }
+
+                    if let Some(string_obj) = ctx
+                        .get_global("String")
+                        .and_then(|v| v.as_object().cloned())
+                    {
+                        if let Some(proto) = string_obj
+                            .get(&PropertyKey::string("prototype"))
+                            .and_then(|v| v.as_object().cloned())
+                        {
+                            let key = Self::utf16_key(name_str);
+                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                            ctx.set_register(dst.0, value);
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                }
 
                 // IC Fast Path
                 if let Some(obj_ref) = object.as_object() {
@@ -2184,6 +2261,51 @@ impl Interpreter {
             } => {
                 let object = ctx.get_register(obj.0).clone();
                 let key_value = ctx.get_register(key.0).clone();
+
+                if let Some(str_ref) = object.as_string() {
+                    let key = if let Some(n) = key_value.as_int32() {
+                        PropertyKey::Index(n as u32)
+                    } else if let Some(s) = key_value.as_string() {
+                        PropertyKey::from_js_string(Arc::clone(s))
+                    } else if let Some(sym) = key_value.as_symbol() {
+                        PropertyKey::Symbol(sym.id)
+                    } else {
+                        let key_str = self.to_string(&key_value);
+                        PropertyKey::string(&key_str)
+                    };
+
+                    match &key {
+                        PropertyKey::String(s) if s.as_str() == "length" => {
+                            ctx.set_register(dst.0, Value::int32(str_ref.len_utf16() as i32));
+                            return Ok(InstructionResult::Continue);
+                        }
+                        PropertyKey::Index(index) => {
+                            let units = str_ref.as_utf16();
+                            if let Some(unit) = units.get(*index as usize) {
+                                let ch = JsString::intern_utf16(&[*unit]);
+                                ctx.set_register(dst.0, Value::string(ch));
+                            } else {
+                                ctx.set_register(dst.0, Value::undefined());
+                            }
+                            return Ok(InstructionResult::Continue);
+                        }
+                        _ => {}
+                    }
+
+                    if let Some(string_obj) = ctx
+                        .get_global("String")
+                        .and_then(|v| v.as_object().cloned())
+                    {
+                        if let Some(proto) = string_obj
+                            .get(&PropertyKey::string("prototype"))
+                            .and_then(|v| v.as_object().cloned())
+                        {
+                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                            ctx.set_register(dst.0, value);
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                }
 
                 if let Some(obj) = object.as_object() {
                     let receiver = object.clone();
@@ -2970,7 +3092,16 @@ impl Interpreter {
         // Native function path
         if let Some(native_fn) = func_value.as_native_function() {
             // Direct execution
-            let result = native_fn(&args).map_err(VmError::type_error)?;
+            let mut native_args;
+            let args_ref = if this_value.is_undefined() || this_value.is_callable() {
+                &args
+            } else {
+                native_args = Vec::with_capacity(args.len() + 1);
+                native_args.push(this_value);
+                native_args.extend(args);
+                &native_args
+            };
+            let result = native_fn(args_ref).map_err(VmError::type_error)?;
             ctx.set_register(return_reg, result);
             return Ok(InstructionResult::Continue);
         }
@@ -3006,12 +3137,8 @@ impl Interpreter {
         }
 
         // Numeric addition
-        let left_num = left
-            .as_number()
-            .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
-        let right_num = right
-            .as_number()
-            .ok_or_else(|| VmError::type_error("Cannot convert to number"))?;
+        let left_num = self.coerce_number(left)?;
+        let right_num = self.coerce_number(right)?;
         Ok(Value::number(left_num + right_num))
     }
 
@@ -3166,6 +3293,51 @@ impl Interpreter {
         f64::NAN
     }
 
+    fn make_error(&self, ctx: &VmContext, name: &str, message: &str) -> Value {
+        let ctor_value = ctx.get_global(name);
+        let proto = ctor_value
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .and_then(|obj| obj.get(&PropertyKey::string("prototype")))
+            .and_then(|v| v.as_object().cloned());
+
+        let obj = Arc::new(JsObject::new(proto));
+        obj.set(
+            PropertyKey::string("name"),
+            Value::string(JsString::intern(name)),
+        );
+        obj.set(
+            PropertyKey::string("message"),
+            Value::string(JsString::intern(message)),
+        );
+        let stack = if message.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}: {}", name, message)
+        };
+        obj.set(
+            PropertyKey::string("stack"),
+            Value::string(JsString::intern(&stack)),
+        );
+        obj.set(PropertyKey::string("__isError__"), Value::boolean(true));
+        obj.set(
+            PropertyKey::string("__errorType__"),
+            Value::string(JsString::intern(name)),
+        );
+        if let Some(ctor) = ctor_value {
+            obj.set(PropertyKey::string("constructor"), ctor);
+        }
+
+        Value::object(obj)
+    }
+
+    fn coerce_number(&self, value: &Value) -> VmResult<f64> {
+        if value.is_symbol() || value.is_bigint() {
+            return Err(VmError::type_error("Cannot convert to number"));
+        }
+        Ok(self.to_number(value))
+    }
+
     /// Convert a Value to a PropertyKey for object property access
     fn value_to_property_key(&self, value: &Value) -> PropertyKey {
         if let Some(n) = value.as_int32() {
@@ -3254,6 +3426,27 @@ impl Interpreter {
             .iter()
             .zip(ascii.as_bytes().iter())
             .all(|(unit, byte)| *unit == *byte as u16)
+    }
+
+    fn utf16_to_index(units: &[u16]) -> Option<u32> {
+        if units.is_empty() {
+            return None;
+        }
+
+        if units.len() > 1 && units[0] == b'0' as u16 {
+            return None;
+        }
+
+        let mut value: u32 = 0;
+        for unit in units {
+            if !(*unit >= b'0' as u16 && *unit <= b'9' as u16) {
+                return None;
+            }
+            value = value.checked_mul(10)?;
+            value = value.checked_add((*unit - b'0' as u16) as u32)?;
+        }
+
+        Some(value)
     }
 }
 

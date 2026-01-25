@@ -116,15 +116,40 @@ impl Compiler {
                 .directives
                 .iter()
                 .any(|d| d.directive.as_str() == "use strict");
+        let is_strict = is_strict || self.has_use_strict_directive(&program.body);
 
         if is_strict {
             self.set_strict_mode(true);
+        }
+
+        // Validate program directives
+        for d in &program.directives {
+            self.literal_validator
+                .validate_string_literal(&d.expression)?;
         }
 
         for stmt in &program.body {
             self.compile_statement(stmt)?;
         }
         Ok(())
+    }
+
+    fn has_use_strict_directive(&self, statements: &[Statement]) -> bool {
+        for stmt in statements {
+            match stmt {
+                Statement::ExpressionStatement(expr_stmt) => {
+                    if let Expression::StringLiteral(lit) = &expr_stmt.expression {
+                        if lit.value.as_str() == "use strict" {
+                            return true;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        false
     }
 
     /// Compile a statement
@@ -1553,10 +1578,16 @@ impl Compiler {
                 .directives
                 .iter()
                 .any(|d| d.directive.as_str() == "use strict");
+            let has_use_strict = has_use_strict || self.has_use_strict_directive(&body.statements);
 
             if has_use_strict {
-                eprintln!("DEBUG: Enabling strict mode for function body");
                 self.set_strict_mode(true);
+            }
+
+            // Validate directives
+            for d in &body.directives {
+                self.literal_validator
+                    .validate_string_literal(&d.expression)?;
             }
 
             for stmt in &body.statements {
@@ -1696,9 +1727,28 @@ impl Compiler {
 
         // Compile function body
         if let Some(body) = &func.body {
+            let saved_strict = self.is_strict_mode();
+            let has_use_strict = body
+                .directives
+                .iter()
+                .any(|d| d.directive.as_str() == "use strict");
+            let has_use_strict = has_use_strict || self.has_use_strict_directive(&body.statements);
+
+            if has_use_strict {
+                self.set_strict_mode(true);
+            }
+
+            // Validate directives
+            for d in &body.directives {
+                self.literal_validator
+                    .validate_string_literal(&d.expression)?;
+            }
+
             for stmt in &body.statements {
                 self.compile_statement(stmt)?;
             }
+
+            self.set_strict_mode(saved_strict);
         }
 
         // Ensure return
@@ -1810,6 +1860,26 @@ impl Compiler {
         }
 
         // Compile body
+        // Compile body
+        let saved_strict = self.is_strict_mode();
+        let has_use_strict = arrow
+            .body
+            .directives
+            .iter()
+            .any(|d| d.directive.as_str() == "use strict");
+        let has_use_strict =
+            has_use_strict || self.has_use_strict_directive(&arrow.body.statements);
+
+        if has_use_strict {
+            self.set_strict_mode(true);
+        }
+
+        // Validate directives
+        for d in &arrow.body.directives {
+            self.literal_validator
+                .validate_string_literal(&d.expression)?;
+        }
+
         if arrow.expression {
             // Expression body: `(x) => x + 1`
             // In oxc, expression body is stored as a single ExpressionStatement
@@ -1827,6 +1897,8 @@ impl Compiler {
             }
             self.codegen.emit(Instruction::ReturnUndefined);
         }
+
+        self.set_strict_mode(saved_strict);
 
         // Exit function and get index
         let func_idx = self.codegen.exit_function();
@@ -2413,6 +2485,7 @@ impl Compiler {
             BinaryOperator::ShiftRight => Instruction::Shr { dst, lhs, rhs },
             BinaryOperator::ShiftRightZeroFill => Instruction::Ushr { dst, lhs, rhs },
             BinaryOperator::Instanceof => Instruction::InstanceOf { dst, lhs, rhs },
+            BinaryOperator::In => Instruction::In { dst, lhs, rhs },
             _ => {
                 return Err(CompileError::unsupported(format!(
                     "Binary operator: {:?}",
@@ -2468,6 +2541,10 @@ impl Compiler {
             let dst = self.codegen.alloc_reg();
 
             return match &unary.argument {
+                Expression::Identifier(_ident) => {
+                    self.codegen.emit(Instruction::LoadTrue { dst });
+                    Ok(dst)
+                }
                 Expression::StaticMemberExpression(member) => {
                     let obj = self.compile_expression(&member.object)?;
                     let key = self.codegen.alloc_reg();
@@ -2494,6 +2571,29 @@ impl Compiler {
                     Ok(dst)
                 }
             };
+        }
+
+        if unary.operator == UnaryOperator::Typeof {
+            if let Expression::Identifier(ident) = &unary.argument {
+                match self.codegen.resolve_variable(&ident.name) {
+                    Some(ResolvedBinding::Local(_)) | Some(ResolvedBinding::Upvalue { .. }) => {
+                        let src = self.compile_identifier(&ident.name)?;
+                        let dst = self.codegen.alloc_reg();
+                        self.codegen.emit(Instruction::TypeOf { dst, src });
+                        self.codegen.free_reg(src);
+                        return Ok(dst);
+                    }
+                    Some(ResolvedBinding::Global(_)) | None => {
+                        let dst = self.codegen.alloc_reg();
+                        let name_idx = self.codegen.add_string(&ident.name);
+                        self.codegen.emit(Instruction::TypeOfName {
+                            dst,
+                            name: name_idx,
+                        });
+                        return Ok(dst);
+                    }
+                }
+            }
         }
 
         let src = self.compile_expression(&unary.argument)?;

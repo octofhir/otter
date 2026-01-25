@@ -430,16 +430,29 @@ impl Value {
         matches!(&self.heap_ref, Some(HeapRef::String(_)))
     }
 
-    /// Check if value is an object
+    /// Check if value is an object (includes functions, arrays, regexps, etc.)
     #[inline]
     pub fn is_object(&self) -> bool {
-        matches!(&self.heap_ref, Some(HeapRef::Object(_)))
+        matches!(
+            &self.heap_ref,
+            Some(HeapRef::Object(_))
+                | Some(HeapRef::Array(_))
+                | Some(HeapRef::RegExp(_))
+                | Some(HeapRef::Function(_))
+                | Some(HeapRef::NativeFunction(_))
+                | Some(HeapRef::Promise(_))
+                | Some(HeapRef::Proxy(_))
+                | Some(HeapRef::Generator(_))
+        )
     }
 
-    /// Check if value is a function
+    /// Check if value is a function (includes native functions)
     #[inline]
     pub fn is_function(&self) -> bool {
-        matches!(&self.heap_ref, Some(HeapRef::Function(_)))
+        matches!(
+            &self.heap_ref,
+            Some(HeapRef::Function(_)) | Some(HeapRef::NativeFunction(_))
+        )
     }
 
     /// Check if value is a promise
@@ -540,8 +553,10 @@ impl Value {
     pub fn as_object(&self) -> Option<&Arc<JsObject>> {
         match &self.heap_ref {
             Some(HeapRef::Object(o)) => Some(o),
+            Some(HeapRef::Array(a)) => Some(a),
             Some(HeapRef::Function(f)) => Some(&f.object),
             Some(HeapRef::NativeFunction(n)) => Some(&n.object),
+            Some(HeapRef::RegExp(r)) => Some(&r.object),
             _ => None,
         }
     }

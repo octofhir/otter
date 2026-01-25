@@ -34,7 +34,7 @@ pub enum VmError {
     OutOfMemory,
 
     /// Thrown JS exception
-    #[error("Uncaught exception")]
+    #[error("Uncaught exception: {0}")]
     Exception(Box<ThrownValue>),
 
     /// Bytecode error
@@ -53,6 +53,12 @@ pub struct ThrownValue {
     pub message: String,
     /// Stack trace
     pub stack: Vec<StackFrame>,
+}
+
+impl std::fmt::Display for ThrownValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
 }
 
 /// A stack frame in error trace

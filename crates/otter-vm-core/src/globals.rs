@@ -107,7 +107,8 @@ fn setup_builtin_constructors(global: &Arc<JsObject>) {
                 Ok(Value::boolean(b))
             })
         } else if name == "RegExp" {
-            Value::native_function(|args| {
+            let proto = Arc::clone(&proto);
+            Value::native_function(move |args| {
                 let pattern = args
                     .get(0)
                     .map(|v| to_string(v))
@@ -123,16 +124,7 @@ fn setup_builtin_constructors(global: &Arc<JsObject>) {
                 // OtterVM might not support new.target fully yet or it's implicitly constructor.
 
                 // Construct RegExp object
-                let regex = Arc::new(JsRegExp::new(
-                    pattern, flags,
-                    None, // TODO: Link to proper prototype if needed explicitly, but JsObject::new(None) usually fine?
-                         // No, JsObject::new(None) creates object with Object.prototype (or null?).
-                         // We want RegExp.prototype.
-                         // But we are inside setup_builtin_constructors loop, 'proto' variable is the prototype we are building!
-                         // But we want instances to have THAT prototype.
-                         // We can't access 'proto' here inside closure easily if we move it?
-                         // Actually 'proto' is Arc, we can clone it into closure.
-                ));
+                let regex = Arc::new(JsRegExp::new(pattern, flags, Some(Arc::clone(&proto))));
                 Ok(Value::regex(regex))
             })
         } else if name == "BigInt" {
@@ -269,8 +261,19 @@ fn setup_builtin_constructors(global: &Arc<JsObject>) {
         } else if name == "RegExp" {
             proto.set(
                 PropertyKey::string("test"),
-                Value::native_function(|_args| {
-                    Ok(Value::boolean(true)) // Placeholder: test usually returns boolean
+                Value::native_function(|args| {
+                    let regex = args
+                        .get(0)
+                        .and_then(|v| v.as_regex())
+                        .ok_or_else(|| {
+                            "TypeError: RegExp.prototype.test called on incompatible receiver"
+                                .to_string()
+                        })?;
+                    let input_js = args
+                        .get(1)
+                        .map(to_js_string)
+                        .unwrap_or_else(|| JsString::intern("undefined"));
+                    Ok(Value::boolean(regex.exec(&input_js, 0).is_some()))
                 }),
             );
             proto.set(
@@ -282,26 +285,36 @@ fn setup_builtin_constructors(global: &Arc<JsObject>) {
                             .to_string()
                     })?;
 
-                    let input_str = if let Some(val) = args.get(1) {
-                        to_string(val)
-                    } else {
-                        "undefined".to_string()
-                    };
+                    let input_js = args
+                        .get(1)
+                        .map(to_js_string)
+                        .unwrap_or_else(|| JsString::intern("undefined"));
 
-                    if let Some((index, matches)) = regex.exec(&input_str) {
+                    if let Some(mat) = regex.exec(&input_js, 0) {
                         // Create result array
-                        let arr = JsObject::array(matches.len());
-                        for (i, m) in matches.iter().enumerate() {
-                            let val = m
-                                .as_ref()
-                                .map(|s| Value::string(JsString::intern(s)))
+                        let mut out = Vec::with_capacity(mat.captures.len() + 1);
+                        for idx in 0..=mat.captures.len() {
+                            let val = mat
+                                .group(idx)
+                                .map(|range| {
+                                    let slice = &input_js.as_utf16()[range.start..range.end];
+                                    Value::string(JsString::intern_utf16(slice))
+                                })
                                 .unwrap_or(Value::undefined());
+                            out.push(val);
+                        }
+
+                        let arr = JsObject::array(out.len());
+                        for (i, val) in out.into_iter().enumerate() {
                             arr.set(PropertyKey::Index(i as u32), val);
                         }
-                        arr.set(PropertyKey::string("index"), Value::number(index as f64));
+                        arr.set(
+                            PropertyKey::string("index"),
+                            Value::number(mat.start() as f64),
+                        );
                         arr.set(
                             PropertyKey::string("input"),
-                            Value::string(JsString::intern(&input_str)),
+                            Value::string(Arc::clone(&input_js)),
                         );
                         arr.set(PropertyKey::string("groups"), Value::undefined());
 
@@ -680,6 +693,13 @@ fn to_string(value: &Value) -> String {
     }
 
     "[object Object]".to_string()
+}
+
+fn to_js_string(value: &Value) -> Arc<JsString> {
+    if let Some(s) = value.as_string() {
+        return Arc::clone(s);
+    }
+    JsString::intern(&to_string(value))
 }
 
 #[cfg(test)]

@@ -293,13 +293,22 @@ impl VmContext {
 
     /// Get a local variable
     #[inline]
-    pub fn get_local(&self, index: u16) -> VmResult<&Value> {
+    pub fn get_local(&self, index: u16) -> VmResult<Value> {
         let frame = self
             .current_frame()
             .ok_or_else(|| VmError::internal("no call frame"))?;
+
+        // If this local has been captured and is still open, use the cell value.
+        // This ensures shared mutable access between the parent function and closures.
+        let frame_id = frame.frame_id;
+        if let Some(cell) = self.open_upvalues.get(&(frame_id, index)) {
+            return Ok(cell.get());
+        }
+
         frame
             .locals
             .get(index as usize)
+            .cloned()
             .ok_or_else(|| VmError::internal(format!("local index {} out of bounds", index)))
     }
 
@@ -609,7 +618,7 @@ impl VmContext {
         }
 
         // Create a new cell with the current local value
-        let value = self.get_local(local_idx)?.clone();
+        let value = self.get_local(local_idx)?;
         let cell = UpvalueCell::new(value);
         self.open_upvalues.insert(key, cell.clone());
         Ok(cell)
@@ -627,7 +636,7 @@ impl VmContext {
 
         if let Some(cell) = self.open_upvalues.get(&key) {
             // Sync the current local value into the cell
-            let value = self.get_local(local_idx)?.clone();
+            let value = self.get_local(local_idx)?;
             cell.set(value);
         }
         // Remove from open upvalues (the closures keep their own clones of the cell)

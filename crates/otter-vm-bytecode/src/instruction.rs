@@ -164,6 +164,8 @@ pub enum Opcode {
     CallSpread = 0x87,
     /// Construct with spread arguments: dst = new func(...spread_arr)
     ConstructSpread = 0x88,
+    /// Call function with explicit receiver: dst = func.call(this, args...)
+    CallWithReceiver = 0x89,
 
     // ==================== Control Flow ====================
     /// Unconditional jump
@@ -317,6 +319,7 @@ impl Opcode {
             0x86 => Some(Self::ReturnUndefined),
             0x87 => Some(Self::CallSpread),
             0x88 => Some(Self::ConstructSpread),
+            0x89 => Some(Self::CallWithReceiver),
 
             0x90 => Some(Self::Jump),
             0x91 => Some(Self::JumpIfTrue),
@@ -443,6 +446,7 @@ impl Opcode {
             Self::ReturnUndefined => "ReturnUndefined",
             Self::CallSpread => "CallSpread",
             Self::ConstructSpread => "ConstructSpread",
+            Self::CallWithReceiver => "CallWithReceiver",
             // Control flow
             Self::Jump => "Jump",
             Self::JumpIfTrue => "JumpIfTrue",
@@ -797,6 +801,12 @@ pub enum Instruction {
         argc: u8,
         /// Index into the feedback vector for Inline Cache
         ic_index: u16,
+    },
+    CallWithReceiver {
+        dst: Register,
+        func: Register,
+        this: Register,
+        argc: u8,
     },
     /// Call method with computed property key: dst = obj[key](...args)
     /// Registers: obj, key, arg1, arg2, ... (contiguous)

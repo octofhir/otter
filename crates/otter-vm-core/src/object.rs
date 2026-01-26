@@ -36,8 +36,15 @@ pub enum PropertyKey {
 }
 
 impl PropertyKey {
-    /// Create a string property key
+    /// Create a string property key (canonicalizes numeric strings to Index)
     pub fn string(s: &str) -> Self {
+        // Canonicalize numeric strings to Index for consistent lookup
+        if let Ok(n) = s.parse::<u32>() {
+            // Verify it's canonical (no leading zeros except for "0")
+            if n.to_string() == s {
+                return Self::Index(n);
+            }
+        }
         Self::String(JsString::intern(s))
     }
 

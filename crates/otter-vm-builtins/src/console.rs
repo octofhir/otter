@@ -334,6 +334,12 @@ fn format_value(value: &Value) -> String {
         } else {
             "Symbol()".to_string()
         }
+    } else if value.is_bigint() {
+        if let Some(otter_vm_core::value::HeapRef::BigInt(b)) = value.heap_ref() {
+            format!("{}n", b.value)
+        } else {
+            "BigInt".to_string()
+        }
     } else if value.is_promise() {
         "[Promise]".to_string()
     } else if let Some(arr) = value.as_array() {
@@ -401,7 +407,11 @@ fn format_object(obj: &std::sync::Arc<otter_vm_core::object::JsObject>) -> Strin
         .collect();
 
     if has_more {
-        format!("{{ {}, ... {} more }}", pairs.join(", "), keys.len() - max_keys)
+        format!(
+            "{{ {}, ... {} more }}",
+            pairs.join(", "),
+            keys.len() - max_keys
+        )
     } else {
         format!("{{ {} }}", pairs.join(", "))
     }

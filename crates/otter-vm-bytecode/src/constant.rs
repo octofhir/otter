@@ -22,6 +22,8 @@ pub enum Constant {
     },
     /// Template literal parts (UTF-16 code units)
     TemplateLiteral(Vec<Vec<u16>>),
+    /// Symbol ID (for private fields)
+    Symbol(u64),
 }
 
 impl Constant {
@@ -113,6 +115,9 @@ impl Constant {
             }
             Self::TemplateLiteral(parts) => {
                 parts.hash(state);
+            }
+            Self::Symbol(id) => {
+                id.hash(state);
             }
         }
     }

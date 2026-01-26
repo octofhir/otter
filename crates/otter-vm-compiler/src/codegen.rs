@@ -266,6 +266,11 @@ impl CodeGen {
         ConstantIndex(self.constants.add(Constant::bigint(s)))
     }
 
+    /// Add a Symbol constant
+    pub fn add_symbol(&mut self, id: u64) -> ConstantIndex {
+        ConstantIndex(self.constants.add(Constant::Symbol(id)))
+    }
+
     /// Emit an instruction
     pub fn emit(&mut self, instruction: Instruction) {
         self.current.emit(instruction);

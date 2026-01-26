@@ -295,6 +295,30 @@ impl Otter {
         // This loop handles HTTP requests by calling the JS dispatcher
         self.run_event_loop_with_http(&mut ctx).await;
 
+        // 10. Check for script errors captured by the wrapper
+        let global = ctx.global();
+        if let Some(error) = global.get(&PropertyKey::string("__otter_script_error")) {
+            if !error.is_undefined() {
+                // If it's an object with 'message', use that, otherwise to_string
+                let msg = if let Some(obj) = error.as_object() {
+                    if let Some(m) = obj.get(&PropertyKey::string("message")) {
+                        if let Some(s) = m.as_string() {
+                            s.as_str().to_string()
+                        } else {
+                            format!("{:?}", m)
+                        }
+                    } else {
+                        format!("{:?}", error)
+                    }
+                } else if let Some(s) = error.as_string() {
+                    s.as_str().to_string()
+                } else {
+                    format!("{:?}", error)
+                };
+                return Err(OtterError::Runtime(msg));
+            }
+        }
+
         Ok(final_value)
     }
 

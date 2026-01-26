@@ -15,7 +15,7 @@ use crate::string::JsString;
 use crate::value::{Closure, UpvalueCell, Value};
 
 use num_bigint::BigInt as NumBigInt;
-use num_traits::{One, Zero};
+use num_traits::{One, ToPrimitive, Zero};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -997,7 +997,7 @@ impl Interpreter {
 
             // ==================== Variables ====================
             Instruction::GetLocal { dst, idx } => {
-                let value = ctx.get_local(idx.0)?.clone();
+                let value = ctx.get_local(idx.0)?;
                 ctx.set_register(dst.0, value);
                 Ok(InstructionResult::Continue)
             }
@@ -1325,6 +1325,37 @@ impl Interpreter {
                 let right = self.coerce_number(right_value)?;
 
                 ctx.set_register(dst.0, Value::number(left % right));
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::Pow { dst, lhs, rhs } => {
+                let left_value = ctx.get_register(lhs.0);
+                let right_value = ctx.get_register(rhs.0);
+                let left_bigint = self.bigint_value(left_value)?;
+                let right_bigint = self.bigint_value(right_value)?;
+
+                if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
+                    if right_bigint < NumBigInt::zero() {
+                        return Err(VmError::range_error(
+                            "Exponent must be non-negative for BigInt",
+                        ));
+                    }
+                    let exponent = right_bigint
+                        .to_u32()
+                        .ok_or_else(|| VmError::range_error("Exponent too large for BigInt"))?;
+                    let result = left_bigint.pow(exponent);
+                    ctx.set_register(dst.0, Value::bigint(result.to_string()));
+                    return Ok(InstructionResult::Continue);
+                }
+
+                if left_value.is_bigint() || right_value.is_bigint() {
+                    return Err(VmError::type_error("Cannot mix BigInt and other types"));
+                }
+
+                let left = self.coerce_number(left_value)?;
+                let right = self.coerce_number(right_value)?;
+
+                ctx.set_register(dst.0, Value::number(left.powf(right)));
                 Ok(InstructionResult::Continue)
             }
 
@@ -1743,6 +1774,24 @@ impl Interpreter {
                 }
 
                 self.handle_call_value(ctx, &func_value, Value::undefined(), args, dst.0)
+            }
+
+            Instruction::CallWithReceiver {
+                dst,
+                func,
+                this,
+                argc,
+            } => {
+                let func_value = ctx.get_register(func.0).clone();
+                let this_value = ctx.get_register(this.0).clone();
+
+                let mut args = Vec::with_capacity(*argc as usize);
+                for i in 0..(*argc as u16) {
+                    let arg = ctx.get_register(func.0 + 1 + i).clone();
+                    args.push(arg);
+                }
+
+                self.handle_call_value(ctx, &func_value, this_value, args, dst.0)
             }
 
             Instruction::TailCall { func, argc } => {
@@ -3553,6 +3602,13 @@ impl Interpreter {
             Constant::TemplateLiteral(_) => {
                 Err(VmError::internal("Template literals not yet supported"))
             }
+            Constant::Symbol(id) => {
+                let sym = Arc::new(crate::value::Symbol {
+                    id: *id,
+                    description: None,
+                });
+                Ok(Value::symbol(sym))
+            }
         }
     }
 
@@ -3988,13 +4044,30 @@ impl Interpreter {
     /// Convert a Value to a PropertyKey for object property access
     fn value_to_property_key(&self, value: &Value) -> PropertyKey {
         if let Some(n) = value.as_int32() {
-            PropertyKey::Index(n as u32)
+            if n >= 0 {
+                PropertyKey::Index(n as u32)
+            } else {
+                PropertyKey::string(&n.to_string())
+            }
         } else if let Some(s) = value.as_string() {
+            // Check if the string is a valid array index (canonical numeric string)
+            if let Ok(n) = s.as_str().parse::<u32>() {
+                // Verify it's canonical (no leading zeros except for "0")
+                if n.to_string() == s.as_str() {
+                    return PropertyKey::Index(n);
+                }
+            }
             PropertyKey::string(s.as_str())
         } else if let Some(sym) = value.as_symbol() {
             PropertyKey::Symbol(sym.id)
         } else {
             let key_str = self.to_string(value);
+            // Also check if the stringified value is a valid array index
+            if let Ok(n) = key_str.parse::<u32>() {
+                if n.to_string() == key_str {
+                    return PropertyKey::Index(n);
+                }
+            }
             PropertyKey::string(&key_str)
         }
     }

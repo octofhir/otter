@@ -128,6 +128,16 @@ impl JsProxy {
     pub fn has_trap(&self, trap_name: &str) -> bool {
         self.get_trap(trap_name).is_some()
     }
+
+    /// Extract values from this proxy and clear its state.
+    /// Used for iterative destruction to prevent stack overflow.
+    pub fn clear_and_extract_values(&self) -> Vec<Value> {
+        self.revoke();
+        vec![
+            Value::object(self.target.clone()),
+            Value::object(self.handler.clone()),
+        ]
+    }
 }
 
 #[cfg(test)]

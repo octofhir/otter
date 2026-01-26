@@ -42,6 +42,14 @@ struct Args {
     /// Show memory usage statistics
     #[arg(long)]
     memory_stats: bool,
+
+    /// Timeout in seconds for each test
+    #[arg(long)]
+    timeout: Option<u64>,
+
+    /// Specific test files to run
+    #[arg(value_name = "FILES")]
+    files: Vec<String>,
 }
 
 /// Memory statistics tracker
@@ -240,13 +248,15 @@ async fn main() {
     use std::io::Write;
     std::io::stdout().flush().unwrap();
 
-    let mut tests = if let Some(ref subdir) = args.subdir {
+    let mut tests = if !args.files.is_empty() {
+        println!("Running {} specific test files", args.files.len());
+        args.files.iter().map(PathBuf::from).collect()
+    } else if let Some(ref subdir) = args.subdir {
         println!("Subdirectory: {}", subdir);
         runner.list_tests_dir(subdir)
     } else {
         runner.list_tests()
     };
-
 
     if let Some(max) = args.max_tests {
         tests.truncate(max);
@@ -255,7 +265,11 @@ async fn main() {
     let mut summary = RunSummary::new(10);
 
     for path in tests {
-        let result = runner.run_test(&path).await;
+        if args.verbose {
+            println!("RUNNING: {}", path.display());
+        }
+        let timeout = args.timeout.map(std::time::Duration::from_secs);
+        let result = runner.run_test(&path, timeout).await;
 
         match result.outcome {
             TestOutcome::Fail | TestOutcome::Crash => {

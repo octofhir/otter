@@ -722,10 +722,10 @@ impl std::fmt::Debug for Value {
                 Some(HeapRef::Array(_)) => write!(f, "[object Array]"),
                 Some(HeapRef::Function(_)) => write!(f, "[Function]"),
                 Some(HeapRef::NativeFunction(_)) => write!(f, "[NativeFunction]"),
-                Some(HeapRef::Promise(p)) => write!(f, "{:?}", p),
-                Some(HeapRef::Proxy(p)) => write!(f, "{:?}", p),
+                Some(HeapRef::Promise(_)) => write!(f, "[object Promise]"),
+                Some(HeapRef::Proxy(_)) => write!(f, "[object Proxy]"),
                 Some(HeapRef::RegExp(r)) => write!(f, "/{}/{}", r.pattern, r.flags),
-                Some(HeapRef::Generator(g)) => write!(f, "{:?}", g),
+                Some(HeapRef::Generator(_)) => write!(f, "[object Generator]"),
                 Some(HeapRef::Symbol(s)) => {
                     if let Some(desc) = &s.description {
                         write!(f, "Symbol({})", desc)

@@ -369,25 +369,25 @@ impl Interpreter {
             let current_module = Arc::clone(module_ref);
 
             // Execute the instruction
-            let instruction_result = match self.execute_instruction(instruction, current_module, ctx)
-            {
-                Ok(result) => result,
-                Err(err) => match err {
-                    VmError::TypeError(message) => {
-                        InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
-                    }
-                    VmError::RangeError(message) => {
-                        InstructionResult::Throw(self.make_error(ctx, "RangeError", &message))
-                    }
-                    VmError::ReferenceError(message) => InstructionResult::Throw(
-                        self.make_error(ctx, "ReferenceError", &message),
-                    ),
-                    VmError::SyntaxError(message) => {
-                        InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
-                    }
-                    other => return VmExecutionResult::Error(other.to_string()),
-                },
-            };
+            let instruction_result =
+                match self.execute_instruction(instruction, current_module, ctx) {
+                    Ok(result) => result,
+                    Err(err) => match err {
+                        VmError::TypeError(message) => {
+                            InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
+                        }
+                        VmError::RangeError(message) => {
+                            InstructionResult::Throw(self.make_error(ctx, "RangeError", &message))
+                        }
+                        VmError::ReferenceError(message) => InstructionResult::Throw(
+                            self.make_error(ctx, "ReferenceError", &message),
+                        ),
+                        VmError::SyntaxError(message) => {
+                            InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
+                        }
+                        other => return VmExecutionResult::Error(other.to_string()),
+                    },
+                };
 
             match instruction_result {
                 InstructionResult::Continue => {
@@ -690,25 +690,25 @@ impl Interpreter {
             let current_module = Arc::clone(module_ref);
 
             // Execute the instruction
-            let instruction_result = match self.execute_instruction(instruction, current_module, ctx)
-            {
-                Ok(result) => result,
-                Err(err) => match err {
-                    VmError::TypeError(message) => {
-                        InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
-                    }
-                    VmError::RangeError(message) => {
-                        InstructionResult::Throw(self.make_error(ctx, "RangeError", &message))
-                    }
-                    VmError::ReferenceError(message) => InstructionResult::Throw(
-                        self.make_error(ctx, "ReferenceError", &message),
-                    ),
-                    VmError::SyntaxError(message) => {
-                        InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
-                    }
-                    other => return Err(other),
-                },
-            };
+            let instruction_result =
+                match self.execute_instruction(instruction, current_module, ctx) {
+                    Ok(result) => result,
+                    Err(err) => match err {
+                        VmError::TypeError(message) => {
+                            InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
+                        }
+                        VmError::RangeError(message) => {
+                            InstructionResult::Throw(self.make_error(ctx, "RangeError", &message))
+                        }
+                        VmError::ReferenceError(message) => InstructionResult::Throw(
+                            self.make_error(ctx, "ReferenceError", &message),
+                        ),
+                        VmError::SyntaxError(message) => {
+                            InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
+                        }
+                        other => return Err(other),
+                    },
+                };
 
             match instruction_result {
                 InstructionResult::Continue => {
@@ -1097,7 +1097,8 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let mut feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic {
+                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic
+                            {
                                 *ic = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                                     shape_id: std::sync::Arc::as_ptr(&global_obj.shape()) as u64,
                                     offset: offset as u32,
@@ -1166,7 +1167,8 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let mut feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic {
+                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic
+                            {
                                 *ic = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                                     shape_id: std::sync::Arc::as_ptr(&global_obj.shape()) as u64,
                                     offset: offset as u32,
@@ -1215,9 +1217,7 @@ impl Interpreter {
                 }
 
                 if left_value.is_bigint() || right_value.is_bigint() {
-                    return Err(VmError::type_error(
-                        "Cannot mix BigInt and other types",
-                    ));
+                    return Err(VmError::type_error("Cannot mix BigInt and other types"));
                 }
 
                 let left = self.coerce_number(left_value)?;
@@ -1266,9 +1266,7 @@ impl Interpreter {
                 }
 
                 if left_value.is_bigint() || right_value.is_bigint() {
-                    return Err(VmError::type_error(
-                        "Cannot mix BigInt and other types",
-                    ));
+                    return Err(VmError::type_error("Cannot mix BigInt and other types"));
                 }
 
                 let left = self.coerce_number(left_value)?;
@@ -1294,9 +1292,7 @@ impl Interpreter {
                 }
 
                 if left_value.is_bigint() || right_value.is_bigint() {
-                    return Err(VmError::type_error(
-                        "Cannot mix BigInt and other types",
-                    ));
+                    return Err(VmError::type_error("Cannot mix BigInt and other types"));
                 }
 
                 let left = self.coerce_number(left_value)?;
@@ -1322,9 +1318,7 @@ impl Interpreter {
                 }
 
                 if left_value.is_bigint() || right_value.is_bigint() {
-                    return Err(VmError::type_error(
-                        "Cannot mix BigInt and other types",
-                    ));
+                    return Err(VmError::type_error("Cannot mix BigInt and other types"));
                 }
 
                 let left = self.coerce_number(left_value)?;
@@ -2013,7 +2007,8 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let mut feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic {
+                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic
+                            {
                                 *ic = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                                     shape_id: std::sync::Arc::as_ptr(&obj_ref.shape()) as u64,
                                     offset: offset as u32,
@@ -2067,8 +2062,8 @@ impl Interpreter {
 
                 // Check if it's a native function first
                 if let Some(native_fn) = func_value.as_native_function() {
-                    // Call the native function directly
-                    let result = native_fn(&args).map_err(VmError::type_error)?;
+                    // Call the native function with depth tracking
+                    let result = self.call_native_fn(ctx, native_fn, &args)?;
                     ctx.set_register(dst.0, result);
                     return Ok(InstructionResult::Continue);
                 }
@@ -2131,7 +2126,7 @@ impl Interpreter {
                     let new_obj = Arc::new(JsObject::new(ctor_proto));
                     let new_obj_value = Value::object(new_obj);
 
-                    let result = native_fn(&args).map_err(VmError::type_error)?;
+                    let result = self.call_native_fn(ctx, native_fn, &args)?;
                     let final_value = if result.is_object() {
                         result
                     } else {
@@ -2324,7 +2319,8 @@ impl Interpreter {
                                 InlineCacheState::Polymorphic { count, entries } => {
                                     for i in 0..(*count as usize) {
                                         if obj_shape_ptr == entries[i].0 {
-                                            cached_val = obj_ref.get_by_offset(entries[i].1 as usize);
+                                            cached_val =
+                                                obj_ref.get_by_offset(entries[i].1 as usize);
                                             break;
                                         }
                                     }
@@ -2379,7 +2375,7 @@ impl Interpreter {
                             };
 
                             if let Some(native_fn) = getter.as_native_function() {
-                                let result = native_fn(&[]).map_err(VmError::type_error)?;
+                                let result = self.call_native_fn(ctx, native_fn, &[])?;
                                 ctx.set_register(dst.0, result);
                                 Ok(InstructionResult::Continue)
                             } else if let Some(closure) = getter.as_function() {
@@ -2415,14 +2411,23 @@ impl Interpreter {
 
                                     match ic {
                                         InlineCacheState::Uninitialized => {
-                                            *ic = InlineCacheState::Monomorphic { shape_id: shape_ptr, offset: offset as u32 };
+                                            *ic = InlineCacheState::Monomorphic {
+                                                shape_id: shape_ptr,
+                                                offset: offset as u32,
+                                            };
                                         }
-                                        InlineCacheState::Monomorphic { shape_id: old_shape, offset: old_offset } => {
+                                        InlineCacheState::Monomorphic {
+                                            shape_id: old_shape,
+                                            offset: old_offset,
+                                        } => {
                                             if *old_shape != shape_ptr {
                                                 let mut entries = [(0u64, 0u32); 4];
                                                 entries[0] = (*old_shape, *old_offset);
                                                 entries[1] = (shape_ptr, offset as u32);
-                                                *ic = InlineCacheState::Polymorphic { count: 2, entries };
+                                                *ic = InlineCacheState::Polymorphic {
+                                                    count: 2,
+                                                    entries,
+                                                };
                                             }
                                         }
                                         InlineCacheState::Polymorphic { count, entries } => {
@@ -2435,7 +2440,8 @@ impl Interpreter {
                                             }
                                             if !found {
                                                 if (*count as usize) < 4 {
-                                                    entries[*count as usize] = (shape_ptr, offset as u32);
+                                                    entries[*count as usize] =
+                                                        (shape_ptr, offset as u32);
                                                     *count += 1;
                                                 } else {
                                                     *ic = InlineCacheState::Megamorphic;
@@ -2503,7 +2509,10 @@ impl Interpreter {
                                 InlineCacheState::Polymorphic { count, entries } => {
                                     for i in 0..(*count as usize) {
                                         if obj_shape_ptr == entries[i].0 {
-                                            if obj.set_by_offset(entries[i].1 as usize, val_val.clone()) {
+                                            if obj.set_by_offset(
+                                                entries[i].1 as usize,
+                                                val_val.clone(),
+                                            ) {
                                                 cached = true;
                                             }
                                             break;
@@ -2526,7 +2535,7 @@ impl Interpreter {
                             };
 
                             if let Some(native_fn) = setter.as_native_function() {
-                                native_fn(&[val_val]).map_err(VmError::type_error)?;
+                                self.call_native_fn(ctx, native_fn, &[val_val])?;
                                 Ok(InstructionResult::Continue)
                             } else if let Some(closure) = setter.as_function() {
                                 ctx.set_pending_args(vec![val_val]);
@@ -2563,14 +2572,23 @@ impl Interpreter {
 
                                     match ic {
                                         InlineCacheState::Uninitialized => {
-                                            *ic = InlineCacheState::Monomorphic { shape_id: shape_ptr, offset: offset as u32 };
+                                            *ic = InlineCacheState::Monomorphic {
+                                                shape_id: shape_ptr,
+                                                offset: offset as u32,
+                                            };
                                         }
-                                        InlineCacheState::Monomorphic { shape_id: old_shape, offset: old_offset } => {
+                                        InlineCacheState::Monomorphic {
+                                            shape_id: old_shape,
+                                            offset: old_offset,
+                                        } => {
                                             if *old_shape != shape_ptr {
                                                 let mut entries = [(0u64, 0u32); 4];
                                                 entries[0] = (*old_shape, *old_offset);
                                                 entries[1] = (shape_ptr, offset as u32);
-                                                *ic = InlineCacheState::Polymorphic { count: 2, entries };
+                                                *ic = InlineCacheState::Polymorphic {
+                                                    count: 2,
+                                                    entries,
+                                                };
                                             }
                                         }
                                         InlineCacheState::Polymorphic { count, entries } => {
@@ -2583,7 +2601,8 @@ impl Interpreter {
                                             }
                                             if !found {
                                                 if (*count as usize) < 4 {
-                                                    entries[*count as usize] = (shape_ptr, offset as u32);
+                                                    entries[*count as usize] =
+                                                        (shape_ptr, offset as u32);
                                                     *count += 1;
                                                 } else {
                                                     *ic = InlineCacheState::Megamorphic;
@@ -2784,14 +2803,23 @@ impl Interpreter {
 
                                     match ic {
                                         InlineCacheState::Uninitialized => {
-                                            *ic = InlineCacheState::Monomorphic { shape_id: shape_ptr, offset: offset as u32 };
+                                            *ic = InlineCacheState::Monomorphic {
+                                                shape_id: shape_ptr,
+                                                offset: offset as u32,
+                                            };
                                         }
-                                        InlineCacheState::Monomorphic { shape_id: old_shape, offset: old_offset } => {
+                                        InlineCacheState::Monomorphic {
+                                            shape_id: old_shape,
+                                            offset: old_offset,
+                                        } => {
                                             if *old_shape != shape_ptr {
                                                 let mut entries = [(0u64, 0u32); 4];
                                                 entries[0] = (*old_shape, *old_offset);
                                                 entries[1] = (shape_ptr, offset as u32);
-                                                *ic = InlineCacheState::Polymorphic { count: 2, entries };
+                                                *ic = InlineCacheState::Polymorphic {
+                                                    count: 2,
+                                                    entries,
+                                                };
                                             }
                                         }
                                         InlineCacheState::Polymorphic { count, entries } => {
@@ -2804,7 +2832,8 @@ impl Interpreter {
                                             }
                                             if !found {
                                                 if (*count as usize) < 4 {
-                                                    entries[*count as usize] = (shape_ptr, offset as u32);
+                                                    entries[*count as usize] =
+                                                        (shape_ptr, offset as u32);
                                                     *count += 1;
                                                 } else {
                                                     *ic = InlineCacheState::Megamorphic;
@@ -2875,7 +2904,10 @@ impl Interpreter {
                                 InlineCacheState::Polymorphic { count, entries } => {
                                     for i in 0..(*count as usize) {
                                         if obj_shape_ptr == entries[i].0 {
-                                            if obj.set_by_offset(entries[i].1 as usize, val_val.clone()) {
+                                            if obj.set_by_offset(
+                                                entries[i].1 as usize,
+                                                val_val.clone(),
+                                            ) {
                                                 cached = true;
                                             }
                                             break;
@@ -2934,14 +2966,23 @@ impl Interpreter {
 
                                     match ic {
                                         InlineCacheState::Uninitialized => {
-                                            *ic = InlineCacheState::Monomorphic { shape_id: shape_ptr, offset: offset as u32 };
+                                            *ic = InlineCacheState::Monomorphic {
+                                                shape_id: shape_ptr,
+                                                offset: offset as u32,
+                                            };
                                         }
-                                        InlineCacheState::Monomorphic { shape_id: old_shape, offset: old_offset } => {
+                                        InlineCacheState::Monomorphic {
+                                            shape_id: old_shape,
+                                            offset: old_offset,
+                                        } => {
                                             if *old_shape != shape_ptr {
                                                 let mut entries = [(0u64, 0u32); 4];
                                                 entries[0] = (*old_shape, *old_offset);
                                                 entries[1] = (shape_ptr, offset as u32);
-                                                *ic = InlineCacheState::Polymorphic { count: 2, entries };
+                                                *ic = InlineCacheState::Polymorphic {
+                                                    count: 2,
+                                                    entries,
+                                                };
                                             }
                                         }
                                         InlineCacheState::Polymorphic { count, entries } => {
@@ -2954,7 +2995,8 @@ impl Interpreter {
                                             }
                                             if !found {
                                                 if (*count as usize) < 4 {
-                                                    entries[*count as usize] = (shape_ptr, offset as u32);
+                                                    entries[*count as usize] =
+                                                        (shape_ptr, offset as u32);
                                                     *count += 1;
                                                 } else {
                                                     *ic = InlineCacheState::Megamorphic;
@@ -3171,7 +3213,8 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let mut feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic {
+                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic
+                            {
                                 *ic = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                                     shape_id: std::sync::Arc::as_ptr(&obj.shape()) as u64,
                                     offset: offset as u32,
@@ -3257,7 +3300,8 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let mut feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic {
+                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic
+                            {
                                 *ic = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                                     shape_id: std::sync::Arc::as_ptr(&obj.shape()) as u64,
                                     offset: offset as u32,
@@ -3363,6 +3407,60 @@ impl Interpreter {
                 }
             }
 
+            Instruction::GetAsyncIterator { dst, src } => {
+                use crate::value::HeapRef;
+
+                let obj = ctx.get_register(src.0).clone();
+
+                // 1. Try Symbol.asyncIterator (ID 2)
+                const SYMBOL_ASYNC_ITERATOR_ID: u64 = 2;
+                const SYMBOL_ITERATOR_ID: u64 = 1;
+
+                let mut iterator_method = match obj.heap_ref() {
+                    Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
+                        o.get(&PropertyKey::Symbol(SYMBOL_ASYNC_ITERATOR_ID))
+                    }
+                    _ => None,
+                };
+
+                // 2. Fallback to Symbol.iterator (ID 1)
+                if iterator_method.is_none() {
+                    iterator_method = match obj.heap_ref() {
+                        Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
+                            o.get(&PropertyKey::Symbol(SYMBOL_ITERATOR_ID))
+                        }
+                        _ => None,
+                    };
+                }
+
+                let iterator_fn = iterator_method
+                    .ok_or_else(|| VmError::type_error("Object is not async iterable"))?;
+
+                // Call the iterator method with obj as `this`
+                if let Some(native_fn) = iterator_fn.as_native_function() {
+                    let iterator =
+                        self.call_native_fn(ctx, native_fn, std::slice::from_ref(&obj))?;
+                    ctx.set_register(dst.0, iterator);
+                    Ok(InstructionResult::Continue)
+                } else if let Some(closure) = iterator_fn.as_function() {
+                    ctx.set_pending_args(Vec::new());
+                    ctx.set_pending_this(obj);
+                    Ok(InstructionResult::Call {
+                        func_index: closure.function_index,
+                        module: Arc::clone(&closure.module),
+                        argc: 0,
+                        return_reg: dst.0,
+                        is_construct: false,
+                        is_async: closure.is_async,
+                        upvalues: closure.upvalues.clone(),
+                    })
+                } else {
+                    Err(VmError::type_error(
+                        "Async iterator method is not a function",
+                    ))
+                }
+            }
+
             Instruction::IteratorNext { dst, done, iter } => {
                 let iterator = ctx.get_register(iter.0).clone();
 
@@ -3378,7 +3476,7 @@ impl Interpreter {
 
                 // Call next()
                 let result = if let Some(native_fn) = next_fn.as_native_function() {
-                    native_fn(std::slice::from_ref(&iterator)).map_err(VmError::type_error)?
+                    self.call_native_fn(ctx, native_fn, std::slice::from_ref(&iterator))?
                 } else {
                     return Err(VmError::type_error("next is not a function"));
                 };
@@ -3540,9 +3638,7 @@ impl Interpreter {
         }
 
         if left.is_bigint() || right.is_bigint() {
-            return Err(VmError::type_error(
-                "Cannot mix BigInt and other types",
-            ));
+            return Err(VmError::type_error("Cannot mix BigInt and other types"));
         }
 
         // Numeric addition
@@ -3576,7 +3672,7 @@ impl Interpreter {
         }
 
         if let Some(native_fn) = method_value.as_native_function() {
-            let result = native_fn(&args).map_err(VmError::type_error)?;
+            let result = self.call_native_fn(ctx, native_fn, &args)?;
             ctx.set_register(return_reg, result);
             return Ok(InstructionResult::Continue);
         }
@@ -3785,10 +3881,9 @@ impl Interpreter {
             (Numeric::BigInt(left), Numeric::Number(right)) => {
                 Ok(self.compare_bigint_number(&left, right))
             }
-            (Numeric::Number(left), Numeric::BigInt(right)) => Ok(
-                self.compare_bigint_number(&right, left)
-                    .map(|ordering| ordering.reverse()),
-            ),
+            (Numeric::Number(left), Numeric::BigInt(right)) => Ok(self
+                .compare_bigint_number(&right, left)
+                .map(|ordering| ordering.reverse())),
         }
     }
 

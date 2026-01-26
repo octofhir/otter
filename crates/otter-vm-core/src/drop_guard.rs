@@ -40,7 +40,23 @@ impl DropGuard {
             let children = obj.clear_and_extract_values();
             for child in children {
                 // Only push objects/functions which might need recursion breaking
-                if child.is_object() || child.is_function() {
+                if child.is_object()
+                    || child.is_function()
+                    || child.is_promise()
+                    || child.is_proxy()
+                {
+                    self.queue.push_back(child);
+                }
+            }
+        } else if let Some(promise) = value.as_promise() {
+            // Handle promises iteratively
+            let children = promise.clear_and_extract_values();
+            for child in children {
+                if child.is_object()
+                    || child.is_function()
+                    || child.is_promise()
+                    || child.is_proxy()
+                {
                     self.queue.push_back(child);
                 }
             }
@@ -51,7 +67,7 @@ impl DropGuard {
                 // If it's not undefined, clear it and queue the old value
                 if !val.is_undefined() {
                     cell.set(Value::undefined());
-                    if val.is_object() || val.is_function() {
+                    if val.is_object() || val.is_function() || val.is_promise() || val.is_proxy() {
                         self.queue.push_back(val);
                     }
                 }

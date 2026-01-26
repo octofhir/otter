@@ -28,12 +28,18 @@ pub struct Compiler {
     depth: usize,
     /// Literal validator for ECMAScript compliance
     literal_validator: LiteralValidator,
+    /// Pending labels for the next loop/switch
+    pending_labels: Vec<String>,
 }
 
 #[derive(Debug)]
 struct ControlScope {
     /// Whether this scope represents a loop (true) or switch (false)
     is_loop: bool,
+    /// Whether this scope represents a switch (true) or block (false)
+    is_switch: bool,
+    /// Labels associated with this scope
+    labels: Vec<String>,
     /// Jump indices for `break` statements targeting this scope
     break_jumps: Vec<usize>,
     /// Jump indices for `continue` statements targeting this scope (only if is_loop)
@@ -50,6 +56,7 @@ impl Compiler {
             loop_stack: Vec::new(),
             depth: 0,
             literal_validator: LiteralValidator::new(false, EcmaVersion::Latest),
+            pending_labels: Vec::new(),
         }
     }
 
@@ -242,12 +249,40 @@ impl Compiler {
                     return Err(CompileError::unsupported("Labeled break"));
                 }
 
-                // Find nearest breakable scope (loop or switch)
-                // Search in reverse order
+                // Find nearest breakable scope
+                // If label is present, find scope with that label.
+                // If label is missing, find nearest loop or switch.
                 let mut target_scope_idx = None;
-                for (i, scope) in self.loop_stack.iter_mut().enumerate().rev() {
-                    target_scope_idx = Some(i);
-                    break;
+
+                if let Some(target_label) = &break_stmt.label {
+                    let target_name = target_label.name.as_str();
+                    for (i, scope) in self.loop_stack.iter_mut().enumerate().rev() {
+                        if scope.labels.iter().any(|l| l == target_name) {
+                            target_scope_idx = Some(i);
+                            break;
+                        }
+                    }
+                    if target_scope_idx.is_none() {
+                        return Err(CompileError::syntax(
+                            format!("Undefined label '{}'", target_name),
+                            0,
+                            0,
+                        ));
+                    }
+                } else {
+                    for (i, scope) in self.loop_stack.iter_mut().enumerate().rev() {
+                        if scope.is_loop || scope.is_switch {
+                            target_scope_idx = Some(i);
+                            break;
+                        }
+                    }
+                    if target_scope_idx.is_none() {
+                        return Err(CompileError::syntax(
+                            "break outside of loop or switch",
+                            0,
+                            0,
+                        ));
+                    }
                 }
 
                 if let Some(idx) = target_scope_idx {
@@ -255,25 +290,39 @@ impl Compiler {
                     self.loop_stack[idx].break_jumps.push(jump_idx);
                     Ok(())
                 } else {
-                    Err(CompileError::syntax(
-                        "break outside of loop or switch",
-                        0,
-                        0,
-                    ))
+                    unreachable!()
                 }
             }
 
             Statement::ContinueStatement(continue_stmt) => {
-                if continue_stmt.label.is_some() {
-                    return Err(CompileError::unsupported("Labeled continue"));
-                }
-
-                // Find nearest loop scope (skip switches)
+                // Find nearest loop scope
                 let mut target_scope_idx = None;
-                for (i, scope) in self.loop_stack.iter_mut().enumerate().rev() {
-                    if scope.is_loop {
-                        target_scope_idx = Some(i);
-                        break;
+
+                if let Some(target_label) = &continue_stmt.label {
+                    let target_name = target_label.name.as_str();
+                    for (i, scope) in self.loop_stack.iter_mut().enumerate().rev() {
+                        // Continue only works on loops
+                        if scope.is_loop && scope.labels.iter().any(|l| l == target_name) {
+                            target_scope_idx = Some(i);
+                            break;
+                        }
+                    }
+                    if target_scope_idx.is_none() {
+                        return Err(CompileError::syntax(
+                            format!("Undefined label '{}' for continue", target_name),
+                            0,
+                            0,
+                        ));
+                    }
+                } else {
+                    for (i, scope) in self.loop_stack.iter_mut().enumerate().rev() {
+                        if scope.is_loop {
+                            target_scope_idx = Some(i);
+                            break;
+                        }
+                    }
+                    if target_scope_idx.is_none() {
+                        return Err(CompileError::syntax("continue outside of loop", 0, 0));
                     }
                 }
 
@@ -282,7 +331,7 @@ impl Compiler {
                     self.loop_stack[idx].continue_jumps.push(jump_idx);
                     Ok(())
                 } else {
-                    Err(CompileError::syntax("continue outside of loop", 0, 0))
+                    unreachable!()
                 }
             }
 
@@ -330,8 +379,8 @@ impl Compiler {
             // Common JS features
             Statement::ClassDeclaration(class_decl) => self.compile_class_declaration(class_decl),
             Statement::SwitchStatement(switch_stmt) => self.compile_switch_statement(switch_stmt),
-            Statement::DoWhileStatement(_) => Err(CompileError::unsupported("DoWhileStatement")),
-            Statement::LabeledStatement(_) => Err(CompileError::unsupported("LabeledStatement")),
+            Statement::DoWhileStatement(stmt) => self.compile_do_while_statement(stmt),
+            Statement::LabeledStatement(stmt) => self.compile_labeled_statement(stmt),
             Statement::WithStatement(_) => Err(CompileError::unsupported("WithStatement")),
 
             _ => Err(CompileError::unsupported("UnknownStatement")),
@@ -1141,11 +1190,98 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compile a labeled statement
+    fn compile_labeled_statement(&mut self, stmt: &LabeledStatement) -> CompileResult<()> {
+        let label = stmt.label.name.to_string();
+        self.pending_labels.push(label.clone());
+
+        match &stmt.body {
+            Statement::ForStatement(_)
+            | Statement::ForInStatement(_)
+            | Statement::ForOfStatement(_)
+            | Statement::WhileStatement(_)
+            | Statement::DoWhileStatement(_)
+            | Statement::SwitchStatement(_) => {
+                // Loop/Switch will consume pending_labels
+                self.compile_statement(&stmt.body)?;
+            }
+            _ => {
+                // Labeled block or other statement
+                // If it's not a loop/switch, we need to create a scope for the label
+                // but this scope is neither a loop nor a switch, so it catches labeled breaks only.
+                self.loop_stack.push(ControlScope {
+                    is_loop: false,
+                    is_switch: false,
+                    labels: std::mem::take(&mut self.pending_labels),
+                    break_jumps: Vec::new(),
+                    continue_jumps: Vec::new(), // Not used
+                    continue_target: None,
+                });
+
+                self.compile_statement(&stmt.body)?;
+
+                let break_target = self.codegen.current_index();
+                let scope = self.loop_stack.pop().expect("scope underflow");
+
+                for jump in scope.break_jumps {
+                    let offset = break_target as i32 - jump as i32;
+                    self.codegen.patch_jump(jump, offset);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a do-while statement
+    fn compile_do_while_statement(&mut self, stmt: &DoWhileStatement) -> CompileResult<()> {
+        let loop_start = self.codegen.current_index();
+
+        self.loop_stack.push(ControlScope {
+            is_loop: true,
+            is_switch: false,
+            labels: std::mem::take(&mut self.pending_labels),
+            break_jumps: Vec::new(),
+            continue_jumps: Vec::new(),
+            continue_target: None, // Will patch later
+        });
+
+        self.compile_statement(&stmt.body)?;
+
+        let cond_start = self.codegen.current_index();
+
+        // Patch continue jumps to cond_start
+        if let Some(scope) = self.loop_stack.last() {
+            let continue_jumps = scope.continue_jumps.clone();
+            for jump in continue_jumps {
+                let offset = cond_start as i32 - jump as i32;
+                self.codegen.patch_jump(jump, offset);
+            }
+        }
+
+        let cond = self.compile_expression(&stmt.test)?;
+        let jump_back = self.codegen.emit_jump_if_true(cond);
+        self.codegen.free_reg(cond);
+
+        self.codegen
+            .patch_jump(jump_back, loop_start as i32 - jump_back as i32);
+
+        let break_target = self.codegen.current_index();
+        let scope = self.loop_stack.pop().unwrap();
+        for jump in scope.break_jumps {
+            self.codegen
+                .patch_jump(jump, break_target as i32 - jump as i32);
+        }
+
+        Ok(())
+    }
+
     /// Compile a while statement
     fn compile_while_statement(&mut self, while_stmt: &WhileStatement) -> CompileResult<()> {
         let loop_start = self.codegen.current_index();
         self.loop_stack.push(ControlScope {
             is_loop: true,
+            is_switch: false,
+            labels: std::mem::take(&mut self.pending_labels),
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             continue_target: Some(loop_start),
@@ -1208,6 +1344,8 @@ impl Compiler {
         let loop_start = self.codegen.current_index();
         self.loop_stack.push(ControlScope {
             is_loop: true,
+            is_switch: false,
+            labels: std::mem::take(&mut self.pending_labels),
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             continue_target: Some(loop_start),
@@ -1275,10 +1413,17 @@ impl Compiler {
 
         // Get iterator: iterator = iterable[Symbol.iterator]()
         let iterator = self.codegen.alloc_reg();
-        self.codegen.emit(Instruction::GetIterator {
-            dst: iterator,
-            src: iterable,
-        });
+        if for_of_stmt.r#await {
+            self.codegen.emit(Instruction::GetAsyncIterator {
+                dst: iterator,
+                src: iterable,
+            });
+        } else {
+            self.codegen.emit(Instruction::GetIterator {
+                dst: iterator,
+                src: iterable,
+            });
+        }
         self.codegen.free_reg(iterable);
 
         // Allocate registers for value and done
@@ -1294,6 +1439,8 @@ impl Compiler {
         let loop_start = self.codegen.current_index();
         self.loop_stack.push(ControlScope {
             is_loop: true,
+            is_switch: false,
+            labels: std::mem::take(&mut self.pending_labels),
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             continue_target: Some(loop_start),
@@ -1316,6 +1463,14 @@ impl Compiler {
         });
         self.codegen.free_reg(frame);
 
+        // if await (for await), await iterator.next() result
+        if for_of_stmt.r#await {
+            self.codegen.emit(Instruction::Await {
+                dst: result_reg,
+                src: result_reg,
+            });
+        }
+
         // done = result.done; value = result.value
         let ic_index_done = self.codegen.alloc_ic();
         self.codegen.emit(Instruction::GetPropConst {
@@ -1331,6 +1486,14 @@ impl Compiler {
             name: value_name,
             ic_index: ic_index_value,
         });
+
+        // if await (for await), await value (as per spec)
+        if for_of_stmt.r#await {
+            self.codegen.emit(Instruction::Await {
+                dst: value_reg,
+                src: value_reg,
+            });
+        }
 
         // JumpIfTrue done -> end
         let jump_end = self.codegen.emit_jump_if_true(done_reg);
@@ -1450,7 +1613,7 @@ impl Compiler {
                     self.codegen.free_reg(idx_reg);
 
                     // Recursively handle the element pattern
-                    self.compile_binding_init_inner(elem_pat, elem_reg, is_const)?;
+                    self.compile_binding_init(elem_pat, elem_reg, is_const)?;
                     self.codegen.free_reg(elem_reg);
                 }
 
@@ -1459,7 +1622,7 @@ impl Compiler {
                     // Call Array.prototype.slice(startIndex) to get remaining elements
                     let start_idx = array_pat.elements.len();
 
-                    // Prepare arguments: source_reg.slice(start_idx)
+                    // Prepare arguments: source_reg.slice(startIndex)
                     let frame = self.codegen.alloc_fresh_block(2);
                     self.codegen.emit(Instruction::Move {
                         dst: frame,
@@ -1484,7 +1647,7 @@ impl Compiler {
                     self.codegen.free_reg(frame);
 
                     // Recursively handle the rest binding
-                    self.compile_binding_init_inner(&rest_elem.argument, rest_reg, is_const)?;
+                    self.compile_binding_init(&rest_elem.argument, rest_reg, is_const)?;
                     self.codegen.free_reg(rest_reg);
                 }
             }
@@ -1640,7 +1803,7 @@ impl Compiler {
                 self.codegen.patch_jump(jump_skip, end_offset);
 
                 // Recursively handle the left pattern
-                self.compile_binding_init_inner(&assign_pat.left, source_reg, is_const)?;
+                self.compile_binding_init(&assign_pat.left, source_reg, is_const)?;
             }
         }
         Ok(())
@@ -1738,7 +1901,7 @@ impl Compiler {
                     self.codegen.free_reg(idx_reg);
 
                     if let Some(target) = elem_maybe_default.as_assignment_target() {
-                        self.compile_assignment_target_init_inner(target, elem_reg)?;
+                        self.compile_assignment_target_init(target, elem_reg)?;
                     } else if let AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(def) =
                         elem_maybe_default
                     {
@@ -1766,7 +1929,7 @@ impl Compiler {
                         let end_offset = self.codegen.current_index() as i32 - jump_skip as i32;
                         self.codegen.patch_jump(jump_skip, end_offset);
 
-                        self.compile_assignment_target_init_inner(&def.binding, elem_reg)?;
+                        self.compile_assignment_target_init(&def.binding, elem_reg)?;
                     }
                     self.codegen.free_reg(elem_reg);
                 }
@@ -1797,7 +1960,7 @@ impl Compiler {
                     });
                     self.codegen.free_reg(frame);
 
-                    self.compile_assignment_target_init_inner(&rest.target, rest_reg)?;
+                    self.compile_assignment_target_init(&rest.target, rest_reg)?;
                     self.codegen.free_reg(rest_reg);
                 }
             }
@@ -1954,16 +2117,11 @@ impl Compiler {
                                         self.codegen.current_index() as i32 - jump_skip as i32;
                                     self.codegen.patch_jump(jump_skip, end_offset);
 
-                                    self.compile_assignment_target_init_inner(
-                                        &def.binding,
-                                        prop_reg,
-                                    )?;
+                                    self.compile_assignment_target_init(&def.binding, prop_reg)?;
                                 }
                                 other => {
                                     if let Some(target) = other.as_assignment_target() {
-                                        self.compile_assignment_target_init_inner(
-                                            target, prop_reg,
-                                        )?;
+                                        self.compile_assignment_target_init(target, prop_reg)?;
                                     } else {
                                         return Err(CompileError::unsupported(
                                             "Unsupported AssignmentTargetMaybeDefault variant",
@@ -2033,7 +2191,7 @@ impl Compiler {
                     self.codegen.free_reg(func_reg);
                     self.codegen.free_reg(excluded_array);
 
-                    self.compile_assignment_target_init_inner(&rest.target, rest_reg)?;
+                    self.compile_assignment_target_init(&rest.target, rest_reg)?;
                     self.codegen.free_reg(rest_reg);
                 }
             }
@@ -2054,66 +2212,133 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_try_statement(&mut self, try_stmt: &TryStatement) -> CompileResult<()> {
-        if try_stmt.finalizer.is_some() {
-            return Err(CompileError::unsupported("try/finally"));
-        }
-        let Some(handler) = &try_stmt.handler else {
-            return Err(CompileError::unsupported("try without catch"));
-        };
+    /// Compile the inner part of a try statement (either try-catch or just try block)
+    fn compile_inner_try_catch(
+        &mut self,
+        try_block: &BlockStatement,
+        handler: Option<&CatchClause>,
+    ) -> CompileResult<()> {
+        if let Some(handler) = handler {
+            // Emit try start (patch catch offset later)
+            let try_start = self.codegen.current_index();
+            self.codegen.emit(Instruction::TryStart {
+                catch_offset: JumpOffset(0),
+            });
 
-        // Emit try start (patch catch offset later)
-        let try_start = self.codegen.current_index();
-        self.codegen.emit(Instruction::TryStart {
-            catch_offset: JumpOffset(0),
-        });
+            // Compile try block
+            for stmt in &try_block.body {
+                self.compile_statement(stmt)?;
+            }
 
-        // Compile try block
-        for stmt in &try_stmt.block.body {
-            self.compile_statement(stmt)?;
-        }
+            // Normal completion pops the handler
+            self.codegen.emit(Instruction::TryEnd);
 
-        // Normal completion pops the handler
-        self.codegen.emit(Instruction::TryEnd);
+            // Jump over catch
+            let jump_over_catch = self.codegen.emit_jump();
 
-        // Jump over catch
-        let jump_over_catch = self.codegen.emit_jump();
+            // Patch try_start to jump into catch block
+            let catch_start = self.codegen.current_index();
+            let catch_offset = catch_start as i32 - try_start as i32;
+            self.codegen.patch_jump(try_start, catch_offset);
 
-        // Patch try_start to jump into catch block
-        let catch_start = self.codegen.current_index();
-        let catch_offset = catch_start as i32 - try_start as i32;
-        self.codegen.patch_jump(try_start, catch_offset);
+            // Catch block begins: load exception into a register, bind param, then run body
+            self.codegen.enter_scope();
 
-        // Catch block begins: load exception into a register, bind param, then run body
-        self.codegen.enter_scope();
+            let exc_reg = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::Catch { dst: exc_reg });
 
-        let exc_reg = self.codegen.alloc_reg();
-        self.codegen.emit(Instruction::Catch { dst: exc_reg });
-
-        if let Some(param) = &handler.param {
-            match &param.pattern {
-                BindingPattern::BindingIdentifier(ident) => {
-                    self.check_identifier_early_error(&ident.name)?;
-                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
-                    self.codegen.emit(Instruction::SetLocal {
-                        idx: LocalIndex(local_idx),
-                        src: exc_reg,
-                    });
+            if let Some(param) = &handler.param {
+                match &param.pattern {
+                    BindingPattern::BindingIdentifier(ident) => {
+                        self.check_identifier_early_error(&ident.name)?;
+                        let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                        self.codegen.emit(Instruction::SetLocal {
+                            idx: LocalIndex(local_idx),
+                            src: exc_reg,
+                        });
+                    }
+                    _ => return Err(CompileError::unsupported("Complex catch parameter pattern")),
                 }
-                _ => return Err(CompileError::unsupported("Complex catch parameter pattern")),
+            }
+
+            for stmt in &handler.body.body {
+                self.compile_statement(stmt)?;
+            }
+
+            self.codegen.free_reg(exc_reg);
+            self.codegen.exit_scope();
+
+            // Patch jump over catch
+            let end_offset = self.codegen.current_index() as i32 - jump_over_catch as i32;
+            self.codegen.patch_jump(jump_over_catch, end_offset);
+        } else {
+            // No catch handler, just compile the body
+            // (This is used when we have try/finally without catch)
+            for stmt in &try_block.body {
+                self.compile_statement(stmt)?;
             }
         }
+        Ok(())
+    }
 
-        for stmt in &handler.body.body {
-            self.compile_statement(stmt)?;
+    fn compile_try_statement(&mut self, try_stmt: &TryStatement) -> CompileResult<()> {
+        if let Some(finalizer) = &try_stmt.finalizer {
+            // Wrap inner logic in Try/Finally
+
+            // 1. Emit outer TryStart
+            let try_start = self.codegen.current_index();
+            self.codegen.emit(Instruction::TryStart {
+                catch_offset: JumpOffset(0),
+            });
+
+            // 2. Compile Inner (Try/Catch or Try)
+            self.compile_inner_try_catch(&try_stmt.block, try_stmt.handler.as_deref())?;
+
+            // 3. Emit TryEnd (for normal completion of inner)
+            self.codegen.emit(Instruction::TryEnd);
+
+            // 4. Compile Finalizer (Normal Path)
+            // Note: In full implementation, we'd use a shared subroutine or Gosub.
+            // Here we duplicate code for simplicity as per plan.
+            for stmt in &finalizer.body {
+                self.compile_statement(stmt)?;
+            }
+
+            // 5. Jump over Exception Path
+            let jump_over_exc = self.codegen.emit_jump();
+
+            // 6. Exception Path Start
+            let exc_start = self.codegen.current_index();
+            let catch_offset = exc_start as i32 - try_start as i32;
+            self.codegen.patch_jump(try_start, catch_offset);
+
+            // 7. Handle Exception (Catch -> Finally -> Rethrow)
+            self.codegen.enter_scope();
+            let exc_reg = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::Catch { dst: exc_reg });
+
+            // 8. Compile Finalizer (Exception Path)
+            for stmt in &finalizer.body {
+                self.compile_statement(stmt)?;
+            }
+
+            // 9. Rethrow
+            self.codegen.emit(Instruction::Throw { src: exc_reg });
+
+            self.codegen.free_reg(exc_reg);
+            self.codegen.exit_scope();
+
+            // 10. Patch jump over exception path
+            let end_offset = self.codegen.current_index() as i32 - jump_over_exc as i32;
+            self.codegen.patch_jump(jump_over_exc, end_offset);
+        } else {
+            // No finally, just standard Try/Catch
+            if try_stmt.handler.is_none() {
+                // Parser usually prevents `try {}` with no catch/finally, but good to be safe
+                return Err(CompileError::unsupported("try without catch or finally"));
+            }
+            self.compile_inner_try_catch(&try_stmt.block, try_stmt.handler.as_deref())?;
         }
-
-        self.codegen.free_reg(exc_reg);
-        self.codegen.exit_scope();
-
-        // Patch jump over catch
-        let end_offset = self.codegen.current_index() as i32 - jump_over_catch as i32;
-        self.codegen.patch_jump(jump_over_catch, end_offset);
 
         Ok(())
     }
@@ -2150,15 +2375,24 @@ impl Compiler {
                 }
                 // Legacy / non-standard representation; keep for forward-compat.
                 BindingPattern::AssignmentPattern(assign) => {
-                    let BindingPattern::BindingIdentifier(ident) = &assign.left else {
-                        return Err(CompileError::unsupported("Complex parameter patterns"));
-                    };
-                    self.check_identifier_early_error(&ident.name)?;
-                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
-                    self.codegen.current.param_count += 1;
-                    param_defaults.push((local_idx, &assign.right));
+                    if let BindingPattern::BindingIdentifier(ident) = &assign.left {
+                        self.check_identifier_early_error(&ident.name)?;
+                        let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                        self.codegen.current.param_count += 1;
+                        param_defaults.push((local_idx, &assign.right));
+                    } else {
+                        // Pattern with default: [x] = []
+                        let param_reg = self.codegen.alloc_reg();
+                        self.codegen.current.param_count += 1;
+                        self.compile_binding_init(&assign.left, param_reg, false)?;
+                    }
                 }
-                _ => return Err(CompileError::unsupported("Complex parameter patterns")),
+                _ => {
+                    // Pattern: [x], {a}
+                    let param_reg = self.codegen.alloc_reg();
+                    self.codegen.current.param_count += 1;
+                    self.compile_binding_init(&param.pattern, param_reg, false)?;
+                }
             }
         }
 
@@ -2307,15 +2541,24 @@ impl Compiler {
                 }
                 // Legacy / non-standard representation; keep for forward-compat.
                 BindingPattern::AssignmentPattern(assign) => {
-                    let BindingPattern::BindingIdentifier(ident) = &assign.left else {
-                        return Err(CompileError::unsupported("Complex parameter patterns"));
-                    };
-                    self.check_identifier_early_error(&ident.name)?;
-                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
-                    self.codegen.current.param_count += 1;
-                    param_defaults.push((local_idx, &assign.right));
+                    if let BindingPattern::BindingIdentifier(ident) = &assign.left {
+                        self.check_identifier_early_error(&ident.name)?;
+                        let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                        self.codegen.current.param_count += 1;
+                        param_defaults.push((local_idx, &assign.right));
+                    } else {
+                        // Pattern with default: [x] = []
+                        let param_reg = self.codegen.alloc_reg();
+                        self.codegen.current.param_count += 1;
+                        self.compile_binding_init(&assign.left, param_reg, false)?;
+                    }
                 }
-                _ => return Err(CompileError::unsupported("Complex parameter patterns")),
+                _ => {
+                    // Pattern: [x], {a}
+                    let param_reg = self.codegen.alloc_reg();
+                    self.codegen.current.param_count += 1;
+                    self.compile_binding_init(&param.pattern, param_reg, false)?;
+                }
             }
         }
 
@@ -2444,15 +2687,24 @@ impl Compiler {
                 }
                 // Legacy / non-standard representation; keep for forward-compat.
                 BindingPattern::AssignmentPattern(assign) => {
-                    let BindingPattern::BindingIdentifier(ident) = &assign.left else {
-                        return Err(CompileError::unsupported("Complex parameter patterns"));
-                    };
-                    self.check_identifier_early_error(&ident.name)?;
-                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
-                    self.codegen.current.param_count += 1;
-                    param_defaults.push((local_idx, &assign.right));
+                    if let BindingPattern::BindingIdentifier(ident) = &assign.left {
+                        self.check_identifier_early_error(&ident.name)?;
+                        let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                        self.codegen.current.param_count += 1;
+                        param_defaults.push((local_idx, &assign.right));
+                    } else {
+                        // Pattern with default: [x] = []
+                        let param_reg = self.codegen.alloc_reg();
+                        self.codegen.current.param_count += 1;
+                        self.compile_binding_init(&assign.left, param_reg, false)?;
+                    }
                 }
-                _ => return Err(CompileError::unsupported("Complex parameter patterns")),
+                _ => {
+                    // Pattern: [x], {a}
+                    let param_reg = self.codegen.alloc_reg();
+                    self.codegen.current.param_count += 1;
+                    self.compile_binding_init(&param.pattern, param_reg, false)?;
+                }
             }
         }
 
@@ -3244,6 +3496,16 @@ impl Compiler {
                     }
                 }
             }
+        }
+
+        if unary.operator == UnaryOperator::Void {
+            let src = self.compile_expression(&unary.argument)?;
+            let dst = self.codegen.alloc_reg();
+            // void evaluates the expression then returns undefined
+            // we just need to free the result of the expression
+            self.codegen.free_reg(src);
+            self.codegen.emit(Instruction::LoadUndefined { dst });
+            return Ok(dst);
         }
 
         let src = self.compile_expression(&unary.argument)?;
@@ -4220,6 +4482,8 @@ impl Compiler {
         // 2. Setup control scope for breaks
         self.loop_stack.push(ControlScope {
             is_loop: false,
+            is_switch: true,
+            labels: std::mem::take(&mut self.pending_labels),
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             continue_target: None,

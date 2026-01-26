@@ -586,6 +586,7 @@ impl Otter {
             OpHandler::Sync(sync_fn) => {
                 // Sync JSON ops need Value -> JSON -> Value conversion
                 Value::native_function(move |args| {
+                    println!("DEBUG: op_sync called");
                     let json_args: Vec<serde_json::Value> =
                         args.iter().map(value_to_json).collect();
                     let result = sync_fn(&json_args)?;
@@ -780,56 +781,76 @@ unsafe impl Send for Otter {}
 
 /// Convert VM Value to JSON
 fn value_to_json(value: &Value) -> serde_json::Value {
-    if value.is_undefined() || value.is_null() {
-        return serde_json::Value::Null;
-    }
-
-    if let Some(b) = value.as_boolean() {
-        return serde_json::Value::Bool(b);
-    }
-
-    if let Some(n) = value.as_number() {
-        if n.is_nan() || n.is_infinite() {
+    fn value_to_json_limited(value: &Value, depth: usize) -> serde_json::Value {
+        if depth % 100 == 0 && depth > 0 {
+            println!("DEBUG: value_to_json depth: {}", depth);
+        }
+        if depth > 512 {
             return serde_json::Value::Null;
         }
-        if n.fract() == 0.0 && n.abs() < (i64::MAX as f64) {
-            return serde_json::Value::Number(serde_json::Number::from(n as i64));
+
+        if value.is_undefined() || value.is_null() {
+            return serde_json::Value::Null;
         }
-        return serde_json::Number::from_f64(n)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null);
-    }
 
-    if let Some(s) = value.as_string() {
-        return serde_json::Value::String(s.as_str().to_string());
-    }
+        if let Some(b) = value.as_boolean() {
+            return serde_json::Value::Bool(b);
+        }
 
-    if let Some(obj) = value.as_object() {
-        if obj.is_array() {
-            let len = obj.array_length();
-            let mut arr = Vec::with_capacity(len);
-            for i in 0..len {
-                let elem = obj
-                    .get(&PropertyKey::Index(i as u32))
-                    .unwrap_or_else(Value::undefined);
-                arr.push(value_to_json(&elem));
+        if let Some(n) = value.as_number() {
+            if n.is_nan() || n.is_infinite() {
+                return serde_json::Value::Null;
             }
-            return serde_json::Value::Array(arr);
+            if n.fract() == 0.0 && n.abs() < (i64::MAX as f64) {
+                return serde_json::Value::Number(serde_json::Number::from(n as i64));
+            }
+            return serde_json::Number::from_f64(n)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null);
         }
 
-        // Regular object
-        let mut map = serde_json::Map::new();
-        for key in obj.own_keys() {
-            if let PropertyKey::String(s) = &key
-                && let Some(val) = obj.get(&key)
-            {
-                map.insert(s.as_str().to_string(), value_to_json(&val));
-            }
+        if let Some(s) = value.as_string() {
+            return serde_json::Value::String(s.as_str().to_string());
         }
-        return serde_json::Value::Object(map);
+
+        if let Some(obj) = value.as_object() {
+            if obj.is_array() {
+                let len = obj.array_length();
+                let mut arr = Vec::with_capacity(len.min(1000));
+                for i in 0..len {
+                    if i > 5000 {
+                        break;
+                    }
+                    let elem = obj
+                        .get(&PropertyKey::Index(i as u32))
+                        .unwrap_or_else(Value::undefined);
+                    arr.push(value_to_json_limited(&elem, depth + 1));
+                }
+                return serde_json::Value::Array(arr);
+            }
+
+            // Regular object
+            let mut map = serde_json::Map::new();
+            for key in obj.own_keys() {
+                if let PropertyKey::String(s) = &key
+                    && let Some(val) = obj.get(&key)
+                {
+                    map.insert(
+                        s.as_str().to_string(),
+                        value_to_json_limited(&val, depth + 1),
+                    );
+                }
+                if map.len() > 1000 {
+                    break;
+                }
+            }
+            return serde_json::Value::Object(map);
+        }
+
+        serde_json::Value::Null
     }
 
-    serde_json::Value::Null
+    value_to_json_limited(value, 0)
 }
 
 /// Convert JSON to VM Value

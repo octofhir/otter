@@ -130,7 +130,7 @@ impl Test262Runner {
         let tests = self.list_tests();
         let mut results = Vec::with_capacity(tests.len());
         for path in tests {
-            results.push(self.run_test(&path).await);
+            results.push(self.run_test(&path, None).await);
         }
         results
     }
@@ -142,7 +142,7 @@ impl Test262Runner {
     {
         let tests = self.list_tests();
         for path in tests {
-            let result = self.run_test(&path).await;
+            let result = self.run_test(&path, None).await;
             callback(result);
         }
     }
@@ -152,7 +152,7 @@ impl Test262Runner {
         let tests = self.list_tests_dir(subdir);
         let mut results = Vec::with_capacity(tests.len());
         for path in tests {
-            results.push(self.run_test(&path).await);
+            results.push(self.run_test(&path, None).await);
         }
         results
     }
@@ -168,13 +168,13 @@ impl Test262Runner {
                 .strip_prefix(&self.test_dir)
                 .unwrap_or(&path)
                 .to_path_buf();
-            let result = self.run_test(&relative_path).await;
+            let result = self.run_test(&relative_path, None).await;
             callback(result);
         }
     }
 
     /// Run a single test
-    pub async fn run_test(&self, path: &Path) -> TestResult {
+    pub async fn run_test(&self, path: &Path, timeout: Option<Duration>) -> TestResult {
         let relative_path = path.strip_prefix(&self.test_dir).unwrap_or(path);
 
         use std::io::Write;
@@ -264,7 +264,7 @@ impl Test262Runner {
 
         // Run the test
         let result = self
-            .execute_test(&test_source, &metadata, &relative_path_str)
+            .execute_test(&test_source, &metadata, &relative_path_str, timeout)
             .await;
 
         TestResult {
@@ -281,11 +281,15 @@ impl Test262Runner {
         &self,
         source: &str,
         metadata: &TestMetadata,
-        test_name: &str,
+        _test_name: &str,
+        timeout: Option<Duration>,
     ) -> (TestOutcome, Option<String>) {
-        let mut engine = self.engine.lock().await;
+        let mut engine = EngineBuilder::new()
+            .with_http()
+            .extension(crate::harness::create_harness_extension())
+            .build();
 
-        match engine.eval(source).await {
+        match self.run_with_timeout(&mut engine, source, timeout).await {
             Ok(value) => {
                 if !value.is_undefined() {
                     // println!("RESULT {}: {}", test_name, format_value(&value));
@@ -316,12 +320,30 @@ impl Test262Runner {
                 OtterError::Runtime(msg) => {
                     if metadata.expects_runtime_error() {
                         (TestOutcome::Pass, None)
+                    } else if msg == "Test timed out" {
+                        (TestOutcome::Timeout, None)
                     } else {
                         (TestOutcome::Fail, Some(msg))
                     }
                 }
                 OtterError::PermissionDenied(msg) => (TestOutcome::Fail, Some(msg)),
             },
+        }
+    }
+
+    async fn run_with_timeout(
+        &self,
+        engine: &mut Otter,
+        source: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Value, OtterError> {
+        if let Some(duration) = timeout {
+            match tokio::time::timeout(duration, engine.eval(source)).await {
+                Ok(result) => result,
+                Err(_) => Err(OtterError::Runtime("Test timed out".to_string())),
+            }
+        } else {
+            engine.eval(source).await
         }
     }
 }

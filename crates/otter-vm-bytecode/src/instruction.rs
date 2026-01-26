@@ -194,6 +194,8 @@ pub enum Opcode {
     IteratorNext = 0xB1,
     /// Iterate over iterable (for-of): jump if done
     ForInNext = 0xB2,
+    /// Get async iterator: dst = obj[Symbol.asyncIterator]() or fallback to Symbol.iterator
+    GetAsyncIterator = 0xB3,
 
     // ==================== Class ====================
     /// Define class
@@ -330,6 +332,7 @@ impl Opcode {
             0xB0 => Some(Self::GetIterator),
             0xB1 => Some(Self::IteratorNext),
             0xB2 => Some(Self::ForInNext),
+            0xB3 => Some(Self::GetAsyncIterator),
 
             0xC0 => Some(Self::DefineClass),
             0xC1 => Some(Self::GetSuper),
@@ -455,6 +458,7 @@ impl Opcode {
             Self::GetIterator => "GetIterator",
             Self::IteratorNext => "IteratorNext",
             Self::ForInNext => "ForInNext",
+            Self::GetAsyncIterator => "GetAsyncIterator",
             // Class
             Self::DefineClass => "DefineClass",
             Self::GetSuper => "GetSuper",
@@ -882,6 +886,10 @@ pub enum Instruction {
 
     // Iteration
     GetIterator {
+        dst: Register,
+        src: Register,
+    },
+    GetAsyncIterator {
         dst: Register,
         src: Register,
     },

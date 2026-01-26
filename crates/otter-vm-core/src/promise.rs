@@ -377,20 +377,29 @@ impl JsPromise {
         !self.is_pending()
     }
 
-    /// Get the resolved value if fulfilled
-    pub fn value(&self) -> Option<Value> {
-        match &*self.state.lock() {
-            PromiseState::Fulfilled(v) => Some(v.clone()),
-            _ => None,
-        }
-    }
+    /// Extract values from this promise and clear its state.
+    /// Used for iterative destruction to prevent stack overflow.
+    pub fn clear_and_extract_values(&self) -> Vec<Value> {
+        let mut values = Vec::new();
 
-    /// Get the rejection reason if rejected
-    pub fn reason(&self) -> Option<Value> {
-        match &*self.state.lock() {
-            PromiseState::Rejected(v) => Some(v.clone()),
-            _ => None,
+        // Clear state and extract value
+        let mut state = self.state.lock();
+        let old_state = std::mem::replace(&mut *state, PromiseState::Pending);
+        match old_state {
+            PromiseState::Fulfilled(v) => values.push(v),
+            PromiseState::Rejected(v) => values.push(v),
+            _ => {}
         }
+        drop(state);
+
+        // Clear callbacks to break references.
+        // NOTE: We cannot easily extract values from within the boxed closures,
+        // but clearing the vectors will at least prevent further reference accumulation.
+        self.on_fulfilled.lock().clear();
+        self.on_rejected.lock().clear();
+        self.on_finally.lock().clear();
+
+        values
     }
 }
 

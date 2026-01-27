@@ -6,9 +6,11 @@
 //! - toFixed, toExponential, toPrecision
 //! - toString, toLocaleString, valueOf
 
+use otter_vm_core::memory;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
-use otter_vm_runtime::{Op, op_native};
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
+use std::sync::Arc;
 
 /// Get Number ops for extension registration
 pub fn ops() -> Vec<Op> {
@@ -75,7 +77,7 @@ fn get_arg_int(args: &[Value], idx: usize) -> Option<i64> {
 // =============================================================================
 
 /// Number.isFinite() - determines whether the passed value is a finite number
-fn number_is_finite(args: &[Value]) -> Result<Value, String> {
+fn number_is_finite(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let val = args.first();
     match val {
         Some(v) if v.is_number() => {
@@ -91,7 +93,7 @@ fn number_is_finite(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Number.isInteger() - determines whether the passed value is an integer
-fn number_is_integer(args: &[Value]) -> Result<Value, String> {
+fn number_is_integer(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let val = args.first();
     match val {
         Some(v) if v.is_int32() => Ok(Value::boolean(true)),
@@ -104,7 +106,7 @@ fn number_is_integer(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Number.isNaN() - determines whether the passed value is NaN
-fn number_is_nan(args: &[Value]) -> Result<Value, String> {
+fn number_is_nan(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let val = args.first();
     match val {
         Some(v) if v.is_number() => {
@@ -117,7 +119,10 @@ fn number_is_nan(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Number.isSafeInteger() - determines whether the provided value is a safe integer
-fn number_is_safe_integer(args: &[Value]) -> Result<Value, String> {
+fn number_is_safe_integer(
+    args: &[Value],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<Value, String> {
     const MAX_SAFE_INTEGER: f64 = 9007199254740991.0; // 2^53 - 1
     const MIN_SAFE_INTEGER: f64 = -9007199254740991.0;
 
@@ -139,7 +144,7 @@ fn number_is_safe_integer(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Number.parseFloat() - parses a string argument and returns a floating point number
-fn number_parse_float(args: &[Value]) -> Result<Value, String> {
+fn number_parse_float(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let s = match args.first() {
         Some(v) if v.is_string() => v.as_string().unwrap().to_string(),
         Some(v) => {
@@ -219,7 +224,7 @@ fn number_parse_float(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Number.parseInt() - parses a string argument and returns an integer
-fn number_parse_int(args: &[Value]) -> Result<Value, String> {
+fn number_parse_int(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let s = match args.first() {
         Some(v) if v.is_string() => v.as_string().unwrap().to_string(),
         Some(v) if v.is_number() => {
@@ -299,7 +304,7 @@ fn number_parse_int(args: &[Value]) -> Result<Value, String> {
 // =============================================================================
 
 /// Number.prototype.toFixed() - formats a number using fixed-point notation
-fn number_to_fixed(args: &[Value]) -> Result<Value, String> {
+fn number_to_fixed(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let num = get_arg_number(args, 0);
     let digits = get_arg_int(args, 1).unwrap_or(0) as usize;
 
@@ -326,7 +331,7 @@ fn number_to_fixed(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Number.prototype.toExponential() - returns a string in exponential notation
-fn number_to_exponential(args: &[Value]) -> Result<Value, String> {
+fn number_to_exponential(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let num = get_arg_number(args, 0);
     let fraction_digits = get_arg_int(args, 1);
 
@@ -355,7 +360,7 @@ fn number_to_exponential(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Number.prototype.toPrecision() - returns a string representing the number to a specified precision
-fn number_to_precision(args: &[Value]) -> Result<Value, String> {
+fn number_to_precision(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let num = get_arg_number(args, 0);
     let precision = get_arg_int(args, 1);
 
@@ -408,7 +413,7 @@ fn number_to_precision(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Number.prototype.toString() - returns a string representing the number
-fn number_to_string(args: &[Value]) -> Result<Value, String> {
+fn number_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let num = get_arg_number(args, 0);
     let radix = get_arg_int(args, 1).unwrap_or(10) as u32;
 
@@ -469,7 +474,10 @@ fn format_radix(mut n: u64, radix: u32) -> String {
 }
 
 /// Number.prototype.toLocaleString() - returns a string with locale-sensitive representation
-fn number_to_locale_string(args: &[Value]) -> Result<Value, String> {
+fn number_to_locale_string(
+    args: &[Value],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<Value, String> {
     let num = get_arg_number(args, 0);
     // Simplified: just return toString result (no locale support yet)
     if num.is_nan() {
@@ -486,7 +494,7 @@ fn number_to_locale_string(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Number.prototype.valueOf() - returns the primitive value of the number
-fn number_value_of(args: &[Value]) -> Result<Value, String> {
+fn number_value_of(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match args.first() {
         Some(v) if v.is_number() => Ok(v.clone()),
         Some(v) if v.is_int32() => Ok(v.clone()),
@@ -509,74 +517,83 @@ mod tests {
 
     #[test]
     fn test_is_finite() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            number_is_finite(&[Value::number(42.0)])
+            number_is_finite(&[Value::number(42.0)], mm.clone())
                 .unwrap()
                 .as_boolean(),
             Some(true)
         );
         assert_eq!(
-            number_is_finite(&[Value::int32(42)]).unwrap().as_boolean(),
+            number_is_finite(&[Value::int32(42)], mm.clone())
+                .unwrap()
+                .as_boolean(),
             Some(true)
         );
         assert_eq!(
-            number_is_finite(&[Value::number(f64::INFINITY)])
+            number_is_finite(&[Value::number(f64::INFINITY)], mm.clone())
                 .unwrap()
                 .as_boolean(),
             Some(false)
         );
         assert_eq!(
-            number_is_finite(&[Value::number(f64::NEG_INFINITY)])
+            number_is_finite(&[Value::number(f64::NEG_INFINITY)], mm.clone())
                 .unwrap()
                 .as_boolean(),
             Some(false)
         );
         assert_eq!(
-            number_is_finite(&[Value::number(f64::NAN)])
+            number_is_finite(&[Value::number(f64::NAN)], mm.clone())
                 .unwrap()
                 .as_boolean(),
             Some(false)
         );
         assert_eq!(
-            number_is_finite(&[str_val("42")]).unwrap().as_boolean(),
+            number_is_finite(&[str_val("42")], mm).unwrap().as_boolean(),
             Some(false)
         );
     }
 
     #[test]
     fn test_is_integer() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            number_is_integer(&[Value::number(42.0)])
+            number_is_integer(&[Value::number(42.0)], mm.clone())
                 .unwrap()
                 .as_boolean(),
             Some(true)
         );
         assert_eq!(
-            number_is_integer(&[Value::number(42.5)])
+            number_is_integer(&[Value::number(42.5)], mm.clone())
                 .unwrap()
                 .as_boolean(),
             Some(false)
         );
         assert_eq!(
-            number_is_integer(&[Value::int32(42)]).unwrap().as_boolean(),
+            number_is_integer(&[Value::int32(42)], mm)
+                .unwrap()
+                .as_boolean(),
             Some(true)
         );
     }
 
     #[test]
     fn test_is_nan() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            number_is_nan(&[Value::number(f64::NAN)])
+            number_is_nan(&[Value::number(f64::NAN)], mm.clone())
                 .unwrap()
                 .as_boolean(),
             Some(true)
         );
         assert_eq!(
-            number_is_nan(&[Value::number(42.0)]).unwrap().as_boolean(),
+            number_is_nan(&[Value::number(42.0)], mm.clone())
+                .unwrap()
+                .as_boolean(),
             Some(false)
         );
         assert_eq!(
-            number_is_nan(&[Value::number(f64::INFINITY)])
+            number_is_nan(&[Value::number(f64::INFINITY)], mm)
                 .unwrap()
                 .as_boolean(),
             Some(false)
@@ -585,20 +602,21 @@ mod tests {
 
     #[test]
     fn test_is_safe_integer() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            number_is_safe_integer(&[Value::number(42.0)])
+            number_is_safe_integer(&[Value::number(42.0)], mm.clone())
                 .unwrap()
                 .as_boolean(),
             Some(true)
         );
         assert_eq!(
-            number_is_safe_integer(&[Value::number(9007199254740991.0)])
+            number_is_safe_integer(&[Value::number(9007199254740991.0)], mm.clone())
                 .unwrap()
                 .as_boolean(),
             Some(true)
         );
         assert_eq!(
-            number_is_safe_integer(&[Value::number(9007199254740992.0)])
+            number_is_safe_integer(&[Value::number(9007199254740992.0)], mm)
                 .unwrap()
                 .as_boolean(),
             Some(false)
@@ -607,18 +625,21 @@ mod tests {
 
     #[test]
     fn test_parse_float() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            number_parse_float(&[str_val("2.75")]).unwrap().as_number(),
+            number_parse_float(&[str_val("2.75")], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(2.75)
         );
         assert_eq!(
-            number_parse_float(&[str_val("Infinity")])
+            number_parse_float(&[str_val("Infinity")], mm.clone())
                 .unwrap()
                 .as_number(),
             Some(f64::INFINITY)
         );
         assert_eq!(
-            number_parse_float(&[str_val("-Infinity")])
+            number_parse_float(&[str_val("-Infinity")], mm)
                 .unwrap()
                 .as_number(),
             Some(f64::NEG_INFINITY)
@@ -627,12 +648,15 @@ mod tests {
 
     #[test]
     fn test_parse_int() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            number_parse_int(&[str_val("42")]).unwrap().as_number(),
+            number_parse_int(&[str_val("42")], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(42.0)
         );
         assert_eq!(
-            number_parse_int(&[str_val("0xff"), Value::int32(16)])
+            number_parse_int(&[str_val("0xff"), Value::int32(16)], mm)
                 .unwrap()
                 .as_number(),
             Some(255.0)
@@ -641,42 +665,50 @@ mod tests {
 
     #[test]
     fn test_to_fixed() {
-        let result = number_to_fixed(&[Value::number(1.23456), Value::int32(2)]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result =
+            number_to_fixed(&[Value::number(1.23456), Value::int32(2)], mm.clone()).unwrap();
         assert_str_result(&result, "1.23");
 
-        let result = number_to_fixed(&[Value::number(f64::NAN), Value::int32(2)]).unwrap();
+        let result =
+            number_to_fixed(&[Value::number(f64::NAN), Value::int32(2)], mm.clone()).unwrap();
         assert_str_result(&result, "NaN");
 
-        let result = number_to_fixed(&[Value::number(f64::INFINITY), Value::int32(2)]).unwrap();
+        let result = number_to_fixed(&[Value::number(f64::INFINITY), Value::int32(2)], mm).unwrap();
         assert_str_result(&result, "Infinity");
     }
 
     #[test]
     fn test_to_string() {
-        let result = number_to_string(&[Value::number(42.0)]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = number_to_string(&[Value::number(42.0)], mm.clone()).unwrap();
         assert_str_result(&result, "42");
 
-        let result = number_to_string(&[Value::number(255.0), Value::int32(16)]).unwrap();
+        let result =
+            number_to_string(&[Value::number(255.0), Value::int32(16)], mm.clone()).unwrap();
         assert_str_result(&result, "ff");
 
-        let result = number_to_string(&[Value::number(f64::NAN)]).unwrap();
+        let result = number_to_string(&[Value::number(f64::NAN)], mm.clone()).unwrap();
         assert_str_result(&result, "NaN");
 
-        let result = number_to_string(&[Value::number(f64::INFINITY)]).unwrap();
+        let result = number_to_string(&[Value::number(f64::INFINITY)], mm.clone()).unwrap();
         assert_str_result(&result, "Infinity");
 
-        let result = number_to_string(&[Value::number(f64::NEG_INFINITY)]).unwrap();
+        let result = number_to_string(&[Value::number(f64::NEG_INFINITY)], mm).unwrap();
         assert_str_result(&result, "-Infinity");
     }
 
     #[test]
     fn test_value_of() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            number_value_of(&[Value::number(42.0)]).unwrap().as_number(),
+            number_value_of(&[Value::number(42.0)], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(42.0)
         );
         assert_eq!(
-            number_value_of(&[Value::int32(42)]).unwrap().as_int32(),
+            number_value_of(&[Value::int32(42)], mm).unwrap().as_int32(),
             Some(42)
         );
     }

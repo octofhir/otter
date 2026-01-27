@@ -11,7 +11,8 @@ use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::promise::JsPromise;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value as VmValue;
-use otter_vm_runtime::{Op, op_native};
+use otter_vm_core::memory;
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -39,7 +40,10 @@ pub fn ops() -> Vec<Op> {
 
 /// Create a new pending promise
 /// Returns the promise value
-fn native_promise_create(_args: &[VmValue]) -> Result<VmValue, String> {
+fn native_promise_create(
+    _args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let promise = JsPromise::new();
     Ok(VmValue::promise(promise))
 }
@@ -47,7 +51,7 @@ fn native_promise_create(_args: &[VmValue]) -> Result<VmValue, String> {
 /// Resolve a promise with a value
 /// Args: [promise, value] - resolve existing promise
 /// Args: [value] - create new resolved promise (Promise.resolve)
-fn native_promise_resolve(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_promise_resolve(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     match args.len() {
         0 => {
             // Promise.resolve() with no args resolves to undefined
@@ -93,7 +97,7 @@ fn native_promise_resolve(args: &[VmValue]) -> Result<VmValue, String> {
 /// Reject a promise with a reason
 /// Args: [promise, reason] - reject existing promise
 /// Args: [reason] - create new rejected promise (Promise.reject)
-fn native_promise_reject(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_promise_reject(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     match args.len() {
         0 => {
             // Promise.reject() with no args rejects with undefined
@@ -122,7 +126,7 @@ fn native_promise_reject(args: &[VmValue]) -> Result<VmValue, String> {
 /// Register a then callback
 /// Args: [promise, onFulfilled, onRejected?]
 /// Returns a new promise that resolves/rejects based on callbacks
-fn native_promise_then(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_promise_then(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let promise_val = args
         .first()
         .ok_or("Promise.then requires a promise argument")?;
@@ -152,7 +156,7 @@ fn native_promise_then(args: &[VmValue]) -> Result<VmValue, String> {
 
 /// Register a catch callback
 /// Args: [promise, onRejected]
-fn native_promise_catch(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_promise_catch(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let promise_val = args
         .first()
         .ok_or("Promise.catch requires a promise argument")?;
@@ -181,7 +185,7 @@ fn native_promise_catch(args: &[VmValue]) -> Result<VmValue, String> {
 
 /// Register a finally callback
 /// Args: [promise, onFinally]
-fn native_promise_finally(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_promise_finally(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let promise_val = args
         .first()
         .ok_or("Promise.finally requires a promise argument")?;
@@ -212,13 +216,13 @@ fn native_promise_finally(args: &[VmValue]) -> Result<VmValue, String> {
 /// Get promise state
 /// Args: [promise]
 /// Returns: { state: "pending"|"fulfilled"|"rejected", value?: any, reason?: any }
-fn native_promise_state(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_promise_state(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let promise_val = args.first().ok_or("Missing promise argument")?;
     let promise = promise_val
         .as_promise()
         .ok_or("Argument must be a promise")?;
 
-    let result = Arc::new(JsObject::new(None));
+    let result = Arc::new(JsObject::new(None, Arc::clone(&mm)));
 
     match promise.state() {
         otter_vm_core::promise::PromiseState::Pending => {
@@ -245,7 +249,7 @@ fn native_promise_state(args: &[VmValue]) -> Result<VmValue, String> {
 
 /// Promise.all - wait for all promises to fulfill
 /// Args: [array of promises/values]
-fn native_promise_all(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_promise_all(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let iterable = args.first().ok_or("Promise.all requires an iterable")?;
 
     // Get array of values (can be promises or regular values)
@@ -253,7 +257,7 @@ fn native_promise_all(args: &[VmValue]) -> Result<VmValue, String> {
 
     if items.is_empty() {
         // Empty array resolves immediately with empty array
-        let result = Arc::new(JsObject::array(0));
+        let result = Arc::new(JsObject::array(0, Arc::clone(&mm)));
         return Ok(VmValue::promise(JsPromise::resolved(VmValue::array(
             result,
         ))));
@@ -270,6 +274,7 @@ fn native_promise_all(args: &[VmValue]) -> Result<VmValue, String> {
         let remaining = remaining.clone();
         let results = results.clone();
         let rejected = rejected.clone();
+        let mm_for_then = Arc::clone(&mm);
 
         if let Some(promise) = item.as_promise() {
             // It's a promise - wait for it
@@ -285,7 +290,7 @@ fn native_promise_all(args: &[VmValue]) -> Result<VmValue, String> {
                 }
                 if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
                     // All done - create result array
-                    let arr = Arc::new(JsObject::array(count));
+                    let arr = Arc::new(JsObject::array(count, Arc::clone(&mm_for_then)));
                     if let Ok(locked) = results.lock() {
                         for (i, v) in locked.iter().enumerate() {
                             if let Some(val) = v {
@@ -308,7 +313,7 @@ fn native_promise_all(args: &[VmValue]) -> Result<VmValue, String> {
                 locked[index] = Some(item);
             }
             if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                let arr = Arc::new(JsObject::array(count));
+                let arr = Arc::new(JsObject::array(count, Arc::clone(&mm)));
                 if let Ok(locked) = results.lock() {
                     for (i, v) in locked.iter().enumerate() {
                         if let Some(val) = v {
@@ -326,7 +331,7 @@ fn native_promise_all(args: &[VmValue]) -> Result<VmValue, String> {
 
 /// Promise.race - first promise to settle wins
 /// Args: [array of promises/values]
-fn native_promise_race(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_promise_race(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let iterable = args.first().ok_or("Promise.race requires an iterable")?;
     let items = get_array_items(iterable)?;
 
@@ -365,14 +370,14 @@ fn native_promise_race(args: &[VmValue]) -> Result<VmValue, String> {
 
 /// Promise.allSettled - wait for all to settle (fulfill or reject)
 /// Args: [array of promises/values]
-fn native_promise_all_settled(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_promise_all_settled(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let iterable = args
         .first()
         .ok_or("Promise.allSettled requires an iterable")?;
     let items = get_array_items(iterable)?;
 
     if items.is_empty() {
-        let result = Arc::new(JsObject::array(0));
+        let result = Arc::new(JsObject::array(0, Arc::clone(&mm)));
         return Ok(VmValue::promise(JsPromise::resolved(VmValue::array(
             result,
         ))));
@@ -390,10 +395,12 @@ fn native_promise_all_settled(args: &[VmValue]) -> Result<VmValue, String> {
         let remaining2 = remaining.clone();
         let results2 = results.clone();
         let result_p2 = result_promise.clone();
+        let mm_for_then = Arc::clone(&mm);
+        let mm_for_catch = Arc::clone(&mm);
 
         if let Some(promise) = item.as_promise() {
             promise.then(move |value| {
-                let obj = Arc::new(JsObject::new(None));
+                let obj = Arc::new(JsObject::new(None, Arc::clone(&mm_for_then)));
                 obj.set(
                     "status".into(),
                     VmValue::string(JsString::intern("fulfilled")),
@@ -404,7 +411,7 @@ fn native_promise_all_settled(args: &[VmValue]) -> Result<VmValue, String> {
                 }
 
                 if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    let arr = Arc::new(JsObject::array(count));
+                    let arr = Arc::new(JsObject::array(count, Arc::clone(&mm_for_then)));
                     if let Ok(locked) = results.lock() {
                         for (i, v) in locked.iter().enumerate() {
                             if let Some(val) = v {
@@ -417,7 +424,7 @@ fn native_promise_all_settled(args: &[VmValue]) -> Result<VmValue, String> {
             });
 
             promise.catch(move |error| {
-                let obj = Arc::new(JsObject::new(None));
+                let obj = Arc::new(JsObject::new(None, Arc::clone(&mm_for_catch)));
                 obj.set(
                     "status".into(),
                     VmValue::string(JsString::intern("rejected")),
@@ -428,7 +435,7 @@ fn native_promise_all_settled(args: &[VmValue]) -> Result<VmValue, String> {
                 }
 
                 if remaining2.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    let arr = Arc::new(JsObject::array(count));
+                    let arr = Arc::new(JsObject::array(count, Arc::clone(&mm_for_catch)));
                     if let Ok(locked) = results2.lock() {
                         for (i, v) in locked.iter().enumerate() {
                             if let Some(val) = v {
@@ -441,7 +448,7 @@ fn native_promise_all_settled(args: &[VmValue]) -> Result<VmValue, String> {
             });
         } else {
             // Non-promise is treated as fulfilled
-            let obj = Arc::new(JsObject::new(None));
+            let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
             obj.set(
                 "status".into(),
                 VmValue::string(JsString::intern("fulfilled")),
@@ -452,7 +459,7 @@ fn native_promise_all_settled(args: &[VmValue]) -> Result<VmValue, String> {
             }
 
             if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                let arr = Arc::new(JsObject::array(count));
+                let arr = Arc::new(JsObject::array(count, Arc::clone(&mm)));
                 if let Ok(locked) = results.lock() {
                     for (i, v) in locked.iter().enumerate() {
                         if let Some(val) = v {
@@ -470,13 +477,13 @@ fn native_promise_all_settled(args: &[VmValue]) -> Result<VmValue, String> {
 
 /// Promise.any - first fulfilled wins, all rejected = AggregateError
 /// Args: [array of promises/values]
-fn native_promise_any(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_promise_any(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let iterable = args.first().ok_or("Promise.any requires an iterable")?;
     let items = get_array_items(iterable)?;
 
     if items.is_empty() {
         // Empty iterable rejects with AggregateError
-        let error = create_aggregate_error(vec![], "All promises were rejected");
+        let error = create_aggregate_error(vec![], "All promises were rejected", Arc::clone(&mm));
         return Ok(VmValue::promise(JsPromise::rejected(error)));
     }
 
@@ -493,6 +500,7 @@ fn native_promise_any(args: &[VmValue]) -> Result<VmValue, String> {
         let errors = errors.clone();
         let result_p2 = result_promise.clone();
         let fulfilled_clone2 = fulfilled.clone();
+        let mm_for_error = Arc::clone(&mm);
 
         if let Some(promise) = item.as_promise() {
             promise.then(move |value| {
@@ -515,7 +523,7 @@ fn native_promise_any(args: &[VmValue]) -> Result<VmValue, String> {
                     } else {
                         vec![]
                     };
-                    let agg_error = create_aggregate_error(errs, "All promises were rejected");
+                    let agg_error = create_aggregate_error(errs, "All promises were rejected", Arc::clone(&mm_for_error));
                     result_p2.reject(agg_error);
                 }
             });
@@ -533,31 +541,40 @@ fn native_promise_any(args: &[VmValue]) -> Result<VmValue, String> {
 
 /// Promise.withResolvers - ES2024 feature
 /// Returns: { promise, resolve, reject }
-fn native_promise_with_resolvers(_args: &[VmValue]) -> Result<VmValue, String> {
-    let resolvers = JsPromise::with_resolvers();
+fn native_promise_with_resolvers(
+    _args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
+    let resolvers = JsPromise::with_resolvers(Arc::clone(&mm));
 
-    let result = Arc::new(JsObject::new(None));
+    let result = Arc::new(JsObject::new(None, Arc::clone(&mm)));
     result.set("promise".into(), VmValue::promise(resolvers.promise));
 
     // Create native functions for resolve/reject
     let resolve_fn = resolvers.resolve;
     result.set(
         "resolve".into(),
-        VmValue::native_function(move |args: &[VmValue]| {
-            let value = args.first().cloned().unwrap_or(VmValue::undefined());
-            resolve_fn(value);
-            Ok(VmValue::undefined())
-        }),
+        VmValue::native_function(
+            move |args: &[VmValue], _mm: Arc<memory::MemoryManager>| {
+                let value = args.first().cloned().unwrap_or(VmValue::undefined());
+                resolve_fn(value);
+                Ok(VmValue::undefined())
+            },
+            Arc::clone(&mm),
+        ),
     );
 
     let reject_fn = resolvers.reject;
     result.set(
         "reject".into(),
-        VmValue::native_function(move |args: &[VmValue]| {
-            let reason = args.first().cloned().unwrap_or(VmValue::undefined());
-            reject_fn(reason);
-            Ok(VmValue::undefined())
-        }),
+        VmValue::native_function(
+            move |args: &[VmValue], _mm: Arc<memory::MemoryManager>| {
+                let reason = args.first().cloned().unwrap_or(VmValue::undefined());
+                reject_fn(reason);
+                Ok(VmValue::undefined())
+            },
+            Arc::clone(&mm),
+        ),
     );
 
     Ok(VmValue::object(result))
@@ -603,15 +620,19 @@ fn get_array_items(value: &VmValue) -> Result<Vec<VmValue>, String> {
 }
 
 /// Create an AggregateError-like object
-fn create_aggregate_error(errors: Vec<VmValue>, message: &str) -> VmValue {
-    let obj = Arc::new(JsObject::new(None));
+fn create_aggregate_error(
+    errors: Vec<VmValue>,
+    message: &str,
+    mm: Arc<memory::MemoryManager>,
+) -> VmValue {
+    let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
     obj.set(
         "name".into(),
         VmValue::string(JsString::intern("AggregateError")),
     );
     obj.set("message".into(), VmValue::string(JsString::intern(message)));
 
-    let errors_arr = Arc::new(JsObject::array(errors.len()));
+    let errors_arr = Arc::new(JsObject::array(errors.len(), Arc::clone(&mm)));
     for (i, e) in errors.into_iter().enumerate() {
         errors_arr.set(PropertyKey::Index(i as u32), e);
     }
@@ -626,23 +647,31 @@ mod tests {
 
     #[test]
     fn test_promise_create() {
-        let result = native_promise_create(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = native_promise_create(&[], mm).unwrap();
         assert!(result.is_promise());
         assert!(result.as_promise().unwrap().is_pending());
     }
 
     #[test]
     fn test_promise_resolve_static() {
-        let result = native_promise_resolve(&[VmValue::number(42.0)]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = native_promise_resolve(&[VmValue::number(42.0)], mm).unwrap();
         assert!(result.is_promise());
         let promise = result.as_promise().unwrap();
         assert!(promise.is_fulfilled());
-        assert_eq!(promise.value().unwrap().as_number(), Some(42.0));
+        match promise.state() {
+            otter_vm_core::promise::PromiseState::Fulfilled(v) => {
+                assert_eq!(v.as_number(), Some(42.0));
+            }
+            other => panic!("expected fulfilled promise, got {other:?}"),
+        }
     }
 
     #[test]
     fn test_promise_reject_static() {
-        let result = native_promise_reject(&[VmValue::string(JsString::intern("error"))]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = native_promise_reject(&[VmValue::string(JsString::intern("error"))], mm).unwrap();
         assert!(result.is_promise());
         let promise = result.as_promise().unwrap();
         assert!(promise.is_rejected());
@@ -650,18 +679,25 @@ mod tests {
 
     #[test]
     fn test_promise_resolve_existing() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let promise = JsPromise::new();
         let promise_val = VmValue::promise(promise.clone());
 
-        native_promise_resolve(&[promise_val, VmValue::number(100.0)]).unwrap();
+        native_promise_resolve(&[promise_val, VmValue::number(100.0)], mm).unwrap();
 
         assert!(promise.is_fulfilled());
-        assert_eq!(promise.value().unwrap().as_number(), Some(100.0));
+        match promise.state() {
+            otter_vm_core::promise::PromiseState::Fulfilled(v) => {
+                assert_eq!(v.as_number(), Some(100.0));
+            }
+            other => panic!("expected fulfilled promise, got {other:?}"),
+        }
     }
 
     #[test]
     fn test_promise_with_resolvers() {
-        let result = native_promise_with_resolvers(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = native_promise_with_resolvers(&[], mm).unwrap();
         assert!(result.is_object());
 
         let obj = result.as_object().unwrap();
@@ -672,15 +708,16 @@ mod tests {
 
     #[test]
     fn test_promise_state() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let promise = JsPromise::new();
-        let result = native_promise_state(&[VmValue::promise(promise.clone())]).unwrap();
+        let result = native_promise_state(&[VmValue::promise(promise.clone())], Arc::clone(&mm)).unwrap();
 
         let obj = result.as_object().unwrap();
         let state = obj.get(&"state".into()).unwrap();
         assert_eq!(state.as_string().map(|s| s.as_str()), Some("pending"));
 
         promise.resolve(VmValue::number(42.0));
-        let result = native_promise_state(&[VmValue::promise(promise)]).unwrap();
+        let result = native_promise_state(&[VmValue::promise(promise)], mm).unwrap();
         let obj = result.as_object().unwrap();
         let state = obj.get(&"state".into()).unwrap();
         assert_eq!(state.as_string().map(|s| s.as_str()), Some("fulfilled"));

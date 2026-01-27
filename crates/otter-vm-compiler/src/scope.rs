@@ -1,6 +1,6 @@
 //! Scope management for variable resolution
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Variable declaration kind
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +40,12 @@ pub struct Scope {
     pub parent: Option<usize>,
     /// Bindings in this scope
     pub bindings: HashMap<String, Binding>,
+    /// Names declared via `var` anywhere within this lexical scope.
+    ///
+    /// This is used to implement early errors between `var` and lexical declarations
+    /// within the same block statement list (including nested blocks), similar to
+    /// ECMAScript's `VarDeclaredNames`.
+    pub var_declared_names: HashSet<String>,
     /// Next local index
     pub next_local: u16,
     /// Is this a function scope
@@ -54,6 +60,7 @@ impl Scope {
         Self {
             parent,
             bindings: HashMap::new(),
+            var_declared_names: HashSet::new(),
             next_local: 0,
             is_function,
             depth,
@@ -96,19 +103,73 @@ impl ScopeChain {
     pub fn declare(&mut self, name: &str, kind: VariableKind) -> Option<u16> {
         let current_idx = self.current?;
 
-        // Check for redeclaration
-        if let Some(existing) = self.scopes[current_idx].bindings.get(name) {
-            // Only allow redeclaration if both are `var`
-            if existing.kind == VariableKind::Var && kind == VariableKind::Var {
-                return Some(existing.index);
-            }
-            // Otherwise it's an error
-            return None;
-        }
-
         // Allocate local indices at the function-scope level so they remain valid
         // after exiting block scopes.
         let function_scope_idx = self.current_function_scope_index()?;
+
+        if kind == VariableKind::Var {
+            // Early error: a `var` declaration conflicts with any existing lexical binding
+            // in this scope chain up to (and including) the function scope.
+            let mut scope_idx = current_idx;
+            loop {
+                if let Some(existing) = self.scopes[scope_idx].bindings.get(name) {
+                    if existing.kind != VariableKind::Var {
+                        return None;
+                    }
+                }
+                if scope_idx == function_scope_idx {
+                    break;
+                }
+                scope_idx = self.scopes[scope_idx].parent?;
+            }
+
+            // Record that this lexical scope (and all enclosing lexical scopes)
+            // contain a `var` declaration of this name. This allows detecting
+            // conflicts when a lexical declaration appears later in the same block.
+            let mut scope_idx = current_idx;
+            loop {
+                self.scopes[scope_idx]
+                    .var_declared_names
+                    .insert(name.to_string());
+                if scope_idx == function_scope_idx {
+                    break;
+                }
+                scope_idx = self.scopes[scope_idx].parent?;
+            }
+
+            // Hoist the binding to the function scope.
+            if let Some(existing) = self.scopes[function_scope_idx].bindings.get(name) {
+                debug_assert_eq!(existing.kind, VariableKind::Var);
+                return Some(existing.index);
+            }
+
+            let index = self.scopes[function_scope_idx].next_local;
+            self.scopes[function_scope_idx].next_local += 1;
+
+            self.scopes[function_scope_idx].bindings.insert(
+                name.to_string(),
+                Binding {
+                    index,
+                    kind,
+                    is_captured: false,
+                    name: name.to_string(),
+                },
+            );
+
+            return Some(index);
+        }
+
+        // Lexical declarations: check for conflicts with `var` declarations in the
+        // same block statement list (including nested blocks).
+        if self.scopes[current_idx].var_declared_names.contains(name) {
+            return None;
+        }
+
+        // Check for redeclaration in current lexical scope.
+        if self.scopes[current_idx].bindings.contains_key(name) {
+            return None;
+        }
+
         let index = self.scopes[function_scope_idx].next_local;
         self.scopes[function_scope_idx].next_local += 1;
 
@@ -293,5 +354,56 @@ mod tests {
         assert!(
             matches!(chain.resolve("console"), Some(ResolvedBinding::Global(ref s)) if s == "console")
         );
+    }
+
+    #[test]
+    fn test_var_is_function_scoped() {
+        let mut chain = ScopeChain::new();
+        chain.enter(true); // function scope
+
+        chain.enter(false); // block scope
+        assert!(chain.declare("x", VariableKind::Var).is_some());
+        chain.exit();
+
+        // `var` binding survives exiting the block (function-scoped).
+        assert!(matches!(chain.resolve("x"), Some(ResolvedBinding::Local(0))));
+    }
+
+    #[test]
+    fn test_var_lexical_conflict_in_same_block() {
+        let mut chain = ScopeChain::new();
+        chain.enter(true); // function scope
+        chain.enter(false); // block scope
+
+        assert!(chain.declare("x", VariableKind::Var).is_some());
+        // `let` conflicts with any `var` declared in the same block statement list.
+        assert!(chain.declare("x", VariableKind::Let).is_none());
+    }
+
+    #[test]
+    fn test_var_lexical_conflict_in_enclosing_block() {
+        let mut chain = ScopeChain::new();
+        chain.enter(true); // function scope
+
+        chain.enter(false); // outer block
+        assert!(chain.declare("x", VariableKind::Let).is_some());
+
+        chain.enter(false); // inner block
+        // `var x` conflicts with `let x` in an enclosing block.
+        assert!(chain.declare("x", VariableKind::Var).is_none());
+    }
+
+    #[test]
+    fn test_var_does_not_conflict_with_lexical_in_sibling_block() {
+        let mut chain = ScopeChain::new();
+        chain.enter(true); // function scope
+
+        chain.enter(false); // block 1
+        assert!(chain.declare("x", VariableKind::Var).is_some());
+        chain.exit();
+
+        chain.enter(false); // block 2 (sibling)
+        // `let x` is allowed in a sibling block even if `var x` exists in the function.
+        assert!(chain.declare("x", VariableKind::Let).is_some());
     }
 }

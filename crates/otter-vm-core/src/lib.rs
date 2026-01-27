@@ -22,6 +22,7 @@ pub mod gc;
 pub mod generator;
 pub mod globals;
 pub mod interpreter;
+pub mod memory;
 pub mod object;
 pub mod promise;
 pub mod proxy;
@@ -35,11 +36,12 @@ pub mod value;
 
 pub use async_context::{AsyncContext, SavedFrame, VmExecutionResult};
 pub use context::{
-    VmContext, DEFAULT_MAX_NATIVE_DEPTH, DEFAULT_MAX_STACK_DEPTH, INTERRUPT_CHECK_INTERVAL,
+    DEFAULT_MAX_NATIVE_DEPTH, DEFAULT_MAX_STACK_DEPTH, INTERRUPT_CHECK_INTERVAL, VmContext,
 };
 pub use error::{VmError, VmResult};
 pub use generator::{GeneratorContext, GeneratorState, IteratorResult, JsGenerator};
 pub use interpreter::Interpreter;
+pub use memory::MemoryManager;
 pub use object::{JsObject, PropertyKey};
 pub use promise::{JsPromise, PromiseState, PromiseWithResolvers};
 pub use proxy::{JsProxy, RevocableProxy};

@@ -2,9 +2,10 @@
 //!
 //! Provides Map and WeakMap collections with full ES2026 support.
 
+use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::value::Value as VmValue;
-use otter_vm_runtime::{Op, op_native};
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::sync::Arc;
 
 /// Get Map ops for extension registration
@@ -81,11 +82,11 @@ fn str_to_key(s: &str) -> PropertyKey {
 // ============================================================================
 
 /// Create a new Map
-fn native_map_new(_args: &[VmValue]) -> Result<VmValue, String> {
-    let map_obj = Arc::new(JsObject::new(None));
+fn native_map_new(_args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+    let map_obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
 
     // Create internal entries storage as a nested object
-    let entries_obj = Arc::new(JsObject::new(None));
+    let entries_obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
     map_obj.set(str_to_key(MAP_ENTRIES_KEY), VmValue::object(entries_obj));
     map_obj.set(str_to_key(MAP_SIZE_KEY), VmValue::int32(0));
     map_obj.set(str_to_key(IS_MAP_KEY), VmValue::boolean(true));
@@ -94,7 +95,7 @@ fn native_map_new(_args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Map.prototype.get(key)
-fn native_map_get(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_map_get(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let map = args.first().ok_or("Map.get requires a Map")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -133,7 +134,7 @@ fn native_map_get(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Map.prototype.set(key, value)
-fn native_map_set(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_map_set(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let map = args.first().ok_or("Map.set requires a Map")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
     let value = args.get(2).cloned().unwrap_or_else(VmValue::undefined);
@@ -162,7 +163,7 @@ fn native_map_set(args: &[VmValue]) -> Result<VmValue, String> {
     let is_new = existing.is_none();
 
     // Create entry object to store both key and value
-    let entry = Arc::new(JsObject::new(None));
+    let entry = Arc::new(JsObject::new(None, Arc::clone(&mm)));
     entry.set(str_to_key("k"), key);
     entry.set(str_to_key("v"), value);
     entries_obj.set(str_to_key(&hash_key), VmValue::object(entry));
@@ -181,7 +182,7 @@ fn native_map_set(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Map.prototype.has(key)
-fn native_map_has(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_map_has(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let map = args.first().ok_or("Map.has requires a Map")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -208,7 +209,7 @@ fn native_map_has(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Map.prototype.delete(key)
-fn native_map_delete(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_map_delete(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let map = args.first().ok_or("Map.delete requires a Map")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -251,7 +252,7 @@ fn native_map_delete(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Map.prototype.clear()
-fn native_map_clear(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_map_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let map = args.first().ok_or("Map.clear requires a Map")?;
 
     let map_obj = map.as_object().ok_or("First argument must be a Map")?;
@@ -264,7 +265,7 @@ fn native_map_clear(args: &[VmValue]) -> Result<VmValue, String> {
     }
 
     // Replace entries with new empty object
-    let new_entries = Arc::new(JsObject::new(None));
+    let new_entries = Arc::new(JsObject::new(None, Arc::clone(&mm)));
     map_obj.set(str_to_key(MAP_ENTRIES_KEY), VmValue::object(new_entries));
     map_obj.set(str_to_key(MAP_SIZE_KEY), VmValue::int32(0));
 
@@ -272,7 +273,7 @@ fn native_map_clear(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Map.prototype.size getter
-fn native_map_size(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_map_size(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let map = args.first().ok_or("Map.size requires a Map")?;
 
     let map_obj = map.as_object().ok_or("First argument must be a Map")?;
@@ -291,7 +292,7 @@ fn native_map_size(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Map.prototype.keys() - returns an iterator over keys
-fn native_map_keys(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_map_keys(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let map = args.first().ok_or("Map.keys requires a Map")?;
 
     let map_obj = map.as_object().ok_or("First argument must be a Map")?;
@@ -311,7 +312,7 @@ fn native_map_keys(args: &[VmValue]) -> Result<VmValue, String> {
         .ok_or("Internal error: entries not an object")?;
 
     // Collect all keys into an array
-    let keys_array = Arc::new(JsObject::array(0));
+    let keys_array = Arc::new(JsObject::array(0, Arc::clone(&mm)));
     let props = entries_obj.own_keys();
     let mut index = 0;
 
@@ -333,7 +334,7 @@ fn native_map_keys(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Map.prototype.values() - returns an iterator over values
-fn native_map_values(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_map_values(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let map = args.first().ok_or("Map.values requires a Map")?;
 
     let map_obj = map.as_object().ok_or("First argument must be a Map")?;
@@ -353,7 +354,7 @@ fn native_map_values(args: &[VmValue]) -> Result<VmValue, String> {
         .ok_or("Internal error: entries not an object")?;
 
     // Collect all values into an array
-    let values_array = Arc::new(JsObject::array(0));
+    let values_array = Arc::new(JsObject::array(0, Arc::clone(&mm)));
     let props = entries_obj.own_keys();
     let mut index = 0;
 
@@ -375,7 +376,7 @@ fn native_map_values(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Map.prototype.entries() - returns an iterator over [key, value] pairs
-fn native_map_entries(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_map_entries(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let map = args.first().ok_or("Map.entries requires a Map")?;
 
     let map_obj = map.as_object().ok_or("First argument must be a Map")?;
@@ -395,7 +396,7 @@ fn native_map_entries(args: &[VmValue]) -> Result<VmValue, String> {
         .ok_or("Internal error: entries not an object")?;
 
     // Collect all [key, value] pairs into an array
-    let entries_array = Arc::new(JsObject::array(0));
+    let entries_array = Arc::new(JsObject::array(0, Arc::clone(&mm)));
     let props = entries_obj.own_keys();
     let mut index = 0;
 
@@ -411,7 +412,7 @@ fn native_map_entries(args: &[VmValue]) -> Result<VmValue, String> {
                     .unwrap_or_else(VmValue::undefined);
 
                 // Create [key, value] pair as array
-                let pair = Arc::new(JsObject::array(0));
+                let pair = Arc::new(JsObject::array(0, Arc::clone(&mm)));
                 pair.set(str_to_key("0"), key);
                 pair.set(str_to_key("1"), value);
                 pair.set(str_to_key("length"), VmValue::int32(2));
@@ -427,10 +428,10 @@ fn native_map_entries(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Map.prototype.forEach(callback, thisArg) - just returns entries for JS to iterate
-fn native_map_foreach(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_map_foreach(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     // The actual forEach iteration is done in JS
     // We just return the entries array here
-    native_map_entries(args)
+    native_map_entries(args, mm)
 }
 
 // ============================================================================
@@ -438,11 +439,14 @@ fn native_map_foreach(args: &[VmValue]) -> Result<VmValue, String> {
 // ============================================================================
 
 /// Create a new WeakMap
-fn native_weakmap_new(_args: &[VmValue]) -> Result<VmValue, String> {
-    let map_obj = Arc::new(JsObject::new(None));
+fn native_weakmap_new(
+    _args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
+    let map_obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
 
     // WeakMap uses the same internal structure but only allows object keys
-    let entries_obj = Arc::new(JsObject::new(None));
+    let entries_obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
     map_obj.set(str_to_key(MAP_ENTRIES_KEY), VmValue::object(entries_obj));
     map_obj.set(str_to_key(IS_WEAKMAP_KEY), VmValue::boolean(true));
 
@@ -459,7 +463,10 @@ fn validate_weakmap_key(key: &VmValue) -> Result<(), String> {
 }
 
 /// WeakMap.prototype.get(key)
-fn native_weakmap_get(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_weakmap_get(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let map = args.first().ok_or("WeakMap.get requires a WeakMap")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -501,7 +508,10 @@ fn native_weakmap_get(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// WeakMap.prototype.set(key, value)
-fn native_weakmap_set(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_weakmap_set(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let map = args.first().ok_or("WeakMap.set requires a WeakMap")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
     let value = args.get(2).cloned().unwrap_or_else(VmValue::undefined);
@@ -527,7 +537,7 @@ fn native_weakmap_set(args: &[VmValue]) -> Result<VmValue, String> {
     let hash_key = value_to_key(&key);
 
     // Create entry object to store both key (weakly) and value
-    let entry = Arc::new(JsObject::new(None));
+    let entry = Arc::new(JsObject::new(None, Arc::clone(&mm)));
     entry.set(str_to_key("k"), key);
     entry.set(str_to_key("v"), value);
     entries_obj.set(str_to_key(&hash_key), VmValue::object(entry));
@@ -537,7 +547,10 @@ fn native_weakmap_set(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// WeakMap.prototype.has(key)
-fn native_weakmap_has(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_weakmap_has(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let map = args.first().ok_or("WeakMap.has requires a WeakMap")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -568,7 +581,10 @@ fn native_weakmap_has(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// WeakMap.prototype.delete(key)
-fn native_weakmap_delete(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_weakmap_delete(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let map = args.first().ok_or("WeakMap.delete requires a WeakMap")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -609,112 +625,144 @@ mod tests {
 
     #[test]
     fn test_map_new() {
-        let result = native_map_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = native_map_new(&[], Arc::clone(&mm)).unwrap();
         assert!(result.is_object());
     }
 
     #[test]
     fn test_map_set_get() {
-        let map = native_map_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let map = native_map_new(&[], Arc::clone(&mm)).unwrap();
 
         // Set a value
         let key = VmValue::int32(42);
         let value = VmValue::int32(100);
-        let _ = native_map_set(&[map.clone(), key.clone(), value.clone()]).unwrap();
+        let _ = native_map_set(
+            &[map.clone(), key.clone(), value.clone()],
+            Arc::clone(&mm),
+        )
+        .unwrap();
 
         // Get the value
-        let result = native_map_get(&[map.clone(), key]).unwrap();
+        let result = native_map_get(&[map.clone(), key], Arc::clone(&mm)).unwrap();
         assert_eq!(result.as_int32(), Some(100));
     }
 
     #[test]
     fn test_map_has() {
-        let map = native_map_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let map = native_map_new(&[], Arc::clone(&mm)).unwrap();
 
         let key = VmValue::int32(42);
         let value = VmValue::int32(100);
 
         // Initially doesn't have key
-        let has = native_map_has(&[map.clone(), key.clone()]).unwrap();
+        let has = native_map_has(&[map.clone(), key.clone()], Arc::clone(&mm)).unwrap();
         assert_eq!(has.as_boolean(), Some(false));
 
         // After set, has key
-        let _ = native_map_set(&[map.clone(), key.clone(), value]).unwrap();
-        let has = native_map_has(&[map.clone(), key]).unwrap();
+        let _ = native_map_set(
+            &[map.clone(), key.clone(), value],
+            Arc::clone(&mm),
+        )
+        .unwrap();
+        let has = native_map_has(&[map.clone(), key], Arc::clone(&mm)).unwrap();
         assert_eq!(has.as_boolean(), Some(true));
     }
 
     #[test]
     fn test_map_delete() {
-        let map = native_map_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let map = native_map_new(&[], Arc::clone(&mm)).unwrap();
         let key = VmValue::int32(42);
         let value = VmValue::int32(100);
 
-        let _ = native_map_set(&[map.clone(), key.clone(), value]).unwrap();
+        let _ =
+            native_map_set(&[map.clone(), key.clone(), value], Arc::clone(&mm)).unwrap();
 
-        let deleted = native_map_delete(&[map.clone(), key.clone()]).unwrap();
+        let deleted =
+            native_map_delete(&[map.clone(), key.clone()], Arc::clone(&mm)).unwrap();
         assert_eq!(deleted.as_boolean(), Some(true));
 
-        let has = native_map_has(&[map, key]).unwrap();
+        let has = native_map_has(&[map, key], Arc::clone(&mm)).unwrap();
         assert_eq!(has.as_boolean(), Some(false));
     }
 
     #[test]
     fn test_map_size() {
-        let map = native_map_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let map = native_map_new(&[], Arc::clone(&mm)).unwrap();
 
         // Initially 0
-        let size = native_map_size(std::slice::from_ref(&map)).unwrap();
+        let size = native_map_size(std::slice::from_ref(&map), Arc::clone(&mm)).unwrap();
         assert_eq!(size.as_int32(), Some(0));
 
         // After adding
-        let _ = native_map_set(&[map.clone(), VmValue::int32(1), VmValue::int32(1)]).unwrap();
-        let _ = native_map_set(&[map.clone(), VmValue::int32(2), VmValue::int32(2)]).unwrap();
+        let _ = native_map_set(
+            &[map.clone(), VmValue::int32(1), VmValue::int32(1)],
+            Arc::clone(&mm),
+        )
+        .unwrap();
+        let _ = native_map_set(
+            &[map.clone(), VmValue::int32(2), VmValue::int32(2)],
+            Arc::clone(&mm),
+        )
+        .unwrap();
 
-        let size = native_map_size(&[map]).unwrap();
+        let size = native_map_size(&[map], Arc::clone(&mm)).unwrap();
         assert_eq!(size.as_int32(), Some(2));
     }
 
     #[test]
     fn test_map_clear() {
-        let map = native_map_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let map = native_map_new(&[], Arc::clone(&mm)).unwrap();
 
-        let _ = native_map_set(&[map.clone(), VmValue::int32(1), VmValue::int32(1)]).unwrap();
-        let _ = native_map_clear(std::slice::from_ref(&map)).unwrap();
+        let _ = native_map_set(
+            &[map.clone(), VmValue::int32(1), VmValue::int32(1)],
+            Arc::clone(&mm),
+        )
+        .unwrap();
+        let _ = native_map_clear(std::slice::from_ref(&map), Arc::clone(&mm)).unwrap();
 
-        let size = native_map_size(&[map]).unwrap();
+        let size = native_map_size(&[map], Arc::clone(&mm)).unwrap();
         assert_eq!(size.as_int32(), Some(0));
     }
 
     #[test]
     fn test_weakmap_new() {
-        let result = native_weakmap_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = native_weakmap_new(&[], Arc::clone(&mm)).unwrap();
         assert!(result.is_object());
     }
 
     #[test]
     fn test_weakmap_requires_object_key() {
-        let map = native_weakmap_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let map = native_weakmap_new(&[], Arc::clone(&mm)).unwrap();
 
         // Primitive key should fail
         let key = VmValue::int32(42);
         let value = VmValue::int32(100);
-        let result = native_weakmap_set(&[map, key, value]);
+        let result = native_weakmap_set(&[map, key, value], Arc::clone(&mm));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_weakmap_with_object_key() {
-        let map = native_weakmap_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let map = native_weakmap_new(&[], Arc::clone(&mm)).unwrap();
 
         // Object key should work
-        let key_obj = Arc::new(JsObject::new(None));
+        let key_obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
         let key = VmValue::object(key_obj);
         let value = VmValue::int32(100);
 
-        let _ = native_weakmap_set(&[map.clone(), key.clone(), value]).unwrap();
+        let _ =
+            native_weakmap_set(&[map.clone(), key.clone(), value], Arc::clone(&mm)).unwrap();
 
-        let result = native_weakmap_get(&[map, key]).unwrap();
+        let result = native_weakmap_get(&[map, key], Arc::clone(&mm)).unwrap();
         assert_eq!(result.as_int32(), Some(100));
     }
 }

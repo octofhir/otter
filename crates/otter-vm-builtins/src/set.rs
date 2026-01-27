@@ -2,9 +2,10 @@
 //!
 //! Provides Set and WeakSet collections with full ES2026 support.
 
+use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::value::Value as VmValue;
-use otter_vm_runtime::{Op, op_native};
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::sync::Arc;
 
 /// Get Set ops for extension registration
@@ -86,11 +87,11 @@ fn str_to_key(s: &str) -> PropertyKey {
 // ============================================================================
 
 /// Create a new Set
-fn native_set_new(_args: &[VmValue]) -> Result<VmValue, String> {
-    let set_obj = Arc::new(JsObject::new(None));
+fn native_set_new(_args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+    let set_obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
 
     // Create internal values storage
-    let values_obj = Arc::new(JsObject::new(None));
+    let values_obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
     set_obj.set(str_to_key(SET_VALUES_KEY), VmValue::object(values_obj));
     set_obj.set(str_to_key(SET_SIZE_KEY), VmValue::int32(0));
     set_obj.set(str_to_key(IS_SET_KEY), VmValue::boolean(true));
@@ -99,7 +100,7 @@ fn native_set_new(_args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Set.prototype.add(value)
-fn native_set_add(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_set_add(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let set = args.first().ok_or("Set.add requires a Set")?;
     let value = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -143,7 +144,7 @@ fn native_set_add(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Set.prototype.has(value)
-fn native_set_has(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_set_has(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let set = args.first().ok_or("Set.has requires a Set")?;
     let value = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -170,7 +171,7 @@ fn native_set_has(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Set.prototype.delete(value)
-fn native_set_delete(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_set_delete(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let set = args.first().ok_or("Set.delete requires a Set")?;
     let value = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -213,7 +214,7 @@ fn native_set_delete(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Set.prototype.clear()
-fn native_set_clear(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_set_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let set = args.first().ok_or("Set.clear requires a Set")?;
 
     let set_obj = set.as_object().ok_or("First argument must be a Set")?;
@@ -226,7 +227,7 @@ fn native_set_clear(args: &[VmValue]) -> Result<VmValue, String> {
     }
 
     // Replace values with new empty object
-    let new_values = Arc::new(JsObject::new(None));
+    let new_values = Arc::new(JsObject::new(None, Arc::clone(&mm)));
     set_obj.set(str_to_key(SET_VALUES_KEY), VmValue::object(new_values));
     set_obj.set(str_to_key(SET_SIZE_KEY), VmValue::int32(0));
 
@@ -234,7 +235,7 @@ fn native_set_clear(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Set.prototype.size getter
-fn native_set_size(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_set_size(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let set = args.first().ok_or("Set.size requires a Set")?;
 
     let set_obj = set.as_object().ok_or("First argument must be a Set")?;
@@ -253,7 +254,7 @@ fn native_set_size(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Set.prototype.values() - returns an iterator over values
-fn native_set_values(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_set_values(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let set = args.first().ok_or("Set.values requires a Set")?;
 
     let set_obj = set.as_object().ok_or("First argument must be a Set")?;
@@ -273,7 +274,7 @@ fn native_set_values(args: &[VmValue]) -> Result<VmValue, String> {
         .ok_or("Internal error: values not an object")?;
 
     // Collect all values into an array
-    let values_array = Arc::new(JsObject::array(0));
+    let values_array = Arc::new(JsObject::array(0, Arc::clone(&mm)));
     let props = values_obj.own_keys();
     let mut index = 0;
 
@@ -289,12 +290,15 @@ fn native_set_values(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Set.prototype.keys() - same as values() per spec
-fn native_set_keys(args: &[VmValue]) -> Result<VmValue, String> {
-    native_set_values(args)
+fn native_set_keys(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+    native_set_values(args, mm)
 }
 
 /// Set.prototype.entries() - returns an iterator over [value, value] pairs
-fn native_set_entries(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_set_entries(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let set = args.first().ok_or("Set.entries requires a Set")?;
 
     let set_obj = set.as_object().ok_or("First argument must be a Set")?;
@@ -314,14 +318,14 @@ fn native_set_entries(args: &[VmValue]) -> Result<VmValue, String> {
         .ok_or("Internal error: values not an object")?;
 
     // Collect all [value, value] pairs into an array
-    let entries_array = Arc::new(JsObject::array(0));
+    let entries_array = Arc::new(JsObject::array(0, Arc::clone(&mm)));
     let props = values_obj.own_keys();
     let mut index = 0;
 
     for prop in props {
         if let Some(value) = values_obj.get(&prop) {
             // Create [value, value] pair as array
-            let pair = Arc::new(JsObject::array(0));
+            let pair = Arc::new(JsObject::array(0, Arc::clone(&mm)));
             pair.set(str_to_key("0"), value.clone());
             pair.set(str_to_key("1"), value);
             pair.set(str_to_key("length"), VmValue::int32(2));
@@ -336,8 +340,8 @@ fn native_set_entries(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Set.prototype.forEach - returns values for JS to iterate
-fn native_set_foreach(args: &[VmValue]) -> Result<VmValue, String> {
-    native_set_values(args)
+fn native_set_foreach(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+    native_set_values(args, mm)
 }
 
 // ============================================================================
@@ -373,35 +377,38 @@ fn get_set_values(set: &VmValue) -> Result<Vec<VmValue>, String> {
 }
 
 /// Set.prototype.union(other)
-fn native_set_union(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_set_union(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let this_values = get_set_values(args.first().ok_or("Missing this")?)?;
     let other_values = get_set_values(args.get(1).ok_or("Missing other Set")?)?;
 
     // Create new set with values from both
-    let result = native_set_new(&[])?;
+    let result = native_set_new(&[], Arc::clone(&mm))?;
 
     for value in this_values {
-        native_set_add(&[result.clone(), value])?;
+        native_set_add(&[result.clone(), value], Arc::clone(&mm))?;
     }
     for value in other_values {
-        native_set_add(&[result.clone(), value])?;
+        native_set_add(&[result.clone(), value], Arc::clone(&mm))?;
     }
 
     Ok(result)
 }
 
 /// Set.prototype.intersection(other)
-fn native_set_intersection(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_set_intersection(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let set = args.first().ok_or("Missing this")?;
     let other = args.get(1).ok_or("Missing other Set")?;
     let this_values = get_set_values(set)?;
 
-    let result = native_set_new(&[])?;
+    let result = native_set_new(&[], Arc::clone(&mm))?;
 
     for value in this_values {
-        let has = native_set_has(&[other.clone(), value.clone()])?;
+        let has = native_set_has(&[other.clone(), value.clone()], Arc::clone(&mm))?;
         if has.as_boolean() == Some(true) {
-            native_set_add(&[result.clone(), value])?;
+            native_set_add(&[result.clone(), value], Arc::clone(&mm))?;
         }
     }
 
@@ -409,17 +416,20 @@ fn native_set_intersection(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Set.prototype.difference(other)
-fn native_set_difference(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_set_difference(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let set = args.first().ok_or("Missing this")?;
     let other = args.get(1).ok_or("Missing other Set")?;
     let this_values = get_set_values(set)?;
 
-    let result = native_set_new(&[])?;
+    let result = native_set_new(&[], Arc::clone(&mm))?;
 
     for value in this_values {
-        let has = native_set_has(&[other.clone(), value.clone()])?;
+        let has = native_set_has(&[other.clone(), value.clone()], Arc::clone(&mm))?;
         if has.as_boolean() != Some(true) {
-            native_set_add(&[result.clone(), value])?;
+            native_set_add(&[result.clone(), value], Arc::clone(&mm))?;
         }
     }
 
@@ -427,27 +437,30 @@ fn native_set_difference(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Set.prototype.symmetricDifference(other)
-fn native_set_symmetric_difference(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_set_symmetric_difference(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let set = args.first().ok_or("Missing this")?;
     let other = args.get(1).ok_or("Missing other Set")?;
     let this_values = get_set_values(set)?;
     let other_values = get_set_values(other)?;
 
-    let result = native_set_new(&[])?;
+    let result = native_set_new(&[], Arc::clone(&mm))?;
 
     // Add values in this but not in other
     for value in &this_values {
-        let has = native_set_has(&[other.clone(), value.clone()])?;
+        let has = native_set_has(&[other.clone(), value.clone()], Arc::clone(&mm))?;
         if has.as_boolean() != Some(true) {
-            native_set_add(&[result.clone(), value.clone()])?;
+            native_set_add(&[result.clone(), value.clone()], Arc::clone(&mm))?;
         }
     }
 
     // Add values in other but not in this
     for value in other_values {
-        let has = native_set_has(&[set.clone(), value.clone()])?;
+        let has = native_set_has(&[set.clone(), value.clone()], Arc::clone(&mm))?;
         if has.as_boolean() != Some(true) {
-            native_set_add(&[result.clone(), value])?;
+            native_set_add(&[result.clone(), value], Arc::clone(&mm))?;
         }
     }
 
@@ -455,13 +468,16 @@ fn native_set_symmetric_difference(args: &[VmValue]) -> Result<VmValue, String> 
 }
 
 /// Set.prototype.isSubsetOf(other)
-fn native_set_is_subset_of(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_set_is_subset_of(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let set = args.first().ok_or("Missing this")?;
     let other = args.get(1).ok_or("Missing other Set")?;
     let this_values = get_set_values(set)?;
 
     for value in this_values {
-        let has = native_set_has(&[other.clone(), value])?;
+        let has = native_set_has(&[other.clone(), value], Arc::clone(&mm))?;
         if has.as_boolean() != Some(true) {
             return Ok(VmValue::boolean(false));
         }
@@ -471,13 +487,16 @@ fn native_set_is_subset_of(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Set.prototype.isSupersetOf(other)
-fn native_set_is_superset_of(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_set_is_superset_of(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let set = args.first().ok_or("Missing this")?;
     let other = args.get(1).ok_or("Missing other Set")?;
     let other_values = get_set_values(other)?;
 
     for value in other_values {
-        let has = native_set_has(&[set.clone(), value])?;
+        let has = native_set_has(&[set.clone(), value], Arc::clone(&mm))?;
         if has.as_boolean() != Some(true) {
             return Ok(VmValue::boolean(false));
         }
@@ -487,13 +506,16 @@ fn native_set_is_superset_of(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Set.prototype.isDisjointFrom(other)
-fn native_set_is_disjoint_from(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_set_is_disjoint_from(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let set = args.first().ok_or("Missing this")?;
     let other = args.get(1).ok_or("Missing other Set")?;
     let this_values = get_set_values(set)?;
 
     for value in this_values {
-        let has = native_set_has(&[other.clone(), value])?;
+        let has = native_set_has(&[other.clone(), value], Arc::clone(&mm))?;
         if has.as_boolean() == Some(true) {
             return Ok(VmValue::boolean(false));
         }
@@ -507,10 +529,13 @@ fn native_set_is_disjoint_from(args: &[VmValue]) -> Result<VmValue, String> {
 // ============================================================================
 
 /// Create a new WeakSet
-fn native_weakset_new(_args: &[VmValue]) -> Result<VmValue, String> {
-    let set_obj = Arc::new(JsObject::new(None));
+fn native_weakset_new(
+    _args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
+    let set_obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
 
-    let values_obj = Arc::new(JsObject::new(None));
+    let values_obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
     set_obj.set(str_to_key(SET_VALUES_KEY), VmValue::object(values_obj));
     set_obj.set(str_to_key(IS_WEAKSET_KEY), VmValue::boolean(true));
 
@@ -527,7 +552,10 @@ fn validate_weakset_value(value: &VmValue) -> Result<(), String> {
 }
 
 /// WeakSet.prototype.add(value)
-fn native_weakset_add(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_weakset_add(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let set = args.first().ok_or("WeakSet.add requires a WeakSet")?;
     let value = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -556,7 +584,10 @@ fn native_weakset_add(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// WeakSet.prototype.has(value)
-fn native_weakset_has(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_weakset_has(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let set = args.first().ok_or("WeakSet.has requires a WeakSet")?;
     let value = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -587,7 +618,10 @@ fn native_weakset_has(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// WeakSet.prototype.delete(value)
-fn native_weakset_delete(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_weakset_delete(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let set = args.first().ok_or("WeakSet.delete requires a WeakSet")?;
     let value = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -628,130 +662,142 @@ mod tests {
 
     #[test]
     fn test_set_new() {
-        let result = native_set_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = native_set_new(&[], Arc::clone(&mm)).unwrap();
         assert!(result.is_object());
     }
 
     #[test]
     fn test_set_add_has() {
-        let set = native_set_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let set = native_set_new(&[], Arc::clone(&mm)).unwrap();
 
         let value = VmValue::int32(42);
-        let _ = native_set_add(&[set.clone(), value.clone()]).unwrap();
+        let _ = native_set_add(&[set.clone(), value.clone()], Arc::clone(&mm)).unwrap();
 
-        let has = native_set_has(&[set, value]).unwrap();
+        let has = native_set_has(&[set, value], Arc::clone(&mm)).unwrap();
         assert_eq!(has.as_boolean(), Some(true));
     }
 
     #[test]
     fn test_set_delete() {
-        let set = native_set_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let set = native_set_new(&[], Arc::clone(&mm)).unwrap();
         let value = VmValue::int32(42);
 
-        let _ = native_set_add(&[set.clone(), value.clone()]).unwrap();
+        let _ = native_set_add(&[set.clone(), value.clone()], Arc::clone(&mm)).unwrap();
 
-        let deleted = native_set_delete(&[set.clone(), value.clone()]).unwrap();
+        let deleted =
+            native_set_delete(&[set.clone(), value.clone()], Arc::clone(&mm)).unwrap();
         assert_eq!(deleted.as_boolean(), Some(true));
 
-        let has = native_set_has(&[set, value]).unwrap();
+        let has = native_set_has(&[set, value], Arc::clone(&mm)).unwrap();
         assert_eq!(has.as_boolean(), Some(false));
     }
 
     #[test]
     fn test_set_size() {
-        let set = native_set_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let set = native_set_new(&[], Arc::clone(&mm)).unwrap();
 
-        let size = native_set_size(std::slice::from_ref(&set)).unwrap();
+        let size = native_set_size(std::slice::from_ref(&set), Arc::clone(&mm)).unwrap();
         assert_eq!(size.as_int32(), Some(0));
 
-        let _ = native_set_add(&[set.clone(), VmValue::int32(1)]).unwrap();
-        let _ = native_set_add(&[set.clone(), VmValue::int32(2)]).unwrap();
+        let _ = native_set_add(&[set.clone(), VmValue::int32(1)], Arc::clone(&mm)).unwrap();
+        let _ = native_set_add(&[set.clone(), VmValue::int32(2)], Arc::clone(&mm)).unwrap();
 
-        let size = native_set_size(&[set]).unwrap();
+        let size = native_set_size(&[set], Arc::clone(&mm)).unwrap();
         assert_eq!(size.as_int32(), Some(2));
     }
 
     #[test]
     fn test_set_clear() {
-        let set = native_set_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let set = native_set_new(&[], Arc::clone(&mm)).unwrap();
 
-        let _ = native_set_add(&[set.clone(), VmValue::int32(1)]).unwrap();
-        let _ = native_set_clear(std::slice::from_ref(&set)).unwrap();
+        let _ = native_set_add(&[set.clone(), VmValue::int32(1)], Arc::clone(&mm)).unwrap();
+        let _ = native_set_clear(std::slice::from_ref(&set), Arc::clone(&mm)).unwrap();
 
-        let size = native_set_size(&[set]).unwrap();
+        let size = native_set_size(&[set], Arc::clone(&mm)).unwrap();
         assert_eq!(size.as_int32(), Some(0));
     }
 
     #[test]
     fn test_set_union() {
-        let set1 = native_set_new(&[]).unwrap();
-        let _ = native_set_add(&[set1.clone(), VmValue::int32(1)]).unwrap();
-        let _ = native_set_add(&[set1.clone(), VmValue::int32(2)]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let set1 = native_set_new(&[], Arc::clone(&mm)).unwrap();
+        let _ = native_set_add(&[set1.clone(), VmValue::int32(1)], Arc::clone(&mm)).unwrap();
+        let _ = native_set_add(&[set1.clone(), VmValue::int32(2)], Arc::clone(&mm)).unwrap();
 
-        let set2 = native_set_new(&[]).unwrap();
-        let _ = native_set_add(&[set2.clone(), VmValue::int32(2)]).unwrap();
-        let _ = native_set_add(&[set2.clone(), VmValue::int32(3)]).unwrap();
+        let set2 = native_set_new(&[], Arc::clone(&mm)).unwrap();
+        let _ = native_set_add(&[set2.clone(), VmValue::int32(2)], Arc::clone(&mm)).unwrap();
+        let _ = native_set_add(&[set2.clone(), VmValue::int32(3)], Arc::clone(&mm)).unwrap();
 
-        let result = native_set_union(&[set1, set2]).unwrap();
-        let size = native_set_size(&[result]).unwrap();
+        let result = native_set_union(&[set1, set2], Arc::clone(&mm)).unwrap();
+        let size = native_set_size(&[result], Arc::clone(&mm)).unwrap();
         assert_eq!(size.as_int32(), Some(3));
     }
 
     #[test]
     fn test_set_intersection() {
-        let set1 = native_set_new(&[]).unwrap();
-        let _ = native_set_add(&[set1.clone(), VmValue::int32(1)]).unwrap();
-        let _ = native_set_add(&[set1.clone(), VmValue::int32(2)]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let set1 = native_set_new(&[], Arc::clone(&mm)).unwrap();
+        let _ = native_set_add(&[set1.clone(), VmValue::int32(1)], Arc::clone(&mm)).unwrap();
+        let _ = native_set_add(&[set1.clone(), VmValue::int32(2)], Arc::clone(&mm)).unwrap();
 
-        let set2 = native_set_new(&[]).unwrap();
-        let _ = native_set_add(&[set2.clone(), VmValue::int32(2)]).unwrap();
-        let _ = native_set_add(&[set2.clone(), VmValue::int32(3)]).unwrap();
+        let set2 = native_set_new(&[], Arc::clone(&mm)).unwrap();
+        let _ = native_set_add(&[set2.clone(), VmValue::int32(2)], Arc::clone(&mm)).unwrap();
+        let _ = native_set_add(&[set2.clone(), VmValue::int32(3)], Arc::clone(&mm)).unwrap();
 
-        let result = native_set_intersection(&[set1, set2]).unwrap();
-        let size = native_set_size(&[result]).unwrap();
+        let result = native_set_intersection(&[set1, set2], Arc::clone(&mm)).unwrap();
+        let size = native_set_size(&[result], Arc::clone(&mm)).unwrap();
         assert_eq!(size.as_int32(), Some(1));
     }
 
     #[test]
     fn test_set_difference() {
-        let set1 = native_set_new(&[]).unwrap();
-        let _ = native_set_add(&[set1.clone(), VmValue::int32(1)]).unwrap();
-        let _ = native_set_add(&[set1.clone(), VmValue::int32(2)]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let set1 = native_set_new(&[], Arc::clone(&mm)).unwrap();
+        let _ = native_set_add(&[set1.clone(), VmValue::int32(1)], Arc::clone(&mm)).unwrap();
+        let _ = native_set_add(&[set1.clone(), VmValue::int32(2)], Arc::clone(&mm)).unwrap();
 
-        let set2 = native_set_new(&[]).unwrap();
-        let _ = native_set_add(&[set2.clone(), VmValue::int32(2)]).unwrap();
-        let _ = native_set_add(&[set2.clone(), VmValue::int32(3)]).unwrap();
+        let set2 = native_set_new(&[], Arc::clone(&mm)).unwrap();
+        let _ = native_set_add(&[set2.clone(), VmValue::int32(2)], Arc::clone(&mm)).unwrap();
+        let _ = native_set_add(&[set2.clone(), VmValue::int32(3)], Arc::clone(&mm)).unwrap();
 
-        let result = native_set_difference(&[set1, set2]).unwrap();
-        let size = native_set_size(&[result]).unwrap();
+        let result = native_set_difference(&[set1, set2], Arc::clone(&mm)).unwrap();
+        let size = native_set_size(&[result], Arc::clone(&mm)).unwrap();
         assert_eq!(size.as_int32(), Some(1));
     }
 
     #[test]
     fn test_weakset_new() {
-        let result = native_weakset_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = native_weakset_new(&[], Arc::clone(&mm)).unwrap();
         assert!(result.is_object());
     }
 
     #[test]
     fn test_weakset_requires_object() {
-        let set = native_weakset_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let set = native_weakset_new(&[], Arc::clone(&mm)).unwrap();
 
         let value = VmValue::int32(42);
-        let result = native_weakset_add(&[set, value]);
+        let result = native_weakset_add(&[set, value], Arc::clone(&mm));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_weakset_with_object() {
-        let set = native_weakset_new(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let set = native_weakset_new(&[], Arc::clone(&mm)).unwrap();
 
-        let obj = Arc::new(JsObject::new(None));
+        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
         let value = VmValue::object(obj);
 
-        let _ = native_weakset_add(&[set.clone(), value.clone()]).unwrap();
+        let _ = native_weakset_add(&[set.clone(), value.clone()], Arc::clone(&mm)).unwrap();
 
-        let has = native_weakset_has(&[set, value]).unwrap();
+        let has = native_weakset_has(&[set, value], Arc::clone(&mm)).unwrap();
         assert_eq!(has.as_boolean(), Some(true));
     }
 }

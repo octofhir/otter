@@ -398,9 +398,10 @@ impl Otter {
             return;
         };
 
+        let mm = self.vm.memory_manager().clone();
         for event in events {
             let payload = ws_event_to_json(&event);
-            let args = vec![json_to_value(&payload)];
+            let args = vec![json_to_value(&payload, mm.clone())];
             let mut interpreter = Interpreter::new();
             let _ = interpreter.call_function(ctx, &dispatch_fn, Value::undefined(), &args);
 
@@ -513,8 +514,12 @@ impl Otter {
 
         for op_name in self.extensions.op_names() {
             if let Some(handler) = self.extensions.get_op(op_name) {
-                let native_fn =
-                    self.create_native_wrapper(op_name, handler.clone(), Arc::clone(&pending_ops));
+                let native_fn = self.create_native_wrapper(
+                    op_name,
+                    handler.clone(),
+                    Arc::clone(&pending_ops),
+                    self.vm.memory_manager().clone(),
+                );
                 global.set(PropertyKey::string(op_name), native_fn);
             }
         }
@@ -524,72 +529,77 @@ impl Otter {
 
         let ctx_ptr = ctx as *mut VmContext as usize;
         let vm_ptr = &self.vm as *const VmRuntime as usize;
+        let mm_eval = self.vm.memory_manager().clone();
+        let mm_eval_closure = mm_eval.clone();
         global.set(
             PropertyKey::string("__otter_eval"),
-            Value::native_function(move |args| {
-                let result_ok = |value: Value| {
-                    let obj = JsObject::new(None);
-                    obj.set(PropertyKey::string("ok"), Value::boolean(true));
-                    obj.set(PropertyKey::string("value"), value);
-                    Value::object(Arc::new(obj))
-                };
-
-                let result_err = |error_type: &str, message: &str| {
-                    let obj = JsObject::new(None);
-                    obj.set(PropertyKey::string("ok"), Value::boolean(false));
-                    obj.set(
-                        PropertyKey::string("errorType"),
-                        Value::string(JsString::intern(error_type)),
-                    );
-                    obj.set(
-                        PropertyKey::string("message"),
-                        Value::string(JsString::intern(message)),
-                    );
-                    Value::object(Arc::new(obj))
-                };
-
-                let code_value = match args.first() {
-                    Some(value) => value.clone(),
-                    None => return Ok(result_ok(Value::undefined())),
-                };
-
-                if !code_value.is_string() {
-                    return Ok(result_ok(code_value));
-                }
-
-                let code = code_value
-                    .as_string()
-                    .map(|s| s.as_str().to_string())
-                    .unwrap_or_default();
-
-                unsafe {
-                    let ctx_addr = ctx_ptr;
-                    let ctx = &mut *(ctx_ptr as *mut VmContext);
-                    let vm = &*(vm_ptr as *const VmRuntime);
-                    let compiler = Compiler::new();
-                    let module = match compiler.compile(&code, "eval.js") {
-                        Ok(module) => module,
-                        Err(err) => {
-                            return Ok(result_err("SyntaxError", &err.to_string()));
-                        }
+            Value::native_function(
+                move |args: &[Value], _mm| {
+                    let mm_result = mm_eval_closure.clone();
+                    let result_ok = |value: Value| {
+                        let obj = JsObject::new(None, mm_result.clone());
+                        obj.set(PropertyKey::string("ok"), Value::boolean(true));
+                        obj.set(PropertyKey::string("value"), value);
+                        Value::object(Arc::new(obj))
                     };
 
-                    match vm.execute_module_with_context(&module, ctx) {
-                        Ok(value) => Ok(result_ok(value)),
-                        Err(err) => {
-                            let (error_type, message) = match err {
-                                VmError::TypeError(msg) => ("TypeError", msg),
-                                VmError::ReferenceError(msg) => ("ReferenceError", msg),
-                                VmError::RangeError(msg) => ("RangeError", msg),
-                                VmError::SyntaxError(msg) => ("SyntaxError", msg),
-                                VmError::Exception(ex) => ("Error", ex.message),
-                                other => ("Error", other.to_string()),
-                            };
-                            Ok(result_err(error_type, &message))
+                    let result_err = |error_type: &str, message: &str| {
+                        let obj = JsObject::new(None, mm_result.clone());
+                        obj.set(PropertyKey::string("ok"), Value::boolean(false));
+                        obj.set(
+                            PropertyKey::string("errorType"),
+                            Value::string(JsString::intern(error_type)),
+                        );
+                        obj.set(
+                            PropertyKey::string("message"),
+                            Value::string(JsString::intern(message)),
+                        );
+                        Value::object(Arc::new(obj))
+                    };
+
+                    let code_value = match args.first() {
+                        Some(value) => value.clone(),
+                        None => return Ok(result_ok(Value::undefined())),
+                    };
+
+                    if !code_value.is_string() {
+                        return Ok(result_ok(code_value));
+                    }
+
+                    let code = code_value
+                        .as_string()
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_default();
+
+                    unsafe {
+                        let ctx = &mut *(ctx_ptr as *mut VmContext);
+                        let vm = &*(vm_ptr as *const VmRuntime);
+                        let compiler = Compiler::new();
+                        let module = match compiler.compile(&code, "eval.js") {
+                            Ok(module) => module,
+                            Err(err) => {
+                                return Ok(result_err("SyntaxError", &err.to_string()));
+                            }
+                        };
+
+                        match vm.execute_module_with_context(&module, ctx) {
+                            Ok(value) => Ok(result_ok(value)),
+                            Err(err) => {
+                                let (error_type, message) = match err {
+                                    VmError::TypeError(msg) => ("TypeError", msg),
+                                    VmError::ReferenceError(msg) => ("ReferenceError", msg),
+                                    VmError::RangeError(msg) => ("RangeError", msg),
+                                    VmError::SyntaxError(msg) => ("SyntaxError", msg),
+                                    VmError::Exception(ex) => ("Error", ex.message),
+                                    other => ("Error", other.to_string()),
+                                };
+                                Ok(result_err(error_type, &message))
+                            }
                         }
                     }
-                }
-            }),
+                },
+                mm_eval,
+            ),
         );
     }
 
@@ -599,66 +609,78 @@ impl Otter {
         name: &str,
         handler: OpHandler,
         pending_ops: Arc<std::sync::atomic::AtomicU64>,
+        mm: Arc<otter_vm_core::MemoryManager>,
     ) -> Value {
         let _name = name.to_string();
 
         match handler {
             OpHandler::Native(native_fn) => {
                 // Native ops work directly with Value
-                Value::native_function(move |args| native_fn(args))
+                Value::native_function(move |args, mm_inner| native_fn(args, mm_inner), mm)
             }
             OpHandler::Sync(sync_fn) => {
                 // Sync JSON ops need Value -> JSON -> Value conversion
-                Value::native_function(move |args| {
-                    println!("DEBUG: op_sync called");
-                    let json_args: Vec<serde_json::Value> =
-                        args.iter().map(value_to_json).collect();
-                    let result = sync_fn(&json_args)?;
-                    Ok(json_to_value(&result))
-                })
+                let mm_inner = mm.clone();
+                Value::native_function(
+                    move |args, _mm_ignored| {
+                        println!("DEBUG: op_sync called");
+                        let json_args: Vec<serde_json::Value> =
+                            args.iter().map(value_to_json).collect();
+                        let result = sync_fn(&json_args)?;
+                        Ok(json_to_value(&result, mm_inner.clone()))
+                    },
+                    mm,
+                )
             }
             OpHandler::Async(async_fn) => {
                 // Async ops return a Promise and spawn a tokio task
                 // The event loop will wait for pending async ops to complete
                 let async_fn: AsyncOpFn = async_fn.clone();
                 let pending_ops = Arc::clone(&pending_ops);
-                Value::native_function(move |args| {
-                    // Create Promise with resolve/reject handles
-                    let resolvers = JsPromise::with_resolvers();
-                    let promise = resolvers.promise.clone();
-                    let resolve = resolvers.resolve.clone();
-                    let reject = resolvers.reject.clone();
+                let mm_outer = mm.clone();
+                let mm_outer_closure = mm_outer.clone();
+                Value::native_function(
+                    move |args, _mm_ignored| {
+                        // Create Promise with resolve/reject handles
+                        let mm_promise = mm_outer_closure.clone();
+                        let resolvers = JsPromise::with_resolvers(mm_promise.clone());
+                        let promise = resolvers.promise.clone();
+                        let resolve = resolvers.resolve.clone();
+                        let reject = resolvers.reject.clone();
 
-                    // Convert args to JSON for the async op
-                    let json_args: Vec<serde_json::Value> =
-                        args.iter().map(value_to_json).collect();
+                        // Convert args to JSON for the async op
+                        let json_args: Vec<serde_json::Value> =
+                            args.iter().map(value_to_json).collect();
 
-                    // Create the future by calling the async function
-                    let future = async_fn(&json_args);
+                        // Create the future by calling the async function
+                        let future = async_fn(&json_args);
 
-                    // Increment pending ops counter
-                    let pending_ops_clone = Arc::clone(&pending_ops);
-                    pending_ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Increment pending ops counter
+                        let pending_ops_clone = Arc::clone(&pending_ops);
+                        pending_ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                    // Spawn async task that will resolve/reject the Promise
-                    tokio::spawn(async move {
-                        match future.await {
-                            Ok(json_result) => {
-                                let value = json_to_value(&json_result);
-                                resolve(value);
+                        // Spawn async task that will resolve/reject the Promise
+                        let mm_spawn = mm_outer_closure.clone();
+                        tokio::spawn(async move {
+                            match future.await {
+                                Ok(json_result) => {
+                                    let value = json_to_value(&json_result, mm_spawn);
+                                    resolve(value);
+                                }
+                                Err(err) => {
+                                    let error = Value::string(JsString::intern(&err));
+                                    reject(error);
+                                }
                             }
-                            Err(err) => {
-                                let error = Value::string(JsString::intern(&err));
-                                reject(error);
-                            }
-                        }
-                        // Decrement pending ops counter when done
-                        pending_ops_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    });
+                            // Decrement pending ops counter when done
+                            pending_ops_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        });
 
-                    // Return the pending Promise - VM will suspend on await
-                    Ok(Value::promise(promise))
-                })
+                        // Return the pending Promise - VM will suspend on await
+                        Ok(Value::promise(promise))
+                    },
+                    mm_outer,
+                )
             }
         }
     }
@@ -671,63 +693,77 @@ impl Otter {
         // __env_get(key) -> string | undefined
         let env_store_get = Arc::clone(&env_store);
         let caps_get = caps.clone();
+        let mm_env = self.vm.memory_manager().clone();
         global.set(
             PropertyKey::string("__env_get"),
-            Value::native_function(move |args| {
-                let key = args
-                    .first()
-                    .and_then(|v| v.as_string())
-                    .map(|s| s.as_str().to_string())
-                    .ok_or_else(|| "env_get requires a string key".to_string())?;
+            Value::native_function(
+                move |args: &[Value], _mm| {
+                    let key = args
+                        .first()
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string())
+                        .ok_or_else(|| "env_get requires a string key".to_string())?;
 
-                // Check capabilities
-                if !caps_get.can_env(&key) {
-                    return Err(format!("Permission denied: env access to '{}'", key));
-                }
+                    // Check capabilities
+                    if !caps_get.can_env(&key) {
+                        return Err(format!("Permission denied: env access to '{}'", key));
+                    }
 
-                match env_store_get.get(&key) {
-                    Some(val) => Ok(Value::string(otter_vm_core::string::JsString::intern(&val))),
-                    None => Ok(Value::undefined()),
-                }
-            }),
+                    match env_store_get.get(&key) {
+                        Some(val) => {
+                            Ok(Value::string(otter_vm_core::string::JsString::intern(&val)))
+                        }
+                        None => Ok(Value::undefined()),
+                    }
+                },
+                mm_env.clone(),
+            ),
         );
 
-        // __env_keys() -> string[]
         let env_store_keys = Arc::clone(&env_store);
+        let mm_keys = mm_env.clone();
+        let mm_keys_closure = mm_keys.clone();
         global.set(
             PropertyKey::string("__env_keys"),
-            Value::native_function(move |_args| {
-                let keys = env_store_keys.keys();
-                let arr = JsObject::array(keys.len());
-                for (i, key) in keys.into_iter().enumerate() {
-                    arr.set(
-                        PropertyKey::Index(i as u32),
-                        Value::string(otter_vm_core::string::JsString::intern(&key)),
-                    );
-                }
-                Ok(Value::object(Arc::new(arr)))
-            }),
+            Value::native_function(
+                move |_args: &[Value], _mm| {
+                    let keys = env_store_keys.keys();
+                    let arr = JsObject::array(keys.len(), mm_keys_closure.clone());
+                    for (i, key) in keys.into_iter().enumerate() {
+                        arr.set(
+                            PropertyKey::Index(i as u32),
+                            Value::string(otter_vm_core::string::JsString::intern(&key)),
+                        );
+                    }
+                    Ok(Value::object(Arc::new(arr)))
+                },
+                mm_keys,
+            ),
         );
 
         // __env_has(key) -> boolean
         let env_store_has = Arc::clone(&env_store);
         let caps_has = caps.clone();
+        let mm_has = self.vm.memory_manager().clone();
         global.set(
             PropertyKey::string("__env_has"),
-            Value::native_function(move |args| {
-                let key = args
-                    .first()
-                    .and_then(|v| v.as_string())
-                    .map(|s| s.as_str().to_string())
-                    .ok_or_else(|| "env_has requires a string key".to_string())?;
+            Value::native_function(
+                move |args: &[Value], _mm| {
+                    let key = args
+                        .first()
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string())
+                        .ok_or_else(|| "env_has requires a string key".to_string())?;
 
-                // Check capabilities
-                if !caps_has.can_env(&key) {
-                    return Ok(Value::boolean(false));
-                }
+                    // Check capabilities
+                    if !caps_has.can_env(&key) {
+                        return Ok(Value::boolean(false));
+                    }
 
-                Ok(Value::boolean(env_store_has.contains(&key)))
-            }),
+                    Ok(Value::boolean(env_store_has.contains(&key)))
+                },
+                mm_has,
+            ),
         );
     }
 
@@ -878,7 +914,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
 }
 
 /// Convert JSON to VM Value
-fn json_to_value(json: &serde_json::Value) -> Value {
+fn json_to_value(json: &serde_json::Value, mm: Arc<otter_vm_core::MemoryManager>) -> Value {
     match json {
         serde_json::Value::Null => Value::null(),
         serde_json::Value::Bool(b) => Value::boolean(*b),
@@ -897,16 +933,19 @@ fn json_to_value(json: &serde_json::Value) -> Value {
         }
         serde_json::Value::String(s) => Value::string(otter_vm_core::string::JsString::intern(s)),
         serde_json::Value::Array(arr) => {
-            let js_arr = JsObject::array(arr.len());
+            let js_arr = JsObject::array(arr.len(), mm.clone());
             for (i, elem) in arr.iter().enumerate() {
-                js_arr.set(PropertyKey::Index(i as u32), json_to_value(elem));
+                js_arr.set(
+                    PropertyKey::Index(i as u32),
+                    json_to_value(elem, mm.clone()),
+                );
             }
             Value::object(Arc::new(js_arr))
         }
         serde_json::Value::Object(obj) => {
-            let js_obj = JsObject::new(None);
+            let js_obj = JsObject::new(None, mm.clone());
             for (key, val) in obj {
-                js_obj.set(PropertyKey::string(key), json_to_value(val));
+                js_obj.set(PropertyKey::string(key), json_to_value(val, mm.clone()));
             }
             Value::object(Arc::new(js_obj))
         }
@@ -1041,6 +1080,7 @@ mod tests {
 
     #[test]
     fn test_value_json_conversion() {
+        let mm = Arc::new(otter_vm_core::MemoryManager::test());
         // Test primitives
         assert_eq!(value_to_json(&Value::null()), serde_json::Value::Null);
         assert_eq!(
@@ -1057,20 +1097,24 @@ mod tests {
 
     #[test]
     fn test_json_value_conversion() {
+        let mm = Arc::new(otter_vm_core::MemoryManager::test());
         // Test primitives
-        assert!(json_to_value(&serde_json::Value::Null).is_null());
+        assert!(json_to_value(&serde_json::Value::Null, mm.clone()).is_null());
         assert_eq!(
-            json_to_value(&serde_json::json!(true)).as_boolean(),
+            json_to_value(&serde_json::json!(true), mm.clone()).as_boolean(),
             Some(true)
         );
-        assert_eq!(json_to_value(&serde_json::json!(42)).as_int32(), Some(42));
         assert_eq!(
-            json_to_value(&serde_json::json!(3.14)).as_number(),
+            json_to_value(&serde_json::json!(42), mm.clone()).as_int32(),
+            Some(42)
+        );
+        assert_eq!(
+            json_to_value(&serde_json::json!(3.14), mm.clone()).as_number(),
             Some(3.14)
         );
 
         // Test string
-        let val = json_to_value(&serde_json::json!("hello"));
+        let val = json_to_value(&serde_json::json!("hello"), mm.clone());
         assert_eq!(val.as_string().map(|s| s.as_str()), Some("hello"));
     }
 

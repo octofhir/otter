@@ -33,8 +33,7 @@ use crate::proxy::JsProxy;
 use crate::regexp::JsRegExp;
 use crate::shared_buffer::SharedArrayBuffer;
 use crate::string::JsString;
-use std::cell::RefCell;
-use std::rc::Rc;
+use parking_lot::Mutex;
 use std::sync::Arc;
 
 /// Heap-allocated cell for mutable upvalues (closures)
@@ -50,28 +49,28 @@ use std::sync::Arc;
 /// }
 /// ```
 #[derive(Clone)]
-pub struct UpvalueCell(Rc<RefCell<Value>>);
+pub struct UpvalueCell(Arc<Mutex<Value>>);
 
 impl UpvalueCell {
     /// Create a new upvalue cell with the given value
     pub fn new(value: Value) -> Self {
-        Self(Rc::new(RefCell::new(value)))
+        Self(Arc::new(Mutex::new(value)))
     }
 
     /// Get the current value from the cell
     pub fn get(&self) -> Value {
-        self.0.borrow().clone()
+        self.0.lock().clone()
     }
 
     /// Set a new value in the cell
     pub fn set(&self, value: Value) {
-        *self.0.borrow_mut() = value;
+        *self.0.lock() = value;
     }
 }
 
 impl std::fmt::Debug for UpvalueCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "UpvalueCell({:?})", self.0.borrow())
+        write!(f, "UpvalueCell({:?})", *self.0.lock())
     }
 }
 
@@ -106,7 +105,8 @@ unsafe impl Send for Value {}
 unsafe impl Sync for Value {}
 
 /// Native function handler type
-pub type NativeFn = Arc<dyn Fn(&[Value]) -> Result<Value, String> + Send + Sync>;
+pub type NativeFn =
+    Arc<dyn Fn(&[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, String> + Send + Sync>;
 
 /// Reference to heap-allocated data
 #[derive(Clone)]
@@ -368,12 +368,15 @@ impl Value {
     }
 
     /// Create native function value
-    pub fn native_function<F>(f: F) -> Self
+    pub fn native_function<F>(f: F, memory_manager: Arc<crate::memory::MemoryManager>) -> Self
     where
-        F: Fn(&[Value]) -> Result<Value, String> + Send + Sync + 'static,
+        F: Fn(&[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, String>
+            + Send
+            + Sync
+            + 'static,
     {
         let func: NativeFn = Arc::new(f);
-        let object = Arc::new(JsObject::new(None));
+        let object = Arc::new(JsObject::new(None, memory_manager));
         let native = Arc::new(NativeFunctionObject { func, object });
         // Use a dummy pointer for NaN-boxing (the actual function is in heap_ref)
         Self {

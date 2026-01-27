@@ -6,9 +6,10 @@
 //! - `Generator.prototype.throw(exception)`
 //! - Iterator helpers for creating iterator results
 
+use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::value::Value as VmValue;
-use otter_vm_runtime::{Op, op_native};
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::sync::Arc;
 
 /// Get Iterator/Generator ops for extension registration
@@ -28,8 +29,8 @@ pub fn ops() -> Vec<Op> {
 // ============================================================================
 
 /// Create an iterator result object { value, done }
-fn create_iterator_result(value: VmValue, done: bool) -> VmValue {
-    let result = Arc::new(JsObject::new(None));
+fn create_iterator_result(value: VmValue, done: bool, mm: Arc<memory::MemoryManager>) -> VmValue {
+    let result = Arc::new(JsObject::new(None, mm));
     result.set(PropertyKey::string("value"), value);
     result.set(PropertyKey::string("done"), VmValue::boolean(done));
     VmValue::object(result)
@@ -41,21 +42,30 @@ fn create_iterator_result(value: VmValue, done: bool) -> VmValue {
 
 /// Create an iterator result { value, done: false }
 /// Args: [value]
-fn native_iterator_result(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_iterator_result(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let value = args.first().cloned().unwrap_or(VmValue::undefined());
-    Ok(create_iterator_result(value, false))
+    Ok(create_iterator_result(value, false, mm))
 }
 
 /// Create a done iterator result { value, done: true }
 /// Args: [value?]
-fn native_iterator_done(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_iterator_done(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let value = args.first().cloned().unwrap_or(VmValue::undefined());
-    Ok(create_iterator_result(value, true))
+    Ok(create_iterator_result(value, true, mm))
 }
 
 /// Generator.prototype.next(value?)
 /// Args: [generator, value?]
-fn native_generator_next(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_generator_next(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let generator_val = args
         .first()
         .ok_or("Generator.next requires a generator argument")?;
@@ -66,7 +76,7 @@ fn native_generator_next(args: &[VmValue]) -> Result<VmValue, String> {
 
     // Check if generator is completed
     if generator.is_completed() {
-        return Ok(create_iterator_result(VmValue::undefined(), true));
+        return Ok(create_iterator_result(VmValue::undefined(), true, mm));
     }
 
     // Get the value to send to the generator
@@ -86,12 +96,15 @@ fn native_generator_next(args: &[VmValue]) -> Result<VmValue, String> {
     // Return a yielded result (the interpreter handles the actual value)
     // This is a simplified implementation - full implementation needs
     // integration with the bytecode interpreter
-    Ok(create_iterator_result(VmValue::undefined(), false))
+    Ok(create_iterator_result(VmValue::undefined(), false, mm))
 }
 
 /// Generator.prototype.return(value?)
 /// Args: [generator, value?]
-fn native_generator_return(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_generator_return(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let generator_val = args
         .first()
         .ok_or("Generator.return requires a generator argument")?;
@@ -106,12 +119,15 @@ fn native_generator_return(args: &[VmValue]) -> Result<VmValue, String> {
     generator.complete();
 
     // Return done result with the provided value
-    Ok(create_iterator_result(return_value, true))
+    Ok(create_iterator_result(return_value, true, mm))
 }
 
 /// Generator.prototype.throw(exception)
 /// Args: [generator, exception]
-fn native_generator_throw(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_generator_throw(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let generator_val = args
         .first()
         .ok_or("Generator.throw requires a generator argument")?;
@@ -137,7 +153,10 @@ fn native_generator_throw(args: &[VmValue]) -> Result<VmValue, String> {
 
 /// Check if value is a generator
 /// Args: [value]
-fn native_is_generator(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_is_generator(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let value = args.first().ok_or("Missing value argument")?;
     Ok(VmValue::boolean(value.is_generator()))
 }
@@ -149,7 +168,8 @@ mod tests {
 
     #[test]
     fn test_iterator_result() {
-        let result = native_iterator_result(&[VmValue::number(42.0)]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = native_iterator_result(&[VmValue::number(42.0)], mm).unwrap();
         let obj = result.as_object().unwrap();
         assert_eq!(obj.get(&"value".into()).unwrap().as_number(), Some(42.0));
         assert_eq!(obj.get(&"done".into()).unwrap().as_boolean(), Some(false));
@@ -157,7 +177,8 @@ mod tests {
 
     #[test]
     fn test_iterator_done() {
-        let result = native_iterator_done(&[VmValue::number(100.0)]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = native_iterator_done(&[VmValue::number(100.0)], mm).unwrap();
         let obj = result.as_object().unwrap();
         assert_eq!(obj.get(&"value".into()).unwrap().as_number(), Some(100.0));
         assert_eq!(obj.get(&"done".into()).unwrap().as_boolean(), Some(true));
@@ -165,7 +186,8 @@ mod tests {
 
     #[test]
     fn test_iterator_done_no_value() {
-        let result = native_iterator_done(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = native_iterator_done(&[], mm).unwrap();
         let obj = result.as_object().unwrap();
         assert!(obj.get(&"value".into()).unwrap().is_undefined());
         assert_eq!(obj.get(&"done".into()).unwrap().as_boolean(), Some(true));
@@ -173,11 +195,12 @@ mod tests {
 
     #[test]
     fn test_generator_return() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let generator = JsGenerator::new(0, vec![]);
-        let result = native_generator_return(&[
-            VmValue::generator(generator.clone()),
-            VmValue::number(99.0),
-        ])
+        let result = native_generator_return(
+            &[VmValue::generator(generator.clone()), VmValue::number(99.0)],
+            mm,
+        )
         .unwrap();
 
         let obj = result.as_object().unwrap();
@@ -188,20 +211,22 @@ mod tests {
 
     #[test]
     fn test_is_generator() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let generator = JsGenerator::new(0, vec![]);
-        let result = native_is_generator(&[VmValue::generator(generator)]).unwrap();
+        let result = native_is_generator(&[VmValue::generator(generator)], mm.clone()).unwrap();
         assert_eq!(result.as_boolean(), Some(true));
 
-        let result = native_is_generator(&[VmValue::number(42.0)]).unwrap();
+        let result = native_is_generator(&[VmValue::number(42.0)], mm).unwrap();
         assert_eq!(result.as_boolean(), Some(false));
     }
 
     #[test]
     fn test_generator_next_on_completed() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let generator = JsGenerator::new(0, vec![]);
         generator.complete();
 
-        let result = native_generator_next(&[VmValue::generator(generator)]).unwrap();
+        let result = native_generator_next(&[VmValue::generator(generator)], mm).unwrap();
         let obj = result.as_object().unwrap();
         assert!(obj.get(&"value".into()).unwrap().is_undefined());
         assert_eq!(obj.get(&"done".into()).unwrap().as_boolean(), Some(true));

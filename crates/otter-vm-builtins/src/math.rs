@@ -2,8 +2,10 @@
 //!
 //! Provides all ES2025 Math methods and constants.
 
+use otter_vm_core::memory;
 use otter_vm_core::value::Value;
-use otter_vm_runtime::{Op, op_native};
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
+use std::sync::Arc;
 
 /// Get Math ops for extension registration
 pub fn ops() -> Vec<Op> {
@@ -80,22 +82,22 @@ fn get_arg(args: &[Value], idx: usize) -> f64 {
 // Basic Methods
 // ============================================================================
 
-fn math_abs(args: &[Value]) -> Result<Value, String> {
+fn math_abs(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.abs()))
 }
 
-fn math_ceil(args: &[Value]) -> Result<Value, String> {
+fn math_ceil(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.ceil()))
 }
 
-fn math_floor(args: &[Value]) -> Result<Value, String> {
+fn math_floor(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.floor()))
 }
 
-fn math_round(args: &[Value]) -> Result<Value, String> {
+fn math_round(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     // JavaScript round: round half towards +infinity
     // e.g., round(-0.5) = -0, round(0.5) = 1
@@ -107,12 +109,12 @@ fn math_round(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(rounded))
 }
 
-fn math_trunc(args: &[Value]) -> Result<Value, String> {
+fn math_trunc(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.trunc()))
 }
 
-fn math_sign(args: &[Value]) -> Result<Value, String> {
+fn math_sign(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     let result = if x.is_nan() {
         f64::NAN
@@ -130,23 +132,23 @@ fn math_sign(args: &[Value]) -> Result<Value, String> {
 // Roots and Powers
 // ============================================================================
 
-fn math_sqrt(args: &[Value]) -> Result<Value, String> {
+fn math_sqrt(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.sqrt()))
 }
 
-fn math_cbrt(args: &[Value]) -> Result<Value, String> {
+fn math_cbrt(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.cbrt()))
 }
 
-fn math_pow(args: &[Value]) -> Result<Value, String> {
+fn math_pow(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let base = get_arg(args, 0);
     let exp = get_arg(args, 1);
     Ok(Value::number(base.powf(exp)))
 }
 
-fn math_hypot(args: &[Value]) -> Result<Value, String> {
+fn math_hypot(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     // hypot(...values) - returns sqrt(sum(x^2))
     if args.is_empty() {
         return Ok(Value::number(0.0));
@@ -177,32 +179,32 @@ fn math_hypot(args: &[Value]) -> Result<Value, String> {
 // Exponentials and Logarithms
 // ============================================================================
 
-fn math_exp(args: &[Value]) -> Result<Value, String> {
+fn math_exp(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.exp()))
 }
 
-fn math_expm1(args: &[Value]) -> Result<Value, String> {
+fn math_expm1(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.exp_m1()))
 }
 
-fn math_log(args: &[Value]) -> Result<Value, String> {
+fn math_log(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.ln()))
 }
 
-fn math_log1p(args: &[Value]) -> Result<Value, String> {
+fn math_log1p(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.ln_1p()))
 }
 
-fn math_log2(args: &[Value]) -> Result<Value, String> {
+fn math_log2(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.log2()))
 }
 
-fn math_log10(args: &[Value]) -> Result<Value, String> {
+fn math_log10(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.log10()))
 }
@@ -211,37 +213,37 @@ fn math_log10(args: &[Value]) -> Result<Value, String> {
 // Trigonometry
 // ============================================================================
 
-fn math_sin(args: &[Value]) -> Result<Value, String> {
+fn math_sin(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.sin()))
 }
 
-fn math_cos(args: &[Value]) -> Result<Value, String> {
+fn math_cos(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.cos()))
 }
 
-fn math_tan(args: &[Value]) -> Result<Value, String> {
+fn math_tan(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.tan()))
 }
 
-fn math_asin(args: &[Value]) -> Result<Value, String> {
+fn math_asin(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.asin()))
 }
 
-fn math_acos(args: &[Value]) -> Result<Value, String> {
+fn math_acos(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.acos()))
 }
 
-fn math_atan(args: &[Value]) -> Result<Value, String> {
+fn math_atan(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.atan()))
 }
 
-fn math_atan2(args: &[Value]) -> Result<Value, String> {
+fn math_atan2(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let y = get_arg(args, 0);
     let x = get_arg(args, 1);
     Ok(Value::number(y.atan2(x)))
@@ -251,32 +253,32 @@ fn math_atan2(args: &[Value]) -> Result<Value, String> {
 // Hyperbolic
 // ============================================================================
 
-fn math_sinh(args: &[Value]) -> Result<Value, String> {
+fn math_sinh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.sinh()))
 }
 
-fn math_cosh(args: &[Value]) -> Result<Value, String> {
+fn math_cosh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.cosh()))
 }
 
-fn math_tanh(args: &[Value]) -> Result<Value, String> {
+fn math_tanh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.tanh()))
 }
 
-fn math_asinh(args: &[Value]) -> Result<Value, String> {
+fn math_asinh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.asinh()))
 }
 
-fn math_acosh(args: &[Value]) -> Result<Value, String> {
+fn math_acosh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.acosh()))
 }
 
-fn math_atanh(args: &[Value]) -> Result<Value, String> {
+fn math_atanh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.atanh()))
 }
@@ -285,7 +287,7 @@ fn math_atanh(args: &[Value]) -> Result<Value, String> {
 // Min/Max/Random
 // ============================================================================
 
-fn math_min(args: &[Value]) -> Result<Value, String> {
+fn math_min(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     if args.is_empty() {
         return Ok(Value::number(f64::INFINITY));
     }
@@ -304,7 +306,7 @@ fn math_min(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(result))
 }
 
-fn math_max(args: &[Value]) -> Result<Value, String> {
+fn math_max(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     if args.is_empty() {
         return Ok(Value::number(f64::NEG_INFINITY));
     }
@@ -323,7 +325,7 @@ fn math_max(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(result))
 }
 
-fn math_random(_args: &[Value]) -> Result<Value, String> {
+fn math_random(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     // Simple xorshift64 PRNG (for demonstration; real impl should use thread_rng)
     use std::cell::Cell;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -358,7 +360,7 @@ fn math_random(_args: &[Value]) -> Result<Value, String> {
 // Special Methods
 // ============================================================================
 
-fn math_clz32(args: &[Value]) -> Result<Value, String> {
+fn math_clz32(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     // ToUint32
     let n = if x.is_nan() || x.is_infinite() {
@@ -369,7 +371,7 @@ fn math_clz32(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(n.leading_zeros() as f64))
 }
 
-fn math_imul(args: &[Value]) -> Result<Value, String> {
+fn math_imul(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let a = get_arg(args, 0);
     let b = get_arg(args, 1);
 
@@ -390,14 +392,14 @@ fn math_imul(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(result as f64))
 }
 
-fn math_fround(args: &[Value]) -> Result<Value, String> {
+fn math_fround(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
     // Round to 32-bit float and back
     let f32_val = x as f32;
     Ok(Value::number(f32_val as f64))
 }
 
-fn math_f16round(args: &[Value]) -> Result<Value, String> {
+fn math_f16round(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let x = get_arg(args, 0);
 
     // Handle special cases
@@ -502,108 +504,135 @@ mod tests {
 
     #[test]
     fn test_math_abs() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            math_abs(&[Value::number(-5.0)]).unwrap().as_number(),
+            math_abs(&[Value::number(-5.0)], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(5.0)
         );
         assert_eq!(
-            math_abs(&[Value::number(5.0)]).unwrap().as_number(),
+            math_abs(&[Value::number(5.0)], mm).unwrap().as_number(),
             Some(5.0)
         );
     }
 
     #[test]
     fn test_math_ceil() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            math_ceil(&[Value::number(1.1)]).unwrap().as_number(),
+            math_ceil(&[Value::number(1.1)], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(2.0)
         );
         assert_eq!(
-            math_ceil(&[Value::number(-1.1)]).unwrap().as_number(),
+            math_ceil(&[Value::number(-1.1)], mm).unwrap().as_number(),
             Some(-1.0)
         );
     }
 
     #[test]
     fn test_math_floor() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            math_floor(&[Value::number(1.9)]).unwrap().as_number(),
+            math_floor(&[Value::number(1.9)], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(1.0)
         );
         assert_eq!(
-            math_floor(&[Value::number(-1.1)]).unwrap().as_number(),
+            math_floor(&[Value::number(-1.1)], mm).unwrap().as_number(),
             Some(-2.0)
         );
     }
 
     #[test]
     fn test_math_round() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            math_round(&[Value::number(1.5)]).unwrap().as_number(),
+            math_round(&[Value::number(1.5)], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(2.0)
         );
         assert_eq!(
-            math_round(&[Value::number(1.4)]).unwrap().as_number(),
+            math_round(&[Value::number(1.4)], mm).unwrap().as_number(),
             Some(1.0)
         );
     }
 
     #[test]
     fn test_math_trunc() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            math_trunc(&[Value::number(1.9)]).unwrap().as_number(),
+            math_trunc(&[Value::number(1.9)], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(1.0)
         );
         assert_eq!(
-            math_trunc(&[Value::number(-1.9)]).unwrap().as_number(),
+            math_trunc(&[Value::number(-1.9)], mm).unwrap().as_number(),
             Some(-1.0)
         );
     }
 
     #[test]
     fn test_math_sign() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            math_sign(&[Value::number(5.0)]).unwrap().as_number(),
+            math_sign(&[Value::number(5.0)], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(1.0)
         );
         assert_eq!(
-            math_sign(&[Value::number(-5.0)]).unwrap().as_number(),
+            math_sign(&[Value::number(-5.0)], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(-1.0)
         );
         assert_eq!(
-            math_sign(&[Value::number(0.0)]).unwrap().as_number(),
+            math_sign(&[Value::number(0.0)], mm).unwrap().as_number(),
             Some(0.0)
         );
     }
 
     #[test]
     fn test_math_sqrt() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            math_sqrt(&[Value::number(4.0)]).unwrap().as_number(),
+            math_sqrt(&[Value::number(4.0)], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(2.0)
         );
         assert_eq!(
-            math_sqrt(&[Value::number(9.0)]).unwrap().as_number(),
+            math_sqrt(&[Value::number(9.0)], mm).unwrap().as_number(),
             Some(3.0)
         );
     }
 
     #[test]
     fn test_math_cbrt() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            math_cbrt(&[Value::number(8.0)]).unwrap().as_number(),
+            math_cbrt(&[Value::number(8.0)], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(2.0)
         );
         assert_eq!(
-            math_cbrt(&[Value::number(27.0)]).unwrap().as_number(),
+            math_cbrt(&[Value::number(27.0)], mm).unwrap().as_number(),
             Some(3.0)
         );
     }
 
     #[test]
     fn test_math_pow() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            math_pow(&[Value::number(2.0), Value::number(3.0)])
+            math_pow(&[Value::number(2.0), Value::number(3.0)], mm)
                 .unwrap()
                 .as_number(),
             Some(8.0)
@@ -612,8 +641,9 @@ mod tests {
 
     #[test]
     fn test_math_hypot() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            math_hypot(&[Value::number(3.0), Value::number(4.0)])
+            math_hypot(&[Value::number(3.0), Value::number(4.0)], mm)
                 .unwrap()
                 .as_number(),
             Some(5.0)
@@ -622,76 +652,95 @@ mod tests {
 
     #[test]
     fn test_math_exp() {
-        let result = math_exp(&[Value::number(1.0)]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = math_exp(&[Value::number(1.0)], mm).unwrap();
         let n = result.as_number().unwrap();
         assert!((n - std::f64::consts::E).abs() < 1e-10);
     }
 
     #[test]
     fn test_math_log() {
-        let result = math_log(&[Value::number(std::f64::consts::E)]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = math_log(&[Value::number(std::f64::consts::E)], mm).unwrap();
         let n = result.as_number().unwrap();
         assert!((n - 1.0).abs() < 1e-10);
     }
 
     #[test]
     fn test_math_trig() {
+        let mm = Arc::new(memory::MemoryManager::test());
         // sin(0) = 0
         assert_eq!(
-            math_sin(&[Value::number(0.0)]).unwrap().as_number(),
+            math_sin(&[Value::number(0.0)], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(0.0)
         );
         // cos(0) = 1
         assert_eq!(
-            math_cos(&[Value::number(0.0)]).unwrap().as_number(),
+            math_cos(&[Value::number(0.0)], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(1.0)
         );
         // tan(0) = 0
         assert_eq!(
-            math_tan(&[Value::number(0.0)]).unwrap().as_number(),
+            math_tan(&[Value::number(0.0)], mm).unwrap().as_number(),
             Some(0.0)
         );
     }
 
     #[test]
     fn test_math_min_max() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            math_min(&[Value::number(1.0), Value::number(2.0), Value::number(3.0)])
-                .unwrap()
-                .as_number(),
+            math_min(
+                &[Value::number(1.0), Value::number(2.0), Value::number(3.0)],
+                mm.clone()
+            )
+            .unwrap()
+            .as_number(),
             Some(1.0)
         );
         assert_eq!(
-            math_max(&[Value::number(1.0), Value::number(2.0), Value::number(3.0)])
-                .unwrap()
-                .as_number(),
+            math_max(
+                &[Value::number(1.0), Value::number(2.0), Value::number(3.0)],
+                mm
+            )
+            .unwrap()
+            .as_number(),
             Some(3.0)
         );
     }
 
     #[test]
     fn test_math_random() {
-        let result = math_random(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = math_random(&[], mm).unwrap();
         let n = result.as_number().unwrap();
         assert!((0.0..1.0).contains(&n));
     }
 
     #[test]
     fn test_math_clz32() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            math_clz32(&[Value::number(1.0)]).unwrap().as_number(),
+            math_clz32(&[Value::number(1.0)], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(31.0)
         );
         assert_eq!(
-            math_clz32(&[Value::number(0.0)]).unwrap().as_number(),
+            math_clz32(&[Value::number(0.0)], mm).unwrap().as_number(),
             Some(32.0)
         );
     }
 
     #[test]
     fn test_math_imul() {
+        let mm = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            math_imul(&[Value::number(3.0), Value::number(4.0)])
+            math_imul(&[Value::number(3.0), Value::number(4.0)], mm)
                 .unwrap()
                 .as_number(),
             Some(12.0)
@@ -700,27 +749,33 @@ mod tests {
 
     #[test]
     fn test_math_fround() {
+        let mm = Arc::new(memory::MemoryManager::test());
         // 1.5 can be exactly represented in f32
         assert_eq!(
-            math_fround(&[Value::number(1.5)]).unwrap().as_number(),
+            math_fround(&[Value::number(1.5)], mm).unwrap().as_number(),
             Some(1.5)
         );
     }
 
     #[test]
     fn test_math_f16round() {
+        let mm = Arc::new(memory::MemoryManager::test());
         // Test that f16round works for common values
         assert_eq!(
-            math_f16round(&[Value::number(0.0)]).unwrap().as_number(),
+            math_f16round(&[Value::number(0.0)], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(0.0)
         );
         assert_eq!(
-            math_f16round(&[Value::number(1.0)]).unwrap().as_number(),
+            math_f16round(&[Value::number(1.0)], mm.clone())
+                .unwrap()
+                .as_number(),
             Some(1.0)
         );
         // f16 can represent 65504 (max normal)
         assert_eq!(
-            math_f16round(&[Value::number(65504.0)])
+            math_f16round(&[Value::number(65504.0)], mm)
                 .unwrap()
                 .as_number(),
             Some(65504.0)

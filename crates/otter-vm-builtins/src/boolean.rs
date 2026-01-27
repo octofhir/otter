@@ -4,9 +4,11 @@
 //! - valueOf - returns primitive boolean value
 //! - toString - returns "true" or "false"
 
+use otter_vm_core::memory;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
-use otter_vm_runtime::{Op, op_native};
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
+use std::sync::Arc;
 
 /// Get Boolean ops for extension registration
 pub fn ops() -> Vec<Op> {
@@ -44,7 +46,7 @@ fn to_boolean(val: &Value) -> bool {
 // =============================================================================
 
 /// Boolean.prototype.valueOf() - returns the primitive value of a Boolean object
-fn boolean_value_of(args: &[Value]) -> Result<Value, String> {
+fn boolean_value_of(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match args.first() {
         Some(v) if v.is_boolean() => Ok(v.clone()),
         Some(v) => {
@@ -56,7 +58,7 @@ fn boolean_value_of(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Boolean.prototype.toString() - returns a string representing the boolean
-fn boolean_to_string(args: &[Value]) -> Result<Value, String> {
+fn boolean_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let b = match args.first() {
         Some(v) if v.is_boolean() => v.as_boolean().unwrap(),
         Some(v) => to_boolean(v),
@@ -85,14 +87,15 @@ mod tests {
 
     #[test]
     fn test_value_of_boolean() {
+        let memory_manager = Arc::new(memory::MemoryManager::test());
         assert_eq!(
-            boolean_value_of(&[Value::boolean(true)])
+            boolean_value_of(&[Value::boolean(true)], memory_manager.clone())
                 .unwrap()
                 .as_boolean(),
             Some(true)
         );
         assert_eq!(
-            boolean_value_of(&[Value::boolean(false)])
+            boolean_value_of(&[Value::boolean(false)], memory_manager.clone())
                 .unwrap()
                 .as_boolean(),
             Some(false)
@@ -101,21 +104,22 @@ mod tests {
 
     #[test]
     fn test_value_of_coercion() {
+        let memory_manager = Arc::new(memory::MemoryManager::test());
         // Numbers
         assert_eq!(
-            boolean_value_of(&[Value::number(0.0)])
+            boolean_value_of(&[Value::number(0.0)], memory_manager.clone())
                 .unwrap()
                 .as_boolean(),
             Some(false)
         );
         assert_eq!(
-            boolean_value_of(&[Value::number(42.0)])
+            boolean_value_of(&[Value::number(42.0)], memory_manager.clone())
                 .unwrap()
                 .as_boolean(),
             Some(true)
         );
         assert_eq!(
-            boolean_value_of(&[Value::number(f64::NAN)])
+            boolean_value_of(&[Value::number(f64::NAN)], memory_manager.clone())
                 .unwrap()
                 .as_boolean(),
             Some(false)
@@ -123,31 +127,41 @@ mod tests {
 
         // Integers
         assert_eq!(
-            boolean_value_of(&[Value::int32(0)]).unwrap().as_boolean(),
+            boolean_value_of(&[Value::int32(0)], memory_manager.clone())
+                .unwrap()
+                .as_boolean(),
             Some(false)
         );
         assert_eq!(
-            boolean_value_of(&[Value::int32(1)]).unwrap().as_boolean(),
+            boolean_value_of(&[Value::int32(1)], memory_manager.clone())
+                .unwrap()
+                .as_boolean(),
             Some(true)
         );
 
         // Strings
         assert_eq!(
-            boolean_value_of(&[str_val("")]).unwrap().as_boolean(),
+            boolean_value_of(&[str_val("")], memory_manager.clone())
+                .unwrap()
+                .as_boolean(),
             Some(false)
         );
         assert_eq!(
-            boolean_value_of(&[str_val("hello")]).unwrap().as_boolean(),
+            boolean_value_of(&[str_val("hello")], memory_manager.clone())
+                .unwrap()
+                .as_boolean(),
             Some(true)
         );
 
         // Null/undefined
         assert_eq!(
-            boolean_value_of(&[Value::null()]).unwrap().as_boolean(),
+            boolean_value_of(&[Value::null()], memory_manager.clone())
+                .unwrap()
+                .as_boolean(),
             Some(false)
         );
         assert_eq!(
-            boolean_value_of(&[Value::undefined()])
+            boolean_value_of(&[Value::undefined()], memory_manager.clone())
                 .unwrap()
                 .as_boolean(),
             Some(false)
@@ -156,27 +170,29 @@ mod tests {
 
     #[test]
     fn test_to_string() {
-        let result = boolean_to_string(&[Value::boolean(true)]).unwrap();
+        let memory_manager = Arc::new(memory::MemoryManager::test());
+        let result = boolean_to_string(&[Value::boolean(true)], memory_manager.clone()).unwrap();
         assert_str_result(&result, "true");
 
-        let result = boolean_to_string(&[Value::boolean(false)]).unwrap();
+        let result = boolean_to_string(&[Value::boolean(false)], memory_manager.clone()).unwrap();
         assert_str_result(&result, "false");
     }
 
     #[test]
     fn test_to_string_coercion() {
+        let memory_manager = Arc::new(memory::MemoryManager::test());
         // Truthy values
-        let result = boolean_to_string(&[Value::number(42.0)]).unwrap();
+        let result = boolean_to_string(&[Value::number(42.0)], memory_manager.clone()).unwrap();
         assert_str_result(&result, "true");
 
         // Falsy values
-        let result = boolean_to_string(&[Value::number(0.0)]).unwrap();
+        let result = boolean_to_string(&[Value::number(0.0)], memory_manager.clone()).unwrap();
         assert_str_result(&result, "false");
 
-        let result = boolean_to_string(&[str_val("")]).unwrap();
+        let result = boolean_to_string(&[str_val("")], memory_manager.clone()).unwrap();
         assert_str_result(&result, "false");
 
-        let result = boolean_to_string(&[Value::null()]).unwrap();
+        let result = boolean_to_string(&[Value::null()], memory_manager.clone()).unwrap();
         assert_str_result(&result, "false");
     }
 }

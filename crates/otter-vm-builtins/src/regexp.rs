@@ -7,9 +7,10 @@
 //! - Symbol methods: match, matchAll, replace, search, split
 
 use dashmap::DashMap;
+use otter_vm_core::memory;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
-use otter_vm_runtime::{Op, op_native};
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use regress::{Flags, Regex, escape};
 use std::sync::{Arc, OnceLock};
 
@@ -145,7 +146,7 @@ fn match_to_strings(input: &JsString, mat: &regress::Match) -> Vec<String> {
 
 /// RegExp.escape(string) - ES2026
 /// Escapes all regex special characters in the string
-fn regexp_escape(args: &[Value]) -> Result<Value, String> {
+fn regexp_escape(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let s = args
         .first()
         .and_then(|v| v.as_string())
@@ -160,7 +161,7 @@ fn regexp_escape(args: &[Value]) -> Result<Value, String> {
 // =============================================================================
 
 /// RegExp.prototype.source - returns the pattern string
-fn regexp_source(args: &[Value]) -> Result<Value, String> {
+fn regexp_source(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let pattern = args
         .first()
         .and_then(|v| v.as_string())
@@ -169,7 +170,7 @@ fn regexp_source(args: &[Value]) -> Result<Value, String> {
 }
 
 /// RegExp.prototype.flags - returns the flags string
-fn regexp_flags(args: &[Value]) -> Result<Value, String> {
+fn regexp_flags(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let flags = args
         .get(1)
         .and_then(|v| v.as_string())
@@ -179,7 +180,7 @@ fn regexp_flags(args: &[Value]) -> Result<Value, String> {
 }
 
 /// RegExp.prototype.global - returns true if 'g' flag is set
-fn regexp_global(args: &[Value]) -> Result<Value, String> {
+fn regexp_global(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let flags = args
         .get(1)
         .and_then(|v| v.as_string())
@@ -189,7 +190,7 @@ fn regexp_global(args: &[Value]) -> Result<Value, String> {
 }
 
 /// RegExp.prototype.ignoreCase - returns true if 'i' flag is set
-fn regexp_ignore_case(args: &[Value]) -> Result<Value, String> {
+fn regexp_ignore_case(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let flags = args
         .get(1)
         .and_then(|v| v.as_string())
@@ -199,7 +200,7 @@ fn regexp_ignore_case(args: &[Value]) -> Result<Value, String> {
 }
 
 /// RegExp.prototype.multiline - returns true if 'm' flag is set
-fn regexp_multiline(args: &[Value]) -> Result<Value, String> {
+fn regexp_multiline(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let flags = args
         .get(1)
         .and_then(|v| v.as_string())
@@ -209,7 +210,7 @@ fn regexp_multiline(args: &[Value]) -> Result<Value, String> {
 }
 
 /// RegExp.prototype.dotAll - returns true if 's' flag is set (ES2018)
-fn regexp_dot_all(args: &[Value]) -> Result<Value, String> {
+fn regexp_dot_all(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let flags = args
         .get(1)
         .and_then(|v| v.as_string())
@@ -219,7 +220,7 @@ fn regexp_dot_all(args: &[Value]) -> Result<Value, String> {
 }
 
 /// RegExp.prototype.sticky - returns true if 'y' flag is set
-fn regexp_sticky(args: &[Value]) -> Result<Value, String> {
+fn regexp_sticky(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let flags = args
         .get(1)
         .and_then(|v| v.as_string())
@@ -229,7 +230,7 @@ fn regexp_sticky(args: &[Value]) -> Result<Value, String> {
 }
 
 /// RegExp.prototype.unicode - returns true if 'u' flag is set
-fn regexp_unicode(args: &[Value]) -> Result<Value, String> {
+fn regexp_unicode(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let flags = args
         .get(1)
         .and_then(|v| v.as_string())
@@ -239,7 +240,7 @@ fn regexp_unicode(args: &[Value]) -> Result<Value, String> {
 }
 
 /// RegExp.prototype.unicodeSets - returns true if 'v' flag is set (ES2024)
-fn regexp_unicode_sets(args: &[Value]) -> Result<Value, String> {
+fn regexp_unicode_sets(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let flags = args
         .get(1)
         .and_then(|v| v.as_string())
@@ -249,7 +250,7 @@ fn regexp_unicode_sets(args: &[Value]) -> Result<Value, String> {
 }
 
 /// RegExp.prototype.hasIndices - returns true if 'd' flag is set (ES2022)
-fn regexp_has_indices(args: &[Value]) -> Result<Value, String> {
+fn regexp_has_indices(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let flags = args
         .get(1)
         .and_then(|v| v.as_string())
@@ -263,7 +264,7 @@ fn regexp_has_indices(args: &[Value]) -> Result<Value, String> {
 // =============================================================================
 
 /// RegExp.prototype.test(string) - returns true if pattern matches
-fn regexp_test(args: &[Value]) -> Result<Value, String> {
+fn regexp_test(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let (pattern, flags) = parse_regex_args(args).ok_or("Invalid RegExp")?;
     let input = args
         .get(2)
@@ -277,7 +278,7 @@ fn regexp_test(args: &[Value]) -> Result<Value, String> {
 
 /// RegExp.prototype.exec(string) - returns match array or null
 /// Returns: [fullMatch, ...captureGroups] with index and input properties
-fn regexp_exec(args: &[Value]) -> Result<Value, String> {
+fn regexp_exec(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let (pattern, flags) = parse_regex_args(args).ok_or("Invalid RegExp")?;
     let input = args
         .get(2)
@@ -301,7 +302,7 @@ fn regexp_exec(args: &[Value]) -> Result<Value, String> {
 }
 
 /// RegExp.prototype.toString() - returns "/pattern/flags"
-fn regexp_to_string(args: &[Value]) -> Result<Value, String> {
+fn regexp_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let pattern = args
         .first()
         .and_then(|v| v.as_string())
@@ -324,7 +325,7 @@ fn regexp_to_string(args: &[Value]) -> Result<Value, String> {
 // =============================================================================
 
 /// RegExp.prototype[Symbol.match](string) - used by String.prototype.match
-fn regexp_match(args: &[Value]) -> Result<Value, String> {
+fn regexp_match(args: &[Value], mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let (pattern, flags) = parse_regex_args(args).ok_or("Invalid RegExp")?;
     let input = args
         .get(2)
@@ -349,13 +350,13 @@ fn regexp_match(args: &[Value]) -> Result<Value, String> {
         }
     } else {
         // Non-global: same as exec
-        regexp_exec(args)
+        regexp_exec(args, mm)
     }
 }
 
 /// RegExp.prototype[Symbol.matchAll](string) - ES2020
 /// Returns iterator of all matches with capture groups
-fn regexp_match_all(args: &[Value]) -> Result<Value, String> {
+fn regexp_match_all(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let (pattern, flags) = parse_regex_args(args).ok_or("Invalid RegExp")?;
     let input = args
         .get(2)
@@ -383,7 +384,7 @@ fn regexp_match_all(args: &[Value]) -> Result<Value, String> {
 }
 
 /// RegExp.prototype[Symbol.replace](string, replacement) - used by String.prototype.replace
-fn regexp_replace(args: &[Value]) -> Result<Value, String> {
+fn regexp_replace(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let (pattern, flags) = parse_regex_args(args).ok_or("Invalid RegExp")?;
     let input = args
         .get(2)
@@ -417,7 +418,7 @@ fn regexp_replace(args: &[Value]) -> Result<Value, String> {
 
 /// RegExp.prototype[Symbol.search](string) - used by String.prototype.search
 /// Returns index of first match, or -1 if not found
-fn regexp_search(args: &[Value]) -> Result<Value, String> {
+fn regexp_search(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let (pattern, flags) = parse_regex_args(args).ok_or("Invalid RegExp")?;
     let input = args
         .get(2)
@@ -433,7 +434,7 @@ fn regexp_search(args: &[Value]) -> Result<Value, String> {
 }
 
 /// RegExp.prototype[Symbol.split](string, limit) - used by String.prototype.split
-fn regexp_split(args: &[Value]) -> Result<Value, String> {
+fn regexp_split(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let (pattern, flags) = parse_regex_args(args).ok_or("Invalid RegExp")?;
     let input = args
         .get(2)
@@ -474,101 +475,110 @@ mod tests {
 
     #[test]
     fn test_regexp_escape() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let args = vec![Value::string(JsString::intern("hello.world*"))];
-        let result = regexp_escape(&args).unwrap();
+        let result = regexp_escape(&args, mm).unwrap();
         let s = result.as_string().unwrap().to_string();
         assert_eq!(s, r"hello\.world\*");
     }
 
     #[test]
     fn test_regexp_test() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let args = vec![
             Value::string(JsString::intern(r"\d+")),
             Value::string(JsString::intern("")),
             Value::string(JsString::intern("abc123def")),
         ];
-        let result = regexp_test(&args).unwrap();
+        let result = regexp_test(&args, mm).unwrap();
         assert_eq!(result.as_boolean(), Some(true));
     }
 
     #[test]
     fn test_regexp_test_no_match() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let args = vec![
             Value::string(JsString::intern(r"\d+")),
             Value::string(JsString::intern("")),
             Value::string(JsString::intern("abcdef")),
         ];
-        let result = regexp_test(&args).unwrap();
+        let result = regexp_test(&args, mm).unwrap();
         assert_eq!(result.as_boolean(), Some(false));
     }
 
     #[test]
     fn test_regexp_test_case_insensitive() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let args = vec![
             Value::string(JsString::intern("hello")),
             Value::string(JsString::intern("i")),
             Value::string(JsString::intern("HELLO WORLD")),
         ];
-        let result = regexp_test(&args).unwrap();
+        let result = regexp_test(&args, mm).unwrap();
         assert_eq!(result.as_boolean(), Some(true));
     }
 
     #[test]
     fn test_regexp_search() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let args = vec![
             Value::string(JsString::intern(r"\d+")),
             Value::string(JsString::intern("")),
             Value::string(JsString::intern("abc123def")),
         ];
-        let result = regexp_search(&args).unwrap();
+        let result = regexp_search(&args, mm).unwrap();
         assert_eq!(result.as_int32(), Some(3));
     }
 
     #[test]
     fn test_regexp_search_not_found() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let args = vec![
             Value::string(JsString::intern(r"\d+")),
             Value::string(JsString::intern("")),
             Value::string(JsString::intern("abcdef")),
         ];
-        let result = regexp_search(&args).unwrap();
+        let result = regexp_search(&args, mm).unwrap();
         assert_eq!(result.as_int32(), Some(-1));
     }
 
     #[test]
     fn test_regexp_replace() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let args = vec![
             Value::string(JsString::intern(r"\d+")),
             Value::string(JsString::intern("")),
             Value::string(JsString::intern("abc123def")),
             Value::string(JsString::intern("XXX")),
         ];
-        let result = regexp_replace(&args).unwrap();
+        let result = regexp_replace(&args, mm).unwrap();
         let s = result.as_string().unwrap().to_string();
         assert_eq!(s, "abcXXXdef");
     }
 
     #[test]
     fn test_regexp_replace_global() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let args = vec![
             Value::string(JsString::intern(r"\d+")),
             Value::string(JsString::intern("g")),
             Value::string(JsString::intern("a1b2c3")),
             Value::string(JsString::intern("X")),
         ];
-        let result = regexp_replace(&args).unwrap();
+        let result = regexp_replace(&args, mm).unwrap();
         let s = result.as_string().unwrap().to_string();
         assert_eq!(s, "aXbXcX");
     }
 
     #[test]
     fn test_regexp_split() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let args = vec![
             Value::string(JsString::intern(r"\s+")),
             Value::string(JsString::intern("")),
             Value::string(JsString::intern("hello world foo")),
         ];
-        let result = regexp_split(&args).unwrap();
+        let result = regexp_split(&args, mm).unwrap();
         let s = result.as_string().unwrap().to_string();
         assert!(s.contains("hello"));
         assert!(s.contains("world"));
@@ -577,37 +587,52 @@ mod tests {
 
     #[test]
     fn test_regexp_to_string() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let args = vec![
             Value::string(JsString::intern(r"\d+")),
             Value::string(JsString::intern("gi")),
         ];
-        let result = regexp_to_string(&args).unwrap();
+        let result = regexp_to_string(&args, mm).unwrap();
         let s = result.as_string().unwrap().to_string();
         assert_eq!(s, r"/\d+/gi");
     }
 
     #[test]
     fn test_regexp_flags() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let args = vec![
             Value::string(JsString::intern("test")),
             Value::string(JsString::intern("gim")),
         ];
 
-        assert_eq!(regexp_global(&args).unwrap().as_boolean(), Some(true));
-        assert_eq!(regexp_ignore_case(&args).unwrap().as_boolean(), Some(true));
-        assert_eq!(regexp_multiline(&args).unwrap().as_boolean(), Some(true));
-        assert_eq!(regexp_dot_all(&args).unwrap().as_boolean(), Some(false));
-        assert_eq!(regexp_sticky(&args).unwrap().as_boolean(), Some(false));
+        assert_eq!(
+            regexp_global(&args, mm.clone()).unwrap().as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            regexp_ignore_case(&args, mm.clone()).unwrap().as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            regexp_multiline(&args, mm.clone()).unwrap().as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            regexp_dot_all(&args, mm.clone()).unwrap().as_boolean(),
+            Some(false)
+        );
+        assert_eq!(regexp_sticky(&args, mm).unwrap().as_boolean(), Some(false));
     }
 
     #[test]
     fn test_regexp_exec() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let args = vec![
             Value::string(JsString::intern(r"(\d+)")),
             Value::string(JsString::intern("")),
             Value::string(JsString::intern("abc123def")),
         ];
-        let result = regexp_exec(&args).unwrap();
+        let result = regexp_exec(&args, mm).unwrap();
         let s = result.as_string().unwrap().to_string();
         assert!(s.contains("123"));
         assert!(s.contains("\"index\":3"));
@@ -615,12 +640,13 @@ mod tests {
 
     #[test]
     fn test_regexp_exec_no_match() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let args = vec![
             Value::string(JsString::intern(r"\d+")),
             Value::string(JsString::intern("")),
             Value::string(JsString::intern("abcdef")),
         ];
-        let result = regexp_exec(&args).unwrap();
+        let result = regexp_exec(&args, mm).unwrap();
         assert!(result.is_null());
     }
 }

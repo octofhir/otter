@@ -451,6 +451,31 @@ impl LiteralValidator {
                         match next_ch {
                             // Valid single-character escapes
                             // Legacy octal escape sequences (deprecated in strict mode)
+                            'x' => {
+                                if !self.validate_hex_escape_sequence(&mut chars) {
+                                    return Err(CompileError::invalid_literal(
+                                        "Invalid hexadecimal escape sequence".to_string(),
+                                        start_pos + position as u32,
+                                        start_pos + position as u32 + 1,
+                                    ));
+                                }
+                                position += 2; // two hex digits
+                            }
+                            'u' => {
+                                let consumed = self.validate_unicode_escape_sequence(&mut chars).map_err(|e| {
+                                    match e {
+                                        CompileError::InvalidLiteral { message, .. } => {
+                                            CompileError::invalid_literal(
+                                                message,
+                                                start_pos + position as u32,
+                                                start_pos + position as u32 + 1,
+                                            )
+                                        }
+                                        other => other,
+                                    }
+                                })?;
+                                position += consumed;
+                            }
                             '0'..='7' => {
                                 // Special case for \0: allowed in strict mode if not followed by decimal digit
                                 if next_ch == '0' {

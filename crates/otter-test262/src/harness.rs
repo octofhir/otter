@@ -28,9 +28,10 @@ pub fn create_harness_extension() -> Extension {
 /// Set up the Test262 harness on a context
 pub fn setup_harness(ctx: &mut VmContext) {
     let global = ctx.global();
+    let mm = Arc::clone(global.memory_manager());
 
     // Create $262 object
-    let obj_262 = Arc::new(JsObject::new(None));
+    let obj_262 = Arc::new(JsObject::new(None, Arc::clone(&mm)));
 
     // $262.global - Reference to the global object
     obj_262.set(PropertyKey::string("global"), Value::object(global.clone()));
@@ -38,10 +39,13 @@ pub fn setup_harness(ctx: &mut VmContext) {
     // $262.gc() - Trigger garbage collection
     obj_262.set(
         PropertyKey::string("gc"),
-        Value::native_function(|_args| {
+        Value::native_function(
+            |_args, _mm| {
             // Trigger VM GC if supported
             Ok(Value::undefined())
-        }),
+            },
+            Arc::clone(&mm),
+        ),
     );
 
     global.set(PropertyKey::string("$262"), Value::object(obj_262));
@@ -49,28 +53,34 @@ pub fn setup_harness(ctx: &mut VmContext) {
     // Set up print function (for test output)
     global.set(
         PropertyKey::string("print"),
-        Value::native_function(|args| {
-            for arg in args {
-                println!("{}", format_value(arg));
-            }
-            Ok(Value::undefined())
-        }),
+        Value::native_function(
+            |args, _mm| {
+                for arg in args {
+                    println!("{}", format_value(arg));
+                }
+                Ok(Value::undefined())
+            },
+            Arc::clone(&mm),
+        ),
     );
 
     // Set up $DONE for async tests
     // async tests call $DONE() or $DONE(error) when complete
     global.set(
         PropertyKey::string("$DONE"),
-        Value::native_function(|args| {
-            if let Some(err) = args.first() {
-                if !err.is_undefined() && !err.is_null() {
-                    // Test failed
-                    return Err(format!("Test failed via $DONE: {:?}", err));
+        Value::native_function(
+            |args, _mm| {
+                if let Some(err) = args.first() {
+                    if !err.is_undefined() && !err.is_null() {
+                        // Test failed
+                        return Err(format!("Test failed via $DONE: {:?}", err));
+                    }
                 }
-            }
-            // Test passed
-            Ok(Value::undefined())
-        }),
+                // Test passed
+                Ok(Value::undefined())
+            },
+            Arc::clone(&mm),
+        ),
     );
 
     // Set up assert functions
@@ -92,7 +102,8 @@ fn format_value(value: &Value) -> String {
 
 /// Set up assert helpers
 fn setup_assert(global: &Arc<JsObject>) {
-    let assert_obj = Arc::new(JsObject::new(None));
+    let mm = Arc::clone(global.memory_manager());
+    let assert_obj = Arc::new(JsObject::new(None, mm));
 
     // assert(condition, message) - Basic assertion
     // assert.sameValue(actual, expected, message) - Strict equality assertion
@@ -132,11 +143,12 @@ impl HarnessFiles {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otter_engine::VmRuntime;
 
     #[test]
     fn test_harness_setup() {
-        let global = Arc::new(JsObject::new(None));
-        let mut ctx = VmContext::new(global.clone());
+        let runtime = VmRuntime::new();
+        let mut ctx = runtime.create_context();
 
         setup_harness(&mut ctx);
 

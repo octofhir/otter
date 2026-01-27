@@ -12,7 +12,7 @@
 //! - **Identity elimination**: Remove Move r0, r0; double negation; etc.
 
 use otter_vm_bytecode::instruction::Instruction;
-use otter_vm_bytecode::operand::Register;
+use otter_vm_bytecode::operand::{JumpOffset, Register};
 use std::collections::HashMap;
 
 /// Peephole optimizer that optimizes bytecode instructions
@@ -32,6 +32,13 @@ impl PeepholeOptimizer {
     pub fn optimize(&mut self, instructions: &mut Vec<Instruction>) -> bool {
         self.changed = false;
 
+        // Keep the instruction stream compact between passes so that:
+        // - window-based optimizations work on adjacent instructions
+        // - jump offsets are kept correct when instructions are removed
+        if self.compact_and_patch_jumps(instructions) {
+            self.changed = true;
+        }
+
         // Run multiple passes until no more changes
         loop {
             let changed_this_pass = self.optimize_pass(instructions);
@@ -39,6 +46,11 @@ impl PeepholeOptimizer {
                 break;
             }
             self.changed = true;
+
+            // Any pass may have introduced Nops (or removed instructions).
+            // Compact and patch control-flow offsets so the next pass sees a
+            // consistent instruction index space.
+            self.compact_and_patch_jumps(instructions);
         }
 
         self.changed
@@ -47,13 +59,6 @@ impl PeepholeOptimizer {
     /// Single optimization pass
     fn optimize_pass(&mut self, instructions: &mut Vec<Instruction>) -> bool {
         let mut changed = false;
-
-        // Remove Nops first
-        let len_before = instructions.len();
-        instructions.retain(|i| !matches!(i, Instruction::Nop));
-        if instructions.len() != len_before {
-            changed = true;
-        }
 
         // Dead code elimination - remove unreachable code after return/throw
         if self.eliminate_dead_code(instructions) {
@@ -109,14 +114,96 @@ impl PeepholeOptimizer {
             i += 1;
         }
 
-        // Final Nop removal
-        let len_before = instructions.len();
-        instructions.retain(|i| !matches!(i, Instruction::Nop));
-        if instructions.len() != len_before {
-            changed = true;
+        changed
+    }
+
+    /// Remove `Nop`s and patch relative jump offsets.
+    ///
+    /// Many optimizations replace instructions with `Nop` (or remove windows),
+    /// which changes instruction indices once we compact the stream. Since jump
+    /// offsets are encoded relative to the current instruction index, we must
+    /// rewrite them after compaction.
+    fn compact_and_patch_jumps(&self, instructions: &mut Vec<Instruction>) -> bool {
+        if !instructions.iter().any(|i| matches!(i, Instruction::Nop)) {
+            return false;
         }
 
-        changed
+        let old = std::mem::take(instructions);
+        let old_len = old.len();
+
+        let mut new = Vec::with_capacity(old_len);
+        let mut new_to_old = Vec::with_capacity(old_len);
+        let mut old_to_new: Vec<Option<usize>> = vec![None; old_len];
+
+        for (old_idx, instr) in old.into_iter().enumerate() {
+            if matches!(instr, Instruction::Nop) {
+                continue;
+            }
+            let new_idx = new.len();
+            old_to_new[old_idx] = Some(new_idx);
+            new_to_old.push(old_idx);
+            new.push(instr);
+        }
+
+        let new_len = new.len();
+
+        // Map an old index to the new index of the next non-Nop instruction at or after it.
+        // This allows redirecting jumps that previously targeted a now-removed instruction.
+        let mut next_live_new = vec![new_len; old_len + 1];
+        let mut next = new_len;
+        for old_idx in (0..old_len).rev() {
+            if let Some(mapped) = old_to_new[old_idx] {
+                next = mapped;
+            }
+            next_live_new[old_idx] = next;
+        }
+        next_live_new[old_len] = new_len;
+
+        for (new_idx, instr) in new.iter_mut().enumerate() {
+            let old_idx = new_to_old[new_idx];
+            Self::patch_offsets(instr, old_idx, new_idx, old_len, new_len, &next_live_new);
+        }
+
+        *instructions = new;
+        true
+    }
+
+    fn patch_offsets(
+        instr: &mut Instruction,
+        old_idx: usize,
+        new_idx: usize,
+        old_len: usize,
+        new_len: usize,
+        next_live_new: &[usize],
+    ) {
+        let map_target = |old_target: i32| -> usize {
+            debug_assert!(
+                old_target >= 0 && old_target <= old_len as i32,
+                "invalid jump target {old_target} (len={old_len})"
+            );
+            if old_target as usize == old_len {
+                // One-past-the-end (implicit return) stays one-past-the-end after compaction.
+                return new_len;
+            }
+            next_live_new[old_target as usize]
+        };
+
+        let patch = |offset: JumpOffset| -> JumpOffset {
+            let old_target = old_idx as i32 + offset.0;
+            let new_target = map_target(old_target);
+            JumpOffset(new_target as i32 - new_idx as i32)
+        };
+
+        match instr {
+            Instruction::Jump { offset } => *offset = patch(*offset),
+            Instruction::JumpIfTrue { offset, .. } => *offset = patch(*offset),
+            Instruction::JumpIfFalse { offset, .. } => *offset = patch(*offset),
+            Instruction::JumpIfNullish { offset, .. } => *offset = patch(*offset),
+            Instruction::JumpIfNotNullish { offset, .. } => *offset = patch(*offset),
+            Instruction::TryStart { catch_offset } => *catch_offset = patch(*catch_offset),
+            Instruction::ForInNext { offset, .. } => *offset = patch(*offset),
+            _ => {}
+        }
     }
 
     /// Eliminate dead code after unconditional control flow
@@ -866,6 +953,35 @@ mod tests {
         assert!(matches!(
             instructions[0],
             Instruction::LoadInt8 { dst: Register(0), value: 1 }
+        ));
+    }
+
+    #[test]
+    fn test_compaction_patches_jump_offsets() {
+        let mut optimizer = PeepholeOptimizer::new();
+        // The Move is optimized to Nop and then removed, so the jump must be patched.
+        let mut instructions = vec![
+            // Make index 2 a jump target so dead-code-elim doesn't wipe it after the Jump.
+            Instruction::JumpIfTrue {
+                cond: Register(0),
+                offset: JumpOffset(2),
+            },
+            // Jump over one Nop and land at Return.
+            Instruction::Jump { offset: JumpOffset(3) },
+            Instruction::LoadInt8 { dst: Register(1), value: 7 },
+            Instruction::Move {
+                dst: Register(0),
+                src: Register(0),
+            },
+            Instruction::Return { src: Register(1) },
+        ];
+
+        let changed = optimizer.optimize(&mut instructions);
+        assert!(changed);
+        assert_eq!(instructions.len(), 4);
+        assert!(matches!(
+            instructions[1],
+            Instruction::Jump { offset: JumpOffset(2) }
         ));
     }
 

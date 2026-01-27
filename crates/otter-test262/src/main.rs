@@ -56,8 +56,8 @@ struct Args {
 struct MemoryTracker {
     system: System,
     pid: Pid,
-    peak_memory_bytes: u64,
-    initial_memory_bytes: u64,
+    peak_memory_kib: u64,
+    initial_memory_kib: u64,
 }
 
 impl MemoryTracker {
@@ -77,8 +77,8 @@ impl MemoryTracker {
         Self {
             system,
             pid,
-            peak_memory_bytes: initial,
-            initial_memory_bytes: initial,
+            peak_memory_kib: initial,
+            initial_memory_kib: initial,
         }
     }
 
@@ -90,8 +90,8 @@ impl MemoryTracker {
         );
         if let Some(process) = self.system.process(self.pid) {
             let current = process.memory();
-            if current > self.peak_memory_bytes {
-                self.peak_memory_bytes = current;
+            if current > self.peak_memory_kib {
+                self.peak_memory_kib = current;
             }
         }
     }
@@ -104,16 +104,17 @@ impl MemoryTracker {
         );
         self.system
             .process(self.pid)
-            .map(|p| p.memory() as f64 / 1024.0 / 1024.0)
+            // sysinfo reports memory in kibibytes (KiB)
+            .map(|p| p.memory() as f64 / 1024.0)
             .unwrap_or(0.0)
     }
 
     fn peak_memory_mb(&self) -> f64 {
-        self.peak_memory_bytes as f64 / 1024.0 / 1024.0
+        self.peak_memory_kib as f64 / 1024.0
     }
 
     fn initial_memory_mb(&self) -> f64 {
-        self.initial_memory_bytes as f64 / 1024.0 / 1024.0
+        self.initial_memory_kib as f64 / 1024.0
     }
 
     fn memory_increase_mb(&mut self) -> f64 {

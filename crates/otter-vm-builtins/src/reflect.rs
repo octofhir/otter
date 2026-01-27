@@ -18,7 +18,8 @@
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value as VmValue;
-use otter_vm_runtime::{Op, op_native};
+use otter_vm_core::memory;
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::sync::Arc;
 
 /// Get Reflect ops for extension registration
@@ -103,7 +104,10 @@ fn get_target_object(value: &VmValue) -> Result<Arc<JsObject>, String> {
 
 /// Reflect.get(target, propertyKey, receiver?)
 /// Returns the value of the property
-fn native_reflect_get(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_reflect_get(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let target = args
         .first()
         .ok_or("Reflect.get requires a target argument")?;
@@ -120,7 +124,10 @@ fn native_reflect_get(args: &[VmValue]) -> Result<VmValue, String> {
 
 /// Reflect.set(target, propertyKey, value, receiver?)
 /// Returns true if the property was set successfully
-fn native_reflect_set(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_reflect_set(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let target = args
         .first()
         .ok_or("Reflect.set requires a target argument")?;
@@ -139,7 +146,10 @@ fn native_reflect_set(args: &[VmValue]) -> Result<VmValue, String> {
 
 /// Reflect.has(target, propertyKey)
 /// Returns true if the property exists
-fn native_reflect_has(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_reflect_has(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let target = args
         .first()
         .ok_or("Reflect.has requires a target argument")?;
@@ -155,7 +165,10 @@ fn native_reflect_has(args: &[VmValue]) -> Result<VmValue, String> {
 
 /// Reflect.deleteProperty(target, propertyKey)
 /// Returns true if the property was deleted
-fn native_reflect_delete_property(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_reflect_delete_property(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let target = args
         .first()
         .ok_or("Reflect.deleteProperty requires a target argument")?;
@@ -172,7 +185,10 @@ fn native_reflect_delete_property(args: &[VmValue]) -> Result<VmValue, String> {
 
 /// Reflect.ownKeys(target)
 /// Returns an array of the target's own property keys
-fn native_reflect_own_keys(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_reflect_own_keys(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let target = args
         .first()
         .ok_or("Reflect.ownKeys requires a target argument")?;
@@ -186,7 +202,7 @@ fn native_reflect_own_keys(args: &[VmValue]) -> Result<VmValue, String> {
         .filter(|k| !matches!(k, PropertyKey::Symbol(_)))
         .collect();
 
-    let result = Arc::new(JsObject::array(filtered_keys.len()));
+    let result = Arc::new(JsObject::array(filtered_keys.len(), Arc::clone(&mm)));
     for (i, key) in filtered_keys.into_iter().enumerate() {
         let key_val = match key {
             PropertyKey::String(s) => VmValue::string(s),
@@ -201,7 +217,10 @@ fn native_reflect_own_keys(args: &[VmValue]) -> Result<VmValue, String> {
 
 /// Reflect.getOwnPropertyDescriptor(target, propertyKey)
 /// Returns the property descriptor or undefined
-fn native_reflect_get_own_property_descriptor(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_reflect_get_own_property_descriptor(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let target = args
         .first()
         .ok_or("Reflect.getOwnPropertyDescriptor requires a target argument")?;
@@ -214,7 +233,7 @@ fn native_reflect_get_own_property_descriptor(args: &[VmValue]) -> Result<VmValu
 
     // Check if property exists
     if let Some(value) = obj.get(&key) {
-        let desc = Arc::new(JsObject::new(None));
+        let desc = Arc::new(JsObject::new(None, Arc::clone(&mm)));
         desc.set("value".into(), value);
         desc.set("writable".into(), VmValue::boolean(true));
         desc.set("enumerable".into(), VmValue::boolean(true));
@@ -227,7 +246,10 @@ fn native_reflect_get_own_property_descriptor(args: &[VmValue]) -> Result<VmValu
 
 /// Reflect.defineProperty(target, propertyKey, attributes)
 /// Returns true if the property was defined successfully
-fn native_reflect_define_property(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_reflect_define_property(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let target = args
         .first()
         .ok_or("Reflect.defineProperty requires a target argument")?;
@@ -311,7 +333,10 @@ fn native_reflect_define_property(args: &[VmValue]) -> Result<VmValue, String> {
 
 /// Reflect.getPrototypeOf(target)
 /// Returns the prototype of the target
-fn native_reflect_get_prototype_of(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_reflect_get_prototype_of(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let target = args
         .first()
         .ok_or("Reflect.getPrototypeOf requires a target argument")?;
@@ -326,7 +351,10 @@ fn native_reflect_get_prototype_of(args: &[VmValue]) -> Result<VmValue, String> 
 
 /// Reflect.setPrototypeOf(target, prototype)
 /// Returns true if the prototype was set successfully
-fn native_reflect_set_prototype_of(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_reflect_set_prototype_of(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let target = args
         .first()
         .ok_or("Reflect.setPrototypeOf requires a target argument")?;
@@ -350,7 +378,10 @@ fn native_reflect_set_prototype_of(args: &[VmValue]) -> Result<VmValue, String> 
 
 /// Reflect.isExtensible(target)
 /// Returns true if the target is extensible
-fn native_reflect_is_extensible(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_reflect_is_extensible(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let target = args
         .first()
         .ok_or("Reflect.isExtensible requires a target argument")?;
@@ -361,7 +392,10 @@ fn native_reflect_is_extensible(args: &[VmValue]) -> Result<VmValue, String> {
 
 /// Reflect.preventExtensions(target)
 /// Returns true if extensions were prevented
-fn native_reflect_prevent_extensions(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_reflect_prevent_extensions(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let target = args
         .first()
         .ok_or("Reflect.preventExtensions requires a target argument")?;
@@ -377,24 +411,31 @@ mod tests {
 
     #[test]
     fn test_reflect_get() {
-        let obj = Arc::new(JsObject::new(None));
+        let mm = Arc::new(memory::MemoryManager::test());
+        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
         obj.set("x".into(), VmValue::number(42.0));
 
-        let result =
-            native_reflect_get(&[VmValue::object(obj), VmValue::string(JsString::intern("x"))])
-                .unwrap();
+        let result = native_reflect_get(
+            &[VmValue::object(obj), VmValue::string(JsString::intern("x"))],
+            Arc::clone(&mm),
+        )
+        .unwrap();
 
         assert_eq!(result.as_number(), Some(42.0));
     }
 
     #[test]
     fn test_reflect_get_missing() {
-        let obj = Arc::new(JsObject::new(None));
+        let mm = Arc::new(memory::MemoryManager::test());
+        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
 
-        let result = native_reflect_get(&[
-            VmValue::object(obj),
-            VmValue::string(JsString::intern("missing")),
-        ])
+        let result = native_reflect_get(
+            &[
+                VmValue::object(obj),
+                VmValue::string(JsString::intern("missing")),
+            ],
+            Arc::clone(&mm),
+        )
         .unwrap();
 
         assert!(result.is_undefined());
@@ -402,13 +443,17 @@ mod tests {
 
     #[test]
     fn test_reflect_set() {
-        let obj = Arc::new(JsObject::new(None));
+        let mm = Arc::new(memory::MemoryManager::test());
+        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
 
-        let result = native_reflect_set(&[
-            VmValue::object(Arc::clone(&obj)),
-            VmValue::string(JsString::intern("x")),
-            VmValue::number(99.0),
-        ])
+        let result = native_reflect_set(
+            &[
+                VmValue::object(Arc::clone(&obj)),
+                VmValue::string(JsString::intern("x")),
+                VmValue::number(99.0),
+            ],
+            Arc::clone(&mm),
+        )
         .unwrap();
 
         assert_eq!(result.as_boolean(), Some(true));
@@ -417,31 +462,41 @@ mod tests {
 
     #[test]
     fn test_reflect_has() {
-        let obj = Arc::new(JsObject::new(None));
+        let mm = Arc::new(memory::MemoryManager::test());
+        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
         obj.set("x".into(), VmValue::number(1.0));
 
-        let result = native_reflect_has(&[
-            VmValue::object(Arc::clone(&obj)),
-            VmValue::string(JsString::intern("x")),
-        ])
+        let result = native_reflect_has(
+            &[
+                VmValue::object(Arc::clone(&obj)),
+                VmValue::string(JsString::intern("x")),
+            ],
+            Arc::clone(&mm),
+        )
         .unwrap();
         assert_eq!(result.as_boolean(), Some(true));
 
-        let result =
-            native_reflect_has(&[VmValue::object(obj), VmValue::string(JsString::intern("y"))])
-                .unwrap();
+        let result = native_reflect_has(
+            &[VmValue::object(obj), VmValue::string(JsString::intern("y"))],
+            Arc::clone(&mm),
+        )
+        .unwrap();
         assert_eq!(result.as_boolean(), Some(false));
     }
 
     #[test]
     fn test_reflect_delete_property() {
-        let obj = Arc::new(JsObject::new(None));
+        let mm = Arc::new(memory::MemoryManager::test());
+        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
         obj.set("x".into(), VmValue::number(1.0));
 
-        let result = native_reflect_delete_property(&[
-            VmValue::object(Arc::clone(&obj)),
-            VmValue::string(JsString::intern("x")),
-        ])
+        let result = native_reflect_delete_property(
+            &[
+                VmValue::object(Arc::clone(&obj)),
+                VmValue::string(JsString::intern("x")),
+            ],
+            Arc::clone(&mm),
+        )
         .unwrap();
 
         assert_eq!(result.as_boolean(), Some(true));
@@ -450,11 +505,12 @@ mod tests {
 
     #[test]
     fn test_reflect_own_keys() {
-        let obj = Arc::new(JsObject::new(None));
+        let mm = Arc::new(memory::MemoryManager::test());
+        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
         obj.set("a".into(), VmValue::number(1.0));
         obj.set("b".into(), VmValue::number(2.0));
 
-        let result = native_reflect_own_keys(&[VmValue::object(obj)]).unwrap();
+        let result = native_reflect_own_keys(&[VmValue::object(obj)], Arc::clone(&mm)).unwrap();
 
         let arr = result.as_array().unwrap();
         assert!(arr.is_array());
@@ -463,23 +519,28 @@ mod tests {
 
     #[test]
     fn test_reflect_get_prototype_of() {
-        let proto = Arc::new(JsObject::new(None));
-        let obj = Arc::new(JsObject::new(Some(Arc::clone(&proto))));
+        let mm = Arc::new(memory::MemoryManager::test());
+        let proto = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let obj = Arc::new(JsObject::new(Some(Arc::clone(&proto)), Arc::clone(&mm)));
 
-        let result = native_reflect_get_prototype_of(&[VmValue::object(obj)]).unwrap();
+        let result =
+            native_reflect_get_prototype_of(&[VmValue::object(obj)], Arc::clone(&mm)).unwrap();
 
         assert!(result.is_object());
     }
 
     #[test]
     fn test_reflect_is_extensible() {
-        let obj = Arc::new(JsObject::new(None));
+        let mm = Arc::new(memory::MemoryManager::test());
+        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
 
-        let result = native_reflect_is_extensible(&[VmValue::object(Arc::clone(&obj))]).unwrap();
+        let result =
+            native_reflect_is_extensible(&[VmValue::object(Arc::clone(&obj))], Arc::clone(&mm))
+                .unwrap();
         assert_eq!(result.as_boolean(), Some(true));
 
         obj.prevent_extensions();
-        let result = native_reflect_is_extensible(&[VmValue::object(obj)]).unwrap();
+        let result = native_reflect_is_extensible(&[VmValue::object(obj)], Arc::clone(&mm)).unwrap();
         assert_eq!(result.as_boolean(), Some(false));
     }
 }

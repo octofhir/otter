@@ -146,8 +146,9 @@ mod tests {
 
     #[test]
     fn test_proxy_creation() {
-        let target = Arc::new(JsObject::new(None));
-        let handler = Arc::new(JsObject::new(None));
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let target = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let handler = Arc::new(JsObject::new(None, memory_manager.clone()));
         let proxy = JsProxy::new(target, handler);
 
         assert!(!proxy.is_revoked());
@@ -157,8 +158,9 @@ mod tests {
 
     #[test]
     fn test_proxy_revoke() {
-        let target = Arc::new(JsObject::new(None));
-        let handler = Arc::new(JsObject::new(None));
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let target = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let handler = Arc::new(JsObject::new(None, memory_manager.clone()));
         let proxy = JsProxy::new(target, handler);
 
         assert!(!proxy.is_revoked());
@@ -170,8 +172,9 @@ mod tests {
 
     #[test]
     fn test_revocable_proxy() {
-        let target = Arc::new(JsObject::new(None));
-        let handler = Arc::new(JsObject::new(None));
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let target = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let handler = Arc::new(JsObject::new(None, memory_manager.clone()));
         let RevocableProxy { proxy, revoke } = JsProxy::revocable(target, handler);
 
         assert!(!proxy.is_revoked());
@@ -181,8 +184,9 @@ mod tests {
 
     #[test]
     fn test_get_trap_missing() {
-        let target = Arc::new(JsObject::new(None));
-        let handler = Arc::new(JsObject::new(None));
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let target = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let handler = Arc::new(JsObject::new(None, memory_manager.clone()));
         let proxy = JsProxy::new(target, handler);
 
         assert!(proxy.get_trap("get").is_none());

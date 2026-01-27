@@ -32,41 +32,41 @@ pub fn setup_global_object(global: &Arc<JsObject>) {
     // Global functions
     global.set(
         PropertyKey::string("eval"),
-        Value::native_function(global_eval),
+        Value::native_function(global_eval, global.memory_manager().clone()),
     );
     global.set(
         PropertyKey::string("isFinite"),
-        Value::native_function(global_is_finite),
+        Value::native_function(global_is_finite, global.memory_manager().clone()),
     );
     global.set(
         PropertyKey::string("isNaN"),
-        Value::native_function(global_is_nan),
+        Value::native_function(global_is_nan, global.memory_manager().clone()),
     );
     global.set(
         PropertyKey::string("parseInt"),
-        Value::native_function(global_parse_int),
+        Value::native_function(global_parse_int, global.memory_manager().clone()),
     );
     global.set(
         PropertyKey::string("parseFloat"),
-        Value::native_function(global_parse_float),
+        Value::native_function(global_parse_float, global.memory_manager().clone()),
     );
 
     // URI encoding/decoding functions
     global.set(
         PropertyKey::string("encodeURI"),
-        Value::native_function(global_encode_uri),
+        Value::native_function(global_encode_uri, global.memory_manager().clone()),
     );
     global.set(
         PropertyKey::string("decodeURI"),
-        Value::native_function(global_decode_uri),
+        Value::native_function(global_decode_uri, global.memory_manager().clone()),
     );
     global.set(
         PropertyKey::string("encodeURIComponent"),
-        Value::native_function(global_encode_uri_component),
+        Value::native_function(global_encode_uri_component, global.memory_manager().clone()),
     );
     global.set(
         PropertyKey::string("decodeURIComponent"),
-        Value::native_function(global_decode_uri_component),
+        Value::native_function(global_decode_uri_component, global.memory_manager().clone()),
     );
 
     // Standard built-in objects
@@ -75,6 +75,7 @@ pub fn setup_global_object(global: &Arc<JsObject>) {
 
 /// Set up standard built-in constructors and their prototypes
 fn setup_builtin_constructors(global: &Arc<JsObject>) {
+    let mm = global.memory_manager().clone();
     let builtins = [
         "Object",
         "Function",
@@ -95,106 +96,129 @@ fn setup_builtin_constructors(global: &Arc<JsObject>) {
     ];
 
     for name in builtins {
-        let proto = Arc::new(JsObject::new(None));
+        let proto = Arc::new(JsObject::new(None, mm.clone()));
         // Create constructor based on type
         let ctor = if name == "Boolean" {
-            Value::native_function(|args| {
-                let b = if let Some(val) = args.get(0) {
-                    to_boolean(val)
-                } else {
-                    false // to_boolean(undefined) is false
-                };
-                Ok(Value::boolean(b))
-            })
+            Value::native_function(
+                |args: &[Value], _mm| {
+                    let b = if let Some(val) = args.get(0) {
+                        to_boolean(val)
+                    } else {
+                        false // to_boolean(undefined) is false
+                    };
+                    Ok(Value::boolean(b))
+                },
+                mm.clone(),
+            )
         } else if name == "RegExp" {
-            let proto = Arc::clone(&proto);
-            Value::native_function(move |args| {
-                let pattern = args
-                    .get(0)
-                    .map(|v| to_string(v))
-                    .unwrap_or_else(|| "".to_string());
-                let flags = args
-                    .get(1)
-                    .map(|v| to_string(v))
-                    .unwrap_or_else(|| "".to_string());
+            let proto_clone = Arc::clone(&proto);
+            let mm_clone = mm.clone();
+            Value::native_function(
+                move |args: &[Value], mm_inner| {
+                    let pattern = args
+                        .get(0)
+                        .map(|v| to_string(v))
+                        .unwrap_or_else(|| "".to_string());
+                    let flags = args
+                        .get(1)
+                        .map(|v| to_string(v))
+                        .unwrap_or_else(|| "".to_string());
 
-                // Get RegExp.prototype from new.target or default?
-                // For now, simpler: create with None (default)
-                // Actually if called as function, RegExp acts as constructor (ES6 NewTarget logic needed?)
-                // OtterVM might not support new.target fully yet or it's implicitly constructor.
-
-                // Construct RegExp object
-                let regex = Arc::new(JsRegExp::new(pattern, flags, Some(Arc::clone(&proto))));
-                Ok(Value::regex(regex))
-            })
+                    // Construct RegExp object
+                    let regex = Arc::new(JsRegExp::new(
+                        pattern,
+                        flags,
+                        Some(Arc::clone(&proto_clone)),
+                        mm_inner,
+                    ));
+                    Ok(Value::regex(regex))
+                },
+                mm_clone,
+            )
         } else if name == "BigInt" {
-            Value::native_function(|args| {
-                if let Some(val) = args.get(0) {
-                    if let Some(n) = val.as_number() {
-                        if n.is_nan() || n.is_infinite() {
-                            return Err("RangeError: invalid BigInt".to_string());
+            Value::native_function(
+                |args: &[Value], _mm| {
+                    if let Some(val) = args.get(0) {
+                        if let Some(n) = val.as_number() {
+                            if n.is_nan() || n.is_infinite() {
+                                return Err("RangeError: invalid BigInt".to_string());
+                            }
+                            if n.trunc() != n {
+                                return Err("RangeError: The number cannot be converted to a BigInt because it is not an integer".to_string());
+                            }
+                            return Ok(Value::bigint(format!("{:.0}", n)));
                         }
-                        if n.trunc() != n {
-                            return Err("RangeError: The number cannot be converted to a BigInt because it is not an integer".to_string());
+                        if val.is_string() {
+                            let s = to_string(val);
+                            return Ok(Value::bigint(s));
                         }
-                        return Ok(Value::bigint(format!("{:.0}", n)));
-                    }
-                    if val.is_string() {
+                        if val.is_boolean() {
+                            return Ok(Value::bigint(if val.to_boolean() {
+                                "1".to_string()
+                            } else {
+                                "0".to_string()
+                            }));
+                        }
+                        // Fallback
                         let s = to_string(val);
-                        return Ok(Value::bigint(s));
+                        Ok(Value::bigint(s))
+                    } else {
+                        Err("TypeError: Cannot convert undefined to a BigInt".to_string())
                     }
-                    if val.is_boolean() {
-                        return Ok(Value::bigint(if val.to_boolean() {
-                            "1".to_string()
-                        } else {
-                            "0".to_string()
-                        }));
-                    }
-                    // Fallback
-                    let s = to_string(val);
-                    Ok(Value::bigint(s))
-                } else {
-                    Err("TypeError: Cannot convert undefined to a BigInt".to_string())
-                }
-            })
+                },
+                mm.clone(),
+            )
         } else {
-            Value::native_function(|args| {
-                // If called as a constructor (which we assume for now for these builtins),
-                // and arguments are present, we might want to set properties.
-                // For Error types, setting 'message' is crucial.
-                if let Some(msg) = args.get(0) {
-                    let obj = JsObject::new(None);
-                    obj.set(PropertyKey::string("message"), msg.clone());
-                    return Ok(Value::object(Arc::new(obj)));
-                }
-                Ok(Value::undefined())
-            })
+            let mm_clone = mm.clone();
+            Value::native_function(
+                move |args: &[Value], mm_inner| {
+                    // If called as a constructor (which we assume for now for these builtins),
+                    // and arguments are present, we might want to set properties.
+                    // For Error types, setting 'message' is crucial.
+                    if let Some(msg) = args.get(0) {
+                        let obj = JsObject::new(None, mm_inner);
+                        obj.set(PropertyKey::string("message"), msg.clone());
+                        return Ok(Value::object(Arc::new(obj)));
+                    }
+                    Ok(Value::undefined())
+                },
+                mm_clone,
+            )
         };
 
         // Add basic toString to prototypes
         if name == "Object" {
             proto.set(
                 PropertyKey::string("toString"),
-                Value::native_function(|_| Ok(Value::string(JsString::intern("[object Object]")))),
+                Value::native_function(
+                    |_, _mm| Ok(Value::string(JsString::intern("[object Object]"))),
+                    mm.clone(),
+                ),
             );
         } else if name == "Function" {
             proto.set(
                 PropertyKey::string("toString"),
-                Value::native_function(|_| {
-                    Ok(Value::string(JsString::intern(
-                        "function () { [native code] }",
-                    )))
-                }),
+                Value::native_function(
+                    |_, _mm| {
+                        Ok(Value::string(JsString::intern(
+                            "function () { [native code] }",
+                        )))
+                    },
+                    mm.clone(),
+                ),
             );
         } else if name == "String" {
             proto.set(
                 PropertyKey::string("toString"),
-                Value::native_function(|args| {
-                    if let Some(this_val) = args.get(0) {
-                        return Ok(Value::string(JsString::intern(&to_string(this_val))));
-                    }
-                    Ok(Value::string(JsString::intern("")))
-                }),
+                Value::native_function(
+                    |args: &[Value], _mm| {
+                        if let Some(this_val) = args.get(0) {
+                            return Ok(Value::string(JsString::intern(&to_string(this_val))));
+                        }
+                        Ok(Value::string(JsString::intern("")))
+                    },
+                    mm.clone(),
+                ),
             );
         }
 
@@ -209,27 +233,30 @@ fn setup_builtin_constructors(global: &Arc<JsObject>) {
             if name == "String" {
                 ctor_obj.set(
                     PropertyKey::string("fromCharCode"),
-                    Value::native_function(|args| {
-                        let mut result = String::new();
-                        for arg in args {
-                            let n = if let Some(n) = arg.as_number() {
-                                n
-                            } else if let Some(s) = arg.as_string() {
-                                // Basic ToNumber for strings (decimal only for now)
-                                s.as_str().parse::<f64>().unwrap_or(f64::NAN)
-                            } else {
-                                // Default to 0 for others (simplified)
-                                0.0
-                            };
+                    Value::native_function(
+                        |args: &[Value], _mm| {
+                            let mut result = String::new();
+                            for arg in args {
+                                let n = if let Some(n) = arg.as_number() {
+                                    n
+                                } else if let Some(s) = arg.as_string() {
+                                    // Basic ToNumber for strings (decimal only for now)
+                                    s.as_str().parse::<f64>().unwrap_or(f64::NAN)
+                                } else {
+                                    // Default to 0 for others (simplified)
+                                    0.0
+                                };
 
-                            if !n.is_nan() {
-                                if let Some(c) = std::char::from_u32(n as u32) {
-                                    result.push(c);
+                                if !n.is_nan() {
+                                    if let Some(c) = std::char::from_u32(n as u32) {
+                                        result.push(c);
+                                    }
                                 }
                             }
-                        }
-                        Ok(Value::string(JsString::intern(&result)))
-                    }),
+                            Ok(Value::string(JsString::intern(&result)))
+                        },
+                        mm.clone(),
+                    ),
                 );
             }
         }
@@ -238,101 +265,113 @@ fn setup_builtin_constructors(global: &Arc<JsObject>) {
         if name == "String" {
             proto.set(
                 PropertyKey::string("indexOf"),
-                Value::native_function(|args| {
-                    if let (Some(this_val), Some(search_val)) = (args.get(0), args.get(1)) {
-                        let this_str = to_string(this_val);
-                        let search_str = to_string(search_val);
-                        if let Some(pos) = this_str.find(&search_str) {
-                            return Ok(Value::number(pos as f64));
+                Value::native_function(
+                    |args: &[Value], _mm| {
+                        if let (Some(this_val), Some(search_val)) = (args.get(0), args.get(1)) {
+                            let this_str = to_string(this_val);
+                            let search_str = to_string(search_val);
+                            if let Some(pos) = this_str.find(&search_str) {
+                                return Ok(Value::number(pos as f64));
+                            }
                         }
-                    }
-                    Ok(Value::number(-1.0))
-                }),
+                        Ok(Value::number(-1.0))
+                    },
+                    mm.clone(),
+                ),
             );
             proto.set(
                 PropertyKey::string("valueOf"),
-                Value::native_function(|args| {
-                    if let Some(this_val) = args.get(0) {
-                        return Ok(this_val.clone());
-                    }
-                    Ok(Value::undefined())
-                }),
+                Value::native_function(
+                    |args: &[Value], _mm| {
+                        if let Some(this_val) = args.get(0) {
+                            return Ok::<Value, String>(this_val.clone());
+                        }
+                        Ok(Value::undefined())
+                    },
+                    mm.clone(),
+                ),
             );
         } else if name == "RegExp" {
             proto.set(
                 PropertyKey::string("test"),
-                Value::native_function(|args| {
-                    let regex = args
-                        .get(0)
-                        .and_then(|v| v.as_regex())
-                        .ok_or_else(|| {
+                Value::native_function(
+                    |args: &[Value], _mm| {
+                        let regex = args.get(0).and_then(|v| v.as_regex()).ok_or_else(|| {
                             "TypeError: RegExp.prototype.test called on incompatible receiver"
                                 .to_string()
                         })?;
-                    let input_js = args
-                        .get(1)
-                        .map(to_js_string)
-                        .unwrap_or_else(|| JsString::intern("undefined"));
-                    Ok(Value::boolean(regex.exec(&input_js, 0).is_some()))
-                }),
+                        let input_js = args
+                            .get(1)
+                            .map(to_js_string)
+                            .unwrap_or_else(|| JsString::intern("undefined"));
+                        Ok(Value::boolean(regex.exec(&input_js, 0).is_some()))
+                    },
+                    mm.clone(),
+                ),
             );
             proto.set(
                 PropertyKey::string("exec"),
-                Value::native_function(|args| {
-                    let this_val_opt = args.get(0);
-                    let regex = this_val_opt.and_then(|v| v.as_regex()).ok_or_else(|| {
-                        "TypeError: RegExp.prototype.exec called on incompatible receiver"
-                            .to_string()
-                    })?;
+                Value::native_function(
+                    |args: &[Value], mm_inner| {
+                        let this_val_opt = args.get(0);
+                        let regex = this_val_opt.and_then(|v| v.as_regex()).ok_or_else(|| {
+                            "TypeError: RegExp.prototype.exec called on incompatible receiver"
+                                .to_string()
+                        })?;
 
-                    let input_js = args
-                        .get(1)
-                        .map(to_js_string)
-                        .unwrap_or_else(|| JsString::intern("undefined"));
+                        let input_js = args
+                            .get(1)
+                            .map(to_js_string)
+                            .unwrap_or_else(|| JsString::intern("undefined"));
 
-                    if let Some(mat) = regex.exec(&input_js, 0) {
-                        // Create result array
-                        let mut out = Vec::with_capacity(mat.captures.len() + 1);
-                        for idx in 0..=mat.captures.len() {
-                            let val = mat
-                                .group(idx)
-                                .map(|range| {
-                                    let slice = &input_js.as_utf16()[range.start..range.end];
-                                    Value::string(JsString::intern_utf16(slice))
-                                })
-                                .unwrap_or(Value::undefined());
-                            out.push(val);
+                        if let Some(mat) = regex.exec(&input_js, 0) {
+                            // Create result array
+                            let mut out = Vec::with_capacity(mat.captures.len() + 1);
+                            for idx in 0..=mat.captures.len() {
+                                let val = mat
+                                    .group(idx)
+                                    .map(|range| {
+                                        let slice = &input_js.as_utf16()[range.start..range.end];
+                                        Value::string(JsString::intern_utf16(slice))
+                                    })
+                                    .unwrap_or(Value::undefined());
+                                out.push(val);
+                            }
+
+                            let arr = JsObject::array(out.len(), mm_inner);
+                            for (i, val) in out.into_iter().enumerate() {
+                                arr.set(PropertyKey::Index(i as u32), val);
+                            }
+                            arr.set(
+                                PropertyKey::string("index"),
+                                Value::number(mat.start() as f64),
+                            );
+                            arr.set(
+                                PropertyKey::string("input"),
+                                Value::string(Arc::clone(&input_js)),
+                            );
+                            arr.set(PropertyKey::string("groups"), Value::undefined());
+
+                            Ok(Value::array(Arc::new(arr)))
+                        } else {
+                            Ok(Value::null())
                         }
-
-                        let arr = JsObject::array(out.len());
-                        for (i, val) in out.into_iter().enumerate() {
-                            arr.set(PropertyKey::Index(i as u32), val);
-                        }
-                        arr.set(
-                            PropertyKey::string("index"),
-                            Value::number(mat.start() as f64),
-                        );
-                        arr.set(
-                            PropertyKey::string("input"),
-                            Value::string(Arc::clone(&input_js)),
-                        );
-                        arr.set(PropertyKey::string("groups"), Value::undefined());
-
-                        Ok(Value::array(Arc::new(arr)))
-                    } else {
-                        Ok(Value::null())
-                    }
-                }),
+                    },
+                    mm.clone(),
+                ),
             );
         } else if name == "Object" {
             proto.set(
                 PropertyKey::string("valueOf"),
-                Value::native_function(|args| {
-                    if let Some(this_val) = args.get(0) {
-                        return Ok(this_val.clone());
-                    }
-                    Ok(Value::undefined())
-                }),
+                Value::native_function(
+                    |args: &[Value], _mm| {
+                        if let Some(this_val) = args.get(0) {
+                            return Ok::<Value, String>(this_val.clone());
+                        }
+                        Ok(Value::undefined())
+                    },
+                    mm.clone(),
+                ),
             );
         }
 
@@ -354,7 +393,7 @@ fn get_arg(args: &[Value], index: usize) -> Value {
 ///
 /// Note: Direct eval is not supported in this VM for security reasons.
 /// Indirect eval throws an error.
-fn global_eval(args: &[Value]) -> Result<Value, String> {
+fn global_eval(args: &[Value], _mm: Arc<crate::memory::MemoryManager>) -> Result<Value, String> {
     // Per spec: if argument is not a string, return it unchanged
     let arg = get_arg(args, 0);
 
@@ -368,21 +407,27 @@ fn global_eval(args: &[Value]) -> Result<Value, String> {
 }
 
 /// `isFinite(number)` - Determines whether the passed value is a finite number.
-fn global_is_finite(args: &[Value]) -> Result<Value, String> {
+fn global_is_finite(
+    args: &[Value],
+    _mm: Arc<crate::memory::MemoryManager>,
+) -> Result<Value, String> {
     let value = get_arg(args, 0);
     let num = to_number(&value);
     Ok(Value::boolean(num.is_finite()))
 }
 
 /// `isNaN(number)` - Determines whether a value is NaN.
-fn global_is_nan(args: &[Value]) -> Result<Value, String> {
+fn global_is_nan(args: &[Value], _mm: Arc<crate::memory::MemoryManager>) -> Result<Value, String> {
     let value = get_arg(args, 0);
     let num = to_number(&value);
     Ok(Value::boolean(num.is_nan()))
 }
 
 /// `parseInt(string, radix)` - Parses a string and returns an integer.
-fn global_parse_int(args: &[Value]) -> Result<Value, String> {
+fn global_parse_int(
+    args: &[Value],
+    _mm: Arc<crate::memory::MemoryManager>,
+) -> Result<Value, String> {
     let input = get_arg(args, 0);
     let radix_arg = args.get(1);
 
@@ -455,7 +500,10 @@ fn global_parse_int(args: &[Value]) -> Result<Value, String> {
 }
 
 /// `parseFloat(string)` - Parses a string and returns a floating point number.
-fn global_parse_float(args: &[Value]) -> Result<Value, String> {
+fn global_parse_float(
+    args: &[Value],
+    _mm: Arc<crate::memory::MemoryManager>,
+) -> Result<Value, String> {
     let input = get_arg(args, 0);
     let input_str = to_string(&input);
     let trimmed = input_str.trim();
@@ -501,7 +549,10 @@ const URI_UNESCAPED: &str =
 const URI_RESERVED: &str = ";/?:@&=+$,#";
 
 /// `encodeURI(uri)` - Encodes a URI by replacing certain characters.
-fn global_encode_uri(args: &[Value]) -> Result<Value, String> {
+fn global_encode_uri(
+    args: &[Value],
+    _mm: Arc<crate::memory::MemoryManager>,
+) -> Result<Value, String> {
     let input = get_arg(args, 0);
     let uri = to_string(&input);
 
@@ -523,7 +574,10 @@ fn global_encode_uri(args: &[Value]) -> Result<Value, String> {
 }
 
 /// `decodeURI(encodedURI)` - Decodes a URI previously created by encodeURI.
-fn global_decode_uri(args: &[Value]) -> Result<Value, String> {
+fn global_decode_uri(
+    args: &[Value],
+    _mm: Arc<crate::memory::MemoryManager>,
+) -> Result<Value, String> {
     let input = get_arg(args, 0);
     let encoded = to_string(&input);
 
@@ -531,7 +585,10 @@ fn global_decode_uri(args: &[Value]) -> Result<Value, String> {
 }
 
 /// `encodeURIComponent(str)` - Encodes a URI component.
-fn global_encode_uri_component(args: &[Value]) -> Result<Value, String> {
+fn global_encode_uri_component(
+    args: &[Value],
+    _mm: Arc<crate::memory::MemoryManager>,
+) -> Result<Value, String> {
     let input = get_arg(args, 0);
     let component = to_string(&input);
 
@@ -553,7 +610,10 @@ fn global_encode_uri_component(args: &[Value]) -> Result<Value, String> {
 }
 
 /// `decodeURIComponent(encodedURIComponent)` - Decodes a URI component.
-fn global_decode_uri_component(args: &[Value]) -> Result<Value, String> {
+fn global_decode_uri_component(
+    args: &[Value],
+    _mm: Arc<crate::memory::MemoryManager>,
+) -> Result<Value, String> {
     let input = get_arg(args, 0);
     let encoded = to_string(&input);
 
@@ -708,7 +768,8 @@ mod tests {
 
     #[test]
     fn test_global_this_setup() {
-        let global = Arc::new(JsObject::new(None));
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let global = Arc::new(JsObject::new(None, memory_manager));
         setup_global_object(&global);
 
         // globalThis should reference the global object itself
@@ -722,15 +783,16 @@ mod tests {
 
     #[test]
     fn test_is_finite() {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // Finite numbers
         assert_eq!(
-            global_is_finite(&[Value::number(42.0)])
+            global_is_finite(&[Value::number(42.0)], memory_manager.clone())
                 .unwrap()
                 .as_boolean(),
             Some(true)
         );
         assert_eq!(
-            global_is_finite(&[Value::number(0.0)])
+            global_is_finite(&[Value::number(0.0)], memory_manager.clone())
                 .unwrap()
                 .as_boolean(),
             Some(true)
@@ -738,19 +800,19 @@ mod tests {
 
         // Non-finite
         assert_eq!(
-            global_is_finite(&[Value::number(f64::INFINITY)])
+            global_is_finite(&[Value::number(f64::INFINITY)], memory_manager.clone())
                 .unwrap()
                 .as_boolean(),
             Some(false)
         );
         assert_eq!(
-            global_is_finite(&[Value::number(f64::NEG_INFINITY)])
+            global_is_finite(&[Value::number(f64::NEG_INFINITY)], memory_manager.clone())
                 .unwrap()
                 .as_boolean(),
             Some(false)
         );
         assert_eq!(
-            global_is_finite(&[Value::number(f64::NAN)])
+            global_is_finite(&[Value::number(f64::NAN)], memory_manager.clone())
                 .unwrap()
                 .as_boolean(),
             Some(false)
@@ -759,138 +821,198 @@ mod tests {
 
     #[test]
     fn test_is_nan() {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         assert_eq!(
-            global_is_nan(&[Value::number(f64::NAN)])
+            global_is_nan(&[Value::number(f64::NAN)], memory_manager.clone())
                 .unwrap()
                 .as_boolean(),
             Some(true)
         );
         assert_eq!(
-            global_is_nan(&[Value::number(42.0)]).unwrap().as_boolean(),
+            global_is_nan(&[Value::number(42.0)], memory_manager.clone())
+                .unwrap()
+                .as_boolean(),
             Some(false)
         );
         assert_eq!(
-            global_is_nan(&[Value::undefined()]).unwrap().as_boolean(),
+            global_is_nan(&[Value::undefined()], memory_manager.clone())
+                .unwrap()
+                .as_boolean(),
             Some(true)
         );
     }
 
     #[test]
     fn test_parse_int() {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // Basic integers
         assert_eq!(
-            global_parse_int(&[Value::string(JsString::intern("42"))])
-                .unwrap()
-                .as_number(),
+            global_parse_int(
+                &[Value::string(JsString::intern("42"))],
+                memory_manager.clone()
+            )
+            .unwrap()
+            .as_number(),
             Some(42.0)
         );
         assert_eq!(
-            global_parse_int(&[Value::string(JsString::intern("-123"))])
-                .unwrap()
-                .as_number(),
+            global_parse_int(
+                &[Value::string(JsString::intern("-123"))],
+                memory_manager.clone()
+            )
+            .unwrap()
+            .as_number(),
             Some(-123.0)
         );
         assert_eq!(
-            global_parse_int(&[Value::string(JsString::intern("+456"))])
-                .unwrap()
-                .as_number(),
+            global_parse_int(
+                &[Value::string(JsString::intern("+456"))],
+                memory_manager.clone()
+            )
+            .unwrap()
+            .as_number(),
             Some(456.0)
         );
 
         // With radix
         assert_eq!(
-            global_parse_int(&[Value::string(JsString::intern("ff")), Value::number(16.0)])
-                .unwrap()
-                .as_number(),
+            global_parse_int(
+                &[Value::string(JsString::intern("ff")), Value::number(16.0)],
+                memory_manager.clone()
+            )
+            .unwrap()
+            .as_number(),
             Some(255.0)
         );
         assert_eq!(
-            global_parse_int(&[Value::string(JsString::intern("1010")), Value::number(2.0)])
-                .unwrap()
-                .as_number(),
+            global_parse_int(
+                &[Value::string(JsString::intern("1010")), Value::number(2.0)],
+                memory_manager.clone()
+            )
+            .unwrap()
+            .as_number(),
             Some(10.0)
         );
 
         // Hex prefix
         assert_eq!(
-            global_parse_int(&[Value::string(JsString::intern("0xFF"))])
-                .unwrap()
-                .as_number(),
+            global_parse_int(
+                &[Value::string(JsString::intern("0xFF"))],
+                memory_manager.clone()
+            )
+            .unwrap()
+            .as_number(),
             Some(255.0)
         );
 
         // Stops at invalid char
         assert_eq!(
-            global_parse_int(&[Value::string(JsString::intern("123abc"))])
-                .unwrap()
-                .as_number(),
+            global_parse_int(
+                &[Value::string(JsString::intern("123abc"))],
+                memory_manager.clone()
+            )
+            .unwrap()
+            .as_number(),
             Some(123.0)
         );
 
         // Invalid - returns NaN
-        let result = global_parse_int(&[Value::string(JsString::intern("hello"))]).unwrap();
+        let result = global_parse_int(
+            &[Value::string(JsString::intern("hello"))],
+            memory_manager.clone(),
+        )
+        .unwrap();
         assert!(result.is_nan());
         assert!(result.as_number().unwrap().is_nan());
     }
 
     #[test]
     fn test_parse_float() {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         assert_eq!(
-            global_parse_float(&[Value::string(JsString::intern("3.5"))])
-                .unwrap()
-                .as_number(),
+            global_parse_float(
+                &[Value::string(JsString::intern("3.5"))],
+                memory_manager.clone()
+            )
+            .unwrap()
+            .as_number(),
             Some(3.5)
         );
         assert_eq!(
-            global_parse_float(&[Value::string(JsString::intern("-2.5"))])
-                .unwrap()
-                .as_number(),
+            global_parse_float(
+                &[Value::string(JsString::intern("-2.5"))],
+                memory_manager.clone()
+            )
+            .unwrap()
+            .as_number(),
             Some(-2.5)
         );
         assert_eq!(
-            global_parse_float(&[Value::string(JsString::intern("  42  "))])
-                .unwrap()
-                .as_number(),
+            global_parse_float(
+                &[Value::string(JsString::intern("  42  "))],
+                memory_manager.clone()
+            )
+            .unwrap()
+            .as_number(),
             Some(42.0)
         );
         assert_eq!(
-            global_parse_float(&[Value::string(JsString::intern("Infinity"))])
-                .unwrap()
-                .as_number(),
+            global_parse_float(
+                &[Value::string(JsString::intern("Infinity"))],
+                memory_manager.clone()
+            )
+            .unwrap()
+            .as_number(),
             Some(f64::INFINITY)
         );
     }
 
     #[test]
     fn test_encode_uri_component() {
-        let result =
-            global_encode_uri_component(&[Value::string(JsString::intern("hello world"))]).unwrap();
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let result = global_encode_uri_component(
+            &[Value::string(JsString::intern("hello world"))],
+            memory_manager.clone(),
+        )
+        .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "hello%20world");
 
-        let result =
-            global_encode_uri_component(&[Value::string(JsString::intern("a=1&b=2"))]).unwrap();
+        let result = global_encode_uri_component(
+            &[Value::string(JsString::intern("a=1&b=2"))],
+            memory_manager.clone(),
+        )
+        .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "a%3D1%26b%3D2");
     }
 
     #[test]
     fn test_decode_uri_component() {
-        let result =
-            global_decode_uri_component(&[Value::string(JsString::intern("hello%20world"))])
-                .unwrap();
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let result = global_decode_uri_component(
+            &[Value::string(JsString::intern("hello%20world"))],
+            memory_manager.clone(),
+        )
+        .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "hello world");
 
-        let result =
-            global_decode_uri_component(&[Value::string(JsString::intern("a%3D1%26b%3D2"))])
-                .unwrap();
+        let result = global_decode_uri_component(
+            &[Value::string(JsString::intern("a%3D1%26b%3D2"))],
+            memory_manager.clone(),
+        )
+        .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "a=1&b=2");
     }
 
     #[test]
     fn test_encode_uri() {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // encodeURI does not encode reserved characters
-        let result = global_encode_uri(&[Value::string(JsString::intern(
-            "http://example.com/path?q=1",
-        ))])
+        let result = global_encode_uri(
+            &[Value::string(JsString::intern(
+                "http://example.com/path?q=1",
+            ))],
+            memory_manager.clone(),
+        )
         .unwrap();
         assert_eq!(
             result.as_string().unwrap().as_str(),
@@ -898,31 +1020,50 @@ mod tests {
         );
 
         // But does encode other special chars
-        let result = global_encode_uri(&[Value::string(JsString::intern("hello world"))]).unwrap();
+        let result = global_encode_uri(
+            &[Value::string(JsString::intern("hello world"))],
+            memory_manager.clone(),
+        )
+        .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "hello%20world");
     }
 
     #[test]
     fn test_decode_uri() {
-        let result =
-            global_decode_uri(&[Value::string(JsString::intern("hello%20world"))]).unwrap();
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let result = global_decode_uri(
+            &[Value::string(JsString::intern("hello%20world"))],
+            memory_manager.clone(),
+        )
+        .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "hello world");
     }
 
     #[test]
     fn test_eval_non_string() {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // eval with non-string returns the value unchanged
         assert_eq!(
-            global_eval(&[Value::number(42.0)]).unwrap().as_number(),
+            global_eval(&[Value::number(42.0)], memory_manager.clone())
+                .unwrap()
+                .as_number(),
             Some(42.0)
         );
-        assert!(global_eval(&[Value::undefined()]).unwrap().is_undefined());
+        assert!(
+            global_eval(&[Value::undefined()], memory_manager.clone())
+                .unwrap()
+                .is_undefined()
+        );
     }
 
     #[test]
     fn test_eval_string() {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // eval with string is not supported
-        let result = global_eval(&[Value::string(JsString::intern("1 + 1"))]);
+        let result = global_eval(
+            &[Value::string(JsString::intern("1 + 1"))],
+            memory_manager.clone(),
+        );
         assert!(result.is_err());
     }
 }

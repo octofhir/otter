@@ -6,9 +6,10 @@
 //! - Symbol.keyFor() - get key from global symbol
 //! - Well-known symbols: iterator, asyncIterator, toStringTag, hasInstance, toPrimitive
 
+use otter_vm_core::memory;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::{Symbol, Value};
-use otter_vm_runtime::{Op, op_native};
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -66,7 +67,7 @@ pub fn ops() -> Vec<Op> {
 
 /// Create a new unique symbol with optional description
 /// Args: [description: string | undefined]
-fn symbol_create(args: &[Value]) -> Result<Value, String> {
+fn symbol_create(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let description = args.first().and_then(|v| {
         if v.is_undefined() {
             None
@@ -85,7 +86,7 @@ fn symbol_create(args: &[Value]) -> Result<Value, String> {
 
 /// Symbol.for(key) - get or create global symbol
 /// Args: [key: string]
-fn symbol_for(args: &[Value]) -> Result<Value, String> {
+fn symbol_for(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let key = args
         .first()
         .and_then(|v| v.as_string())
@@ -122,7 +123,7 @@ fn symbol_for(args: &[Value]) -> Result<Value, String> {
 
 /// Symbol.keyFor(symbol) - get key for global symbol
 /// Args: [symbol: symbol]
-fn symbol_key_for(args: &[Value]) -> Result<Value, String> {
+fn symbol_key_for(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let sym = args
         .first()
         .and_then(|v| v.as_symbol())
@@ -142,7 +143,7 @@ fn symbol_key_for(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Symbol.prototype.toString() - returns "Symbol(description)"
-fn symbol_to_string(args: &[Value]) -> Result<Value, String> {
+fn symbol_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let sym = args
         .first()
         .and_then(|v| v.as_symbol())
@@ -158,7 +159,7 @@ fn symbol_to_string(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Symbol.prototype.valueOf() - returns the symbol itself
-fn symbol_value_of(args: &[Value]) -> Result<Value, String> {
+fn symbol_value_of(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let val = args.first().ok_or("Symbol.valueOf requires a symbol")?;
 
     if val.is_symbol() {
@@ -169,7 +170,7 @@ fn symbol_value_of(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Symbol.prototype.description getter
-fn symbol_description(args: &[Value]) -> Result<Value, String> {
+fn symbol_description(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let sym = args
         .first()
         .and_then(|v| v.as_symbol())
@@ -183,7 +184,7 @@ fn symbol_description(args: &[Value]) -> Result<Value, String> {
 
 /// Get well-known symbol by name
 /// Args: [name: string]
-fn symbol_get_well_known(args: &[Value]) -> Result<Value, String> {
+fn symbol_get_well_known(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let name = args
         .first()
         .and_then(|v| v.as_string())
@@ -219,7 +220,7 @@ fn symbol_get_well_known(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Get symbol ID (for internal use, e.g., property key conversion)
-fn symbol_get_id(args: &[Value]) -> Result<Value, String> {
+fn symbol_get_id(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let sym = args
         .first()
         .and_then(|v| v.as_symbol())
@@ -239,7 +240,8 @@ mod tests {
 
     #[test]
     fn test_symbol_create() {
-        let result = symbol_create(&[str_val("test")]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = symbol_create(&[str_val("test")], mm).unwrap();
         assert!(result.is_symbol());
 
         let sym = result.as_symbol().unwrap();
@@ -248,7 +250,8 @@ mod tests {
 
     #[test]
     fn test_symbol_create_no_description() {
-        let result = symbol_create(&[Value::undefined()]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = symbol_create(&[Value::undefined()], mm).unwrap();
         assert!(result.is_symbol());
 
         let sym = result.as_symbol().unwrap();
@@ -257,8 +260,9 @@ mod tests {
 
     #[test]
     fn test_symbol_uniqueness() {
-        let sym1 = symbol_create(&[str_val("test")]).unwrap();
-        let sym2 = symbol_create(&[str_val("test")]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let sym1 = symbol_create(&[str_val("test")], mm.clone()).unwrap();
+        let sym2 = symbol_create(&[str_val("test")], mm).unwrap();
 
         let id1 = sym1.as_symbol().unwrap().id;
         let id2 = sym2.as_symbol().unwrap().id;
@@ -271,9 +275,10 @@ mod tests {
 
     #[test]
     fn test_symbol_for_creates_and_reuses() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let key = "my.global.symbol";
-        let sym1 = symbol_for(&[str_val(key)]).unwrap();
-        let sym2 = symbol_for(&[str_val(key)]).unwrap();
+        let sym1 = symbol_for(&[str_val(key)], mm.clone()).unwrap();
+        let sym2 = symbol_for(&[str_val(key)], mm).unwrap();
 
         let id1 = sym1.as_symbol().unwrap().id;
         let id2 = sym2.as_symbol().unwrap().id;
@@ -286,41 +291,46 @@ mod tests {
 
     #[test]
     fn test_symbol_key_for() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let key = "test.key.for";
-        let sym = symbol_for(&[str_val(key)]).unwrap();
+        let sym = symbol_for(&[str_val(key)], mm.clone()).unwrap();
 
-        let result = symbol_key_for(&[sym]).unwrap();
+        let result = symbol_key_for(&[sym], mm).unwrap();
         let found_key = result.as_string().unwrap().as_str();
         assert_eq!(found_key, key);
     }
 
     #[test]
     fn test_symbol_key_for_non_global() {
-        let sym = symbol_create(&[str_val("local")]).unwrap();
-        let result = symbol_key_for(&[sym]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let sym = symbol_create(&[str_val("local")], mm.clone()).unwrap();
+        let result = symbol_key_for(&[sym], mm).unwrap();
         assert!(result.is_undefined());
     }
 
     #[test]
     fn test_symbol_to_string() {
-        let sym = symbol_create(&[str_val("mySymbol")]).unwrap();
-        let result = symbol_to_string(&[sym]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let sym = symbol_create(&[str_val("mySymbol")], mm.clone()).unwrap();
+        let result = symbol_to_string(&[sym], mm).unwrap();
         let s = result.as_string().unwrap().as_str();
         assert_eq!(s, "Symbol(mySymbol)");
     }
 
     #[test]
     fn test_symbol_to_string_no_description() {
-        let sym = symbol_create(&[Value::undefined()]).unwrap();
-        let result = symbol_to_string(&[sym]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let sym = symbol_create(&[Value::undefined()], mm.clone()).unwrap();
+        let result = symbol_to_string(&[sym], mm).unwrap();
         let s = result.as_string().unwrap().as_str();
         assert_eq!(s, "Symbol()");
     }
 
     #[test]
     fn test_symbol_value_of() {
-        let sym = symbol_create(&[str_val("test")]).unwrap();
-        let result = symbol_value_of(std::slice::from_ref(&sym)).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let sym = symbol_create(&[str_val("test")], mm.clone()).unwrap();
+        let result = symbol_value_of(std::slice::from_ref(&sym), mm).unwrap();
 
         // Same symbol instance
         let orig_id = sym.as_symbol().unwrap().id;
@@ -330,15 +340,17 @@ mod tests {
 
     #[test]
     fn test_symbol_description() {
-        let sym = symbol_create(&[str_val("desc")]).unwrap();
-        let result = symbol_description(&[sym]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let sym = symbol_create(&[str_val("desc")], mm.clone()).unwrap();
+        let result = symbol_description(&[sym], mm).unwrap();
         let s = result.as_string().unwrap().as_str();
         assert_eq!(s, "desc");
     }
 
     #[test]
     fn test_symbol_get_well_known() {
-        let sym = symbol_get_well_known(&[str_val("iterator")]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let sym = symbol_get_well_known(&[str_val("iterator")], mm).unwrap();
         assert!(sym.is_symbol());
 
         let sym_ref = sym.as_symbol().unwrap();
@@ -348,9 +360,10 @@ mod tests {
 
     #[test]
     fn test_well_known_symbols_have_fixed_ids() {
+        let mm = Arc::new(memory::MemoryManager::test());
         // Get the same well-known symbol twice
-        let sym1 = symbol_get_well_known(&[str_val("iterator")]).unwrap();
-        let sym2 = symbol_get_well_known(&[str_val("iterator")]).unwrap();
+        let sym1 = symbol_get_well_known(&[str_val("iterator")], mm.clone()).unwrap();
+        let sym2 = symbol_get_well_known(&[str_val("iterator")], mm).unwrap();
 
         let id1 = sym1.as_symbol().unwrap().id;
         let id2 = sym2.as_symbol().unwrap().id;
@@ -361,8 +374,9 @@ mod tests {
 
     #[test]
     fn test_symbol_get_id() {
-        let sym = symbol_create(&[str_val("test")]).unwrap();
-        let result = symbol_get_id(std::slice::from_ref(&sym)).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let sym = symbol_create(&[str_val("test")], mm.clone()).unwrap();
+        let result = symbol_get_id(std::slice::from_ref(&sym), mm).unwrap();
 
         let expected_id = sym.as_symbol().unwrap().id;
         let actual_id = result.as_number().unwrap() as u64;

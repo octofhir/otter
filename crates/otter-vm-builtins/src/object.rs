@@ -6,10 +6,11 @@
 //! Object.is()
 
 use otter_macros::dive;
+use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value as VmValue;
-use otter_vm_runtime::{Op, op_native, op_sync};
+use otter_vm_runtime::{Op, op_native_with_mm as op_native, op_sync};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -48,7 +49,10 @@ pub fn ops() -> Vec<Op> {
 // ============================================================================
 
 /// Object.freeze() - native implementation
-fn native_object_freeze(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_object_freeze(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let obj = args.first().ok_or("Object.freeze requires an argument")?;
     if let Some(obj_ref) = obj.as_object() {
         obj_ref.freeze();
@@ -58,14 +62,20 @@ fn native_object_freeze(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Object.isFrozen() - native implementation
-fn native_object_is_frozen(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_object_is_frozen(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let obj = args.first().ok_or("Object.isFrozen requires an argument")?;
     let is_frozen = obj.as_object().map(|o| o.is_frozen()).unwrap_or(true); // Non-objects are considered frozen
     Ok(VmValue::boolean(is_frozen))
 }
 
 /// Object.seal() - native implementation
-fn native_object_seal(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_object_seal(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let obj = args.first().ok_or("Object.seal requires an argument")?;
     if let Some(obj_ref) = obj.as_object() {
         obj_ref.seal();
@@ -74,14 +84,20 @@ fn native_object_seal(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Object.isSealed() - native implementation
-fn native_object_is_sealed(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_object_is_sealed(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let obj = args.first().ok_or("Object.isSealed requires an argument")?;
     let is_sealed = obj.as_object().map(|o| o.is_sealed()).unwrap_or(true); // Non-objects are considered sealed
     Ok(VmValue::boolean(is_sealed))
 }
 
 /// Object.preventExtensions() - native implementation
-fn native_object_prevent_extensions(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_object_prevent_extensions(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let obj = args
         .first()
         .ok_or("Object.preventExtensions requires an argument")?;
@@ -92,7 +108,10 @@ fn native_object_prevent_extensions(args: &[VmValue]) -> Result<VmValue, String>
 }
 
 /// Object.isExtensible() - native implementation
-fn native_object_is_extensible(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_object_is_extensible(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let obj = args
         .first()
         .ok_or("Object.isExtensible requires an argument")?;
@@ -132,7 +151,10 @@ fn to_property_key(value: &VmValue) -> PropertyKey {
 }
 
 /// Object.defineProperty(obj, prop, descriptor) - native implementation
-fn native_object_define_property(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_object_define_property(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let obj_val = args
         .first()
         .ok_or("Object.defineProperty requires an object")?;
@@ -222,7 +244,10 @@ fn native_object_define_property(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Object.create(proto, propertiesObject?) - native implementation
-fn native_object_create(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_object_create(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let proto_val = args
         .first()
         .ok_or("Object.create requires a prototype argument")?;
@@ -236,7 +261,7 @@ fn native_object_create(args: &[VmValue]) -> Result<VmValue, String> {
         return Err("Object prototype may only be an Object or null".to_string());
     };
 
-    let new_obj = Arc::new(JsObject::new(prototype));
+    let new_obj = Arc::new(JsObject::new(prototype, mm));
 
     // Handle optional properties object (second argument)
     if let Some(props_val) = args.get(1) {
@@ -307,7 +332,7 @@ fn native_object_create(args: &[VmValue]) -> Result<VmValue, String> {
 }
 
 /// Object.is(value1, value2) - SameValue algorithm
-fn native_object_is(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_object_is(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let v1 = args.first().cloned().unwrap_or(VmValue::undefined());
     let v2 = args.get(1).cloned().unwrap_or(VmValue::undefined());
 
@@ -490,11 +515,12 @@ mod tests {
         use otter_vm_core::object::JsObject;
         use std::sync::Arc;
 
-        let obj = Arc::new(JsObject::new(None));
+        let memory_manager = Arc::new(memory::MemoryManager::test());
+        let obj = Arc::new(JsObject::new(None, memory_manager.clone()));
         obj.set("a".into(), VmValue::int32(1));
 
         let value = VmValue::object(obj.clone());
-        let result = native_object_freeze(std::slice::from_ref(&value)).unwrap();
+        let result = native_object_freeze(std::slice::from_ref(&value), memory_manager).unwrap();
 
         assert!(obj.is_frozen());
         // Result should be the same value
@@ -503,19 +529,18 @@ mod tests {
 
     #[test]
     fn test_native_object_is_frozen() {
-        use otter_vm_core::object::JsObject;
-        use std::sync::Arc;
-
-        let obj = Arc::new(JsObject::new(None));
+        let memory_manager = Arc::new(memory::MemoryManager::test());
+        let obj = Arc::new(JsObject::new(None, memory_manager.clone()));
         let value = VmValue::object(obj.clone());
 
         // Initially not frozen
-        let result = native_object_is_frozen(std::slice::from_ref(&value)).unwrap();
+        let result =
+            native_object_is_frozen(std::slice::from_ref(&value), memory_manager.clone()).unwrap();
         assert_eq!(result.as_boolean(), Some(false));
 
         // After freeze
         obj.freeze();
-        let result = native_object_is_frozen(std::slice::from_ref(&value)).unwrap();
+        let result = native_object_is_frozen(std::slice::from_ref(&value), memory_manager).unwrap();
         assert_eq!(result.as_boolean(), Some(true));
     }
 
@@ -524,11 +549,12 @@ mod tests {
         use otter_vm_core::object::JsObject;
         use std::sync::Arc;
 
-        let obj = Arc::new(JsObject::new(None));
+        let memory_manager = Arc::new(memory::MemoryManager::test());
+        let obj = Arc::new(JsObject::new(None, memory_manager.clone()));
         obj.set("a".into(), VmValue::int32(1));
 
         let value = VmValue::object(obj.clone());
-        let _ = native_object_seal(std::slice::from_ref(&value)).unwrap();
+        let _ = native_object_seal(std::slice::from_ref(&value), memory_manager).unwrap();
 
         assert!(obj.is_sealed());
     }
@@ -538,13 +564,15 @@ mod tests {
         use otter_vm_core::object::JsObject;
         use std::sync::Arc;
 
-        let obj = Arc::new(JsObject::new(None));
+        let memory_manager = Arc::new(memory::MemoryManager::test());
+        let obj = Arc::new(JsObject::new(None, memory_manager.clone()));
         let value = VmValue::object(obj.clone());
 
         // Initially extensible
         assert!(obj.is_extensible());
 
-        let _ = native_object_prevent_extensions(std::slice::from_ref(&value)).unwrap();
+        let _ =
+            native_object_prevent_extensions(std::slice::from_ref(&value), memory_manager).unwrap();
 
         // Now not extensible
         assert!(!obj.is_extensible());
@@ -552,20 +580,18 @@ mod tests {
 
     #[test]
     fn test_native_object_rest() {
-        use otter_vm_core::object::JsObject;
-        use std::sync::Arc;
-
-        let obj = Arc::new(JsObject::new(None));
+        let memory_manager = Arc::new(memory::MemoryManager::test());
+        let obj = Arc::new(JsObject::new(None, memory_manager.clone()));
         obj.set("a".into(), VmValue::int32(1));
         obj.set("b".into(), VmValue::int32(2));
         obj.set("c".into(), VmValue::int32(3));
 
-        let excluded = Arc::new(JsObject::new_array());
-        excluded.set_index(0, VmValue::string(JsString::intern("a")));
-        excluded.set_index(1, VmValue::string(JsString::intern("b")));
+        let excluded = Arc::new(JsObject::array(2, memory_manager.clone()));
+        excluded.set(PropertyKey::Index(0), VmValue::string(JsString::intern("a")));
+        excluded.set(PropertyKey::Index(1), VmValue::string(JsString::intern("b")));
 
         let args = vec![VmValue::object(obj), VmValue::object(excluded)];
-        let result = native_object_rest(&args).unwrap();
+        let result = native_object_rest(&args, memory_manager).unwrap();
         let result_obj = result.as_object().unwrap();
 
         assert_eq!(result_obj.own_keys().len(), 1);
@@ -577,7 +603,7 @@ mod tests {
 }
 
 /// Object rest helper: copy own enumerable properties from source excluding keys in excluded_keys_array
-fn native_object_rest(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_object_rest(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
     let source = args.first().ok_or("Object rest requires a source object")?;
     let excluded_keys_val = args
         .get(1)
@@ -615,7 +641,10 @@ fn native_object_rest(args: &[VmValue]) -> Result<VmValue, String> {
         }
     }
 
-    let new_obj = Arc::new(JsObject::new(Some(Arc::new(JsObject::new(None))))); // Should probably use Object.prototype
+    let new_obj = Arc::new(JsObject::new(
+        Some(Arc::new(JsObject::new(None, mm.clone()))),
+        mm,
+    )); // Should probably use Object.prototype
 
     for key in source_obj.own_keys() {
         // Only enumerable own properties

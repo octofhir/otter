@@ -15,8 +15,9 @@
 //! let ops = console_ops_with_adapter(TracingConsole::new());
 //! ```
 
+use otter_vm_core::memory;
 use otter_vm_core::value::Value;
-use otter_vm_runtime::{Op, op_native};
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
@@ -201,92 +202,119 @@ pub fn console_ops_with_adapter<A: ConsoleAdapter>(adapter: A) -> Vec<Op> {
 // ============================================================================
 
 fn create_log_op<A: ConsoleAdapter>(name: &str, adapter: Arc<A>, level: LogLevel) -> Op {
-    op_native(name, move |args: &[Value]| {
-        let message = format_args(args);
-        adapter.log(level, &message);
-        Ok(Value::undefined())
-    })
+    op_native(
+        name,
+        move |args: &[Value], _mm: Arc<memory::MemoryManager>| {
+            let message = format_args(args);
+            adapter.log(level, &message);
+            Ok(Value::undefined())
+        },
+    )
 }
 
 fn create_time_op<A: ConsoleAdapter>(adapter: Arc<A>) -> Op {
-    op_native("__console_time", move |args: &[Value]| {
-        let label = get_string_arg(args, 0).unwrap_or_else(|| "default".to_string());
-        adapter.time_start(&label);
-        Ok(Value::undefined())
-    })
+    op_native(
+        "__console_time",
+        move |args: &[Value], _mm: Arc<memory::MemoryManager>| {
+            let label = get_string_arg(args, 0).unwrap_or_else(|| "default".to_string());
+            adapter.time_start(&label);
+            Ok(Value::undefined())
+        },
+    )
 }
 
 fn create_time_end_op<A: ConsoleAdapter>(adapter: Arc<A>) -> Op {
-    op_native("__console_timeEnd", move |args: &[Value]| {
-        let label = get_string_arg(args, 0).unwrap_or_else(|| "default".to_string());
-        if let Some(elapsed) = adapter.time_end(&label) {
-            adapter.log(LogLevel::Log, &format!("{}: {:.3}ms", label, elapsed));
-        } else {
-            adapter.log(LogLevel::Warn, &format!("Timer '{}' does not exist", label));
-        }
-        Ok(Value::undefined())
-    })
+    op_native(
+        "__console_timeEnd",
+        move |args: &[Value], _mm: Arc<memory::MemoryManager>| {
+            let label = get_string_arg(args, 0).unwrap_or_else(|| "default".to_string());
+            if let Some(elapsed) = adapter.time_end(&label) {
+                adapter.log(LogLevel::Log, &format!("{}: {:.3}ms", label, elapsed));
+            } else {
+                adapter.log(LogLevel::Warn, &format!("Timer '{}' does not exist", label));
+            }
+            Ok(Value::undefined())
+        },
+    )
 }
 
 fn create_time_log_op<A: ConsoleAdapter>(adapter: Arc<A>) -> Op {
     // timeLog prints elapsed without stopping the timer
-    op_native("__console_timeLog", move |args: &[Value]| {
-        let label = get_string_arg(args, 0).unwrap_or_else(|| "default".to_string());
-        // We can't access elapsed without removing, so this is a simplified impl
-        // In a real impl, we'd need to track start time separately
-        adapter.log(LogLevel::Log, &format!("{}: (timer running)", label));
-        Ok(Value::undefined())
-    })
+    op_native(
+        "__console_timeLog",
+        move |args: &[Value], _mm: Arc<memory::MemoryManager>| {
+            let label = get_string_arg(args, 0).unwrap_or_else(|| "default".to_string());
+            // We can't access elapsed without removing, so this is a simplified impl
+            // In a real impl, we'd need to track start time separately
+            adapter.log(LogLevel::Log, &format!("{}: (timer running)", label));
+            Ok(Value::undefined())
+        },
+    )
 }
 
 fn create_assert_op<A: ConsoleAdapter>(adapter: Arc<A>) -> Op {
-    op_native("__console_assert", move |args: &[Value]| {
-        let condition = args.first().map(|v| v.to_boolean()).unwrap_or(false);
+    op_native(
+        "__console_assert",
+        move |args: &[Value], _mm: Arc<memory::MemoryManager>| {
+            let condition = args.first().map(|v| v.to_boolean()).unwrap_or(false);
 
-        if !condition {
-            let message = if args.len() > 1 {
-                format!("Assertion failed: {}", format_args(&args[1..]))
-            } else {
-                "Assertion failed".to_string()
-            };
-            adapter.log(LogLevel::Error, &message);
-        }
-        Ok(Value::undefined())
-    })
+            if !condition {
+                let message = if args.len() > 1 {
+                    format!("Assertion failed: {}", format_args(&args[1..]))
+                } else {
+                    "Assertion failed".to_string()
+                };
+                adapter.log(LogLevel::Error, &message);
+            }
+            Ok(Value::undefined())
+        },
+    )
 }
 
 fn create_clear_op<A: ConsoleAdapter>(adapter: Arc<A>) -> Op {
-    op_native("__console_clear", move |_args: &[Value]| {
-        adapter.clear();
-        Ok(Value::undefined())
-    })
+    op_native(
+        "__console_clear",
+        move |_args: &[Value], _mm: Arc<memory::MemoryManager>| {
+            adapter.clear();
+            Ok(Value::undefined())
+        },
+    )
 }
 
 fn create_count_op<A: ConsoleAdapter>(adapter: Arc<A>) -> Op {
-    op_native("__console_count", move |args: &[Value]| {
-        let label = get_string_arg(args, 0).unwrap_or_else(|| "default".to_string());
-        let count = adapter.count(&label);
-        adapter.log(LogLevel::Log, &format!("{}: {}", label, count));
-        Ok(Value::undefined())
-    })
+    op_native(
+        "__console_count",
+        move |args: &[Value], _mm: Arc<memory::MemoryManager>| {
+            let label = get_string_arg(args, 0).unwrap_or_else(|| "default".to_string());
+            let count = adapter.count(&label);
+            adapter.log(LogLevel::Log, &format!("{}: {}", label, count));
+            Ok(Value::undefined())
+        },
+    )
 }
 
 fn create_count_reset_op<A: ConsoleAdapter>(adapter: Arc<A>) -> Op {
-    op_native("__console_countReset", move |args: &[Value]| {
-        let label = get_string_arg(args, 0).unwrap_or_else(|| "default".to_string());
-        adapter.count_reset(&label);
-        Ok(Value::undefined())
-    })
+    op_native(
+        "__console_countReset",
+        move |args: &[Value], _mm: Arc<memory::MemoryManager>| {
+            let label = get_string_arg(args, 0).unwrap_or_else(|| "default".to_string());
+            adapter.count_reset(&label);
+            Ok(Value::undefined())
+        },
+    )
 }
 
 fn create_table_op<A: ConsoleAdapter>(adapter: Arc<A>) -> Op {
-    op_native("__console_table", move |args: &[Value]| {
-        if let Some(data) = args.first() {
-            let formatted = format_table(data);
-            adapter.log(LogLevel::Log, &formatted);
-        }
-        Ok(Value::undefined())
-    })
+    op_native(
+        "__console_table",
+        move |args: &[Value], _mm: Arc<memory::MemoryManager>| {
+            if let Some(data) = args.first() {
+                let formatted = format_table(data);
+                adapter.log(LogLevel::Log, &formatted);
+            }
+            Ok(Value::undefined())
+        },
+    )
 }
 
 // ============================================================================
@@ -502,10 +530,14 @@ mod tests {
 
         // Find console_log op
         let log_op = ops.iter().find(|op| op.name == "__console_log").unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
 
         // Call it
         if let otter_vm_runtime::OpHandler::Native(handler) = &log_op.handler {
-            let result = handler(&[Value::string(otter_vm_core::JsString::intern("hello"))]);
+            let result = handler(
+                &[Value::string(otter_vm_core::JsString::intern("hello"))],
+                mm,
+            );
             assert!(result.is_ok());
         }
 
@@ -521,9 +553,13 @@ mod tests {
         let ops = console_ops_with_adapter(capture.clone());
 
         let error_op = ops.iter().find(|op| op.name == "__console_error").unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
 
         if let otter_vm_runtime::OpHandler::Native(handler) = &error_op.handler {
-            let _ = handler(&[Value::string(otter_vm_core::JsString::intern("error!"))]);
+            let _ = handler(
+                &[Value::string(otter_vm_core::JsString::intern("error!"))],
+                mm,
+            );
         }
 
         let logs = capture.get_logs();
@@ -537,12 +573,22 @@ mod tests {
         let ops = console_ops_with_adapter(capture.clone());
 
         let count_op = ops.iter().find(|op| op.name == "__console_count").unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
 
         if let otter_vm_runtime::OpHandler::Native(handler) = &count_op.handler {
             // Call count 3 times
-            let _ = handler(&[Value::string(otter_vm_core::JsString::intern("test"))]);
-            let _ = handler(&[Value::string(otter_vm_core::JsString::intern("test"))]);
-            let _ = handler(&[Value::string(otter_vm_core::JsString::intern("test"))]);
+            let _ = handler(
+                &[Value::string(otter_vm_core::JsString::intern("test"))],
+                mm.clone(),
+            );
+            let _ = handler(
+                &[Value::string(otter_vm_core::JsString::intern("test"))],
+                mm.clone(),
+            );
+            let _ = handler(
+                &[Value::string(otter_vm_core::JsString::intern("test"))],
+                mm,
+            );
         }
 
         let logs = capture.get_logs();
@@ -558,10 +604,11 @@ mod tests {
         let ops = console_ops_with_adapter(capture.clone());
 
         let assert_op = ops.iter().find(|op| op.name == "__console_assert").unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
 
         if let otter_vm_runtime::OpHandler::Native(handler) = &assert_op.handler {
             // Pass: true condition
-            let _ = handler(&[Value::boolean(true)]);
+            let _ = handler(&[Value::boolean(true)], mm);
         }
 
         // No logs when assertion passes
@@ -575,13 +622,17 @@ mod tests {
         let ops = console_ops_with_adapter(capture.clone());
 
         let assert_op = ops.iter().find(|op| op.name == "__console_assert").unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
 
         if let otter_vm_runtime::OpHandler::Native(handler) = &assert_op.handler {
             // Fail: false condition
-            let _ = handler(&[
-                Value::boolean(false),
-                Value::string(otter_vm_core::JsString::intern("x should be positive")),
-            ]);
+            let _ = handler(
+                &[
+                    Value::boolean(false),
+                    Value::string(otter_vm_core::JsString::intern("x should be positive")),
+                ],
+                mm,
+            );
         }
 
         let logs = capture.get_logs();

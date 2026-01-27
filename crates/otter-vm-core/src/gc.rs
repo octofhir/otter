@@ -162,6 +162,7 @@ impl Trace for crate::object::JsObject {
                                 tracer.mark_value(v);
                             }
                         }
+                        PropertyDescriptor::Deleted => {}
                     }
                 }
             }
@@ -184,6 +185,7 @@ impl Trace for crate::object::JsObject {
                             tracer.mark_value(v);
                         }
                     }
+                    PropertyDescriptor::Deleted => {}
                 }
             }
         }

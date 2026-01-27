@@ -21,7 +21,8 @@ pub struct RegisterAllocator {
     max: u16,
     /// Free-list of registers that can be reused.
     free: Vec<u16>,
-    /// Tracks which registers are currently allocated.
+    /// Tracks which registers are currently allocated (debug-only).
+    #[cfg(debug_assertions)]
     in_use: Vec<bool>,
 }
 
@@ -32,6 +33,7 @@ impl RegisterAllocator {
             next: 0,
             max: 0,
             free: Vec::new(),
+            #[cfg(debug_assertions)]
             in_use: vec![false; 65536],
         }
     }
@@ -39,17 +41,23 @@ impl RegisterAllocator {
     /// Allocate a register
     pub fn alloc(&mut self) -> Register {
         if let Some(id) = self.free.pop() {
-            debug_assert!(!self.in_use[id as usize], "register {id} already in use");
-            self.in_use[id as usize] = true;
+            #[cfg(debug_assertions)]
+            {
+                debug_assert!(!self.in_use[id as usize], "register {id} already in use");
+                self.in_use[id as usize] = true;
+            }
             Register(id)
         } else {
             let reg = Register(self.next);
-            debug_assert!(
-                !self.in_use[reg.0 as usize],
-                "register {} already in use",
-                reg.0
-            );
-            self.in_use[reg.0 as usize] = true;
+            #[cfg(debug_assertions)]
+            {
+                debug_assert!(
+                    !self.in_use[reg.0 as usize],
+                    "register {} already in use",
+                    reg.0
+                );
+                self.in_use[reg.0 as usize] = true;
+            }
             self.next = self
                 .next
                 .checked_add(1)
@@ -65,6 +73,7 @@ impl RegisterAllocator {
     /// must be contiguous.
     pub fn alloc_fresh_block(&mut self, count: u8) -> Register {
         let base = self.next;
+        #[cfg(debug_assertions)]
         for id in base..base.saturating_add(count as u16) {
             debug_assert!(!self.in_use[id as usize], "register {id} already in use");
             self.in_use[id as usize] = true;
@@ -79,12 +88,15 @@ impl RegisterAllocator {
 
     /// Free a register
     pub fn free(&mut self, reg: Register) {
-        debug_assert!(
-            self.in_use[reg.0 as usize],
-            "freeing register {} that is not in use",
-            reg.0
-        );
-        self.in_use[reg.0 as usize] = false;
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                self.in_use[reg.0 as usize],
+                "freeing register {} that is not in use",
+                reg.0
+            );
+            self.in_use[reg.0 as usize] = false;
+        }
         self.free.push(reg.0);
     }
 
@@ -95,6 +107,7 @@ impl RegisterAllocator {
 
     /// Restore to a previous position
     pub fn restore(&mut self, pos: u16) {
+        #[cfg(debug_assertions)]
         for id in pos..self.next {
             self.in_use[id as usize] = false;
         }

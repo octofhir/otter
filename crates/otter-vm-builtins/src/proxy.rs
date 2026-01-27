@@ -9,7 +9,8 @@
 use otter_vm_core::object::JsObject;
 use otter_vm_core::proxy::JsProxy;
 use otter_vm_core::value::Value as VmValue;
-use otter_vm_runtime::{Op, op_native};
+use otter_vm_core::memory;
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::sync::Arc;
 
 /// Get Proxy ops for extension registration
@@ -29,7 +30,10 @@ pub fn ops() -> Vec<Op> {
 
 /// Create a new proxy
 /// Args: [target, handler]
-fn native_proxy_create(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_proxy_create(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let target = args.first().ok_or("Proxy requires a target argument")?;
     let handler = args.get(1).ok_or("Proxy requires a handler argument")?;
 
@@ -48,7 +52,10 @@ fn native_proxy_create(args: &[VmValue]) -> Result<VmValue, String> {
 /// Create a revocable proxy
 /// Args: [target, handler]
 /// Returns: { proxy, revoke }
-fn native_proxy_revocable(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_proxy_revocable(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let target = args
         .first()
         .ok_or("Proxy.revocable requires a target argument")?;
@@ -64,17 +71,20 @@ fn native_proxy_revocable(args: &[VmValue]) -> Result<VmValue, String> {
 
     let revocable = JsProxy::revocable(Arc::clone(target_obj), Arc::clone(handler_obj));
 
-    let result = Arc::new(JsObject::new(None));
+    let result = Arc::new(JsObject::new(None, Arc::clone(&mm)));
     result.set("proxy".into(), VmValue::proxy(revocable.proxy));
 
     // Create native function for revoke
     let revoke_fn = revocable.revoke;
     result.set(
         "revoke".into(),
-        VmValue::native_function(move |_args: &[VmValue]| {
-            revoke_fn();
-            Ok(VmValue::undefined())
-        }),
+        VmValue::native_function(
+            move |_args: &[VmValue], _mm: Arc<memory::MemoryManager>| {
+                revoke_fn();
+                Ok(VmValue::undefined())
+            },
+            Arc::clone(&mm),
+        ),
     );
 
     Ok(VmValue::object(result))
@@ -83,7 +93,10 @@ fn native_proxy_revocable(args: &[VmValue]) -> Result<VmValue, String> {
 /// Get proxy target
 /// Args: [proxy]
 /// Returns: target object or undefined if revoked
-fn native_proxy_get_target(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_proxy_get_target(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let proxy_val = args.first().ok_or("Missing proxy argument")?;
 
     let proxy = proxy_val.as_proxy().ok_or("Argument must be a proxy")?;
@@ -97,7 +110,10 @@ fn native_proxy_get_target(args: &[VmValue]) -> Result<VmValue, String> {
 /// Get proxy handler
 /// Args: [proxy]
 /// Returns: handler object or throws if revoked
-fn native_proxy_get_handler(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_proxy_get_handler(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let proxy_val = args.first().ok_or("Missing proxy argument")?;
 
     let proxy = proxy_val.as_proxy().ok_or("Argument must be a proxy")?;
@@ -111,7 +127,10 @@ fn native_proxy_get_handler(args: &[VmValue]) -> Result<VmValue, String> {
 /// Check if proxy is revoked
 /// Args: [proxy]
 /// Returns: boolean
-fn native_proxy_is_revoked(args: &[VmValue]) -> Result<VmValue, String> {
+fn native_proxy_is_revoked(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
     let proxy_val = args.first().ok_or("Missing proxy argument")?;
 
     let proxy = proxy_val.as_proxy().ok_or("Argument must be a proxy")?;
@@ -125,11 +144,12 @@ mod tests {
 
     #[test]
     fn test_proxy_create() {
-        let target = Arc::new(JsObject::new(None));
-        let handler = Arc::new(JsObject::new(None));
+        let mm = Arc::new(memory::MemoryManager::test());
+        let target = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let handler = Arc::new(JsObject::new(None, Arc::clone(&mm)));
 
         let result =
-            native_proxy_create(&[VmValue::object(target), VmValue::object(handler)]).unwrap();
+            native_proxy_create(&[VmValue::object(target), VmValue::object(handler)], mm).unwrap();
 
         assert!(result.is_proxy());
         assert!(!result.as_proxy().unwrap().is_revoked());
@@ -137,19 +157,25 @@ mod tests {
 
     #[test]
     fn test_proxy_create_invalid_target() {
-        let handler = Arc::new(JsObject::new(None));
-        let result = native_proxy_create(&[VmValue::number(42.0), VmValue::object(handler)]);
+        let mm = Arc::new(memory::MemoryManager::test());
+        let handler = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let result = native_proxy_create(
+            &[VmValue::number(42.0), VmValue::object(handler)],
+            Arc::clone(&mm),
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("target must be an object"));
     }
 
     #[test]
     fn test_proxy_revocable() {
-        let target = Arc::new(JsObject::new(None));
-        let handler = Arc::new(JsObject::new(None));
+        let mm = Arc::new(memory::MemoryManager::test());
+        let target = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let handler = Arc::new(JsObject::new(None, Arc::clone(&mm)));
 
         let result =
-            native_proxy_revocable(&[VmValue::object(target), VmValue::object(handler)]).unwrap();
+            native_proxy_revocable(&[VmValue::object(target), VmValue::object(handler)], mm)
+                .unwrap();
 
         assert!(result.is_object());
         let obj = result.as_object().unwrap();
@@ -163,27 +189,30 @@ mod tests {
 
     #[test]
     fn test_proxy_is_revoked() {
-        let target = Arc::new(JsObject::new(None));
-        let handler = Arc::new(JsObject::new(None));
+        let mm = Arc::new(memory::MemoryManager::test());
+        let target = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let handler = Arc::new(JsObject::new(None, Arc::clone(&mm)));
         let proxy = JsProxy::new(target, handler);
         let proxy_val = VmValue::proxy(proxy.clone());
 
-        let result = native_proxy_is_revoked(std::slice::from_ref(&proxy_val)).unwrap();
+        let result =
+            native_proxy_is_revoked(std::slice::from_ref(&proxy_val), Arc::clone(&mm)).unwrap();
         assert_eq!(result.as_boolean(), Some(false));
 
         proxy.revoke();
-        let result = native_proxy_is_revoked(&[proxy_val]).unwrap();
+        let result = native_proxy_is_revoked(&[proxy_val], Arc::clone(&mm)).unwrap();
         assert_eq!(result.as_boolean(), Some(true));
     }
 
     #[test]
     fn test_proxy_get_target() {
-        let target = Arc::new(JsObject::new(None));
+        let mm = Arc::new(memory::MemoryManager::test());
+        let target = Arc::new(JsObject::new(None, Arc::clone(&mm)));
         target.set("x".into(), VmValue::number(42.0));
-        let handler = Arc::new(JsObject::new(None));
+        let handler = Arc::new(JsObject::new(None, Arc::clone(&mm)));
         let proxy = JsProxy::new(Arc::clone(&target), handler);
 
-        let result = native_proxy_get_target(&[VmValue::proxy(proxy)]).unwrap();
+        let result = native_proxy_get_target(&[VmValue::proxy(proxy)], Arc::clone(&mm)).unwrap();
         assert!(result.is_object());
         let obj = result.as_object().unwrap();
         assert_eq!(obj.get(&"x".into()).unwrap().as_number(), Some(42.0));
@@ -191,12 +220,13 @@ mod tests {
 
     #[test]
     fn test_proxy_get_target_revoked() {
-        let target = Arc::new(JsObject::new(None));
-        let handler = Arc::new(JsObject::new(None));
+        let mm = Arc::new(memory::MemoryManager::test());
+        let target = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let handler = Arc::new(JsObject::new(None, Arc::clone(&mm)));
         let proxy = JsProxy::new(target, handler);
         proxy.revoke();
 
-        let result = native_proxy_get_target(&[VmValue::proxy(proxy)]);
+        let result = native_proxy_get_target(&[VmValue::proxy(proxy)], Arc::clone(&mm));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("revoked"));
     }

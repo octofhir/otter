@@ -200,7 +200,7 @@ impl Interpreter {
 
             let instruction = &func.instructions[frame.pc];
 
-            match self.execute_instruction(instruction, Arc::clone(&current_module), ctx) {
+            match self.execute_instruction(instruction, &current_module, ctx) {
                 Ok(InstructionResult::Continue) => {
                     ctx.advance_pc();
                 }
@@ -365,12 +365,9 @@ impl Interpreter {
             // Record instruction execution for profiling
             ctx.record_instruction();
 
-            // Clone module Arc for execute_instruction (required since it takes ownership)
-            let current_module = Arc::clone(module_ref);
-
             // Execute the instruction
             let instruction_result =
-                match self.execute_instruction(instruction, current_module, ctx) {
+                match self.execute_instruction(instruction, module_ref, ctx) {
                     Ok(result) => result,
                     Err(err) => match err {
                         VmError::TypeError(message) => {
@@ -497,7 +494,10 @@ impl Interpreter {
                         };
 
                         // Create rest array
-                        let rest_arr = Arc::new(JsObject::array(rest_args.len()));
+                        let rest_arr = Arc::new(JsObject::array(
+                            rest_args.len(),
+                            ctx.memory_manager().clone(),
+                        ));
                         // If `Array.prototype` is available, attach it so rest arrays are iterable.
                         if let Some(array_obj) =
                             ctx.get_global("Array").and_then(|v| v.as_object().cloned())
@@ -567,7 +567,10 @@ impl Interpreter {
                         } else {
                             Vec::new()
                         };
-                        let rest_arr = Arc::new(JsObject::array(rest_args.len()));
+                        let rest_arr = Arc::new(JsObject::array(
+                            rest_args.len(),
+                            ctx.memory_manager().clone(),
+                        ));
                         if let Some(array_obj) =
                             ctx.get_global("Array").and_then(|v| v.as_object().cloned())
                             && let Some(array_proto) = array_obj
@@ -631,7 +634,7 @@ impl Interpreter {
                 }
                 InstructionResult::Yield { value } => {
                     // Generator yielded a value
-                    let result = Arc::new(JsObject::new(None));
+                    let result = Arc::new(JsObject::new(None, ctx.memory_manager().clone()));
                     result.set(PropertyKey::string("value"), value);
                     result.set(PropertyKey::string("done"), Value::boolean(false));
                     ctx.advance_pc();
@@ -686,12 +689,9 @@ impl Interpreter {
             // Record instruction execution for profiling
             ctx.record_instruction();
 
-            // Clone module Arc for execute_instruction (required since it takes ownership)
-            let current_module = Arc::clone(module_ref);
-
             // Execute the instruction
             let instruction_result =
-                match self.execute_instruction(instruction, current_module, ctx) {
+                match self.execute_instruction(instruction, module_ref, ctx) {
                     Ok(result) => result,
                     Err(err) => match err {
                         VmError::TypeError(message) => {
@@ -812,7 +812,10 @@ impl Interpreter {
                         };
 
                         // Create rest array
-                        let rest_arr = Arc::new(JsObject::array(rest_args.len()));
+                        let rest_arr = Arc::new(JsObject::array(
+                            rest_args.len(),
+                            ctx.memory_manager().clone(),
+                        ));
                         // If `Array.prototype` is available, attach it so rest arrays are iterable.
                         if let Some(array_obj) =
                             ctx.get_global("Array").and_then(|v| v.as_object().cloned())
@@ -878,7 +881,10 @@ impl Interpreter {
                         } else {
                             Vec::new()
                         };
-                        let rest_arr = Arc::new(JsObject::array(rest_args.len()));
+                        let rest_arr = Arc::new(JsObject::array(
+                            rest_args.len(),
+                            ctx.memory_manager().clone(),
+                        ));
                         if let Some(array_obj) =
                             ctx.get_global("Array").and_then(|v| v.as_object().cloned())
                             && let Some(array_proto) = array_obj
@@ -935,7 +941,7 @@ impl Interpreter {
                 InstructionResult::Yield { value } => {
                     // Generator yielded a value
                     // Create an iterator result object { value, done: false }
-                    let result = Arc::new(JsObject::new(None));
+                    let result = Arc::new(JsObject::new(None, ctx.memory_manager().clone()));
                     result.set(PropertyKey::string("value"), value);
                     result.set(PropertyKey::string("done"), Value::boolean(false));
                     ctx.advance_pc();
@@ -949,7 +955,7 @@ impl Interpreter {
     fn execute_instruction(
         &mut self,
         instruction: &Instruction,
-        module: Arc<Module>,
+        module: &Arc<Module>,
         ctx: &mut VmContext,
     ) -> VmResult<InstructionResult> {
         match instruction {
@@ -1624,11 +1630,11 @@ impl Interpreter {
                 // Capture upvalues from parent frame
                 let captured_upvalues = self.capture_upvalues(ctx, &func_def.upvalues)?;
 
-                let func_obj = Arc::new(JsObject::new(None));
-                let proto = Arc::new(JsObject::new(None));
+                let func_obj = Arc::new(JsObject::new(None, ctx.memory_manager().clone()));
+                let proto = Arc::new(JsObject::new(None, ctx.memory_manager().clone()));
                 let closure = Arc::new(Closure {
                     function_index: func.0,
-                    module: Arc::clone(&module),
+                    module: Arc::clone(module),
                     upvalues: captured_upvalues,
                     is_async: func_def.is_async(),
                     object: Arc::clone(&func_obj),
@@ -1652,11 +1658,11 @@ impl Interpreter {
                 // Capture upvalues from parent frame
                 let captured_upvalues = self.capture_upvalues(ctx, &func_def.upvalues)?;
 
-                let func_obj = Arc::new(JsObject::new(None));
-                let proto = Arc::new(JsObject::new(None));
+                let func_obj = Arc::new(JsObject::new(None, ctx.memory_manager().clone()));
+                let proto = Arc::new(JsObject::new(None, ctx.memory_manager().clone()));
                 let closure = Arc::new(Closure {
                     function_index: func.0,
-                    module: Arc::clone(&module),
+                    module: Arc::clone(module),
                     upvalues: captured_upvalues,
                     is_async: true,
                     object: Arc::clone(&func_obj),
@@ -1854,7 +1860,7 @@ impl Interpreter {
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
                         .and_then(|v| v.as_object().cloned());
-                    let new_obj = Arc::new(JsObject::new(ctor_proto));
+                    let new_obj = Arc::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
                     let new_obj_value = Value::object(new_obj);
 
                     // Call native constructor with depth tracking
@@ -1875,7 +1881,7 @@ impl Interpreter {
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
                         .and_then(|v| v.as_object().cloned());
-                    let new_obj = Arc::new(JsObject::new(ctor_proto));
+                    let new_obj = Arc::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
                     let new_obj_value = Value::object(new_obj.clone());
 
                     // Copy arguments from caller registers
@@ -2172,7 +2178,7 @@ impl Interpreter {
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
                         .and_then(|v| v.as_object().cloned());
-                    let new_obj = Arc::new(JsObject::new(ctor_proto));
+                    let new_obj = Arc::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
                     let new_obj_value = Value::object(new_obj);
 
                     let result = self.call_native_fn(ctx, native_fn, &args)?;
@@ -2194,7 +2200,7 @@ impl Interpreter {
                     .as_object()
                     .and_then(|o| o.get(&PropertyKey::string("prototype")))
                     .and_then(|v| v.as_object().cloned());
-                let new_obj = Arc::new(JsObject::new(ctor_proto));
+                let new_obj = Arc::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
                 let new_obj_value = Value::object(new_obj);
 
                 let argc_u8 = args.len() as u8;
@@ -2284,7 +2290,7 @@ impl Interpreter {
                     })
                     .and_then(|proto_val| proto_val.as_object().cloned());
 
-                let obj = Arc::new(JsObject::new(proto));
+                let obj = Arc::new(JsObject::new(proto, ctx.memory_manager().clone()));
                 ctx.set_register(dst.0, Value::object(obj));
                 Ok(InstructionResult::Continue)
             }
@@ -2815,7 +2821,7 @@ impl Interpreter {
                             };
 
                             if let Some(native_fn) = getter.as_native_function() {
-                                let result = native_fn(&[]).map_err(VmError::type_error)?;
+                                let result = self.call_native_fn(ctx, native_fn, &[])?;
                                 ctx.set_register(dst.0, result);
                                 Ok(InstructionResult::Continue)
                             } else if let Some(closure) = getter.as_function() {
@@ -2979,7 +2985,7 @@ impl Interpreter {
                             };
 
                             if let Some(native_fn) = setter.as_native_function() {
-                                native_fn(&[val_val]).map_err(VmError::type_error)?;
+                                self.call_native_fn(ctx, native_fn, &[val_val])?;
                                 Ok(InstructionResult::Continue)
                             } else if let Some(closure) = setter.as_function() {
                                 ctx.set_pending_args(vec![val_val]);
@@ -3120,7 +3126,7 @@ impl Interpreter {
 
             // ==================== Arrays ====================
             Instruction::NewArray { dst, len } => {
-                let arr = Arc::new(JsObject::array(*len as usize));
+                let arr = Arc::new(JsObject::array(*len as usize, ctx.memory_manager().clone()));
                 // Attach `Array.prototype` if present so arrays are iterable and have methods.
                 if let Some(array_obj) =
                     ctx.get_global("Array").and_then(|v| v.as_object().cloned())
@@ -3435,7 +3441,7 @@ impl Interpreter {
                 if let Some(native_fn) = iterator_fn.as_native_function() {
                     // Native iterator methods take the receiver as their first argument.
                     let iterator =
-                        native_fn(std::slice::from_ref(&obj)).map_err(VmError::type_error)?;
+                        self.call_native_fn(ctx, native_fn, std::slice::from_ref(&obj))?;
                     ctx.set_register(dst.0, iterator);
                     Ok(InstructionResult::Continue)
                 } else if let Some(closure) = iterator_fn.as_function() {
@@ -3595,8 +3601,12 @@ impl Interpreter {
                     None
                 };
 
-                let js_regex =
-                    Arc::new(JsRegExp::new(pattern.to_string(), flags.to_string(), proto));
+                let js_regex = Arc::new(JsRegExp::new(
+                    pattern.to_string(),
+                    flags.to_string(),
+                    proto,
+                    ctx.memory_manager().clone(),
+                ));
                 Ok(Value::regex(js_regex))
             }
             Constant::TemplateLiteral(_) => {
@@ -3625,7 +3635,7 @@ impl Interpreter {
         args: &[Value],
     ) -> VmResult<Value> {
         ctx.enter_native_call()?;
-        let result = native_fn(args).map_err(VmError::type_error);
+        let result = native_fn(args, ctx.memory_manager().clone()).map_err(VmError::type_error);
         ctx.exit_native_call();
         result
     }
@@ -3804,7 +3814,7 @@ impl Interpreter {
     /// Create a JavaScript Promise object from an internal promise
     /// This creates an object with _internal field and copies methods from Promise.prototype
     fn create_js_promise(&self, ctx: &VmContext, internal: Arc<JsPromise>) -> Value {
-        let obj = Arc::new(JsObject::new(None));
+        let obj = Arc::new(JsObject::new(None, ctx.memory_manager().clone()));
 
         // Set _internal to the raw promise
         obj.set(PropertyKey::string("_internal"), Value::promise(internal));
@@ -3869,7 +3879,7 @@ impl Interpreter {
             .and_then(|obj| obj.get(&PropertyKey::string("prototype")))
             .and_then(|v| v.as_object().cloned());
 
-        let obj = Arc::new(JsObject::new(proto));
+        let obj = Arc::new(JsObject::new(proto, ctx.memory_manager().clone()));
         obj.set(
             PropertyKey::string("name"),
             Value::string(JsString::intern(name)),
@@ -4222,8 +4232,9 @@ mod tests {
     use otter_vm_bytecode::{Function, Module};
 
     fn create_test_context() -> VmContext {
-        let global = Arc::new(JsObject::new(None));
-        VmContext::new(global)
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let global = Arc::new(JsObject::new(None, memory_manager.clone()));
+        VmContext::new(global, memory_manager)
     }
 
     #[test]

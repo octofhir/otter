@@ -32,7 +32,9 @@ pub type SyncOpFn = Arc<dyn Fn(&[JsonValue]) -> OpResult + Send + Sync>;
 pub type AsyncOpFn = Arc<dyn Fn(&[JsonValue]) -> OpFuture + Send + Sync>;
 
 /// Type for native sync operation handler (works with VM Value)
-pub type NativeSyncOpFn = Arc<dyn Fn(&[VmValue]) -> NativeOpResult + Send + Sync>;
+pub type NativeSyncOpFn = Arc<
+    dyn Fn(&[VmValue], Arc<otter_vm_core::memory::MemoryManager>) -> NativeOpResult + Send + Sync,
+>;
 
 /// Operation handler type
 #[derive(Clone)]
@@ -56,9 +58,13 @@ impl OpHandler {
     }
 
     /// Execute native sync operation (works with VM Value)
-    pub fn call_native(&self, args: &[VmValue]) -> NativeOpResult {
+    pub fn call_native(
+        &self,
+        args: &[VmValue],
+        memory_manager: Arc<otter_vm_core::memory::MemoryManager>,
+    ) -> NativeOpResult {
         match self {
-            OpHandler::Native(f) => f(args),
+            OpHandler::Native(f) => f(args, memory_manager),
             OpHandler::Sync(_) => Err("Cannot call JSON op with native args".to_string()),
             OpHandler::Async(_) => Err("Cannot call async op with native args".to_string()),
         }
@@ -276,6 +282,24 @@ where
 pub fn op_native<F>(name: impl Into<String>, handler: F) -> Op
 where
     F: Fn(&[VmValue]) -> NativeOpResult + Send + Sync + 'static,
+{
+    let handler = Arc::new(handler);
+    Op {
+        name: name.into(),
+        handler: OpHandler::Native(Arc::new(move |args, _memory_manager| handler(args))),
+    }
+}
+
+/// Native op that also receives the VM's `MemoryManager`.
+///
+/// Prefer this when the op needs to allocate VM objects or otherwise needs
+/// access to per-VM memory accounting.
+pub fn op_native_with_mm<F>(name: impl Into<String>, handler: F) -> Op
+where
+    F: Fn(&[VmValue], Arc<otter_vm_core::memory::MemoryManager>) -> NativeOpResult
+        + Send
+        + Sync
+        + 'static,
 {
     Op {
         name: name.into(),

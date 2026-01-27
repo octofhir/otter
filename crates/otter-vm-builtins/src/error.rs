@@ -12,7 +12,7 @@
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
-use otter_vm_runtime::{Op, op_native};
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::sync::Arc;
 
 /// Get Error ops for extension registration
@@ -33,7 +33,10 @@ pub fn ops() -> Vec<Op> {
 
 /// Create an error object with name, message, and optional stack
 /// Args: [name: string, message: string | undefined, stack: string | undefined]
-fn error_create(args: &[Value]) -> Result<Value, String> {
+fn error_create(
+    args: &[Value],
+    mm: Arc<otter_vm_core::memory::MemoryManager>,
+) -> Result<Value, String> {
     let name = args
         .first()
         .and_then(|v| v.as_string())
@@ -60,7 +63,7 @@ fn error_create(args: &[Value]) -> Result<Value, String> {
     });
 
     // Create error object
-    let obj = Arc::new(JsObject::new(None));
+    let obj = Arc::new(JsObject::new(None, mm));
 
     // Set name property
     obj.set(
@@ -104,7 +107,10 @@ fn error_create(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Get error message
-fn error_get_message(args: &[Value]) -> Result<Value, String> {
+fn error_get_message(
+    args: &[Value],
+    _mm: Arc<otter_vm_core::memory::MemoryManager>,
+) -> Result<Value, String> {
     let obj = args
         .first()
         .and_then(|v| v.as_object())
@@ -118,7 +124,10 @@ fn error_get_message(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Get error name
-fn error_get_name(args: &[Value]) -> Result<Value, String> {
+fn error_get_name(
+    args: &[Value],
+    _mm: Arc<otter_vm_core::memory::MemoryManager>,
+) -> Result<Value, String> {
     let obj = args
         .first()
         .and_then(|v| v.as_object())
@@ -132,7 +141,10 @@ fn error_get_name(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Get error stack trace
-fn error_get_stack(args: &[Value]) -> Result<Value, String> {
+fn error_get_stack(
+    args: &[Value],
+    _mm: Arc<otter_vm_core::memory::MemoryManager>,
+) -> Result<Value, String> {
     let obj = args
         .first()
         .and_then(|v| v.as_object())
@@ -146,7 +158,10 @@ fn error_get_stack(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Set error stack trace (used by Error.captureStackTrace)
-fn error_set_stack(args: &[Value]) -> Result<Value, String> {
+fn error_set_stack(
+    args: &[Value],
+    _mm: Arc<otter_vm_core::memory::MemoryManager>,
+) -> Result<Value, String> {
     let obj = args
         .first()
         .and_then(|v| v.as_object())
@@ -160,7 +175,10 @@ fn error_set_stack(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Error.prototype.toString() - returns "name: message" or just "name"
-fn error_to_string(args: &[Value]) -> Result<Value, String> {
+fn error_to_string(
+    args: &[Value],
+    _mm: Arc<otter_vm_core::memory::MemoryManager>,
+) -> Result<Value, String> {
     let obj = args
         .first()
         .and_then(|v| v.as_object())
@@ -200,11 +218,15 @@ mod tests {
 
     #[test]
     fn test_error_create_basic() {
-        let result = error_create(&[
-            str_val("Error"),
-            str_val("something went wrong"),
-            Value::undefined(),
-        ])
+        let mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
+        let result = error_create(
+            &[
+                str_val("Error"),
+                str_val("something went wrong"),
+                Value::undefined(),
+            ],
+            mm,
+        )
         .unwrap();
 
         assert!(result.is_object());
@@ -226,11 +248,15 @@ mod tests {
 
     #[test]
     fn test_error_create_type_error() {
-        let result = error_create(&[
-            str_val("TypeError"),
-            str_val("not a function"),
-            Value::undefined(),
-        ])
+        let mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
+        let result = error_create(
+            &[
+                str_val("TypeError"),
+                str_val("not a function"),
+                Value::undefined(),
+            ],
+            mm,
+        )
         .unwrap();
 
         let obj = result.as_object().unwrap();
@@ -244,8 +270,12 @@ mod tests {
 
     #[test]
     fn test_error_create_no_message() {
-        let result =
-            error_create(&[str_val("Error"), Value::undefined(), Value::undefined()]).unwrap();
+        let mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
+        let result = error_create(
+            &[str_val("Error"), Value::undefined(), Value::undefined()],
+            mm,
+        )
+        .unwrap();
 
         let obj = result.as_object().unwrap();
 
@@ -258,12 +288,16 @@ mod tests {
 
     #[test]
     fn test_error_create_with_stack() {
+        let mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
         let stack_trace = "    at foo (test.js:1:1)\n    at bar (test.js:2:2)";
-        let result = error_create(&[
-            str_val("Error"),
-            str_val("test error"),
-            str_val(stack_trace),
-        ])
+        let result = error_create(
+            &[
+                str_val("Error"),
+                str_val("test error"),
+                str_val(stack_trace),
+            ],
+            mm,
+        )
         .unwrap();
 
         let obj = result.as_object().unwrap();
@@ -277,47 +311,69 @@ mod tests {
 
     #[test]
     fn test_error_get_message() {
-        let err = error_create(&[str_val("Error"), str_val("hello"), Value::undefined()]).unwrap();
-        let result = error_get_message(std::slice::from_ref(&err)).unwrap();
+        let mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
+        let err = error_create(
+            &[str_val("Error"), str_val("hello"), Value::undefined()],
+            mm.clone(),
+        )
+        .unwrap();
+        let result = error_get_message(std::slice::from_ref(&err), mm).unwrap();
         assert_str_result(&result, "hello");
     }
 
     #[test]
     fn test_error_get_name() {
-        let err =
-            error_create(&[str_val("TypeError"), str_val("oops"), Value::undefined()]).unwrap();
-        let result = error_get_name(std::slice::from_ref(&err)).unwrap();
+        let mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
+        let err = error_create(
+            &[str_val("TypeError"), str_val("oops"), Value::undefined()],
+            mm.clone(),
+        )
+        .unwrap();
+        let result = error_get_name(std::slice::from_ref(&err), mm).unwrap();
         assert_str_result(&result, "TypeError");
     }
 
     #[test]
     fn test_error_to_string() {
-        let err = error_create(&[
-            str_val("RangeError"),
-            str_val("out of bounds"),
-            Value::undefined(),
-        ])
+        let mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
+        let err = error_create(
+            &[
+                str_val("RangeError"),
+                str_val("out of bounds"),
+                Value::undefined(),
+            ],
+            mm.clone(),
+        )
         .unwrap();
-        let result = error_to_string(std::slice::from_ref(&err)).unwrap();
+        let result = error_to_string(std::slice::from_ref(&err), mm).unwrap();
         assert_str_result(&result, "RangeError: out of bounds");
     }
 
     #[test]
     fn test_error_to_string_no_message() {
-        let err =
-            error_create(&[str_val("Error"), Value::undefined(), Value::undefined()]).unwrap();
-        let result = error_to_string(std::slice::from_ref(&err)).unwrap();
+        let mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
+        let err = error_create(
+            &[str_val("Error"), Value::undefined(), Value::undefined()],
+            mm.clone(),
+        )
+        .unwrap();
+        let result = error_to_string(std::slice::from_ref(&err), mm).unwrap();
         assert_str_result(&result, "Error");
     }
 
     #[test]
     fn test_error_set_stack() {
-        let err = error_create(&[str_val("Error"), str_val("test"), Value::undefined()]).unwrap();
+        let mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
+        let err = error_create(
+            &[str_val("Error"), str_val("test"), Value::undefined()],
+            mm.clone(),
+        )
+        .unwrap();
         let new_stack = str_val("new stack trace");
 
-        error_set_stack(&[err.clone(), new_stack]).unwrap();
+        error_set_stack(&[err.clone(), new_stack], mm.clone()).unwrap();
 
-        let stack = error_get_stack(std::slice::from_ref(&err)).unwrap();
+        let stack = error_get_stack(std::slice::from_ref(&err), mm).unwrap();
         assert_str_result(&stack, "new stack trace");
     }
 }

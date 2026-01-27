@@ -111,6 +111,8 @@ pub struct VmContext {
     /// Optional profiling stats (enabled with 'profiling' feature)
     #[cfg(feature = "profiling")]
     profiling_stats: Option<Arc<RuntimeStats>>,
+    /// Memory manager for accounting and limits
+    memory_manager: Arc<crate::memory::MemoryManager>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,8 +123,13 @@ struct TryHandler {
 
 impl VmContext {
     /// Create a new context with a global object
-    pub fn new(global: Arc<JsObject>) -> Self {
-        Self::with_config(global, DEFAULT_MAX_STACK_DEPTH, DEFAULT_MAX_NATIVE_DEPTH)
+    pub fn new(global: Arc<JsObject>, memory_manager: Arc<crate::memory::MemoryManager>) -> Self {
+        Self::with_config(
+            global,
+            DEFAULT_MAX_STACK_DEPTH,
+            DEFAULT_MAX_NATIVE_DEPTH,
+            memory_manager,
+        )
     }
 
     /// Create a new context with custom stack limits
@@ -130,6 +137,7 @@ impl VmContext {
         global: Arc<JsObject>,
         max_stack_depth: usize,
         max_native_depth: usize,
+        memory_manager: Arc<crate::memory::MemoryManager>,
     ) -> Self {
         Self {
             registers: vec![Value::undefined(); MAX_REGISTERS],
@@ -150,7 +158,13 @@ impl VmContext {
             instruction_count: 0,
             #[cfg(feature = "profiling")]
             profiling_stats: None,
+            memory_manager,
         }
+    }
+
+    /// Get the memory manager
+    pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
+        &self.memory_manager
     }
 
     /// Set the maximum stack depth
@@ -851,6 +865,7 @@ impl VmContext {
                                 }
                             }
                         }
+                        crate::object::PropertyDescriptor::Deleted => {}
                     }
                 }
             }
@@ -988,8 +1003,9 @@ mod tests {
 
     #[test]
     fn test_context_registers() {
-        let global = Arc::new(JsObject::new(None));
-        let mut ctx = VmContext::new(global);
+        let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024));
+        let global = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let mut ctx = VmContext::new(global, memory_manager);
 
         ctx.push_frame(0, dummy_module(), 0, None, false, false)
             .unwrap();
@@ -1000,8 +1016,9 @@ mod tests {
 
     #[test]
     fn test_context_locals() {
-        let global = Arc::new(JsObject::new(None));
-        let mut ctx = VmContext::new(global);
+        let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024));
+        let global = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let mut ctx = VmContext::new(global, memory_manager);
 
         ctx.push_frame(0, dummy_module(), 3, None, false, false)
             .unwrap();
@@ -1016,10 +1033,16 @@ mod tests {
 
     #[test]
     fn test_stack_overflow() {
-        let global = Arc::new(JsObject::new(None));
+        let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024));
+        let global = Arc::new(JsObject::new(None, memory_manager.clone()));
         // Use a small max_stack_depth for testing
         let test_max_depth = 100;
-        let mut ctx = VmContext::with_config(global, test_max_depth, DEFAULT_MAX_NATIVE_DEPTH);
+        let mut ctx = VmContext::with_config(
+            global,
+            test_max_depth,
+            DEFAULT_MAX_NATIVE_DEPTH,
+            memory_manager,
+        );
         let module = dummy_module();
 
         // Push frames until overflow
@@ -1035,8 +1058,9 @@ mod tests {
 
     #[test]
     fn test_native_call_depth() {
-        let global = Arc::new(JsObject::new(None));
-        let ctx = VmContext::with_config(global, DEFAULT_MAX_STACK_DEPTH, 3);
+        let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024));
+        let global = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let ctx = VmContext::with_config(global, DEFAULT_MAX_STACK_DEPTH, 3, memory_manager);
 
         // Should be able to enter 3 native calls
         assert!(ctx.enter_native_call().is_ok());
@@ -1053,8 +1077,9 @@ mod tests {
 
     #[test]
     fn test_program_counter() {
-        let global = Arc::new(JsObject::new(None));
-        let mut ctx = VmContext::new(global);
+        let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024));
+        let global = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let mut ctx = VmContext::new(global, memory_manager);
 
         ctx.push_frame(0, dummy_module(), 0, None, false, false)
             .unwrap();

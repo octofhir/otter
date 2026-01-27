@@ -101,7 +101,7 @@ impl JsPromise {
     /// // Later, resolve from Rust
     /// (resolvers.resolve)(Value::number(42.0));
     /// ```
-    pub fn with_resolvers() -> PromiseWithResolvers {
+    pub fn with_resolvers(_mm: Arc<crate::memory::MemoryManager>) -> PromiseWithResolvers {
         let promise = JsPromise::new();
 
         let resolve = {
@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn test_with_resolvers() {
-        let resolvers = JsPromise::with_resolvers();
+        let resolvers = JsPromise::with_resolvers(Arc::new(crate::memory::MemoryManager::test()));
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
 
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn test_with_resolvers_reject() {
-        let resolvers = JsPromise::with_resolvers();
+        let resolvers = JsPromise::with_resolvers(Arc::new(crate::memory::MemoryManager::test()));
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
 

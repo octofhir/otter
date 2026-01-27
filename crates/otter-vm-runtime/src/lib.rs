@@ -28,7 +28,8 @@ pub use builder::OtterBuilder;
 pub use event_loop::{ActiveServerCount, EventLoop, HttpEvent, WsEvent};
 pub use microtask::MicrotaskQueue;
 pub use extension::{
-    Extension, ExtensionRegistry, NativeOpResult, Op, OpHandler, op_async, op_native, op_sync,
+    Extension, ExtensionRegistry, NativeOpResult, Op, OpHandler, op_async, op_native,
+    op_native_with_mm, op_sync,
 };
 pub use module_loader::{
     LoadedModule, ModuleError, ModuleLoader, ModuleNamespace, ModuleState, ModuleType,

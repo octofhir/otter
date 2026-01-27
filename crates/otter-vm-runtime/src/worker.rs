@@ -9,7 +9,7 @@
 //! - `worker.onmessage` - Receive messages from the worker
 //! - `worker.terminate()` - Stop the worker
 
-use otter_vm_core::{StructuredCloneError, Value, structured_clone};
+use otter_vm_core::{MemoryManager, StructuredCloneError, Value, structured_clone};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -55,6 +55,8 @@ pub struct Worker {
     on_message: Mutex<Option<MessageHandler>>,
     /// Error handler (onerror)
     on_error: Mutex<Option<ErrorHandler>>,
+    /// Destination memory manager for messages sent to the worker
+    target_memory_manager: Arc<MemoryManager>,
 }
 
 impl Worker {
@@ -62,7 +64,11 @@ impl Worker {
     ///
     /// The `script` is the source code to execute in the worker.
     /// The `executor` is called with the worker context to run the script.
-    pub fn new<F>(executor: F) -> Arc<Self>
+    pub fn new<F>(
+        executor: F,
+        worker_mm: Arc<MemoryManager>,
+        main_mm: Arc<MemoryManager>,
+    ) -> Arc<Self>
     where
         F: FnOnce(WorkerContext) + Send + 'static,
     {
@@ -80,6 +86,7 @@ impl Worker {
             terminated: AtomicBool::new(false),
             on_message: Mutex::new(None),
             on_error: Mutex::new(None),
+            target_memory_manager: Arc::clone(&worker_mm),
         });
 
         // Create worker context
@@ -88,6 +95,7 @@ impl Worker {
             tx: worker_tx,
             rx: worker_rx,
             terminated: Arc::new(AtomicBool::new(false)),
+            target_memory_manager: main_mm,
         };
 
         // Spawn worker thread
@@ -118,7 +126,8 @@ impl Worker {
         }
 
         // Clone the value using structured clone
-        let cloned = structured_clone(&value).map_err(WorkerError::CloneError)?;
+        let cloned = structured_clone(&value, self.target_memory_manager.clone())
+            .map_err(WorkerError::CloneError)?;
 
         self.tx
             .send(WorkerMessage::Data(cloned))
@@ -204,6 +213,8 @@ pub struct WorkerContext {
     rx: Receiver<WorkerMessage>,
     /// Termination flag
     terminated: Arc<AtomicBool>,
+    /// Destination memory manager for messages sent to the main thread
+    target_memory_manager: Arc<MemoryManager>,
 }
 
 impl WorkerContext {
@@ -219,7 +230,8 @@ impl WorkerContext {
         }
 
         // Clone the value using structured clone
-        let cloned = structured_clone(&value).map_err(WorkerError::CloneError)?;
+        let cloned = structured_clone(&value, self.target_memory_manager.clone())
+            .map_err(WorkerError::CloneError)?;
 
         self.tx
             .send(WorkerMessage::Data(cloned))
@@ -293,11 +305,16 @@ impl WorkerPool {
     }
 
     /// Spawn a new worker
-    pub fn spawn<F>(&self, executor: F) -> Arc<Worker>
+    pub fn spawn<F>(
+        &self,
+        executor: F,
+        worker_mm: Arc<MemoryManager>,
+        main_mm: Arc<MemoryManager>,
+    ) -> Arc<Worker>
     where
         F: FnOnce(WorkerContext) + Send + 'static,
     {
-        let worker = Worker::new(executor);
+        let worker = Worker::new(executor, worker_mm, main_mm);
         self.workers.lock().push(Arc::clone(&worker));
         worker
     }
@@ -356,9 +373,15 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = Arc::clone(&counter);
 
-        let worker = Worker::new(move |_ctx| {
-            counter_clone.fetch_add(1, Ordering::Relaxed);
-        });
+        let main_mm = Arc::new(MemoryManager::test());
+        let worker_mm = Arc::new(MemoryManager::test());
+        let worker = Worker::new(
+            move |_ctx| {
+                counter_clone.fetch_add(1, Ordering::Relaxed);
+            },
+            worker_mm,
+            main_mm,
+        );
 
         // Give the worker time to run
         thread::sleep(Duration::from_millis(50));
@@ -372,12 +395,18 @@ mod tests {
         let received = Arc::new(Mutex::new(None));
         let received_clone = Arc::clone(&received);
 
-        let worker = Worker::new(move |ctx| {
-            // Wait for message
-            if let Some(WorkerMessage::Data(value)) = ctx.recv() {
-                *received_clone.lock() = Some(value);
-            }
-        });
+        let main_mm = Arc::new(MemoryManager::test());
+        let worker_mm = Arc::new(MemoryManager::test());
+        let worker = Worker::new(
+            move |ctx| {
+                // Wait for message
+                if let Some(WorkerMessage::Data(value)) = ctx.recv() {
+                    *received_clone.lock() = Some(value);
+                }
+            },
+            worker_mm,
+            main_mm,
+        );
 
         // Send message to worker
         worker.post_message(Value::int32(42)).unwrap();
@@ -393,21 +422,27 @@ mod tests {
 
     #[test]
     fn test_worker_bidirectional() {
-        let worker = Worker::new(|ctx| {
-            // Echo messages back
-            while let Some(msg) = ctx.recv() {
-                match msg {
-                    WorkerMessage::Data(value) => {
-                        let _ = ctx.post_message(value);
+        let main_mm = Arc::new(MemoryManager::test());
+        let worker_mm = Arc::new(MemoryManager::test());
+        let worker = Worker::new(
+            |ctx| {
+                // Echo messages back
+                while let Some(msg) = ctx.recv() {
+                    match msg {
+                        WorkerMessage::Data(value) => {
+                            let _ = ctx.post_message(value);
+                        }
+                        WorkerMessage::Terminate => {
+                            ctx.mark_terminated();
+                            break;
+                        }
+                        _ => {}
                     }
-                    WorkerMessage::Terminate => {
-                        ctx.mark_terminated();
-                        break;
-                    }
-                    _ => {}
                 }
-            }
-        });
+            },
+            worker_mm,
+            main_mm,
+        );
 
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_clone = Arc::clone(&received);
@@ -438,14 +473,20 @@ mod tests {
         let terminated = Arc::new(AtomicBool::new(false));
         let terminated_clone = Arc::clone(&terminated);
 
-        let worker = Worker::new(move |ctx| {
-            while let Some(msg) = ctx.recv() {
-                if matches!(msg, WorkerMessage::Terminate) {
-                    terminated_clone.store(true, Ordering::Relaxed);
-                    break;
+        let main_mm = Arc::new(MemoryManager::test());
+        let worker_mm = Arc::new(MemoryManager::test());
+        let worker = Worker::new(
+            move |ctx| {
+                while let Some(msg) = ctx.recv() {
+                    if matches!(msg, WorkerMessage::Terminate) {
+                        terminated_clone.store(true, Ordering::Relaxed);
+                        break;
+                    }
                 }
-            }
-        });
+            },
+            worker_mm,
+            main_mm,
+        );
 
         worker.terminate();
         thread::sleep(Duration::from_millis(50));
@@ -459,11 +500,17 @@ mod tests {
         let pool = WorkerPool::new();
         let counter = Arc::new(AtomicUsize::new(0));
 
+        let main_mm = Arc::new(MemoryManager::test());
         for _ in 0..3 {
             let counter_clone = Arc::clone(&counter);
-            pool.spawn(move |_ctx| {
-                counter_clone.fetch_add(1, Ordering::Relaxed);
-            });
+            let worker_mm = Arc::new(MemoryManager::test());
+            pool.spawn(
+                move |_ctx| {
+                    counter_clone.fetch_add(1, Ordering::Relaxed);
+                },
+                worker_mm,
+                main_mm.clone(),
+            );
         }
 
         assert_eq!(pool.len(), 3);
@@ -482,15 +529,21 @@ mod tests {
         let sab = Arc::new(SharedArrayBuffer::new(4));
         let sab_clone = Arc::clone(&sab);
 
-        let worker = Worker::new(move |ctx| {
-            // Wait for SharedArrayBuffer
-            if let Some(WorkerMessage::Data(value)) = ctx.recv()
-                && let Some(received_sab) = value.as_shared_array_buffer()
-            {
-                // Modify the shared buffer
-                received_sab.set(0, 42);
-            }
-        });
+        let main_mm = Arc::new(MemoryManager::test());
+        let worker_mm = Arc::new(MemoryManager::test());
+        let worker = Worker::new(
+            move |ctx| {
+                // Wait for SharedArrayBuffer
+                if let Some(WorkerMessage::Data(value)) = ctx.recv()
+                    && let Some(received_sab) = value.as_shared_array_buffer()
+                {
+                    // Modify the shared buffer
+                    received_sab.set(0, 42);
+                }
+            },
+            worker_mm,
+            main_mm,
+        );
 
         // Send SharedArrayBuffer to worker
         worker

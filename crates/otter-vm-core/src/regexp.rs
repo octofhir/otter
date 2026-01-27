@@ -21,8 +21,13 @@ pub struct JsRegExp {
 
 impl JsRegExp {
     /// Create a new JsRegExp
-    pub fn new(pattern: String, flags: String, proto: Option<Arc<JsObject>>) -> Self {
-        let object = Arc::new(JsObject::new(proto));
+    pub fn new(
+        pattern: String,
+        flags: String,
+        proto: Option<Arc<JsObject>>,
+        memory_manager: Arc<crate::memory::MemoryManager>,
+    ) -> Self {
+        let object = Arc::new(JsObject::new(proto, memory_manager));
         let source = if pattern.is_empty() {
             "(?:)".to_string()
         } else {
@@ -91,6 +96,10 @@ impl JsRegExp {
             unicode,
             native_regex,
         }
+    }
+
+    pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
+        self.object.memory_manager()
     }
 
     /// Execute the regex on a string

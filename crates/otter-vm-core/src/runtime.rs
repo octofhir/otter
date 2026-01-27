@@ -26,6 +26,8 @@ pub struct VmRuntime {
     global_template: Arc<JsObject>,
     /// Runtime configuration
     config: RuntimeConfig,
+    /// Memory manager for this runtime
+    memory_manager: Arc<crate::memory::MemoryManager>,
 }
 
 /// Runtime configuration
@@ -57,12 +59,14 @@ impl VmRuntime {
 
     /// Create a new runtime with custom configuration
     pub fn with_config(config: RuntimeConfig) -> Self {
-        let global = Arc::new(JsObject::new(None));
+        let memory_manager = Arc::new(crate::memory::MemoryManager::new(config.max_heap_size));
+        let global = Arc::new(JsObject::new(None, memory_manager.clone()));
         globals::setup_global_object(&global);
 
         Self {
             modules: DashMap::new(),
             global_template: global,
+            memory_manager,
             config,
         }
     }
@@ -84,12 +88,13 @@ impl VmRuntime {
     pub fn create_context(&self) -> VmContext {
         // Clone global object for isolation
         // TODO: Proper cloning with prototype chain
-        let global = Arc::new(JsObject::new(None));
+        let global = Arc::new(JsObject::new(None, self.memory_manager.clone()));
         globals::setup_global_object(&global);
         VmContext::with_config(
             global,
             self.config.max_stack_depth,
             crate::context::DEFAULT_MAX_NATIVE_DEPTH,
+            Arc::clone(&self.memory_manager),
         )
     }
 
@@ -120,6 +125,11 @@ impl VmRuntime {
     /// Get number of loaded modules
     pub fn module_count(&self) -> usize {
         self.modules.len()
+    }
+
+    /// Get the memory manager for this runtime
+    pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
+        &self.memory_manager
     }
 }
 

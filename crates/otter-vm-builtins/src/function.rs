@@ -8,10 +8,11 @@
 //! - name - returns function name
 //! - length - returns function parameter count
 
+use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
-use otter_vm_runtime::{Op, op_native};
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::sync::Arc;
 
 /// Get Function ops for extension registration
@@ -30,7 +31,7 @@ pub fn ops() -> Vec<Op> {
 // =============================================================================
 
 /// Function.prototype.toString() - returns string representation
-fn function_to_string(args: &[Value]) -> Result<Value, String> {
+fn function_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let func = args
         .first()
         .ok_or("Function.toString requires a function")?;
@@ -63,7 +64,7 @@ fn function_to_string(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Get function name
-fn function_get_name(args: &[Value]) -> Result<Value, String> {
+fn function_get_name(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let func = args.first().ok_or("Function.name requires a function")?;
 
     // Check for bound function first
@@ -83,7 +84,7 @@ fn function_get_name(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Get function parameter count (length)
-fn function_get_length(args: &[Value]) -> Result<Value, String> {
+fn function_get_length(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let func = args.first().ok_or("Function.length requires a function")?;
 
     // Check for bound function first
@@ -103,7 +104,7 @@ fn function_get_length(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Check if value is a function
-fn function_is_function(args: &[Value]) -> Result<Value, String> {
+fn function_is_function(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let val = args.first().ok_or("isFunction requires an argument")?;
 
     let is_func = val.is_callable()
@@ -117,13 +118,13 @@ fn function_is_function(args: &[Value]) -> Result<Value, String> {
 
 /// Create a bound function object
 /// Args: [originalFunc, thisArg, ...boundArgs]
-fn function_create_bound(args: &[Value]) -> Result<Value, String> {
+fn function_create_bound(args: &[Value], mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let original = args.first().ok_or("bind requires a function")?.clone();
 
     let this_arg = args.get(1).cloned().unwrap_or_else(Value::undefined);
 
     // Create bound function as an object with special properties
-    let bound = Arc::new(JsObject::new(None));
+    let bound = Arc::new(JsObject::new(None, mm.clone()));
 
     // Store the original function
     bound.set(PropertyKey::string("__boundFunction__"), original.clone());
@@ -135,7 +136,7 @@ fn function_create_bound(args: &[Value]) -> Result<Value, String> {
     if args.len() > 2 {
         let bound_args: Vec<Value> = args[2..].to_vec();
         // Store as array
-        let arr = Arc::new(JsObject::new(None));
+        let arr = Arc::new(JsObject::new(None, mm.clone()));
         for (i, arg) in bound_args.iter().enumerate() {
             arr.set(PropertyKey::Index(i as u32), arg.clone());
         }
@@ -194,46 +195,61 @@ mod tests {
 
     #[test]
     fn test_function_is_function() {
+        let memory_manager = Arc::new(memory::MemoryManager::test());
         // Native function should be detected
-        let native_fn = Value::native_function(|_args| Ok(Value::undefined()));
-        let result = function_is_function(std::slice::from_ref(&native_fn)).unwrap();
+        let native_fn =
+            Value::native_function(|_args, _mm| Ok(Value::undefined()), memory_manager.clone());
+        let result =
+            function_is_function(std::slice::from_ref(&native_fn), memory_manager.clone()).unwrap();
         assert_eq!(result.as_boolean(), Some(true));
 
         // Non-function should return false
         let num = Value::int32(42);
-        let result = function_is_function(std::slice::from_ref(&num)).unwrap();
+        let result =
+            function_is_function(std::slice::from_ref(&num), memory_manager.clone()).unwrap();
         assert_eq!(result.as_boolean(), Some(false));
     }
 
     #[test]
     fn test_function_to_string_native() {
-        let native_fn = Value::native_function(|_args| Ok(Value::undefined()));
-        let result = function_to_string(std::slice::from_ref(&native_fn)).unwrap();
+        let memory_manager = Arc::new(memory::MemoryManager::test());
+        let native_fn =
+            Value::native_function(|_args, _mm| Ok(Value::undefined()), memory_manager.clone());
+        let result =
+            function_to_string(std::slice::from_ref(&native_fn), memory_manager.clone()).unwrap();
         let s = result.as_string().unwrap().as_str();
         assert!(s.contains("[native code]"));
     }
 
     #[test]
     fn test_function_get_name_default() {
-        let native_fn = Value::native_function(|_args| Ok(Value::undefined()));
-        let result = function_get_name(std::slice::from_ref(&native_fn)).unwrap();
+        let memory_manager = Arc::new(memory::MemoryManager::test());
+        let native_fn =
+            Value::native_function(|_args, _mm| Ok(Value::undefined()), memory_manager.clone());
+        let result =
+            function_get_name(std::slice::from_ref(&native_fn), memory_manager.clone()).unwrap();
         let s = result.as_string().unwrap().as_str();
         assert_eq!(s, "");
     }
 
     #[test]
     fn test_function_get_length_default() {
-        let native_fn = Value::native_function(|_args| Ok(Value::undefined()));
-        let result = function_get_length(std::slice::from_ref(&native_fn)).unwrap();
+        let memory_manager = Arc::new(memory::MemoryManager::test());
+        let native_fn =
+            Value::native_function(|_args, _mm| Ok(Value::undefined()), memory_manager.clone());
+        let result =
+            function_get_length(std::slice::from_ref(&native_fn), memory_manager.clone()).unwrap();
         assert_eq!(result.as_int32(), Some(0));
     }
 
     #[test]
     fn test_function_create_bound() {
-        let original = Value::native_function(|_args| Ok(Value::int32(42)));
+        let memory_manager = Arc::new(memory::MemoryManager::test());
+        let original =
+            Value::native_function(|_args, _mm| Ok(Value::int32(42)), memory_manager.clone());
         let this_arg = Value::undefined();
 
-        let result = function_create_bound(&[original, this_arg]).unwrap();
+        let result = function_create_bound(&[original, this_arg], memory_manager.clone()).unwrap();
 
         // Should be an object
         assert!(result.is_object());
@@ -248,12 +264,16 @@ mod tests {
 
     #[test]
     fn test_function_create_bound_with_args() {
-        let original = Value::native_function(|_args| Ok(Value::int32(42)));
+        let memory_manager = Arc::new(memory::MemoryManager::test());
+        let original =
+            Value::native_function(|_args, _mm| Ok(Value::int32(42)), memory_manager.clone());
         let this_arg = Value::undefined();
         let arg1 = Value::int32(1);
         let arg2 = Value::int32(2);
 
-        let result = function_create_bound(&[original, this_arg, arg1, arg2]).unwrap();
+        let result =
+            function_create_bound(&[original, this_arg, arg1, arg2], memory_manager.clone())
+                .unwrap();
 
         let obj = result.as_object().unwrap();
 
@@ -264,10 +284,14 @@ mod tests {
 
     #[test]
     fn test_bound_function_is_callable() {
-        let original = Value::native_function(|_args| Ok(Value::int32(42)));
-        let bound = function_create_bound(&[original, Value::undefined()]).unwrap();
+        let memory_manager = Arc::new(memory::MemoryManager::test());
+        let original =
+            Value::native_function(|_args, _mm| Ok(Value::int32(42)), memory_manager.clone());
+        let bound =
+            function_create_bound(&[original, Value::undefined()], memory_manager.clone()).unwrap();
 
-        let result = function_is_function(std::slice::from_ref(&bound)).unwrap();
+        let result =
+            function_is_function(std::slice::from_ref(&bound), memory_manager.clone()).unwrap();
         assert_eq!(result.as_boolean(), Some(true));
     }
 }

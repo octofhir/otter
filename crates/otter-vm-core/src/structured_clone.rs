@@ -44,13 +44,15 @@ impl std::error::Error for StructuredCloneError {}
 pub struct StructuredCloner {
     /// Map from source pointer to cloned value (for circular reference handling)
     memory: FxHashMap<usize, Value>,
+    memory_manager: Arc<crate::memory::MemoryManager>,
 }
 
 impl StructuredCloner {
     /// Create a new cloner
-    pub fn new() -> Self {
+    pub fn new(memory_manager: Arc<crate::memory::MemoryManager>) -> Self {
         Self {
             memory: FxHashMap::default(),
+            memory_manager,
         }
     }
 
@@ -113,12 +115,8 @@ impl StructuredCloner {
                 let new_regex = Arc::new(crate::regexp::JsRegExp::new(
                     r.pattern.clone(),
                     r.flags.clone(),
-                    None, // Prototype will be set by constructor/default logic usually, but here we strip it?
-                          // In structured clone, generally proto is not preserved, but for RegExp it should be standard built-in prototype.
-                          // JsRegExp::new logic handles default proto if None?
-                          // It seems JsRegExp::new takes proto.
-                          // Passing None usually means "no prototype" or "Object.prototype" depending on impl.
-                          // For now this is sufficient to pass compilation.
+                    None,
+                    self.memory_manager.clone(),
                 ));
                 Ok(Value::regex(new_regex))
             }
@@ -138,7 +136,7 @@ impl StructuredCloner {
         }
 
         // Create new object
-        let new_obj = Arc::new(JsObject::new(None));
+        let new_obj = Arc::new(JsObject::new(None, self.memory_manager.clone()));
         let new_value = Value::object(Arc::clone(&new_obj));
 
         // Register before cloning properties (to handle circular refs)
@@ -165,7 +163,7 @@ impl StructuredCloner {
 
         // Create new array
         let len = arr.array_length();
-        let new_arr = Arc::new(JsObject::array(len));
+        let new_arr = Arc::new(JsObject::array(len, self.memory_manager.clone()));
         let new_value = Value::array(Arc::clone(&new_arr));
 
         // Register before cloning elements
@@ -184,15 +182,12 @@ impl StructuredCloner {
     }
 }
 
-impl Default for StructuredCloner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Convenience function to clone a value
-pub fn structured_clone(value: &Value) -> Result<Value, StructuredCloneError> {
-    StructuredCloner::new().clone(value)
+pub fn structured_clone(
+    value: &Value,
+    memory_manager: Arc<crate::memory::MemoryManager>,
+) -> Result<Value, StructuredCloneError> {
+    StructuredCloner::new(memory_manager).clone(value)
 }
 
 #[cfg(test)]
@@ -201,7 +196,8 @@ mod tests {
 
     #[test]
     fn test_clone_primitives() {
-        let mut cloner = StructuredCloner::new();
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let mut cloner = StructuredCloner::new(memory_manager.clone());
 
         assert!(cloner.clone(&Value::undefined()).unwrap().is_undefined());
         assert!(cloner.clone(&Value::null()).unwrap().is_null());
@@ -217,7 +213,8 @@ mod tests {
 
     #[test]
     fn test_clone_string() {
-        let mut cloner = StructuredCloner::new();
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let mut cloner = StructuredCloner::new(memory_manager.clone());
         let s = Value::string(JsString::intern("hello"));
         let cloned = cloner.clone(&s).unwrap();
         assert!(cloned.is_string());
@@ -226,8 +223,9 @@ mod tests {
 
     #[test]
     fn test_clone_object() {
-        let mut cloner = StructuredCloner::new();
-        let obj = Arc::new(JsObject::new(None));
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let mut cloner = StructuredCloner::new(memory_manager.clone());
+        let obj = Arc::new(JsObject::new(None, memory_manager.clone()));
         obj.set(PropertyKey::string("x"), Value::int32(1));
         obj.set(PropertyKey::string("y"), Value::int32(2));
 
@@ -248,7 +246,8 @@ mod tests {
 
     #[test]
     fn test_shared_array_buffer_shares_memory() {
-        let mut cloner = StructuredCloner::new();
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let mut cloner = StructuredCloner::new(memory_manager.clone());
         let sab = Arc::new(SharedArrayBuffer::new(4));
         sab.set(0, 42);
 
@@ -270,14 +269,15 @@ mod tests {
         use crate::value::Closure;
         use otter_vm_bytecode::Module;
 
-        let mut cloner = StructuredCloner::new();
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let mut cloner = StructuredCloner::new(memory_manager.clone());
         let dummy_module = Arc::new(Module::builder("test.js").build());
         let func = Value::function(Arc::new(Closure {
             function_index: 0,
             module: dummy_module,
             upvalues: vec![],
             is_async: false,
-            object: Arc::new(JsObject::new(None)),
+            object: Arc::new(JsObject::new(None, memory_manager.clone())),
         }));
 
         let result = cloner.clone(&func);

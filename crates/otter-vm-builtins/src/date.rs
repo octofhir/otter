@@ -11,9 +11,11 @@
 //! - Locale: toLocaleDateString, toLocaleTimeString, toLocaleString
 
 use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Timelike, Utc};
+use otter_vm_core::memory;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
-use otter_vm_runtime::{Op, op_native};
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
+use std::sync::Arc;
 
 /// Get Date ops for extension registration
 pub fn ops() -> Vec<Op> {
@@ -122,13 +124,13 @@ fn timestamp_to_utc(ts: i64) -> Option<DateTime<Utc>> {
 // =============================================================================
 
 /// Date.now() - returns current timestamp in milliseconds
-fn date_now(_args: &[Value]) -> Result<Value, String> {
+fn date_now(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let now = Utc::now().timestamp_millis();
     Ok(Value::number(now as f64))
 }
 
 /// Date.parse(dateString) - parses a date string and returns timestamp
-fn date_parse(args: &[Value]) -> Result<Value, String> {
+fn date_parse(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let s = match args.first() {
         Some(v) if v.is_string() => v.as_string().unwrap().to_string(),
         _ => return Ok(Value::number(f64::NAN)),
@@ -172,7 +174,7 @@ fn date_parse(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Date.UTC(year, month, ...) - returns timestamp for UTC date
-fn date_utc(args: &[Value]) -> Result<Value, String> {
+fn date_utc(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let year = get_arg_i32(args, 0).unwrap_or(1970);
     let month = get_arg_i32(args, 1).unwrap_or(0); // 0-indexed
     let day = get_arg_i32(args, 2).unwrap_or(1);
@@ -210,28 +212,28 @@ fn date_utc(args: &[Value]) -> Result<Value, String> {
 // Local getters
 // =============================================================================
 
-fn date_get_full_year(args: &[Value]) -> Result<Value, String> {
+fn date_get_full_year(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_local) {
         Some(dt) => Ok(Value::int32(dt.year())),
         None => Ok(Value::number(f64::NAN)),
     }
 }
 
-fn date_get_month(args: &[Value]) -> Result<Value, String> {
+fn date_get_month(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_local) {
         Some(dt) => Ok(Value::int32(dt.month0() as i32)), // 0-indexed
         None => Ok(Value::number(f64::NAN)),
     }
 }
 
-fn date_get_date(args: &[Value]) -> Result<Value, String> {
+fn date_get_date(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_local) {
         Some(dt) => Ok(Value::int32(dt.day() as i32)),
         None => Ok(Value::number(f64::NAN)),
     }
 }
 
-fn date_get_day(args: &[Value]) -> Result<Value, String> {
+fn date_get_day(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_local) {
         Some(dt) => {
             // chrono: Mon=0, Sun=6; JS: Sun=0, Sat=6
@@ -242,28 +244,28 @@ fn date_get_day(args: &[Value]) -> Result<Value, String> {
     }
 }
 
-fn date_get_hours(args: &[Value]) -> Result<Value, String> {
+fn date_get_hours(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_local) {
         Some(dt) => Ok(Value::int32(dt.hour() as i32)),
         None => Ok(Value::number(f64::NAN)),
     }
 }
 
-fn date_get_minutes(args: &[Value]) -> Result<Value, String> {
+fn date_get_minutes(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_local) {
         Some(dt) => Ok(Value::int32(dt.minute() as i32)),
         None => Ok(Value::number(f64::NAN)),
     }
 }
 
-fn date_get_seconds(args: &[Value]) -> Result<Value, String> {
+fn date_get_seconds(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_local) {
         Some(dt) => Ok(Value::int32(dt.second() as i32)),
         None => Ok(Value::number(f64::NAN)),
     }
 }
 
-fn date_get_milliseconds(args: &[Value]) -> Result<Value, String> {
+fn date_get_milliseconds(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_local) {
         Some(dt) => Ok(Value::int32((dt.nanosecond() / 1_000_000) as i32)),
         None => Ok(Value::number(f64::NAN)),
@@ -274,28 +276,31 @@ fn date_get_milliseconds(args: &[Value]) -> Result<Value, String> {
 // UTC getters
 // =============================================================================
 
-fn date_get_utc_full_year(args: &[Value]) -> Result<Value, String> {
+fn date_get_utc_full_year(
+    args: &[Value],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_utc) {
         Some(dt) => Ok(Value::int32(dt.year())),
         None => Ok(Value::number(f64::NAN)),
     }
 }
 
-fn date_get_utc_month(args: &[Value]) -> Result<Value, String> {
+fn date_get_utc_month(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_utc) {
         Some(dt) => Ok(Value::int32(dt.month0() as i32)),
         None => Ok(Value::number(f64::NAN)),
     }
 }
 
-fn date_get_utc_date(args: &[Value]) -> Result<Value, String> {
+fn date_get_utc_date(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_utc) {
         Some(dt) => Ok(Value::int32(dt.day() as i32)),
         None => Ok(Value::number(f64::NAN)),
     }
 }
 
-fn date_get_utc_day(args: &[Value]) -> Result<Value, String> {
+fn date_get_utc_day(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_utc) {
         Some(dt) => {
             let day = dt.weekday().num_days_from_sunday();
@@ -305,28 +310,31 @@ fn date_get_utc_day(args: &[Value]) -> Result<Value, String> {
     }
 }
 
-fn date_get_utc_hours(args: &[Value]) -> Result<Value, String> {
+fn date_get_utc_hours(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_utc) {
         Some(dt) => Ok(Value::int32(dt.hour() as i32)),
         None => Ok(Value::number(f64::NAN)),
     }
 }
 
-fn date_get_utc_minutes(args: &[Value]) -> Result<Value, String> {
+fn date_get_utc_minutes(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_utc) {
         Some(dt) => Ok(Value::int32(dt.minute() as i32)),
         None => Ok(Value::number(f64::NAN)),
     }
 }
 
-fn date_get_utc_seconds(args: &[Value]) -> Result<Value, String> {
+fn date_get_utc_seconds(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_utc) {
         Some(dt) => Ok(Value::int32(dt.second() as i32)),
         None => Ok(Value::number(f64::NAN)),
     }
 }
 
-fn date_get_utc_milliseconds(args: &[Value]) -> Result<Value, String> {
+fn date_get_utc_milliseconds(
+    args: &[Value],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_utc) {
         Some(dt) => Ok(Value::int32((dt.nanosecond() / 1_000_000) as i32)),
         None => Ok(Value::number(f64::NAN)),
@@ -337,14 +345,17 @@ fn date_get_utc_milliseconds(args: &[Value]) -> Result<Value, String> {
 // Other getters
 // =============================================================================
 
-fn date_get_time(args: &[Value]) -> Result<Value, String> {
+fn date_get_time(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args) {
         Some(ts) => Ok(Value::number(ts as f64)),
         None => Ok(Value::number(f64::NAN)),
     }
 }
 
-fn date_get_timezone_offset(_args: &[Value]) -> Result<Value, String> {
+fn date_get_timezone_offset(
+    _args: &[Value],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<Value, String> {
     // Return offset in minutes (negative for east of UTC)
     let local = Local::now();
     let offset_secs = local.offset().local_minus_utc();
@@ -355,7 +366,7 @@ fn date_get_timezone_offset(_args: &[Value]) -> Result<Value, String> {
 // Local setters (return new timestamp)
 // =============================================================================
 
-fn date_set_full_year(args: &[Value]) -> Result<Value, String> {
+fn date_set_full_year(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let ts = get_timestamp(args).unwrap_or_else(|| Utc::now().timestamp_millis());
     let year = get_arg_i32(args, 1).unwrap_or(1970);
     let month = get_arg_i32(args, 2);
@@ -377,7 +388,7 @@ fn date_set_full_year(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(f64::NAN))
 }
 
-fn date_set_month(args: &[Value]) -> Result<Value, String> {
+fn date_set_month(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let ts = get_timestamp(args).unwrap_or_else(|| Utc::now().timestamp_millis());
     let month = get_arg_i32(args, 1).unwrap_or(0);
     let day = get_arg_i32(args, 2);
@@ -398,7 +409,7 @@ fn date_set_month(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(f64::NAN))
 }
 
-fn date_set_date(args: &[Value]) -> Result<Value, String> {
+fn date_set_date(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let ts = get_timestamp(args).unwrap_or_else(|| Utc::now().timestamp_millis());
     let day = get_arg_i32(args, 1).unwrap_or(1);
 
@@ -414,7 +425,7 @@ fn date_set_date(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(f64::NAN))
 }
 
-fn date_set_hours(args: &[Value]) -> Result<Value, String> {
+fn date_set_hours(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let ts = get_timestamp(args).unwrap_or_else(|| Utc::now().timestamp_millis());
     let hours = get_arg_i32(args, 1).unwrap_or(0) as u32;
     let minutes = get_arg_i32(args, 2);
@@ -437,7 +448,7 @@ fn date_set_hours(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(f64::NAN))
 }
 
-fn date_set_minutes(args: &[Value]) -> Result<Value, String> {
+fn date_set_minutes(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let ts = get_timestamp(args).unwrap_or_else(|| Utc::now().timestamp_millis());
     let minutes = get_arg_i32(args, 1).unwrap_or(0) as u32;
     let seconds = get_arg_i32(args, 2);
@@ -460,7 +471,7 @@ fn date_set_minutes(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(f64::NAN))
 }
 
-fn date_set_seconds(args: &[Value]) -> Result<Value, String> {
+fn date_set_seconds(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let ts = get_timestamp(args).unwrap_or_else(|| Utc::now().timestamp_millis());
     let seconds = get_arg_i32(args, 1).unwrap_or(0) as u32;
     let ms = get_arg_i32(args, 2);
@@ -481,7 +492,7 @@ fn date_set_seconds(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(f64::NAN))
 }
 
-fn date_set_milliseconds(args: &[Value]) -> Result<Value, String> {
+fn date_set_milliseconds(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let ts = get_timestamp(args).unwrap_or_else(|| Utc::now().timestamp_millis());
     let ms = get_arg_i32(args, 1).unwrap_or(0) as u32;
 
@@ -497,7 +508,7 @@ fn date_set_milliseconds(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(f64::NAN))
 }
 
-fn date_set_time(args: &[Value]) -> Result<Value, String> {
+fn date_set_time(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_arg_i32(args, 1) {
         Some(ts) => Ok(Value::number(ts as f64)),
         None => {
@@ -517,7 +528,10 @@ fn date_set_time(args: &[Value]) -> Result<Value, String> {
 // UTC setters
 // =============================================================================
 
-fn date_set_utc_full_year(args: &[Value]) -> Result<Value, String> {
+fn date_set_utc_full_year(
+    args: &[Value],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<Value, String> {
     let ts = get_timestamp(args).unwrap_or_else(|| Utc::now().timestamp_millis());
     let year = get_arg_i32(args, 1).unwrap_or(1970);
     let month = get_arg_i32(args, 2);
@@ -537,7 +551,7 @@ fn date_set_utc_full_year(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(f64::NAN))
 }
 
-fn date_set_utc_month(args: &[Value]) -> Result<Value, String> {
+fn date_set_utc_month(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let ts = get_timestamp(args).unwrap_or_else(|| Utc::now().timestamp_millis());
     let month = get_arg_i32(args, 1).unwrap_or(0);
     let day = get_arg_i32(args, 2);
@@ -556,7 +570,7 @@ fn date_set_utc_month(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(f64::NAN))
 }
 
-fn date_set_utc_date(args: &[Value]) -> Result<Value, String> {
+fn date_set_utc_date(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let ts = get_timestamp(args).unwrap_or_else(|| Utc::now().timestamp_millis());
     let day = get_arg_i32(args, 1).unwrap_or(1);
 
@@ -571,7 +585,7 @@ fn date_set_utc_date(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(f64::NAN))
 }
 
-fn date_set_utc_hours(args: &[Value]) -> Result<Value, String> {
+fn date_set_utc_hours(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let ts = get_timestamp(args).unwrap_or_else(|| Utc::now().timestamp_millis());
     let hours = get_arg_i32(args, 1).unwrap_or(0) as u32;
     let minutes = get_arg_i32(args, 2);
@@ -592,7 +606,7 @@ fn date_set_utc_hours(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(f64::NAN))
 }
 
-fn date_set_utc_minutes(args: &[Value]) -> Result<Value, String> {
+fn date_set_utc_minutes(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let ts = get_timestamp(args).unwrap_or_else(|| Utc::now().timestamp_millis());
     let minutes = get_arg_i32(args, 1).unwrap_or(0) as u32;
     let seconds = get_arg_i32(args, 2);
@@ -613,7 +627,7 @@ fn date_set_utc_minutes(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(f64::NAN))
 }
 
-fn date_set_utc_seconds(args: &[Value]) -> Result<Value, String> {
+fn date_set_utc_seconds(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     let ts = get_timestamp(args).unwrap_or_else(|| Utc::now().timestamp_millis());
     let seconds = get_arg_i32(args, 1).unwrap_or(0) as u32;
     let ms = get_arg_i32(args, 2);
@@ -632,7 +646,10 @@ fn date_set_utc_seconds(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(f64::NAN))
 }
 
-fn date_set_utc_milliseconds(args: &[Value]) -> Result<Value, String> {
+fn date_set_utc_milliseconds(
+    args: &[Value],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<Value, String> {
     let ts = get_timestamp(args).unwrap_or_else(|| Utc::now().timestamp_millis());
     let ms = get_arg_i32(args, 1).unwrap_or(0) as u32;
 
@@ -652,7 +669,7 @@ fn date_set_utc_milliseconds(args: &[Value]) -> Result<Value, String> {
 // =============================================================================
 
 /// toString - e.g., "Thu Jan 23 2026 15:30:45 GMT-0500 (Eastern Standard Time)"
-fn date_to_string(args: &[Value]) -> Result<Value, String> {
+fn date_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_local) {
         Some(dt) => {
             let s = dt.format("%a %b %d %Y %H:%M:%S GMT%z").to_string();
@@ -663,7 +680,7 @@ fn date_to_string(args: &[Value]) -> Result<Value, String> {
 }
 
 /// toDateString - e.g., "Thu Jan 23 2026"
-fn date_to_date_string(args: &[Value]) -> Result<Value, String> {
+fn date_to_date_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_local) {
         Some(dt) => {
             let s = dt.format("%a %b %d %Y").to_string();
@@ -674,7 +691,7 @@ fn date_to_date_string(args: &[Value]) -> Result<Value, String> {
 }
 
 /// toTimeString - e.g., "15:30:45 GMT-0500 (Eastern Standard Time)"
-fn date_to_time_string(args: &[Value]) -> Result<Value, String> {
+fn date_to_time_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_local) {
         Some(dt) => {
             let s = dt.format("%H:%M:%S GMT%z").to_string();
@@ -685,7 +702,7 @@ fn date_to_time_string(args: &[Value]) -> Result<Value, String> {
 }
 
 /// toISOString - e.g., "2026-01-23T20:30:45.000Z"
-fn date_to_iso_string(args: &[Value]) -> Result<Value, String> {
+fn date_to_iso_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_utc) {
         Some(dt) => {
             let s = dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
@@ -696,7 +713,7 @@ fn date_to_iso_string(args: &[Value]) -> Result<Value, String> {
 }
 
 /// toUTCString - e.g., "Thu, 23 Jan 2026 20:30:45 GMT"
-fn date_to_utc_string(args: &[Value]) -> Result<Value, String> {
+fn date_to_utc_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_utc) {
         Some(dt) => {
             let s = dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
@@ -707,7 +724,7 @@ fn date_to_utc_string(args: &[Value]) -> Result<Value, String> {
 }
 
 /// toJSON - same as toISOString (used by JSON.stringify)
-fn date_to_json(args: &[Value]) -> Result<Value, String> {
+fn date_to_json(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_utc) {
         Some(dt) => {
             let s = dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
@@ -718,7 +735,7 @@ fn date_to_json(args: &[Value]) -> Result<Value, String> {
 }
 
 /// valueOf - returns timestamp
-fn date_value_of(args: &[Value]) -> Result<Value, String> {
+fn date_value_of(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args) {
         Some(ts) => Ok(Value::number(ts as f64)),
         None => Ok(Value::number(f64::NAN)),
@@ -726,7 +743,10 @@ fn date_value_of(args: &[Value]) -> Result<Value, String> {
 }
 
 /// toLocaleDateString (simplified - no locale support yet)
-fn date_to_locale_date_string(args: &[Value]) -> Result<Value, String> {
+fn date_to_locale_date_string(
+    args: &[Value],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_local) {
         Some(dt) => {
             let s = dt.format("%m/%d/%Y").to_string();
@@ -737,7 +757,10 @@ fn date_to_locale_date_string(args: &[Value]) -> Result<Value, String> {
 }
 
 /// toLocaleTimeString (simplified - no locale support yet)
-fn date_to_locale_time_string(args: &[Value]) -> Result<Value, String> {
+fn date_to_locale_time_string(
+    args: &[Value],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_local) {
         Some(dt) => {
             let s = dt.format("%I:%M:%S %p").to_string();
@@ -748,7 +771,7 @@ fn date_to_locale_time_string(args: &[Value]) -> Result<Value, String> {
 }
 
 /// toLocaleString (simplified - no locale support yet)
-fn date_to_locale_string(args: &[Value]) -> Result<Value, String> {
+fn date_to_locale_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
     match get_timestamp(args).and_then(timestamp_to_local) {
         Some(dt) => {
             let s = dt.format("%m/%d/%Y, %I:%M:%S %p").to_string();
@@ -764,13 +787,15 @@ mod tests {
 
     #[test]
     fn test_date_now() {
-        let result = date_now(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = date_now(&[], mm).unwrap();
         let ts = result.as_number().unwrap();
         assert!(ts > 1700000000000.0); // After 2023
     }
 
     #[test]
     fn test_date_utc() {
+        let mm = Arc::new(memory::MemoryManager::test());
         // Date.UTC(2026, 0, 23, 12, 30, 45, 500)
         let args = vec![
             Value::int32(2026),
@@ -781,47 +806,51 @@ mod tests {
             Value::int32(45),
             Value::int32(500),
         ];
-        let result = date_utc(&args).unwrap();
+        let result = date_utc(&args, mm).unwrap();
         let ts = result.as_number().unwrap();
         assert!(ts > 0.0);
     }
 
     #[test]
     fn test_date_parse_iso() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let args = vec![Value::string(JsString::intern("2026-01-23T12:30:45.000Z"))];
-        let result = date_parse(&args).unwrap();
+        let result = date_parse(&args, mm).unwrap();
         let ts = result.as_number().unwrap();
         assert!(ts > 0.0);
     }
 
     #[test]
     fn test_date_getters() {
+        let mm = Arc::new(memory::MemoryManager::test());
         // Use a known timestamp: 2026-01-23T12:30:45.500Z
         let ts = 1769170245500i64; // approximately
         let args = vec![Value::number(ts as f64)];
 
-        let year = date_get_utc_full_year(&args).unwrap();
+        let year = date_get_utc_full_year(&args, mm.clone()).unwrap();
         assert_eq!(year.as_int32(), Some(2026));
 
-        let month = date_get_utc_month(&args).unwrap();
+        let month = date_get_utc_month(&args, mm.clone()).unwrap();
         assert_eq!(month.as_int32(), Some(0)); // January = 0
 
-        let date = date_get_utc_date(&args).unwrap();
+        let date = date_get_utc_date(&args, mm).unwrap();
         assert!(date.as_int32().is_some());
     }
 
     #[test]
     fn test_date_to_iso_string() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let ts = 0i64; // Unix epoch
         let args = vec![Value::number(ts as f64)];
-        let result = date_to_iso_string(&args).unwrap();
+        let result = date_to_iso_string(&args, mm).unwrap();
         let s = result.as_string().unwrap().to_string();
         assert_eq!(s, "1970-01-01T00:00:00.000Z");
     }
 
     #[test]
     fn test_date_timezone_offset() {
-        let result = date_get_timezone_offset(&[]).unwrap();
+        let mm = Arc::new(memory::MemoryManager::test());
+        let result = date_get_timezone_offset(&[], mm).unwrap();
         let offset = result.as_int32().unwrap();
         // Offset should be within reasonable range (-720 to 840 minutes)
         assert!((-720..=840).contains(&offset));
@@ -829,8 +858,9 @@ mod tests {
 
     #[test]
     fn test_invalid_date() {
+        let mm = Arc::new(memory::MemoryManager::test());
         let args = vec![Value::number(f64::NAN)];
-        let result = date_to_string(&args).unwrap();
+        let result = date_to_string(&args, mm).unwrap();
         let s = result.as_string().unwrap().to_string();
         assert_eq!(s, "Invalid Date");
     }

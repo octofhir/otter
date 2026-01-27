@@ -140,6 +140,11 @@ pub enum PropertyDescriptor {
         /// Attributes
         attributes: PropertyAttributes,
     },
+    /// Tombstone for a deleted property.
+    ///
+    /// We keep the key in the object's Shape (hidden class) for now, but treat this
+    /// descriptor as "absent" for `get`/`has`/`own_keys` so deletion is observable.
+    Deleted,
 }
 
 impl PropertyDescriptor {
@@ -160,7 +165,7 @@ impl PropertyDescriptor {
     pub fn value(&self) -> Option<&Value> {
         match self {
             Self::Data { value, .. } => Some(value),
-            Self::Accessor { .. } => None,
+            Self::Accessor { .. } | Self::Deleted => None,
         }
     }
 
@@ -168,7 +173,7 @@ impl PropertyDescriptor {
     pub fn value_mut(&mut self) -> Option<&mut Value> {
         match self {
             Self::Data { value, .. } => Some(value),
-            Self::Accessor { .. } => None,
+            Self::Accessor { .. } | Self::Deleted => None,
         }
     }
 
@@ -176,7 +181,7 @@ impl PropertyDescriptor {
     pub fn is_writable(&self) -> bool {
         match self {
             Self::Data { attributes, .. } => attributes.writable,
-            Self::Accessor { .. } => false,
+            Self::Accessor { .. } | Self::Deleted => false,
         }
     }
 
@@ -186,6 +191,7 @@ impl PropertyDescriptor {
             Self::Data { attributes, .. } | Self::Accessor { attributes, .. } => {
                 attributes.configurable
             }
+            Self::Deleted => true,
         }
     }
 
@@ -195,6 +201,7 @@ impl PropertyDescriptor {
             Self::Data { attributes, .. } | Self::Accessor { attributes, .. } => {
                 attributes.enumerable
             }
+            Self::Deleted => false,
         }
     }
 }
@@ -228,6 +235,8 @@ pub struct JsObject {
     elements: RwLock<Vec<Value>>,
     /// Object flags (mutable for freeze/seal/preventExtensions)
     flags: RwLock<ObjectFlags>,
+    /// Memory manager for accounting
+    memory_manager: Arc<crate::memory::MemoryManager>,
 }
 
 /// Object flags
@@ -245,7 +254,14 @@ pub struct ObjectFlags {
 
 impl JsObject {
     /// Create a new empty object
-    pub fn new(prototype: Option<Arc<JsObject>>) -> Self {
+    pub fn new(
+        prototype: Option<Arc<JsObject>>,
+        memory_manager: Arc<crate::memory::MemoryManager>,
+    ) -> Self {
+        // Assume basic object size for now
+        let size = std::mem::size_of::<Self>();
+        let _ = memory_manager.alloc(size); // ignore err in basic constructor for now or return Result
+
         Self {
             shape: RwLock::new(Shape::root()),
             inline_properties: RwLock::new([None, None, None, None]),
@@ -256,12 +272,17 @@ impl JsObject {
                 extensible: true,
                 ..Default::default()
             }),
+            memory_manager,
         }
     }
 
+    pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
+        &self.memory_manager
+    }
+
     /// Create a new array
-    pub fn array(length: usize) -> Self {
-        let obj = Self::new(None); // TODO: Array.prototype
+    pub fn array(length: usize, memory_manager: Arc<crate::memory::MemoryManager>) -> Self {
+        let obj = Self::new(None, memory_manager); // TODO: Array.prototype
         obj.flags.write().is_array = true;
         obj.elements.write().resize(length, Value::undefined());
         obj
@@ -289,13 +310,18 @@ impl JsObject {
     /// Get property entry by offset (includes accessor properties)
     #[inline]
     pub fn get_property_entry_by_offset(&self, offset: usize) -> Option<PropertyDescriptor> {
-        if offset < INLINE_PROPERTY_COUNT {
+        let desc = if offset < INLINE_PROPERTY_COUNT {
             let inline = self.inline_properties.read();
-            inline[offset].as_ref().map(|e| e.desc.clone())
+            inline[offset].as_ref().map(|e| e.desc.clone())?
         } else {
             let overflow = self.overflow_properties.read();
             let overflow_idx = offset - INLINE_PROPERTY_COUNT;
-            overflow.get(overflow_idx).map(|e| e.desc.clone())
+            overflow.get(overflow_idx).map(|e| e.desc.clone())?
+        };
+
+        match desc {
+            PropertyDescriptor::Deleted => None,
+            other => Some(other),
         }
     }
 
@@ -303,17 +329,31 @@ impl JsObject {
     /// First INLINE_PROPERTY_COUNT properties are stored inline, rest in overflow.
     #[inline]
     pub fn set_by_offset(&self, offset: usize, value: Value) -> bool {
+        let flags = self.flags.read();
+        if flags.frozen {
+            return false;
+        }
+        let can_add = flags.extensible && !flags.sealed;
+        drop(flags);
+
         if offset < INLINE_PROPERTY_COUNT {
             let mut inline = self.inline_properties.write();
             if let Some(entry) = inline[offset].as_mut() {
-                if entry.desc.is_writable() {
-                    if let PropertyDescriptor::Data {
-                        value: ref mut v, ..
-                    } = entry.desc
-                    {
-                        *v = value;
+                match &mut entry.desc {
+                    PropertyDescriptor::Deleted => {
+                        if !can_add {
+                            return false;
+                        }
+                        entry.desc = PropertyDescriptor::data(value);
                         return true;
                     }
+                    PropertyDescriptor::Data { value: v, attributes } => {
+                        if attributes.writable {
+                            *v = value;
+                            return true;
+                        }
+                    }
+                    PropertyDescriptor::Accessor { .. } => {}
                 }
             }
             false
@@ -321,14 +361,21 @@ impl JsObject {
             let mut overflow = self.overflow_properties.write();
             let overflow_idx = offset - INLINE_PROPERTY_COUNT;
             if let Some(entry) = overflow.get_mut(overflow_idx) {
-                if entry.desc.is_writable() {
-                    if let PropertyDescriptor::Data {
-                        value: ref mut v, ..
-                    } = entry.desc
-                    {
-                        *v = value;
+                match &mut entry.desc {
+                    PropertyDescriptor::Deleted => {
+                        if !can_add {
+                            return false;
+                        }
+                        entry.desc = PropertyDescriptor::data(value);
                         return true;
                     }
+                    PropertyDescriptor::Data { value: v, attributes } => {
+                        if attributes.writable {
+                            *v = value;
+                            return true;
+                        }
+                    }
+                    PropertyDescriptor::Accessor { .. } => {}
                 }
             }
             false
@@ -363,7 +410,15 @@ impl JsObject {
         {
             let shape = self.shape.read();
             if let Some(offset) = shape.get_offset(key) {
-                return self.get_by_offset(offset);
+                if let Some(desc) = self.get_property_entry_by_offset(offset) {
+                    match desc {
+                        PropertyDescriptor::Data { value, .. } => return Some(value),
+                        // Accessors are handled via `lookup_property_descriptor` in the interpreter.
+                        // For this low-level helper, treat them as non-values.
+                        PropertyDescriptor::Accessor { .. } => return None,
+                        PropertyDescriptor::Deleted => {}
+                    }
+                }
             }
         }
 
@@ -394,7 +449,13 @@ impl JsObject {
             {
                 let shape = proto.shape.read();
                 if let Some(offset) = shape.get_offset(key) {
-                    return proto.get_by_offset(offset);
+                    if let Some(desc) = proto.get_property_entry_by_offset(offset) {
+                        match desc {
+                            PropertyDescriptor::Data { value, .. } => return Some(value),
+                            PropertyDescriptor::Accessor { .. } => return None,
+                            PropertyDescriptor::Deleted => {}
+                        }
+                    }
                 }
             }
 
@@ -424,6 +485,7 @@ impl JsObject {
                                 values.push(v);
                             }
                         }
+                        PropertyDescriptor::Deleted => {}
                     }
                 }
             }
@@ -443,6 +505,7 @@ impl JsObject {
                             values.push(v);
                         }
                     }
+                    PropertyDescriptor::Deleted => {}
                 }
             }
         }
@@ -575,12 +638,35 @@ impl JsObject {
 
     /// Delete property
     pub fn delete(&self, key: &PropertyKey) -> bool {
-        // Sealed or frozen objects cannot have properties deleted
+        // Array element deletion (best-effort).
+        //
+        // NOTE: We currently don't model array holes, so we can't fully implement
+        // `delete arr[i]`. Setting the element to `undefined` preserves the read
+        // behavior, but `i in arr` will still be true.
+        if let PropertyKey::Index(i) = key {
+            let idx = *i as usize;
+            let mut elements = self.elements.write();
+            if idx < elements.len() {
+                elements[idx] = Value::undefined();
+            }
+            return true;
+        }
+
+        let Some(offset) = self.shape.read().get_offset(key) else {
+            // Per JS semantics, deleting a non-existent property succeeds.
+            return true;
+        };
+
+        // Already deleted => treat as absent.
+        if self.get_property_entry_by_offset(offset).is_none() {
+            return true;
+        }
+
+        // Sealed or frozen objects cannot have properties deleted.
         let flags = self.flags.read();
         if flags.sealed || flags.frozen {
             return false;
         }
-        drop(flags);
 
         // Check if configurable
         if let Some(desc) = self.get_own_property_descriptor(key) {
@@ -588,19 +674,32 @@ impl JsObject {
                 return false;
             }
 
-            // Note: Deleting properties breaks the Shape transition model.
-            // Modern engines usually transition to a "Dictionary Mode" shape.
-            // For simplicity, we just return false and don't actually delete from Vec
-            return false;
+            // Mark tombstone in-place (Shape remains unchanged for now).
+            if offset < INLINE_PROPERTY_COUNT {
+                let mut inline = self.inline_properties.write();
+                if let Some(entry) = inline[offset].as_mut() {
+                    entry.desc = PropertyDescriptor::Deleted;
+                    return true;
+                }
+            } else {
+                let mut overflow = self.overflow_properties.write();
+                let overflow_idx = offset - INLINE_PROPERTY_COUNT;
+                if let Some(entry) = overflow.get_mut(overflow_idx) {
+                    entry.desc = PropertyDescriptor::Deleted;
+                    return true;
+                }
+            }
         }
 
-        false
+        // If we couldn't find storage for an offset that exists in the Shape,
+        // treat it as a no-op deletion.
+        true
     }
 
     /// Check if object has own property
     pub fn has_own(&self, key: &PropertyKey) -> bool {
-        if self.shape.read().get_offset(key).is_some() {
-            return true;
+        if let Some(offset) = self.shape.read().get_offset(key) {
+            return self.get_property_entry_by_offset(offset).is_some();
         }
 
         // Check indexed elements
@@ -640,7 +739,13 @@ impl JsObject {
 
     /// Get own property keys
     pub fn own_keys(&self) -> Vec<PropertyKey> {
-        let mut keys = self.shape.read().own_keys();
+        let shape_keys = self.shape.read().own_keys();
+        let mut keys = Vec::with_capacity(shape_keys.len());
+        for key in shape_keys {
+            if self.get_own_property_descriptor(&key).is_some() {
+                keys.push(key);
+            }
+        }
 
         // Add indexed elements
         let elements = self.elements.read();
@@ -664,6 +769,12 @@ impl JsObject {
         let offset = self.shape.read().get_offset(&key);
 
         if let Some(off) = offset {
+            // Treat deleted slots as non-existent for extensibility checks.
+            if self.get_property_entry_by_offset(off).is_none() && (!flags.extensible || flags.sealed)
+            {
+                return false;
+            }
+
             // Update existing property
             if off < INLINE_PROPERTY_COUNT {
                 let mut inline = self.inline_properties.write();
@@ -780,6 +891,7 @@ impl JsObject {
                 PropertyDescriptor::Accessor { attributes, .. } => {
                     attributes.configurable = false;
                 }
+                PropertyDescriptor::Deleted => {}
             }
         }
     }
@@ -802,11 +914,14 @@ impl JsObject {
         let mut overflow = self.overflow_properties.write();
         for entry in overflow.iter_mut() {
             match &mut entry.desc {
-                PropertyDescriptor::Data { attributes, .. }
-                | PropertyDescriptor::Accessor { attributes, .. } => {
+                PropertyDescriptor::Data { attributes, .. } => {
                     attributes.configurable = false;
                 }
-            }
+                PropertyDescriptor::Accessor { attributes, .. } => {
+                    attributes.configurable = false;
+                }
+                PropertyDescriptor::Deleted => {}
+            };
         }
     }
 
@@ -881,7 +996,8 @@ mod tests {
 
     #[test]
     fn test_object_get_set() {
-        let obj = JsObject::new(None);
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let obj = JsObject::new(None, memory_manager);
 
         obj.set(PropertyKey::string("foo"), Value::int32(42));
         assert_eq!(obj.get(&PropertyKey::string("foo")), Some(Value::int32(42)));
@@ -889,7 +1005,8 @@ mod tests {
 
     #[test]
     fn test_object_has() {
-        let obj = JsObject::new(None);
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let obj = JsObject::new(None, memory_manager);
         obj.set(PropertyKey::string("foo"), Value::int32(42));
 
         assert!(obj.has(&PropertyKey::string("foo")));
@@ -898,7 +1015,8 @@ mod tests {
 
     #[test]
     fn test_array() {
-        let arr = JsObject::array(3);
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let arr = JsObject::array(3, memory_manager);
         assert!(arr.is_array());
         assert_eq!(arr.array_length(), 3);
 
@@ -919,7 +1037,8 @@ mod tests {
 
     #[test]
     fn test_object_freeze() {
-        let obj = JsObject::new(None);
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let obj = JsObject::new(None, memory_manager);
         obj.set(PropertyKey::string("foo"), Value::int32(42));
 
         assert!(!obj.is_frozen());
@@ -946,7 +1065,8 @@ mod tests {
 
     #[test]
     fn test_object_seal() {
-        let obj = JsObject::new(None);
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let obj = JsObject::new(None, memory_manager);
         obj.set(PropertyKey::string("foo"), Value::int32(42));
 
         assert!(!obj.is_sealed());
@@ -974,7 +1094,8 @@ mod tests {
 
     #[test]
     fn test_object_prevent_extensions() {
-        let obj = JsObject::new(None);
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let obj = JsObject::new(None, memory_manager);
         obj.set(PropertyKey::string("foo"), Value::int32(42));
 
         assert!(obj.is_extensible());
@@ -991,16 +1112,18 @@ mod tests {
         // Cannot add new property
         assert!(!obj.set(PropertyKey::string("bar"), Value::int32(200)));
 
-        // Deleting property is not supported yet
-        assert!(!obj.delete(&PropertyKey::string("foo")));
+        // Can delete existing (configurable) property even if not extensible
+        assert!(obj.delete(&PropertyKey::string("foo")));
+        assert_eq!(obj.get(&PropertyKey::string("foo")), None);
     }
 
     #[test]
     fn test_deep_prototype_chain() {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // Build a prototype chain of depth 100
         let mut proto: Option<Arc<JsObject>> = None;
         for i in 0..100 {
-            let obj = Arc::new(JsObject::new(proto.clone()));
+            let obj = Arc::new(JsObject::new(proto.clone(), Arc::clone(&memory_manager)));
             obj.set(
                 PropertyKey::string(&format!("prop{}", i)),
                 Value::int32(i as i32),
@@ -1008,7 +1131,7 @@ mod tests {
             proto = Some(obj);
         }
 
-        let child = JsObject::new(proto);
+        let child = JsObject::new(proto, memory_manager);
 
         // Should be able to access properties at depth 100
         assert_eq!(
@@ -1024,17 +1147,18 @@ mod tests {
 
     #[test]
     fn test_prototype_chain_depth_limit() {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // Build a prototype chain that exceeds the limit (100)
         let mut proto: Option<Arc<JsObject>> = None;
         for i in 0..110 {
-            let obj = Arc::new(JsObject::new(proto.clone()));
+            let obj = Arc::new(JsObject::new(proto.clone(), Arc::clone(&memory_manager)));
             if i == 0 {
                 obj.set(PropertyKey::string("deep_prop"), Value::int32(42));
             }
             proto = Some(obj);
         }
 
-        let child = JsObject::new(proto);
+        let child = JsObject::new(proto, memory_manager);
 
         // Property at depth > 100 should not be found (returns None gracefully)
         assert_eq!(child.get(&PropertyKey::string("deep_prop")), None);
@@ -1043,9 +1167,16 @@ mod tests {
 
     #[test]
     fn test_prototype_cycle_prevention() {
-        let obj1 = Arc::new(JsObject::new(None));
-        let obj2 = Arc::new(JsObject::new(Some(obj1.clone())));
-        let obj3 = Arc::new(JsObject::new(Some(obj2.clone())));
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let obj1 = Arc::new(JsObject::new(None, Arc::clone(&memory_manager)));
+        let obj2 = Arc::new(JsObject::new(
+            Some(obj1.clone()),
+            Arc::clone(&memory_manager),
+        ));
+        let obj3 = Arc::new(JsObject::new(
+            Some(obj2.clone()),
+            Arc::clone(&memory_manager),
+        ));
 
         // Attempting to create a cycle should fail
         // obj1 -> obj2 -> obj3 -> obj1 would be a cycle
@@ -1055,7 +1186,7 @@ mod tests {
         assert!(obj1.set_prototype(None));
 
         // Setting to an unrelated object should work
-        let unrelated = Arc::new(JsObject::new(None));
+        let unrelated = Arc::new(JsObject::new(None, memory_manager));
         assert!(obj1.set_prototype(Some(unrelated)));
     }
 }

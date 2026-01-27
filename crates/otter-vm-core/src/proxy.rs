@@ -10,6 +10,7 @@
 //! let proxy = JsProxy::new(target, handler);
 //! ```
 
+use crate::gc::GcRef;
 use crate::object::JsObject;
 use crate::value::Value;
 use std::sync::Arc;
@@ -21,9 +22,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// through handler traps.
 pub struct JsProxy {
     /// The target object being proxied
-    target: Arc<JsObject>,
+    target: GcRef<JsObject>,
     /// The handler object containing traps
-    handler: Arc<JsObject>,
+    handler: GcRef<JsObject>,
     /// Whether this proxy has been revoked
     revoked: AtomicBool,
 }
@@ -48,7 +49,7 @@ pub struct RevocableProxy {
 
 impl JsProxy {
     /// Create a new proxy
-    pub fn new(target: Arc<JsObject>, handler: Arc<JsObject>) -> Arc<Self> {
+    pub fn new(target: GcRef<JsObject>, handler: GcRef<JsObject>) -> Arc<Self> {
         Arc::new(Self {
             target,
             handler,
@@ -57,7 +58,7 @@ impl JsProxy {
     }
 
     /// Create a revocable proxy
-    pub fn revocable(target: Arc<JsObject>, handler: Arc<JsObject>) -> RevocableProxy {
+    pub fn revocable(target: GcRef<JsObject>, handler: GcRef<JsObject>) -> RevocableProxy {
         let proxy = Self::new(target, handler);
         let proxy_for_revoke = proxy.clone();
 
@@ -72,22 +73,22 @@ impl JsProxy {
     /// Get the target object
     ///
     /// Returns `None` if the proxy has been revoked.
-    pub fn target(&self) -> Option<&Arc<JsObject>> {
+    pub fn target(&self) -> Option<GcRef<JsObject>> {
         if self.is_revoked() {
             None
         } else {
-            Some(&self.target)
+            Some(self.target)
         }
     }
 
     /// Get the handler object
     ///
     /// Returns `None` if the proxy has been revoked.
-    pub fn handler(&self) -> Option<&Arc<JsObject>> {
+    pub fn handler(&self) -> Option<GcRef<JsObject>> {
         if self.is_revoked() {
             None
         } else {
-            Some(&self.handler)
+            Some(self.handler)
         }
     }
 
@@ -134,8 +135,8 @@ impl JsProxy {
     pub fn clear_and_extract_values(&self) -> Vec<Value> {
         self.revoke();
         vec![
-            Value::object(self.target.clone()),
-            Value::object(self.handler.clone()),
+            Value::object(self.target),
+            Value::object(self.handler),
         ]
     }
 }
@@ -147,8 +148,8 @@ mod tests {
     #[test]
     fn test_proxy_creation() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let target = Arc::new(JsObject::new(None, memory_manager.clone()));
-        let handler = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let target = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let handler = GcRef::new(JsObject::new(None, memory_manager.clone()));
         let proxy = JsProxy::new(target, handler);
 
         assert!(!proxy.is_revoked());
@@ -159,8 +160,8 @@ mod tests {
     #[test]
     fn test_proxy_revoke() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let target = Arc::new(JsObject::new(None, memory_manager.clone()));
-        let handler = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let target = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let handler = GcRef::new(JsObject::new(None, memory_manager.clone()));
         let proxy = JsProxy::new(target, handler);
 
         assert!(!proxy.is_revoked());
@@ -173,8 +174,8 @@ mod tests {
     #[test]
     fn test_revocable_proxy() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let target = Arc::new(JsObject::new(None, memory_manager.clone()));
-        let handler = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let target = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let handler = GcRef::new(JsObject::new(None, memory_manager.clone()));
         let RevocableProxy { proxy, revoke } = JsProxy::revocable(target, handler);
 
         assert!(!proxy.is_revoked());
@@ -185,8 +186,8 @@ mod tests {
     #[test]
     fn test_get_trap_missing() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let target = Arc::new(JsObject::new(None, memory_manager.clone()));
-        let handler = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let target = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let handler = GcRef::new(JsObject::new(None, memory_manager.clone()));
         let proxy = JsProxy::new(target, handler);
 
         assert!(proxy.get_trap("get").is_none());

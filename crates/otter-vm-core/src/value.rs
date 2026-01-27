@@ -26,6 +26,7 @@
 //! - False:      0x7FF8_0000_0000_0003
 //! ```
 
+use crate::gc::GcRef;
 use crate::generator::JsGenerator;
 use crate::object::JsObject;
 use crate::promise::JsPromise;
@@ -111,12 +112,12 @@ pub type NativeFn =
 /// Reference to heap-allocated data
 #[derive(Clone)]
 pub enum HeapRef {
-    /// String value
-    String(Arc<JsString>),
-    /// Object value
-    Object(Arc<JsObject>),
-    /// Array value (stored as Object internally)
-    Array(Arc<JsObject>),
+    /// String value (GC-managed)
+    String(GcRef<JsString>),
+    /// Object value (GC-managed)
+    Object(GcRef<JsObject>),
+    /// Array value (stored as Object internally, GC-managed)
+    Array(GcRef<JsObject>),
     /// Function closure
     Function(Arc<Closure>),
     /// Symbol
@@ -167,15 +168,17 @@ pub struct Closure {
     pub upvalues: Vec<UpvalueCell>,
     /// Is this an async function
     pub is_async: bool,
-    /// Function object for properties like `.prototype`
-    pub object: Arc<JsObject>,
+    /// Function object for properties like `.prototype` (GC-managed)
+    pub object: GcRef<JsObject>,
 }
 
 /// A native function with an attached object for properties.
 #[derive(Clone)]
 pub struct NativeFunctionObject {
+    /// The native function handler
     pub func: NativeFn,
-    pub object: Arc<JsObject>,
+    /// Attached object for properties (GC-managed)
+    pub object: GcRef<JsObject>,
 }
 
 /// A JavaScript Symbol
@@ -267,19 +270,19 @@ impl Value {
         }
     }
 
-    /// Create string value
-    pub fn string(s: Arc<JsString>) -> Self {
+    /// Create string value (GC-managed)
+    pub fn string(s: GcRef<JsString>) -> Self {
         // Store pointer address in NaN-boxed format
-        let ptr = Arc::as_ptr(&s) as u64;
+        let ptr = s.as_ptr() as u64;
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::String(s)),
         }
     }
 
-    /// Create object value
-    pub fn object(obj: Arc<JsObject>) -> Self {
-        let ptr = Arc::as_ptr(&obj) as u64;
+    /// Create object value (GC-managed)
+    pub fn object(obj: GcRef<JsObject>) -> Self {
+        let ptr = obj.as_ptr() as u64;
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::Object(obj)),
@@ -339,9 +342,9 @@ impl Value {
         }
     }
 
-    /// Create array value
-    pub fn array(arr: Arc<JsObject>) -> Self {
-        let ptr = Arc::as_ptr(&arr) as u64;
+    /// Create array value (GC-managed)
+    pub fn array(arr: GcRef<JsObject>) -> Self {
+        let ptr = arr.as_ptr() as u64;
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::Array(arr)),
@@ -376,7 +379,7 @@ impl Value {
             + 'static,
     {
         let func: NativeFn = Arc::new(f);
-        let object = Arc::new(JsObject::new(None, memory_manager));
+        let object = GcRef::new(JsObject::new(None, memory_manager));
         let native = Arc::new(NativeFunctionObject { func, object });
         // Use a dummy pointer for NaN-boxing (the actual function is in heap_ref)
         Self {
@@ -544,30 +547,30 @@ impl Value {
         }
     }
 
-    /// Get as string
-    pub fn as_string(&self) -> Option<&Arc<JsString>> {
+    /// Get as string (GC-managed)
+    pub fn as_string(&self) -> Option<GcRef<JsString>> {
         match &self.heap_ref {
-            Some(HeapRef::String(s)) => Some(s),
+            Some(HeapRef::String(s)) => Some(*s),
             _ => None,
         }
     }
 
-    /// Get as object
-    pub fn as_object(&self) -> Option<&Arc<JsObject>> {
+    /// Get as object (GC-managed)
+    pub fn as_object(&self) -> Option<GcRef<JsObject>> {
         match &self.heap_ref {
-            Some(HeapRef::Object(o)) => Some(o),
-            Some(HeapRef::Array(a)) => Some(a),
-            Some(HeapRef::Function(f)) => Some(&f.object),
-            Some(HeapRef::NativeFunction(n)) => Some(&n.object),
-            Some(HeapRef::RegExp(r)) => Some(&r.object),
+            Some(HeapRef::Object(o)) => Some(*o),
+            Some(HeapRef::Array(a)) => Some(*a),
+            Some(HeapRef::Function(f)) => Some(f.object),
+            Some(HeapRef::NativeFunction(n)) => Some(n.object),
+            Some(HeapRef::RegExp(r)) => Some(r.object),
             _ => None,
         }
     }
 
-    /// Get as array object
-    pub fn as_array(&self) -> Option<&Arc<JsObject>> {
+    /// Get as array object (GC-managed)
+    pub fn as_array(&self) -> Option<GcRef<JsObject>> {
         match &self.heap_ref {
-            Some(HeapRef::Array(a)) => Some(a),
+            Some(HeapRef::Array(a)) => Some(*a),
             _ => None,
         }
     }
@@ -640,6 +643,29 @@ impl Value {
     #[doc(hidden)]
     pub fn heap_ref(&self) -> &Option<HeapRef> {
         &self.heap_ref
+    }
+
+    /// Get the GC header pointer for this value (if it's a GC-managed type)
+    ///
+    /// Returns the pointer to the GcHeader if this value contains a GC-managed
+    /// object (String or Object), otherwise returns None.
+    pub fn gc_header(&self) -> Option<*const otter_vm_gc::GcHeader> {
+        match &self.heap_ref {
+            Some(HeapRef::String(s)) => Some(s.header() as *const _),
+            Some(HeapRef::Object(o)) => Some(o.header() as *const _),
+            Some(HeapRef::Array(a)) => Some(a.header() as *const _),
+            Some(HeapRef::Function(f)) => Some(f.object.header() as *const _),
+            Some(HeapRef::NativeFunction(n)) => Some(n.object.header() as *const _),
+            Some(HeapRef::RegExp(r)) => Some(r.object.header() as *const _),
+            // These types use Arc, not GcRef, so they don't have GcHeaders
+            Some(HeapRef::Symbol(_))
+            | Some(HeapRef::BigInt(_))
+            | Some(HeapRef::Promise(_))
+            | Some(HeapRef::Proxy(_))
+            | Some(HeapRef::Generator(_))
+            | Some(HeapRef::SharedArrayBuffer(_)) => None,
+            None => None,
+        }
     }
 
     /// Convert to boolean (ToBoolean)

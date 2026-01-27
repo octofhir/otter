@@ -6,6 +6,7 @@
 //! Object.is()
 
 use otter_macros::dive;
+use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use otter_vm_core::string::JsString;
@@ -129,7 +130,7 @@ fn to_property_key(value: &VmValue) -> PropertyKey {
         return PropertyKey::Index(n as u32);
     }
     if let Some(s) = value.as_string() {
-        return PropertyKey::String(Arc::clone(s));
+        return PropertyKey::String(s);
     }
     if let Some(sym) = value.as_symbol() {
         return PropertyKey::Symbol(sym.id);
@@ -256,12 +257,12 @@ fn native_object_create(
     let prototype = if proto_val.is_null() {
         None
     } else if let Some(proto_obj) = proto_val.as_object() {
-        Some(Arc::clone(proto_obj))
+        Some(proto_obj)
     } else {
         return Err("Object prototype may only be an Object or null".to_string());
     };
 
-    let new_obj = Arc::new(JsObject::new(prototype, mm));
+    let new_obj = GcRef::new(JsObject::new(prototype, mm));
 
     // Handle optional properties object (second argument)
     if let Some(props_val) = args.get(1) {
@@ -363,7 +364,7 @@ fn native_object_is(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result
         sym1.id == sym2.id
     } else if let (Some(o1), Some(o2)) = (v1.as_object(), v2.as_object()) {
         // Same reference check
-        Arc::ptr_eq(o1, o2)
+        o1.as_ptr() == o2.as_ptr()
     } else if let (Some(f1), Some(f2)) = (v1.as_function(), v2.as_function()) {
         // Same closure check
         Arc::ptr_eq(&f1.module, &f2.module) && f1.function_index == f2.function_index
@@ -516,7 +517,7 @@ mod tests {
         use std::sync::Arc;
 
         let memory_manager = Arc::new(memory::MemoryManager::test());
-        let obj = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
         obj.set("a".into(), VmValue::int32(1));
 
         let value = VmValue::object(obj.clone());
@@ -530,7 +531,7 @@ mod tests {
     #[test]
     fn test_native_object_is_frozen() {
         let memory_manager = Arc::new(memory::MemoryManager::test());
-        let obj = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
         let value = VmValue::object(obj.clone());
 
         // Initially not frozen
@@ -550,7 +551,7 @@ mod tests {
         use std::sync::Arc;
 
         let memory_manager = Arc::new(memory::MemoryManager::test());
-        let obj = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
         obj.set("a".into(), VmValue::int32(1));
 
         let value = VmValue::object(obj.clone());
@@ -565,7 +566,7 @@ mod tests {
         use std::sync::Arc;
 
         let memory_manager = Arc::new(memory::MemoryManager::test());
-        let obj = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
         let value = VmValue::object(obj.clone());
 
         // Initially extensible
@@ -581,12 +582,12 @@ mod tests {
     #[test]
     fn test_native_object_rest() {
         let memory_manager = Arc::new(memory::MemoryManager::test());
-        let obj = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
         obj.set("a".into(), VmValue::int32(1));
         obj.set("b".into(), VmValue::int32(2));
         obj.set("c".into(), VmValue::int32(3));
 
-        let excluded = Arc::new(JsObject::array(2, memory_manager.clone()));
+        let excluded = GcRef::new(JsObject::array(2, memory_manager.clone()));
         excluded.set(PropertyKey::Index(0), VmValue::string(JsString::intern("a")));
         excluded.set(PropertyKey::Index(1), VmValue::string(JsString::intern("b")));
 
@@ -617,7 +618,6 @@ fn native_object_rest(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
     // Coerce to object
     let source_obj = source
         .as_object()
-        .cloned()
         .or_else(|| {
             // Primitive coercion (simplified for now)
             None
@@ -641,8 +641,8 @@ fn native_object_rest(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
         }
     }
 
-    let new_obj = Arc::new(JsObject::new(
-        Some(Arc::new(JsObject::new(None, mm.clone()))),
+    let new_obj = GcRef::new(JsObject::new(
+        Some(GcRef::new(JsObject::new(None, mm.clone()))),
         mm,
     )); // Should probably use Object.prototype
 

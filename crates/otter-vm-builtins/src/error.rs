@@ -9,6 +9,7 @@
 //! - URIError - URI errors
 //! - EvalError - eval errors
 
+use otter_vm_core::gc::GcRef;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
@@ -63,7 +64,7 @@ fn error_create(
     });
 
     // Create error object
-    let obj = Arc::new(JsObject::new(None, mm));
+    let obj = GcRef::new(JsObject::new(None, mm));
 
     // Set name property
     obj.set(
@@ -242,8 +243,8 @@ mod tests {
 
         // Check stack (should contain "Error: something went wrong")
         let stack = obj.get(&PropertyKey::string("stack")).unwrap();
-        let stack_str = stack.as_string().unwrap().as_str();
-        assert!(stack_str.contains("Error: something went wrong"));
+        let stack_str = stack.as_string().unwrap();
+        assert!(stack_str.as_str().contains("Error: something went wrong"));
     }
 
     #[test]
@@ -302,11 +303,11 @@ mod tests {
 
         let obj = result.as_object().unwrap();
         let stack = obj.get(&PropertyKey::string("stack")).unwrap();
-        let stack_str = stack.as_string().unwrap().as_str();
+        let stack_str = stack.as_string().unwrap();
 
-        assert!(stack_str.starts_with("Error: test error"));
-        assert!(stack_str.contains("at foo"));
-        assert!(stack_str.contains("at bar"));
+        assert!(stack_str.as_str().starts_with("Error: test error"));
+        assert!(stack_str.as_str().contains("at foo"));
+        assert!(stack_str.as_str().contains("at bar"));
     }
 
     #[test]

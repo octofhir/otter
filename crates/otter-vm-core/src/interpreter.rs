@@ -7,6 +7,7 @@ use otter_vm_bytecode::{Instruction, Module, UpvalueCapture};
 use crate::async_context::{AsyncContext, VmExecutionResult};
 use crate::context::VmContext;
 use crate::error::{VmError, VmResult};
+use crate::gc::GcRef;
 use crate::generator::JsGenerator;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::promise::{JsPromise, PromiseState};
@@ -324,9 +325,13 @@ impl Interpreter {
 
         loop {
             // Periodic interrupt check for responsive timeouts
-            if ctx.should_check_interrupt() && ctx.is_interrupted() {
-                ctx.set_running(false);
-                return VmExecutionResult::Error("Execution interrupted".to_string());
+            if ctx.should_check_interrupt() {
+                if ctx.is_interrupted() {
+                    ctx.set_running(false);
+                    return VmExecutionResult::Error("Execution interrupted".to_string());
+                }
+                // Check for GC trigger at safepoint
+                ctx.maybe_collect_garbage();
             }
 
             let frame = match ctx.current_frame() {
@@ -366,25 +371,24 @@ impl Interpreter {
             ctx.record_instruction();
 
             // Execute the instruction
-            let instruction_result =
-                match self.execute_instruction(instruction, module_ref, ctx) {
-                    Ok(result) => result,
-                    Err(err) => match err {
-                        VmError::TypeError(message) => {
-                            InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
-                        }
-                        VmError::RangeError(message) => {
-                            InstructionResult::Throw(self.make_error(ctx, "RangeError", &message))
-                        }
-                        VmError::ReferenceError(message) => InstructionResult::Throw(
-                            self.make_error(ctx, "ReferenceError", &message),
-                        ),
-                        VmError::SyntaxError(message) => {
-                            InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
-                        }
-                        other => return VmExecutionResult::Error(other.to_string()),
-                    },
-                };
+            let instruction_result = match self.execute_instruction(instruction, module_ref, ctx) {
+                Ok(result) => result,
+                Err(err) => match err {
+                    VmError::TypeError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
+                    }
+                    VmError::RangeError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "RangeError", &message))
+                    }
+                    VmError::ReferenceError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "ReferenceError", &message))
+                    }
+                    VmError::SyntaxError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
+                    }
+                    other => return VmExecutionResult::Error(other.to_string()),
+                },
+            };
 
             match instruction_result {
                 InstructionResult::Continue => {
@@ -494,16 +498,16 @@ impl Interpreter {
                         };
 
                         // Create rest array
-                        let rest_arr = Arc::new(JsObject::array(
+                        let rest_arr = GcRef::new(JsObject::array(
                             rest_args.len(),
                             ctx.memory_manager().clone(),
                         ));
                         // If `Array.prototype` is available, attach it so rest arrays are iterable.
                         if let Some(array_obj) =
-                            ctx.get_global("Array").and_then(|v| v.as_object().cloned())
+                            ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
                                 .get(&PropertyKey::string("prototype"))
-                                .and_then(|v| v.as_object().cloned())
+                                .and_then(|v| v.as_object())
                         {
                             rest_arr.set_prototype(Some(array_proto));
                         }
@@ -567,15 +571,15 @@ impl Interpreter {
                         } else {
                             Vec::new()
                         };
-                        let rest_arr = Arc::new(JsObject::array(
+                        let rest_arr = GcRef::new(JsObject::array(
                             rest_args.len(),
                             ctx.memory_manager().clone(),
                         ));
                         if let Some(array_obj) =
-                            ctx.get_global("Array").and_then(|v| v.as_object().cloned())
+                            ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
                                 .get(&PropertyKey::string("prototype"))
-                                .and_then(|v| v.as_object().cloned())
+                                .and_then(|v| v.as_object())
                         {
                             rest_arr.set_prototype(Some(array_proto));
                         }
@@ -634,7 +638,7 @@ impl Interpreter {
                 }
                 InstructionResult::Yield { value } => {
                     // Generator yielded a value
-                    let result = Arc::new(JsObject::new(None, ctx.memory_manager().clone()));
+                    let result = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
                     result.set(PropertyKey::string("value"), value);
                     result.set(PropertyKey::string("done"), Value::boolean(false));
                     ctx.advance_pc();
@@ -652,8 +656,12 @@ impl Interpreter {
 
         loop {
             // Periodic interrupt check for responsive timeouts
-            if ctx.should_check_interrupt() && ctx.is_interrupted() {
-                return Err(VmError::interrupted());
+            if ctx.should_check_interrupt() {
+                if ctx.is_interrupted() {
+                    return Err(VmError::interrupted());
+                }
+                // Check for GC trigger at safepoint
+                ctx.maybe_collect_garbage();
             }
 
             let frame = ctx
@@ -690,25 +698,24 @@ impl Interpreter {
             ctx.record_instruction();
 
             // Execute the instruction
-            let instruction_result =
-                match self.execute_instruction(instruction, module_ref, ctx) {
-                    Ok(result) => result,
-                    Err(err) => match err {
-                        VmError::TypeError(message) => {
-                            InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
-                        }
-                        VmError::RangeError(message) => {
-                            InstructionResult::Throw(self.make_error(ctx, "RangeError", &message))
-                        }
-                        VmError::ReferenceError(message) => InstructionResult::Throw(
-                            self.make_error(ctx, "ReferenceError", &message),
-                        ),
-                        VmError::SyntaxError(message) => {
-                            InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
-                        }
-                        other => return Err(other),
-                    },
-                };
+            let instruction_result = match self.execute_instruction(instruction, module_ref, ctx) {
+                Ok(result) => result,
+                Err(err) => match err {
+                    VmError::TypeError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
+                    }
+                    VmError::RangeError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "RangeError", &message))
+                    }
+                    VmError::ReferenceError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "ReferenceError", &message))
+                    }
+                    VmError::SyntaxError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
+                    }
+                    other => return Err(other),
+                },
+            };
 
             match instruction_result {
                 InstructionResult::Continue => {
@@ -812,16 +819,16 @@ impl Interpreter {
                         };
 
                         // Create rest array
-                        let rest_arr = Arc::new(JsObject::array(
+                        let rest_arr = GcRef::new(JsObject::array(
                             rest_args.len(),
                             ctx.memory_manager().clone(),
                         ));
                         // If `Array.prototype` is available, attach it so rest arrays are iterable.
                         if let Some(array_obj) =
-                            ctx.get_global("Array").and_then(|v| v.as_object().cloned())
+                            ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
                                 .get(&PropertyKey::string("prototype"))
-                                .and_then(|v| v.as_object().cloned())
+                                .and_then(|v| v.as_object())
                         {
                             rest_arr.set_prototype(Some(array_proto));
                         }
@@ -881,15 +888,15 @@ impl Interpreter {
                         } else {
                             Vec::new()
                         };
-                        let rest_arr = Arc::new(JsObject::array(
+                        let rest_arr = GcRef::new(JsObject::array(
                             rest_args.len(),
                             ctx.memory_manager().clone(),
                         ));
                         if let Some(array_obj) =
-                            ctx.get_global("Array").and_then(|v| v.as_object().cloned())
+                            ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
                                 .get(&PropertyKey::string("prototype"))
-                                .and_then(|v| v.as_object().cloned())
+                                .and_then(|v| v.as_object())
                         {
                             rest_arr.set_prototype(Some(array_proto));
                         }
@@ -941,7 +948,7 @@ impl Interpreter {
                 InstructionResult::Yield { value } => {
                     // Generator yielded a value
                     // Create an iterator result object { value, done: false }
-                    let result = Arc::new(JsObject::new(None, ctx.memory_manager().clone()));
+                    let result = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
                     result.set(PropertyKey::string("value"), value);
                     result.set(PropertyKey::string("done"), Value::boolean(false));
                     ctx.advance_pc();
@@ -1475,7 +1482,7 @@ impl Interpreter {
             // ==================== Type Operations ====================
             Instruction::TypeOf { dst, src } => {
                 let type_name = ctx.get_register(src.0).type_of();
-                let str_value = Value::string(Arc::new(JsString::new(type_name)));
+                let str_value = Value::string(JsString::intern(type_name));
                 ctx.set_register(dst.0, str_value);
                 Ok(InstructionResult::Continue)
             }
@@ -1490,11 +1497,11 @@ impl Interpreter {
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
 
-                let type_name = match ctx.get_global_utf16(name_str) {
+                let type_name = match ctx.get_global_utf16(&name_str) {
                     Some(value) => value.type_of(),
                     None => "undefined",
                 };
-                let str_value = Value::string(Arc::new(JsString::new(type_name)));
+                let str_value = Value::string(JsString::intern(type_name));
                 ctx.set_register(dst.0, str_value);
                 Ok(InstructionResult::Continue)
             }
@@ -1503,7 +1510,7 @@ impl Interpreter {
                 let left = ctx.get_register(lhs.0).clone();
                 let right = ctx.get_register(rhs.0).clone();
 
-                let Some(left_obj) = left.as_object().cloned() else {
+                let Some(left_obj) = left.as_object() else {
                     ctx.set_register(dst.0, Value::boolean(false));
                     return Ok(InstructionResult::Continue);
                 };
@@ -1517,7 +1524,7 @@ impl Interpreter {
                 let proto_val = right_obj
                     .get(&PropertyKey::string("prototype"))
                     .unwrap_or_else(Value::undefined);
-                let Some(target_proto) = proto_val.as_object().cloned() else {
+                let Some(target_proto) = proto_val.as_object() else {
                     return Err(VmError::type_error("Function has non-object prototype"));
                 };
 
@@ -1525,7 +1532,7 @@ impl Interpreter {
                 let mut depth = 0;
                 const MAX_PROTO_DEPTH: usize = 100;
                 while let Some(obj) = current {
-                    if Arc::ptr_eq(&obj, &target_proto) {
+                    if obj.as_ptr() == target_proto.as_ptr() {
                         ctx.set_register(dst.0, Value::boolean(true));
                         return Ok(InstructionResult::Continue);
                     }
@@ -1553,7 +1560,7 @@ impl Interpreter {
                 let key = if let Some(n) = left.as_int32() {
                     PropertyKey::Index(n as u32)
                 } else if let Some(s) = left.as_string() {
-                    PropertyKey::from_js_string(Arc::clone(s))
+                    PropertyKey::from_js_string(s)
                 } else if let Some(sym) = left.as_symbol() {
                     PropertyKey::Symbol(sym.id)
                 } else {
@@ -1630,19 +1637,19 @@ impl Interpreter {
                 // Capture upvalues from parent frame
                 let captured_upvalues = self.capture_upvalues(ctx, &func_def.upvalues)?;
 
-                let func_obj = Arc::new(JsObject::new(None, ctx.memory_manager().clone()));
-                let proto = Arc::new(JsObject::new(None, ctx.memory_manager().clone()));
+                let func_obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                let proto = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
                 let closure = Arc::new(Closure {
                     function_index: func.0,
                     module: Arc::clone(module),
                     upvalues: captured_upvalues,
                     is_async: func_def.is_async(),
-                    object: Arc::clone(&func_obj),
+                    object: func_obj,
                 });
                 let func_value = Value::function(closure);
                 func_obj.set(
                     PropertyKey::string("prototype"),
-                    Value::object(Arc::clone(&proto)),
+                    Value::object(proto),
                 );
                 proto.set(PropertyKey::string("constructor"), func_value.clone());
                 ctx.set_register(dst.0, func_value);
@@ -1658,19 +1665,19 @@ impl Interpreter {
                 // Capture upvalues from parent frame
                 let captured_upvalues = self.capture_upvalues(ctx, &func_def.upvalues)?;
 
-                let func_obj = Arc::new(JsObject::new(None, ctx.memory_manager().clone()));
-                let proto = Arc::new(JsObject::new(None, ctx.memory_manager().clone()));
+                let func_obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                let proto = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
                 let closure = Arc::new(Closure {
                     function_index: func.0,
                     module: Arc::clone(module),
                     upvalues: captured_upvalues,
                     is_async: true,
-                    object: Arc::clone(&func_obj),
+                    object: func_obj,
                 });
                 let func_value = Value::function(closure);
                 func_obj.set(
                     PropertyKey::string("prototype"),
-                    Value::object(Arc::clone(&proto)),
+                    Value::object(proto),
                 );
                 proto.set(PropertyKey::string("constructor"), func_value.clone());
                 ctx.set_register(dst.0, func_value);
@@ -1710,7 +1717,7 @@ impl Interpreter {
                             .get(&PropertyKey::string("__boundThis__"))
                             .unwrap_or_else(Value::undefined);
                         let this_arg = if raw_this_arg.is_null() || raw_this_arg.is_undefined() {
-                            Value::object(Arc::clone(ctx.global()))
+                            Value::object(ctx.global())
                         } else {
                             raw_this_arg
                         };
@@ -1859,8 +1866,8 @@ impl Interpreter {
                     let ctor_proto = func_value
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
-                        .and_then(|v| v.as_object().cloned());
-                    let new_obj = Arc::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
+                        .and_then(|v| v.as_object());
+                    let new_obj = GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
                     let new_obj_value = Value::object(new_obj);
 
                     // Call native constructor with depth tracking
@@ -1880,8 +1887,8 @@ impl Interpreter {
                     let ctor_proto = func_value
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
-                        .and_then(|v| v.as_object().cloned());
-                    let new_obj = Arc::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
+                        .and_then(|v| v.as_object());
+                    let new_obj = GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
                     let new_obj_value = Value::object(new_obj.clone());
 
                     // Copy arguments from caller registers
@@ -1972,11 +1979,11 @@ impl Interpreter {
                 let method_value = if receiver.is_function() || receiver.is_native_function() {
                     let function_obj = ctx
                         .get_global("Function")
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                         .ok_or_else(|| VmError::type_error("Function is not defined"))?;
                     let proto = function_obj
                         .get(&PropertyKey::string("prototype"))
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                         .ok_or_else(|| VmError::type_error("Function.prototype is not defined"))?;
                     if let Some(obj_ref) = receiver.as_object() {
                         obj_ref
@@ -1995,11 +2002,11 @@ impl Interpreter {
                 } else if receiver.is_string() {
                     let string_obj = ctx
                         .get_global("String")
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                         .ok_or_else(|| VmError::type_error("String is not defined"))?;
                     let proto = string_obj
                         .get(&PropertyKey::string("prototype"))
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                         .ok_or_else(|| VmError::type_error("String.prototype is not defined"))?;
                     proto
                         .get(&Self::utf16_key(method_name))
@@ -2007,11 +2014,11 @@ impl Interpreter {
                 } else if receiver.is_promise() {
                     let promise_obj = ctx
                         .get_global("Promise")
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                         .ok_or_else(|| VmError::type_error("Promise is not defined"))?;
                     let proto = promise_obj
                         .get(&PropertyKey::string("prototype"))
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                         .ok_or_else(|| VmError::type_error("Promise.prototype is not defined"))?;
                     proto
                         .get(&Self::utf16_key(method_name))
@@ -2019,11 +2026,11 @@ impl Interpreter {
                 } else if receiver.is_number() {
                     let number_obj = ctx
                         .get_global("Number")
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                         .ok_or_else(|| VmError::type_error("Number is not defined"))?;
                     let proto = number_obj
                         .get(&PropertyKey::string("prototype"))
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                         .ok_or_else(|| VmError::type_error("Number.prototype is not defined"))?;
                     proto
                         .get(&Self::utf16_key(method_name))
@@ -2031,11 +2038,11 @@ impl Interpreter {
                 } else if receiver.is_boolean() {
                     let boolean_obj = ctx
                         .get_global("Boolean")
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                         .ok_or_else(|| VmError::type_error("Boolean is not defined"))?;
                     let proto = boolean_obj
                         .get(&PropertyKey::string("prototype"))
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                         .ok_or_else(|| VmError::type_error("Boolean.prototype is not defined"))?;
                     proto
                         .get(&Self::utf16_key(method_name))
@@ -2177,8 +2184,8 @@ impl Interpreter {
                     let ctor_proto = func_value
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
-                        .and_then(|v| v.as_object().cloned());
-                    let new_obj = Arc::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
+                        .and_then(|v| v.as_object());
+                    let new_obj = GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
                     let new_obj_value = Value::object(new_obj);
 
                     let result = self.call_native_fn(ctx, native_fn, &args)?;
@@ -2199,8 +2206,8 @@ impl Interpreter {
                 let ctor_proto = func_value
                     .as_object()
                     .and_then(|o| o.get(&PropertyKey::string("prototype")))
-                    .and_then(|v| v.as_object().cloned());
-                let new_obj = Arc::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
+                    .and_then(|v| v.as_object());
+                let new_obj = GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
                 let new_obj_value = Value::object(new_obj);
 
                 let argc_u8 = args.len() as u8;
@@ -2288,9 +2295,9 @@ impl Interpreter {
                             .as_object()
                             .and_then(|o| o.get(&PropertyKey::string("prototype")))
                     })
-                    .and_then(|proto_val| proto_val.as_object().cloned());
+                    .and_then(|proto_val| proto_val.as_object());
 
-                let obj = Arc::new(JsObject::new(proto, ctx.memory_manager().clone()));
+                let obj = GcRef::new(JsObject::new(proto, ctx.memory_manager().clone()));
                 ctx.set_register(dst.0, Value::object(obj));
                 Ok(InstructionResult::Continue)
             }
@@ -2329,11 +2336,11 @@ impl Interpreter {
 
                     if let Some(string_obj) = ctx
                         .get_global("String")
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                     {
                         if let Some(proto) = string_obj
                             .get(&PropertyKey::string("prototype"))
-                            .and_then(|v| v.as_object().cloned())
+                            .and_then(|v| v.as_object())
                         {
                             let key = Self::utf16_key(name_str);
                             let value = proto.get(&key).unwrap_or_else(Value::undefined);
@@ -2404,11 +2411,11 @@ impl Interpreter {
                     // Then look up from Function.prototype
                     if let Some(function_obj) = ctx
                         .get_global("Function")
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                     {
                         if let Some(proto) = function_obj
                             .get(&PropertyKey::string("prototype"))
-                            .and_then(|v| v.as_object().cloned())
+                            .and_then(|v| v.as_object())
                         {
                             let value = proto.get(&key).unwrap_or_else(Value::undefined);
                             ctx.set_register(dst.0, value);
@@ -2718,7 +2725,7 @@ impl Interpreter {
                     let key = if let Some(n) = key_value.as_int32() {
                         PropertyKey::Index(n as u32)
                     } else if let Some(s) = key_value.as_string() {
-                        PropertyKey::from_js_string(Arc::clone(s))
+                        PropertyKey::from_js_string(s)
                     } else if let Some(sym) = key_value.as_symbol() {
                         PropertyKey::Symbol(sym.id)
                     } else {
@@ -2746,11 +2753,11 @@ impl Interpreter {
 
                     if let Some(string_obj) = ctx
                         .get_global("String")
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                     {
                         if let Some(proto) = string_obj
                             .get(&PropertyKey::string("prototype"))
-                            .and_then(|v| v.as_object().cloned())
+                            .and_then(|v| v.as_object())
                         {
                             let value = proto.get(&key).unwrap_or_else(Value::undefined);
                             ctx.set_register(dst.0, value);
@@ -3126,13 +3133,13 @@ impl Interpreter {
 
             // ==================== Arrays ====================
             Instruction::NewArray { dst, len } => {
-                let arr = Arc::new(JsObject::array(*len as usize, ctx.memory_manager().clone()));
+                let arr = GcRef::new(JsObject::array(*len as usize, ctx.memory_manager().clone()));
                 // Attach `Array.prototype` if present so arrays are iterable and have methods.
                 if let Some(array_obj) =
-                    ctx.get_global("Array").and_then(|v| v.as_object().cloned())
+                    ctx.get_global("Array").and_then(|v| v.as_object())
                     && let Some(array_proto) = array_obj
                         .get(&PropertyKey::string("prototype"))
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                 {
                     arr.set_prototype(Some(array_proto));
                 }
@@ -3596,7 +3603,7 @@ impl Interpreter {
                     .unwrap_or_else(Value::undefined);
                 let proto = if let Some(ctor) = regexp_ctor.as_object() {
                     ctor.get(&PropertyKey::string("prototype"))
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                 } else {
                     None
                 };
@@ -3692,7 +3699,7 @@ impl Interpreter {
             let left_str = self.to_string(left);
             let right_str = self.to_string(right);
             let result = format!("{}{}", left_str, right_str);
-            let js_str = Arc::new(JsString::new(result));
+            let js_str = JsString::intern(&result);
             return Ok(Value::string(js_str));
         }
 
@@ -3814,7 +3821,7 @@ impl Interpreter {
     /// Create a JavaScript Promise object from an internal promise
     /// This creates an object with _internal field and copies methods from Promise.prototype
     fn create_js_promise(&self, ctx: &VmContext, internal: Arc<JsPromise>) -> Value {
-        let obj = Arc::new(JsObject::new(None, ctx.memory_manager().clone()));
+        let obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
 
         // Set _internal to the raw promise
         obj.set(PropertyKey::string("_internal"), Value::promise(internal));
@@ -3822,11 +3829,11 @@ impl Interpreter {
         // Try to get Promise.prototype and copy its methods
         if let Some(promise_ctor) = ctx
             .get_global("Promise")
-            .and_then(|v| v.as_object().cloned())
+            .and_then(|v| v.as_object())
         {
             if let Some(proto) = promise_ctor
                 .get(&PropertyKey::string("prototype"))
-                .and_then(|v| v.as_object().cloned())
+                .and_then(|v| v.as_object())
             {
                 // Copy then, catch, finally from prototype
                 if let Some(then_fn) = proto.get(&PropertyKey::string("then")) {
@@ -3877,9 +3884,9 @@ impl Interpreter {
             .as_ref()
             .and_then(|v| v.as_object())
             .and_then(|obj| obj.get(&PropertyKey::string("prototype")))
-            .and_then(|v| v.as_object().cloned());
+            .and_then(|v| v.as_object());
 
-        let obj = Arc::new(JsObject::new(proto, ctx.memory_manager().clone()));
+        let obj = GcRef::new(JsObject::new(proto, ctx.memory_manager().clone()));
         obj.set(
             PropertyKey::string("name"),
             Value::string(JsString::intern(name)),
@@ -4233,7 +4240,7 @@ mod tests {
 
     fn create_test_context() -> VmContext {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let global = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
         VmContext::new(global, memory_manager)
     }
 
@@ -4502,7 +4509,8 @@ mod tests {
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         // typeof function === "function"
-        assert_eq!(result.as_string().map(|s| s.as_str()), Some("function"));
+        let result_str = result.as_string().expect("expected string");
+        assert_eq!(result_str.as_str(), "function");
     }
 
     #[test]

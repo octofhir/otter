@@ -185,11 +185,11 @@ fn symbol_description(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result
 /// Get well-known symbol by name
 /// Args: [name: string]
 fn symbol_get_well_known(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
-    let name = args
+    let name_js = args
         .first()
         .and_then(|v| v.as_string())
-        .map(|s| s.as_str())
         .ok_or("Symbol.getWellKnown requires a string name")?;
+    let name = name_js.as_str();
 
     let (id, desc) = match name {
         "iterator" => (well_known::ITERATOR, "Symbol.iterator"),
@@ -296,8 +296,8 @@ mod tests {
         let sym = symbol_for(&[str_val(key)], mm.clone()).unwrap();
 
         let result = symbol_key_for(&[sym], mm).unwrap();
-        let found_key = result.as_string().unwrap().as_str();
-        assert_eq!(found_key, key);
+        let found_key = result.as_string().unwrap();
+        assert_eq!(found_key.as_str(), key);
     }
 
     #[test]
@@ -313,8 +313,8 @@ mod tests {
         let mm = Arc::new(memory::MemoryManager::test());
         let sym = symbol_create(&[str_val("mySymbol")], mm.clone()).unwrap();
         let result = symbol_to_string(&[sym], mm).unwrap();
-        let s = result.as_string().unwrap().as_str();
-        assert_eq!(s, "Symbol(mySymbol)");
+        let s = result.as_string().unwrap();
+        assert_eq!(s.as_str(), "Symbol(mySymbol)");
     }
 
     #[test]
@@ -322,8 +322,8 @@ mod tests {
         let mm = Arc::new(memory::MemoryManager::test());
         let sym = symbol_create(&[Value::undefined()], mm.clone()).unwrap();
         let result = symbol_to_string(&[sym], mm).unwrap();
-        let s = result.as_string().unwrap().as_str();
-        assert_eq!(s, "Symbol()");
+        let s = result.as_string().unwrap();
+        assert_eq!(s.as_str(), "Symbol()");
     }
 
     #[test]
@@ -343,8 +343,8 @@ mod tests {
         let mm = Arc::new(memory::MemoryManager::test());
         let sym = symbol_create(&[str_val("desc")], mm.clone()).unwrap();
         let result = symbol_description(&[sym], mm).unwrap();
-        let s = result.as_string().unwrap().as_str();
-        assert_eq!(s, "desc");
+        let s = result.as_string().unwrap();
+        assert_eq!(s.as_str(), "desc");
     }
 
     #[test]

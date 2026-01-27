@@ -39,6 +39,7 @@ pub use context::{
     DEFAULT_MAX_NATIVE_DEPTH, DEFAULT_MAX_STACK_DEPTH, INTERRUPT_CHECK_INTERVAL, VmContext,
 };
 pub use error::{VmError, VmResult};
+pub use gc::GcRef;
 pub use generator::{GeneratorContext, GeneratorState, IteratorResult, JsGenerator};
 pub use interpreter::Interpreter;
 pub use memory::MemoryManager;

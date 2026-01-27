@@ -1,3 +1,4 @@
+use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
@@ -7,8 +8,8 @@ use std::sync::Arc;
 /// JavaScript RegExp object
 #[derive(Debug)]
 pub struct JsRegExp {
-    /// The Ordinary Object part (properties like lastIndex)
-    pub object: Arc<JsObject>,
+    /// The Ordinary Object part (properties like lastIndex) - GC-managed
+    pub object: GcRef<JsObject>,
     /// The regex pattern
     pub pattern: String,
     /// The regex flags
@@ -24,10 +25,10 @@ impl JsRegExp {
     pub fn new(
         pattern: String,
         flags: String,
-        proto: Option<Arc<JsObject>>,
+        proto: Option<GcRef<JsObject>>,
         memory_manager: Arc<crate::memory::MemoryManager>,
     ) -> Self {
-        let object = Arc::new(JsObject::new(proto, memory_manager));
+        let object = GcRef::new(JsObject::new(proto, memory_manager));
         let source = if pattern.is_empty() {
             "(?:)".to_string()
         } else {

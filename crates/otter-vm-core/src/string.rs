@@ -2,16 +2,25 @@
 //!
 //! Strings are immutable and interned for deduplication.
 //! This allows fast equality comparison (pointer comparison).
+//!
+//! ## GC Integration
+//!
+//! Strings are managed via `GcRef<JsString>` which wraps a `GcBox<JsString>`.
+//! The `GcBox` provides the GC header for marking. Interned strings are kept
+//! alive by the global intern table (acting as a GC root).
 
+use crate::gc::GcRef;
 use dashmap::DashMap;
-use otter_vm_gc::object::tags;
-use otter_vm_gc::{GcHeader, GcObject};
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
 /// Global string intern table
-static STRING_TABLE: std::sync::LazyLock<DashMap<u64, Arc<JsString>>> =
+///
+/// Stores `GcRef<JsString>` which are Copy (raw pointers).
+/// The backing `GcBox` memory is leaked (kept alive forever) for interned strings.
+/// This is acceptable since interned strings are typically long-lived.
+static STRING_TABLE: std::sync::LazyLock<DashMap<u64, GcRef<JsString>>> =
     std::sync::LazyLock::new(DashMap::new);
 
 /// String interning table for explicit management
@@ -19,7 +28,7 @@ static STRING_TABLE: std::sync::LazyLock<DashMap<u64, Arc<JsString>>> =
 /// This provides an instance-based alternative to the global STRING_TABLE.
 /// Useful for VM instances that want isolated string tables.
 pub struct StringTable {
-    strings: DashMap<u64, Arc<JsString>>,
+    strings: DashMap<u64, GcRef<JsString>>,
 }
 
 impl StringTable {
@@ -31,7 +40,7 @@ impl StringTable {
     }
 
     /// Intern a string in this table
-    pub fn intern(&self, s: &str) -> Arc<JsString> {
+    pub fn intern(&self, s: &str) -> GcRef<JsString> {
         let units: Vec<u16> = s.encode_utf16().collect();
         let hash = JsString::compute_hash_units(&units);
 
@@ -39,18 +48,17 @@ impl StringTable {
         if let Some(existing) = self.strings.get(&hash)
             && existing.data.as_ref() == units.as_slice()
         {
-            return existing.clone();
+            return *existing;
         }
 
         // Create new interned string
-        let js_str = Arc::new(JsString {
-            header: GcHeader::new(tags::STRING),
+        let js_str = GcRef::new(JsString {
             data: units.into(),
             utf8: OnceLock::new(),
             hash,
         });
 
-        self.strings.insert(hash, js_str.clone());
+        self.strings.insert(hash, js_str);
         js_str
     }
 
@@ -62,21 +70,20 @@ impl StringTable {
     }
 
     /// Intern a UTF-16 string in this table
-    pub fn intern_utf16(&self, units: &[u16]) -> Arc<JsString> {
+    pub fn intern_utf16(&self, units: &[u16]) -> GcRef<JsString> {
         let hash = JsString::compute_hash_units(units);
         if let Some(existing) = self.strings.get(&hash)
             && existing.data.as_ref() == units
         {
-            return existing.clone();
+            return *existing;
         }
 
-        let js_str = Arc::new(JsString {
-            header: GcHeader::new(tags::STRING),
+        let js_str = GcRef::new(JsString {
             data: Arc::from(units),
             utf8: OnceLock::new(),
             hash,
         });
-        self.strings.insert(hash, js_str.clone());
+        self.strings.insert(hash, js_str);
         js_str
     }
 
@@ -98,12 +105,13 @@ impl Default for StringTable {
 }
 
 /// An interned JavaScript string with GC support
-#[repr(C)]
+///
+/// `JsString` is allocated via `GcRef<JsString>` which wraps it in a `GcBox`.
+/// The `GcBox` provides the GC header for marking. `JsString` itself only
+/// contains the string data and metadata.
 #[derive(Clone)]
 pub struct JsString {
-    /// GC header for garbage collection
-    header: GcHeader,
-    /// The actual string data
+    /// The actual string data (UTF-16 code units)
     data: Arc<[u16]>,
     /// Cached UTF-8 representation (lossy for lone surrogates)
     utf8: OnceLock<Arc<str>>,
@@ -113,7 +121,7 @@ pub struct JsString {
 
 impl JsString {
     /// Create or retrieve an interned string (using global table)
-    pub fn intern(s: &str) -> Arc<Self> {
+    pub fn intern(s: &str) -> GcRef<Self> {
         let units: Vec<u16> = s.encode_utf16().collect();
         let hash = Self::compute_hash_units(&units);
 
@@ -121,61 +129,60 @@ impl JsString {
         if let Some(existing) = STRING_TABLE.get(&hash)
             && existing.data.as_ref() == units.as_slice()
         {
-            return existing.clone();
+            return *existing;
         }
 
-        // Create new interned string
-        let js_str = Arc::new(Self {
-            header: GcHeader::new(tags::STRING),
+        // Create new interned string via GcRef
+        let js_str = GcRef::new(Self {
             data: units.into(),
             utf8: OnceLock::new(),
             hash,
         });
 
-        STRING_TABLE.insert(hash, js_str.clone());
+        STRING_TABLE.insert(hash, js_str);
         js_str
     }
 
     /// Create a string without interning (for temporary strings)
-    pub fn new(s: impl AsRef<str>) -> Self {
+    ///
+    /// Returns a `GcRef<JsString>` for the new string.
+    pub fn new_gc(s: impl AsRef<str>) -> GcRef<Self> {
         let units: Vec<u16> = s.as_ref().encode_utf16().collect();
-        Self::from_utf16_units(units)
+        Self::from_utf16_units_gc(units)
     }
 
     /// Create a string from UTF-16 code units without interning
     pub fn from_utf16_units(units: Vec<u16>) -> Self {
         let hash = Self::compute_hash_units(&units);
         Self {
-            header: GcHeader::new(tags::STRING),
             data: units.into(),
             utf8: OnceLock::new(),
             hash,
         }
     }
 
+    /// Create a GcRef<JsString> from UTF-16 code units without interning
+    pub fn from_utf16_units_gc(units: Vec<u16>) -> GcRef<Self> {
+        GcRef::new(Self::from_utf16_units(units))
+    }
+
     /// Create or retrieve an interned string from UTF-16 code units
-    pub fn intern_utf16(units: &[u16]) -> Arc<Self> {
+    pub fn intern_utf16(units: &[u16]) -> GcRef<Self> {
         let hash = Self::compute_hash_units(units);
         if let Some(existing) = STRING_TABLE.get(&hash)
             && existing.data.as_ref() == units
         {
-            return existing.clone();
+            return *existing;
         }
 
-        let js_str = Arc::new(Self {
-            header: GcHeader::new(tags::STRING),
+        let js_str = GcRef::new(Self {
             data: Arc::from(units),
             utf8: OnceLock::new(),
             hash,
         });
 
-        STRING_TABLE.insert(hash, js_str.clone());
+        STRING_TABLE.insert(hash, js_str);
         js_str
-    }
-
-    /// Get the GC header
-    pub fn gc_header(&self) -> &GcHeader {
-        &self.header
     }
 
     /// Get the string as a str slice
@@ -218,7 +225,7 @@ impl JsString {
     }
 
     /// Concatenate two strings
-    pub fn concat(&self, other: &JsString) -> Arc<Self> {
+    pub fn concat(&self, other: &JsString) -> GcRef<Self> {
         let mut units = Vec::with_capacity(self.data.len() + other.data.len());
         units.extend_from_slice(&self.data);
         units.extend_from_slice(&other.data);
@@ -233,7 +240,7 @@ impl JsString {
     }
 
     /// Get substring (character-based)
-    pub fn substring(&self, start: usize, end: usize) -> Arc<Self> {
+    pub fn substring(&self, start: usize, end: usize) -> GcRef<Self> {
         let s = self.as_str();
         let chars: Vec<char> = s.chars().collect();
         let start = start.min(chars.len());
@@ -245,7 +252,7 @@ impl JsString {
     /// Get substring with UTF-16 semantics (for JS String.prototype.substring)
     ///
     /// JavaScript strings use UTF-16 internally, so indices are in UTF-16 code units.
-    pub fn substring_utf16(&self, start: usize, end: usize) -> Arc<Self> {
+    pub fn substring_utf16(&self, start: usize, end: usize) -> GcRef<Self> {
         let start = start.min(self.data.len());
         let end = end.min(self.data.len()).max(start);
         let slice = &self.data[start..end];
@@ -253,7 +260,7 @@ impl JsString {
     }
 
     /// Concatenate using a string table instead of global intern
-    pub fn concat_with_table(&self, other: &JsString, table: &StringTable) -> Arc<Self> {
+    pub fn concat_with_table(&self, other: &JsString, table: &StringTable) -> GcRef<Self> {
         let mut units = Vec::with_capacity(self.data.len() + other.data.len());
         units.extend_from_slice(&self.data);
         units.extend_from_slice(&other.data);
@@ -310,19 +317,14 @@ impl AsRef<[u16]> for JsString {
     }
 }
 
-// GC integration
-impl GcObject for JsString {
-    fn header(&self) -> &GcHeader {
-        &self.header
-    }
-
-    fn trace(&self, _tracer: &mut dyn FnMut(*const GcHeader)) {
-        // Strings don't contain references to other GC objects
-        // The Arc<[u16]> data is managed by Rust's reference counting
-    }
-}
+// Note: JsString no longer implements GcObject directly.
+// The GcBox<JsString> wrapper (via GcRef) provides the GC header.
+// JsString::trace is a no-op since strings don't contain GC references.
 
 /// Well-known interned strings (for property names)
+///
+/// These are lazily initialized and stored as `GcRef<JsString>`.
+/// Since `GcRef` is `Copy`, we store them directly without `LazyLock`.
 pub mod well_known {
     use super::*;
     use std::sync::LazyLock;
@@ -330,7 +332,8 @@ pub mod well_known {
     macro_rules! well_known_string {
         ($name:ident, $value:literal) => {
             /// Well-known string constant
-            pub static $name: LazyLock<Arc<JsString>> = LazyLock::new(|| JsString::intern($value));
+            pub static $name: LazyLock<GcRef<JsString>> =
+                LazyLock::new(|| JsString::intern($value));
         };
     }
 
@@ -364,8 +367,8 @@ mod tests {
         let s1 = JsString::intern("hello");
         let s2 = JsString::intern("hello");
 
-        // Should be the same Arc (interned)
-        assert!(Arc::ptr_eq(&s1, &s2));
+        // Should be the same GcRef (interned) - same pointer
+        assert_eq!(s1.as_ptr(), s2.as_ptr());
     }
 
     #[test]
@@ -373,7 +376,7 @@ mod tests {
         let s1 = JsString::intern("hello");
         let s2 = JsString::intern("world");
 
-        assert!(!Arc::ptr_eq(&s1, &s2));
+        assert_ne!(s1.as_ptr(), s2.as_ptr());
         assert_ne!(s1.hash_value(), s2.hash_value());
     }
 
@@ -402,10 +405,10 @@ mod tests {
         let s2 = table.intern("hello");
         let s3 = table.intern("world");
 
-        // Same string should return same Arc
-        assert!(Arc::ptr_eq(&s1, &s2));
+        // Same string should return same GcRef (same pointer)
+        assert_eq!(s1.as_ptr(), s2.as_ptr());
         // Different string should be different
-        assert!(!Arc::ptr_eq(&s1, &s3));
+        assert_ne!(s1.as_ptr(), s3.as_ptr());
 
         assert!(table.is_interned("hello"));
         assert!(table.is_interned("world"));
@@ -442,30 +445,16 @@ mod tests {
     }
 
     #[test]
-    fn test_gc_header() {
+    fn test_gcref_header() {
         use otter_vm_gc::object::MarkColor;
 
         let s = JsString::intern("test");
-        let header = s.gc_header();
+
+        // GcRef provides header via GcBox
+        let header = s.header();
 
         // Default mark should be white
         assert_eq!(header.mark(), MarkColor::White);
-        assert_eq!(header.tag(), tags::STRING);
-    }
-
-    #[test]
-    fn test_gc_object_trait() {
-        let s = JsString::intern("test");
-
-        // Test header() method from GcObject trait
-        let header = GcObject::header(s.as_ref());
-        assert_eq!(header.tag(), tags::STRING);
-
-        // Test trace() - should not panic
-        GcObject::trace(s.as_ref(), &mut |_ptr| {
-            // Strings don't have references, so this should never be called
-            panic!("Strings should not trace any references");
-        });
     }
 
     #[test]

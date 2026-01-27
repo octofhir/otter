@@ -9,6 +9,7 @@ use otter_vm_bytecode::Module;
 
 use crate::context::VmContext;
 use crate::error::VmResult;
+use crate::gc::GcRef;
 use crate::globals;
 use crate::interpreter::Interpreter;
 use crate::object::JsObject;
@@ -23,7 +24,7 @@ pub struct VmRuntime {
     modules: DashMap<String, Arc<Module>>,
     /// Global object template
     #[allow(dead_code)]
-    global_template: Arc<JsObject>,
+    global_template: GcRef<JsObject>,
     /// Runtime configuration
     config: RuntimeConfig,
     /// Memory manager for this runtime
@@ -60,8 +61,8 @@ impl VmRuntime {
     /// Create a new runtime with custom configuration
     pub fn with_config(config: RuntimeConfig) -> Self {
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(config.max_heap_size));
-        let global = Arc::new(JsObject::new(None, memory_manager.clone()));
-        globals::setup_global_object(&global);
+        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        globals::setup_global_object(global);
 
         Self {
             modules: DashMap::new(),
@@ -88,8 +89,8 @@ impl VmRuntime {
     pub fn create_context(&self) -> VmContext {
         // Clone global object for isolation
         // TODO: Proper cloning with prototype chain
-        let global = Arc::new(JsObject::new(None, self.memory_manager.clone()));
-        globals::setup_global_object(&global);
+        let global = GcRef::new(JsObject::new(None, self.memory_manager.clone()));
+        globals::setup_global_object(global);
         VmContext::with_config(
             global,
             self.config.max_stack_depth,

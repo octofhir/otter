@@ -1740,6 +1740,7 @@ dependencies = [
  "sha2",
  "strsim",
  "tar",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "walkdir",
@@ -1881,6 +1882,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-utils",
  "parking_lot",
+ "tracing",
 ]
 
 [[package]]

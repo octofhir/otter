@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::async_context::SavedFrame;
 use crate::error::{VmError, VmResult};
+use crate::gc::GcRef;
 use crate::object::JsObject;
 use crate::string::JsString;
 use crate::value::{UpvalueCell, Value};
@@ -79,7 +80,7 @@ pub struct VmContext {
     /// Call stack
     call_stack: Vec<CallFrame>,
     /// Global object
-    global: Arc<JsObject>,
+    global: GcRef<JsObject>,
     /// Exception state
     exception: Option<Value>,
     /// Try/catch handler stack (catch pc + frame depth)
@@ -113,6 +114,10 @@ pub struct VmContext {
     profiling_stats: Option<Arc<RuntimeStats>>,
     /// Memory manager for accounting and limits
     memory_manager: Arc<crate::memory::MemoryManager>,
+    /// Root slots for Handle<T> references (managed by HandleScope)
+    root_slots: Vec<Value>,
+    /// Scope boundaries (stack of base indices for nested HandleScopes)
+    scope_markers: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,7 +128,7 @@ struct TryHandler {
 
 impl VmContext {
     /// Create a new context with a global object
-    pub fn new(global: Arc<JsObject>, memory_manager: Arc<crate::memory::MemoryManager>) -> Self {
+    pub fn new(global: GcRef<JsObject>, memory_manager: Arc<crate::memory::MemoryManager>) -> Self {
         Self::with_config(
             global,
             DEFAULT_MAX_STACK_DEPTH,
@@ -134,7 +139,7 @@ impl VmContext {
 
     /// Create a new context with custom stack limits
     pub fn with_config(
-        global: Arc<JsObject>,
+        global: GcRef<JsObject>,
         max_stack_depth: usize,
         max_native_depth: usize,
         memory_manager: Arc<crate::memory::MemoryManager>,
@@ -159,12 +164,69 @@ impl VmContext {
             #[cfg(feature = "profiling")]
             profiling_stats: None,
             memory_manager,
+            root_slots: Vec::new(),
+            scope_markers: Vec::new(),
         }
     }
 
     /// Get the memory manager
     pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
         &self.memory_manager
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Root slot management (for HandleScope)
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// Get the current number of root slots
+    #[inline]
+    pub fn root_slots_len(&self) -> usize {
+        self.root_slots.len()
+    }
+
+    /// Push a value to root slots, returning its index
+    #[inline]
+    pub fn push_root_slot(&mut self, value: Value) -> usize {
+        let index = self.root_slots.len();
+        self.root_slots.push(value);
+        index
+    }
+
+    /// Pop the specified number of root slots
+    #[inline]
+    pub fn pop_root_slots(&mut self, count: usize) {
+        let new_len = self.root_slots.len().saturating_sub(count);
+        self.root_slots.truncate(new_len);
+    }
+
+    /// Get a reference to a root slot value
+    #[inline]
+    pub fn get_root_slot(&self, index: usize) -> &Value {
+        &self.root_slots[index]
+    }
+
+    /// Get the total number of roots (for testing)
+    #[inline]
+    pub fn root_count(&self) -> usize {
+        self.root_slots.len()
+    }
+
+    /// Push a scope marker (base index of a new HandleScope)
+    #[inline]
+    pub fn push_scope_marker(&mut self, index: usize) {
+        self.scope_markers.push(index);
+    }
+
+    /// Pop the most recent scope marker
+    #[inline]
+    pub fn pop_scope_marker(&mut self) {
+        self.scope_markers.pop();
+    }
+
+    /// Get root slots for GC tracing
+    #[inline]
+    pub fn root_slots_to_trace(&self) -> &[Value] {
+        &self.root_slots
     }
 
     /// Set the maximum stack depth
@@ -350,8 +412,8 @@ impl VmContext {
     }
 
     /// Get global object
-    pub fn global(&self) -> &Arc<JsObject> {
-        &self.global
+    pub fn global(&self) -> GcRef<JsObject> {
+        self.global
     }
 
     /// Push a try handler for the current frame.
@@ -829,6 +891,147 @@ impl VmContext {
         &self.open_upvalues
     }
 
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Garbage Collection
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// Trigger a garbage collection cycle
+    ///
+    /// This performs a stop-the-world mark/sweep collection:
+    /// 1. Collects all root pointers from VM state
+    /// 2. Marks all reachable objects
+    /// 3. Sweeps (frees) all unreachable objects
+    ///
+    /// Returns the number of bytes reclaimed.
+    pub fn collect_garbage(&self) -> usize {
+        let roots = self.collect_gc_roots();
+        let reclaimed = otter_vm_gc::global_registry().collect(&roots);
+
+        // Update memory manager with post-GC state
+        let live_bytes = otter_vm_gc::global_registry().total_bytes();
+        self.memory_manager.on_gc_complete(live_bytes);
+
+        reclaimed
+    }
+
+    /// Trigger GC if allocation threshold is exceeded
+    ///
+    /// Returns true if a collection was performed.
+    pub fn maybe_collect_garbage(&self) -> bool {
+        // Check both GC registry threshold and memory manager conditions
+        let should_gc = otter_vm_gc::global_registry().should_gc()
+            || self.memory_manager.should_collect_garbage();
+
+        if should_gc {
+            self.collect_garbage();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Request an explicit GC cycle
+    ///
+    /// The GC will run at the next safepoint.
+    pub fn request_gc(&self) {
+        self.memory_manager.request_gc();
+    }
+
+    /// Get current heap size (bytes allocated by GC)
+    pub fn heap_size(&self) -> usize {
+        otter_vm_gc::global_registry().total_bytes()
+    }
+
+    /// Get GC statistics
+    pub fn gc_stats(&self) -> otter_vm_gc::RegistryStats {
+        otter_vm_gc::global_registry().stats()
+    }
+
+    /// Set the GC threshold (bytes before auto-collection)
+    pub fn set_gc_threshold(&self, threshold: usize) {
+        otter_vm_gc::global_registry().set_gc_threshold(threshold);
+    }
+
+    /// Collect all GC root pointers from VM state
+    ///
+    /// This gathers pointers to all GcHeaders that are currently reachable:
+    /// - Global object
+    /// - Registers
+    /// - Call stack locals and upvalues
+    /// - Root slots (HandleScope roots)
+    /// - Exception value
+    /// - Pending call arguments
+    fn collect_gc_roots(&self) -> Vec<*const otter_vm_gc::GcHeader> {
+        let mut roots: Vec<*const otter_vm_gc::GcHeader> = Vec::new();
+
+        // Add global object
+        roots.push(self.global.header() as *const _);
+
+        // Add values from registers
+        for value in self.registers.iter() {
+            if let Some(header) = value.gc_header() {
+                roots.push(header);
+            }
+        }
+
+        // Add values from call stack
+        for frame in self.call_stack.iter() {
+            // Locals
+            for value in frame.locals.iter() {
+                if let Some(header) = value.gc_header() {
+                    roots.push(header);
+                }
+            }
+            // Upvalues
+            for cell in frame.upvalues.iter() {
+                if let Some(header) = cell.get().gc_header() {
+                    roots.push(header);
+                }
+            }
+            // This value
+            if let Some(header) = frame.this_value.gc_header() {
+                roots.push(header);
+            }
+        }
+
+        // Add root slots (HandleScope roots)
+        for value in self.root_slots.iter() {
+            if let Some(header) = value.gc_header() {
+                roots.push(header);
+            }
+        }
+
+        // Add exception if any
+        if let Some(exc) = &self.exception {
+            if let Some(header) = exc.gc_header() {
+                roots.push(header);
+            }
+        }
+
+        // Add pending args
+        for value in self.pending_args.iter() {
+            if let Some(header) = value.gc_header() {
+                roots.push(header);
+            }
+        }
+
+        // Add pending this
+        if let Some(this) = &self.pending_this {
+            if let Some(header) = this.gc_header() {
+                roots.push(header);
+            }
+        }
+
+        // Add open upvalues
+        for cell in self.open_upvalues.values() {
+            if let Some(header) = cell.get().gc_header() {
+                roots.push(header);
+            }
+        }
+
+        roots
+    }
+
     /// Teardown the context and break reference cycles
     pub fn teardown(&mut self) {
         // Break the globalThis cycle first
@@ -1004,7 +1207,7 @@ mod tests {
     #[test]
     fn test_context_registers() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024));
-        let global = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
         let mut ctx = VmContext::new(global, memory_manager);
 
         ctx.push_frame(0, dummy_module(), 0, None, false, false)
@@ -1017,7 +1220,7 @@ mod tests {
     #[test]
     fn test_context_locals() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024));
-        let global = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
         let mut ctx = VmContext::new(global, memory_manager);
 
         ctx.push_frame(0, dummy_module(), 3, None, false, false)
@@ -1034,7 +1237,7 @@ mod tests {
     #[test]
     fn test_stack_overflow() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024));
-        let global = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
         // Use a small max_stack_depth for testing
         let test_max_depth = 100;
         let mut ctx = VmContext::with_config(
@@ -1059,7 +1262,7 @@ mod tests {
     #[test]
     fn test_native_call_depth() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024));
-        let global = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
         let ctx = VmContext::with_config(global, DEFAULT_MAX_STACK_DEPTH, 3, memory_manager);
 
         // Should be able to enter 3 native calls
@@ -1078,7 +1281,7 @@ mod tests {
     #[test]
     fn test_program_counter() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024));
-        let global = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
         let mut ctx = VmContext::new(global, memory_manager);
 
         ctx.push_frame(0, dummy_module(), 0, None, false, false)

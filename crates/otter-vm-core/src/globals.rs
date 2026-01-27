@@ -8,17 +8,18 @@
 
 use std::sync::Arc;
 
+use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::regexp::JsRegExp;
 use crate::string::JsString;
 use crate::value::Value;
 
 /// Set up all standard global properties on the global object
-pub fn setup_global_object(global: &Arc<JsObject>) {
+pub fn setup_global_object(global: GcRef<JsObject>) {
     // globalThis - self-referencing
     global.set(
         PropertyKey::string("globalThis"),
-        Value::object(global.clone()),
+        Value::object(global),
     );
 
     // Primitive values
@@ -74,7 +75,7 @@ pub fn setup_global_object(global: &Arc<JsObject>) {
 }
 
 /// Set up standard built-in constructors and their prototypes
-fn setup_builtin_constructors(global: &Arc<JsObject>) {
+fn setup_builtin_constructors(global: GcRef<JsObject>) {
     let mm = global.memory_manager().clone();
     let builtins = [
         "Object",
@@ -96,7 +97,7 @@ fn setup_builtin_constructors(global: &Arc<JsObject>) {
     ];
 
     for name in builtins {
-        let proto = Arc::new(JsObject::new(None, mm.clone()));
+        let proto = GcRef::new(JsObject::new(None, mm.clone()));
         // Create constructor based on type
         let ctor = if name == "Boolean" {
             Value::native_function(
@@ -111,7 +112,6 @@ fn setup_builtin_constructors(global: &Arc<JsObject>) {
                 mm.clone(),
             )
         } else if name == "RegExp" {
-            let proto_clone = Arc::clone(&proto);
             let mm_clone = mm.clone();
             Value::native_function(
                 move |args: &[Value], mm_inner| {
@@ -128,7 +128,7 @@ fn setup_builtin_constructors(global: &Arc<JsObject>) {
                     let regex = Arc::new(JsRegExp::new(
                         pattern,
                         flags,
-                        Some(Arc::clone(&proto_clone)),
+                        Some(proto),
                         mm_inner,
                     ));
                     Ok(Value::regex(regex))
@@ -178,7 +178,7 @@ fn setup_builtin_constructors(global: &Arc<JsObject>) {
                     if let Some(msg) = args.get(0) {
                         let obj = JsObject::new(None, mm_inner);
                         obj.set(PropertyKey::string("message"), msg.clone());
-                        return Ok(Value::object(Arc::new(obj)));
+                        return Ok(Value::object(GcRef::new(obj)));
                     }
                     Ok(Value::undefined())
                 },
@@ -348,11 +348,11 @@ fn setup_builtin_constructors(global: &Arc<JsObject>) {
                             );
                             arr.set(
                                 PropertyKey::string("input"),
-                                Value::string(Arc::clone(&input_js)),
+                                Value::string(input_js),
                             );
                             arr.set(PropertyKey::string("groups"), Value::undefined());
 
-                            Ok(Value::array(Arc::new(arr)))
+                            Ok(Value::array(GcRef::new(arr)))
                         } else {
                             Ok(Value::null())
                         }
@@ -755,9 +755,9 @@ fn to_string(value: &Value) -> String {
     "[object Object]".to_string()
 }
 
-fn to_js_string(value: &Value) -> Arc<JsString> {
+fn to_js_string(value: &Value) -> GcRef<JsString> {
     if let Some(s) = value.as_string() {
-        return Arc::clone(s);
+        return s;
     }
     JsString::intern(&to_string(value))
 }
@@ -769,8 +769,8 @@ mod tests {
     #[test]
     fn test_global_this_setup() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let global = Arc::new(JsObject::new(None, memory_manager));
-        setup_global_object(&global);
+        let global = GcRef::new(JsObject::new(None, memory_manager));
+        setup_global_object(global);
 
         // globalThis should reference the global object itself
         let global_this = global.get(&PropertyKey::string("globalThis"));

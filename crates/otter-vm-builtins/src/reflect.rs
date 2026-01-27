@@ -15,6 +15,7 @@
 //! - `Reflect.apply(target, thisArgument, argumentsList)`
 //! - `Reflect.construct(target, argumentsList, newTarget?)`
 
+use otter_vm_core::gc::GcRef;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value as VmValue;
@@ -59,7 +60,7 @@ fn to_property_key(value: &VmValue) -> PropertyKey {
         return PropertyKey::Index(n as u32);
     }
     if let Some(s) = value.as_string() {
-        return PropertyKey::String(Arc::clone(s));
+        return PropertyKey::String(s);
     }
     if let Some(sym) = value.as_symbol() {
         return PropertyKey::Symbol(sym.id);
@@ -80,16 +81,15 @@ fn to_property_key(value: &VmValue) -> PropertyKey {
 }
 
 /// Get object from value, checking for proxy first
-fn get_target_object(value: &VmValue) -> Result<Arc<JsObject>, String> {
+fn get_target_object(value: &VmValue) -> Result<GcRef<JsObject>, String> {
     // Check if it's a proxy first
     if let Some(proxy) = value.as_proxy() {
         return proxy
             .target()
-            .cloned()
             .ok_or_else(|| "Cannot perform operation on a revoked proxy".to_string());
     }
 
-    value.as_object().cloned().ok_or_else(|| {
+    value.as_object().ok_or_else(|| {
         format!(
             "Reflect method requires an object target (got {}: {:?})",
             value.type_of(),
@@ -202,7 +202,7 @@ fn native_reflect_own_keys(
         .filter(|k| !matches!(k, PropertyKey::Symbol(_)))
         .collect();
 
-    let result = Arc::new(JsObject::array(filtered_keys.len(), Arc::clone(&mm)));
+    let result = GcRef::new(JsObject::array(filtered_keys.len(), Arc::clone(&mm)));
     for (i, key) in filtered_keys.into_iter().enumerate() {
         let key_val = match key {
             PropertyKey::String(s) => VmValue::string(s),
@@ -233,7 +233,7 @@ fn native_reflect_get_own_property_descriptor(
 
     // Check if property exists
     if let Some(value) = obj.get(&key) {
-        let desc = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let desc = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
         desc.set("value".into(), value);
         desc.set("writable".into(), VmValue::boolean(true));
         desc.set("enumerable".into(), VmValue::boolean(true));
@@ -367,7 +367,7 @@ fn native_reflect_set_prototype_of(
     let new_proto = if prototype.is_null() {
         None
     } else if let Some(proto_obj) = prototype.as_object() {
-        Some(Arc::clone(proto_obj))
+        Some(proto_obj)
     } else {
         return Err("Prototype must be an object or null".to_string());
     };
@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn test_reflect_get() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
         obj.set("x".into(), VmValue::number(42.0));
 
         let result = native_reflect_get(
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn test_reflect_get_missing() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
 
         let result = native_reflect_get(
             &[
@@ -444,11 +444,11 @@ mod tests {
     #[test]
     fn test_reflect_set() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
 
         let result = native_reflect_set(
             &[
-                VmValue::object(Arc::clone(&obj)),
+                VmValue::object(obj),
                 VmValue::string(JsString::intern("x")),
                 VmValue::number(99.0),
             ],
@@ -463,12 +463,12 @@ mod tests {
     #[test]
     fn test_reflect_has() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
         obj.set("x".into(), VmValue::number(1.0));
 
         let result = native_reflect_has(
             &[
-                VmValue::object(Arc::clone(&obj)),
+                VmValue::object(obj),
                 VmValue::string(JsString::intern("x")),
             ],
             Arc::clone(&mm),
@@ -487,12 +487,12 @@ mod tests {
     #[test]
     fn test_reflect_delete_property() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
         obj.set("x".into(), VmValue::number(1.0));
 
         let result = native_reflect_delete_property(
             &[
-                VmValue::object(Arc::clone(&obj)),
+                VmValue::object(obj),
                 VmValue::string(JsString::intern("x")),
             ],
             Arc::clone(&mm),
@@ -506,7 +506,7 @@ mod tests {
     #[test]
     fn test_reflect_own_keys() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
         obj.set("a".into(), VmValue::number(1.0));
         obj.set("b".into(), VmValue::number(2.0));
 
@@ -520,8 +520,8 @@ mod tests {
     #[test]
     fn test_reflect_get_prototype_of() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let proto = Arc::new(JsObject::new(None, Arc::clone(&mm)));
-        let obj = Arc::new(JsObject::new(Some(Arc::clone(&proto)), Arc::clone(&mm)));
+        let proto = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+        let obj = GcRef::new(JsObject::new(Some(proto), Arc::clone(&mm)));
 
         let result =
             native_reflect_get_prototype_of(&[VmValue::object(obj)], Arc::clone(&mm)).unwrap();
@@ -532,10 +532,10 @@ mod tests {
     #[test]
     fn test_reflect_is_extensible() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
 
         let result =
-            native_reflect_is_extensible(&[VmValue::object(Arc::clone(&obj))], Arc::clone(&mm))
+            native_reflect_is_extensible(&[VmValue::object(obj)], Arc::clone(&mm))
                 .unwrap();
         assert_eq!(result.as_boolean(), Some(true));
 

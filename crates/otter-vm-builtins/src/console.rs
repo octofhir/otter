@@ -15,7 +15,9 @@
 //! let ops = console_ops_with_adapter(TracingConsole::new());
 //! ```
 
+use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
+use otter_vm_core::object::JsObject;
 use otter_vm_core::value::Value;
 use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::collections::HashMap;
@@ -379,7 +381,7 @@ fn format_value(value: &Value) -> String {
     }
 }
 
-fn format_array(arr: &std::sync::Arc<otter_vm_core::object::JsObject>) -> String {
+fn format_array(arr: GcRef<JsObject>) -> String {
     let len = arr.array_length();
     if len == 0 {
         return "[]".to_string();
@@ -403,7 +405,7 @@ fn format_array(arr: &std::sync::Arc<otter_vm_core::object::JsObject>) -> String
     }
 }
 
-fn format_object(obj: &std::sync::Arc<otter_vm_core::object::JsObject>) -> String {
+fn format_object(obj: GcRef<JsObject>) -> String {
     use otter_vm_core::object::PropertyKey;
 
     let keys = obj.own_keys();

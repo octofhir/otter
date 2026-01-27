@@ -6,8 +6,13 @@ description = "Garbage collector for Otter VM"
 license = "MIT"
 repository = "https://github.com/aspect-build/otter"
 
+[features]
+default = []
+gc_logging = ["tracing"]
+
 [dependencies]
 parking_lot = "0.12"
 crossbeam-utils = "0.8"
+tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]

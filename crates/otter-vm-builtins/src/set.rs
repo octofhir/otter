@@ -2,6 +2,7 @@
 //!
 //! Provides Set and WeakSet collections with full ES2026 support.
 
+use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::value::Value as VmValue;
@@ -69,7 +70,7 @@ fn value_to_key(value: &VmValue) -> String {
     }
     // For objects, use pointer address for identity
     if let Some(obj) = value.as_object() {
-        return format!("__obj_{:p}__", Arc::as_ptr(obj));
+        return format!("__obj_{:p}__", obj.as_ptr());
     }
     if let Some(func) = value.as_function() {
         return format!("__func_{:p}__", Arc::as_ptr(func));
@@ -79,7 +80,7 @@ fn value_to_key(value: &VmValue) -> String {
 
 /// Helper to convert string to PropertyKey
 fn str_to_key(s: &str) -> PropertyKey {
-    PropertyKey::String(Arc::new(otter_vm_core::string::JsString::new(s)))
+    PropertyKey::String(otter_vm_core::string::JsString::intern(s))
 }
 
 // ============================================================================
@@ -88,10 +89,10 @@ fn str_to_key(s: &str) -> PropertyKey {
 
 /// Create a new Set
 fn native_set_new(_args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
-    let set_obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+    let set_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
 
     // Create internal values storage
-    let values_obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+    let values_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
     set_obj.set(str_to_key(SET_VALUES_KEY), VmValue::object(values_obj));
     set_obj.set(str_to_key(SET_SIZE_KEY), VmValue::int32(0));
     set_obj.set(str_to_key(IS_SET_KEY), VmValue::boolean(true));
@@ -227,7 +228,7 @@ fn native_set_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<
     }
 
     // Replace values with new empty object
-    let new_values = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+    let new_values = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
     set_obj.set(str_to_key(SET_VALUES_KEY), VmValue::object(new_values));
     set_obj.set(str_to_key(SET_SIZE_KEY), VmValue::int32(0));
 
@@ -274,7 +275,7 @@ fn native_set_values(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result
         .ok_or("Internal error: values not an object")?;
 
     // Collect all values into an array
-    let values_array = Arc::new(JsObject::array(0, Arc::clone(&mm)));
+    let values_array = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
     let props = values_obj.own_keys();
     let mut index = 0;
 
@@ -318,14 +319,14 @@ fn native_set_entries(
         .ok_or("Internal error: values not an object")?;
 
     // Collect all [value, value] pairs into an array
-    let entries_array = Arc::new(JsObject::array(0, Arc::clone(&mm)));
+    let entries_array = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
     let props = values_obj.own_keys();
     let mut index = 0;
 
     for prop in props {
         if let Some(value) = values_obj.get(&prop) {
             // Create [value, value] pair as array
-            let pair = Arc::new(JsObject::array(0, Arc::clone(&mm)));
+            let pair = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
             pair.set(str_to_key("0"), value.clone());
             pair.set(str_to_key("1"), value);
             pair.set(str_to_key("length"), VmValue::int32(2));
@@ -533,9 +534,9 @@ fn native_weakset_new(
     _args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
 ) -> Result<VmValue, String> {
-    let set_obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+    let set_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
 
-    let values_obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+    let values_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
     set_obj.set(str_to_key(SET_VALUES_KEY), VmValue::object(values_obj));
     set_obj.set(str_to_key(IS_WEAKSET_KEY), VmValue::boolean(true));
 
@@ -792,7 +793,7 @@ mod tests {
         let mm = Arc::new(memory::MemoryManager::test());
         let set = native_weakset_new(&[], Arc::clone(&mm)).unwrap();
 
-        let obj = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
         let value = VmValue::object(obj);
 
         let _ = native_weakset_add(&[set.clone(), value.clone()], Arc::clone(&mm)).unwrap();

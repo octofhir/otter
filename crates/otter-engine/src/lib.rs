@@ -100,6 +100,8 @@ pub use otter_vm_runtime::{
 
 // Re-export VM core types (for extension authors)
 pub use otter_vm_core::{
+    // GC types
+    GcRef,
     // Generator
     GeneratorContext,
     GeneratorState,

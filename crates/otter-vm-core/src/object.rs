@@ -13,6 +13,7 @@
 use parking_lot::RwLock;
 use std::sync::Arc;
 
+use crate::gc::GcRef;
 use crate::shape::Shape;
 
 /// Maximum prototype chain depth to prevent stack overflow
@@ -25,10 +26,10 @@ use crate::string::JsString;
 use crate::value::Value;
 
 /// Property key (string or symbol)
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PropertyKey {
-    /// String property key
-    String(Arc<JsString>),
+    /// String property key (GC-managed)
+    String(GcRef<JsString>),
     /// Symbol property key
     Symbol(u64),
     /// Integer index (for arrays)
@@ -48,8 +49,8 @@ impl PropertyKey {
         Self::String(JsString::intern(s))
     }
 
-    /// Create from a string Arc
-    pub fn from_js_string(s: Arc<JsString>) -> Self {
+    /// Create from a GcRef<JsString>
+    pub fn from_js_string(s: GcRef<JsString>) -> Self {
         Self::String(s)
     }
 
@@ -62,7 +63,8 @@ impl PropertyKey {
     pub fn trace(&self, tracer: &mut dyn crate::gc::Tracer) {
         match self {
             Self::String(s) => {
-                tracer.mark_header(s.gc_header() as *const _);
+                // GcRef provides header() via GcBox wrapper
+                tracer.mark_header(s.header() as *const _);
             }
             _ => {}
         }
@@ -229,8 +231,8 @@ pub struct JsObject {
     inline_properties: RwLock<[Option<PropertyEntry>; INLINE_PROPERTY_COUNT]>,
     /// Overflow properties storage (for properties beyond INLINE_PROPERTY_COUNT)
     overflow_properties: RwLock<Vec<PropertyEntry>>,
-    /// Prototype (null for Object.prototype, mutable via Reflect.setPrototypeOf)
-    prototype: RwLock<Option<Arc<JsObject>>>,
+    /// Prototype (null for Object.prototype, mutable via Reflect.setPrototypeOf) - GC-managed
+    prototype: RwLock<Option<GcRef<JsObject>>>,
     /// Array elements (for array-like objects)
     elements: RwLock<Vec<Value>>,
     /// Object flags (mutable for freeze/seal/preventExtensions)
@@ -253,9 +255,9 @@ pub struct ObjectFlags {
 }
 
 impl JsObject {
-    /// Create a new empty object
+    /// Create a new empty object (GC-managed prototype)
     pub fn new(
-        prototype: Option<Arc<JsObject>>,
+        prototype: Option<GcRef<JsObject>>,
         memory_manager: Arc<crate::memory::MemoryManager>,
     ) -> Self {
         // Assume basic object size for now
@@ -347,7 +349,10 @@ impl JsObject {
                         entry.desc = PropertyDescriptor::data(value);
                         return true;
                     }
-                    PropertyDescriptor::Data { value: v, attributes } => {
+                    PropertyDescriptor::Data {
+                        value: v,
+                        attributes,
+                    } => {
                         if attributes.writable {
                             *v = value;
                             return true;
@@ -369,7 +374,10 @@ impl JsObject {
                         entry.desc = PropertyDescriptor::data(value);
                         return true;
                     }
-                    PropertyDescriptor::Data { value: v, attributes } => {
+                    PropertyDescriptor::Data {
+                        value: v,
+                        attributes,
+                    } => {
                         if attributes.writable {
                             *v = value;
                             return true;
@@ -435,7 +443,7 @@ impl JsObject {
         }
 
         // Check prototype chain iteratively to avoid stack overflow
-        let mut current: Option<Arc<JsObject>> = self.prototype.read().clone();
+        let mut current: Option<GcRef<JsObject>> = self.prototype.read().clone();
         let mut depth = 0;
 
         while let Some(proto) = current {
@@ -545,7 +553,7 @@ impl JsObject {
         }
 
         // Walk prototype chain iteratively to avoid stack overflow
-        let mut current: Option<Arc<JsObject>> = self.prototype.read().clone();
+        let mut current: Option<GcRef<JsObject>> = self.prototype.read().clone();
         let mut depth = 0;
 
         while let Some(proto) = current {
@@ -718,7 +726,7 @@ impl JsObject {
         }
 
         // Walk prototype chain iteratively to avoid stack overflow
-        let mut current: Option<Arc<JsObject>> = self.prototype.read().clone();
+        let mut current: Option<GcRef<JsObject>> = self.prototype.read().clone();
         let mut depth = 0;
 
         while let Some(proto) = current {
@@ -770,7 +778,8 @@ impl JsObject {
 
         if let Some(off) = offset {
             // Treat deleted slots as non-existent for extensibility checks.
-            if self.get_property_entry_by_offset(off).is_none() && (!flags.extensible || flags.sealed)
+            if self.get_property_entry_by_offset(off).is_none()
+                && (!flags.extensible || flags.sealed)
             {
                 return false;
             }
@@ -824,22 +833,22 @@ impl JsObject {
     }
 
     /// Get prototype
-    pub fn prototype(&self) -> Option<Arc<JsObject>> {
+    pub fn prototype(&self) -> Option<GcRef<JsObject>> {
         self.prototype.read().clone()
     }
 
     /// Set prototype
     /// Returns false if object is not extensible, if it would create a cycle,
     /// or if the chain would be too deep
-    pub fn set_prototype(&self, prototype: Option<Arc<JsObject>>) -> bool {
+    pub fn set_prototype(&self, prototype: Option<GcRef<JsObject>>) -> bool {
         if !self.flags.read().extensible {
             return false;
         }
 
         // Check for cycles and excessive depth
-        if let Some(ref proto) = prototype {
+        if let Some(proto) = prototype {
             let self_ptr = self as *const JsObject;
-            let mut current = Some(Arc::clone(proto));
+            let mut current = Some(proto);
             let mut depth = 0;
 
             while let Some(p) = current {
@@ -847,7 +856,7 @@ impl JsObject {
                 if depth > MAX_PROTOTYPE_CHAIN_DEPTH {
                     return false; // Chain would be too deep
                 }
-                if Arc::as_ptr(&p) as *const JsObject == self_ptr {
+                if p.as_ptr() == self_ptr {
                     return false; // Would create cycle
                 }
                 current = p.prototype.read().clone();
@@ -1121,9 +1130,9 @@ mod tests {
     fn test_deep_prototype_chain() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // Build a prototype chain of depth 100
-        let mut proto: Option<Arc<JsObject>> = None;
+        let mut proto: Option<GcRef<JsObject>> = None;
         for i in 0..100 {
-            let obj = Arc::new(JsObject::new(proto.clone(), Arc::clone(&memory_manager)));
+            let obj = GcRef::new(JsObject::new(proto, Arc::clone(&memory_manager)));
             obj.set(
                 PropertyKey::string(&format!("prop{}", i)),
                 Value::int32(i as i32),
@@ -1149,9 +1158,9 @@ mod tests {
     fn test_prototype_chain_depth_limit() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // Build a prototype chain that exceeds the limit (100)
-        let mut proto: Option<Arc<JsObject>> = None;
+        let mut proto: Option<GcRef<JsObject>> = None;
         for i in 0..110 {
-            let obj = Arc::new(JsObject::new(proto.clone(), Arc::clone(&memory_manager)));
+            let obj = GcRef::new(JsObject::new(proto, Arc::clone(&memory_manager)));
             if i == 0 {
                 obj.set(PropertyKey::string("deep_prop"), Value::int32(42));
             }
@@ -1168,25 +1177,25 @@ mod tests {
     #[test]
     fn test_prototype_cycle_prevention() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let obj1 = Arc::new(JsObject::new(None, Arc::clone(&memory_manager)));
-        let obj2 = Arc::new(JsObject::new(
-            Some(obj1.clone()),
+        let obj1 = GcRef::new(JsObject::new(None, Arc::clone(&memory_manager)));
+        let obj2 = GcRef::new(JsObject::new(
+            Some(obj1),
             Arc::clone(&memory_manager),
         ));
-        let obj3 = Arc::new(JsObject::new(
-            Some(obj2.clone()),
+        let obj3 = GcRef::new(JsObject::new(
+            Some(obj2),
             Arc::clone(&memory_manager),
         ));
 
         // Attempting to create a cycle should fail
         // obj1 -> obj2 -> obj3 -> obj1 would be a cycle
-        assert!(!obj1.set_prototype(Some(obj3.clone())));
+        assert!(!obj1.set_prototype(Some(obj3)));
 
         // Setting to None should work
         assert!(obj1.set_prototype(None));
 
         // Setting to an unrelated object should work
-        let unrelated = Arc::new(JsObject::new(None, memory_manager));
+        let unrelated = GcRef::new(JsObject::new(None, memory_manager));
         assert!(obj1.set_prototype(Some(unrelated)));
     }
 }

@@ -17,6 +17,7 @@ use otter_vm_compiler::Compiler;
 use otter_vm_core::async_context::VmExecutionResult;
 use otter_vm_core::context::VmContext;
 use otter_vm_core::error::VmError;
+use otter_vm_core::gc::GcRef;
 use otter_vm_core::interpreter::Interpreter;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::promise::JsPromise;
@@ -525,7 +526,7 @@ impl Otter {
         }
 
         // Also register environment access if capabilities allow
-        self.register_env_access(&global);
+        self.register_env_access(global);
 
         let ctx_ptr = ctx as *mut VmContext as usize;
         let vm_ptr = &self.vm as *const VmRuntime as usize;
@@ -540,7 +541,7 @@ impl Otter {
                         let obj = JsObject::new(None, mm_result.clone());
                         obj.set(PropertyKey::string("ok"), Value::boolean(true));
                         obj.set(PropertyKey::string("value"), value);
-                        Value::object(Arc::new(obj))
+                        Value::object(GcRef::new(obj))
                     };
 
                     let result_err = |error_type: &str, message: &str| {
@@ -554,7 +555,7 @@ impl Otter {
                             PropertyKey::string("message"),
                             Value::string(JsString::intern(message)),
                         );
-                        Value::object(Arc::new(obj))
+                        Value::object(GcRef::new(obj))
                     };
 
                     let code_value = match args.first() {
@@ -623,7 +624,6 @@ impl Otter {
                 let mm_inner = mm.clone();
                 Value::native_function(
                     move |args, _mm_ignored| {
-                        println!("DEBUG: op_sync called");
                         let json_args: Vec<serde_json::Value> =
                             args.iter().map(value_to_json).collect();
                         let result = sync_fn(&json_args)?;
@@ -686,7 +686,7 @@ impl Otter {
     }
 
     /// Register environment variable access functions
-    fn register_env_access(&self, global: &Arc<JsObject>) {
+    fn register_env_access(&self, global: GcRef<JsObject>) {
         let env_store = Arc::clone(&self.env_store);
         let caps = self.capabilities.clone();
 
@@ -735,7 +735,7 @@ impl Otter {
                             Value::string(otter_vm_core::string::JsString::intern(&key)),
                         );
                     }
-                    Ok(Value::object(Arc::new(arr)))
+                    Ok(Value::object(GcRef::new(arr)))
                 },
                 mm_keys,
             ),
@@ -940,14 +940,14 @@ fn json_to_value(json: &serde_json::Value, mm: Arc<otter_vm_core::MemoryManager>
                     json_to_value(elem, mm.clone()),
                 );
             }
-            Value::object(Arc::new(js_arr))
+            Value::object(GcRef::new(js_arr))
         }
         serde_json::Value::Object(obj) => {
             let js_obj = JsObject::new(None, mm.clone());
             for (key, val) in obj {
                 js_obj.set(PropertyKey::string(key), json_to_value(val, mm.clone()));
             }
-            Value::object(Arc::new(js_obj))
+            Value::object(GcRef::new(js_obj))
         }
     }
 }
@@ -1115,7 +1115,8 @@ mod tests {
 
         // Test string
         let val = json_to_value(&serde_json::json!("hello"), mm.clone());
-        assert_eq!(val.as_string().map(|s| s.as_str()), Some("hello"));
+        let val_str = val.as_string().unwrap();
+        assert_eq!(val_str.as_str(), "hello");
     }
 
     #[test]

@@ -272,7 +272,7 @@ fn regexp_test(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value,
         .ok_or("test requires a string argument")?;
 
     let regex = build_regex(&pattern, &flags)?;
-    let found = find_first(&regex, input, &flags, 0).is_some();
+    let found = find_first(&regex, &input, &flags, 0).is_some();
     Ok(Value::boolean(found))
 }
 
@@ -287,9 +287,9 @@ fn regexp_exec(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value,
 
     let regex = build_regex(&pattern, &flags)?;
 
-    match find_first(&regex, input, &flags, 0) {
+    match find_first(&regex, &input, &flags, 0) {
         Some(mat) => {
-            let matches = match_to_strings(input, &mat);
+            let matches = match_to_strings(&input, &mat);
             let result = serde_json::json!({
                 "matches": matches,
                 "index": mat.start(),
@@ -337,9 +337,9 @@ fn regexp_match(args: &[Value], mm: Arc<memory::MemoryManager>) -> Result<Value,
 
     if is_global {
         // Global: return all matches
-        let matches: Vec<String> = find_all(&regex, input, &flags)
+        let matches: Vec<String> = find_all(&regex, &input, &flags)
             .into_iter()
-            .map(|m| slice_utf16(input, m.range()))
+            .map(|m| slice_utf16(&input, m.range()))
             .collect();
 
         if matches.is_empty() {
@@ -371,8 +371,8 @@ fn regexp_match_all(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<V
     let regex = build_regex(&pattern, &flags)?;
 
     let mut all_matches: Vec<serde_json::Value> = Vec::new();
-    for mat in find_all(&regex, input, &flags) {
-        let matches = match_to_strings(input, &mat);
+    for mat in find_all(&regex, &input, &flags) {
+        let matches = match_to_strings(&input, &mat);
         all_matches.push(serde_json::json!({
             "matches": matches,
             "index": mat.start()
@@ -427,7 +427,7 @@ fn regexp_search(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Valu
 
     let regex = build_regex(&pattern, &flags)?;
 
-    match find_first(&regex, input, &flags, 0) {
+    match find_first(&regex, &input, &flags, 0) {
         Some(mat) => Ok(Value::int32(mat.start() as i32)),
         None => Ok(Value::int32(-1)),
     }
@@ -448,7 +448,7 @@ fn regexp_split(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value
     let mut last_end = 0;
     let input_len = input.len_utf16();
 
-    for mat in find_all(&regex, input, &flags) {
+    for mat in find_all(&regex, &input, &flags) {
         if let Some(lim) = limit {
             if parts.len() >= lim {
                 break;
@@ -456,13 +456,13 @@ fn regexp_split(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value
         }
         let start = mat.start();
         if start >= last_end {
-            parts.push(slice_utf16(input, last_end..start));
+            parts.push(slice_utf16(&input, last_end..start));
         }
         last_end = mat.end();
     }
 
     if limit.map(|l| parts.len() < l).unwrap_or(true) {
-        parts.push(slice_utf16(input, last_end..input_len));
+        parts.push(slice_utf16(&input, last_end..input_len));
     }
 
     let result = serde_json::to_string(&parts).unwrap_or_else(|_| "[]".to_string());

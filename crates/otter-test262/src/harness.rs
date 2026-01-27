@@ -1,4 +1,4 @@
-use otter_engine::{Extension, JsObject, PropertyKey, Value, VmContext};
+use otter_engine::{Extension, GcRef, JsObject, PropertyKey, Value, VmContext};
 use std::sync::Arc;
 
 /// Create a Test262 harness extension
@@ -31,10 +31,10 @@ pub fn setup_harness(ctx: &mut VmContext) {
     let mm = Arc::clone(global.memory_manager());
 
     // Create $262 object
-    let obj_262 = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+    let obj_262 = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
 
     // $262.global - Reference to the global object
-    obj_262.set(PropertyKey::string("global"), Value::object(global.clone()));
+    obj_262.set(PropertyKey::string("global"), Value::object(global));
 
     // $262.gc() - Trigger garbage collection
     obj_262.set(
@@ -101,9 +101,9 @@ fn format_value(value: &Value) -> String {
 }
 
 /// Set up assert helpers
-fn setup_assert(global: &Arc<JsObject>) {
+fn setup_assert(global: GcRef<JsObject>) {
     let mm = Arc::clone(global.memory_manager());
-    let assert_obj = Arc::new(JsObject::new(None, mm));
+    let assert_obj = GcRef::new(JsObject::new(None, mm));
 
     // assert(condition, message) - Basic assertion
     // assert.sameValue(actual, expected, message) - Strict equality assertion

@@ -6,6 +6,7 @@
 //! - `Generator.prototype.throw(exception)`
 //! - Iterator helpers for creating iterator results
 
+use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::value::Value as VmValue;
@@ -30,7 +31,7 @@ pub fn ops() -> Vec<Op> {
 
 /// Create an iterator result object { value, done }
 fn create_iterator_result(value: VmValue, done: bool, mm: Arc<memory::MemoryManager>) -> VmValue {
-    let result = Arc::new(JsObject::new(None, mm));
+    let result = GcRef::new(JsObject::new(None, mm));
     result.set(PropertyKey::string("value"), value);
     result.set(PropertyKey::string("done"), VmValue::boolean(done));
     VmValue::object(result)

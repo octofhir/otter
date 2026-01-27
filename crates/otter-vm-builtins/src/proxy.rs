@@ -6,10 +6,11 @@
 //!
 //! Proxy traps are called from JavaScript via the handler object.
 
+use otter_vm_core::gc::GcRef;
+use otter_vm_core::memory;
 use otter_vm_core::object::JsObject;
 use otter_vm_core::proxy::JsProxy;
 use otter_vm_core::value::Value as VmValue;
-use otter_vm_core::memory;
 use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::sync::Arc;
 
@@ -45,7 +46,7 @@ fn native_proxy_create(
         .as_object()
         .ok_or("Proxy handler must be an object")?;
 
-    let proxy = JsProxy::new(Arc::clone(target_obj), Arc::clone(handler_obj));
+    let proxy = JsProxy::new(target_obj, handler_obj);
     Ok(VmValue::proxy(proxy))
 }
 
@@ -69,9 +70,9 @@ fn native_proxy_revocable(
         .as_object()
         .ok_or("Proxy handler must be an object")?;
 
-    let revocable = JsProxy::revocable(Arc::clone(target_obj), Arc::clone(handler_obj));
+    let revocable = JsProxy::revocable(target_obj, handler_obj);
 
-    let result = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+    let result = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
     result.set("proxy".into(), VmValue::proxy(revocable.proxy));
 
     // Create native function for revoke
@@ -102,7 +103,7 @@ fn native_proxy_get_target(
     let proxy = proxy_val.as_proxy().ok_or("Argument must be a proxy")?;
 
     match proxy.target() {
-        Some(target) => Ok(VmValue::object(Arc::clone(target))),
+        Some(target) => Ok(VmValue::object(target)),
         None => Err("Cannot perform operation on a revoked proxy".to_string()),
     }
 }
@@ -119,7 +120,7 @@ fn native_proxy_get_handler(
     let proxy = proxy_val.as_proxy().ok_or("Argument must be a proxy")?;
 
     match proxy.handler() {
-        Some(handler) => Ok(VmValue::object(Arc::clone(handler))),
+        Some(handler) => Ok(VmValue::object(handler)),
         None => Err("Cannot perform operation on a revoked proxy".to_string()),
     }
 }
@@ -145,8 +146,8 @@ mod tests {
     #[test]
     fn test_proxy_create() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let target = Arc::new(JsObject::new(None, Arc::clone(&mm)));
-        let handler = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let target = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+        let handler = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
 
         let result =
             native_proxy_create(&[VmValue::object(target), VmValue::object(handler)], mm).unwrap();
@@ -158,7 +159,7 @@ mod tests {
     #[test]
     fn test_proxy_create_invalid_target() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let handler = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let handler = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
         let result = native_proxy_create(
             &[VmValue::number(42.0), VmValue::object(handler)],
             Arc::clone(&mm),
@@ -170,8 +171,8 @@ mod tests {
     #[test]
     fn test_proxy_revocable() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let target = Arc::new(JsObject::new(None, Arc::clone(&mm)));
-        let handler = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let target = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+        let handler = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
 
         let result =
             native_proxy_revocable(&[VmValue::object(target), VmValue::object(handler)], mm)
@@ -190,8 +191,8 @@ mod tests {
     #[test]
     fn test_proxy_is_revoked() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let target = Arc::new(JsObject::new(None, Arc::clone(&mm)));
-        let handler = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let target = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+        let handler = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
         let proxy = JsProxy::new(target, handler);
         let proxy_val = VmValue::proxy(proxy.clone());
 
@@ -207,10 +208,10 @@ mod tests {
     #[test]
     fn test_proxy_get_target() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let target = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let target = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
         target.set("x".into(), VmValue::number(42.0));
-        let handler = Arc::new(JsObject::new(None, Arc::clone(&mm)));
-        let proxy = JsProxy::new(Arc::clone(&target), handler);
+        let handler = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+        let proxy = JsProxy::new(target, handler);
 
         let result = native_proxy_get_target(&[VmValue::proxy(proxy)], Arc::clone(&mm)).unwrap();
         assert!(result.is_object());
@@ -221,8 +222,8 @@ mod tests {
     #[test]
     fn test_proxy_get_target_revoked() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let target = Arc::new(JsObject::new(None, Arc::clone(&mm)));
-        let handler = Arc::new(JsObject::new(None, Arc::clone(&mm)));
+        let target = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+        let handler = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
         let proxy = JsProxy::new(target, handler);
         proxy.revoke();
 

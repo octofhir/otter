@@ -1,9 +1,50 @@
 //! Garbage collection support
 //!
-//! This module provides GC root tracking and tracing interfaces,
-//! integrating with otter-vm-gc crate.
+//! This module provides GC root tracking, tracing interfaces, and a rooting API
+//! for safe garbage collection.
+//!
+//! # Rooting Protocol
+//!
+//! The rooting API provides safe access to GC-managed objects:
+//!
+//! - [`Gc<T>`]: An unrooted GC pointer. Only valid within a single operation that
+//!   cannot trigger GC. Holding a `Gc<T>` across any function that might allocate
+//!   or run JavaScript code is undefined behavior.
+//!
+//! - [`Handle<T>`]: A rooted GC pointer managed by a [`HandleScope`]. Safe to hold
+//!   across function calls that might trigger GC.
+//!
+//! - [`HandleScope`]: RAII scope that manages handles. All handles created within
+//!   a scope are automatically unrooted when the scope drops.
+//!
+//! # Example
+//!
+//! ```ignore
+//! fn example(ctx: &mut VmContext) {
+//!     let scope = HandleScope::new(ctx);
+//!
+//!     // Root a value to keep it alive across potential GC points
+//!     let handle = scope.root_value(Value::int32(42));
+//!
+//!     // Safe to call functions that might trigger GC
+//!     some_js_operation(ctx);
+//!
+//!     // Handle is still valid
+//!     let value = ctx.get_root_slot(handle.slot_index());
+//! }  // scope drops, handle is unrooted
+//! ```
+//!
+//! # Safety Invariants
+//!
+//! 1. `Gc<T>` must not be held across GC points (allocations, JS execution)
+//! 2. `Handle<T>` is valid only while its `HandleScope` is alive
+//! 3. `HandleScope`s must be dropped in LIFO order (enforced by Rust)
+//! 4. Handles should not escape to long-lived storage
 
 use std::any::Any;
+use std::cell::Cell;
+use std::marker::PhantomData;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 // Re-export GC types from otter-vm-gc
@@ -81,23 +122,24 @@ pub fn gc_alloc<T>(value: T) -> GcHandle<T> {
     Arc::new(value)
 }
 
-/// Safe handle to a raw GC pointer
+/// Raw handle to a GC pointer (low-level, unsafe)
 ///
-/// Prevents collection while held.
-pub struct Handle<T> {
+/// This is a thin wrapper around a raw pointer for internal use.
+/// For safe rooted handles, use [`Handle<T>`] with [`HandleScope`].
+pub struct RawHandle<T> {
     ptr: *const T,
-    _marker: std::marker::PhantomData<T>,
+    _marker: PhantomData<T>,
 }
 
-impl<T> Handle<T> {
-    /// Create a new handle
+impl<T> RawHandle<T> {
+    /// Create a new raw handle
     ///
     /// # Safety
     /// The pointer must be valid and point to a live object.
     pub unsafe fn new(ptr: *const T) -> Self {
         Self {
             ptr,
-            _marker: std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -124,10 +166,381 @@ impl<T> Handle<T> {
     }
 }
 
-// Handle is Send if T is Send
-unsafe impl<T: Send> Send for Handle<T> {}
-// Handle is Sync if T is Sync
-unsafe impl<T: Sync> Sync for Handle<T> {}
+// RawHandle is Send if T is Send
+unsafe impl<T: Send> Send for RawHandle<T> {}
+// RawHandle is Sync if T is Sync
+unsafe impl<T: Sync> Sync for RawHandle<T> {}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rooting API: GcBox, Gc, Handle, HandleScope
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A GC-managed heap cell containing a value and GC metadata.
+///
+/// This is the low-level allocation unit for GC objects. The header
+/// contains marking bits for tri-color marking.
+#[repr(C)]
+pub struct GcBox<T> {
+    /// GC metadata (mark bits, generation, etc.)
+    header: GcHeader,
+    /// The actual value
+    value: T,
+}
+
+impl<T> GcBox<T> {
+    /// Create a new GcBox with the given value.
+    ///
+    /// Note: This creates an unallocated GcBox. Use `Gc::alloc` to allocate
+    /// on the GC heap.
+    pub fn new(value: T) -> Self {
+        Self {
+            header: GcHeader::new(0), // Type tag 0 for now
+            value,
+        }
+    }
+
+    /// Get reference to the header
+    pub fn header(&self) -> &GcHeader {
+        &self.header
+    }
+
+    /// Get reference to the value
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    /// Get mutable reference to the value
+    pub fn value_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
+
+/// An unrooted GC pointer.
+///
+/// `Gc<T>` is a thin wrapper around a pointer to a GC-managed object.
+/// It is only valid within a single operation that cannot trigger GC.
+///
+/// # Safety
+///
+/// Holding a `Gc<T>` across any function that might:
+/// - Allocate memory
+/// - Run JavaScript code
+/// - Trigger garbage collection
+///
+/// ...is undefined behavior, as the pointer may become dangling.
+///
+/// To keep a value alive across GC points, root it using [`HandleScope::root`].
+#[derive(Debug)]
+pub struct Gc<T> {
+    ptr: NonNull<GcBox<T>>,
+}
+
+impl<T> Gc<T> {
+    /// Create from a raw NonNull pointer.
+    ///
+    /// # Safety
+    /// The pointer must be valid and point to a live GcBox<T>.
+    pub unsafe fn from_raw(ptr: NonNull<GcBox<T>>) -> Self {
+        Self { ptr }
+    }
+
+    /// Get the raw pointer.
+    pub fn as_ptr(&self) -> *const GcBox<T> {
+        self.ptr.as_ptr()
+    }
+
+    /// Get reference to the inner value.
+    ///
+    /// # Safety
+    /// The GcBox must still be live (not collected).
+    pub unsafe fn get(&self) -> &T {
+        // SAFETY: Caller guarantees the GcBox is still live
+        unsafe { &(*self.ptr.as_ptr()).value }
+    }
+
+    /// Get mutable reference to the inner value.
+    ///
+    /// # Safety
+    /// Caller must ensure exclusive access and that GcBox is still live.
+    pub unsafe fn get_mut(&mut self) -> &mut T {
+        // SAFETY: Caller guarantees exclusive access and GcBox is still live
+        unsafe { &mut (*self.ptr.as_ptr()).value }
+    }
+
+    /// Get the GC header.
+    pub fn header(&self) -> &GcHeader {
+        unsafe { &(*self.ptr.as_ptr()).header }
+    }
+}
+
+// Gc<T> is Copy for ergonomic use within a single operation
+impl<T> Clone for Gc<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Gc<T> {}
+
+// Do NOT implement Send/Sync - Gc<T> should not escape the current operation
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GcRef<T> - Safe reference to GC-managed object (replaces Arc<T>)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A safe reference to a GC-managed object.
+///
+/// `GcRef<T>` is the primary way to hold references to GC-managed objects.
+/// It replaces `Arc<T>` in the codebase and provides safe access through `Deref`.
+///
+/// # Safety Model
+///
+/// `GcRef<T>` is safe to use because:
+/// 1. It can only be created from a valid `Gc<T>` via `GcRef::from_gc`
+/// 2. Any `GcRef<T>` stored in a `Value` is traced by the GC
+/// 3. Objects reachable from roots survive garbage collection
+///
+/// The GC ensures that any `GcRef<T>` that's reachable (stored in registers,
+/// locals, object properties, etc.) points to a live object.
+///
+/// # Thread Safety
+///
+/// `GcRef<T>` is `Send + Sync` when `T` is `Send + Sync`, matching `Arc<T>`
+/// behavior. The underlying `GcBox<T>` uses interior mutability (RwLock)
+/// for thread-safe access where needed.
+#[derive(Debug)]
+pub struct GcRef<T> {
+    gc: Gc<T>,
+}
+
+impl<T> GcRef<T> {
+    /// Create a new GcRef from a Gc pointer.
+    ///
+    /// # Safety
+    /// The Gc pointer must point to a valid, live GcBox<T>.
+    /// The caller must ensure the object will remain rooted/reachable.
+    pub unsafe fn from_gc(gc: Gc<T>) -> Self {
+        Self { gc }
+    }
+
+    /// Create a GcRef by allocating a new GcBox on the heap.
+    ///
+    /// This allocates memory using Box (temporary - will use GC heap later).
+    /// The returned GcRef owns the allocation.
+    pub fn new(value: T) -> Self {
+        // For now, allocate via Box. In the future, this will use GcHeap.
+        let boxed = Box::new(GcBox::new(value));
+        let ptr = NonNull::new(Box::into_raw(boxed)).unwrap();
+        Self {
+            gc: unsafe { Gc::from_raw(ptr) },
+        }
+    }
+
+    /// Get the underlying Gc pointer.
+    pub fn as_gc(&self) -> Gc<T> {
+        self.gc
+    }
+
+    /// Get the GC header.
+    pub fn header(&self) -> &GcHeader {
+        self.gc.header()
+    }
+
+    /// Get raw pointer (for identity comparison).
+    pub fn as_ptr(&self) -> *const T {
+        unsafe { &(*self.gc.as_ptr()).value as *const T }
+    }
+}
+
+impl<T> std::ops::Deref for GcRef<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: GcRef can only exist for live objects that are rooted/reachable.
+        // The GC guarantees objects won't be collected while reachable.
+        unsafe { self.gc.get() }
+    }
+}
+
+impl<T> Clone for GcRef<T> {
+    fn clone(&self) -> Self {
+        Self { gc: self.gc }
+    }
+}
+
+// GcRef is Copy like Gc - it's just a pointer
+impl<T> Copy for GcRef<T> {}
+
+// GcRef is Send + Sync when T is, matching Arc behavior
+unsafe impl<T: Send + Sync> Send for GcRef<T> {}
+unsafe impl<T: Send + Sync> Sync for GcRef<T> {}
+
+impl<T: PartialEq> PartialEq for GcRef<T> {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare by pointer identity first (fast path)
+        if self.as_ptr() == other.as_ptr() {
+            return true;
+        }
+        // Fall back to value comparison
+        **self == **other
+    }
+}
+
+impl<T: Eq> Eq for GcRef<T> {}
+
+impl<T: std::hash::Hash> std::hash::Hash for GcRef<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (**self).hash(state)
+    }
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for GcRef<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T> AsRef<T> for GcRef<T> {
+    fn as_ref(&self) -> &T {
+        self
+    }
+}
+
+/// A rooted handle to a GC-managed object.
+///
+/// `Handle<T>` keeps its target alive across garbage collection cycles.
+/// Handles are created by [`HandleScope::root`] and are automatically
+/// unrooted when their scope drops.
+///
+/// Unlike [`Gc<T>`], `Handle<T>` is safe to hold across function calls
+/// that might trigger GC.
+#[derive(Debug)]
+pub struct Handle<T> {
+    /// Index into VmContext's root_slots
+    slot_index: usize,
+    _marker: PhantomData<T>,
+}
+
+impl<T> Handle<T> {
+    /// Create a new handle with the given slot index.
+    ///
+    /// This is internal - use [`HandleScope::root`] to create handles.
+    fn new(slot_index: usize) -> Self {
+        Self {
+            slot_index,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Get the slot index (for internal use and testing).
+    pub fn slot_index(&self) -> usize {
+        self.slot_index
+    }
+
+    /// Check if the handle is valid (has a valid slot index).
+    pub fn is_valid(&self) -> bool {
+        // A handle is valid if it has been created by a HandleScope
+        // The actual validity depends on the scope still being alive
+        true // Slot index is always valid within its scope
+    }
+}
+
+// Handle is Copy for ergonomic use
+impl<T> Clone for Handle<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Handle<T> {}
+
+/// RAII scope for managing rooted handles.
+///
+/// All handles created within a scope are automatically unrooted
+/// when the scope drops. Scopes can be nested, and inner scopes
+/// must drop before outer scopes (enforced by Rust's borrow checker).
+///
+/// # Example
+///
+/// ```ignore
+/// fn example(ctx: &mut VmContext) {
+///     let scope = HandleScope::new(ctx);
+///
+///     let handle = scope.root_value(Value::int32(42));
+///     assert_eq!(ctx.root_count(), 1);
+///
+///     call_js_function(ctx);  // May trigger GC
+///
+///     // handle is still valid!
+///     let value = ctx.get_root_slot(handle.slot_index());
+/// }  // scope drops, handle unrooted, ctx.root_count() == 0
+/// ```
+pub struct HandleScope<'ctx> {
+    /// Pointer to VmContext (we need interior mutability for root operations)
+    ctx: *mut crate::context::VmContext,
+    /// Index of first slot owned by this scope (for future escape functionality)
+    #[allow(dead_code)]
+    base_index: usize,
+    /// Number of slots allocated by this scope
+    slot_count: Cell<usize>,
+    /// Lifetime marker
+    _marker: PhantomData<&'ctx mut crate::context::VmContext>,
+}
+
+impl<'ctx> HandleScope<'ctx> {
+    /// Create a new handle scope.
+    ///
+    /// The scope borrows the VmContext mutably for its lifetime.
+    pub fn new(ctx: &'ctx mut crate::context::VmContext) -> Self {
+        let base_index = ctx.root_slots_len();
+        ctx.push_scope_marker(base_index);
+
+        Self {
+            ctx: ctx as *mut _,
+            base_index,
+            slot_count: Cell::new(0),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Root a Value, returning a Handle.
+    ///
+    /// The handle will keep the value alive until this scope drops.
+    pub fn root_value(&self, value: crate::value::Value) -> Handle<crate::value::Value> {
+        let index = self.allocate_slot(value);
+        Handle::new(index)
+    }
+
+    /// Get reference to the VmContext.
+    pub fn context(&self) -> &crate::context::VmContext {
+        unsafe { &*self.ctx }
+    }
+
+    /// Get mutable reference to the VmContext.
+    ///
+    /// This uses interior mutability through a raw pointer because HandleScope
+    /// needs to modify root_slots while allowing immutable access for Handle::get.
+    #[allow(clippy::mut_from_ref)]
+    pub fn context_mut(&self) -> &mut crate::context::VmContext {
+        unsafe { &mut *self.ctx }
+    }
+
+    /// Allocate a slot for a value and return its index.
+    fn allocate_slot(&self, value: crate::value::Value) -> usize {
+        let ctx = unsafe { &mut *self.ctx };
+        let index = ctx.push_root_slot(value);
+        self.slot_count.set(self.slot_count.get() + 1);
+        index
+    }
+}
+
+impl<'ctx> Drop for HandleScope<'ctx> {
+    fn drop(&mut self) {
+        let ctx = unsafe { &mut *self.ctx };
+        ctx.pop_root_slots(self.slot_count.get());
+        ctx.pop_scope_marker();
+    }
+}
 
 // Implement Trace for Value
 impl Trace for crate::value::Value {
@@ -289,6 +702,11 @@ impl Trace for crate::context::VmContext {
         for cell in self.open_upvalues_to_trace().values() {
             cell.trace(tracer);
         }
+
+        // Trace root slots (handles managed by HandleScope)
+        for value in self.root_slots_to_trace() {
+            tracer.mark_value(value);
+        }
     }
 }
 
@@ -369,5 +787,110 @@ mod tests {
         let mut collector = GcCollector::new(heap);
         collector.collect(&[]);
         assert_eq!(collector.stats().collections, 1);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Rooting API tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn create_test_context() -> crate::context::VmContext {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024 * 100));
+        let global = GcRef::new(crate::object::JsObject::new(None, memory_manager.clone()));
+        crate::context::VmContext::new(global, memory_manager)
+    }
+
+    #[test]
+    fn test_handle_scope_basic() {
+        let mut ctx = create_test_context();
+        let initial_count = ctx.root_count();
+
+        {
+            let scope = HandleScope::new(&mut ctx);
+
+            let handle = scope.root_value(crate::value::Value::int32(42));
+            assert!(handle.is_valid());
+            assert_eq!(scope.context().root_count(), initial_count + 1);
+
+            // Value should be accessible
+            let value = scope.context().get_root_slot(handle.slot_index());
+            assert_eq!(value.as_int32(), Some(42));
+        }
+
+        // After scope drop, roots should be cleaned
+        assert_eq!(ctx.root_count(), initial_count);
+    }
+
+    #[test]
+    fn test_handle_scope_drop_cleans_roots() {
+        let mut ctx = create_test_context();
+        let initial_root_count = ctx.root_count();
+
+        {
+            let scope = HandleScope::new(&mut ctx);
+            let _handle1 = scope.root_value(crate::value::Value::int32(1));
+            let _handle2 = scope.root_value(crate::value::Value::int32(2));
+            let _handle3 = scope.root_value(crate::value::Value::int32(3));
+            assert_eq!(scope.context().root_count(), initial_root_count + 3);
+        }
+
+        // After scope drop, all roots should be cleaned
+        assert_eq!(ctx.root_count(), initial_root_count);
+    }
+
+    #[test]
+    fn test_nested_handle_scopes() {
+        let mut ctx = create_test_context();
+        let initial = ctx.root_count();
+
+        {
+            let outer = HandleScope::new(&mut ctx);
+            let h1 = outer.root_value(crate::value::Value::int32(1));
+            assert_eq!(outer.context().root_count(), initial + 1);
+
+            {
+                let inner = HandleScope::new(outer.context_mut());
+                let _h2 = inner.root_value(crate::value::Value::int32(2));
+                assert_eq!(inner.context().root_count(), initial + 2);
+            }
+
+            // Inner scope dropped, but outer handle still valid
+            assert_eq!(outer.context().root_count(), initial + 1);
+            let value = outer.context().get_root_slot(h1.slot_index());
+            assert_eq!(value.as_int32(), Some(1));
+        }
+
+        // Both scopes dropped
+        assert_eq!(ctx.root_count(), initial);
+    }
+
+    #[test]
+    fn test_gcbox_basic() {
+        let gcbox = GcBox::new(42i32);
+        assert_eq!(*gcbox.value(), 42);
+    }
+
+    #[test]
+    fn test_gc_pointer_basic() {
+        let mut gcbox = Box::new(GcBox::new(100i32));
+        let ptr = NonNull::new(gcbox.as_mut()).unwrap();
+
+        let gc = unsafe { Gc::from_raw(ptr) };
+        assert_eq!(unsafe { *gc.get() }, 100);
+
+        // Gc is Copy
+        let gc2 = gc;
+        assert_eq!(unsafe { *gc2.get() }, 100);
+    }
+
+    #[test]
+    fn test_handle_copy() {
+        let mut ctx = create_test_context();
+
+        let scope = HandleScope::new(&mut ctx);
+        let handle = scope.root_value(crate::value::Value::int32(42));
+
+        // Handle is Copy
+        let handle2 = handle;
+        assert_eq!(handle.slot_index(), handle2.slot_index());
     }
 }

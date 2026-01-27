@@ -6,6 +6,7 @@
 //! - `JSON.rawJSON(string)` - create raw JSON wrapper (ES2024+)
 //! - `JSON.isRawJSON(value)` - check if value is raw JSON (ES2024+)
 
+use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::string::JsString;
@@ -48,14 +49,14 @@ fn json_to_value(value: &JsonValue, mm: Arc<memory::MemoryManager>) -> Value {
                     json_to_value(item, mm.clone()),
                 );
             }
-            Value::array(Arc::new(arr))
+            Value::array(GcRef::new(arr))
         }
         JsonValue::Object(map) => {
             let obj = JsObject::new(None, mm.clone());
             for (key, value) in map {
                 obj.set(PropertyKey::string(key), json_to_value(value, mm.clone()));
             }
-            Value::object(Arc::new(obj))
+            Value::object(GcRef::new(obj))
         }
     }
 }
@@ -245,7 +246,8 @@ mod tests {
         // String
         let args = vec![Value::string(JsString::intern("\"hello\""))];
         let result = json_parse(&args, memory_manager.clone()).unwrap();
-        assert_eq!(result.as_string().map(|s| s.as_str()), Some("hello"));
+        let result_str = result.as_string().unwrap();
+        assert_eq!(result_str.as_str(), "hello");
 
         // Boolean
         let args = vec![Value::string(JsString::intern("true"))];

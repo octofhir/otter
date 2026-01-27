@@ -9,6 +9,7 @@
 //! - Supports SharedArrayBuffer transfer (shares, not copies)
 //! - Throws on non-cloneable values (functions, symbols, etc.)
 
+use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyKey};
 use crate::value::{HeapRef, Value};
 use rustc_hash::FxHashMap;
@@ -79,8 +80,8 @@ impl StructuredCloner {
         // Handle heap-allocated types
         match value.heap_ref() {
             Some(HeapRef::String(s)) => {
-                // Strings are immutable, can share the Arc
-                Ok(Value::string(Arc::clone(s)))
+                // Strings are immutable, can share the GcRef (it's Copy)
+                Ok(Value::string(*s))
             }
 
             Some(HeapRef::SharedArrayBuffer(sab)) => {
@@ -88,9 +89,9 @@ impl StructuredCloner {
                 Ok(Value::shared_array_buffer(Arc::clone(sab)))
             }
 
-            Some(HeapRef::Object(obj)) => self.clone_object(obj),
+            Some(HeapRef::Object(obj)) => self.clone_object(*obj),
 
-            Some(HeapRef::Array(arr)) => self.clone_array(arr),
+            Some(HeapRef::Array(arr)) => self.clone_array(*arr),
 
             Some(HeapRef::Function(_)) => Err(StructuredCloneError::NotCloneable("function")),
 
@@ -127,8 +128,8 @@ impl StructuredCloner {
         }
     }
 
-    fn clone_object(&mut self, obj: &Arc<JsObject>) -> Result<Value, StructuredCloneError> {
-        let ptr = Arc::as_ptr(obj) as usize;
+    fn clone_object(&mut self, obj: GcRef<JsObject>) -> Result<Value, StructuredCloneError> {
+        let ptr = obj.as_ptr() as usize;
 
         // Check for circular reference
         if let Some(cloned) = self.memory.get(&ptr) {
@@ -136,8 +137,8 @@ impl StructuredCloner {
         }
 
         // Create new object
-        let new_obj = Arc::new(JsObject::new(None, self.memory_manager.clone()));
-        let new_value = Value::object(Arc::clone(&new_obj));
+        let new_obj = GcRef::new(JsObject::new(None, self.memory_manager.clone()));
+        let new_value = Value::object(new_obj);
 
         // Register before cloning properties (to handle circular refs)
         self.memory.insert(ptr, new_value.clone());
@@ -153,8 +154,8 @@ impl StructuredCloner {
         Ok(new_value)
     }
 
-    fn clone_array(&mut self, arr: &Arc<JsObject>) -> Result<Value, StructuredCloneError> {
-        let ptr = Arc::as_ptr(arr) as usize;
+    fn clone_array(&mut self, arr: GcRef<JsObject>) -> Result<Value, StructuredCloneError> {
+        let ptr = arr.as_ptr() as usize;
 
         // Check for circular reference
         if let Some(cloned) = self.memory.get(&ptr) {
@@ -163,8 +164,8 @@ impl StructuredCloner {
 
         // Create new array
         let len = arr.array_length();
-        let new_arr = Arc::new(JsObject::array(len, self.memory_manager.clone()));
-        let new_value = Value::array(Arc::clone(&new_arr));
+        let new_arr = GcRef::new(JsObject::array(len, self.memory_manager.clone()));
+        let new_value = Value::array(new_arr);
 
         // Register before cloning elements
         self.memory.insert(ptr, new_value.clone());
@@ -225,7 +226,7 @@ mod tests {
     fn test_clone_object() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         let mut cloner = StructuredCloner::new(memory_manager.clone());
-        let obj = Arc::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
         obj.set(PropertyKey::string("x"), Value::int32(1));
         obj.set(PropertyKey::string("y"), Value::int32(2));
 
@@ -277,7 +278,7 @@ mod tests {
             module: dummy_module,
             upvalues: vec![],
             is_async: false,
-            object: Arc::new(JsObject::new(None, memory_manager.clone())),
+            object: GcRef::new(JsObject::new(None, memory_manager.clone())),
         }));
 
         let result = cloner.clone(&func);

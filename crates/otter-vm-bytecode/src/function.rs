@@ -42,9 +42,10 @@ pub enum UpvalueCapture {
 }
 
 /// State of an Inline Cache (IC) for property access
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InlineCacheState {
     /// Initial state: no information cached
+    #[default]
     Uninitialized,
     /// Monomorphic state: single shape and offset cached
     Monomorphic {
@@ -62,12 +63,6 @@ pub enum InlineCacheState {
     },
     /// Megamorphic state: too many shapes seen, fallback to slow path
     Megamorphic,
-}
-
-impl Default for InlineCacheState {
-    fn default() -> Self {
-        Self::Uninitialized
-    }
 }
 
 /// Type flags for value type observations (used for type feedback)
@@ -115,7 +110,7 @@ impl TypeFlags {
             + self.seen_string as u8
             + self.seen_object as u8
             + self.seen_function as u8;
-        count >= 2 && count <= 4
+        (2..=4).contains(&count)
     }
 }
 

@@ -8,6 +8,7 @@
 //! - name - returns function name
 //! - length - returns function parameter count
 
+use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::string::JsString;
@@ -124,7 +125,7 @@ fn function_create_bound(args: &[Value], mm: Arc<memory::MemoryManager>) -> Resu
     let this_arg = args.get(1).cloned().unwrap_or_else(Value::undefined);
 
     // Create bound function as an object with special properties
-    let bound = Arc::new(JsObject::new(None, mm.clone()));
+    let bound = GcRef::new(JsObject::new(None, mm.clone()));
 
     // Store the original function
     bound.set(PropertyKey::string("__boundFunction__"), original.clone());
@@ -136,7 +137,7 @@ fn function_create_bound(args: &[Value], mm: Arc<memory::MemoryManager>) -> Resu
     if args.len() > 2 {
         let bound_args: Vec<Value> = args[2..].to_vec();
         // Store as array
-        let arr = Arc::new(JsObject::new(None, mm.clone()));
+        let arr = GcRef::new(JsObject::new(None, mm.clone()));
         for (i, arg) in bound_args.iter().enumerate() {
             arr.set(PropertyKey::Index(i as u32), arg.clone());
         }
@@ -217,8 +218,8 @@ mod tests {
             Value::native_function(|_args, _mm| Ok(Value::undefined()), memory_manager.clone());
         let result =
             function_to_string(std::slice::from_ref(&native_fn), memory_manager.clone()).unwrap();
-        let s = result.as_string().unwrap().as_str();
-        assert!(s.contains("[native code]"));
+        let s = result.as_string().unwrap();
+        assert!(s.as_str().contains("[native code]"));
     }
 
     #[test]
@@ -228,8 +229,8 @@ mod tests {
             Value::native_function(|_args, _mm| Ok(Value::undefined()), memory_manager.clone());
         let result =
             function_get_name(std::slice::from_ref(&native_fn), memory_manager.clone()).unwrap();
-        let s = result.as_string().unwrap().as_str();
-        assert_eq!(s, "");
+        let s = result.as_string().unwrap();
+        assert_eq!(s.as_str(), "");
     }
 
     #[test]

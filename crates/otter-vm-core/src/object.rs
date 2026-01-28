@@ -75,7 +75,8 @@ impl PropertyKey {
                 return Self::Index(n);
             }
         }
-        Self::String(JsString::intern(s))
+        let js_str = JsString::intern(s);
+        Self::String(js_str)
     }
 
     /// Create from a GcRef<JsString>
@@ -233,6 +234,14 @@ impl PropertyDescriptor {
                 attributes.enumerable
             }
             Self::Deleted => false,
+        }
+    }
+    /// Create an accessor property with just a getter
+    pub fn getter(get: Value) -> Self {
+        Self::Accessor {
+            get: Some(get),
+            set: None,
+            attributes: PropertyAttributes::accessor(),
         }
     }
 }
@@ -463,17 +472,20 @@ impl JsObject {
         let overflow = self.overflow_properties.read();
 
         // Iterate over all properties in the shape
-        for (key, offset) in shape.own_keys().into_iter().zip(0..) {
-            let entry = if offset < INLINE_PROPERTY_COUNT {
-                inline[offset].clone()
-            } else {
-                overflow.get(offset - INLINE_PROPERTY_COUNT).cloned()
-            };
+        // IMPORTANT: Use the actual offset from shape, not a sequential counter
+        for key in shape.own_keys() {
+            if let Some(offset) = shape.get_offset(&key) {
+                let entry = if offset < INLINE_PROPERTY_COUNT {
+                    inline[offset].clone()
+                } else {
+                    overflow.get(offset - INLINE_PROPERTY_COUNT).cloned()
+                };
 
-            if let Some(entry) = entry {
-                // Skip deleted entries
-                if !matches!(entry.desc, PropertyDescriptor::Deleted) {
-                    dict.insert(key, entry);
+                if let Some(entry) = entry {
+                    // Skip deleted entries
+                    if !matches!(entry.desc, PropertyDescriptor::Deleted) {
+                        dict.insert(key, entry);
+                    }
                 }
             }
         }

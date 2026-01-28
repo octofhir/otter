@@ -87,11 +87,11 @@ check-project project:
 
 # Run Test262 tests (all)
 test262 *args:
-    cargo run -p otter-test262 -- {{args}}
+    cargo run -p otter-test262 --bin test262 -- {{args}}
 
 # Run Test262 tests with filter (e.g., "literals")
 test262-filter filter:
-    cargo run -p otter-test262 -- --filter {{filter}} --verbose
+    cargo run -p otter-test262 --bin test262 -- --filter {{filter}} --verbose
 
 # Run Test262 for specific directory (e.g., "language/expressions")
 test262-dir dir:

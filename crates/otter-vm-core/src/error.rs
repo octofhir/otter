@@ -105,8 +105,13 @@ impl VmError {
 
     /// Create an exception from a thrown JS value
     pub fn exception(value: Value) -> Self {
+        let message = if let Some(s) = value.as_string() {
+            s.as_str().to_string()
+        } else {
+            format!("{:?}", value)
+        };
         Self::Exception(Box::new(ThrownValue {
-            message: format!("{:?}", value),
+            message,
             value,
             stack: Vec::new(),
         }))

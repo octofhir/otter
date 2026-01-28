@@ -13,8 +13,54 @@ const _symbolSplit = __Symbol_getWellKnown('split');
 const _symbolSpecies = __Symbol_getWellKnown('species');
 const _symbolUnscopables = __Symbol_getWellKnown('unscopables');
 
+// Reflect built-in (must be defined EARLY for use in Object methods)
+globalThis.Reflect = {};
+globalThis.Reflect.getOwnPropertyDescriptor = function (target, propertyKey) { return __Reflect_getOwnPropertyDescriptor(target, propertyKey); };
+globalThis.Reflect.getPrototypeOf = function (target) { return __Reflect_getPrototypeOf(target); };
+globalThis.Reflect.setPrototypeOf = function (target, prototype) { return __Reflect_setPrototypeOf(target, prototype); };
+globalThis.Reflect.get = function (target, propertyKey, receiver) { return __Reflect_get(target, propertyKey, receiver); };
+globalThis.Reflect.set = function (target, propertyKey, value, receiver) { return __Reflect_set(target, propertyKey, value, receiver); };
+globalThis.Reflect.has = function (target, propertyKey) { return __Reflect_has(target, propertyKey); };
+globalThis.Reflect.deleteProperty = function (target, propertyKey) { return __Reflect_deleteProperty(target, propertyKey); };
+globalThis.Reflect.ownKeys = function (target) { return __Reflect_ownKeys(target); };
+globalThis.Reflect.defineProperty = function (target, propertyKey, attributes) { return __Reflect_defineProperty(target, propertyKey, attributes); };
+globalThis.Reflect.isExtensible = function (target) { return __Reflect_isExtensible(target); };
+globalThis.Reflect.preventExtensions = function (target) { return __Reflect_preventExtensions(target); };
+globalThis.Reflect.apply = function (target, thisArgument, argumentsList) {
+    if (typeof target !== 'function') {
+        throw new TypeError('Reflect.apply requires target to be a function');
+    }
+    if (!Array.isArray(argumentsList)) {
+        throw new TypeError('Reflect.apply requires argumentsList to be an array');
+    }
+    return target.apply(thisArgument, argumentsList);
+};
+globalThis.Reflect.construct = function (target, argumentsList, newTarget) {
+    if (typeof target !== 'function') {
+        throw new TypeError('Reflect.construct requires target to be a constructor');
+    }
+    if (!Array.isArray(argumentsList)) {
+        throw new TypeError('Reflect.construct requires argumentsList to be an array');
+    }
+    if (newTarget === undefined) {
+        newTarget = target;
+    }
+    if (typeof newTarget !== 'function') {
+        throw new TypeError('Reflect.construct requires newTarget to be a constructor');
+    }
+    if (target.__non_constructor === true) {
+        throw new TypeError('Reflect.construct requires target to be a constructor');
+    }
+    if (newTarget.__non_constructor === true) {
+        throw new TypeError('Reflect.construct requires newTarget to be a constructor');
+    }
+    return new target(...argumentsList);
+};
+
+
+
 // eval built-in (global eval only)
-globalThis.eval = function eval(code) {
+globalThis.eval = function (code) {
     if (typeof code !== 'string') {
         return code;
     }
@@ -38,25 +84,32 @@ globalThis.eval = function eval(code) {
     return result ? result.value : undefined;
 };
 
+
 function __markNonConstructor(fn) {
     if (typeof fn !== 'function') {
         return fn;
     }
     try {
-        Object.defineProperty(fn, "__non_constructor", {
+        const Obj = globalThis.Object || Object;
+        if (typeof Obj === 'undefined') {
+        } else if (typeof Obj.defineProperty !== 'function') {
+        }
+        Obj.defineProperty(fn, "__non_constructor", {
             value: true,
             writable: false,
             enumerable: false,
             configurable: false,
         });
-    } catch (_) {
-        // ignore
+    } catch (e) {
     }
     return fn;
 }
 
 // Object built-in wrapper
 // Object built-in wrapper
+// Try to set a test property on 'this'
+const testFunc = function() { return 42; };
+this.TestProperty123 = testFunc;
 globalThis.Object = function (value) {
     if (value === undefined || value === null) {
         return {};
@@ -68,46 +121,46 @@ globalThis.Object = function (value) {
     return value;
 };
 
-Object.keys = function (obj) {
+globalThis.Object.keys = function (obj) {
     return __native_Object_keys(obj);
 };
-Object.values = function (obj) {
+globalThis.Object.values = function (obj) {
     return __Object_values(obj);
 };
-Object.entries = function (obj) {
+globalThis.Object.entries = function (obj) {
     return __Object_entries(obj);
 };
-Object.assign = function (target, ...sources) {
+globalThis.Object.assign = function (target, ...sources) {
     return __Object_assign(target, ...sources);
 };
-Object.hasOwn = function (obj, key) {
+globalThis.Object.hasOwn = function (obj, key) {
     // Use Object.getOwnPropertyDescriptor which properly handles functions
     if (typeof obj === 'object' && obj !== null || typeof obj === 'function') {
-        return Object.getOwnPropertyDescriptor(obj, key) !== undefined;
+        return globalThis.Object.getOwnPropertyDescriptor(obj, key) !== undefined;
     }
     return false;
 };
 // Object mutability methods (native ops)
-Object.freeze = function (obj) {
+globalThis.Object.freeze = function (obj) {
     return __Object_freeze(obj);
 };
-Object.isFrozen = function (obj) {
+globalThis.Object.isFrozen = function (obj) {
     return __Object_isFrozen(obj);
 };
-Object.seal = function (obj) {
+globalThis.Object.seal = function (obj) {
     return __Object_seal(obj);
 };
-Object.isSealed = function (obj) {
+globalThis.Object.isSealed = function (obj) {
     return __Object_isSealed(obj);
 };
-Object.preventExtensions = function (obj) {
+globalThis.Object.preventExtensions = function (obj) {
     return __Object_preventExtensions(obj);
 };
-Object.isExtensible = function (obj) {
+globalThis.Object.isExtensible = function (obj) {
     return __Object_isExtensible(obj);
 };
 // Object.defineProperty(obj, prop, descriptor)
-Object.defineProperty = function (obj, prop, descriptor) {
+const _defineProperty = function (obj, prop, descriptor) {
     if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
         throw new TypeError('Object.defineProperty called on non-object');
     }
@@ -116,30 +169,36 @@ Object.defineProperty = function (obj, prop, descriptor) {
     }
     return __Object_defineProperty(obj, prop, descriptor);
 };
+globalThis.Object.defineProperty = _defineProperty;
+Object.defineProperty = _defineProperty;
+
+
 // Object.defineProperties(obj, props)
-Object.defineProperties = function (obj, props) {
+globalThis.Object.defineProperties = function (obj, props) {
     if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
         throw new TypeError('Object.defineProperties called on non-object');
     }
     const keys = Object.keys(props);
     for (const key of keys) {
-        Object.defineProperty(obj, key, props[key]);
+        // Use globalThis.Object.defineProperty to ensure we call the function we just defined
+        globalThis.Object.defineProperty(obj, key, props[key]);
     }
     return obj;
 };
 // Object.create(proto, propertiesObject?)
-Object.create = function (proto, propertiesObject) {
+globalThis.Object.create = function (proto, propertiesObject) {
     if (proto !== null && typeof proto !== 'object' && typeof proto !== 'function') {
         throw new TypeError('Object prototype may only be an Object or null');
     }
     return __Object_create(proto, propertiesObject);
 };
+Object.create = globalThis.Object.create;
 // Object.is(value1, value2) - SameValue algorithm
-Object.is = function (value1, value2) {
+globalThis.Object.is = function (value1, value2) {
     return __Object_is(value1, value2);
 };
 // Object.fromEntries(iterable)
-Object.fromEntries = function (iterable) {
+globalThis.Object.fromEntries = function (iterable) {
     if (iterable === null || iterable === undefined) {
         throw new TypeError('Object.fromEntries requires an iterable argument');
     }
@@ -155,28 +214,28 @@ Object.fromEntries = function (iterable) {
     return obj;
 };
 // Object.getOwnPropertyNames(obj)
-Object.getOwnPropertyNames = function (obj) {
+globalThis.Object.getOwnPropertyNames = function (obj) {
     return __Object_getOwnPropertyNames(obj);
 };
 // Object.getOwnPropertySymbols(obj)
-Object.getOwnPropertySymbols = function (obj) {
+globalThis.Object.getOwnPropertySymbols = function (obj) {
     return __Object_getOwnPropertySymbols(obj);
 };
-Object.getOwnPropertyDescriptor = function (obj, prop) {
+globalThis.Object.getOwnPropertyDescriptor = function (obj, prop) {
     if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
         throw new TypeError('Object.getOwnPropertyDescriptor called on non-object');
     }
     return __Reflect_getOwnPropertyDescriptor(obj, prop);
 };
 // Object.getOwnPropertyDescriptors(obj)
-Object.getOwnPropertyDescriptors = function (obj) {
+globalThis.Object.getOwnPropertyDescriptors = function (obj) {
     if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
         throw new TypeError('Object.getOwnPropertyDescriptors called on non-object');
     }
     return __Object_getOwnPropertyDescriptors(obj);
 };
 // Object.getPrototypeOf(obj)
-Object.getPrototypeOf = function (obj) {
+globalThis.Object.getPrototypeOf = function (obj) {
     if (obj === null || obj === undefined) {
         throw new TypeError('Cannot convert undefined or null to object');
     }
@@ -187,7 +246,7 @@ Object.getPrototypeOf = function (obj) {
     return Reflect.getPrototypeOf(obj);
 };
 // Object.setPrototypeOf(obj, proto)
-Object.setPrototypeOf = function (obj, proto) {
+globalThis.Object.setPrototypeOf = function (obj, proto) {
     if (obj === null || obj === undefined) {
         throw new TypeError('Object.setPrototypeOf called on null or undefined');
     }
@@ -200,6 +259,7 @@ Object.setPrototypeOf = function (obj, proto) {
     Reflect.setPrototypeOf(obj, proto);
     return obj;
 };
+
 
 // Object.prototype methods
 const _objectPrototype = {
@@ -234,7 +294,8 @@ const _objectPrototype = {
     },
 };
 
-Object.prototype = _objectPrototype;
+globalThis.Object.prototype = _objectPrototype;
+
 
 // Array built-in wrapper
 globalThis.Array = function (...args) {
@@ -257,6 +318,7 @@ Array.from = function (arrayLike) {
 Array.of = function (...items) {
     return __Array_of(items);
 };
+
 
 // Math built-in
 globalThis.Math = {
@@ -320,6 +382,7 @@ globalThis.Math = {
     fround: function (x) { return __Math_fround(x); },
     f16round: function (x) { return __Math_f16round(x); },
 };
+
 
 // JSON built-in
 globalThis.JSON = {
@@ -610,6 +673,7 @@ globalThis.JSON = {
     },
 };
 
+
 // String built-in wrapper
 globalThis.String = function (value) {
     // Avoid recursion: this function replaces the global `String`.
@@ -778,6 +842,7 @@ String.prototype = {
     },
 };
 
+
 // Number built-in wrapper
 globalThis.Number = function (value) {
     if (value === undefined) return 0;
@@ -841,6 +906,7 @@ Number.prototype = {
     },
 };
 
+
 // Boolean built-in wrapper
 globalThis.Boolean = function (value) {
     // ToBoolean conversion
@@ -860,6 +926,7 @@ Boolean.prototype = {
         return __Boolean_toString(this);
     },
 };
+
 
 // RegExp built-in
 globalThis.RegExp = function (pattern, flags) {
@@ -972,6 +1039,7 @@ RegExp.prototype.constructor = RegExp;
 RegExp.escape = function (string) {
     return __RegExp_escape(string);
 };
+
 
 // Array.prototype methods (simplified - real impl needs prototype chain)
 Array.prototype = {
@@ -1189,6 +1257,7 @@ Array.prototype = {
     },
 };
 
+
 // Date built-in
 globalThis.Date = function (year, month, date, hours, minutes, seconds, ms) {
     // Internal timestamp storage
@@ -1267,6 +1336,7 @@ globalThis.Date = function (year, month, date, hours, minutes, seconds, ms) {
 Date.now = function () { return __Date_now(); };
 Date.parse = function (s) { return __Date_parse(s); };
 Date.UTC = function (y, m, d, h, min, s, ms) { return __Date_UTC(y, m, d, h, min, s, ms); };
+
 
 // Temporal API (Stage 3, Chrome 144+ / Firefox 139+)
 globalThis.Temporal = {
@@ -1545,6 +1615,7 @@ globalThis.Temporal = {
     },
 };
 
+
 // Symbol built-in
 // Symbol constructor
 globalThis.Symbol = (description) => {
@@ -1724,7 +1795,6 @@ globalThis.Function.prototype = {
         }
     },
 
-    // Function.prototype.toString()
     toString: function () {
         return __Function_toString(this);
     },
@@ -1739,6 +1809,7 @@ globalThis.Function.prototype = {
         return __Function_getLength(this);
     },
 };
+
 
 // Console built-in
 globalThis.console = {
@@ -1896,6 +1967,7 @@ Map.groupBy = function (iterable, keySelector) {
     return map;
 };
 
+
 // WeakMap built-in
 globalThis.WeakMap = function WeakMap(iterable) {
     const map = __WeakMap_new();
@@ -1936,6 +2008,7 @@ globalThis.WeakMap = function WeakMap(iterable) {
         },
     };
 };
+
 
 // Set built-in (ES2026 with ES2025 set methods)
 globalThis.Set = function Set(iterable) {
@@ -2109,6 +2182,7 @@ Set._fromInternal = function (internal) {
     return set;
 };
 
+
 // WeakSet built-in
 globalThis.WeakSet = function WeakSet(iterable) {
     const set = __WeakSet_new();
@@ -2143,6 +2217,7 @@ globalThis.WeakSet = function WeakSet(iterable) {
         },
     };
 };
+
 
 // Promise built-in
 globalThis.Promise = function Promise(executor) {
@@ -2425,6 +2500,7 @@ if (typeof globalThis.queueMicrotask === 'undefined') {
     };
 }
 
+
 // ============================================================================
 // Proxy built-in
 // ============================================================================
@@ -2453,137 +2529,8 @@ Proxy.revocable = function (target, handler) {
     return __Proxy_revocable(target, handler);
 };
 
+
 // ============================================================================
-// Reflect built-in
-// ============================================================================
-
-globalThis.Reflect = {
-    // Reflect.get(target, propertyKey, receiver?)
-    get: function (target, propertyKey, receiver) {
-        if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
-            throw new TypeError('Reflect.get requires target to be an object');
-        }
-        return __Reflect_get(target, propertyKey, receiver);
-    },
-
-    // Reflect.set(target, propertyKey, value, receiver?)
-    set: function (target, propertyKey, value, receiver) {
-        if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
-            throw new TypeError('Reflect.set requires target to be an object');
-        }
-        return __Reflect_set(target, propertyKey, value, receiver);
-    },
-
-    // Reflect.has(target, propertyKey)
-    has: function (target, propertyKey) {
-        if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
-            throw new TypeError('Reflect.has requires target to be an object');
-        }
-        return __Reflect_has(target, propertyKey);
-    },
-
-    // Reflect.deleteProperty(target, propertyKey)
-    deleteProperty: function (target, propertyKey) {
-        if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
-            throw new TypeError('Reflect.deleteProperty requires target to be an object');
-        }
-        return __Reflect_deleteProperty(target, propertyKey);
-    },
-
-    // Reflect.ownKeys(target)
-    ownKeys: function (target) {
-        if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
-            throw new TypeError('Reflect.ownKeys requires target to be an object');
-        }
-        return __Reflect_ownKeys(target);
-    },
-
-    // Reflect.getOwnPropertyDescriptor(target, propertyKey)
-    getOwnPropertyDescriptor: function (target, propertyKey) {
-        if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
-            throw new TypeError('Reflect.getOwnPropertyDescriptor requires target to be an object');
-        }
-        return __Reflect_getOwnPropertyDescriptor(target, propertyKey);
-    },
-
-    // Reflect.defineProperty(target, propertyKey, attributes)
-    defineProperty: function (target, propertyKey, attributes) {
-        if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
-            throw new TypeError('Reflect.defineProperty requires target to be an object');
-        }
-        return __Reflect_defineProperty(target, propertyKey, attributes);
-    },
-
-    // Reflect.getPrototypeOf(target)
-    getPrototypeOf: function (target) {
-        if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
-            throw new TypeError('Reflect.getPrototypeOf requires target to be an object');
-        }
-        return __Reflect_getPrototypeOf(target);
-    },
-
-    // Reflect.setPrototypeOf(target, prototype)
-    setPrototypeOf: function (target, prototype) {
-        if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
-            throw new TypeError('Reflect.setPrototypeOf requires target to be an object');
-        }
-        if (prototype !== null && typeof prototype !== 'object') {
-            throw new TypeError('Prototype must be an object or null');
-        }
-        return __Reflect_setPrototypeOf(target, prototype);
-    },
-
-    // Reflect.isExtensible(target)
-    isExtensible: function (target) {
-        if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
-            throw new TypeError('Reflect.isExtensible requires target to be an object');
-        }
-        return __Reflect_isExtensible(target);
-    },
-
-    // Reflect.preventExtensions(target)
-    preventExtensions: function (target) {
-        if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
-            throw new TypeError('Reflect.preventExtensions requires target to be an object');
-        }
-        return __Reflect_preventExtensions(target);
-    },
-
-    // Reflect.apply(target, thisArgument, argumentsList)
-    apply: function (target, thisArgument, argumentsList) {
-        if (typeof target !== 'function') {
-            throw new TypeError('Reflect.apply requires target to be a function');
-        }
-        if (!Array.isArray(argumentsList)) {
-            throw new TypeError('Reflect.apply requires argumentsList to be an array');
-        }
-        return target.apply(thisArgument, argumentsList);
-    },
-
-    // Reflect.construct(target, argumentsList, newTarget?)
-    construct: function (target, argumentsList, newTarget) {
-        if (typeof target !== 'function') {
-            throw new TypeError('Reflect.construct requires target to be a constructor');
-        }
-        if (!Array.isArray(argumentsList)) {
-            throw new TypeError('Reflect.construct requires argumentsList to be an array');
-        }
-        newTarget = newTarget || target;
-        if (typeof newTarget !== 'function') {
-            throw new TypeError('Reflect.construct requires newTarget to be a constructor');
-        }
-        if (target.__non_constructor === true) {
-            throw new TypeError('Reflect.construct requires target to be a constructor');
-        }
-        if (newTarget.__non_constructor === true) {
-            throw new TypeError('Reflect.construct requires newTarget to be a constructor');
-        }
-        return new target(...argumentsList);
-    },
-
-    // Symbol.toStringTag
-    get [_symbolToStringTag]() { return 'Reflect'; },
-};
 
 // ============================================================================
 // Generator / Iterator Protocol Support
@@ -2612,10 +2559,17 @@ globalThis.GeneratorPrototype = {
         return 'Generator';
     },
 };
-__markNonConstructor(GeneratorPrototype.next);
-__markNonConstructor(GeneratorPrototype.return);
-__markNonConstructor(GeneratorPrototype.throw);
-__markNonConstructor(GeneratorPrototype[_symbolIterator]);
+if (GeneratorPrototype) {
+}
+
+try {
+    __markNonConstructor(GeneratorPrototype.next);
+    __markNonConstructor(GeneratorPrototype.return);
+    __markNonConstructor(GeneratorPrototype.throw);
+    __markNonConstructor(GeneratorPrototype[_symbolIterator]);
+} catch (e) {
+    // Don't rethrow for now, to see if we can continue
+}
 
 // GeneratorFunction.prototype - the prototype of all generator functions
 // When you do Object.getPrototypeOf(function* g() {}), you get this object
@@ -2660,6 +2614,7 @@ globalThis.__createIteratorResult = (value, done) => {
 // Check if a value is a generator
 globalThis.__isGenerator = (value) => __Generator_isGenerator(value);
 
+
 // ArrayBuffer built-in
 globalThis.ArrayBuffer = function ArrayBuffer(length, options) {
     // ArrayBuffer must be called with 'new'
@@ -2684,10 +2639,10 @@ globalThis.ArrayBuffer = function ArrayBuffer(length, options) {
     }
 
     const _internal = __ArrayBuffer_create(byteLength, maxByteLength);
-    
+
     const obj = Object.create(ArrayBuffer.prototype);
     obj._internal = _internal;
-    
+
     return obj;
 };
 
@@ -2762,19 +2717,28 @@ ArrayBuffer.prototype = {
     },
 };
 
-Object.defineProperty(ArrayBuffer.prototype, 'constructor', {
-    value: ArrayBuffer,
-    writable: true,
-    enumerable: false,
-    configurable: true,
-});
+if (Object) {
+}
 
-ArrayBuffer.isView = __markNonConstructor(function isView(arg) {
-    return __ArrayBuffer_isView(arg);
-});
+try {
+    Object.defineProperty(ArrayBuffer.prototype, 'constructor', {
+        value: ArrayBuffer,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+    });
+} catch (e) {
+}
+
+try {
+    ArrayBuffer.isView = __markNonConstructor(function isView(arg) {
+        return __ArrayBuffer_isView(arg);
+    });
+} catch (e) {
+}
 
 // Helper to create ArrayBuffer from internal value (for slice/transfer operations)
-ArrayBuffer._fromInternal = function(internal) {
+ArrayBuffer._fromInternal = function (internal) {
     const result = Object.create(ArrayBuffer.prototype);
     result._internal = internal;
     return result;
@@ -3094,7 +3058,7 @@ const TypedArrayPrototype = {
 
 // Factory to create TypedArray constructors
 function __createTypedArrayConstructor(name, bytesPerElement) {
-    const Constructor = function(arg, byteOffset, length) {
+    const Constructor = function (arg, byteOffset, length) {
         if (!new.target) {
             throw new TypeError(`Constructor ${name} requires 'new'`);
         }
@@ -3139,16 +3103,16 @@ function __createTypedArrayConstructor(name, bytesPerElement) {
         return obj;
     };
 
-    Constructor.prototype = Object.create(TypedArrayPrototype);
+    Constructor.prototype = globalThis.Object.create(TypedArrayPrototype);
     Constructor.prototype.constructor = Constructor;
 
-    Object.defineProperty(Constructor.prototype, _symbolToStringTag, {
+    globalThis.Object.defineProperty(Constructor.prototype, _symbolToStringTag, {
         get() { return name; },
         configurable: true
     });
 
     Constructor.BYTES_PER_ELEMENT = bytesPerElement;
-    Object.defineProperty(Constructor.prototype, 'BYTES_PER_ELEMENT', {
+    globalThis.Object.defineProperty(Constructor.prototype, 'BYTES_PER_ELEMENT', {
         value: bytesPerElement,
         writable: false,
         enumerable: false,
@@ -3156,7 +3120,7 @@ function __createTypedArrayConstructor(name, bytesPerElement) {
     });
 
     // Static methods
-    Constructor.of = function(...items) {
+    Constructor.of = function (...items) {
         const result = new Constructor(items.length);
         for (let i = 0; i < items.length; i++) {
             __TypedArray_set(result._internal, i, items[i]);
@@ -3164,7 +3128,7 @@ function __createTypedArrayConstructor(name, bytesPerElement) {
         return result;
     };
 
-    Constructor.from = function(source, mapFn, thisArg) {
+    Constructor.from = function (source, mapFn, thisArg) {
         const arr = Array.from(source);
         const len = arr.length;
         const result = new Constructor(len);
@@ -3175,14 +3139,16 @@ function __createTypedArrayConstructor(name, bytesPerElement) {
         return result;
     };
 
-    Constructor._fromInternal = function(internal) {
+    Constructor._fromInternal = function (internal) {
         const obj = Object.create(Constructor.prototype);
         obj._internal = internal;
         return obj;
     };
 
+    // Explicitly return Constructor
     return Constructor;
 }
+
 
 // Create all 11 TypedArray constructors
 globalThis.Int8Array = __createTypedArrayConstructor('Int8Array', 1);
@@ -3197,9 +3163,10 @@ globalThis.Float64Array = __createTypedArrayConstructor('Float64Array', 8);
 globalThis.BigInt64Array = __createTypedArrayConstructor('BigInt64Array', 8);
 globalThis.BigUint64Array = __createTypedArrayConstructor('BigUint64Array', 8);
 
+
 // ===== DataView =====
 
-globalThis.DataView = (function() {
+globalThis.DataView = (function () {
     function DataViewConstructor(buffer, byteOffset, byteLength) {
         if (!new.target) {
             throw new TypeError("Constructor DataView requires 'new'");
@@ -3222,7 +3189,7 @@ globalThis.DataView = (function() {
 })();
 
 Object.defineProperty(globalThis.globalThis.DataView.prototype, 'buffer', {
-    get: function() {
+    get: function () {
         if (!this._internal || !__DataView_isDataView(this._internal)) {
             throw new TypeError('get globalThis.DataView.prototype.buffer called on incompatible receiver');
         }
@@ -3237,7 +3204,7 @@ Object.defineProperty(globalThis.globalThis.DataView.prototype, 'buffer', {
 });
 
 Object.defineProperty(globalThis.DataView.prototype, 'byteOffset', {
-    get: function() {
+    get: function () {
         if (!this._internal || !__DataView_isDataView(this._internal)) {
             throw new TypeError('get globalThis.DataView.prototype.byteOffset called on incompatible receiver');
         }
@@ -3248,7 +3215,7 @@ Object.defineProperty(globalThis.DataView.prototype, 'byteOffset', {
 });
 
 Object.defineProperty(globalThis.DataView.prototype, 'byteLength', {
-    get: function() {
+    get: function () {
         if (!this._internal || !__DataView_isDataView(this._internal)) {
             throw new TypeError('get globalThis.DataView.prototype.byteLength called on incompatible receiver');
         }
@@ -3259,103 +3226,103 @@ Object.defineProperty(globalThis.DataView.prototype, 'byteLength', {
 });
 
 // Get methods
-globalThis.DataView.prototype.getInt8 = function(byteOffset) {
+globalThis.DataView.prototype.getInt8 = function (byteOffset) {
     if (!this._internal) throw new TypeError('not a DataView');
     return __DataView_getInt8(this._internal, byteOffset);
 };
 
-globalThis.DataView.prototype.getUint8 = function(byteOffset) {
+globalThis.DataView.prototype.getUint8 = function (byteOffset) {
     if (!this._internal) throw new TypeError('not a DataView');
     return __DataView_getUint8(this._internal, byteOffset);
 };
 
-globalThis.DataView.prototype.getInt16 = function(byteOffset, littleEndian) {
+globalThis.DataView.prototype.getInt16 = function (byteOffset, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     return __DataView_getInt16(this._internal, byteOffset, littleEndian);
 };
 
-globalThis.DataView.prototype.getUint16 = function(byteOffset, littleEndian) {
+globalThis.DataView.prototype.getUint16 = function (byteOffset, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     return __DataView_getUint16(this._internal, byteOffset, littleEndian);
 };
 
-globalThis.DataView.prototype.getInt32 = function(byteOffset, littleEndian) {
+globalThis.DataView.prototype.getInt32 = function (byteOffset, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     return __DataView_getInt32(this._internal, byteOffset, littleEndian);
 };
 
-globalThis.DataView.prototype.getUint32 = function(byteOffset, littleEndian) {
+globalThis.DataView.prototype.getUint32 = function (byteOffset, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     return __DataView_getUint32(this._internal, byteOffset, littleEndian);
 };
 
-globalThis.DataView.prototype.getFloat32 = function(byteOffset, littleEndian) {
+globalThis.DataView.prototype.getFloat32 = function (byteOffset, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     return __DataView_getFloat32(this._internal, byteOffset, littleEndian);
 };
 
-globalThis.DataView.prototype.getFloat64 = function(byteOffset, littleEndian) {
+globalThis.DataView.prototype.getFloat64 = function (byteOffset, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     return __DataView_getFloat64(this._internal, byteOffset, littleEndian);
 };
 
-globalThis.DataView.prototype.getBigInt64 = function(byteOffset, littleEndian) {
+globalThis.DataView.prototype.getBigInt64 = function (byteOffset, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     return __DataView_getBigInt64(this._internal, byteOffset, littleEndian);
 };
 
-globalThis.DataView.prototype.getBigUint64 = function(byteOffset, littleEndian) {
+globalThis.DataView.prototype.getBigUint64 = function (byteOffset, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     return __DataView_getBigUint64(this._internal, byteOffset, littleEndian);
 };
 
 // Set methods
-globalThis.DataView.prototype.setInt8 = function(byteOffset, value) {
+globalThis.DataView.prototype.setInt8 = function (byteOffset, value) {
     if (!this._internal) throw new TypeError('not a DataView');
     __DataView_setInt8(this._internal, byteOffset, value);
 };
 
-globalThis.DataView.prototype.setUint8 = function(byteOffset, value) {
+globalThis.DataView.prototype.setUint8 = function (byteOffset, value) {
     if (!this._internal) throw new TypeError('not a DataView');
     __DataView_setUint8(this._internal, byteOffset, value);
 };
 
-globalThis.DataView.prototype.setInt16 = function(byteOffset, value, littleEndian) {
+globalThis.DataView.prototype.setInt16 = function (byteOffset, value, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     __DataView_setInt16(this._internal, byteOffset, value, littleEndian);
 };
 
-globalThis.DataView.prototype.setUint16 = function(byteOffset, value, littleEndian) {
+globalThis.DataView.prototype.setUint16 = function (byteOffset, value, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     __DataView_setUint16(this._internal, byteOffset, value, littleEndian);
 };
 
-globalThis.DataView.prototype.setInt32 = function(byteOffset, value, littleEndian) {
+globalThis.DataView.prototype.setInt32 = function (byteOffset, value, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     __DataView_setInt32(this._internal, byteOffset, value, littleEndian);
 };
 
-globalThis.DataView.prototype.setUint32 = function(byteOffset, value, littleEndian) {
+globalThis.DataView.prototype.setUint32 = function (byteOffset, value, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     __DataView_setUint32(this._internal, byteOffset, value, littleEndian);
 };
 
-globalThis.DataView.prototype.setFloat32 = function(byteOffset, value, littleEndian) {
+globalThis.DataView.prototype.setFloat32 = function (byteOffset, value, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     __DataView_setFloat32(this._internal, byteOffset, value, littleEndian);
 };
 
-globalThis.DataView.prototype.setFloat64 = function(byteOffset, value, littleEndian) {
+globalThis.DataView.prototype.setFloat64 = function (byteOffset, value, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     __DataView_setFloat64(this._internal, byteOffset, value, littleEndian);
 };
 
-globalThis.DataView.prototype.setBigInt64 = function(byteOffset, value, littleEndian) {
+globalThis.DataView.prototype.setBigInt64 = function (byteOffset, value, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     __DataView_setBigInt64(this._internal, byteOffset, value, littleEndian);
 };
 
-globalThis.DataView.prototype.setBigUint64 = function(byteOffset, value, littleEndian) {
+globalThis.DataView.prototype.setBigUint64 = function (byteOffset, value, littleEndian) {
     if (!this._internal) throw new TypeError('not a DataView');
     __DataView_setBigUint64(this._internal, byteOffset, value, littleEndian);
 };

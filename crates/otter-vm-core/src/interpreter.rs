@@ -9,7 +9,9 @@ use crate::context::VmContext;
 use crate::error::{VmError, VmResult};
 use crate::gc::GcRef;
 use crate::generator::{GeneratorFrame, GeneratorState, JsGenerator};
-use crate::object::{get_proto_epoch, JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
+use crate::object::{
+    JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey, get_proto_epoch,
+};
 use crate::promise::{JsPromise, PromiseState};
 use crate::regexp::JsRegExp;
 use crate::string::JsString;
@@ -305,8 +307,8 @@ impl Interpreter {
                 Ok(InstructionResult::Throw(error)) => {
                     ctx.set_running(was_running);
                     return Err(VmError::internal(format!(
-                        "Uncaught exception: {:?}",
-                        error
+                        "Uncaught exception: {}",
+                        self.to_string(&error)
                     )));
                 }
                 Err(e) => {
@@ -1253,7 +1255,12 @@ impl Interpreter {
             }
 
             // ==================== Arithmetic ====================
-            Instruction::Add { dst, lhs, rhs, feedback_index } => {
+            Instruction::Add {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => {
                 let left = ctx.get_register(lhs.0);
                 let right = ctx.get_register(rhs.0);
 
@@ -1292,7 +1299,12 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::Sub { dst, lhs, rhs, feedback_index } => {
+            Instruction::Sub {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => {
                 let left_value = ctx.get_register(lhs.0);
                 let right_value = ctx.get_register(rhs.0);
 
@@ -1371,7 +1383,12 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::Mul { dst, lhs, rhs, feedback_index } => {
+            Instruction::Mul {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => {
                 let left_value = ctx.get_register(lhs.0);
                 let right_value = ctx.get_register(rhs.0);
 
@@ -1424,7 +1441,12 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::Div { dst, lhs, rhs, feedback_index } => {
+            Instruction::Div {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => {
                 let left_value = ctx.get_register(lhs.0);
                 let right_value = ctx.get_register(rhs.0);
 
@@ -1482,7 +1504,12 @@ impl Interpreter {
             }
 
             // ==================== Quickened Arithmetic (type-specialized) ====================
-            Instruction::AddI32 { dst, lhs, rhs, feedback_index: _ } => {
+            Instruction::AddI32 {
+                dst,
+                lhs,
+                rhs,
+                feedback_index: _,
+            } => {
                 let left = ctx.get_register(lhs.0);
                 let right = ctx.get_register(rhs.0);
 
@@ -1501,7 +1528,12 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::SubI32 { dst, lhs, rhs, feedback_index: _ } => {
+            Instruction::SubI32 {
+                dst,
+                lhs,
+                rhs,
+                feedback_index: _,
+            } => {
                 let left = ctx.get_register(lhs.0);
                 let right = ctx.get_register(rhs.0);
 
@@ -1520,7 +1552,12 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::MulI32 { dst, lhs, rhs, feedback_index: _ } => {
+            Instruction::MulI32 {
+                dst,
+                lhs,
+                rhs,
+                feedback_index: _,
+            } => {
                 let left = ctx.get_register(lhs.0);
                 let right = ctx.get_register(rhs.0);
 
@@ -1539,7 +1576,12 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::DivI32 { dst, lhs, rhs, feedback_index: _ } => {
+            Instruction::DivI32 {
+                dst,
+                lhs,
+                rhs,
+                feedback_index: _,
+            } => {
                 let left = ctx.get_register(lhs.0);
                 let right = ctx.get_register(rhs.0);
 
@@ -1560,7 +1602,12 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::AddF64 { dst, lhs, rhs, feedback_index: _ } => {
+            Instruction::AddF64 {
+                dst,
+                lhs,
+                rhs,
+                feedback_index: _,
+            } => {
                 let left = ctx.get_register(lhs.0);
                 let right = ctx.get_register(rhs.0);
 
@@ -1576,7 +1623,12 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::SubF64 { dst, lhs, rhs, feedback_index: _ } => {
+            Instruction::SubF64 {
+                dst,
+                lhs,
+                rhs,
+                feedback_index: _,
+            } => {
                 let left = ctx.get_register(lhs.0);
                 let right = ctx.get_register(rhs.0);
 
@@ -1593,7 +1645,12 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::MulF64 { dst, lhs, rhs, feedback_index: _ } => {
+            Instruction::MulF64 {
+                dst,
+                lhs,
+                rhs,
+                feedback_index: _,
+            } => {
                 let left = ctx.get_register(lhs.0);
                 let right = ctx.get_register(rhs.0);
 
@@ -1610,7 +1667,12 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::DivF64 { dst, lhs, rhs, feedback_index: _ } => {
+            Instruction::DivF64 {
+                dst,
+                lhs,
+                rhs,
+                feedback_index: _,
+            } => {
                 let left = ctx.get_register(lhs.0);
                 let right = ctx.get_register(rhs.0);
 
@@ -1909,37 +1971,38 @@ impl Interpreter {
                                         };
                                         ic.proto_epoch = current_epoch;
                                     }
-                                InlineCacheState::Monomorphic {
-                                    shape_id: old_shape,
-                                    offset: old_offset,
-                                } => {
-                                    if *old_shape != shape_ptr {
-                                        let mut entries = [(0u64, 0u32); 4];
-                                        entries[0] = (*old_shape, *old_offset);
-                                        entries[1] = (shape_ptr, offset as u32);
-                                        ic.ic_state =
-                                            InlineCacheState::Polymorphic { count: 2, entries };
-                                        ic.proto_epoch = current_epoch;
-                                    }
-                                }
-                                InlineCacheState::Polymorphic { count, entries } => {
-                                    let mut found = false;
-                                    for i in 0..(*count as usize) {
-                                        if entries[i].0 == shape_ptr {
-                                            found = true;
-                                            break;
-                                        }
-                                    }
-                                    if !found {
-                                        if (*count as usize) < 4 {
-                                            entries[*count as usize] = (shape_ptr, offset as u32);
-                                            *count += 1;
+                                    InlineCacheState::Monomorphic {
+                                        shape_id: old_shape,
+                                        offset: old_offset,
+                                    } => {
+                                        if *old_shape != shape_ptr {
+                                            let mut entries = [(0u64, 0u32); 4];
+                                            entries[0] = (*old_shape, *old_offset);
+                                            entries[1] = (shape_ptr, offset as u32);
+                                            ic.ic_state =
+                                                InlineCacheState::Polymorphic { count: 2, entries };
                                             ic.proto_epoch = current_epoch;
-                                        } else {
-                                            ic.ic_state = InlineCacheState::Megamorphic;
                                         }
                                     }
-                                }
+                                    InlineCacheState::Polymorphic { count, entries } => {
+                                        let mut found = false;
+                                        for i in 0..(*count as usize) {
+                                            if entries[i].0 == shape_ptr {
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                        if !found {
+                                            if (*count as usize) < 4 {
+                                                entries[*count as usize] =
+                                                    (shape_ptr, offset as u32);
+                                                *count += 1;
+                                                ic.proto_epoch = current_epoch;
+                                            } else {
+                                                ic.ic_state = InlineCacheState::Megamorphic;
+                                            }
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -2095,7 +2158,8 @@ impl Interpreter {
                                         }
                                         if !found {
                                             if (*count as usize) < 4 {
-                                                entries[*count as usize] = (shape_ptr, exists_marker);
+                                                entries[*count as usize] =
+                                                    (shape_ptr, exists_marker);
                                                 *count += 1;
                                                 ic.proto_epoch = current_epoch;
                                             } else {
@@ -3599,7 +3663,8 @@ impl Interpreter {
                                 match &ic.ic_state {
                                     InlineCacheState::Monomorphic { shape_id, offset } => {
                                         if obj_shape_ptr == *shape_id {
-                                            if obj.set_by_offset(*offset as usize, val_val.clone()) {
+                                            if obj.set_by_offset(*offset as usize, val_val.clone())
+                                            {
                                                 cached = true;
                                             }
                                         }
@@ -3657,7 +3722,8 @@ impl Interpreter {
                             obj.set(key, val_val);
                             // Skip IC for dictionary mode objects
                             if !obj.is_dictionary_mode() {
-                                if let Some(offset) = obj.shape().get_offset(&Self::utf16_key(name_str))
+                                if let Some(offset) =
+                                    obj.shape().get_offset(&Self::utf16_key(name_str))
                                 {
                                     let frame = ctx
                                         .current_frame()
@@ -4046,7 +4112,8 @@ impl Interpreter {
                                 match &ic.ic_state {
                                     InlineCacheState::Monomorphic { shape_id, offset } => {
                                         if obj_shape_ptr == *shape_id {
-                                            if obj.set_by_offset(*offset as usize, val_val.clone()) {
+                                            if obj.set_by_offset(*offset as usize, val_val.clone())
+                                            {
                                                 cached = true;
                                             }
                                         }
@@ -4348,8 +4415,10 @@ impl Interpreter {
                                                 let mut entries = [(0u64, 0u32); 4];
                                                 entries[0] = (*old_shape, *old_offset);
                                                 entries[1] = (shape_ptr, offset as u32);
-                                                ic.ic_state =
-                                                    InlineCacheState::Polymorphic { count: 2, entries };
+                                                ic.ic_state = InlineCacheState::Polymorphic {
+                                                    count: 2,
+                                                    entries,
+                                                };
                                                 ic.proto_epoch = current_epoch;
                                             }
                                         }
@@ -4440,8 +4509,10 @@ impl Interpreter {
                                     match &ic.ic_state {
                                         InlineCacheState::Monomorphic { shape_id, offset } => {
                                             if obj_shape_ptr == *shape_id {
-                                                if obj.set_by_offset(*offset as usize, val_val.clone())
-                                                {
+                                                if obj.set_by_offset(
+                                                    *offset as usize,
+                                                    val_val.clone(),
+                                                ) {
                                                     cached = true;
                                                 }
                                             }
@@ -4501,8 +4572,10 @@ impl Interpreter {
                                                 let mut entries = [(0u64, 0u32); 4];
                                                 entries[0] = (*old_shape, *old_offset);
                                                 entries[1] = (shape_ptr, offset as u32);
-                                                ic.ic_state =
-                                                    InlineCacheState::Polymorphic { count: 2, entries };
+                                                ic.ic_state = InlineCacheState::Polymorphic {
+                                                    count: 2,
+                                                    entries,
+                                                };
                                                 ic.proto_epoch = current_epoch;
                                             }
                                         }
@@ -5567,7 +5640,36 @@ impl Interpreter {
                     "0".to_string()
                 }
             }
-            _ => "[object Object]".to_string(),
+            _ => {
+                if let Some(obj) = value.as_object() {
+                    let name = obj
+                        .get(&PropertyKey::string("name"))
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string());
+                    let message = obj
+                        .get(&PropertyKey::string("message"))
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string());
+
+                    match (name, message) {
+                        (Some(n), Some(m)) => format!("{}: {}", n, m),
+                        (Some(n), None) => n,
+                        (None, Some(m)) => m,
+                        (None, None) => {
+                            let keys = obj.own_keys();
+                            if keys.is_empty() {
+                                "[object Object]".to_string()
+                            } else {
+                                let key_strings: Vec<String> =
+                                    keys.iter().map(|k| format!("{:?}", k)).collect();
+                                format!("[object Object {{ {} }}]", key_strings.join(", "))
+                            }
+                        }
+                    }
+                } else {
+                    format!("{:?}", value)
+                }
+            }
         }
     }
 
@@ -7946,9 +8048,9 @@ mod tests {
     #[test]
     fn test_proto_chain_cache_ic_stores_epoch() {
         // Test that IC stores proto_epoch when caching
+        use crate::object::get_proto_epoch;
         use otter_vm_bytecode::function::InlineCacheState;
         use otter_vm_bytecode::operand::ConstantIndex;
-        use crate::object::get_proto_epoch;
 
         let mut builder = Module::builder("test.js");
         builder.constants_mut().add_string("x");
@@ -8015,9 +8117,9 @@ mod tests {
         // Test that IC read path rejects cached data when proto_epoch has changed.
         // After execution populates the IC, we bump the proto_epoch externally
         // and verify that proto_epoch_matches would return false.
+        use crate::object::{bump_proto_epoch, get_proto_epoch};
         use otter_vm_bytecode::function::InlineCacheState;
         use otter_vm_bytecode::operand::ConstantIndex;
-        use crate::object::{get_proto_epoch, bump_proto_epoch};
 
         let mut builder = Module::builder("test.js");
         builder.constants_mut().add_string("x");
@@ -8081,9 +8183,9 @@ mod tests {
     #[test]
     fn test_proto_chain_cache_epoch_consistency() {
         // Test that proto_epoch is consistent across multiple IC updates
+        use crate::object::get_proto_epoch;
         use otter_vm_bytecode::function::InlineCacheState;
         use otter_vm_bytecode::operand::ConstantIndex;
-        use crate::object::get_proto_epoch;
 
         let mut builder = Module::builder("test.js");
         builder.constants_mut().add_string("x");
@@ -8182,30 +8284,45 @@ mod tests {
     #[test]
     fn test_dictionary_mode_threshold_trigger() {
         // Test that adding more than DICTIONARY_THRESHOLD properties triggers dictionary mode
-        use crate::object::{JsObject, PropertyKey, DICTIONARY_THRESHOLD};
+        use crate::object::{DICTIONARY_THRESHOLD, JsObject, PropertyKey};
 
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         let obj = GcRef::new(JsObject::new(None, memory_manager));
 
         // Initially not in dictionary mode
-        assert!(!obj.is_dictionary_mode(), "Object should not be in dictionary mode initially");
+        assert!(
+            !obj.is_dictionary_mode(),
+            "Object should not be in dictionary mode initially"
+        );
 
         // Add properties up to just below threshold
         for i in 0..(DICTIONARY_THRESHOLD - 1) {
             let key = PropertyKey::String(crate::string::JsString::intern(&format!("prop{}", i)));
             obj.set(key, Value::int32(i as i32));
         }
-        assert!(!obj.is_dictionary_mode(), "Object should not be in dictionary mode below threshold");
+        assert!(
+            !obj.is_dictionary_mode(),
+            "Object should not be in dictionary mode below threshold"
+        );
 
         // Add one more property to exceed threshold
-        let key = PropertyKey::String(crate::string::JsString::intern(&format!("prop{}", DICTIONARY_THRESHOLD - 1)));
+        let key = PropertyKey::String(crate::string::JsString::intern(&format!(
+            "prop{}",
+            DICTIONARY_THRESHOLD - 1
+        )));
         obj.set(key, Value::int32(DICTIONARY_THRESHOLD as i32 - 1));
 
         // One more should trigger dictionary mode
-        let key = PropertyKey::String(crate::string::JsString::intern(&format!("prop{}", DICTIONARY_THRESHOLD)));
+        let key = PropertyKey::String(crate::string::JsString::intern(&format!(
+            "prop{}",
+            DICTIONARY_THRESHOLD
+        )));
         obj.set(key, Value::int32(DICTIONARY_THRESHOLD as i32));
 
-        assert!(obj.is_dictionary_mode(), "Object should be in dictionary mode after exceeding threshold");
+        assert!(
+            obj.is_dictionary_mode(),
+            "Object should be in dictionary mode after exceeding threshold"
+        );
     }
 
     #[test]
@@ -8222,12 +8339,18 @@ mod tests {
         obj.set(key_a.clone(), Value::int32(1));
         obj.set(key_b.clone(), Value::int32(2));
 
-        assert!(!obj.is_dictionary_mode(), "Object should not be in dictionary mode before delete");
+        assert!(
+            !obj.is_dictionary_mode(),
+            "Object should not be in dictionary mode before delete"
+        );
 
         // Delete a property
         obj.delete(&key_a);
 
-        assert!(obj.is_dictionary_mode(), "Object should be in dictionary mode after delete");
+        assert!(
+            obj.is_dictionary_mode(),
+            "Object should be in dictionary mode after delete"
+        );
 
         // Verify we can still access the remaining property
         assert_eq!(obj.get(&key_b), Some(Value::int32(2)));
@@ -8270,8 +8393,8 @@ mod tests {
     #[test]
     fn test_dictionary_mode_ic_skip() {
         // Test that IC reports Megamorphic for dictionary mode objects
-        use otter_vm_bytecode::function::InlineCacheState;
         use crate::object::{JsObject, PropertyKey};
+        use otter_vm_bytecode::function::InlineCacheState;
 
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         let obj = GcRef::new(JsObject::new(None, memory_manager));
@@ -8311,7 +8434,10 @@ mod tests {
         // Simple function that returns immediately
         let func = Function::builder()
             .name("hot_candidate")
-            .instruction(Instruction::LoadInt32 { dst: Register(0), value: 42 })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(0),
+                value: 42,
+            })
             .instruction(Instruction::Return { src: Register(0) })
             .build();
 
@@ -8406,15 +8532,24 @@ mod tests {
                 dst: Register(0),
                 func: FunctionIndex(1),
             })
-            .instruction(Instruction::LoadInt32 { dst: Register(1), value: 0 })  // counter
-            .instruction(Instruction::LoadInt32 { dst: Register(2), value: 100 })  // limit
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: 0,
+            }) // counter
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(2),
+                value: 100,
+            }) // limit
             // Loop: call inner function
             .instruction(Instruction::Call {
                 dst: Register(3),
                 func: Register(0),
                 argc: 0,
             })
-            .instruction(Instruction::LoadInt32 { dst: Register(4), value: 1 })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(4),
+                value: 1,
+            })
             .instruction(Instruction::Add {
                 dst: Register(1),
                 lhs: Register(1),
@@ -8437,7 +8572,10 @@ mod tests {
         // Inner function just returns 1
         let inner = Function::builder()
             .name("inner")
-            .instruction(Instruction::LoadInt32 { dst: Register(0), value: 1 })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(0),
+                value: 1,
+            })
             .instruction(Instruction::Return { src: Register(0) })
             .build();
 

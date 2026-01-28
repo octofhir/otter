@@ -126,10 +126,14 @@ impl JsString {
         let hash = Self::compute_hash_units(&units);
 
         // Check if already interned
-        if let Some(existing) = STRING_TABLE.get(&hash)
-            && existing.data.as_ref() == units.as_slice()
-        {
-            return *existing;
+        if let Some(existing) = STRING_TABLE.get(&hash) {
+            if existing.data.as_ref() == units.as_slice() {
+                return *existing;
+            } else {
+                // HASH COLLISION DETECTED!
+                eprintln!("HASH COLLISION: '{}' and '{}' have the same hash {}",
+                         existing.as_str(), s, hash);
+            }
         }
 
         // Create new interned string via GcRef

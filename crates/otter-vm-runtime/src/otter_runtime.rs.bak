@@ -218,11 +218,28 @@ impl Otter {
 
         // 3. Create execution context with globals and interrupt flag
         let mut ctx = self.vm.create_context();
+        // DEBUG: Check globalThis RIGHT AFTER create_context
+        eprintln!("DEBUG otter_runtime: RIGHT AFTER create_context");
+        if let Some(val) = ctx.global().get(&PropertyKey::string("globalThis")) {
+            eprintln!("DEBUG otter_runtime: globalThis RIGHT AFTER CREATE = {:?}", val);
+        } else {
+            eprintln!("DEBUG otter_runtime: globalThis is NONE after create!");
+        }
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
         ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
 
         // 4. Register extension ops as global native functions
+        // DEBUG: Check globalThis before register_ops
+        eprintln!("DEBUG otter_runtime: Before register_ops_in_context");
+        if let Some(val) = ctx.global().get(&PropertyKey::string("globalThis")) {
+            eprintln!("DEBUG otter_runtime: globalThis BEFORE = {:?}", val);
+        }
         self.register_ops_in_context(&mut ctx);
+        // DEBUG: Check globalThis after register_ops
+        eprintln!("DEBUG otter_runtime: After register_ops_in_context");
+        if let Some(val) = ctx.global().get(&PropertyKey::string("globalThis")) {
+            eprintln!("DEBUG otter_runtime: globalThis AFTER = {:?}", val);
+        }
 
         // Expose interrupt flag to JS for the wrapper to see
         // We use a getter so it's always up to date
@@ -239,6 +256,7 @@ impl Otter {
         let compiled_modules = self.extensions.all_compiled_js();
         if !compiled_modules.is_empty() {
             for module in compiled_modules {
+                eprintln!("DEBUG: Setting up extension module: {}", module.source_url);
                 if let Err(e) = self.vm.execute_module_with_context(&module, &mut ctx) {
                     eprintln!("Extension setup failed: {}", e);
                     return Err(OtterError::Runtime(e.to_string()));
@@ -580,6 +598,7 @@ impl Otter {
         let pending_ops = self.event_loop.get_pending_async_ops_count();
 
         for op_name in self.extensions.op_names() {
+            eprintln!("DEBUG: Registering op: {}", op_name); // DEBUG
             if let Some(handler) = self.extensions.get_op(op_name) {
                 let native_fn = self.create_native_wrapper(
                     op_name,

@@ -7,10 +7,11 @@
 
 use otter_macros::dive;
 use otter_vm_core::gc::GcRef;
-use otter_vm_core::memory;
+use otter_vm_core::memory::{self, MemoryManager};
 use otter_vm_core::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value as VmValue;
+use otter_vm_core::{VmContext, VmResult};
 use otter_vm_runtime::{Op, op_native_with_mm as op_native, op_sync};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -42,6 +43,19 @@ pub fn ops() -> Vec<Op> {
         op_native("__Object_create", native_object_create),
         op_native("__Object_is", native_object_is),
         op_native("__Object_rest", native_object_rest),
+        op_native(
+            "__Object_getOwnPropertyNames",
+            native_object_get_own_property_names,
+        ),
+        op_native(
+            "__Object_getOwnPropertySymbols",
+            native_object_get_own_property_symbols,
+        ),
+        op_native(
+            "__Object_getOwnPropertyDescriptors",
+            native_object_get_own_property_descriptors,
+        ),
+        op_native("__native_Object_keys", native_object_keys),
     ]
 }
 
@@ -588,8 +602,14 @@ mod tests {
         obj.set("c".into(), VmValue::int32(3));
 
         let excluded = GcRef::new(JsObject::array(2, memory_manager.clone()));
-        excluded.set(PropertyKey::Index(0), VmValue::string(JsString::intern("a")));
-        excluded.set(PropertyKey::Index(1), VmValue::string(JsString::intern("b")));
+        excluded.set(
+            PropertyKey::Index(0),
+            VmValue::string(JsString::intern("a")),
+        );
+        excluded.set(
+            PropertyKey::Index(1),
+            VmValue::string(JsString::intern("b")),
+        );
 
         let args = vec![VmValue::object(obj), VmValue::object(excluded)];
         let result = native_object_rest(&args, memory_manager).unwrap();
@@ -658,4 +678,172 @@ fn native_object_rest(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
     }
 
     Ok(VmValue::object(new_obj))
+}
+
+/// Object.getOwnPropertyNames(obj) - native implementation
+fn native_object_get_own_property_names(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
+    let obj_val = args
+        .first()
+        .ok_or("Object.getOwnPropertyNames requires an argument")?;
+
+    // If not an object, return empty array for now (per builtins.js current behavior)
+    // Spec says: ToObject(obj) -> GetOwnPropertyKeys(obj, string)
+    let Some(obj) = obj_val.as_object() else {
+        return Ok(VmValue::object(GcRef::new(JsObject::array(
+            0,
+            Arc::clone(&mm),
+        ))));
+    };
+
+    let keys = obj.own_keys();
+    let mut names = Vec::new();
+
+    for key in keys {
+        if let PropertyKey::String(s) = key {
+            names.push(VmValue::string(s));
+        } else if let PropertyKey::Index(i) = key {
+            names.push(VmValue::string(JsString::intern(&i.to_string())));
+        }
+    }
+
+    let result = GcRef::new(JsObject::array(names.len(), Arc::clone(&mm)));
+    for (i, name) in names.into_iter().enumerate() {
+        result.set(PropertyKey::Index(i as u32), name);
+    }
+
+    Ok(VmValue::array(result))
+}
+
+/// Object.keys(obj) - native implementation
+fn native_object_keys(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+    let obj_val = args.get(0).ok_or("Object.keys requires an object")?;
+    let obj = obj_val
+        .as_object()
+        .ok_or("Object.keys argument must be an object")?;
+
+    let keys = obj.own_keys();
+    let mut names = Vec::new();
+
+    for key in keys {
+        if let PropertyKey::String(s) = &key {
+            if let Some(desc) = obj.get_own_property_descriptor(&PropertyKey::String(s.clone())) {
+                if desc.enumerable() {
+                    names.push(VmValue::string(s.clone()));
+                }
+            }
+        }
+    }
+
+    let result = GcRef::new(JsObject::array(names.len(), Arc::clone(&mm)));
+    for (i, name) in names.into_iter().enumerate() {
+        result.set(PropertyKey::Index(i as u32), name);
+    }
+
+    Ok(VmValue::array(result))
+}
+
+/// Object.getOwnPropertySymbols(obj) - native implementation
+fn native_object_get_own_property_symbols(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
+    let obj_val = args
+        .first()
+        .ok_or("Object.getOwnPropertySymbols requires an argument")?;
+
+    // If not an object, return empty array
+    let Some(obj) = obj_val.as_object() else {
+        return Ok(VmValue::object(GcRef::new(JsObject::array(
+            0,
+            Arc::clone(&mm),
+        ))));
+    };
+
+    let _keys = obj.own_keys();
+    let symbols = Vec::new();
+
+    // FIXME: We currently only store symbol IDs in PropertyKey, so we can't
+    // easily reconstruct the Arc<Symbol> here. This requires a global symbol
+    // registry or storing Arc<Symbol> in PropertyKey.
+    /*
+    for key in keys {
+        if let PropertyKey::Symbol(id) = key {
+            // ...
+        }
+    }
+    */
+
+    let result = GcRef::new(JsObject::array(symbols.len(), Arc::clone(&mm)));
+    for (i, sym) in symbols.into_iter().enumerate() {
+        result.set(PropertyKey::Index(i as u32), sym);
+    }
+
+    Ok(VmValue::array(result))
+}
+
+/// Helper to convert a PropertyDescriptor to a JS object
+fn descriptor_to_object(
+    desc: PropertyDescriptor,
+    mm: &Arc<memory::MemoryManager>,
+) -> GcRef<JsObject> {
+    let desc_obj = GcRef::new(JsObject::new(None, Arc::clone(mm)));
+    match desc {
+        PropertyDescriptor::Data { value, attributes } => {
+            desc_obj.set("value".into(), value);
+            desc_obj.set("writable".into(), VmValue::boolean(attributes.writable));
+            desc_obj.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
+            desc_obj.set(
+                "configurable".into(),
+                VmValue::boolean(attributes.configurable),
+            );
+        }
+        PropertyDescriptor::Accessor {
+            get,
+            set,
+            attributes,
+        } => {
+            desc_obj.set("get".into(), get.unwrap_or(VmValue::undefined()));
+            desc_obj.set("set".into(), set.unwrap_or(VmValue::undefined()));
+            desc_obj.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
+            desc_obj.set(
+                "configurable".into(),
+                VmValue::boolean(attributes.configurable),
+            );
+        }
+        PropertyDescriptor::Deleted => {}
+    }
+    desc_obj
+}
+
+/// Object.getOwnPropertyDescriptors(obj)
+fn native_object_get_own_property_descriptors(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, String> {
+    let obj_val = args
+        .first()
+        .ok_or("Object.getOwnPropertyDescriptors requires a target")?;
+
+    // If not an object, return empty object (shams/wrappers should handle this)
+    let Some(obj) = obj_val.as_object() else {
+        return Ok(VmValue::object(GcRef::new(JsObject::new(
+            None,
+            Arc::clone(&mm),
+        ))));
+    };
+
+    let result = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let keys = obj.own_keys();
+
+    for key in keys {
+        if let Some(prop_desc) = obj.get_own_property_descriptor(&key) {
+            let desc_obj = descriptor_to_object(prop_desc, &mm);
+            result.set(key, VmValue::object(desc_obj));
+        }
+    }
+
+    Ok(VmValue::object(result))
 }

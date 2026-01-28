@@ -1,5 +1,6 @@
 //! VM error types
 
+use crate::value::Value;
 use thiserror::Error;
 
 /// VM execution errors
@@ -49,7 +50,9 @@ pub enum VmError {
 /// A thrown JavaScript value
 #[derive(Debug)]
 pub struct ThrownValue {
-    /// The thrown value (as a string representation for now)
+    /// The thrown value
+    pub value: Value,
+    /// The thrown value (as a string representation)
     pub message: String,
     /// Stack trace
     pub stack: Vec<StackFrame>,
@@ -98,6 +101,15 @@ impl VmError {
     /// Create an interrupted error (for timeout/cancellation)
     pub fn interrupted() -> Self {
         Self::Interrupted
+    }
+
+    /// Create an exception from a thrown JS value
+    pub fn exception(value: Value) -> Self {
+        Self::Exception(Box::new(ThrownValue {
+            message: format!("{:?}", value),
+            value,
+            stack: Vec::new(),
+        }))
     }
 }
 

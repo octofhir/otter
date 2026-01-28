@@ -17,10 +17,7 @@ use crate::value::Value;
 /// Set up all standard global properties on the global object
 pub fn setup_global_object(global: GcRef<JsObject>) {
     // globalThis - self-referencing
-    global.set(
-        PropertyKey::string("globalThis"),
-        Value::object(global),
-    );
+    global.set(PropertyKey::string("globalThis"), Value::object(global));
 
     // Primitive values
     global.set(PropertyKey::string("undefined"), Value::undefined());
@@ -125,12 +122,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
                         .unwrap_or_else(|| "".to_string());
 
                     // Construct RegExp object
-                    let regex = Arc::new(JsRegExp::new(
-                        pattern,
-                        flags,
-                        Some(proto),
-                        mm_inner,
-                    ));
+                    let regex = Arc::new(JsRegExp::new(pattern, flags, Some(proto), mm_inner));
                     Ok(Value::regex(regex))
                 },
                 mm_clone,
@@ -346,10 +338,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
                                 PropertyKey::string("index"),
                                 Value::number(mat.start() as f64),
                             );
-                            arr.set(
-                                PropertyKey::string("input"),
-                                Value::string(input_js),
-                            );
+                            arr.set(PropertyKey::string("input"), Value::string(input_js));
                             arr.set(PropertyKey::string("groups"), Value::undefined());
 
                             Ok(Value::array(GcRef::new(arr)))

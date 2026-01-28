@@ -130,6 +130,7 @@ pub use otter_vm_core::{
     Symbol,
     Value,
     VmContext,
+    VmContextSnapshot,
     // Errors
     VmError,
     VmResult,

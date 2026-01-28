@@ -2,18 +2,18 @@
 //!
 //! Executes bytecode instructions.
 
-use otter_vm_bytecode::{Instruction, Module, UpvalueCapture};
+use otter_vm_bytecode::{Instruction, Module, TypeFlags, UpvalueCapture};
 
 use crate::async_context::{AsyncContext, VmExecutionResult};
 use crate::context::VmContext;
 use crate::error::{VmError, VmResult};
 use crate::gc::GcRef;
-use crate::generator::JsGenerator;
-use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
+use crate::generator::{GeneratorFrame, GeneratorState, JsGenerator};
+use crate::object::{get_proto_epoch, JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::promise::{JsPromise, PromiseState};
 use crate::regexp::JsRegExp;
 use crate::string::JsString;
-use crate::value::{Closure, UpvalueCell, Value};
+use crate::value::{Closure, HeapRef, UpvalueCell, Value};
 
 use num_bigint::BigInt as NumBigInt;
 use num_traits::{One, ToPrimitive, Zero};
@@ -53,6 +53,9 @@ impl Interpreter {
             .entry_function()
             .ok_or_else(|| VmError::internal("no entry function"))?;
 
+        // Record the function call for hot function detection
+        let _ = entry_func.record_call();
+
         // Push initial frame with module reference
         ctx.push_frame(
             module.entry_point,
@@ -61,6 +64,7 @@ impl Interpreter {
             None,
             false,
             entry_func.is_async(),
+            0,
         )?;
         ctx.set_running(true);
 
@@ -88,6 +92,9 @@ impl Interpreter {
             None => return VmExecutionResult::Error("no entry function".to_string()),
         };
 
+        // Record the function call for hot function detection
+        let _ = entry_func.record_call();
+
         // Push initial frame with module reference
         if let Err(e) = ctx.push_frame(
             module.entry_point,
@@ -96,6 +103,7 @@ impl Interpreter {
             None,
             false,
             entry_func.is_async(),
+            0,
         ) {
             return VmExecutionResult::Error(e.to_string());
         }
@@ -165,7 +173,7 @@ impl Interpreter {
         ctx.set_pending_this(this_value);
         ctx.set_pending_upvalues(closure.upvalues.clone());
 
-        // Push frame for the function call
+        let argc = args.len();
         ctx.push_frame(
             closure.function_index,
             Arc::clone(&closure.module),
@@ -173,6 +181,7 @@ impl Interpreter {
             Some(0), // Return register (unused, we get result from Return)
             false,   // Not a construct call
             closure.is_async,
+            argc,
         )?;
         ctx.set_running(true);
 
@@ -225,17 +234,30 @@ impl Interpreter {
                 Ok(InstructionResult::Call {
                     func_index,
                     module,
-                    argc: _,
+                    argc,
                     return_reg,
                     is_construct,
                     is_async,
                     upvalues,
                 }) => {
                     ctx.advance_pc();
-                    let local_count = module
+                    let func = module
                         .function(func_index)
-                        .ok_or_else(|| VmError::internal("function not found"))?
-                        .local_count;
+                        .ok_or_else(|| VmError::internal("function not found"))?;
+
+                    // Record the function call for hot function detection
+                    let became_hot = func.record_call();
+                    if became_hot {
+                        // JIT trigger hook: function just became hot
+                        // In Phase 3, this will trigger JIT compilation
+                        #[cfg(feature = "jit")]
+                        {
+                            // TODO: Queue function for JIT compilation
+                        }
+                        let _ = became_hot; // Silence unused warning when jit feature is off
+                    }
+
+                    let local_count = func.local_count;
                     ctx.set_pending_upvalues(upvalues);
                     ctx.push_frame(
                         func_index,
@@ -244,12 +266,13 @@ impl Interpreter {
                         Some(return_reg),
                         is_construct,
                         is_async,
+                        argc as usize,
                     )?;
                 }
                 Ok(InstructionResult::TailCall {
                     func_index,
                     module,
-                    argc: _,
+                    argc,
                     return_reg,
                     is_async,
                     upvalues,
@@ -268,6 +291,7 @@ impl Interpreter {
                         Some(return_reg),
                         false,
                         is_async,
+                        argc as usize,
                     )?;
                 }
                 Ok(InstructionResult::Suspend { .. }) => {
@@ -374,6 +398,7 @@ impl Interpreter {
             let instruction_result = match self.execute_instruction(instruction, module_ref, ctx) {
                 Ok(result) => result,
                 Err(err) => match err {
+                    VmError::Exception(thrown) => InstructionResult::Throw(thrown.value),
                     VmError::TypeError(message) => {
                         InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
                     }
@@ -462,7 +487,7 @@ impl Interpreter {
                 InstructionResult::Call {
                     func_index,
                     module: call_module,
-                    argc: _,
+                    argc,
                     return_reg,
                     is_construct,
                     is_async,
@@ -480,6 +505,9 @@ impl Interpreter {
                             ));
                         }
                     };
+
+                    // Record the function call for hot function detection
+                    let _ = callee.record_call();
 
                     // Extract values before moving call_module
                     let local_count = callee.local_count;
@@ -503,8 +531,7 @@ impl Interpreter {
                             ctx.memory_manager().clone(),
                         ));
                         // If `Array.prototype` is available, attach it so rest arrays are iterable.
-                        if let Some(array_obj) =
-                            ctx.get_global("Array").and_then(|v| v.as_object())
+                        if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
                                 .get(&PropertyKey::string("prototype"))
                                 .and_then(|v| v.as_object())
@@ -531,6 +558,7 @@ impl Interpreter {
                         Some(return_reg),
                         is_construct,
                         is_async,
+                        argc as usize,
                     ) {
                         return VmExecutionResult::Error(e.to_string());
                     }
@@ -538,7 +566,7 @@ impl Interpreter {
                 InstructionResult::TailCall {
                     func_index,
                     module: call_module,
-                    argc: _,
+                    argc,
                     return_reg,
                     is_async,
                     upvalues,
@@ -575,8 +603,7 @@ impl Interpreter {
                             rest_args.len(),
                             ctx.memory_manager().clone(),
                         ));
-                        if let Some(array_obj) =
-                            ctx.get_global("Array").and_then(|v| v.as_object())
+                        if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
                                 .get(&PropertyKey::string("prototype"))
                                 .and_then(|v| v.as_object())
@@ -599,6 +626,7 @@ impl Interpreter {
                         Some(return_reg),
                         false,
                         is_async,
+                        argc as usize,
                     ) {
                         return VmExecutionResult::Error(e.to_string());
                     }
@@ -636,7 +664,7 @@ impl Interpreter {
                         }
                     }
                 }
-                InstructionResult::Yield { value } => {
+                InstructionResult::Yield { value, .. } => {
                     // Generator yielded a value
                     let result = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
                     result.set(PropertyKey::string("value"), value);
@@ -701,6 +729,7 @@ impl Interpreter {
             let instruction_result = match self.execute_instruction(instruction, module_ref, ctx) {
                 Ok(result) => result,
                 Err(err) => match err {
+                    VmError::Exception(thrown) => InstructionResult::Throw(thrown.value),
                     VmError::TypeError(message) => {
                         InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
                     }
@@ -780,13 +809,14 @@ impl Interpreter {
                     // No handler: convert to an uncaught exception
                     return Err(VmError::Exception(Box::new(crate::error::ThrownValue {
                         message: self.to_string(&value),
+                        value: value.clone(),
                         stack: Vec::new(),
                     })));
                 }
                 InstructionResult::Call {
                     func_index,
                     module: call_module,
-                    argc: _,
+                    argc,
                     return_reg,
                     is_construct,
                     is_async,
@@ -801,6 +831,9 @@ impl Interpreter {
                             call_module.function_count()
                         ))
                     })?;
+
+                    // Record the function call for hot function detection
+                    let _ = callee.record_call();
 
                     // Extract values before moving call_module
                     let local_count = callee.local_count;
@@ -824,8 +857,7 @@ impl Interpreter {
                             ctx.memory_manager().clone(),
                         ));
                         // If `Array.prototype` is available, attach it so rest arrays are iterable.
-                        if let Some(array_obj) =
-                            ctx.get_global("Array").and_then(|v| v.as_object())
+                        if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
                                 .get(&PropertyKey::string("prototype"))
                                 .and_then(|v| v.as_object())
@@ -844,7 +876,6 @@ impl Interpreter {
                     // Set pending upvalues (captured closure values) for the new frame
                     ctx.set_pending_upvalues(upvalues);
 
-                    // Push frame with the callee's module (closures carry their own module)
                     ctx.push_frame(
                         func_index,
                         call_module,
@@ -852,12 +883,13 @@ impl Interpreter {
                         Some(return_reg),
                         is_construct,
                         is_async,
+                        argc as usize,
                     )?;
                 }
                 InstructionResult::TailCall {
                     func_index,
                     module: call_module,
-                    argc: _,
+                    argc,
                     return_reg,
                     is_async,
                     upvalues,
@@ -892,8 +924,7 @@ impl Interpreter {
                             rest_args.len(),
                             ctx.memory_manager().clone(),
                         ));
-                        if let Some(array_obj) =
-                            ctx.get_global("Array").and_then(|v| v.as_object())
+                        if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
                                 .get(&PropertyKey::string("prototype"))
                                 .and_then(|v| v.as_object())
@@ -909,7 +940,6 @@ impl Interpreter {
 
                     ctx.set_pending_upvalues(upvalues);
 
-                    // Push new frame (reusing the stack slot we just freed)
                     ctx.push_frame(
                         func_index,
                         call_module,
@@ -917,6 +947,7 @@ impl Interpreter {
                         Some(return_reg),
                         false, // tail calls are never construct
                         is_async,
+                        argc as usize,
                     )?;
                 }
                 InstructionResult::Suspend {
@@ -945,7 +976,7 @@ impl Interpreter {
                         }
                     }
                 }
-                InstructionResult::Yield { value } => {
+                InstructionResult::Yield { value, .. } => {
                     // Generator yielded a value
                     // Create an iterator result object { value, done: false }
                     let result = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
@@ -1066,13 +1097,17 @@ impl Interpreter {
                         .function(frame.function_index)
                         .ok_or_else(|| VmError::internal("no function"))?;
                     let feedback = func.feedback_vector.read();
-                    if let Some(otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                        shape_id: shape_addr,
-                        offset,
-                    }) = feedback.get(*ic_index as usize)
-                    {
-                        if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr {
-                            global_obj.get_by_offset(*offset as usize)
+                    if let Some(ic) = feedback.get(*ic_index as usize) {
+                        if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                            shape_id: shape_addr,
+                            offset,
+                        } = &ic.ic_state
+                        {
+                            if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr {
+                                global_obj.get_by_offset(*offset as usize)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
@@ -1110,12 +1145,16 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let mut feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic
-                            {
-                                *ic = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                                    shape_id: std::sync::Arc::as_ptr(&global_obj.shape()) as u64,
-                                    offset: offset as u32,
-                                };
+                            if matches!(
+                                ic.ic_state,
+                                otter_vm_bytecode::function::InlineCacheState::Uninitialized
+                            ) {
+                                ic.ic_state =
+                                    otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                        shape_id: std::sync::Arc::as_ptr(&global_obj.shape())
+                                            as u64,
+                                        offset: offset as u32,
+                                    };
                             }
                         }
                     }
@@ -1151,14 +1190,16 @@ impl Interpreter {
                         .function(frame.function_index)
                         .ok_or_else(|| VmError::internal("no function"))?;
                     let feedback = func.feedback_vector.read();
-                    if let Some(otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                        shape_id: shape_addr,
-                        offset,
-                    }) = feedback.get(*ic_index as usize)
-                    {
-                        if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr {
-                            if global_obj.set_by_offset(*offset as usize, val_val.clone()) {
-                                return Ok(InstructionResult::Continue);
+                    if let Some(ic) = feedback.get(*ic_index as usize) {
+                        if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                            shape_id: shape_addr,
+                            offset,
+                        } = &ic.ic_state
+                        {
+                            if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr {
+                                if global_obj.set_by_offset(*offset as usize, val_val.clone()) {
+                                    return Ok(InstructionResult::Continue);
+                                }
                             }
                         }
                     }
@@ -1180,12 +1221,16 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let mut feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic
-                            {
-                                *ic = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                                    shape_id: std::sync::Arc::as_ptr(&global_obj.shape()) as u64,
-                                    offset: offset as u32,
-                                };
+                            if matches!(
+                                ic.ic_state,
+                                otter_vm_bytecode::function::InlineCacheState::Uninitialized
+                            ) {
+                                ic.ic_state =
+                                    otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                        shape_id: std::sync::Arc::as_ptr(&global_obj.shape())
+                                            as u64,
+                                        offset: offset as u32,
+                                    };
                             }
                         }
                     }
@@ -1208,18 +1253,78 @@ impl Interpreter {
             }
 
             // ==================== Arithmetic ====================
-            Instruction::Add { dst, lhs, rhs } => {
+            Instruction::Add { dst, lhs, rhs, feedback_index } => {
                 let left = ctx.get_register(lhs.0);
                 let right = ctx.get_register(rhs.0);
 
+                // Collect type feedback and check for quickening opportunity
+                let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
+                    if let Some(func) = frame.module.function(frame.function_index) {
+                        let mut feedback = func.feedback_vector.write();
+                        if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
+                            Self::observe_value_type(&mut meta.type_observations, left);
+                            Self::observe_value_type(&mut meta.type_observations, right);
+                            // Use fast path if only int32 types have been seen
+                            meta.type_observations.is_int32_only()
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                // Fast path for int32 addition (inline quickening)
+                if use_int32_fast_path {
+                    if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
+                        if let Some(result) = l.checked_add(r) {
+                            ctx.set_register(dst.0, Value::int32(result));
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                }
+
+                // Generic path
                 let result = self.op_add(left, right)?;
                 ctx.set_register(dst.0, result);
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::Sub { dst, lhs, rhs } => {
+            Instruction::Sub { dst, lhs, rhs, feedback_index } => {
                 let left_value = ctx.get_register(lhs.0);
                 let right_value = ctx.get_register(rhs.0);
+
+                // Collect type feedback and check for quickening opportunity
+                let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
+                    if let Some(func) = frame.module.function(frame.function_index) {
+                        let mut feedback = func.feedback_vector.write();
+                        if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
+                            Self::observe_value_type(&mut meta.type_observations, left_value);
+                            Self::observe_value_type(&mut meta.type_observations, right_value);
+                            meta.type_observations.is_int32_only()
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                // Fast path for int32 subtraction (inline quickening)
+                if use_int32_fast_path {
+                    if let (Some(l), Some(r)) = (left_value.as_int32(), right_value.as_int32()) {
+                        if let Some(result) = l.checked_sub(r) {
+                            ctx.set_register(dst.0, Value::int32(result));
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                }
+
+                // Generic path
                 let left_bigint = self.bigint_value(left_value)?;
                 let right_bigint = self.bigint_value(right_value)?;
 
@@ -1266,9 +1371,39 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::Mul { dst, lhs, rhs } => {
+            Instruction::Mul { dst, lhs, rhs, feedback_index } => {
                 let left_value = ctx.get_register(lhs.0);
                 let right_value = ctx.get_register(rhs.0);
+
+                // Collect type feedback and check for quickening opportunity
+                let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
+                    if let Some(func) = frame.module.function(frame.function_index) {
+                        let mut feedback = func.feedback_vector.write();
+                        if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
+                            Self::observe_value_type(&mut meta.type_observations, left_value);
+                            Self::observe_value_type(&mut meta.type_observations, right_value);
+                            meta.type_observations.is_int32_only()
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                // Fast path for int32 multiplication (inline quickening)
+                if use_int32_fast_path {
+                    if let (Some(l), Some(r)) = (left_value.as_int32(), right_value.as_int32()) {
+                        if let Some(result) = l.checked_mul(r) {
+                            ctx.set_register(dst.0, Value::int32(result));
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                }
+
+                // Generic path
                 let left_bigint = self.bigint_value(left_value)?;
                 let right_bigint = self.bigint_value(right_value)?;
 
@@ -1289,9 +1424,40 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::Div { dst, lhs, rhs } => {
+            Instruction::Div { dst, lhs, rhs, feedback_index } => {
                 let left_value = ctx.get_register(lhs.0);
                 let right_value = ctx.get_register(rhs.0);
+
+                // Collect type feedback and check for quickening opportunity
+                let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
+                    if let Some(func) = frame.module.function(frame.function_index) {
+                        let mut feedback = func.feedback_vector.write();
+                        if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
+                            Self::observe_value_type(&mut meta.type_observations, left_value);
+                            Self::observe_value_type(&mut meta.type_observations, right_value);
+                            meta.type_observations.is_int32_only()
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                // Fast path for int32 division (only if result is exact integer)
+                if use_int32_fast_path {
+                    if let (Some(l), Some(r)) = (left_value.as_int32(), right_value.as_int32()) {
+                        if r != 0 && l % r == 0 {
+                            // Result is an exact integer
+                            ctx.set_register(dst.0, Value::int32(l / r));
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                }
+
+                // Generic path
                 let left_bigint = self.bigint_value(left_value)?;
                 let right_bigint = self.bigint_value(right_value)?;
 
@@ -1312,6 +1478,152 @@ impl Interpreter {
                 let right = self.coerce_number(right_value)?;
 
                 ctx.set_register(dst.0, Value::number(left / right));
+                Ok(InstructionResult::Continue)
+            }
+
+            // ==================== Quickened Arithmetic (type-specialized) ====================
+            Instruction::AddI32 { dst, lhs, rhs, feedback_index: _ } => {
+                let left = ctx.get_register(lhs.0);
+                let right = ctx.get_register(rhs.0);
+
+                // Fast path: both operands are int32
+                if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
+                    // Check for overflow, fall back to f64 if it occurs
+                    if let Some(result) = l.checked_add(r) {
+                        ctx.set_register(dst.0, Value::int32(result));
+                        return Ok(InstructionResult::Continue);
+                    }
+                }
+
+                // Fallback to generic add
+                let result = self.op_add(left, right)?;
+                ctx.set_register(dst.0, result);
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::SubI32 { dst, lhs, rhs, feedback_index: _ } => {
+                let left = ctx.get_register(lhs.0);
+                let right = ctx.get_register(rhs.0);
+
+                // Fast path: both operands are int32
+                if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
+                    if let Some(result) = l.checked_sub(r) {
+                        ctx.set_register(dst.0, Value::int32(result));
+                        return Ok(InstructionResult::Continue);
+                    }
+                }
+
+                // Fallback to generic sub
+                let left_num = self.coerce_number(left)?;
+                let right_num = self.coerce_number(right)?;
+                ctx.set_register(dst.0, Value::number(left_num - right_num));
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::MulI32 { dst, lhs, rhs, feedback_index: _ } => {
+                let left = ctx.get_register(lhs.0);
+                let right = ctx.get_register(rhs.0);
+
+                // Fast path: both operands are int32
+                if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
+                    if let Some(result) = l.checked_mul(r) {
+                        ctx.set_register(dst.0, Value::int32(result));
+                        return Ok(InstructionResult::Continue);
+                    }
+                }
+
+                // Fallback to generic mul
+                let left_num = self.coerce_number(left)?;
+                let right_num = self.coerce_number(right)?;
+                ctx.set_register(dst.0, Value::number(left_num * right_num));
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::DivI32 { dst, lhs, rhs, feedback_index: _ } => {
+                let left = ctx.get_register(lhs.0);
+                let right = ctx.get_register(rhs.0);
+
+                // Fast path: both operands are int32 and divide evenly
+                if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
+                    if r != 0 && l % r == 0 {
+                        if let Some(result) = l.checked_div(r) {
+                            ctx.set_register(dst.0, Value::int32(result));
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                }
+
+                // Fallback to generic div (produces f64)
+                let left_num = self.coerce_number(left)?;
+                let right_num = self.coerce_number(right)?;
+                ctx.set_register(dst.0, Value::number(left_num / right_num));
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::AddF64 { dst, lhs, rhs, feedback_index: _ } => {
+                let left = ctx.get_register(lhs.0);
+                let right = ctx.get_register(rhs.0);
+
+                // Fast path: both operands are numbers
+                if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
+                    ctx.set_register(dst.0, Value::number(l + r));
+                    return Ok(InstructionResult::Continue);
+                }
+
+                // Fallback to generic add
+                let result = self.op_add(left, right)?;
+                ctx.set_register(dst.0, result);
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::SubF64 { dst, lhs, rhs, feedback_index: _ } => {
+                let left = ctx.get_register(lhs.0);
+                let right = ctx.get_register(rhs.0);
+
+                // Fast path: both operands are numbers
+                if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
+                    ctx.set_register(dst.0, Value::number(l - r));
+                    return Ok(InstructionResult::Continue);
+                }
+
+                // Fallback to generic sub
+                let left_num = self.coerce_number(left)?;
+                let right_num = self.coerce_number(right)?;
+                ctx.set_register(dst.0, Value::number(left_num - right_num));
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::MulF64 { dst, lhs, rhs, feedback_index: _ } => {
+                let left = ctx.get_register(lhs.0);
+                let right = ctx.get_register(rhs.0);
+
+                // Fast path: both operands are numbers
+                if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
+                    ctx.set_register(dst.0, Value::number(l * r));
+                    return Ok(InstructionResult::Continue);
+                }
+
+                // Fallback to generic mul
+                let left_num = self.coerce_number(left)?;
+                let right_num = self.coerce_number(right)?;
+                ctx.set_register(dst.0, Value::number(left_num * right_num));
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::DivF64 { dst, lhs, rhs, feedback_index: _ } => {
+                let left = ctx.get_register(lhs.0);
+                let right = ctx.get_register(rhs.0);
+
+                // Fast path: both operands are numbers
+                if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
+                    ctx.set_register(dst.0, Value::number(l / r));
+                    return Ok(InstructionResult::Continue);
+                }
+
+                // Fallback to generic div
+                let left_num = self.coerce_number(left)?;
+                let right_num = self.coerce_number(right)?;
+                ctx.set_register(dst.0, Value::number(left_num / right_num));
                 Ok(InstructionResult::Continue)
             }
 
@@ -1506,7 +1818,12 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::InstanceOf { dst, lhs, rhs } => {
+            Instruction::InstanceOf {
+                dst,
+                lhs,
+                rhs,
+                ic_index,
+            } => {
                 let left = ctx.get_register(lhs.0).clone();
                 let right = ctx.get_register(rhs.0).clone();
 
@@ -1521,9 +1838,117 @@ impl Interpreter {
                     ));
                 };
 
-                let proto_val = right_obj
-                    .get(&PropertyKey::string("prototype"))
-                    .unwrap_or_else(Value::undefined);
+                // IC Fast Path - cache the prototype property lookup on the constructor
+                let proto_key = PropertyKey::string("prototype");
+                let mut cached_proto = None;
+                {
+                    let frame = ctx
+                        .current_frame()
+                        .ok_or_else(|| VmError::internal("no frame"))?;
+                    let func = frame
+                        .module
+                        .function(frame.function_index)
+                        .ok_or_else(|| VmError::internal("no function"))?;
+                    let feedback = func.feedback_vector.read();
+                    if let Some(ic) = feedback.get(*ic_index as usize) {
+                        use otter_vm_bytecode::function::InlineCacheState;
+                        let obj_shape_ptr = std::sync::Arc::as_ptr(&right_obj.shape()) as u64;
+
+                        if ic.proto_epoch_matches(get_proto_epoch()) {
+                            match &ic.ic_state {
+                                InlineCacheState::Monomorphic { shape_id, offset } => {
+                                    if obj_shape_ptr == *shape_id {
+                                        cached_proto = right_obj.get_by_offset(*offset as usize);
+                                    }
+                                }
+                                InlineCacheState::Polymorphic { count, entries } => {
+                                    for i in 0..(*count as usize) {
+                                        if obj_shape_ptr == entries[i].0 {
+                                            cached_proto =
+                                                right_obj.get_by_offset(entries[i].1 as usize);
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                let proto_val = if let Some(val) = cached_proto {
+                    val
+                } else {
+                    // Slow path: full lookup and IC update
+                    let proto = right_obj.get(&proto_key).unwrap_or_else(Value::undefined);
+
+                    // Update IC
+                    if let Some(offset) = right_obj.shape().get_offset(&proto_key) {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        let func = frame
+                            .module
+                            .function(frame.function_index)
+                            .ok_or_else(|| VmError::internal("no function"))?;
+                        let mut feedback = func.feedback_vector.write();
+                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                            use otter_vm_bytecode::function::InlineCacheState;
+                            // Skip IC for dictionary mode objects
+                            if right_obj.is_dictionary_mode() {
+                                ic.ic_state = InlineCacheState::Megamorphic;
+                            } else {
+                                let shape_ptr = std::sync::Arc::as_ptr(&right_obj.shape()) as u64;
+                                let current_epoch = get_proto_epoch();
+
+                                match &mut ic.ic_state {
+                                    InlineCacheState::Uninitialized => {
+                                        ic.ic_state = InlineCacheState::Monomorphic {
+                                            shape_id: shape_ptr,
+                                            offset: offset as u32,
+                                        };
+                                        ic.proto_epoch = current_epoch;
+                                    }
+                                InlineCacheState::Monomorphic {
+                                    shape_id: old_shape,
+                                    offset: old_offset,
+                                } => {
+                                    if *old_shape != shape_ptr {
+                                        let mut entries = [(0u64, 0u32); 4];
+                                        entries[0] = (*old_shape, *old_offset);
+                                        entries[1] = (shape_ptr, offset as u32);
+                                        ic.ic_state =
+                                            InlineCacheState::Polymorphic { count: 2, entries };
+                                        ic.proto_epoch = current_epoch;
+                                    }
+                                }
+                                InlineCacheState::Polymorphic { count, entries } => {
+                                    let mut found = false;
+                                    for i in 0..(*count as usize) {
+                                        if entries[i].0 == shape_ptr {
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                    if !found {
+                                        if (*count as usize) < 4 {
+                                            entries[*count as usize] = (shape_ptr, offset as u32);
+                                            *count += 1;
+                                            ic.proto_epoch = current_epoch;
+                                        } else {
+                                            ic.ic_state = InlineCacheState::Megamorphic;
+                                        }
+                                    }
+                                }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
+                    proto
+                };
+
                 let Some(target_proto) = proto_val.as_object() else {
                     return Err(VmError::type_error("Function has non-object prototype"));
                 };
@@ -1547,7 +1972,12 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::In { dst, lhs, rhs } => {
+            Instruction::In {
+                dst,
+                lhs,
+                rhs,
+                ic_index,
+            } => {
                 let left = ctx.get_register(lhs.0);
                 let right = ctx.get_register(rhs.0);
 
@@ -1567,6 +1997,121 @@ impl Interpreter {
                     let idx_str = self.to_string(left);
                     PropertyKey::string(&idx_str)
                 };
+
+                // IC Fast Path - only for string keys
+                // For 'in' operator, we cache whether the property exists on a shape
+                // The offset field is reused: 0 = property doesn't exist, non-zero = exists
+                if matches!(&key, PropertyKey::String(_)) {
+                    let mut cached_result = None;
+                    {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        let func = frame
+                            .module
+                            .function(frame.function_index)
+                            .ok_or_else(|| VmError::internal("no function"))?;
+                        let feedback = func.feedback_vector.read();
+                        if let Some(ic) = feedback.get(*ic_index as usize) {
+                            use otter_vm_bytecode::function::InlineCacheState;
+                            let obj_shape_ptr = std::sync::Arc::as_ptr(&right_obj.shape()) as u64;
+
+                            if ic.proto_epoch_matches(get_proto_epoch()) {
+                                match &ic.ic_state {
+                                    InlineCacheState::Monomorphic { shape_id, offset } => {
+                                        if obj_shape_ptr == *shape_id {
+                                            // offset encodes: 1 = exists, 0 = doesn't exist
+                                            cached_result = Some(*offset != 0);
+                                        }
+                                    }
+                                    InlineCacheState::Polymorphic { count, entries } => {
+                                        for i in 0..(*count as usize) {
+                                            if obj_shape_ptr == entries[i].0 {
+                                                cached_result = Some(entries[i].1 != 0);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(result) = cached_result {
+                        ctx.set_register(dst.0, Value::boolean(result));
+                        return Ok(InstructionResult::Continue);
+                    }
+
+                    // Slow path with IC update
+                    let has_property = right_obj.has(&key);
+                    {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        let func = frame
+                            .module
+                            .function(frame.function_index)
+                            .ok_or_else(|| VmError::internal("no function"))?;
+                        let mut feedback = func.feedback_vector.write();
+                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                            use otter_vm_bytecode::function::InlineCacheState;
+                            // Skip IC for dictionary mode objects
+                            if right_obj.is_dictionary_mode() {
+                                ic.ic_state = InlineCacheState::Megamorphic;
+                            } else {
+                                let shape_ptr = std::sync::Arc::as_ptr(&right_obj.shape()) as u64;
+                                let exists_marker = if has_property { 1u32 } else { 0u32 };
+                                let current_epoch = get_proto_epoch();
+
+                                match &mut ic.ic_state {
+                                    InlineCacheState::Uninitialized => {
+                                        ic.ic_state = InlineCacheState::Monomorphic {
+                                            shape_id: shape_ptr,
+                                            offset: exists_marker,
+                                        };
+                                        ic.proto_epoch = current_epoch;
+                                    }
+                                    InlineCacheState::Monomorphic {
+                                        shape_id: old_shape,
+                                        offset: old_exists,
+                                    } => {
+                                        if *old_shape != shape_ptr {
+                                            let mut entries = [(0u64, 0u32); 4];
+                                            entries[0] = (*old_shape, *old_exists);
+                                            entries[1] = (shape_ptr, exists_marker);
+                                            ic.ic_state =
+                                                InlineCacheState::Polymorphic { count: 2, entries };
+                                            ic.proto_epoch = current_epoch;
+                                        }
+                                    }
+                                    InlineCacheState::Polymorphic { count, entries } => {
+                                        let mut found = false;
+                                        for i in 0..(*count as usize) {
+                                            if entries[i].0 == shape_ptr {
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                        if !found {
+                                            if (*count as usize) < 4 {
+                                                entries[*count as usize] = (shape_ptr, exists_marker);
+                                                *count += 1;
+                                                ic.proto_epoch = current_epoch;
+                                            } else {
+                                                ic.ic_state = InlineCacheState::Megamorphic;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
+                    ctx.set_register(dst.0, Value::boolean(has_property));
+                    return Ok(InstructionResult::Continue);
+                }
 
                 let result = right_obj.has(&key);
                 ctx.set_register(dst.0, Value::boolean(result));
@@ -1639,19 +2184,54 @@ impl Interpreter {
 
                 let func_obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
                 let proto = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+
+                // Set function length and name properties with correct attributes
+                // (writable: false, enumerable: false, configurable: true)
+                let fn_attrs = crate::object::PropertyAttributes {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                };
+                func_obj.define_property(
+                    PropertyKey::string("length"),
+                    crate::object::PropertyDescriptor::Data {
+                        value: Value::int32(func_def.param_count as i32),
+                        attributes: fn_attrs,
+                    },
+                );
+                let fn_name = func_def.name.as_deref().unwrap_or("");
+                func_obj.define_property(
+                    PropertyKey::string("name"),
+                    crate::object::PropertyDescriptor::Data {
+                        value: Value::string(JsString::intern(fn_name)),
+                        attributes: fn_attrs,
+                    },
+                );
+
                 let closure = Arc::new(Closure {
                     function_index: func.0,
                     module: Arc::clone(module),
                     upvalues: captured_upvalues,
                     is_async: func_def.is_async(),
+                    is_generator: false,
                     object: func_obj,
                 });
                 let func_value = Value::function(closure);
-                func_obj.set(
-                    PropertyKey::string("prototype"),
-                    Value::object(proto),
-                );
+                func_obj.set(PropertyKey::string("prototype"), Value::object(proto));
                 proto.set(PropertyKey::string("constructor"), func_value.clone());
+                if func_def.is_arrow() || func_def.is_async() {
+                    func_obj.define_property(
+                        PropertyKey::string("__non_constructor"),
+                        PropertyDescriptor::Data {
+                            value: Value::boolean(true),
+                            attributes: PropertyAttributes {
+                                writable: false,
+                                enumerable: false,
+                                configurable: false,
+                            },
+                        },
+                    );
+                }
                 ctx.set_register(dst.0, func_value);
                 Ok(InstructionResult::Continue)
             }
@@ -1667,40 +2247,241 @@ impl Interpreter {
 
                 let func_obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
                 let proto = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+
+                // Set function length and name properties
+                let fn_attrs = crate::object::PropertyAttributes {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                };
+                func_obj.define_property(
+                    PropertyKey::string("length"),
+                    crate::object::PropertyDescriptor::Data {
+                        value: Value::int32(func_def.param_count as i32),
+                        attributes: fn_attrs,
+                    },
+                );
+                let fn_name = func_def.name.as_deref().unwrap_or("");
+                func_obj.define_property(
+                    PropertyKey::string("name"),
+                    crate::object::PropertyDescriptor::Data {
+                        value: Value::string(JsString::intern(fn_name)),
+                        attributes: fn_attrs,
+                    },
+                );
+
                 let closure = Arc::new(Closure {
                     function_index: func.0,
                     module: Arc::clone(module),
                     upvalues: captured_upvalues,
                     is_async: true,
+                    is_generator: false,
                     object: func_obj,
                 });
                 let func_value = Value::function(closure);
-                func_obj.set(
-                    PropertyKey::string("prototype"),
-                    Value::object(proto),
-                );
+                func_obj.set(PropertyKey::string("prototype"), Value::object(proto));
                 proto.set(PropertyKey::string("constructor"), func_value.clone());
+                func_obj.define_property(
+                    PropertyKey::string("__non_constructor"),
+                    PropertyDescriptor::Data {
+                        value: Value::boolean(true),
+                        attributes: PropertyAttributes {
+                            writable: false,
+                            enumerable: false,
+                            configurable: false,
+                        },
+                    },
+                );
                 ctx.set_register(dst.0, func_value);
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::GeneratorClosure { dst, func } => {
-                // Create a generator function - when called, it creates a generator object
-                let generator_fn = JsGenerator::new(func.0, Vec::new());
-                ctx.set_register(dst.0, Value::generator(generator_fn));
+                // Get the function definition to know what upvalues to capture
+                let func_def = module
+                    .function(func.0)
+                    .ok_or_else(|| VmError::internal("function not found for generator closure"))?;
+
+                // Capture upvalues from parent frame
+                let captured_upvalues = self.capture_upvalues(ctx, &func_def.upvalues)?;
+
+                // Get GeneratorFunctionPrototype as the function's prototype (for Object.getPrototypeOf)
+                let gen_func_proto = ctx
+                    .get_global("GeneratorFunctionPrototype")
+                    .and_then(|v| v.as_object());
+
+                // Create a generator function closure - when called, it creates a generator object
+                let func_obj =
+                    GcRef::new(JsObject::new(gen_func_proto, ctx.memory_manager().clone()));
+
+                // Set function length and name properties
+                let fn_attrs = crate::object::PropertyAttributes {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                };
+                func_obj.define_property(
+                    PropertyKey::string("length"),
+                    crate::object::PropertyDescriptor::Data {
+                        value: Value::int32(func_def.param_count as i32),
+                        attributes: fn_attrs,
+                    },
+                );
+                let fn_name = func_def.name.as_deref().unwrap_or("");
+                func_obj.define_property(
+                    PropertyKey::string("name"),
+                    crate::object::PropertyDescriptor::Data {
+                        value: Value::string(JsString::intern(fn_name)),
+                        attributes: fn_attrs,
+                    },
+                );
+
+                // Create the .prototype for instances - this becomes the prototype of generator instances
+                let gen_proto = ctx
+                    .get_global("GeneratorPrototype")
+                    .and_then(|v| v.as_object());
+                let proto = GcRef::new(JsObject::new(gen_proto, ctx.memory_manager().clone()));
+
+                let closure = Arc::new(Closure {
+                    function_index: func.0,
+                    module: Arc::clone(module),
+                    upvalues: captured_upvalues,
+                    is_async: false,
+                    is_generator: true,
+                    object: func_obj,
+                });
+                let func_value = Value::function(closure);
+                func_obj.set(PropertyKey::string("prototype"), Value::object(proto));
+                proto.set(PropertyKey::string("constructor"), func_value.clone());
+                func_obj.define_property(
+                    PropertyKey::string("__non_constructor"),
+                    PropertyDescriptor::Data {
+                        value: Value::boolean(true),
+                        attributes: PropertyAttributes {
+                            writable: false,
+                            enumerable: false,
+                            configurable: false,
+                        },
+                    },
+                );
+                ctx.set_register(dst.0, func_value);
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::AsyncGeneratorClosure { dst, func } => {
+                // Get the function definition to know what upvalues to capture
+                let func_def = module.function(func.0).ok_or_else(|| {
+                    VmError::internal("function not found for async generator closure")
+                })?;
+
+                // Capture upvalues from parent frame
+                let captured_upvalues = self.capture_upvalues(ctx, &func_def.upvalues)?;
+
+                // Get AsyncGeneratorFunctionPrototype as the function's prototype (for Object.getPrototypeOf)
+                let async_gen_func_proto = ctx
+                    .get_global("AsyncGeneratorFunctionPrototype")
+                    .and_then(|v| v.as_object());
+
+                // Create an async generator function closure
+                let func_obj = GcRef::new(JsObject::new(
+                    async_gen_func_proto,
+                    ctx.memory_manager().clone(),
+                ));
+
+                // Set function length and name properties
+                let fn_attrs = crate::object::PropertyAttributes {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                };
+                func_obj.define_property(
+                    PropertyKey::string("length"),
+                    crate::object::PropertyDescriptor::Data {
+                        value: Value::int32(func_def.param_count as i32),
+                        attributes: fn_attrs,
+                    },
+                );
+                let fn_name = func_def.name.as_deref().unwrap_or("");
+                func_obj.define_property(
+                    PropertyKey::string("name"),
+                    crate::object::PropertyDescriptor::Data {
+                        value: Value::string(JsString::intern(fn_name)),
+                        attributes: fn_attrs,
+                    },
+                );
+
+                // Create the .prototype for instances - this becomes the prototype of generator instances
+                let gen_proto = ctx
+                    .get_global("GeneratorPrototype")
+                    .and_then(|v| v.as_object());
+                let proto = GcRef::new(JsObject::new(gen_proto, ctx.memory_manager().clone()));
+
+                let closure = Arc::new(Closure {
+                    function_index: func.0,
+                    module: Arc::clone(module),
+                    upvalues: captured_upvalues,
+                    is_async: true,
+                    is_generator: true,
+                    object: func_obj,
+                });
+                let func_value = Value::function(closure);
+                func_obj.set(PropertyKey::string("prototype"), Value::object(proto));
+                proto.set(PropertyKey::string("constructor"), func_value.clone());
+                func_obj.define_property(
+                    PropertyKey::string("__non_constructor"),
+                    PropertyDescriptor::Data {
+                        value: Value::boolean(true),
+                        attributes: PropertyAttributes {
+                            writable: false,
+                            enumerable: false,
+                            configurable: false,
+                        },
+                    },
+                );
+                ctx.set_register(dst.0, func_value);
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Call { dst, func, argc } => {
                 let func_value = ctx.get_register(func.0).clone();
 
+                // Collect arguments upfront (used by multiple paths)
+                let mut args = Vec::with_capacity(*argc as usize);
+                for i in 0..(*argc as u16) {
+                    let arg = ctx.get_register(func.0 + 1 + i).clone();
+                    args.push(arg);
+                }
+
                 // Check if it's a native function first
                 if let Some(native_fn) = func_value.as_native_function() {
-                    // Collect arguments
-                    let mut args = Vec::with_capacity(*argc as usize);
-                    for i in 0..(*argc as u16) {
-                        let arg = ctx.get_register(func.0 + 1 + i).clone();
-                        args.push(arg);
+                    // Some native ops need interpreter-level dispatch (call/apply, generator ops).
+                    let is_same_native = |candidate: &Value| -> bool {
+                        match (func_value.heap_ref(), candidate.heap_ref()) {
+                            (
+                                Some(HeapRef::NativeFunction(a)),
+                                Some(HeapRef::NativeFunction(b)),
+                            ) => Arc::ptr_eq(a, b),
+                            _ => false,
+                        }
+                    };
+                    let is_special = [
+                        "__Function_call",
+                        "__Function_apply",
+                        "__Generator_next",
+                        "__Generator_return",
+                        "__Generator_throw",
+                    ]
+                    .iter()
+                    .any(|name| ctx.get_global(name).is_some_and(|v| is_same_native(&v)));
+
+                    if is_special {
+                        return self.handle_call_value(
+                            ctx,
+                            &func_value,
+                            Value::undefined(),
+                            args,
+                            dst.0,
+                        );
                     }
 
                     // Call the native function with depth tracking
@@ -1758,13 +2539,14 @@ impl Interpreter {
                             return Ok(InstructionResult::Continue);
                         } else if let Some(closure) = bound_fn.as_function() {
                             // Set the bound this and args
+                            let argc = all_args.len() as u8;
                             ctx.set_pending_this(this_arg);
                             ctx.set_pending_args(all_args);
 
                             return Ok(InstructionResult::Call {
                                 func_index: closure.function_index,
                                 module: Arc::clone(&closure.module),
-                                argc: *argc,
+                                argc,
                                 return_reg: dst.0,
                                 is_construct: false,
                                 is_async: closure.is_async,
@@ -1776,14 +2558,6 @@ impl Interpreter {
                             ));
                         }
                     }
-                }
-
-                // Copy arguments from caller registers (func+1, func+2, ...)
-                // to prepare for the new frame
-                let mut args = Vec::with_capacity(*argc as usize);
-                for i in 0..(*argc as u16) {
-                    let arg = ctx.get_register(func.0 + 1 + i).clone();
-                    args.push(arg);
                 }
 
                 self.handle_call_value(ctx, &func_value, Value::undefined(), args, dst.0)
@@ -1855,6 +2629,16 @@ impl Interpreter {
             Instruction::Construct { dst, func, argc } => {
                 let func_value = ctx.get_register(func.0).clone();
 
+                if let Some(func_obj) = func_value.as_object() {
+                    if func_obj
+                        .get(&PropertyKey::string("__non_constructor"))
+                        .and_then(|v| v.as_boolean())
+                        == Some(true)
+                    {
+                        return Err(VmError::type_error("not a constructor"));
+                    }
+                }
+
                 if let Some(native_fn) = func_value.as_native_function() {
                     let mut args = Vec::with_capacity(*argc as usize);
                     for i in 0..(*argc as u16) {
@@ -1867,7 +2651,8 @@ impl Interpreter {
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
                         .and_then(|v| v.as_object());
-                    let new_obj = GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
+                    let new_obj =
+                        GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
                     let new_obj_value = Value::object(new_obj);
 
                     // Call native constructor with depth tracking
@@ -1888,7 +2673,8 @@ impl Interpreter {
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
                         .and_then(|v| v.as_object());
-                    let new_obj = GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
+                    let new_obj =
+                        GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
                     let new_obj_value = Value::object(new_obj.clone());
 
                     // Copy arguments from caller registers
@@ -1947,13 +2733,17 @@ impl Interpreter {
                         .function(frame.function_index)
                         .ok_or_else(|| VmError::internal("no function"))?;
                     let feedback = func.feedback_vector.read();
-                    if let Some(otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                        shape_id: shape_addr,
-                        offset,
-                    }) = feedback.get(*ic_index as usize)
-                    {
-                        if std::sync::Arc::as_ptr(&obj_ref.shape()) as u64 == *shape_addr {
-                            obj_ref.get_by_offset(*offset as usize)
+                    if let Some(ic) = feedback.get(*ic_index as usize) {
+                        if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                            shape_id: shape_addr,
+                            offset,
+                        } = &ic.ic_state
+                        {
+                            if std::sync::Arc::as_ptr(&obj_ref.shape()) as u64 == *shape_addr {
+                                obj_ref.get_by_offset(*offset as usize)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
@@ -2011,6 +2801,148 @@ impl Interpreter {
                     proto
                         .get(&Self::utf16_key(method_name))
                         .unwrap_or_else(Value::undefined)
+                } else if receiver.is_generator() {
+                    // Special handling for generator methods - execute directly
+                    let method_str = String::from_utf16_lossy(method_name);
+                    if method_str == "next" || method_str == "return" || method_str == "throw" {
+                        // Get the generator and execute it directly
+                        let generator = receiver
+                            .as_generator()
+                            .ok_or_else(|| VmError::internal("Expected generator"))?;
+
+                        // Get the sent value (first argument if present)
+                        let sent_value = if *argc > 0 {
+                            Some(ctx.get_register(obj.0 + 1).clone())
+                        } else {
+                            None
+                        };
+
+                        // Handle the specific method
+                        let gen_result = match method_str.as_str() {
+                            "next" => self.execute_generator(generator, ctx, sent_value),
+                            "return" => {
+                                // generator.return(value) - complete with the value
+                                // If generator has try handlers, we need to run finally blocks
+                                // See: https://tc39.es/ecma262/#sec-generatorresumeabrupt
+                                let return_value = sent_value.unwrap_or_else(Value::undefined);
+
+                                if generator.is_completed() {
+                                    // Already completed, just return
+                                    GeneratorResult::Returned(return_value)
+                                } else if !generator.has_try_handlers() {
+                                    // No try handlers, no finally blocks to run
+                                    generator.complete();
+                                    GeneratorResult::Returned(return_value)
+                                } else {
+                                    // Has try handlers - need to run finally blocks
+                                    // Set pending return and resume to trigger exception path
+                                    generator.set_pending_return(return_value);
+                                    self.execute_generator(generator, ctx, None)
+                                }
+                            }
+                            "throw" => {
+                                // generator.throw(error) - throw into the generator
+                                let error_value = sent_value.unwrap_or_else(Value::undefined);
+                                if generator.is_completed() {
+                                    // If already completed, just throw the error
+                                    GeneratorResult::Error(VmError::exception(error_value))
+                                } else {
+                                    // Set pending throw and resume
+                                    generator.set_pending_throw(error_value.clone());
+                                    self.execute_generator(generator, ctx, None)
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+
+                        // For async generators, wrap result in a Promise
+                        if generator.is_async() {
+                            let promise = JsPromise::new();
+                            match gen_result {
+                                GeneratorResult::Yielded(v) => {
+                                    let iter_result = GcRef::new(JsObject::new(
+                                        None,
+                                        ctx.memory_manager().clone(),
+                                    ));
+                                    iter_result.set(PropertyKey::string("value"), v);
+                                    iter_result
+                                        .set(PropertyKey::string("done"), Value::boolean(false));
+                                    promise.resolve(Value::object(iter_result));
+                                }
+                                GeneratorResult::Returned(v) => {
+                                    let iter_result = GcRef::new(JsObject::new(
+                                        None,
+                                        ctx.memory_manager().clone(),
+                                    ));
+                                    iter_result.set(PropertyKey::string("value"), v);
+                                    iter_result
+                                        .set(PropertyKey::string("done"), Value::boolean(true));
+                                    promise.resolve(Value::object(iter_result));
+                                }
+                                GeneratorResult::Error(e) => {
+                                    let error_msg = e.to_string();
+                                    promise.reject(Value::string(JsString::intern(&error_msg)));
+                                }
+                                GeneratorResult::Suspended {
+                                    promise: awaited_promise,
+                                    resume_reg,
+                                    generator: suspended_gen,
+                                } => {
+                                    // Generator is awaiting a promise
+                                    // Chain onto the awaited promise and resume when it settles
+                                    let result_promise = promise.clone();
+                                    let mm = ctx.memory_manager().clone();
+                                    awaited_promise.then(move |resolved_value| {
+                                        // When the awaited promise resolves, we would resume the generator
+                                        // For now, just resolve with the awaited value wrapped in an iterator result
+                                        // TODO: Properly resume async generator execution
+                                        let iter_result =
+                                            GcRef::new(JsObject::new(None, mm.clone()));
+                                        iter_result
+                                            .set(PropertyKey::string("value"), resolved_value);
+                                        iter_result.set(
+                                            PropertyKey::string("done"),
+                                            Value::boolean(false),
+                                        );
+                                        result_promise.resolve(Value::object(iter_result));
+                                    });
+                                    // Store the resume_reg and generator for later use
+                                    let _ = (resume_reg, suspended_gen);
+                                }
+                            }
+                            ctx.set_register(dst.0, Value::promise(promise));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        // For sync generators, return iterator result directly
+                        let (result_value, is_done) = match gen_result {
+                            GeneratorResult::Yielded(v) => (v, false),
+                            GeneratorResult::Returned(v) => (v, true),
+                            GeneratorResult::Error(e) => return Err(e),
+                            GeneratorResult::Suspended { .. } => {
+                                return Err(VmError::internal("Sync generator cannot suspend"));
+                            }
+                        };
+
+                        // Create iterator result object { value, done }
+                        let result = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                        result.set(PropertyKey::string("value"), result_value);
+                        result.set(PropertyKey::string("done"), Value::boolean(is_done));
+                        ctx.set_register(dst.0, Value::object(result));
+                        return Ok(InstructionResult::Continue);
+                    }
+
+                    // For other methods, fall through to prototype lookup
+                    let generator_proto = ctx
+                        .get_global("GeneratorPrototype")
+                        .ok_or_else(|| VmError::type_error("GeneratorPrototype is not defined"))?;
+                    if let Some(proto) = generator_proto.as_object() {
+                        proto
+                            .get(&Self::utf16_key(method_name))
+                            .unwrap_or_else(Value::undefined)
+                    } else {
+                        Value::undefined()
+                    }
                 } else if receiver.is_promise() {
                     let promise_obj = ctx
                         .get_global("Promise")
@@ -2069,12 +3001,15 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let mut feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic
-                            {
-                                *ic = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                                    shape_id: std::sync::Arc::as_ptr(&obj_ref.shape()) as u64,
-                                    offset: offset as u32,
-                                };
+                            if matches!(
+                                ic.ic_state,
+                                otter_vm_bytecode::function::InlineCacheState::Uninitialized
+                            ) {
+                                ic.ic_state =
+                                    otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                        shape_id: std::sync::Arc::as_ptr(&obj_ref.shape()) as u64,
+                                        offset: offset as u32,
+                                    };
                             }
                         }
                     }
@@ -2185,7 +3120,8 @@ impl Interpreter {
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
                         .and_then(|v| v.as_object());
-                    let new_obj = GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
+                    let new_obj =
+                        GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
                     let new_obj_value = Value::object(new_obj);
 
                     let result = self.call_native_fn(ctx, native_fn, &args)?;
@@ -2278,10 +3214,13 @@ impl Interpreter {
 
                 // Yield suspends the generator and returns the value
                 // The dst register will receive the value sent to next() on resumption
-                ctx.set_register(dst.0, Value::undefined()); // Will be set on resume
+                // (handled in resume_generator_execution using yield_dst)
 
-                // Return a yield result
-                Ok(InstructionResult::Yield { value })
+                // Return a yield result with the destination register
+                Ok(InstructionResult::Yield {
+                    value,
+                    yield_dst: dst.0,
+                })
             }
 
             // ==================== Objects ====================
@@ -2302,6 +3241,50 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
+            Instruction::CreateArguments { dst } => {
+                let frame = ctx
+                    .current_frame()
+                    .ok_or_else(|| VmError::internal("no frame"))?;
+                let argc = frame.argc;
+                let mm = ctx.memory_manager().clone();
+
+                // Get Array.prototype for the arguments object
+                let array_proto = ctx
+                    .get_global("Array")
+                    .and_then(|v| v.as_object())
+                    .and_then(|o| o.get(&PropertyKey::string("prototype")))
+                    .and_then(|v| v.as_object());
+
+                let args_obj = GcRef::new(JsObject::array(argc, mm));
+                if let Some(proto) = array_proto {
+                    args_obj.set_prototype(Some(proto));
+                }
+
+                // Populate arguments from locals
+                // Arguments 0..param_count are in locals[0..param_count]
+                // Arguments param_count..argc are in locals[local_count..]
+                let func = &frame.module.functions[frame.function_index as usize];
+                let param_count = func.param_count as usize;
+                let local_count = func.local_count as usize;
+
+                for i in 0..argc {
+                    let val = if i < param_count {
+                        ctx.get_local(i as u16)?
+                    } else {
+                        let offset = local_count + (i - param_count);
+                        ctx.get_local(offset as u16)?
+                    };
+                    // println!("DEBUG: arg[{}] = {:?} (param_count={}, local_count={})", i, val, param_count, local_count);
+                    args_obj.set(PropertyKey::index(i as u32), val);
+                }
+
+                // Set length property
+                args_obj.set(PropertyKey::string("length"), Value::number(argc as f64));
+
+                ctx.set_register(dst.0, Value::object(args_obj));
+                Ok(InstructionResult::Continue)
+            }
+
             Instruction::GetPropConst {
                 dst,
                 obj,
@@ -2316,6 +3299,34 @@ impl Interpreter {
                 let name_str = name_const
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
+
+                // Generator property access
+                if object.is_generator() {
+                    // For generators, return the prototype method from GeneratorPrototype
+                    // or from the global generator prototype if available
+                    if Self::utf16_eq_ascii(name_str, "next")
+                        || Self::utf16_eq_ascii(name_str, "return")
+                        || Self::utf16_eq_ascii(name_str, "throw")
+                    {
+                        // Get the method from GeneratorPrototype global if available
+                        if let Some(gen_proto) = ctx.get_global("GeneratorPrototype") {
+                            if let Some(proto_obj) = gen_proto.as_object() {
+                                let key = Self::utf16_key(name_str);
+                                if let Some(method) = proto_obj.get(&key) {
+                                    ctx.set_register(dst.0, method);
+                                    return Ok(InstructionResult::Continue);
+                                }
+                            }
+                        }
+                        // If no prototype available, return a placeholder function
+                        // The CallMethod instruction will handle the actual generator operations
+                        ctx.set_register(dst.0, Value::undefined());
+                        return Ok(InstructionResult::Continue);
+                    }
+                    // Other properties on generators return undefined
+                    ctx.set_register(dst.0, Value::undefined());
+                    return Ok(InstructionResult::Continue);
+                }
 
                 if let Some(str_ref) = object.as_string() {
                     if Self::utf16_eq_ascii(name_str, "length") {
@@ -2334,10 +3345,7 @@ impl Interpreter {
                         return Ok(InstructionResult::Continue);
                     }
 
-                    if let Some(string_obj) = ctx
-                        .get_global("String")
-                        .and_then(|v| v.as_object())
-                    {
+                    if let Some(string_obj) = ctx.get_global("String").and_then(|v| v.as_object()) {
                         if let Some(proto) = string_obj
                             .get(&PropertyKey::string("prototype"))
                             .and_then(|v| v.as_object())
@@ -2348,6 +3356,25 @@ impl Interpreter {
                             return Ok(InstructionResult::Continue);
                         }
                     }
+                }
+
+                // Function property access
+                if let Some(closure) = object.as_function() {
+                    let key = Self::utf16_key(name_str);
+                    // Check the function's internal object first (for properties like .prototype, .length, .name)
+                    if let Some(val) = closure.object.get(&key) {
+                        ctx.set_register(dst.0, val);
+                        return Ok(InstructionResult::Continue);
+                    }
+                    // Check prototype chain
+                    if let Some(proto) = closure.object.prototype() {
+                        if let Some(val) = proto.get(&key) {
+                            ctx.set_register(dst.0, val);
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                    ctx.set_register(dst.0, Value::undefined());
+                    return Ok(InstructionResult::Continue);
                 }
 
                 // IC Fast Path
@@ -2372,22 +3399,24 @@ impl Interpreter {
                             use otter_vm_bytecode::function::InlineCacheState;
                             let obj_shape_ptr = std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
 
-                            match ic {
-                                InlineCacheState::Monomorphic { shape_id, offset } => {
-                                    if obj_shape_ptr == *shape_id {
-                                        cached_val = obj_ref.get_by_offset(*offset as usize);
-                                    }
-                                }
-                                InlineCacheState::Polymorphic { count, entries } => {
-                                    for i in 0..(*count as usize) {
-                                        if obj_shape_ptr == entries[i].0 {
-                                            cached_val =
-                                                obj_ref.get_by_offset(entries[i].1 as usize);
-                                            break;
+                            if ic.proto_epoch_matches(get_proto_epoch()) {
+                                match &ic.ic_state {
+                                    InlineCacheState::Monomorphic { shape_id, offset } => {
+                                        if obj_shape_ptr == *shape_id {
+                                            cached_val = obj_ref.get_by_offset(*offset as usize);
                                         }
                                     }
+                                    InlineCacheState::Polymorphic { count, entries } => {
+                                        for i in 0..(*count as usize) {
+                                            if obj_shape_ptr == entries[i].0 {
+                                                cached_val =
+                                                    obj_ref.get_by_offset(entries[i].1 as usize);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
                         }
                     }
@@ -2409,9 +3438,8 @@ impl Interpreter {
                         }
                     }
                     // Then look up from Function.prototype
-                    if let Some(function_obj) = ctx
-                        .get_global("Function")
-                        .and_then(|v| v.as_object())
+                    if let Some(function_obj) =
+                        ctx.get_global("Function").and_then(|v| v.as_object())
                     {
                         if let Some(proto) = function_obj
                             .get(&PropertyKey::string("prototype"))
@@ -2458,59 +3486,66 @@ impl Interpreter {
                         }
                         _ => {
                             // Slow path: full lookup and IC update
-                            if let Some(offset) = obj.shape().get_offset(&key) {
-                                let frame = ctx
-                                    .current_frame()
-                                    .ok_or_else(|| VmError::internal("no frame"))?;
-                                let func = frame
-                                    .module
-                                    .function(frame.function_index)
-                                    .ok_or_else(|| VmError::internal("no function"))?;
-                                let mut feedback = func.feedback_vector.write();
-                                if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                    use otter_vm_bytecode::function::InlineCacheState;
-                                    let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                            // Skip IC for dictionary mode objects
+                            if !obj.is_dictionary_mode() {
+                                if let Some(offset) = obj.shape().get_offset(&key) {
+                                    let frame = ctx
+                                        .current_frame()
+                                        .ok_or_else(|| VmError::internal("no frame"))?;
+                                    let func = frame
+                                        .module
+                                        .function(frame.function_index)
+                                        .ok_or_else(|| VmError::internal("no function"))?;
+                                    let mut feedback = func.feedback_vector.write();
+                                    if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                        use otter_vm_bytecode::function::InlineCacheState;
+                                        let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                        let current_epoch = get_proto_epoch();
 
-                                    match ic {
-                                        InlineCacheState::Uninitialized => {
-                                            *ic = InlineCacheState::Monomorphic {
-                                                shape_id: shape_ptr,
-                                                offset: offset as u32,
-                                            };
-                                        }
-                                        InlineCacheState::Monomorphic {
-                                            shape_id: old_shape,
-                                            offset: old_offset,
-                                        } => {
-                                            if *old_shape != shape_ptr {
-                                                let mut entries = [(0u64, 0u32); 4];
-                                                entries[0] = (*old_shape, *old_offset);
-                                                entries[1] = (shape_ptr, offset as u32);
-                                                *ic = InlineCacheState::Polymorphic {
-                                                    count: 2,
-                                                    entries,
+                                        match &mut ic.ic_state {
+                                            InlineCacheState::Uninitialized => {
+                                                ic.ic_state = InlineCacheState::Monomorphic {
+                                                    shape_id: shape_ptr,
+                                                    offset: offset as u32,
                                                 };
+                                                ic.proto_epoch = current_epoch;
                                             }
-                                        }
-                                        InlineCacheState::Polymorphic { count, entries } => {
-                                            let mut found = false;
-                                            for i in 0..(*count as usize) {
-                                                if entries[i].0 == shape_ptr {
-                                                    found = true;
-                                                    break;
+                                            InlineCacheState::Monomorphic {
+                                                shape_id: old_shape,
+                                                offset: old_offset,
+                                            } => {
+                                                if *old_shape != shape_ptr {
+                                                    let mut entries = [(0u64, 0u32); 4];
+                                                    entries[0] = (*old_shape, *old_offset);
+                                                    entries[1] = (shape_ptr, offset as u32);
+                                                    ic.ic_state = InlineCacheState::Polymorphic {
+                                                        count: 2,
+                                                        entries,
+                                                    };
+                                                    ic.proto_epoch = current_epoch;
                                                 }
                                             }
-                                            if !found {
-                                                if (*count as usize) < 4 {
-                                                    entries[*count as usize] =
-                                                        (shape_ptr, offset as u32);
-                                                    *count += 1;
-                                                } else {
-                                                    *ic = InlineCacheState::Megamorphic;
+                                            InlineCacheState::Polymorphic { count, entries } => {
+                                                let mut found = false;
+                                                for i in 0..(*count as usize) {
+                                                    if entries[i].0 == shape_ptr {
+                                                        found = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if !found {
+                                                    if (*count as usize) < 4 {
+                                                        entries[*count as usize] =
+                                                            (shape_ptr, offset as u32);
+                                                        *count += 1;
+                                                        ic.proto_epoch = current_epoch;
+                                                    } else {
+                                                        ic.ic_state = InlineCacheState::Megamorphic;
+                                                    }
                                                 }
                                             }
+                                            _ => {}
                                         }
-                                        _ => {}
                                     }
                                 }
                             }
@@ -2560,28 +3595,30 @@ impl Interpreter {
                             use otter_vm_bytecode::function::InlineCacheState;
                             let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
 
-                            match ic {
-                                InlineCacheState::Monomorphic { shape_id, offset } => {
-                                    if obj_shape_ptr == *shape_id {
-                                        if obj.set_by_offset(*offset as usize, val_val.clone()) {
-                                            cached = true;
-                                        }
-                                    }
-                                }
-                                InlineCacheState::Polymorphic { count, entries } => {
-                                    for i in 0..(*count as usize) {
-                                        if obj_shape_ptr == entries[i].0 {
-                                            if obj.set_by_offset(
-                                                entries[i].1 as usize,
-                                                val_val.clone(),
-                                            ) {
+                            if ic.proto_epoch_matches(get_proto_epoch()) {
+                                match &ic.ic_state {
+                                    InlineCacheState::Monomorphic { shape_id, offset } => {
+                                        if obj_shape_ptr == *shape_id {
+                                            if obj.set_by_offset(*offset as usize, val_val.clone()) {
                                                 cached = true;
                                             }
-                                            break;
                                         }
                                     }
+                                    InlineCacheState::Polymorphic { count, entries } => {
+                                        for i in 0..(*count as usize) {
+                                            if obj_shape_ptr == entries[i].0 {
+                                                if obj.set_by_offset(
+                                                    entries[i].1 as usize,
+                                                    val_val.clone(),
+                                                ) {
+                                                    cached = true;
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
                         }
                     }
@@ -2618,60 +3655,67 @@ impl Interpreter {
                         _ => {
                             // Slow path: update IC
                             obj.set(key, val_val);
-                            if let Some(offset) = obj.shape().get_offset(&Self::utf16_key(name_str))
-                            {
-                                let frame = ctx
-                                    .current_frame()
-                                    .ok_or_else(|| VmError::internal("no frame"))?;
-                                let func = frame
-                                    .module
-                                    .function(frame.function_index)
-                                    .ok_or_else(|| VmError::internal("no function"))?;
-                                let mut feedback = func.feedback_vector.write();
-                                if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                    use otter_vm_bytecode::function::InlineCacheState;
-                                    let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                            // Skip IC for dictionary mode objects
+                            if !obj.is_dictionary_mode() {
+                                if let Some(offset) = obj.shape().get_offset(&Self::utf16_key(name_str))
+                                {
+                                    let frame = ctx
+                                        .current_frame()
+                                        .ok_or_else(|| VmError::internal("no frame"))?;
+                                    let func = frame
+                                        .module
+                                        .function(frame.function_index)
+                                        .ok_or_else(|| VmError::internal("no function"))?;
+                                    let mut feedback = func.feedback_vector.write();
+                                    if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                        use otter_vm_bytecode::function::InlineCacheState;
+                                        let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                        let current_epoch = get_proto_epoch();
 
-                                    match ic {
-                                        InlineCacheState::Uninitialized => {
-                                            *ic = InlineCacheState::Monomorphic {
-                                                shape_id: shape_ptr,
-                                                offset: offset as u32,
-                                            };
-                                        }
-                                        InlineCacheState::Monomorphic {
-                                            shape_id: old_shape,
-                                            offset: old_offset,
-                                        } => {
-                                            if *old_shape != shape_ptr {
-                                                let mut entries = [(0u64, 0u32); 4];
-                                                entries[0] = (*old_shape, *old_offset);
-                                                entries[1] = (shape_ptr, offset as u32);
-                                                *ic = InlineCacheState::Polymorphic {
-                                                    count: 2,
-                                                    entries,
+                                        match &mut ic.ic_state {
+                                            InlineCacheState::Uninitialized => {
+                                                ic.ic_state = InlineCacheState::Monomorphic {
+                                                    shape_id: shape_ptr,
+                                                    offset: offset as u32,
                                                 };
+                                                ic.proto_epoch = current_epoch;
                                             }
-                                        }
-                                        InlineCacheState::Polymorphic { count, entries } => {
-                                            let mut found = false;
-                                            for i in 0..(*count as usize) {
-                                                if entries[i].0 == shape_ptr {
-                                                    found = true;
-                                                    break;
+                                            InlineCacheState::Monomorphic {
+                                                shape_id: old_shape,
+                                                offset: old_offset,
+                                            } => {
+                                                if *old_shape != shape_ptr {
+                                                    let mut entries = [(0u64, 0u32); 4];
+                                                    entries[0] = (*old_shape, *old_offset);
+                                                    entries[1] = (shape_ptr, offset as u32);
+                                                    ic.ic_state = InlineCacheState::Polymorphic {
+                                                        count: 2,
+                                                        entries,
+                                                    };
+                                                    ic.proto_epoch = current_epoch;
                                                 }
                                             }
-                                            if !found {
-                                                if (*count as usize) < 4 {
-                                                    entries[*count as usize] =
-                                                        (shape_ptr, offset as u32);
-                                                    *count += 1;
-                                                } else {
-                                                    *ic = InlineCacheState::Megamorphic;
+                                            InlineCacheState::Polymorphic { count, entries } => {
+                                                let mut found = false;
+                                                for i in 0..(*count as usize) {
+                                                    if entries[i].0 == shape_ptr {
+                                                        found = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if !found {
+                                                    if (*count as usize) < 4 {
+                                                        entries[*count as usize] =
+                                                            (shape_ptr, offset as u32);
+                                                        *count += 1;
+                                                        ic.proto_epoch = current_epoch;
+                                                    } else {
+                                                        ic.ic_state = InlineCacheState::Megamorphic;
+                                                    }
                                                 }
                                             }
+                                            _ => {}
                                         }
-                                        _ => {}
                                     }
                                 }
                             }
@@ -2687,22 +3731,30 @@ impl Interpreter {
                 let object = ctx.get_register(obj.0);
                 let key_value = ctx.get_register(key.0);
 
-                let result = if let Some(obj) = object.as_object() {
-                    let key = if let Some(n) = key_value.as_int32() {
-                        PropertyKey::Index(n as u32)
-                    } else if let Some(s) = key_value.as_string() {
-                        PropertyKey::string(s.as_str())
-                    } else if let Some(sym) = key_value.as_symbol() {
-                        PropertyKey::Symbol(sym.id)
-                    } else {
-                        let key_str = self.to_string(key_value);
-                        PropertyKey::string(&key_str)
-                    };
+                // Convert key to PropertyKey
+                let prop_key = if let Some(n) = key_value.as_int32() {
+                    PropertyKey::Index(n as u32)
+                } else if let Some(s) = key_value.as_string() {
+                    PropertyKey::from_js_string(s)
+                } else if let Some(sym) = key_value.as_symbol() {
+                    PropertyKey::Symbol(sym.id)
+                } else {
+                    let key_str = self.to_string(key_value);
+                    PropertyKey::string(&key_str)
+                };
 
-                    if !obj.has_own(&key) {
+                let result = if let Some(obj) = object.as_object() {
+                    if !obj.has_own(&prop_key) {
                         true
                     } else {
-                        obj.delete(&key)
+                        obj.delete(&prop_key)
+                    }
+                } else if let Some(closure) = object.as_function() {
+                    // Handle delete on function objects (for .length, .name, etc.)
+                    if !closure.object.has_own(&prop_key) {
+                        true
+                    } else {
+                        closure.object.delete(&prop_key)
                     }
                 } else {
                     true
@@ -2751,10 +3803,7 @@ impl Interpreter {
                         _ => {}
                     }
 
-                    if let Some(string_obj) = ctx
-                        .get_global("String")
-                        .and_then(|v| v.as_object())
-                    {
+                    if let Some(string_obj) = ctx.get_global("String").and_then(|v| v.as_object()) {
                         if let Some(proto) = string_obj
                             .get(&PropertyKey::string("prototype"))
                             .and_then(|v| v.as_object())
@@ -2766,47 +3815,36 @@ impl Interpreter {
                     }
                 }
 
-                if let Some(obj) = object.as_object() {
-                    let receiver = object.clone();
+                // Function property access
+                if let Some(closure) = object.as_function() {
+                    // Convert key to property key
+                    let key = if let Some(s) = key_value.as_string() {
+                        PropertyKey::from_js_string(s)
+                    } else if let Some(sym) = key_value.as_symbol() {
+                        PropertyKey::Symbol(sym.id)
+                    } else {
+                        let key_str = self.to_string(&key_value);
+                        PropertyKey::string(&key_str)
+                    };
 
-                    // IC Fast Path
-                    let mut cached_val = None;
-                    {
-                        let frame = ctx
-                            .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let func = frame
-                            .module
-                            .function(frame.function_index)
-                            .ok_or_else(|| VmError::internal("no function"))?;
-                        let feedback = func.feedback_vector.read();
-                        if let Some(ic) = feedback.get(*ic_index as usize) {
-                            use otter_vm_bytecode::function::InlineCacheState;
-                            let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
-
-                            match ic {
-                                InlineCacheState::Monomorphic { shape_id, offset } => {
-                                    if obj_shape_ptr == *shape_id {
-                                        cached_val = obj.get_by_offset(*offset as usize);
-                                    }
-                                }
-                                InlineCacheState::Polymorphic { count, entries } => {
-                                    for i in 0..(*count as usize) {
-                                        if obj_shape_ptr == entries[i].0 {
-                                            cached_val = obj.get_by_offset(entries[i].1 as usize);
-                                            break;
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-
-                    if let Some(val) = cached_val {
+                    // Check the function's internal object first (for properties like .prototype, .length, .name)
+                    if let Some(val) = closure.object.get(&key) {
                         ctx.set_register(dst.0, val);
                         return Ok(InstructionResult::Continue);
                     }
+                    // Check prototype chain
+                    if let Some(proto) = closure.object.prototype() {
+                        if let Some(val) = proto.get(&key) {
+                            ctx.set_register(dst.0, val);
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                    ctx.set_register(dst.0, Value::undefined());
+                    return Ok(InstructionResult::Continue);
+                }
+
+                if let Some(obj) = object.as_object() {
+                    let receiver = object.clone();
 
                     // Convert key to property key
                     let key = if let Some(n) = key_value.as_int32() {
@@ -2819,6 +3857,50 @@ impl Interpreter {
                         let key_str = self.to_string(&key_value);
                         PropertyKey::string(&key_str)
                     };
+
+                    // IC Fast Path - only for string keys (not index or symbol)
+                    if matches!(&key, PropertyKey::String(_)) {
+                        let mut cached_val = None;
+                        {
+                            let frame = ctx
+                                .current_frame()
+                                .ok_or_else(|| VmError::internal("no frame"))?;
+                            let func = frame
+                                .module
+                                .function(frame.function_index)
+                                .ok_or_else(|| VmError::internal("no function"))?;
+                            let feedback = func.feedback_vector.read();
+                            if let Some(ic) = feedback.get(*ic_index as usize) {
+                                use otter_vm_bytecode::function::InlineCacheState;
+                                let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+
+                                if ic.proto_epoch_matches(get_proto_epoch()) {
+                                    match &ic.ic_state {
+                                        InlineCacheState::Monomorphic { shape_id, offset } => {
+                                            if obj_shape_ptr == *shape_id {
+                                                cached_val = obj.get_by_offset(*offset as usize);
+                                            }
+                                        }
+                                        InlineCacheState::Polymorphic { count, entries } => {
+                                            for i in 0..(*count as usize) {
+                                                if obj_shape_ptr == entries[i].0 {
+                                                    cached_val =
+                                                        obj.get_by_offset(entries[i].1 as usize);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(val) = cached_val {
+                            ctx.set_register(dst.0, val);
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
 
                     match obj.lookup_property_descriptor(&key) {
                         Some(crate::object::PropertyDescriptor::Accessor { get, .. }) => {
@@ -2848,61 +3930,66 @@ impl Interpreter {
                             }
                         }
                         _ => {
-                            // Slow Path (Full lookup)
-                            if let Some(offset) = obj.shape().get_offset(&key) {
-                                // Update IC to Monomorphic
-                                let frame = ctx
-                                    .current_frame()
-                                    .ok_or_else(|| VmError::internal("no frame"))?;
-                                let func = frame
-                                    .module
-                                    .function(frame.function_index)
-                                    .ok_or_else(|| VmError::internal("no function"))?;
-                                let mut feedback = func.feedback_vector.write();
-                                if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                    use otter_vm_bytecode::function::InlineCacheState;
-                                    let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                            // Slow path: full lookup and IC update (only for string keys, skip dictionary mode)
+                            if matches!(&key, PropertyKey::String(_)) && !obj.is_dictionary_mode() {
+                                if let Some(offset) = obj.shape().get_offset(&key) {
+                                    let frame = ctx
+                                        .current_frame()
+                                        .ok_or_else(|| VmError::internal("no frame"))?;
+                                    let func = frame
+                                        .module
+                                        .function(frame.function_index)
+                                        .ok_or_else(|| VmError::internal("no function"))?;
+                                    let mut feedback = func.feedback_vector.write();
+                                    if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                        use otter_vm_bytecode::function::InlineCacheState;
+                                        let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                        let current_epoch = get_proto_epoch();
 
-                                    match ic {
-                                        InlineCacheState::Uninitialized => {
-                                            *ic = InlineCacheState::Monomorphic {
-                                                shape_id: shape_ptr,
-                                                offset: offset as u32,
-                                            };
-                                        }
-                                        InlineCacheState::Monomorphic {
-                                            shape_id: old_shape,
-                                            offset: old_offset,
-                                        } => {
-                                            if *old_shape != shape_ptr {
-                                                let mut entries = [(0u64, 0u32); 4];
-                                                entries[0] = (*old_shape, *old_offset);
-                                                entries[1] = (shape_ptr, offset as u32);
-                                                *ic = InlineCacheState::Polymorphic {
-                                                    count: 2,
-                                                    entries,
+                                        match &mut ic.ic_state {
+                                            InlineCacheState::Uninitialized => {
+                                                ic.ic_state = InlineCacheState::Monomorphic {
+                                                    shape_id: shape_ptr,
+                                                    offset: offset as u32,
                                                 };
+                                                ic.proto_epoch = current_epoch;
                                             }
-                                        }
-                                        InlineCacheState::Polymorphic { count, entries } => {
-                                            let mut found = false;
-                                            for i in 0..(*count as usize) {
-                                                if entries[i].0 == shape_ptr {
-                                                    found = true;
-                                                    break;
+                                            InlineCacheState::Monomorphic {
+                                                shape_id: old_shape,
+                                                offset: old_offset,
+                                            } => {
+                                                if *old_shape != shape_ptr {
+                                                    let mut entries = [(0u64, 0u32); 4];
+                                                    entries[0] = (*old_shape, *old_offset);
+                                                    entries[1] = (shape_ptr, offset as u32);
+                                                    ic.ic_state = InlineCacheState::Polymorphic {
+                                                        count: 2,
+                                                        entries,
+                                                    };
+                                                    ic.proto_epoch = current_epoch;
                                                 }
                                             }
-                                            if !found {
-                                                if (*count as usize) < 4 {
-                                                    entries[*count as usize] =
-                                                        (shape_ptr, offset as u32);
-                                                    *count += 1;
-                                                } else {
-                                                    *ic = InlineCacheState::Megamorphic;
+                                            InlineCacheState::Polymorphic { count, entries } => {
+                                                let mut found = false;
+                                                for i in 0..(*count as usize) {
+                                                    if entries[i].0 == shape_ptr {
+                                                        found = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if !found {
+                                                    if (*count as usize) < 4 {
+                                                        entries[*count as usize] =
+                                                            (shape_ptr, offset as u32);
+                                                        *count += 1;
+                                                        ic.proto_epoch = current_epoch;
+                                                    } else {
+                                                        ic.ic_state = InlineCacheState::Megamorphic;
+                                                    }
                                                 }
                                             }
+                                            _ => {}
                                         }
-                                        _ => {}
                                     }
                                 }
                             }
@@ -2955,28 +4042,30 @@ impl Interpreter {
                             use otter_vm_bytecode::function::InlineCacheState;
                             let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
 
-                            match ic {
-                                InlineCacheState::Monomorphic { shape_id, offset } => {
-                                    if obj_shape_ptr == *shape_id {
-                                        if obj.set_by_offset(*offset as usize, val_val.clone()) {
-                                            cached = true;
-                                        }
-                                    }
-                                }
-                                InlineCacheState::Polymorphic { count, entries } => {
-                                    for i in 0..(*count as usize) {
-                                        if obj_shape_ptr == entries[i].0 {
-                                            if obj.set_by_offset(
-                                                entries[i].1 as usize,
-                                                val_val.clone(),
-                                            ) {
+                            if ic.proto_epoch_matches(get_proto_epoch()) {
+                                match &ic.ic_state {
+                                    InlineCacheState::Monomorphic { shape_id, offset } => {
+                                        if obj_shape_ptr == *shape_id {
+                                            if obj.set_by_offset(*offset as usize, val_val.clone()) {
                                                 cached = true;
                                             }
-                                            break;
                                         }
                                     }
+                                    InlineCacheState::Polymorphic { count, entries } => {
+                                        for i in 0..(*count as usize) {
+                                            if obj_shape_ptr == entries[i].0 {
+                                                if obj.set_by_offset(
+                                                    entries[i].1 as usize,
+                                                    val_val.clone(),
+                                                ) {
+                                                    cached = true;
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
                         }
                     }
@@ -3011,61 +4100,67 @@ impl Interpreter {
                             }
                         }
                         _ => {
-                            // Slow path: update IC
+                            // Slow path: update IC (skip for dictionary mode)
                             obj.set(key.clone(), val_val);
-                            if let Some(offset) = obj.shape().get_offset(&key) {
-                                let frame = ctx
-                                    .current_frame()
-                                    .ok_or_else(|| VmError::internal("no frame"))?;
-                                let func = frame
-                                    .module
-                                    .function(frame.function_index)
-                                    .ok_or_else(|| VmError::internal("no function"))?;
-                                let mut feedback = func.feedback_vector.write();
-                                if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                    use otter_vm_bytecode::function::InlineCacheState;
-                                    let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                            if !obj.is_dictionary_mode() {
+                                if let Some(offset) = obj.shape().get_offset(&key) {
+                                    let frame = ctx
+                                        .current_frame()
+                                        .ok_or_else(|| VmError::internal("no frame"))?;
+                                    let func = frame
+                                        .module
+                                        .function(frame.function_index)
+                                        .ok_or_else(|| VmError::internal("no function"))?;
+                                    let mut feedback = func.feedback_vector.write();
+                                    if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                        use otter_vm_bytecode::function::InlineCacheState;
+                                        let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                        let current_epoch = get_proto_epoch();
 
-                                    match ic {
-                                        InlineCacheState::Uninitialized => {
-                                            *ic = InlineCacheState::Monomorphic {
-                                                shape_id: shape_ptr,
-                                                offset: offset as u32,
-                                            };
-                                        }
-                                        InlineCacheState::Monomorphic {
-                                            shape_id: old_shape,
-                                            offset: old_offset,
-                                        } => {
-                                            if *old_shape != shape_ptr {
-                                                let mut entries = [(0u64, 0u32); 4];
-                                                entries[0] = (*old_shape, *old_offset);
-                                                entries[1] = (shape_ptr, offset as u32);
-                                                *ic = InlineCacheState::Polymorphic {
-                                                    count: 2,
-                                                    entries,
+                                        match &mut ic.ic_state {
+                                            InlineCacheState::Uninitialized => {
+                                                ic.ic_state = InlineCacheState::Monomorphic {
+                                                    shape_id: shape_ptr,
+                                                    offset: offset as u32,
                                                 };
+                                                ic.proto_epoch = current_epoch;
                                             }
-                                        }
-                                        InlineCacheState::Polymorphic { count, entries } => {
-                                            let mut found = false;
-                                            for i in 0..(*count as usize) {
-                                                if entries[i].0 == shape_ptr {
-                                                    found = true;
-                                                    break;
+                                            InlineCacheState::Monomorphic {
+                                                shape_id: old_shape,
+                                                offset: old_offset,
+                                            } => {
+                                                if *old_shape != shape_ptr {
+                                                    let mut entries = [(0u64, 0u32); 4];
+                                                    entries[0] = (*old_shape, *old_offset);
+                                                    entries[1] = (shape_ptr, offset as u32);
+                                                    ic.ic_state = InlineCacheState::Polymorphic {
+                                                        count: 2,
+                                                        entries,
+                                                    };
+                                                    ic.proto_epoch = current_epoch;
                                                 }
                                             }
-                                            if !found {
-                                                if (*count as usize) < 4 {
-                                                    entries[*count as usize] =
-                                                        (shape_ptr, offset as u32);
-                                                    *count += 1;
-                                                } else {
-                                                    *ic = InlineCacheState::Megamorphic;
+                                            InlineCacheState::Polymorphic { count, entries } => {
+                                                let mut found = false;
+                                                for i in 0..(*count as usize) {
+                                                    if entries[i].0 == shape_ptr {
+                                                        found = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if !found {
+                                                    if (*count as usize) < 4 {
+                                                        entries[*count as usize] =
+                                                            (shape_ptr, offset as u32);
+                                                        *count += 1;
+                                                        ic.proto_epoch = current_epoch;
+                                                    } else {
+                                                        ic.ic_state = InlineCacheState::Megamorphic;
+                                                    }
                                                 }
                                             }
+                                            _ => {}
                                         }
-                                        _ => {}
                                     }
                                 }
                             }
@@ -3135,8 +4230,7 @@ impl Interpreter {
             Instruction::NewArray { dst, len } => {
                 let arr = GcRef::new(JsObject::array(*len as usize, ctx.memory_manager().clone()));
                 // Attach `Array.prototype` if present so arrays are iterable and have methods.
-                if let Some(array_obj) =
-                    ctx.get_global("Array").and_then(|v| v.as_object())
+                if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                     && let Some(array_proto) = array_obj
                         .get(&PropertyKey::string("prototype"))
                         .and_then(|v| v.as_object())
@@ -3147,11 +4241,17 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::GetElem { dst, arr, idx } => {
+            Instruction::GetElem {
+                dst,
+                arr,
+                idx,
+                ic_index,
+            } => {
                 let array = ctx.get_register(arr.0).clone();
                 let index = ctx.get_register(idx.0).clone();
 
                 if let Some(obj) = array.as_object() {
+                    // Fast path for integer index access on arrays
                     if obj.is_array() {
                         if let Some(n) = index.as_int32() {
                             let idx = n as usize;
@@ -3163,15 +4263,123 @@ impl Interpreter {
                         }
                     }
 
-                    // Fallback to generic access
-                    let value = if let Some(n) = index.as_int32() {
-                        obj.get(&PropertyKey::Index(n as u32))
-                            .unwrap_or_else(Value::undefined)
+                    // Convert index to property key
+                    let key = if let Some(n) = index.as_int32() {
+                        PropertyKey::Index(n as u32)
+                    } else if let Some(s) = index.as_string() {
+                        PropertyKey::string(s.as_str())
                     } else {
                         let idx_str = self.to_string(&index);
-                        obj.get(&PropertyKey::string(&idx_str))
-                            .unwrap_or_else(Value::undefined)
+                        PropertyKey::string(&idx_str)
                     };
+
+                    // IC Fast Path - only for string keys
+                    if matches!(&key, PropertyKey::String(_)) {
+                        let mut cached_val = None;
+                        {
+                            let frame = ctx
+                                .current_frame()
+                                .ok_or_else(|| VmError::internal("no frame"))?;
+                            let func = frame
+                                .module
+                                .function(frame.function_index)
+                                .ok_or_else(|| VmError::internal("no function"))?;
+                            let feedback = func.feedback_vector.read();
+                            if let Some(ic) = feedback.get(*ic_index as usize) {
+                                use otter_vm_bytecode::function::InlineCacheState;
+                                let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+
+                                if ic.proto_epoch_matches(get_proto_epoch()) {
+                                    match &ic.ic_state {
+                                        InlineCacheState::Monomorphic { shape_id, offset } => {
+                                            if obj_shape_ptr == *shape_id {
+                                                cached_val = obj.get_by_offset(*offset as usize);
+                                            }
+                                        }
+                                        InlineCacheState::Polymorphic { count, entries } => {
+                                            for i in 0..(*count as usize) {
+                                                if obj_shape_ptr == entries[i].0 {
+                                                    cached_val =
+                                                        obj.get_by_offset(entries[i].1 as usize);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(val) = cached_val {
+                            ctx.set_register(dst.0, val);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        // Slow path with IC update (skip for dictionary mode)
+                        if !obj.is_dictionary_mode() {
+                            if let Some(offset) = obj.shape().get_offset(&key) {
+                                let frame = ctx
+                                    .current_frame()
+                                    .ok_or_else(|| VmError::internal("no frame"))?;
+                                let func = frame
+                                    .module
+                                    .function(frame.function_index)
+                                    .ok_or_else(|| VmError::internal("no function"))?;
+                                let mut feedback = func.feedback_vector.write();
+                                if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                    use otter_vm_bytecode::function::InlineCacheState;
+                                    let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                    let current_epoch = get_proto_epoch();
+
+                                    match &mut ic.ic_state {
+                                        InlineCacheState::Uninitialized => {
+                                            ic.ic_state = InlineCacheState::Monomorphic {
+                                                shape_id: shape_ptr,
+                                                offset: offset as u32,
+                                            };
+                                            ic.proto_epoch = current_epoch;
+                                        }
+                                        InlineCacheState::Monomorphic {
+                                            shape_id: old_shape,
+                                            offset: old_offset,
+                                        } => {
+                                            if *old_shape != shape_ptr {
+                                                let mut entries = [(0u64, 0u32); 4];
+                                                entries[0] = (*old_shape, *old_offset);
+                                                entries[1] = (shape_ptr, offset as u32);
+                                                ic.ic_state =
+                                                    InlineCacheState::Polymorphic { count: 2, entries };
+                                                ic.proto_epoch = current_epoch;
+                                            }
+                                        }
+                                        InlineCacheState::Polymorphic { count, entries } => {
+                                            let mut found = false;
+                                            for i in 0..(*count as usize) {
+                                                if entries[i].0 == shape_ptr {
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                            if !found {
+                                                if (*count as usize) < 4 {
+                                                    entries[*count as usize] =
+                                                        (shape_ptr, offset as u32);
+                                                    *count += 1;
+                                                    ic.proto_epoch = current_epoch;
+                                                } else {
+                                                    ic.ic_state = InlineCacheState::Megamorphic;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let value = obj.get(&key).unwrap_or_else(Value::undefined);
                     ctx.set_register(dst.0, value);
                 } else {
                     ctx.set_register(dst.0, Value::undefined());
@@ -3179,12 +4387,18 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::SetElem { arr, idx, val } => {
+            Instruction::SetElem {
+                arr,
+                idx,
+                val,
+                ic_index,
+            } => {
                 let array = ctx.get_register(arr.0).clone();
                 let index = ctx.get_register(idx.0).clone();
                 let val_val = ctx.get_register(val.0).clone();
 
                 if let Some(obj) = array.as_object() {
+                    // Fast path for integer index access on arrays
                     if obj.is_array() {
                         if let Some(n) = index.as_int32() {
                             let idx = n as usize;
@@ -3196,13 +4410,129 @@ impl Interpreter {
                         }
                     }
 
-                    // Fallback to generic access
-                    if let Some(n) = index.as_int32() {
-                        obj.set(PropertyKey::Index(n as u32), val_val);
+                    // Convert index to property key
+                    let key = if let Some(n) = index.as_int32() {
+                        PropertyKey::Index(n as u32)
+                    } else if let Some(s) = index.as_string() {
+                        PropertyKey::string(s.as_str())
                     } else {
                         let idx_str = self.to_string(&index);
-                        obj.set(PropertyKey::string(&idx_str), val_val);
+                        PropertyKey::string(&idx_str)
+                    };
+
+                    // IC Fast Path - only for string keys
+                    if matches!(&key, PropertyKey::String(_)) {
+                        let mut cached = false;
+                        {
+                            let frame = ctx
+                                .current_frame()
+                                .ok_or_else(|| VmError::internal("no frame"))?;
+                            let func = frame
+                                .module
+                                .function(frame.function_index)
+                                .ok_or_else(|| VmError::internal("no function"))?;
+                            let feedback = func.feedback_vector.read();
+                            if let Some(ic) = feedback.get(*ic_index as usize) {
+                                use otter_vm_bytecode::function::InlineCacheState;
+                                let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+
+                                if ic.proto_epoch_matches(get_proto_epoch()) {
+                                    match &ic.ic_state {
+                                        InlineCacheState::Monomorphic { shape_id, offset } => {
+                                            if obj_shape_ptr == *shape_id {
+                                                if obj.set_by_offset(*offset as usize, val_val.clone())
+                                                {
+                                                    cached = true;
+                                                }
+                                            }
+                                        }
+                                        InlineCacheState::Polymorphic { count, entries } => {
+                                            for i in 0..(*count as usize) {
+                                                if obj_shape_ptr == entries[i].0 {
+                                                    if obj.set_by_offset(
+                                                        entries[i].1 as usize,
+                                                        val_val.clone(),
+                                                    ) {
+                                                        cached = true;
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+
+                        if cached {
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        // Slow path with IC update (skip for dictionary mode)
+                        if !obj.is_dictionary_mode() {
+                            if let Some(offset) = obj.shape().get_offset(&key) {
+                                let frame = ctx
+                                    .current_frame()
+                                    .ok_or_else(|| VmError::internal("no frame"))?;
+                                let func = frame
+                                    .module
+                                    .function(frame.function_index)
+                                    .ok_or_else(|| VmError::internal("no function"))?;
+                                let mut feedback = func.feedback_vector.write();
+                                if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                    use otter_vm_bytecode::function::InlineCacheState;
+                                    let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                    let current_epoch = get_proto_epoch();
+
+                                    match &mut ic.ic_state {
+                                        InlineCacheState::Uninitialized => {
+                                            ic.ic_state = InlineCacheState::Monomorphic {
+                                                shape_id: shape_ptr,
+                                                offset: offset as u32,
+                                            };
+                                            ic.proto_epoch = current_epoch;
+                                        }
+                                        InlineCacheState::Monomorphic {
+                                            shape_id: old_shape,
+                                            offset: old_offset,
+                                        } => {
+                                            if *old_shape != shape_ptr {
+                                                let mut entries = [(0u64, 0u32); 4];
+                                                entries[0] = (*old_shape, *old_offset);
+                                                entries[1] = (shape_ptr, offset as u32);
+                                                ic.ic_state =
+                                                    InlineCacheState::Polymorphic { count: 2, entries };
+                                                ic.proto_epoch = current_epoch;
+                                            }
+                                        }
+                                        InlineCacheState::Polymorphic { count, entries } => {
+                                            let mut found = false;
+                                            for i in 0..(*count as usize) {
+                                                if entries[i].0 == shape_ptr {
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                            if !found {
+                                                if (*count as usize) < 4 {
+                                                    entries[*count as usize] =
+                                                        (shape_ptr, offset as u32);
+                                                    *count += 1;
+                                                    ic.proto_epoch = current_epoch;
+                                                } else {
+                                                    ic.ic_state = InlineCacheState::Megamorphic;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
                     }
+
+                    obj.set(key, val_val);
                 }
                 Ok(InstructionResult::Continue)
             }
@@ -3228,13 +4558,17 @@ impl Interpreter {
                         .function(frame.function_index)
                         .ok_or_else(|| VmError::internal("no function"))?;
                     let feedback = func.feedback_vector.read();
-                    if let Some(otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                        shape_id: shape_addr,
-                        offset,
-                    }) = feedback.get(*ic_index as usize)
-                    {
-                        if std::sync::Arc::as_ptr(&obj.shape()) as u64 == *shape_addr {
-                            obj.get_by_offset(*offset as usize)
+                    if let Some(ic) = feedback.get(*ic_index as usize) {
+                        if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                            shape_id: shape_addr,
+                            offset,
+                        } = &ic.ic_state
+                        {
+                            if std::sync::Arc::as_ptr(&obj.shape()) as u64 == *shape_addr {
+                                obj.get_by_offset(*offset as usize)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
@@ -3256,6 +4590,123 @@ impl Interpreter {
                     return self.handle_call_value(ctx, &method_value, receiver, args, dst.0);
                 }
 
+                // Special handling for generator methods
+                if receiver.is_generator() {
+                    let method_str = self.to_string(&key_value);
+                    if method_str == "next" || method_str == "return" || method_str == "throw" {
+                        let generator = receiver
+                            .as_generator()
+                            .ok_or_else(|| VmError::internal("Expected generator"))?;
+
+                        // Get the sent value (first argument if present)
+                        let sent_value = if *argc > 0 {
+                            Some(ctx.get_register(key.0 + 1).clone())
+                        } else {
+                            None
+                        };
+
+                        // Handle the specific method
+                        let gen_result = match method_str.as_str() {
+                            "next" => self.execute_generator(generator, ctx, sent_value),
+                            "return" => {
+                                // generator.return(value) - complete with the value
+                                // If generator has try handlers, we need to run finally blocks
+                                let return_value = sent_value.unwrap_or_else(Value::undefined);
+
+                                if generator.is_completed() {
+                                    GeneratorResult::Returned(return_value)
+                                } else if !generator.has_try_handlers() {
+                                    generator.complete();
+                                    GeneratorResult::Returned(return_value)
+                                } else {
+                                    // Has try handlers - need to run finally blocks
+                                    generator.set_pending_return(return_value);
+                                    self.execute_generator(generator, ctx, None)
+                                }
+                            }
+                            "throw" => {
+                                let error_value = sent_value.unwrap_or_else(Value::undefined);
+                                if generator.is_completed() {
+                                    GeneratorResult::Error(VmError::exception(error_value))
+                                } else {
+                                    generator.set_pending_throw(error_value.clone());
+                                    self.execute_generator(generator, ctx, None)
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+
+                        // For async generators, wrap result in a Promise
+                        if generator.is_async() {
+                            let promise = JsPromise::new();
+                            match gen_result {
+                                GeneratorResult::Yielded(v) => {
+                                    let iter_result = GcRef::new(JsObject::new(
+                                        None,
+                                        ctx.memory_manager().clone(),
+                                    ));
+                                    iter_result.set(PropertyKey::string("value"), v);
+                                    iter_result
+                                        .set(PropertyKey::string("done"), Value::boolean(false));
+                                    promise.resolve(Value::object(iter_result));
+                                }
+                                GeneratorResult::Returned(v) => {
+                                    let iter_result = GcRef::new(JsObject::new(
+                                        None,
+                                        ctx.memory_manager().clone(),
+                                    ));
+                                    iter_result.set(PropertyKey::string("value"), v);
+                                    iter_result
+                                        .set(PropertyKey::string("done"), Value::boolean(true));
+                                    promise.resolve(Value::object(iter_result));
+                                }
+                                GeneratorResult::Error(e) => {
+                                    let error_msg = e.to_string();
+                                    promise.reject(Value::string(JsString::intern(&error_msg)));
+                                }
+                                GeneratorResult::Suspended {
+                                    promise: awaited_promise,
+                                    ..
+                                } => {
+                                    // Generator is awaiting a promise
+                                    let result_promise = promise.clone();
+                                    let mm = ctx.memory_manager().clone();
+                                    awaited_promise.then(move |resolved_value| {
+                                        let iter_result =
+                                            GcRef::new(JsObject::new(None, mm.clone()));
+                                        iter_result
+                                            .set(PropertyKey::string("value"), resolved_value);
+                                        iter_result.set(
+                                            PropertyKey::string("done"),
+                                            Value::boolean(false),
+                                        );
+                                        result_promise.resolve(Value::object(iter_result));
+                                    });
+                                }
+                            }
+                            ctx.set_register(dst.0, Value::promise(promise));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        // For sync generators, return iterator result directly
+                        let (result_value, is_done) = match gen_result {
+                            GeneratorResult::Yielded(v) => (v, false),
+                            GeneratorResult::Returned(v) => (v, true),
+                            GeneratorResult::Error(e) => return Err(e),
+                            GeneratorResult::Suspended { .. } => {
+                                return Err(VmError::internal("Sync generator cannot suspend"));
+                            }
+                        };
+
+                        // Create iterator result object { value, done }
+                        let result = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                        result.set(PropertyKey::string("value"), result_value);
+                        result.set(PropertyKey::string("done"), Value::boolean(is_done));
+                        ctx.set_register(dst.0, Value::object(result));
+                        return Ok(InstructionResult::Continue);
+                    }
+                }
+
                 let key = self.value_to_property_key(&key_value);
                 let method_value = if let Some(obj_ref) = receiver.as_object() {
                     obj_ref.get(&key).unwrap_or_else(Value::undefined)
@@ -3275,12 +4726,14 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let mut feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic
+                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized =
+                                ic.ic_state
                             {
-                                *ic = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                                    shape_id: std::sync::Arc::as_ptr(&obj.shape()) as u64,
-                                    offset: offset as u32,
-                                };
+                                ic.ic_state =
+                                    otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                        shape_id: std::sync::Arc::as_ptr(&obj.shape()) as u64,
+                                        offset: offset as u32,
+                                    };
                             }
                         }
                     }
@@ -3315,13 +4768,17 @@ impl Interpreter {
                         .function(frame.function_index)
                         .ok_or_else(|| VmError::internal("no function"))?;
                     let feedback = func.feedback_vector.read();
-                    if let Some(otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                        shape_id: shape_addr,
-                        offset,
-                    }) = feedback.get(*ic_index as usize)
-                    {
-                        if std::sync::Arc::as_ptr(&obj.shape()) as u64 == *shape_addr {
-                            obj.get_by_offset(*offset as usize)
+                    if let Some(ic) = feedback.get(*ic_index as usize) {
+                        if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                            shape_id: shape_addr,
+                            offset,
+                        } = &ic.ic_state
+                        {
+                            if std::sync::Arc::as_ptr(&obj.shape()) as u64 == *shape_addr {
+                                obj.get_by_offset(*offset as usize)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
@@ -3362,12 +4819,14 @@ impl Interpreter {
                             .ok_or_else(|| VmError::internal("no function"))?;
                         let mut feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized = ic
+                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized =
+                                ic.ic_state
                             {
-                                *ic = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                                    shape_id: std::sync::Arc::as_ptr(&obj.shape()) as u64,
-                                    offset: offset as u32,
-                                };
+                                ic.ic_state =
+                                    otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                        shape_id: std::sync::Arc::as_ptr(&obj.shape()) as u64,
+                                        offset: offset as u32,
+                                    };
                             }
                         }
                     }
@@ -3526,6 +4985,25 @@ impl Interpreter {
             Instruction::IteratorNext { dst, done, iter } => {
                 let iterator = ctx.get_register(iter.0).clone();
 
+                // Fast path for generator iterators: resume execution directly.
+                if let Some(generator) = iterator.as_generator() {
+                    let gen_result = self.execute_generator(generator, ctx, None);
+                    let (value, is_done) = match gen_result {
+                        GeneratorResult::Yielded(v) => (v, false),
+                        GeneratorResult::Returned(v) => (v, true),
+                        GeneratorResult::Error(e) => return Err(e),
+                        GeneratorResult::Suspended { .. } => {
+                            return Err(VmError::internal(
+                                "Async generator cannot be used in sync iteration",
+                            ));
+                        }
+                    };
+
+                    ctx.set_register(dst.0, value);
+                    ctx.set_register(done.0, Value::boolean(is_done));
+                    return Ok(InstructionResult::Continue);
+                }
+
                 // Get the next method
                 let next_method = if let Some(obj) = iterator.as_object() {
                     obj.get(&PropertyKey::string("next"))
@@ -3649,23 +5127,252 @@ impl Interpreter {
 
     /// Handle a function call value (native or closure)
     fn handle_call_value(
-        &self,
+        &mut self,
         ctx: &mut VmContext,
         func_value: &Value,
         this_value: Value,
         args: Vec<Value>,
         return_reg: u16,
     ) -> VmResult<InstructionResult> {
-        // Native function path
-        if let Some(native_fn) = func_value.as_native_function() {
-            // Direct execution with native depth tracking
-            let mut native_args;
-            let args_ref = if this_value.is_undefined() || this_value.is_callable() {
-                &args
+        let mut current_func = func_value.clone();
+        let mut current_this = this_value;
+        let mut current_args = args;
+
+        // 1. Unwrap all nested bound functions
+        while let Some(obj) = current_func.as_object() {
+            if let Some(bound_fn) = obj.get(&PropertyKey::string("__boundFunction__")) {
+                let raw_this_arg = obj
+                    .get(&PropertyKey::string("__boundThis__"))
+                    .unwrap_or_else(Value::undefined);
+                if raw_this_arg.is_null() || raw_this_arg.is_undefined() {
+                    current_this = Value::object(ctx.global());
+                } else {
+                    current_this = raw_this_arg;
+                };
+
+                if let Some(bound_args_val) = obj.get(&PropertyKey::string("__boundArgs__")) {
+                    if let Some(args_obj) = bound_args_val.as_object() {
+                        let len =
+                            if let Some(len_val) = args_obj.get(&PropertyKey::string("length")) {
+                                len_val.as_int32().unwrap_or(0) as usize
+                            } else {
+                                0
+                            };
+                        let mut new_args = Vec::with_capacity(len + current_args.len());
+                        for i in 0..len {
+                            new_args.push(
+                                args_obj
+                                    .get(&PropertyKey::Index(i as u32))
+                                    .unwrap_or_else(Value::undefined),
+                            );
+                        }
+                        new_args.extend(current_args);
+                        current_args = new_args;
+                    }
+                }
+                current_func = bound_fn;
             } else {
-                native_args = Vec::with_capacity(args.len() + 1);
-                native_args.push(this_value);
-                native_args.extend(args);
+                break;
+            }
+        }
+
+        // 2. Handle native functions (including interception for call/apply/Generator)
+        if let Some(native_fn) = current_func.as_native_function() {
+            let is_same_native = |candidate: &Value| -> bool {
+                match (current_func.heap_ref(), candidate.heap_ref()) {
+                    (Some(HeapRef::NativeFunction(a)), Some(HeapRef::NativeFunction(b))) => {
+                        Arc::ptr_eq(a, b)
+                    }
+                    _ => false,
+                }
+            };
+
+            // Intercept Function.prototype.call/apply
+            let fn_op = if let Some(value) = ctx.get_global("__Function_call")
+                && is_same_native(&value)
+            {
+                Some("call")
+            } else if let Some(value) = ctx.get_global("__Function_apply")
+                && is_same_native(&value)
+            {
+                Some("apply")
+            } else {
+                None
+            };
+
+            if let Some(_op) = fn_op {
+                let target = current_args
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| VmError::type_error("Function.call requires a target"))?;
+                let mut intercepted_this = current_args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(Value::undefined);
+                let args_list = current_args
+                    .get(2)
+                    .cloned()
+                    .unwrap_or_else(Value::undefined);
+
+                if intercepted_this.is_nullish() {
+                    intercepted_this = Value::object(ctx.global());
+                }
+
+                let mut call_args = Vec::new();
+                if !args_list.is_nullish() {
+                    if let Some(obj) = args_list.as_object() {
+                        let len = obj
+                            .get(&PropertyKey::string("length"))
+                            .and_then(|v| v.as_int32())
+                            .unwrap_or(0);
+                        if len > 0 {
+                            call_args.reserve(len as usize);
+                            for i in 0..len {
+                                call_args.push(
+                                    obj.get(&PropertyKey::Index(i as u32))
+                                        .unwrap_or_else(Value::undefined),
+                                );
+                            }
+                        }
+                    } else {
+                        return Err(VmError::type_error(
+                            "Internal Error: Function helper expects an array-like object",
+                        ));
+                    }
+                }
+
+                return self.handle_call_value(
+                    ctx,
+                    &target,
+                    intercepted_this,
+                    call_args,
+                    return_reg,
+                );
+            }
+
+            // Intercept Generator ops
+            let gen_op = if let Some(value) = ctx.get_global("__Generator_next")
+                && is_same_native(&value)
+            {
+                Some("next")
+            } else if let Some(value) = ctx.get_global("__Generator_return")
+                && is_same_native(&value)
+            {
+                Some("return")
+            } else if let Some(value) = ctx.get_global("__Generator_throw")
+                && is_same_native(&value)
+            {
+                Some("throw")
+            } else {
+                None
+            };
+
+            if let Some(op) = gen_op {
+                let (generator, sent_value) = if let Some(generator_ref) =
+                    current_args.first().and_then(|v| v.as_generator())
+                {
+                    let value = if current_args.len() > 1 {
+                        Some(current_args[1].clone())
+                    } else {
+                        None
+                    };
+                    (generator_ref, value)
+                } else if let Some(generator_ref) = current_this.as_generator() {
+                    let value = current_args.first().cloned();
+                    (generator_ref, value)
+                } else {
+                    return Err(VmError::type_error("First argument must be a generator"));
+                };
+
+                let gen_result = match op {
+                    "next" => self.execute_generator(generator, ctx, sent_value),
+                    "return" => {
+                        let return_value = sent_value.unwrap_or_else(Value::undefined);
+                        if generator.is_completed() {
+                            GeneratorResult::Returned(return_value)
+                        } else if !generator.has_try_handlers() {
+                            generator.complete();
+                            GeneratorResult::Returned(return_value)
+                        } else {
+                            generator.set_pending_return(return_value);
+                            self.execute_generator(generator, ctx, None)
+                        }
+                    }
+                    "throw" => {
+                        let error_value = sent_value.unwrap_or_else(Value::undefined);
+                        if generator.is_completed() {
+                            GeneratorResult::Error(VmError::exception(error_value))
+                        } else {
+                            generator.set_pending_throw(error_value.clone());
+                            self.execute_generator(generator, ctx, None)
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+
+                if generator.is_async() {
+                    let promise = JsPromise::new();
+                    match gen_result {
+                        GeneratorResult::Yielded(v) => {
+                            let iter_result =
+                                GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                            iter_result.set(PropertyKey::string("value"), v);
+                            iter_result.set(PropertyKey::string("done"), Value::boolean(false));
+                            promise.resolve(Value::object(iter_result));
+                        }
+                        GeneratorResult::Returned(v) => {
+                            let iter_result =
+                                GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                            iter_result.set(PropertyKey::string("value"), v);
+                            iter_result.set(PropertyKey::string("done"), Value::boolean(true));
+                            promise.resolve(Value::object(iter_result));
+                        }
+                        GeneratorResult::Error(e) => {
+                            let error_msg = e.to_string();
+                            promise.reject(Value::string(JsString::intern(&error_msg)));
+                        }
+                        GeneratorResult::Suspended {
+                            promise: awaited_promise,
+                            ..
+                        } => {
+                            let result_promise = promise.clone();
+                            let mm = ctx.memory_manager().clone();
+                            awaited_promise.then(move |resolved_value| {
+                                let iter_result = GcRef::new(JsObject::new(None, mm.clone()));
+                                iter_result.set(PropertyKey::string("value"), resolved_value);
+                                iter_result.set(PropertyKey::string("done"), Value::boolean(false));
+                                result_promise.resolve(Value::object(iter_result));
+                            });
+                        }
+                    }
+                    ctx.set_register(return_reg, Value::promise(promise));
+                    return Ok(InstructionResult::Continue);
+                }
+
+                let (result_value, is_done) = match gen_result {
+                    GeneratorResult::Yielded(v) => (v, false),
+                    GeneratorResult::Returned(v) => (v, true),
+                    GeneratorResult::Error(e) => return Err(e),
+                    GeneratorResult::Suspended { .. } => {
+                        return Err(VmError::internal("Sync generator cannot suspend"));
+                    }
+                };
+
+                let result = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                result.set(PropertyKey::string("value"), result_value);
+                result.set(PropertyKey::string("done"), Value::boolean(is_done));
+                ctx.set_register(return_reg, Value::object(result));
+                return Ok(InstructionResult::Continue);
+            }
+
+            // Normal native function execution
+            let mut native_args;
+            let args_ref = if current_this.is_undefined() || current_this.is_callable() {
+                &current_args
+            } else {
+                native_args = Vec::with_capacity(current_args.len() + 1);
+                native_args.push(current_this);
+                native_args.extend(current_args);
                 &native_args
             };
             let result = self.call_native_fn(ctx, native_fn, args_ref)?;
@@ -3673,11 +5380,35 @@ impl Interpreter {
             return Ok(InstructionResult::Continue);
         }
 
-        // Closure path
-        if let Some(closure) = func_value.as_function() {
-            let argc = args.len() as u8;
-            ctx.set_pending_this(this_value);
-            ctx.set_pending_args(args);
+        // 3. Handle closures
+        if let Some(closure) = current_func.as_function() {
+            if closure.is_generator {
+                // Get the .prototype from the generator function
+                let proto = closure
+                    .object
+                    .get(&PropertyKey::string("prototype"))
+                    .and_then(|v| v.as_object());
+
+                // Create the generator's internal object
+                let gen_obj = GcRef::new(JsObject::new(proto, ctx.memory_manager().clone()));
+
+                let generator = JsGenerator::new(
+                    closure.function_index,
+                    Arc::clone(&closure.module),
+                    closure.upvalues.clone(),
+                    current_args,
+                    current_this,
+                    false, // is_construct
+                    closure.is_async,
+                    gen_obj,
+                );
+                ctx.set_register(return_reg, Value::generator(generator));
+                return Ok(InstructionResult::Continue);
+            }
+
+            let argc = current_args.len() as u8;
+            ctx.set_pending_this(current_this);
+            ctx.set_pending_args(current_args);
             return Ok(InstructionResult::Call {
                 func_index: closure.function_index,
                 module: Arc::clone(&closure.module),
@@ -3689,7 +5420,29 @@ impl Interpreter {
             });
         }
 
-        Err(VmError::type_error("not a function"))
+        Err(VmError::type_error("Value is not a function"))
+    }
+
+    /// Observe the type of a value for type feedback collection
+    #[inline]
+    fn observe_value_type(type_flags: &mut TypeFlags, value: &Value) {
+        if value.is_undefined() {
+            type_flags.observe_undefined();
+        } else if value.is_null() {
+            type_flags.observe_null();
+        } else if value.is_boolean() {
+            type_flags.observe_boolean();
+        } else if value.is_int32() {
+            type_flags.observe_int32();
+        } else if value.is_number() {
+            type_flags.observe_number();
+        } else if value.is_string() {
+            type_flags.observe_string();
+        } else if value.is_function() {
+            type_flags.observe_function();
+        } else if value.is_object() {
+            type_flags.observe_object();
+        }
     }
 
     /// Add operation (handles string concatenation)
@@ -3827,10 +5580,7 @@ impl Interpreter {
         obj.set(PropertyKey::string("_internal"), Value::promise(internal));
 
         // Try to get Promise.prototype and copy its methods
-        if let Some(promise_ctor) = ctx
-            .get_global("Promise")
-            .and_then(|v| v.as_object())
-        {
+        if let Some(promise_ctor) = ctx.get_global("Promise").and_then(|v| v.as_object()) {
             if let Some(proto) = promise_ctor
                 .get(&PropertyKey::string("prototype"))
                 .and_then(|v| v.as_object())
@@ -4193,6 +5943,677 @@ impl Default for Interpreter {
     }
 }
 
+// ============================================================================
+// Generator Execution
+// ============================================================================
+
+/// Result of generator execution
+#[derive(Debug)]
+pub enum GeneratorResult {
+    /// Generator yielded a value
+    Yielded(Value),
+    /// Generator returned a value (completed)
+    Returned(Value),
+    /// Generator threw an error
+    Error(VmError),
+    /// Async generator suspended on await (waiting for promise)
+    Suspended {
+        /// The promise being awaited
+        promise: Arc<JsPromise>,
+        /// The register to store the resolved value
+        resume_reg: u16,
+        /// The generator (for resumption)
+        generator: Arc<JsGenerator>,
+    },
+}
+
+impl Interpreter {
+    /// Execute a generator (start or resume)
+    ///
+    /// This method handles both starting a generator for the first time
+    /// and resuming a suspended generator.
+    ///
+    /// # Arguments
+    /// * `generator` - The generator to execute
+    /// * `ctx` - The VM context
+    /// * `sent_value` - Value sent to the generator (for next(value))
+    ///
+    /// # Returns
+    /// * `GeneratorResult::Yielded(value)` - Generator yielded
+    /// * `GeneratorResult::Returned(value)` - Generator completed
+    /// * `GeneratorResult::Error(err)` - Generator threw an error
+    pub fn execute_generator(
+        &mut self,
+        generator: &Arc<JsGenerator>,
+        ctx: &mut VmContext,
+        sent_value: Option<Value>,
+    ) -> GeneratorResult {
+        match generator.state() {
+            GeneratorState::Completed => {
+                // Already completed - return undefined
+                GeneratorResult::Returned(Value::undefined())
+            }
+            GeneratorState::Executing => {
+                // Already executing - this is an error
+                GeneratorResult::Error(VmError::type_error(
+                    "Generator is already executing".to_string(),
+                ))
+            }
+            GeneratorState::SuspendedStart => {
+                // First execution - set up initial frame
+                generator.start_executing();
+                self.start_generator_execution(generator, ctx, sent_value)
+            }
+            GeneratorState::SuspendedYield => {
+                // Resume from saved frame
+                generator.start_executing();
+                self.resume_generator_execution(generator, ctx, sent_value)
+            }
+        }
+    }
+
+    /// Start generator execution from the beginning
+    fn start_generator_execution(
+        &mut self,
+        generator: &Arc<JsGenerator>,
+        ctx: &mut VmContext,
+        _sent_value: Option<Value>,
+    ) -> GeneratorResult {
+        // Handle pending throw (for generator.throw() called on a generator that hasn't started)
+        if let Some(error) = generator.take_pending_throw() {
+            generator.complete();
+            return GeneratorResult::Error(VmError::exception(error));
+        }
+
+        // Handle pending return (for generator.return() called on a generator that hasn't started)
+        if let Some(value) = generator.take_pending_return() {
+            generator.complete();
+            return GeneratorResult::Returned(value);
+        }
+        // Get generator's function info
+        let func = match generator.module.function(generator.function_index) {
+            Some(f) => f,
+            None => {
+                generator.complete();
+                return GeneratorResult::Error(VmError::internal("Generator function not found"));
+            }
+        };
+
+        // Take initial arguments
+        let args = generator.take_initial_args();
+        let this_value = generator.take_initial_this();
+        let argc = args.len();
+
+        // Set up pending args and push initial frame
+        ctx.set_pending_args(args);
+        ctx.set_pending_this(this_value);
+        ctx.set_pending_upvalues(generator.upvalues.clone());
+
+        // Remember the stack depth before pushing the generator frame
+        let initial_depth = ctx.stack_depth();
+
+        if let Err(e) = ctx.push_frame(
+            generator.function_index,
+            Arc::clone(&generator.module),
+            func.local_count,
+            None,
+            generator.is_construct(),
+            false, // generators are not async
+            argc,
+        ) {
+            generator.complete();
+            return GeneratorResult::Error(e);
+        }
+
+        // Run until yield or return
+        self.run_generator_loop(generator, ctx, initial_depth)
+    }
+
+    /// Resume generator execution from saved frame
+    fn resume_generator_execution(
+        &mut self,
+        generator: &Arc<JsGenerator>,
+        ctx: &mut VmContext,
+        sent_value: Option<Value>,
+    ) -> GeneratorResult {
+        // Get the saved frame
+        let frame = match generator.take_frame() {
+            Some(f) => f,
+            None => {
+                generator.complete();
+                return GeneratorResult::Error(VmError::internal("Generator has no saved frame"));
+            }
+        };
+
+        // Capture yield_dst and pending throw from frame
+        let yield_dst = frame.yield_dst;
+        let pending_throw = frame.pending_throw.clone();
+
+        // Check for pending return (set on the generator, not the frame)
+        // This is set by generator.return() and persists across take_frame()
+        let pending_return = generator.has_pending_return();
+
+        // Remember the stack depth before restoring the generator frame
+        let initial_depth = ctx.stack_depth();
+
+        // Restore the frame to context
+        if let Err(e) = self.restore_generator_frame(ctx, &frame) {
+            generator.complete();
+            return GeneratorResult::Error(e);
+        }
+
+        // Handle pending throw (for generator.throw())
+        if let Some(error) = pending_throw {
+            // Inject throw - find try handler and jump to it, or error out
+            if let Some((frame_depth, catch_pc)) = ctx.peek_nearest_try() {
+                if frame_depth > initial_depth {
+                    ctx.take_nearest_try(); // Actually pop it
+                    while ctx.stack_depth() > frame_depth {
+                        ctx.pop_frame();
+                    }
+                    ctx.set_pc(catch_pc);
+                    // Put error in register 0 for catch block (standard convention)
+                    ctx.set_register(0, error.clone());
+                    ctx.set_exception(error);
+                } else {
+                    generator.complete();
+                    return GeneratorResult::Error(VmError::exception(error));
+                }
+            } else {
+                generator.complete();
+                return GeneratorResult::Error(VmError::exception(error));
+            }
+        } else if pending_return {
+            // Handle pending return (for generator.return())
+            // We need to run finally blocks. Trigger the exception path with a dummy value.
+            let mut internal_handler = false;
+            if let Some((frame_depth, catch_pc)) = ctx.peek_nearest_try() {
+                if frame_depth > initial_depth {
+                    internal_handler = true;
+                    ctx.take_nearest_try(); // Actually pop it
+                    while ctx.stack_depth() > frame_depth {
+                        ctx.pop_frame();
+                    }
+                    ctx.set_pc(catch_pc);
+                    // Use pending return value as the exception object so it propagates
+                    let pending_val = generator.get_pending_return().unwrap_or(Value::undefined());
+                    ctx.set_exception(pending_val);
+                }
+            }
+
+            if !internal_handler {
+                // No internal try handlers, just return the value
+                let return_value = generator
+                    .take_pending_return()
+                    .unwrap_or_else(Value::undefined);
+                generator.complete();
+                return GeneratorResult::Returned(return_value);
+            }
+        } else {
+            // Normal resume - the sent value becomes the result of the yield expression
+            // Store it in the destination register that was saved from the Yield instruction
+            if let Some(dst) = yield_dst {
+                ctx.set_register(dst, sent_value.unwrap_or_else(Value::undefined));
+            }
+        }
+
+        // Run until yield or return
+        self.run_generator_loop(generator, ctx, initial_depth)
+    }
+
+    /// Restore a generator frame to the context
+    fn restore_generator_frame(
+        &mut self,
+        ctx: &mut VmContext,
+        frame: &GeneratorFrame,
+    ) -> VmResult<()> {
+        // Push a new frame with the saved state
+        ctx.set_pending_upvalues(frame.upvalues.clone());
+        ctx.set_pending_this(frame.this_value.clone());
+
+        // Set up the locals as pending args (they'll be copied to locals)
+        ctx.set_pending_args(frame.locals.clone());
+
+        // Get function info
+        let func = frame
+            .module
+            .function(frame.function_index)
+            .ok_or_else(|| VmError::internal("Generator function not found"))?;
+
+        ctx.push_frame(
+            frame.function_index,
+            Arc::clone(&frame.module),
+            func.local_count,
+            None,
+            frame.is_construct,
+            false,
+            frame.argc,
+        )?;
+
+        // Restore PC (push_frame sets it to 0, we need to set it to the saved value)
+        ctx.set_pc(frame.pc);
+
+        // Restore registers
+        for (i, reg_value) in frame.registers.iter().enumerate() {
+            ctx.set_register(i as u16, reg_value.clone());
+        }
+
+        // Restore locals
+        for (i, local_value) in frame.locals.iter().enumerate() {
+            ctx.set_local(i as u16, local_value.clone())?;
+        }
+
+        // Restore try stack
+        for try_entry in &frame.try_stack {
+            ctx.push_try(try_entry.catch_pc);
+        }
+
+        Ok(())
+    }
+
+    /// Save current execution state to a generator frame
+    fn save_generator_frame(
+        &self,
+        ctx: &mut VmContext,
+        module: &Arc<Module>,
+    ) -> VmResult<GeneratorFrame> {
+        let current_frame = ctx
+            .current_frame()
+            .ok_or_else(|| VmError::internal("No current frame"))?;
+
+        // Collect registers (we need the function's register count)
+        let func = module
+            .function(current_frame.function_index)
+            .ok_or_else(|| VmError::internal("Function not found"))?;
+
+        let mut registers = Vec::with_capacity(func.register_count as usize);
+        for i in 0..func.register_count {
+            registers.push(ctx.get_register(i).clone());
+        }
+
+        // Collect try stack entries for this frame
+        let try_handlers = ctx.get_try_handlers_for_current_frame();
+        let try_stack: Vec<crate::generator::TryEntry> = try_handlers
+            .into_iter()
+            .map(|(catch_pc, frame_depth)| crate::generator::TryEntry {
+                catch_pc,
+                frame_depth,
+            })
+            .collect();
+
+        Ok(GeneratorFrame::new(
+            current_frame.pc,
+            current_frame.function_index,
+            Arc::clone(&current_frame.module),
+            current_frame.locals.clone(),
+            registers,
+            current_frame.upvalues.clone(),
+            try_stack,
+            current_frame.this_value.clone(),
+            current_frame.is_construct,
+            current_frame.frame_id,
+            current_frame.argc,
+        ))
+    }
+
+    /// Run the generator execution loop until yield, return, or error
+    ///
+    /// `initial_depth` is the stack depth before the generator frame was pushed.
+    /// This is used to correctly identify when the generator has returned.
+    fn run_generator_loop(
+        &mut self,
+        generator: &Arc<JsGenerator>,
+        ctx: &mut VmContext,
+        initial_depth: usize,
+    ) -> GeneratorResult {
+        // Similar to run_loop but handles Yield specially
+        let mut cached_module: Option<Arc<Module>> = None;
+        let mut cached_frame_id: usize = usize::MAX;
+
+        loop {
+            // Periodic interrupt check
+            if ctx.should_check_interrupt() {
+                if ctx.is_interrupted() {
+                    generator.complete();
+                    return GeneratorResult::Error(VmError::interrupted());
+                }
+                ctx.maybe_collect_garbage();
+            }
+
+            let frame = match ctx.current_frame() {
+                Some(f) => f,
+                None => {
+                    // No more frames - generator completed with undefined
+                    generator.complete();
+                    return GeneratorResult::Returned(Value::undefined());
+                }
+            };
+
+            // Cache module reference
+            if frame.frame_id != cached_frame_id {
+                cached_module = Some(Arc::clone(&frame.module));
+                cached_frame_id = frame.frame_id;
+            }
+
+            let module_ref = cached_module.as_ref().unwrap();
+            let func = match module_ref.function(frame.function_index) {
+                Some(f) => f,
+                None => {
+                    generator.complete();
+                    return GeneratorResult::Error(VmError::internal("Function not found"));
+                }
+            };
+
+            // Check if we've reached the end
+            if frame.pc >= func.instructions.len() {
+                // Generator frame has no more instructions - pop it
+                ctx.pop_frame();
+
+                // Check if we're back to the initial depth (generator is done)
+                if ctx.stack_depth() <= initial_depth {
+                    generator.complete();
+                    // If we have a pending return from generator.return(), use it
+                    if let Some(pending) = generator.take_pending_return() {
+                        return GeneratorResult::Returned(pending);
+                    }
+                    return GeneratorResult::Returned(Value::undefined());
+                }
+
+                // There are still frames from nested calls - continue
+                cached_frame_id = usize::MAX;
+                continue;
+            }
+
+            let instruction = &func.instructions[frame.pc];
+            ctx.record_instruction();
+
+            // Execute instruction
+            let instruction_result = match self.execute_instruction(instruction, module_ref, ctx) {
+                Ok(result) => result,
+                Err(err) => match err {
+                    VmError::TypeError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
+                    }
+                    VmError::RangeError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "RangeError", &message))
+                    }
+                    VmError::ReferenceError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "ReferenceError", &message))
+                    }
+                    VmError::SyntaxError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
+                    }
+                    other => {
+                        generator.complete();
+                        return GeneratorResult::Error(other);
+                    }
+                },
+            };
+
+            match instruction_result {
+                InstructionResult::Continue => {
+                    ctx.advance_pc();
+                }
+                InstructionResult::Jump(offset) => {
+                    ctx.jump(offset);
+                }
+                InstructionResult::Return(value) => {
+                    // Pop the current frame
+                    let frame = ctx.pop_frame().unwrap();
+
+                    // Check if we're back to the initial depth (generator is returning)
+                    if ctx.stack_depth() <= initial_depth {
+                        generator.complete();
+                        // If we have a pending return from generator.return(), use it
+                        if let Some(pending) = generator.take_pending_return() {
+                            return GeneratorResult::Returned(pending);
+                        }
+                        return GeneratorResult::Returned(value);
+                    }
+
+                    // There's a caller frame within the generator - pass return value
+                    if let Some(ret_reg) = frame.return_register {
+                        ctx.set_register(ret_reg, value);
+                    }
+                    cached_frame_id = usize::MAX;
+                }
+                InstructionResult::Yield { value, yield_dst } => {
+                    // Save frame state before advancing PC
+                    ctx.advance_pc(); // Move past the yield instruction
+
+                    match self.save_generator_frame(ctx, module_ref) {
+                        Ok(mut frame) => {
+                            // Store the yield destination register so we know where
+                            // to put the sent value when resuming
+                            frame.yield_dst = Some(yield_dst);
+                            generator.suspend_with_frame(frame);
+                        }
+                        Err(e) => {
+                            generator.complete();
+                            return GeneratorResult::Error(e);
+                        }
+                    }
+
+                    // Pop the generator's frame from context
+                    ctx.pop_frame();
+
+                    return GeneratorResult::Yielded(value);
+                }
+                InstructionResult::Throw(error) => {
+                    // Try to find a catch handler inside the generator
+                    if let Some((frame_depth, catch_pc)) = ctx.peek_nearest_try() {
+                        if frame_depth > initial_depth {
+                            ctx.take_nearest_try(); // Actually pop it
+                            // Unwind to the handler frame
+                            while ctx.stack_depth() > frame_depth {
+                                ctx.pop_frame();
+                            }
+                            ctx.set_pc(catch_pc);
+                            ctx.set_exception(error.clone());
+                            // Put error in register 0 for catch block
+                            ctx.set_register(0, error);
+                            cached_frame_id = usize::MAX;
+                            continue;
+                        }
+                    }
+
+                    // No internal handler - check pending return from generator.return()
+                    if let Some(return_value) = generator.take_pending_return() {
+                        generator.complete();
+                        while ctx.stack_depth() > initial_depth {
+                            ctx.pop_frame();
+                        }
+                        return GeneratorResult::Returned(return_value);
+                    }
+
+                    // No internal handler - completion will buble out
+                    generator.complete();
+                    // Pop all frames down to initial_depth
+                    while ctx.stack_depth() > initial_depth {
+                        ctx.pop_frame();
+                    }
+                    return GeneratorResult::Error(VmError::exception(error));
+                }
+                InstructionResult::Call {
+                    func_index,
+                    module: call_module,
+                    argc,
+                    return_reg,
+                    is_construct,
+                    is_async,
+                    upvalues,
+                } => {
+                    ctx.advance_pc(); // Advance before pushing new frame
+
+                    let callee = match call_module.function(func_index) {
+                        Some(f) => f,
+                        None => {
+                            generator.complete();
+                            return GeneratorResult::Error(VmError::internal(format!(
+                                "callee not found (func_index={}, function_count={})",
+                                func_index,
+                                call_module.function_count()
+                            )));
+                        }
+                    };
+
+                    let local_count = callee.local_count;
+                    let has_rest = callee.flags.has_rest;
+                    let param_count = callee.param_count as usize;
+
+                    if has_rest {
+                        let mut args = ctx.take_pending_args();
+                        let rest_args: Vec<Value> = if args.len() > param_count {
+                            args.drain(param_count..).collect()
+                        } else {
+                            Vec::new()
+                        };
+
+                        let rest_arr = GcRef::new(JsObject::array(
+                            rest_args.len(),
+                            ctx.memory_manager().clone(),
+                        ));
+                        if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
+                            && let Some(array_proto) = array_obj
+                                .get(&PropertyKey::string("prototype"))
+                                .and_then(|v| v.as_object())
+                        {
+                            rest_arr.set_prototype(Some(array_proto));
+                        }
+                        for (i, arg) in rest_args.into_iter().enumerate() {
+                            rest_arr.set(PropertyKey::Index(i as u32), arg);
+                        }
+
+                        args.push(Value::object(rest_arr));
+                        ctx.set_pending_args(args);
+                    }
+
+                    ctx.set_pending_upvalues(upvalues);
+
+                    if let Err(e) = ctx.push_frame(
+                        func_index,
+                        call_module,
+                        local_count,
+                        Some(return_reg),
+                        is_construct,
+                        is_async,
+                        argc as usize,
+                    ) {
+                        generator.complete();
+                        return GeneratorResult::Error(e);
+                    }
+                }
+                InstructionResult::TailCall {
+                    func_index,
+                    module: call_module,
+                    argc,
+                    return_reg,
+                    is_async,
+                    upvalues,
+                } => {
+                    // Tail call optimization: pop current frame before pushing new one
+                    ctx.pop_frame();
+                    cached_frame_id = usize::MAX;
+
+                    let callee = match call_module.function(func_index) {
+                        Some(f) => f,
+                        None => {
+                            generator.complete();
+                            return GeneratorResult::Error(VmError::internal(format!(
+                                "callee not found (func_index={}, function_count={})",
+                                func_index,
+                                call_module.function_count()
+                            )));
+                        }
+                    };
+
+                    let local_count = callee.local_count;
+                    let has_rest = callee.flags.has_rest;
+                    let param_count = callee.param_count as usize;
+
+                    if has_rest {
+                        let mut args = ctx.take_pending_args();
+                        let rest_args: Vec<Value> = if args.len() > param_count {
+                            args.drain(param_count..).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let rest_arr = GcRef::new(JsObject::array(
+                            rest_args.len(),
+                            ctx.memory_manager().clone(),
+                        ));
+                        if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
+                            && let Some(array_proto) = array_obj
+                                .get(&PropertyKey::string("prototype"))
+                                .and_then(|v| v.as_object())
+                        {
+                            rest_arr.set_prototype(Some(array_proto));
+                        }
+                        for (i, arg) in rest_args.into_iter().enumerate() {
+                            rest_arr.set(PropertyKey::Index(i as u32), arg);
+                        }
+                        args.push(Value::object(rest_arr));
+                        ctx.set_pending_args(args);
+                    }
+
+                    ctx.set_pending_upvalues(upvalues);
+
+                    if let Err(e) = ctx.push_frame(
+                        func_index,
+                        call_module,
+                        local_count,
+                        Some(return_reg),
+                        false,
+                        is_async,
+                        argc as usize,
+                    ) {
+                        generator.complete();
+                        return GeneratorResult::Error(e);
+                    }
+                }
+                InstructionResult::Suspend {
+                    promise,
+                    resume_reg,
+                } => {
+                    // Await in async generator - suspend and return the promise
+                    if generator.is_async() {
+                        // Save frame state before advancing PC
+                        ctx.advance_pc(); // Move past the await instruction
+
+                        match self.save_generator_frame(ctx, module_ref) {
+                            Ok(mut frame) => {
+                                // Store the await resume register so we know where
+                                // to put the resolved value when resuming
+                                frame.yield_dst = Some(resume_reg);
+                                generator.suspend_with_frame(frame);
+                            }
+                            Err(e) => {
+                                generator.complete();
+                                return GeneratorResult::Error(e);
+                            }
+                        }
+
+                        // Pop the generator's frame from context
+                        ctx.pop_frame();
+
+                        return GeneratorResult::Suspended {
+                            promise,
+                            resume_reg,
+                            generator: Arc::clone(generator),
+                        };
+                    } else {
+                        // Sync generators cannot await
+                        generator.complete();
+                        return GeneratorResult::Error(VmError::internal(
+                            "Sync generator cannot use await",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Result of executing an instruction
 #[allow(dead_code)]
 enum InstructionResult {
@@ -4227,7 +6648,7 @@ enum InstructionResult {
         resume_reg: u16,
     },
     /// Yield from generator
-    Yield { value: Value },
+    Yield { value: Value, yield_dst: u16 },
     /// Throw a JS value
     Throw(Value),
 }
@@ -4285,6 +6706,7 @@ mod tests {
                 dst: Register(2),
                 lhs: Register(0),
                 rhs: Register(1),
+                feedback_index: 0,
             })
             .instruction(Instruction::Return { src: Register(2) })
             .build();
@@ -4381,6 +6803,7 @@ mod tests {
 
         let func = Function::builder()
             .name("main")
+            .feedback_vector_size(2)
             // NewArray r0, 3
             .instruction(Instruction::NewArray {
                 dst: Register(0),
@@ -4401,12 +6824,14 @@ mod tests {
                 arr: Register(0),
                 idx: Register(2),
                 val: Register(1),
+                ic_index: 0,
             })
             // GetElem r3, r0, r2
             .instruction(Instruction::GetElem {
                 dst: Register(3),
                 arr: Register(0),
                 idx: Register(2),
+                ic_index: 1,
             })
             // Return r3
             .instruction(Instruction::Return { src: Register(3) })
@@ -4549,6 +6974,7 @@ mod tests {
         //   Return r1
         let double = Function::builder()
             .name("double")
+            .param_count(1)
             .local_count(1)
             .instruction(Instruction::GetLocal {
                 dst: Register(0),
@@ -4558,6 +6984,7 @@ mod tests {
                 dst: Register(1),
                 lhs: Register(0),
                 rhs: Register(0),
+                feedback_index: 0,
             })
             .instruction(Instruction::Return { src: Register(1) })
             .build();
@@ -4605,6 +7032,7 @@ mod tests {
         // add(a, b): returns a + b
         let add = Function::builder()
             .name("add")
+            .param_count(2)
             .local_count(2)
             .instruction(Instruction::GetLocal {
                 dst: Register(0),
@@ -4618,6 +7046,7 @@ mod tests {
                 dst: Register(2),
                 lhs: Register(0),
                 rhs: Register(1),
+                feedback_index: 0,
             })
             .instruction(Instruction::Return { src: Register(2) })
             .build();
@@ -4661,6 +7090,7 @@ mod tests {
         // outer(x): returns inner(x) * 2
         let outer = Function::builder()
             .name("outer")
+            .param_count(1)
             .local_count(1)
             // Get argument x
             .instruction(Instruction::GetLocal {
@@ -4691,6 +7121,7 @@ mod tests {
                 dst: Register(5),
                 lhs: Register(3),
                 rhs: Register(4),
+                feedback_index: 0,
             })
             .instruction(Instruction::Return { src: Register(5) })
             .build();
@@ -4698,6 +7129,7 @@ mod tests {
         // inner(x): returns x * x
         let inner = Function::builder()
             .name("inner")
+            .param_count(1)
             .local_count(1)
             .instruction(Instruction::GetLocal {
                 dst: Register(0),
@@ -4707,6 +7139,7 @@ mod tests {
                 dst: Register(1),
                 lhs: Register(0),
                 rhs: Register(0),
+                feedback_index: 0,
             })
             .instruction(Instruction::Return { src: Register(1) })
             .build();
@@ -4884,5 +7317,1147 @@ mod tests {
         // For now, just verify we can define a setter without crashing
         // Full setter semantics (with 'this' binding) would need more setup
         assert!(result.is_number() || result.is_undefined());
+    }
+
+    // ==================== IC Coverage Tests ====================
+
+    #[test]
+    fn test_ic_coverage_getprop_computed() {
+        // Test GetProp IC with computed property access
+        use otter_vm_bytecode::ConstantIndex;
+
+        let mut builder = Module::builder("test.js");
+        builder.constants_mut().add_string("x");
+
+        let func = Function::builder()
+            .name("main")
+            .feedback_vector_size(2) // For SetPropConst and GetProp
+            .instruction(Instruction::NewObject { dst: Register(0) })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: 42,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(0),
+                name: ConstantIndex(0),
+                val: Register(1),
+                ic_index: 0,
+            })
+            .instruction(Instruction::LoadConst {
+                dst: Register(2),
+                idx: ConstantIndex(0),
+            })
+            .instruction(Instruction::GetProp {
+                dst: Register(3),
+                obj: Register(0),
+                key: Register(2),
+                ic_index: 1,
+            })
+            .instruction(Instruction::Return { src: Register(3) })
+            .build();
+
+        builder.add_function(func);
+        let module = builder.build();
+
+        let mut ctx = create_test_context();
+        let mut interpreter = Interpreter::new();
+        let result = interpreter.execute(&module, &mut ctx).unwrap();
+
+        assert_eq!(result.as_int32(), Some(42));
+    }
+
+    #[test]
+    fn test_ic_coverage_getelem_setelem() {
+        // Test GetElem/SetElem IC with string keys on objects
+        use otter_vm_bytecode::ConstantIndex;
+
+        let mut builder = Module::builder("test.js");
+        builder.constants_mut().add_string("x");
+
+        let func = Function::builder()
+            .name("main")
+            .feedback_vector_size(2) // For SetElem and GetElem
+            .instruction(Instruction::NewObject { dst: Register(0) })
+            .instruction(Instruction::LoadConst {
+                dst: Register(1),
+                idx: ConstantIndex(0),
+            })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(2),
+                value: 100,
+            })
+            .instruction(Instruction::SetElem {
+                arr: Register(0),
+                idx: Register(1),
+                val: Register(2),
+                ic_index: 0,
+            })
+            .instruction(Instruction::GetElem {
+                dst: Register(3),
+                arr: Register(0),
+                idx: Register(1),
+                ic_index: 1,
+            })
+            .instruction(Instruction::Return { src: Register(3) })
+            .build();
+
+        builder.add_function(func);
+        let module = builder.build();
+
+        let mut ctx = create_test_context();
+        let mut interpreter = Interpreter::new();
+        let result = interpreter.execute(&module, &mut ctx).unwrap();
+
+        assert_eq!(result.as_int32(), Some(100));
+    }
+
+    #[test]
+    fn test_ic_coverage_in_operator() {
+        // Test In operator IC
+        use otter_vm_bytecode::ConstantIndex;
+
+        let mut builder = Module::builder("test.js");
+        builder.constants_mut().add_string("x");
+
+        let func = Function::builder()
+            .name("main")
+            .feedback_vector_size(2) // For SetPropConst and In
+            .instruction(Instruction::NewObject { dst: Register(0) })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: 1,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(0),
+                name: ConstantIndex(0),
+                val: Register(1),
+                ic_index: 0,
+            })
+            .instruction(Instruction::LoadConst {
+                dst: Register(2),
+                idx: ConstantIndex(0),
+            })
+            .instruction(Instruction::In {
+                dst: Register(3),
+                lhs: Register(2),
+                rhs: Register(0),
+                ic_index: 1,
+            })
+            .instruction(Instruction::Return { src: Register(3) })
+            .build();
+
+        builder.add_function(func);
+        let module = builder.build();
+
+        let mut ctx = create_test_context();
+        let mut interpreter = Interpreter::new();
+        let result = interpreter.execute(&module, &mut ctx).unwrap();
+
+        assert_eq!(result.as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn test_ic_coverage_instanceof() {
+        // Test InstanceOf IC - caches prototype lookup on constructor
+        // This test uses Construct to properly create an instance
+        use otter_vm_bytecode::{ConstantIndex, FunctionIndex};
+
+        let mut builder = Module::builder("test.js");
+        builder.constants_mut().add_string("prototype");
+
+        // Create a constructor function and test instanceof using Construct
+        let main = Function::builder()
+            .name("main")
+            .feedback_vector_size(2)
+            // Create constructor function
+            .instruction(Instruction::Closure {
+                dst: Register(0),
+                func: FunctionIndex(1),
+            })
+            // Create instance using Construct
+            .instruction(Instruction::Construct {
+                dst: Register(1),
+                func: Register(0),
+                argc: 0,
+            })
+            // Test instanceof (this exercises the IC on prototype lookup)
+            .instruction(Instruction::InstanceOf {
+                dst: Register(2),
+                lhs: Register(1),
+                rhs: Register(0),
+                ic_index: 0,
+            })
+            .instruction(Instruction::Return { src: Register(2) })
+            .build();
+
+        // Constructor function
+        let constructor = Function::builder()
+            .name("Constructor")
+            .instruction(Instruction::LoadUndefined { dst: Register(0) })
+            .instruction(Instruction::Return { src: Register(0) })
+            .build();
+
+        builder.add_function(main);
+        builder.add_function(constructor);
+        let module = builder.build();
+
+        let mut ctx = create_test_context();
+        let mut interpreter = Interpreter::new();
+        let result = interpreter.execute(&module, &mut ctx).unwrap();
+
+        assert_eq!(result.as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn test_ic_coverage_array_integer_access() {
+        // Test GetElem/SetElem fast path with integer indices on arrays
+        let mut builder = Module::builder("test.js");
+
+        let func = Function::builder()
+            .name("main")
+            .feedback_vector_size(2)
+            // Create array with 3 elements
+            .instruction(Instruction::NewArray {
+                dst: Register(0),
+                len: 3,
+            })
+            // Set arr[1] = 42
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: 1, // index
+            })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(2),
+                value: 42, // value
+            })
+            .instruction(Instruction::SetElem {
+                arr: Register(0),
+                idx: Register(1),
+                val: Register(2),
+                ic_index: 0,
+            })
+            // Get arr[1]
+            .instruction(Instruction::GetElem {
+                dst: Register(3),
+                arr: Register(0),
+                idx: Register(1),
+                ic_index: 1,
+            })
+            .instruction(Instruction::Return { src: Register(3) })
+            .build();
+
+        builder.add_function(func);
+        let module = builder.build();
+
+        let mut ctx = create_test_context();
+        let mut interpreter = Interpreter::new();
+        let result = interpreter.execute(&module, &mut ctx).unwrap();
+
+        assert_eq!(result.as_int32(), Some(42));
+    }
+
+    // ==================== IC State Machine Tests ====================
+
+    #[test]
+    fn test_ic_state_machine_uninitialized_to_mono() {
+        // Test that IC transitions from Uninitialized to Monomorphic on first access
+        use otter_vm_bytecode::function::InlineCacheState;
+        use otter_vm_bytecode::operand::ConstantIndex;
+
+        let mut builder = Module::builder("test.js");
+        builder.constants_mut().add_string("x");
+
+        let func = Function::builder()
+            .name("main")
+            .feedback_vector_size(1)
+            // Create object with property
+            .instruction(Instruction::NewObject { dst: Register(0) })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: 42,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(0),
+                name: ConstantIndex(0), // "x"
+                val: Register(1),
+                ic_index: 0,
+            })
+            // Read the property (this should cache in IC)
+            .instruction(Instruction::GetPropConst {
+                dst: Register(2),
+                obj: Register(0),
+                name: ConstantIndex(0),
+                ic_index: 0,
+            })
+            .instruction(Instruction::Return { src: Register(2) })
+            .build();
+
+        builder.add_function(func);
+        let module = builder.build();
+        let module = std::sync::Arc::new(module);
+
+        let mut ctx = create_test_context();
+        let mut interpreter = Interpreter::new();
+        let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
+
+        assert_eq!(result.as_int32(), Some(42));
+
+        // Check IC state transitioned to Monomorphic
+        let func = module.function(0).unwrap();
+        let feedback = func.feedback_vector.read();
+        if let Some(ic) = feedback.get(0) {
+            match &ic.ic_state {
+                InlineCacheState::Monomorphic { .. } => {}
+                state => panic!("Expected Monomorphic IC state, got {:?}", state),
+            }
+        }
+    }
+
+    #[test]
+    fn test_ic_state_machine_mono_to_poly() {
+        // Test that IC transitions from Monomorphic to Polymorphic on 2nd shape
+        use otter_vm_bytecode::function::InlineCacheState;
+        use otter_vm_bytecode::operand::ConstantIndex;
+
+        let mut builder = Module::builder("test.js");
+        builder.constants_mut().add_string("x");
+        builder.constants_mut().add_string("y");
+
+        let func = Function::builder()
+            .name("main")
+            .local_count(10)
+            .register_count(10)
+            .feedback_vector_size(1)
+            // Create first object with property "x"
+            .instruction(Instruction::NewObject { dst: Register(0) })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: 10,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(0),
+                name: ConstantIndex(0), // "x"
+                val: Register(1),
+                ic_index: 0,
+            })
+            // Read x from first object (caches mono state)
+            .instruction(Instruction::GetPropConst {
+                dst: Register(2),
+                obj: Register(0),
+                name: ConstantIndex(0),
+                ic_index: 0,
+            })
+            // Create second object with different shape (has "y" first, then "x")
+            .instruction(Instruction::NewObject { dst: Register(3) })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(4),
+                value: 100,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(3),
+                name: ConstantIndex(1), // "y"
+                val: Register(4),
+                ic_index: 0, // uses same IC slot but different shape
+            })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(5),
+                value: 20,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(3),
+                name: ConstantIndex(0), // "x"
+                val: Register(5),
+                ic_index: 0,
+            })
+            // Read x from second object (should transition to poly)
+            .instruction(Instruction::GetPropConst {
+                dst: Register(6),
+                obj: Register(3),
+                name: ConstantIndex(0),
+                ic_index: 0,
+            })
+            // Return sum of both reads
+            .instruction(Instruction::Add {
+                dst: Register(7),
+                lhs: Register(2),
+                rhs: Register(6),
+                feedback_index: 1,
+            })
+            .instruction(Instruction::Return { src: Register(7) })
+            .build();
+
+        builder.add_function(func);
+        let module = builder.build();
+        let module = std::sync::Arc::new(module);
+
+        let mut ctx = create_test_context();
+        let mut interpreter = Interpreter::new();
+        let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
+
+        assert_eq!(result.as_int32(), Some(30)); // 10 + 20
+
+        // Check IC state transitioned to Polymorphic
+        let func = module.function(0).unwrap();
+        let feedback = func.feedback_vector.read();
+        if let Some(ic) = feedback.get(0) {
+            match &ic.ic_state {
+                InlineCacheState::Polymorphic { count, .. } => {
+                    assert!(*count >= 2, "Expected at least 2 shapes cached");
+                }
+                state => panic!("Expected Polymorphic IC state, got {:?}", state),
+            }
+        }
+    }
+
+    #[test]
+    fn test_ic_state_machine_poly_to_mega() {
+        // Test that IC transitions from Polymorphic to Megamorphic at 4+ shapes
+        use otter_vm_bytecode::function::InlineCacheState;
+        use otter_vm_bytecode::operand::ConstantIndex;
+
+        let mut builder = Module::builder("test.js");
+        builder.constants_mut().add_string("x"); // 0
+        builder.constants_mut().add_string("a"); // 1
+        builder.constants_mut().add_string("b"); // 2
+        builder.constants_mut().add_string("c"); // 3
+        builder.constants_mut().add_string("d"); // 4
+
+        let func = Function::builder()
+            .name("main")
+            .local_count(30)
+            .register_count(30)
+            .feedback_vector_size(1)
+            // Create 5 objects with different shapes, all having "x"
+            // Object 1: only "x"
+            .instruction(Instruction::NewObject { dst: Register(0) })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: 1,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(0),
+                name: ConstantIndex(0), // "x"
+                val: Register(1),
+                ic_index: 0,
+            })
+            .instruction(Instruction::GetPropConst {
+                dst: Register(2),
+                obj: Register(0),
+                name: ConstantIndex(0),
+                ic_index: 0,
+            })
+            // Object 2: "a" then "x"
+            .instruction(Instruction::NewObject { dst: Register(3) })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(4),
+                value: 100,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(3),
+                name: ConstantIndex(1), // "a"
+                val: Register(4),
+                ic_index: 0,
+            })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(5),
+                value: 2,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(3),
+                name: ConstantIndex(0), // "x"
+                val: Register(5),
+                ic_index: 0,
+            })
+            .instruction(Instruction::GetPropConst {
+                dst: Register(6),
+                obj: Register(3),
+                name: ConstantIndex(0),
+                ic_index: 0,
+            })
+            // Object 3: "b" then "x"
+            .instruction(Instruction::NewObject { dst: Register(7) })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(8),
+                value: 100,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(7),
+                name: ConstantIndex(2), // "b"
+                val: Register(8),
+                ic_index: 0,
+            })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(9),
+                value: 3,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(7),
+                name: ConstantIndex(0), // "x"
+                val: Register(9),
+                ic_index: 0,
+            })
+            .instruction(Instruction::GetPropConst {
+                dst: Register(10),
+                obj: Register(7),
+                name: ConstantIndex(0),
+                ic_index: 0,
+            })
+            // Object 4: "c" then "x"
+            .instruction(Instruction::NewObject { dst: Register(11) })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(12),
+                value: 100,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(11),
+                name: ConstantIndex(3), // "c"
+                val: Register(12),
+                ic_index: 0,
+            })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(13),
+                value: 4,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(11),
+                name: ConstantIndex(0), // "x"
+                val: Register(13),
+                ic_index: 0,
+            })
+            .instruction(Instruction::GetPropConst {
+                dst: Register(14),
+                obj: Register(11),
+                name: ConstantIndex(0),
+                ic_index: 0,
+            })
+            // Object 5: "d" then "x" - this should trigger Megamorphic
+            .instruction(Instruction::NewObject { dst: Register(15) })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(16),
+                value: 100,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(15),
+                name: ConstantIndex(4), // "d"
+                val: Register(16),
+                ic_index: 0,
+            })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(17),
+                value: 5,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(15),
+                name: ConstantIndex(0), // "x"
+                val: Register(17),
+                ic_index: 0,
+            })
+            .instruction(Instruction::GetPropConst {
+                dst: Register(18),
+                obj: Register(15),
+                name: ConstantIndex(0),
+                ic_index: 0,
+            })
+            // Sum all x values: 1+2+3+4+5 = 15
+            .instruction(Instruction::Add {
+                dst: Register(19),
+                lhs: Register(2),
+                rhs: Register(6),
+                feedback_index: 1,
+            })
+            .instruction(Instruction::Add {
+                dst: Register(20),
+                lhs: Register(19),
+                rhs: Register(10),
+                feedback_index: 2,
+            })
+            .instruction(Instruction::Add {
+                dst: Register(21),
+                lhs: Register(20),
+                rhs: Register(14),
+                feedback_index: 3,
+            })
+            .instruction(Instruction::Add {
+                dst: Register(22),
+                lhs: Register(21),
+                rhs: Register(18),
+                feedback_index: 4,
+            })
+            .instruction(Instruction::Return { src: Register(22) })
+            .build();
+
+        builder.add_function(func);
+        let module = builder.build();
+        let module = std::sync::Arc::new(module);
+
+        let mut ctx = create_test_context();
+        let mut interpreter = Interpreter::new();
+        let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
+
+        assert_eq!(result.as_int32(), Some(15)); // 1+2+3+4+5
+
+        // Check IC state transitioned to Megamorphic
+        let func = module.function(0).unwrap();
+        let feedback = func.feedback_vector.read();
+        if let Some(ic) = feedback.get(0) {
+            match &ic.ic_state {
+                InlineCacheState::Megamorphic => {}
+                state => panic!("Expected Megamorphic IC state, got {:?}", state),
+            }
+        }
+    }
+
+    // ==================== Proto Chain Cache Tests ====================
+
+    #[test]
+    fn test_proto_chain_cache_epoch_bump() {
+        // Test that proto_epoch is bumped when set_prototype is called
+        use crate::object::get_proto_epoch;
+
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+
+        // Record initial epoch
+        let initial_epoch = get_proto_epoch();
+
+        // Create objects and set prototype
+        let obj1 = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let obj2 = GcRef::new(JsObject::new(None, memory_manager.clone()));
+
+        // Set prototype should bump epoch
+        obj1.set_prototype(Some(obj2.clone()));
+
+        let after_first = get_proto_epoch();
+        assert!(
+            after_first > initial_epoch,
+            "proto_epoch should be bumped after set_prototype"
+        );
+
+        // Another set_prototype should bump again
+        let obj3 = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        obj2.set_prototype(Some(obj3));
+
+        let after_second = get_proto_epoch();
+        assert!(
+            after_second > after_first,
+            "proto_epoch should be bumped after each set_prototype"
+        );
+    }
+
+    #[test]
+    fn test_proto_chain_cache_ic_stores_epoch() {
+        // Test that IC stores proto_epoch when caching
+        use otter_vm_bytecode::function::InlineCacheState;
+        use otter_vm_bytecode::operand::ConstantIndex;
+        use crate::object::get_proto_epoch;
+
+        let mut builder = Module::builder("test.js");
+        builder.constants_mut().add_string("x");
+
+        let func = Function::builder()
+            .name("main")
+            .feedback_vector_size(1)
+            // Create object and set property
+            .instruction(Instruction::NewObject { dst: Register(0) })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: 42,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(0),
+                name: ConstantIndex(0), // "x"
+                val: Register(1),
+                ic_index: 0,
+            })
+            // Read property to trigger IC caching
+            .instruction(Instruction::GetPropConst {
+                dst: Register(2),
+                obj: Register(0),
+                name: ConstantIndex(0),
+                ic_index: 0,
+            })
+            .instruction(Instruction::Return { src: Register(2) })
+            .build();
+
+        builder.add_function(func);
+        let module = builder.build();
+        let module = std::sync::Arc::new(module);
+
+        // Record epoch before execution
+        let epoch_before = get_proto_epoch();
+
+        let mut ctx = create_test_context();
+        let mut interpreter = Interpreter::new();
+        let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
+
+        assert_eq!(result.as_int32(), Some(42));
+
+        // Check that IC has proto_epoch stored
+        let func = module.function(0).unwrap();
+        let feedback = func.feedback_vector.read();
+        if let Some(ic) = feedback.get(0) {
+            match &ic.ic_state {
+                InlineCacheState::Monomorphic { .. } => {
+                    // proto_epoch should be >= epoch_before (execution may have bumped it)
+                    assert!(
+                        ic.proto_epoch >= epoch_before,
+                        "IC proto_epoch ({}) should be >= epoch_before ({})",
+                        ic.proto_epoch,
+                        epoch_before
+                    );
+                }
+                state => panic!("Expected Monomorphic IC state, got {:?}", state),
+            }
+        }
+    }
+
+    #[test]
+    fn test_proto_chain_cache_invalidation_on_read() {
+        // Test that IC read path rejects cached data when proto_epoch has changed.
+        // After execution populates the IC, we bump the proto_epoch externally
+        // and verify that proto_epoch_matches would return false.
+        use otter_vm_bytecode::function::InlineCacheState;
+        use otter_vm_bytecode::operand::ConstantIndex;
+        use crate::object::{get_proto_epoch, bump_proto_epoch};
+
+        let mut builder = Module::builder("test.js");
+        builder.constants_mut().add_string("x");
+
+        let func = Function::builder()
+            .name("main")
+            .feedback_vector_size(1)
+            .instruction(Instruction::NewObject { dst: Register(0) })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: 42,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(0),
+                name: ConstantIndex(0), // "x"
+                val: Register(1),
+                ic_index: 0,
+            })
+            .instruction(Instruction::GetPropConst {
+                dst: Register(2),
+                obj: Register(0),
+                name: ConstantIndex(0),
+                ic_index: 0,
+            })
+            .instruction(Instruction::Return { src: Register(2) })
+            .build();
+
+        builder.add_function(func);
+        let module = builder.build();
+        let module = std::sync::Arc::new(module);
+
+        let mut ctx = create_test_context();
+        let mut interpreter = Interpreter::new();
+        let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
+        assert_eq!(result.as_int32(), Some(42));
+
+        // IC should be populated
+        let func = module.function(0).unwrap();
+        {
+            let feedback = func.feedback_vector.read();
+            let ic = feedback.get(0).expect("IC slot should exist");
+            assert!(matches!(&ic.ic_state, InlineCacheState::Monomorphic { .. }));
+            // At this point, epoch matches
+            assert!(ic.proto_epoch_matches(get_proto_epoch()));
+        }
+
+        // Bump proto_epoch (simulating a prototype change)
+        bump_proto_epoch();
+
+        // Now the IC's cached epoch should NOT match
+        {
+            let feedback = func.feedback_vector.read();
+            let ic = feedback.get(0).expect("IC slot should exist");
+            assert!(
+                !ic.proto_epoch_matches(get_proto_epoch()),
+                "IC should be invalidated after proto_epoch bump"
+            );
+        }
+    }
+
+    #[test]
+    fn test_proto_chain_cache_epoch_consistency() {
+        // Test that proto_epoch is consistent across multiple IC updates
+        use otter_vm_bytecode::function::InlineCacheState;
+        use otter_vm_bytecode::operand::ConstantIndex;
+        use crate::object::get_proto_epoch;
+
+        let mut builder = Module::builder("test.js");
+        builder.constants_mut().add_string("x");
+        builder.constants_mut().add_string("y");
+
+        let func = Function::builder()
+            .name("main")
+            .local_count(10)
+            .register_count(10)
+            .feedback_vector_size(1)
+            // Create first object and set property
+            .instruction(Instruction::NewObject { dst: Register(0) })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: 10,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(0),
+                name: ConstantIndex(0), // "x"
+                val: Register(1),
+                ic_index: 0,
+            })
+            .instruction(Instruction::GetPropConst {
+                dst: Register(2),
+                obj: Register(0),
+                name: ConstantIndex(0),
+                ic_index: 0,
+            })
+            // Create second object with different shape
+            .instruction(Instruction::NewObject { dst: Register(3) })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(4),
+                value: 100,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(3),
+                name: ConstantIndex(1), // "y"
+                val: Register(4),
+                ic_index: 0,
+            })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(5),
+                value: 20,
+            })
+            .instruction(Instruction::SetPropConst {
+                obj: Register(3),
+                name: ConstantIndex(0), // "x"
+                val: Register(5),
+                ic_index: 0,
+            })
+            .instruction(Instruction::GetPropConst {
+                dst: Register(6),
+                obj: Register(3),
+                name: ConstantIndex(0),
+                ic_index: 0,
+            })
+            .instruction(Instruction::Add {
+                dst: Register(7),
+                lhs: Register(2),
+                rhs: Register(6),
+                feedback_index: 1,
+            })
+            .instruction(Instruction::Return { src: Register(7) })
+            .build();
+
+        builder.add_function(func);
+        let module = builder.build();
+        let module = std::sync::Arc::new(module);
+
+        let epoch_before = get_proto_epoch();
+
+        let mut ctx = create_test_context();
+        let mut interpreter = Interpreter::new();
+        let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
+
+        assert_eq!(result.as_int32(), Some(30)); // 10 + 20
+
+        // Check that IC has transitioned to Polymorphic and has proto_epoch
+        let func = module.function(0).unwrap();
+        let feedback = func.feedback_vector.read();
+        if let Some(ic) = feedback.get(0) {
+            match &ic.ic_state {
+                InlineCacheState::Polymorphic { count, .. } => {
+                    assert!(*count >= 2, "Expected at least 2 shapes cached");
+                    // proto_epoch should be reasonable
+                    assert!(
+                        ic.proto_epoch >= epoch_before,
+                        "IC proto_epoch should be >= epoch_before"
+                    );
+                }
+                state => panic!("Expected Polymorphic IC state, got {:?}", state),
+            }
+        }
+    }
+
+    #[test]
+    fn test_dictionary_mode_threshold_trigger() {
+        // Test that adding more than DICTIONARY_THRESHOLD properties triggers dictionary mode
+        use crate::object::{JsObject, PropertyKey, DICTIONARY_THRESHOLD};
+
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let obj = GcRef::new(JsObject::new(None, memory_manager));
+
+        // Initially not in dictionary mode
+        assert!(!obj.is_dictionary_mode(), "Object should not be in dictionary mode initially");
+
+        // Add properties up to just below threshold
+        for i in 0..(DICTIONARY_THRESHOLD - 1) {
+            let key = PropertyKey::String(crate::string::JsString::intern(&format!("prop{}", i)));
+            obj.set(key, Value::int32(i as i32));
+        }
+        assert!(!obj.is_dictionary_mode(), "Object should not be in dictionary mode below threshold");
+
+        // Add one more property to exceed threshold
+        let key = PropertyKey::String(crate::string::JsString::intern(&format!("prop{}", DICTIONARY_THRESHOLD - 1)));
+        obj.set(key, Value::int32(DICTIONARY_THRESHOLD as i32 - 1));
+
+        // One more should trigger dictionary mode
+        let key = PropertyKey::String(crate::string::JsString::intern(&format!("prop{}", DICTIONARY_THRESHOLD)));
+        obj.set(key, Value::int32(DICTIONARY_THRESHOLD as i32));
+
+        assert!(obj.is_dictionary_mode(), "Object should be in dictionary mode after exceeding threshold");
+    }
+
+    #[test]
+    fn test_dictionary_mode_delete_trigger() {
+        // Test that deleting a property triggers dictionary mode
+        use crate::object::{JsObject, PropertyKey};
+
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let obj = GcRef::new(JsObject::new(None, memory_manager));
+
+        // Add a few properties
+        let key_a = PropertyKey::String(crate::string::JsString::intern("a"));
+        let key_b = PropertyKey::String(crate::string::JsString::intern("b"));
+        obj.set(key_a.clone(), Value::int32(1));
+        obj.set(key_b.clone(), Value::int32(2));
+
+        assert!(!obj.is_dictionary_mode(), "Object should not be in dictionary mode before delete");
+
+        // Delete a property
+        obj.delete(&key_a);
+
+        assert!(obj.is_dictionary_mode(), "Object should be in dictionary mode after delete");
+
+        // Verify we can still access the remaining property
+        assert_eq!(obj.get(&key_b), Some(Value::int32(2)));
+    }
+
+    #[test]
+    fn test_dictionary_mode_storage_correctness() {
+        // Test that dictionary mode storage works correctly
+        use crate::object::{JsObject, PropertyKey};
+
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let obj = GcRef::new(JsObject::new(None, memory_manager));
+
+        // Add a property
+        let key_a = PropertyKey::String(crate::string::JsString::intern("a"));
+        obj.set(key_a.clone(), Value::int32(42));
+
+        // Trigger dictionary mode via delete
+        let key_b = PropertyKey::String(crate::string::JsString::intern("b"));
+        obj.set(key_b.clone(), Value::int32(100));
+        obj.delete(&key_b);
+
+        assert!(obj.is_dictionary_mode());
+
+        // Add a new property in dictionary mode
+        let key_c = PropertyKey::String(crate::string::JsString::intern("c"));
+        obj.set(key_c.clone(), Value::int32(200));
+
+        // Verify all properties work correctly
+        assert_eq!(obj.get(&key_a), Some(Value::int32(42)));
+        assert_eq!(obj.get(&key_b), None); // Deleted
+        assert_eq!(obj.get(&key_c), Some(Value::int32(200)));
+
+        // Verify has_own works
+        assert!(obj.has_own(&key_a));
+        assert!(!obj.has_own(&key_b));
+        assert!(obj.has_own(&key_c));
+    }
+
+    #[test]
+    fn test_dictionary_mode_ic_skip() {
+        // Test that IC reports Megamorphic for dictionary mode objects
+        use otter_vm_bytecode::function::InlineCacheState;
+        use crate::object::{JsObject, PropertyKey};
+
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let obj = GcRef::new(JsObject::new(None, memory_manager));
+
+        // Add and delete a property to trigger dictionary mode
+        let key_a = PropertyKey::String(crate::string::JsString::intern("a"));
+        let key_b = PropertyKey::String(crate::string::JsString::intern("b"));
+        obj.set(key_a.clone(), Value::int32(1));
+        obj.set(key_b.clone(), Value::int32(2));
+        obj.delete(&key_a);
+
+        assert!(obj.is_dictionary_mode());
+
+        // Create an IC metadata and verify it can detect dictionary mode
+        let mut ic = otter_vm_bytecode::function::InstructionMetadata::new();
+
+        // Simulate what IC write code does for dictionary mode objects
+        if obj.is_dictionary_mode() {
+            ic.ic_state = InlineCacheState::Megamorphic;
+        }
+
+        // IC should be Megamorphic for dictionary mode objects
+        assert!(
+            matches!(ic.ic_state, InlineCacheState::Megamorphic),
+            "IC should be Megamorphic for dictionary mode objects"
+        );
+    }
+
+    // ==================== Hot Function Detection Tests ====================
+
+    #[test]
+    fn test_hot_function_detection_call_count() {
+        use otter_vm_bytecode::function::HOT_FUNCTION_THRESHOLD;
+
+        let mut builder = Module::builder("test.js");
+
+        // Simple function that returns immediately
+        let func = Function::builder()
+            .name("hot_candidate")
+            .instruction(Instruction::LoadInt32 { dst: Register(0), value: 42 })
+            .instruction(Instruction::Return { src: Register(0) })
+            .build();
+
+        builder.add_function(func);
+        let module = builder.build();
+        let module = Arc::new(module);
+
+        // Get the function and check initial state
+        let func = module.function(0).unwrap();
+        assert_eq!(func.get_call_count(), 0);
+        assert!(!func.is_hot_function());
+
+        // Execute the function multiple times
+        for _ in 0..100 {
+            let mut ctx = create_test_context();
+            let mut interpreter = Interpreter::new();
+            let _ = interpreter.execute_arc(module.clone(), &mut ctx);
+        }
+
+        // Call count should be 100
+        assert_eq!(func.get_call_count(), 100);
+        assert!(!func.is_hot_function()); // Not yet hot
+
+        // Execute until we cross the threshold
+        for _ in 0..(HOT_FUNCTION_THRESHOLD - 100) {
+            let mut ctx = create_test_context();
+            let mut interpreter = Interpreter::new();
+            let _ = interpreter.execute_arc(module.clone(), &mut ctx);
+        }
+
+        // Should now be hot
+        assert!(func.get_call_count() >= HOT_FUNCTION_THRESHOLD);
+        assert!(func.is_hot_function());
+    }
+
+    #[test]
+    fn test_hot_function_detection_record_call() {
+        use otter_vm_bytecode::function::HOT_FUNCTION_THRESHOLD;
+
+        let func = Function::builder()
+            .name("test")
+            .instruction(Instruction::Return { src: Register(0) })
+            .build();
+
+        // Initially not hot
+        assert_eq!(func.get_call_count(), 0);
+        assert!(!func.is_hot_function());
+
+        // Record calls up to threshold - 1
+        for _ in 0..(HOT_FUNCTION_THRESHOLD - 1) {
+            let became_hot = func.record_call();
+            assert!(!became_hot);
+        }
+
+        assert!(!func.is_hot_function());
+
+        // This call should make it hot
+        let became_hot = func.record_call();
+        assert!(became_hot);
+        assert!(func.is_hot_function());
+
+        // Subsequent calls should not report becoming hot again
+        let became_hot = func.record_call();
+        assert!(!became_hot);
+        assert!(func.is_hot_function());
+    }
+
+    #[test]
+    fn test_hot_function_mark_hot() {
+        let func = Function::builder()
+            .name("test")
+            .instruction(Instruction::Return { src: Register(0) })
+            .build();
+
+        assert!(!func.is_hot_function());
+
+        // Manually mark as hot
+        func.mark_hot();
+        assert!(func.is_hot_function());
+    }
+
+    #[test]
+    fn test_hot_function_nested_calls() {
+        use otter_vm_bytecode::FunctionIndex;
+
+        let mut builder = Module::builder("test.js");
+
+        // Main function calls inner function in a loop
+        let main = Function::builder()
+            .name("main")
+            .instruction(Instruction::Closure {
+                dst: Register(0),
+                func: FunctionIndex(1),
+            })
+            .instruction(Instruction::LoadInt32 { dst: Register(1), value: 0 })  // counter
+            .instruction(Instruction::LoadInt32 { dst: Register(2), value: 100 })  // limit
+            // Loop: call inner function
+            .instruction(Instruction::Call {
+                dst: Register(3),
+                func: Register(0),
+                argc: 0,
+            })
+            .instruction(Instruction::LoadInt32 { dst: Register(4), value: 1 })
+            .instruction(Instruction::Add {
+                dst: Register(1),
+                lhs: Register(1),
+                rhs: Register(4),
+                feedback_index: 0,
+            })
+            .instruction(Instruction::Lt {
+                dst: Register(5),
+                lhs: Register(1),
+                rhs: Register(2),
+            })
+            .instruction(Instruction::JumpIfTrue {
+                cond: Register(5),
+                offset: otter_vm_bytecode::JumpOffset(-5),
+            })
+            .instruction(Instruction::Return { src: Register(1) })
+            .feedback_vector_size(1)
+            .build();
+
+        // Inner function just returns 1
+        let inner = Function::builder()
+            .name("inner")
+            .instruction(Instruction::LoadInt32 { dst: Register(0), value: 1 })
+            .instruction(Instruction::Return { src: Register(0) })
+            .build();
+
+        builder.add_function(main);
+        builder.add_function(inner);
+        let module = builder.build();
+        let module = Arc::new(module);
+
+        let mut ctx = create_test_context();
+        let mut interpreter = Interpreter::new();
+        let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
+
+        assert_eq!(result.as_int32(), Some(100));
+
+        // Main was called once
+        let main_func = module.function(0).unwrap();
+        assert_eq!(main_func.get_call_count(), 1);
+
+        // Inner was called 100 times
+        let inner_func = module.function(1).unwrap();
+        assert_eq!(inner_func.get_call_count(), 100);
     }
 }

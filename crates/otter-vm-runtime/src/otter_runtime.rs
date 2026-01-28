@@ -15,7 +15,7 @@ use crate::capabilities::Capabilities;
 use crate::env_store::IsolatedEnvStore;
 use otter_vm_compiler::Compiler;
 use otter_vm_core::async_context::VmExecutionResult;
-use otter_vm_core::context::VmContext;
+use otter_vm_core::context::{VmContext, VmContextSnapshot};
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::interpreter::Interpreter;
@@ -87,6 +87,8 @@ pub struct Otter {
     capabilities: Capabilities,
     /// Interrupt flag for timeout/cancellation
     interrupt_flag: Arc<AtomicBool>,
+    /// Debug snapshot for watchdogs
+    debug_snapshot: Arc<parking_lot::Mutex<VmContextSnapshot>>,
 }
 
 impl Otter {
@@ -109,6 +111,7 @@ impl Otter {
             env_store: Arc::new(IsolatedEnvStore::default()),
             capabilities: Capabilities::none(),
             interrupt_flag: Arc::new(AtomicBool::new(false)),
+            debug_snapshot: Arc::new(parking_lot::Mutex::new(VmContextSnapshot::default())),
         }
     }
 
@@ -124,6 +127,16 @@ impl Otter {
     /// ```
     pub fn interrupt_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.interrupt_flag)
+    }
+
+    /// Get the latest debug snapshot (updated periodically during execution).
+    pub fn debug_snapshot(&self) -> VmContextSnapshot {
+        self.debug_snapshot.lock().clone()
+    }
+
+    /// Get the debug snapshot handle for watchdogs.
+    pub fn debug_snapshot_handle(&self) -> Arc<parking_lot::Mutex<VmContextSnapshot>> {
+        Arc::clone(&self.debug_snapshot)
     }
 
     /// Request interruption of execution
@@ -206,6 +219,7 @@ impl Otter {
         // 3. Create execution context with globals and interrupt flag
         let mut ctx = self.vm.create_context();
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
+        ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
 
         // 4. Register extension ops as global native functions
         self.register_ops_in_context(&mut ctx);
@@ -253,6 +267,10 @@ impl Otter {
 
                     // Wait for the promise to resolve
                     let resolved_value = loop {
+                        if self.interrupt_flag.load(Ordering::Relaxed) {
+                            return Err(OtterError::Runtime("Test timed out".to_string()));
+                        }
+
                         // Drain microtasks first (this may resolve promises)
                         while let Some(task) = self.event_loop.microtask_queue().dequeue() {
                             task();
@@ -296,10 +314,17 @@ impl Otter {
         // This loop handles HTTP requests by calling the JS dispatcher
         self.run_event_loop_with_http(&mut ctx).await;
 
+        if self.interrupt_flag.load(Ordering::Relaxed) {
+            return Err(OtterError::Runtime(
+                "Execution interrupted (timeout)".to_string(),
+            ));
+        }
+
         // 10. Check for script errors captured by the wrapper
         let global = ctx.global();
         if let Some(error) = global.get(&PropertyKey::string("__otter_script_error")) {
             if !error.is_undefined() {
+                println!("DEBUG: Found __otter_script_error: {:?}", error);
                 // If it's an object with 'message', use that, otherwise to_string
                 let msg = if let Some(obj) = error.as_object() {
                     if let Some(m) = obj.get(&PropertyKey::string("message")) {
@@ -339,6 +364,11 @@ impl Otter {
             // 2. Drain microtasks
             while let Some(task) = self.event_loop.microtask_queue().dequeue() {
                 task();
+            }
+
+            // 2b. Check for interrupt
+            if self.interrupt_flag.load(Ordering::Relaxed) {
+                break;
             }
 
             // 3. Check if we should exit
@@ -472,6 +502,7 @@ impl Otter {
         // Create execution context with interrupt flag
         let mut ctx = self.vm.create_context();
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
+        ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
 
         // Register extension ops as global native functions
         self.register_ops_in_context(&mut ctx);
@@ -842,9 +873,6 @@ unsafe impl Send for Otter {}
 /// Convert VM Value to JSON
 fn value_to_json(value: &Value) -> serde_json::Value {
     fn value_to_json_limited(value: &Value, depth: usize) -> serde_json::Value {
-        if depth % 100 == 0 && depth > 0 {
-            println!("DEBUG: value_to_json depth: {}", depth);
-        }
         if depth > 512 {
             return serde_json::Value::Null;
         }

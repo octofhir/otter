@@ -38,6 +38,23 @@ globalThis.eval = function eval(code) {
     return result ? result.value : undefined;
 };
 
+function __markNonConstructor(fn) {
+    if (typeof fn !== 'function') {
+        return fn;
+    }
+    try {
+        Object.defineProperty(fn, "__non_constructor", {
+            value: true,
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        });
+    } catch (_) {
+        // ignore
+    }
+    return fn;
+}
+
 // Object built-in wrapper
 // Object built-in wrapper
 globalThis.Object = function (value) {
@@ -52,7 +69,7 @@ globalThis.Object = function (value) {
 };
 
 Object.keys = function (obj) {
-    return __Object_keys(obj);
+    return __native_Object_keys(obj);
 };
 Object.values = function (obj) {
     return __Object_values(obj);
@@ -64,7 +81,11 @@ Object.assign = function (target, ...sources) {
     return __Object_assign(target, ...sources);
 };
 Object.hasOwn = function (obj, key) {
-    return __Object_hasOwn(obj, key);
+    // Use Object.getOwnPropertyDescriptor which properly handles functions
+    if (typeof obj === 'object' && obj !== null || typeof obj === 'function') {
+        return Object.getOwnPropertyDescriptor(obj, key) !== undefined;
+    }
+    return false;
 };
 // Object mutability methods (native ops)
 Object.freeze = function (obj) {
@@ -135,36 +156,24 @@ Object.fromEntries = function (iterable) {
 };
 // Object.getOwnPropertyNames(obj)
 Object.getOwnPropertyNames = function (obj) {
-    if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
-        throw new TypeError('Object.getOwnPropertyNames called on non-object');
-    }
-    return Reflect.ownKeys(obj).filter(k => typeof k === 'string');
+    return __Object_getOwnPropertyNames(obj);
 };
 // Object.getOwnPropertySymbols(obj)
 Object.getOwnPropertySymbols = function (obj) {
-    if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
-        throw new TypeError('Object.getOwnPropertySymbols called on non-object');
-    }
-    return Reflect.ownKeys(obj).filter(k => typeof k === 'symbol');
+    return __Object_getOwnPropertySymbols(obj);
 };
-// Object.getOwnPropertyDescriptor(obj, prop)
 Object.getOwnPropertyDescriptor = function (obj, prop) {
     if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
         throw new TypeError('Object.getOwnPropertyDescriptor called on non-object');
     }
-    return Reflect.getOwnPropertyDescriptor(obj, prop);
+    return __Reflect_getOwnPropertyDescriptor(obj, prop);
 };
 // Object.getOwnPropertyDescriptors(obj)
 Object.getOwnPropertyDescriptors = function (obj) {
     if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
         throw new TypeError('Object.getOwnPropertyDescriptors called on non-object');
     }
-    const result = {};
-    const keys = Reflect.ownKeys(obj);
-    for (const key of keys) {
-        result[key] = Reflect.getOwnPropertyDescriptor(obj, key);
-    }
-    return result;
+    return __Object_getOwnPropertyDescriptors(obj);
 };
 // Object.getPrototypeOf(obj)
 Object.getPrototypeOf = function (obj) {
@@ -549,9 +558,11 @@ globalThis.JSON = {
         if (typeof value === 'object') {
             const parts = [];
             const keys = Object.keys(value);
-            for (const key of keys) {
+            for (let i = 0; i < keys.length; i++) {
+                const key = keys[i];
                 if (typeof key !== 'string') continue;
-                const v = JSON.stringifyValue(value[key], replacer);
+                const propVal = value[key];
+                const v = JSON.stringifyValue(propVal, replacer);
                 if (v !== undefined) {
                     parts.push(JSON.escapeString(key) + ':' + v);
                 }
@@ -588,7 +599,9 @@ globalThis.JSON = {
                     value[i] = JSON.applyReviver(value[i], String(i), reviver);
                 }
             } else {
-                for (const k of Object.keys(value)) {
+                const keys = Object.keys(value);
+                for (let i = 0; i < keys.length; i++) {
+                    const k = keys[i];
                     value[k] = JSON.applyReviver(value[k], k, reviver);
                 }
             }
@@ -964,7 +977,7 @@ RegExp.escape = function (string) {
 Array.prototype = {
     // === Mutating Methods ===
     push: function (...items) {
-        return __Array_push(this, items);
+        return __Array_push_native(this, items);
     },
     pop: function () {
         return __Array_pop(this);
@@ -1649,9 +1662,6 @@ Error.captureStackTrace = function (targetObject, constructorOpt) {
 };
 
 // Function built-in
-// Symbol for internal use in call/apply
-const _fnSymbol = Symbol('__fn__');
-
 // Define Function constructor first
 globalThis.Function = function Function(...args) {
     // The Function constructor creates a new function from strings
@@ -1663,51 +1673,12 @@ globalThis.Function = function Function(...args) {
 globalThis.Function.prototype = {
     // Function.prototype.call(thisArg, ...args)
     call: function (thisArg, ...args) {
-        const fn = this;
-
-        // If thisArg is null/undefined, use globalThis
-        if (thisArg === null || thisArg === undefined) {
-            thisArg = globalThis;
-        }
-
-        // Convert primitives to objects
-        if (typeof thisArg !== 'object' && typeof thisArg !== 'function') {
-            thisArg = Object(thisArg);
-        }
-
-        // Temporarily attach function to thisArg and call as method
-        thisArg[_fnSymbol] = fn;
-        const result = thisArg[_fnSymbol](...args);
-        delete thisArg[_fnSymbol];
-
-        return result;
+        return __Function_call(this, thisArg, args);
     },
 
     // Function.prototype.apply(thisArg, argsArray)
     apply: function (thisArg, argsArray) {
-        const fn = this;
-
-        // Handle null/undefined argsArray
-        if (argsArray === null || argsArray === undefined) {
-            argsArray = [];
-        }
-
-        // If thisArg is null/undefined, use globalThis
-        if (thisArg === null || thisArg === undefined) {
-            thisArg = globalThis;
-        }
-
-        // Convert primitives to objects
-        if (typeof thisArg !== 'object' && typeof thisArg !== 'function') {
-            thisArg = Object(thisArg);
-        }
-
-        // Temporarily attach function to thisArg and call as method
-        thisArg[_fnSymbol] = fn;
-        const result = thisArg[_fnSymbol](...argsArray);
-        delete thisArg[_fnSymbol];
-
-        return result;
+        return __Function_apply(this, thisArg, argsArray);
     },
 
     // Function.prototype.bind(thisArg, a0, a1, a2, a3, a4, a5, a6, a7)
@@ -2601,6 +2572,12 @@ globalThis.Reflect = {
         if (typeof newTarget !== 'function') {
             throw new TypeError('Reflect.construct requires newTarget to be a constructor');
         }
+        if (target.__non_constructor === true) {
+            throw new TypeError('Reflect.construct requires target to be a constructor');
+        }
+        if (newTarget.__non_constructor === true) {
+            throw new TypeError('Reflect.construct requires newTarget to be a constructor');
+        }
         return new target(...argumentsList);
     },
 
@@ -2635,6 +2612,35 @@ globalThis.GeneratorPrototype = {
         return 'Generator';
     },
 };
+__markNonConstructor(GeneratorPrototype.next);
+__markNonConstructor(GeneratorPrototype.return);
+__markNonConstructor(GeneratorPrototype.throw);
+__markNonConstructor(GeneratorPrototype[_symbolIterator]);
+
+// GeneratorFunction.prototype - the prototype of all generator functions
+// When you do Object.getPrototypeOf(function* g() {}), you get this object
+globalThis.GeneratorFunctionPrototype = {
+    // The prototype property of generator functions should be GeneratorPrototype
+    prototype: globalThis.GeneratorPrototype,
+
+    // Generator functions aren't constructable
+    constructor: undefined,
+
+    get [_symbolToStringTag]() {
+        return 'GeneratorFunction';
+    },
+};
+
+// AsyncGeneratorFunction.prototype - the prototype of all async generator functions
+globalThis.AsyncGeneratorFunctionPrototype = {
+    prototype: globalThis.GeneratorPrototype,
+
+    constructor: undefined,
+
+    get [_symbolToStringTag]() {
+        return 'AsyncGeneratorFunction';
+    },
+};
 
 // Internal: IteratorPrototype for custom iterators
 globalThis.IteratorPrototype = {
@@ -2653,3 +2659,718 @@ globalThis.__createIteratorResult = (value, done) => {
 
 // Check if a value is a generator
 globalThis.__isGenerator = (value) => __Generator_isGenerator(value);
+
+// ArrayBuffer built-in
+globalThis.ArrayBuffer = function ArrayBuffer(length, options) {
+    // ArrayBuffer must be called with 'new'
+    if (!new.target) {
+        throw new TypeError("Constructor ArrayBuffer requires 'new'");
+    }
+
+    const byteLength = length === undefined ? 0 : Number(length);
+    if (!Number.isFinite(byteLength) || byteLength < 0) {
+        throw new RangeError('Invalid array buffer length');
+    }
+
+    let maxByteLength;
+    if (options !== undefined && options !== null && typeof options === 'object') {
+        maxByteLength = options.maxByteLength;
+        if (maxByteLength !== undefined) {
+            maxByteLength = Number(maxByteLength);
+            if (!Number.isFinite(maxByteLength) || maxByteLength < 0) {
+                throw new RangeError('Invalid maxByteLength');
+            }
+        }
+    }
+
+    const _internal = __ArrayBuffer_create(byteLength, maxByteLength);
+    
+    const obj = Object.create(ArrayBuffer.prototype);
+    obj._internal = _internal;
+    
+    return obj;
+};
+
+ArrayBuffer.prototype = {
+    get byteLength() {
+        if (!this._internal) {
+            throw new TypeError('ArrayBuffer.prototype.byteLength requires that "this" be an ArrayBuffer');
+        }
+        return __ArrayBuffer_byteLength(this._internal);
+    },
+
+    get maxByteLength() {
+        if (!this._internal) {
+            throw new TypeError('ArrayBuffer.prototype.maxByteLength requires that "this" be an ArrayBuffer');
+        }
+        return __ArrayBuffer_maxByteLength(this._internal);
+    },
+
+    get resizable() {
+        if (!this._internal) {
+            throw new TypeError('ArrayBuffer.prototype.resizable requires that "this" be an ArrayBuffer');
+        }
+        return __ArrayBuffer_resizable(this._internal);
+    },
+
+    get detached() {
+        if (!this._internal) {
+            throw new TypeError('ArrayBuffer.prototype.detached requires that "this" be an ArrayBuffer');
+        }
+        return __ArrayBuffer_detached(this._internal);
+    },
+
+    slice(begin, end) {
+        if (!this._internal) {
+            throw new TypeError('ArrayBuffer.prototype.slice requires that "this" be an ArrayBuffer');
+        }
+        const newInternal = __ArrayBuffer_slice(this._internal, begin, end);
+        const result = Object.create(ArrayBuffer.prototype);
+        result._internal = newInternal;
+        return result;
+    },
+
+    transfer(newLength) {
+        if (!this._internal) {
+            throw new TypeError('ArrayBuffer.prototype.transfer requires that "this" be an ArrayBuffer');
+        }
+        const newInternal = __ArrayBuffer_transfer(this._internal);
+        const result = Object.create(ArrayBuffer.prototype);
+        result._internal = newInternal;
+        return result;
+    },
+
+    transferToFixedLength(newLength) {
+        if (!this._internal) {
+            throw new TypeError('ArrayBuffer.prototype.transferToFixedLength requires that "this" be an ArrayBuffer');
+        }
+        const newInternal = __ArrayBuffer_transferToFixedLength(this._internal, newLength);
+        const result = Object.create(ArrayBuffer.prototype);
+        result._internal = newInternal;
+        return result;
+    },
+
+    resize(newLength) {
+        if (!this._internal) {
+            throw new TypeError('ArrayBuffer.prototype.resize requires that "this" be an ArrayBuffer');
+        }
+        __ArrayBuffer_resize(this._internal, newLength);
+    },
+
+    get [_symbolToStringTag]() {
+        return 'ArrayBuffer';
+    },
+};
+
+Object.defineProperty(ArrayBuffer.prototype, 'constructor', {
+    value: ArrayBuffer,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+});
+
+ArrayBuffer.isView = __markNonConstructor(function isView(arg) {
+    return __ArrayBuffer_isView(arg);
+});
+
+// Helper to create ArrayBuffer from internal value (for slice/transfer operations)
+ArrayBuffer._fromInternal = function(internal) {
+    const result = Object.create(ArrayBuffer.prototype);
+    result._internal = internal;
+    return result;
+};
+
+// ============================================================================
+// TypedArray built-ins
+// ============================================================================
+
+// %TypedArray% intrinsic - base for all typed array types
+const TypedArrayPrototype = {
+    get buffer() {
+        return __TypedArray_buffer(this._internal);
+    },
+
+    get byteLength() {
+        return __TypedArray_byteLength(this._internal);
+    },
+
+    get byteOffset() {
+        return __TypedArray_byteOffset(this._internal);
+    },
+
+    get length() {
+        return __TypedArray_length(this._internal);
+    },
+
+    at(index) {
+        const len = this.length;
+        const k = index >= 0 ? index : len + index;
+        if (k < 0 || k >= len) return undefined;
+        return __TypedArray_get(this._internal, k);
+    },
+
+    subarray(begin, end) {
+        const result = __TypedArray_subarray(this._internal, begin, end);
+        return this.constructor._fromInternal(result);
+    },
+
+    slice(begin, end) {
+        const result = __TypedArray_slice(this._internal, begin, end);
+        return this.constructor._fromInternal(result);
+    },
+
+    fill(value, start, end) {
+        __TypedArray_fill(this._internal, value, start, end);
+        return this;
+    },
+
+    copyWithin(target, start, end) {
+        __TypedArray_copyWithin(this._internal, target, start, end);
+        return this;
+    },
+
+    reverse() {
+        __TypedArray_reverse(this._internal);
+        return this;
+    },
+
+    set(source, offset) {
+        if (offset === undefined) offset = 0;
+        if (source._internal && __TypedArray_isTypedArray(source._internal)) {
+            // TypedArray source
+            const srcLen = source.length;
+            for (let i = 0; i < srcLen; i++) {
+                __TypedArray_set(this._internal, offset + i, __TypedArray_get(source._internal, i));
+            }
+        } else {
+            // Array-like source
+            __TypedArray_set_array(this._internal, source, offset);
+        }
+    },
+
+    indexOf(searchElement, fromIndex) {
+        const len = this.length;
+        let k = fromIndex === undefined ? 0 : Math.trunc(fromIndex);
+        if (k < 0) k = Math.max(len + k, 0);
+        for (; k < len; k++) {
+            const elem = __TypedArray_get(this._internal, k);
+            if (elem === searchElement) return k;
+        }
+        return -1;
+    },
+
+    lastIndexOf(searchElement, fromIndex) {
+        const len = this.length;
+        let k = fromIndex === undefined ? len - 1 : Math.trunc(fromIndex);
+        if (k < 0) k = len + k;
+        for (; k >= 0; k--) {
+            const elem = __TypedArray_get(this._internal, k);
+            if (elem === searchElement) return k;
+        }
+        return -1;
+    },
+
+    includes(searchElement, fromIndex) {
+        return this.indexOf(searchElement, fromIndex) !== -1;
+    },
+
+    join(separator) {
+        const sep = separator === undefined ? ',' : String(separator);
+        const len = this.length;
+        if (len === 0) return '';
+        let result = String(__TypedArray_get(this._internal, 0));
+        for (let i = 1; i < len; i++) {
+            result += sep + String(__TypedArray_get(this._internal, i));
+        }
+        return result;
+    },
+
+    toString() {
+        return this.join(',');
+    },
+
+    forEach(callback, thisArg) {
+        const len = this.length;
+        for (let i = 0; i < len; i++) {
+            callback.call(thisArg, __TypedArray_get(this._internal, i), i, this);
+        }
+    },
+
+    map(callback, thisArg) {
+        const len = this.length;
+        const result = new this.constructor(len);
+        for (let i = 0; i < len; i++) {
+            const mapped = callback.call(thisArg, __TypedArray_get(this._internal, i), i, this);
+            __TypedArray_set(result._internal, i, mapped);
+        }
+        return result;
+    },
+
+    filter(callback, thisArg) {
+        const len = this.length;
+        const kept = [];
+        for (let i = 0; i < len; i++) {
+            const val = __TypedArray_get(this._internal, i);
+            if (callback.call(thisArg, val, i, this)) {
+                kept.push(val);
+            }
+        }
+        const result = new this.constructor(kept.length);
+        for (let i = 0; i < kept.length; i++) {
+            __TypedArray_set(result._internal, i, kept[i]);
+        }
+        return result;
+    },
+
+    reduce(callback, initialValue) {
+        const len = this.length;
+        let k = 0;
+        let accumulator;
+        if (arguments.length >= 2) {
+            accumulator = initialValue;
+        } else {
+            if (len === 0) throw new TypeError('Reduce of empty array with no initial value');
+            accumulator = __TypedArray_get(this._internal, 0);
+            k = 1;
+        }
+        for (; k < len; k++) {
+            accumulator = callback(accumulator, __TypedArray_get(this._internal, k), k, this);
+        }
+        return accumulator;
+    },
+
+    reduceRight(callback, initialValue) {
+        const len = this.length;
+        let k = len - 1;
+        let accumulator;
+        if (arguments.length >= 2) {
+            accumulator = initialValue;
+        } else {
+            if (len === 0) throw new TypeError('Reduce of empty array with no initial value');
+            accumulator = __TypedArray_get(this._internal, len - 1);
+            k = len - 2;
+        }
+        for (; k >= 0; k--) {
+            accumulator = callback(accumulator, __TypedArray_get(this._internal, k), k, this);
+        }
+        return accumulator;
+    },
+
+    find(callback, thisArg) {
+        const len = this.length;
+        for (let i = 0; i < len; i++) {
+            const val = __TypedArray_get(this._internal, i);
+            if (callback.call(thisArg, val, i, this)) return val;
+        }
+        return undefined;
+    },
+
+    findIndex(callback, thisArg) {
+        const len = this.length;
+        for (let i = 0; i < len; i++) {
+            if (callback.call(thisArg, __TypedArray_get(this._internal, i), i, this)) return i;
+        }
+        return -1;
+    },
+
+    findLast(callback, thisArg) {
+        const len = this.length;
+        for (let i = len - 1; i >= 0; i--) {
+            const val = __TypedArray_get(this._internal, i);
+            if (callback.call(thisArg, val, i, this)) return val;
+        }
+        return undefined;
+    },
+
+    findLastIndex(callback, thisArg) {
+        const len = this.length;
+        for (let i = len - 1; i >= 0; i--) {
+            if (callback.call(thisArg, __TypedArray_get(this._internal, i), i, this)) return i;
+        }
+        return -1;
+    },
+
+    every(callback, thisArg) {
+        const len = this.length;
+        for (let i = 0; i < len; i++) {
+            if (!callback.call(thisArg, __TypedArray_get(this._internal, i), i, this)) return false;
+        }
+        return true;
+    },
+
+    some(callback, thisArg) {
+        const len = this.length;
+        for (let i = 0; i < len; i++) {
+            if (callback.call(thisArg, __TypedArray_get(this._internal, i), i, this)) return true;
+        }
+        return false;
+    },
+
+    sort(compareFn) {
+        const len = this.length;
+        const arr = [];
+        for (let i = 0; i < len; i++) {
+            arr.push(__TypedArray_get(this._internal, i));
+        }
+        if (compareFn === undefined) {
+            arr.sort((a, b) => a - b);
+        } else {
+            arr.sort(compareFn);
+        }
+        for (let i = 0; i < len; i++) {
+            __TypedArray_set(this._internal, i, arr[i]);
+        }
+        return this;
+    },
+
+    toReversed() {
+        const copy = this.slice();
+        copy.reverse();
+        return copy;
+    },
+
+    toSorted(compareFn) {
+        const copy = this.slice();
+        copy.sort(compareFn);
+        return copy;
+    },
+
+    with(index, value) {
+        const len = this.length;
+        const k = index >= 0 ? index : len + index;
+        if (k < 0 || k >= len) throw new RangeError('Invalid index');
+        const copy = this.slice();
+        __TypedArray_set(copy._internal, k, value);
+        return copy;
+    },
+
+    [_symbolIterator]() {
+        let index = 0;
+        const arr = this;
+        return {
+            next() {
+                if (index < arr.length) {
+                    return { value: __TypedArray_get(arr._internal, index++), done: false };
+                }
+                return { value: undefined, done: true };
+            },
+            [_symbolIterator]() { return this; }
+        };
+    },
+
+    entries() {
+        let index = 0;
+        const arr = this;
+        return {
+            next() {
+                if (index < arr.length) {
+                    const val = __TypedArray_get(arr._internal, index);
+                    return { value: [index++, val], done: false };
+                }
+                return { value: undefined, done: true };
+            },
+            [_symbolIterator]() { return this; }
+        };
+    },
+
+    keys() {
+        let index = 0;
+        const arr = this;
+        return {
+            next() {
+                if (index < arr.length) {
+                    return { value: index++, done: false };
+                }
+                return { value: undefined, done: true };
+            },
+            [_symbolIterator]() { return this; }
+        };
+    },
+
+    values() {
+        return this[_symbolIterator]();
+    },
+};
+
+// Factory to create TypedArray constructors
+function __createTypedArrayConstructor(name, bytesPerElement) {
+    const Constructor = function(arg, byteOffset, length) {
+        if (!new.target) {
+            throw new TypeError(`Constructor ${name} requires 'new'`);
+        }
+
+        let internal;
+
+        if (arg === undefined || arg === null) {
+            // new TypedArray() - empty array
+            internal = __TypedArray_createFromLength(0, name);
+        } else if (typeof arg === 'number') {
+            // new TypedArray(length)
+            if (!Number.isInteger(arg) || arg < 0) {
+                throw new RangeError('Invalid typed array length');
+            }
+            internal = __TypedArray_createFromLength(arg, name);
+        } else if (arg._internal && arg._internal.constructor && arg._internal.constructor.name === 'ArrayBuffer') {
+            // new TypedArray(buffer, byteOffset?, length?)
+            internal = __TypedArray_create(arg._internal, name, byteOffset, length);
+        } else if (ArrayBuffer.prototype.isPrototypeOf(arg)) {
+            // Direct ArrayBuffer (internal)
+            internal = __TypedArray_create(arg._internal, name, byteOffset, length);
+        } else if (__TypedArray_isTypedArray(arg._internal)) {
+            // new TypedArray(typedArray) - copy
+            const srcLen = arg.length;
+            internal = __TypedArray_createFromLength(srcLen, name);
+            for (let i = 0; i < srcLen; i++) {
+                __TypedArray_set(internal, i, __TypedArray_get(arg._internal, i));
+            }
+        } else if (typeof arg === 'object') {
+            // new TypedArray(arrayLike) or new TypedArray(iterable)
+            const arr = Array.from(arg);
+            internal = __TypedArray_createFromLength(arr.length, name);
+            for (let i = 0; i < arr.length; i++) {
+                __TypedArray_set(internal, i, arr[i]);
+            }
+        } else {
+            throw new TypeError('Invalid argument for TypedArray constructor');
+        }
+
+        const obj = Object.create(Constructor.prototype);
+        obj._internal = internal;
+        return obj;
+    };
+
+    Constructor.prototype = Object.create(TypedArrayPrototype);
+    Constructor.prototype.constructor = Constructor;
+
+    Object.defineProperty(Constructor.prototype, _symbolToStringTag, {
+        get() { return name; },
+        configurable: true
+    });
+
+    Constructor.BYTES_PER_ELEMENT = bytesPerElement;
+    Object.defineProperty(Constructor.prototype, 'BYTES_PER_ELEMENT', {
+        value: bytesPerElement,
+        writable: false,
+        enumerable: false,
+        configurable: false
+    });
+
+    // Static methods
+    Constructor.of = function(...items) {
+        const result = new Constructor(items.length);
+        for (let i = 0; i < items.length; i++) {
+            __TypedArray_set(result._internal, i, items[i]);
+        }
+        return result;
+    };
+
+    Constructor.from = function(source, mapFn, thisArg) {
+        const arr = Array.from(source);
+        const len = arr.length;
+        const result = new Constructor(len);
+        for (let i = 0; i < len; i++) {
+            const val = mapFn ? mapFn.call(thisArg, arr[i], i) : arr[i];
+            __TypedArray_set(result._internal, i, val);
+        }
+        return result;
+    };
+
+    Constructor._fromInternal = function(internal) {
+        const obj = Object.create(Constructor.prototype);
+        obj._internal = internal;
+        return obj;
+    };
+
+    return Constructor;
+}
+
+// Create all 11 TypedArray constructors
+globalThis.Int8Array = __createTypedArrayConstructor('Int8Array', 1);
+globalThis.Uint8Array = __createTypedArrayConstructor('Uint8Array', 1);
+globalThis.Uint8ClampedArray = __createTypedArrayConstructor('Uint8ClampedArray', 1);
+globalThis.Int16Array = __createTypedArrayConstructor('Int16Array', 2);
+globalThis.Uint16Array = __createTypedArrayConstructor('Uint16Array', 2);
+globalThis.Int32Array = __createTypedArrayConstructor('Int32Array', 4);
+globalThis.Uint32Array = __createTypedArrayConstructor('Uint32Array', 4);
+globalThis.Float32Array = __createTypedArrayConstructor('Float32Array', 4);
+globalThis.Float64Array = __createTypedArrayConstructor('Float64Array', 8);
+globalThis.BigInt64Array = __createTypedArrayConstructor('BigInt64Array', 8);
+globalThis.BigUint64Array = __createTypedArrayConstructor('BigUint64Array', 8);
+
+// ===== DataView =====
+
+globalThis.DataView = (function() {
+    function DataViewConstructor(buffer, byteOffset, byteLength) {
+        if (!new.target) {
+            throw new TypeError("Constructor DataView requires 'new'");
+        }
+
+        if (!(buffer instanceof ArrayBuffer)) {
+            throw new TypeError("First argument must be an ArrayBuffer");
+        }
+
+        const internal = __DataView_create(buffer._internal, byteOffset, byteLength);
+
+        Object.defineProperty(this, '_internal', {
+            value: internal,
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        });
+    }
+    return DataViewConstructor;
+})();
+
+Object.defineProperty(globalThis.globalThis.DataView.prototype, 'buffer', {
+    get: function() {
+        if (!this._internal || !__DataView_isDataView(this._internal)) {
+            throw new TypeError('get globalThis.DataView.prototype.buffer called on incompatible receiver');
+        }
+        const ab = __DataView_getBuffer(this._internal);
+        // Wrap in ArrayBuffer-like object
+        const result = Object.create(ArrayBuffer.prototype);
+        Object.defineProperty(result, '_internal', { value: ab, writable: false, enumerable: false, configurable: false });
+        return result;
+    },
+    enumerable: false,
+    configurable: true,
+});
+
+Object.defineProperty(globalThis.DataView.prototype, 'byteOffset', {
+    get: function() {
+        if (!this._internal || !__DataView_isDataView(this._internal)) {
+            throw new TypeError('get globalThis.DataView.prototype.byteOffset called on incompatible receiver');
+        }
+        return __DataView_getByteOffset(this._internal);
+    },
+    enumerable: false,
+    configurable: true,
+});
+
+Object.defineProperty(globalThis.DataView.prototype, 'byteLength', {
+    get: function() {
+        if (!this._internal || !__DataView_isDataView(this._internal)) {
+            throw new TypeError('get globalThis.DataView.prototype.byteLength called on incompatible receiver');
+        }
+        return __DataView_getByteLength(this._internal);
+    },
+    enumerable: false,
+    configurable: true,
+});
+
+// Get methods
+globalThis.DataView.prototype.getInt8 = function(byteOffset) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    return __DataView_getInt8(this._internal, byteOffset);
+};
+
+globalThis.DataView.prototype.getUint8 = function(byteOffset) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    return __DataView_getUint8(this._internal, byteOffset);
+};
+
+globalThis.DataView.prototype.getInt16 = function(byteOffset, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    return __DataView_getInt16(this._internal, byteOffset, littleEndian);
+};
+
+globalThis.DataView.prototype.getUint16 = function(byteOffset, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    return __DataView_getUint16(this._internal, byteOffset, littleEndian);
+};
+
+globalThis.DataView.prototype.getInt32 = function(byteOffset, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    return __DataView_getInt32(this._internal, byteOffset, littleEndian);
+};
+
+globalThis.DataView.prototype.getUint32 = function(byteOffset, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    return __DataView_getUint32(this._internal, byteOffset, littleEndian);
+};
+
+globalThis.DataView.prototype.getFloat32 = function(byteOffset, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    return __DataView_getFloat32(this._internal, byteOffset, littleEndian);
+};
+
+globalThis.DataView.prototype.getFloat64 = function(byteOffset, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    return __DataView_getFloat64(this._internal, byteOffset, littleEndian);
+};
+
+globalThis.DataView.prototype.getBigInt64 = function(byteOffset, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    return __DataView_getBigInt64(this._internal, byteOffset, littleEndian);
+};
+
+globalThis.DataView.prototype.getBigUint64 = function(byteOffset, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    return __DataView_getBigUint64(this._internal, byteOffset, littleEndian);
+};
+
+// Set methods
+globalThis.DataView.prototype.setInt8 = function(byteOffset, value) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    __DataView_setInt8(this._internal, byteOffset, value);
+};
+
+globalThis.DataView.prototype.setUint8 = function(byteOffset, value) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    __DataView_setUint8(this._internal, byteOffset, value);
+};
+
+globalThis.DataView.prototype.setInt16 = function(byteOffset, value, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    __DataView_setInt16(this._internal, byteOffset, value, littleEndian);
+};
+
+globalThis.DataView.prototype.setUint16 = function(byteOffset, value, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    __DataView_setUint16(this._internal, byteOffset, value, littleEndian);
+};
+
+globalThis.DataView.prototype.setInt32 = function(byteOffset, value, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    __DataView_setInt32(this._internal, byteOffset, value, littleEndian);
+};
+
+globalThis.DataView.prototype.setUint32 = function(byteOffset, value, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    __DataView_setUint32(this._internal, byteOffset, value, littleEndian);
+};
+
+globalThis.DataView.prototype.setFloat32 = function(byteOffset, value, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    __DataView_setFloat32(this._internal, byteOffset, value, littleEndian);
+};
+
+globalThis.DataView.prototype.setFloat64 = function(byteOffset, value, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    __DataView_setFloat64(this._internal, byteOffset, value, littleEndian);
+};
+
+globalThis.DataView.prototype.setBigInt64 = function(byteOffset, value, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    __DataView_setBigInt64(this._internal, byteOffset, value, littleEndian);
+};
+
+globalThis.DataView.prototype.setBigUint64 = function(byteOffset, value, littleEndian) {
+    if (!this._internal) throw new TypeError('not a DataView');
+    __DataView_setBigUint64(this._internal, byteOffset, value, littleEndian);
+};
+
+Object.defineProperty(globalThis.DataView.prototype, Symbol.toStringTag, {
+    value: 'DataView',
+    writable: false,
+    enumerable: false,
+    configurable: true,
+});
+
+// Update ArrayBuffer.isView to detect TypedArrays and DataView
+ArrayBuffer.isView = __markNonConstructor(function isView(arg) {
+    if (arg === null || arg === undefined) return false;
+    if (arg._internal && __TypedArray_isTypedArray(arg._internal)) return true;
+    if (arg._internal && __DataView_isDataView(arg._internal)) return true;
+    return false;
+});

@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// through handler traps.
 pub struct JsProxy {
     /// The target object being proxied
-    target: GcRef<JsObject>,
+    pub(crate) target: GcRef<JsObject>,
     /// The handler object containing traps
-    handler: GcRef<JsObject>,
+    pub(crate) handler: GcRef<JsObject>,
     /// Whether this proxy has been revoked
     revoked: AtomicBool,
 }
@@ -134,10 +134,7 @@ impl JsProxy {
     /// Used for iterative destruction to prevent stack overflow.
     pub fn clear_and_extract_values(&self) -> Vec<Value> {
         self.revoke();
-        vec![
-            Value::object(self.target),
-            Value::object(self.handler),
-        ]
+        vec![Value::object(self.target), Value::object(self.handler)]
     }
 }
 

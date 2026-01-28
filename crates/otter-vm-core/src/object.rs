@@ -11,10 +11,33 @@
 //! properties.
 
 use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 use crate::gc::GcRef;
 use crate::shape::Shape;
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Global prototype epoch counter for IC invalidation.
+/// Incremented whenever any object's prototype is modified.
+/// Used by inline caches to detect when prototype chain lookups may be stale.
+static PROTO_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Get the current global prototype epoch.
+/// Used by IC code to record the epoch when caching prototype chain lookups.
+#[inline]
+pub fn get_proto_epoch() -> u64 {
+    PROTO_EPOCH.load(Ordering::Acquire)
+}
+
+/// Increment the global prototype epoch.
+/// Called whenever an object's prototype is modified.
+/// Returns the new epoch value.
+#[inline]
+pub fn bump_proto_epoch() -> u64 {
+    PROTO_EPOCH.fetch_add(1, Ordering::AcqRel) + 1
+}
 
 /// Maximum prototype chain depth to prevent stack overflow
 const MAX_PROTOTYPE_CHAIN_DEPTH: usize = 100;
@@ -22,6 +45,12 @@ const MAX_PROTOTYPE_CHAIN_DEPTH: usize = 100;
 /// Number of properties stored inline in the object (JSC-style optimization)
 /// Properties beyond this count overflow to a Vec.
 pub const INLINE_PROPERTY_COUNT: usize = 4;
+
+/// Threshold for transitioning to dictionary mode.
+/// Objects with more than this many properties, or objects that have had
+/// properties deleted, switch to HashMap-based storage for better memory
+/// efficiency at the cost of IC cacheability.
+pub const DICTIONARY_THRESHOLD: usize = 32;
 use crate::string::JsString;
 use crate::value::Value;
 
@@ -231,6 +260,9 @@ pub struct JsObject {
     inline_properties: RwLock<[Option<PropertyEntry>; INLINE_PROPERTY_COUNT]>,
     /// Overflow properties storage (for properties beyond INLINE_PROPERTY_COUNT)
     overflow_properties: RwLock<Vec<PropertyEntry>>,
+    /// Dictionary mode property storage (used when is_dictionary flag is set)
+    /// When in dictionary mode, shape/inline/overflow are ignored for property access.
+    dictionary_properties: RwLock<Option<FxHashMap<PropertyKey, PropertyEntry>>>,
     /// Prototype (null for Object.prototype, mutable via Reflect.setPrototypeOf) - GC-managed
     prototype: RwLock<Option<GcRef<JsObject>>>,
     /// Array elements (for array-like objects)
@@ -252,6 +284,8 @@ pub struct ObjectFlags {
     pub sealed: bool,
     /// Is frozen
     pub frozen: bool,
+    /// Is in dictionary mode (HashMap storage, IC-uncacheable)
+    pub is_dictionary: bool,
 }
 
 impl JsObject {
@@ -268,6 +302,7 @@ impl JsObject {
             shape: RwLock::new(Shape::root()),
             inline_properties: RwLock::new([None, None, None, None]),
             overflow_properties: RwLock::new(Vec::new()),
+            dictionary_properties: RwLock::new(None),
             prototype: RwLock::new(prototype),
             elements: RwLock::new(Vec::new()),
             flags: RwLock::new(ObjectFlags {
@@ -404,6 +439,54 @@ impl JsObject {
         self.shape.read().clone()
     }
 
+    /// Check if object is in dictionary mode (IC-uncacheable).
+    /// Objects in dictionary mode use HashMap storage instead of shape-based indexed storage.
+    #[inline]
+    pub fn is_dictionary_mode(&self) -> bool {
+        self.flags.read().is_dictionary
+    }
+
+    /// Transition object to dictionary mode.
+    /// This converts shape-based indexed storage to HashMap storage.
+    /// Called when property count exceeds DICTIONARY_THRESHOLD or on delete operations.
+    fn transition_to_dictionary(&self) {
+        let mut flags = self.flags.write();
+        if flags.is_dictionary {
+            return; // Already in dictionary mode
+        }
+
+        // Build HashMap from existing properties
+        let mut dict = FxHashMap::default();
+
+        let shape = self.shape.read();
+        let inline = self.inline_properties.read();
+        let overflow = self.overflow_properties.read();
+
+        // Iterate over all properties in the shape
+        for (key, offset) in shape.own_keys().into_iter().zip(0..) {
+            let entry = if offset < INLINE_PROPERTY_COUNT {
+                inline[offset].clone()
+            } else {
+                overflow.get(offset - INLINE_PROPERTY_COUNT).cloned()
+            };
+
+            if let Some(entry) = entry {
+                // Skip deleted entries
+                if !matches!(entry.desc, PropertyDescriptor::Deleted) {
+                    dict.insert(key, entry);
+                }
+            }
+        }
+
+        drop(shape);
+        drop(inline);
+        drop(overflow);
+
+        // Store the dictionary
+        *self.dictionary_properties.write() = Some(dict);
+        flags.is_dictionary = true;
+    }
+
     /// Get property by key
     pub fn get(&self, key: &PropertyKey) -> Option<Value> {
         // Special handling for array "length" property
@@ -414,8 +497,20 @@ impl JsObject {
             return Some(Value::int32(self.elements.read().len() as i32));
         }
 
-        // Check own properties first via shape lookup
-        {
+        // Dictionary mode: use HashMap lookup
+        if self.is_dictionary_mode() {
+            if let Some(dict) = self.dictionary_properties.read().as_ref() {
+                if let Some(entry) = dict.get(key) {
+                    match &entry.desc {
+                        PropertyDescriptor::Data { value, .. } => return Some(value.clone()),
+                        PropertyDescriptor::Accessor { .. } => return None,
+                        PropertyDescriptor::Deleted => {}
+                    }
+                }
+            }
+            // Fall through to indexed elements and prototype chain
+        } else {
+            // Check own properties first via shape lookup
             let shape = self.shape.read();
             if let Some(offset) = shape.get_offset(key) {
                 if let Some(desc) = self.get_property_entry_by_offset(offset) {
@@ -539,6 +634,14 @@ impl JsObject {
 
     /// Get own property descriptor (does not walk prototype chain).
     pub fn get_own_property_descriptor(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        // Dictionary mode: lookup in HashMap
+        if self.is_dictionary_mode() {
+            if let Some(dict) = self.dictionary_properties.read().as_ref() {
+                return dict.get(key).map(|e| e.desc.clone());
+            }
+            return None;
+        }
+
         let shape = self.shape.read();
         if let Some(offset) = shape.get_offset(key) {
             return self.get_property_entry_by_offset(offset);
@@ -601,6 +704,20 @@ impl JsObject {
             return self.set(string_key, value);
         }
 
+        // Dictionary mode: use HashMap storage
+        if flags.is_dictionary {
+            drop(flags);
+            let mut dict = self.dictionary_properties.write();
+            if let Some(map) = dict.as_mut() {
+                let entry = PropertyEntry {
+                    desc: PropertyDescriptor::data(value),
+                };
+                map.insert(key, entry);
+                return true;
+            }
+            return false;
+        }
+
         // Check if property exists
         {
             let shape = self.shape.read();
@@ -614,29 +731,55 @@ impl JsObject {
 
         // New property addition
         if flags.extensible && !flags.sealed {
+            drop(flags);
+
             let mut shape_write = self.shape.write();
-
-            // Get current property count to determine where to store
-            let inline = self.inline_properties.read();
-            let current_inline_count = inline.iter().filter(|v| v.is_some()).count();
-            drop(inline);
-
             // Transition to new shape
             let next_shape = shape_write.transition(key);
+            let offset = next_shape
+                .offset
+                .expect("Shape transition should have an offset");
+
+            // Check if we should transition to dictionary mode
+            if offset >= DICTIONARY_THRESHOLD {
+                drop(shape_write);
+                self.transition_to_dictionary();
+                // Now set in dictionary mode
+                let mut dict = self.dictionary_properties.write();
+                if let Some(map) = dict.as_mut() {
+                    let entry = PropertyEntry {
+                        desc: PropertyDescriptor::data(value),
+                    };
+                    // Re-insert the key we were adding
+                    map.insert(next_shape.key.clone().unwrap(), entry);
+                    return true;
+                }
+                return false;
+            }
+
             *shape_write = next_shape;
 
             let entry = PropertyEntry {
                 desc: PropertyDescriptor::data(value),
             };
 
-            if current_inline_count < INLINE_PROPERTY_COUNT {
+            if offset < INLINE_PROPERTY_COUNT {
                 // Store in inline slot
                 let mut inline = self.inline_properties.write();
-                inline[current_inline_count] = Some(entry);
+                inline[offset] = Some(entry);
             } else {
                 // Store in overflow
                 let mut overflow = self.overflow_properties.write();
-                overflow.push(entry);
+                let overflow_idx = offset - INLINE_PROPERTY_COUNT;
+                if overflow_idx >= overflow.len() {
+                    overflow.resize(
+                        overflow_idx + 1,
+                        PropertyEntry {
+                            desc: PropertyDescriptor::Deleted,
+                        },
+                    );
+                }
+                overflow[overflow_idx] = entry;
             }
             true
         } else {
@@ -660,6 +803,15 @@ impl JsObject {
             return true;
         }
 
+        // Dictionary mode: remove from HashMap
+        if self.is_dictionary_mode() {
+            let mut dict = self.dictionary_properties.write();
+            if let Some(map) = dict.as_mut() {
+                map.remove(key);
+            }
+            return true;
+        }
+
         let Some(offset) = self.shape.read().get_offset(key) else {
             // Per JS semantics, deleting a non-existent property succeeds.
             return true;
@@ -675,6 +827,7 @@ impl JsObject {
         if flags.sealed || flags.frozen {
             return false;
         }
+        drop(flags);
 
         // Check if configurable
         if let Some(desc) = self.get_own_property_descriptor(key) {
@@ -682,21 +835,15 @@ impl JsObject {
                 return false;
             }
 
-            // Mark tombstone in-place (Shape remains unchanged for now).
-            if offset < INLINE_PROPERTY_COUNT {
-                let mut inline = self.inline_properties.write();
-                if let Some(entry) = inline[offset].as_mut() {
-                    entry.desc = PropertyDescriptor::Deleted;
-                    return true;
-                }
-            } else {
-                let mut overflow = self.overflow_properties.write();
-                let overflow_idx = offset - INLINE_PROPERTY_COUNT;
-                if let Some(entry) = overflow.get_mut(overflow_idx) {
-                    entry.desc = PropertyDescriptor::Deleted;
-                    return true;
-                }
+            // Transition to dictionary mode on delete (creates sparse storage)
+            self.transition_to_dictionary();
+
+            // Now remove from dictionary
+            let mut dict = self.dictionary_properties.write();
+            if let Some(map) = dict.as_mut() {
+                map.remove(key);
             }
+            return true;
         }
 
         // If we couldn't find storage for an offset that exists in the Shape,
@@ -706,8 +853,17 @@ impl JsObject {
 
     /// Check if object has own property
     pub fn has_own(&self, key: &PropertyKey) -> bool {
-        if let Some(offset) = self.shape.read().get_offset(key) {
-            return self.get_property_entry_by_offset(offset).is_some();
+        // Dictionary mode: check HashMap
+        if self.is_dictionary_mode() {
+            if let Some(dict) = self.dictionary_properties.read().as_ref() {
+                if dict.contains_key(key) {
+                    return true;
+                }
+            }
+        } else if let Some(offset) = self.shape.read().get_offset(key) {
+            if self.get_property_entry_by_offset(offset).is_some() {
+                return true;
+            }
         }
 
         // Check indexed elements
@@ -747,11 +903,20 @@ impl JsObject {
 
     /// Get own property keys
     pub fn own_keys(&self) -> Vec<PropertyKey> {
-        let shape_keys = self.shape.read().own_keys();
-        let mut keys = Vec::with_capacity(shape_keys.len());
-        for key in shape_keys {
-            if self.get_own_property_descriptor(&key).is_some() {
-                keys.push(key);
+        let mut keys = Vec::new();
+
+        // Dictionary mode: get keys from HashMap
+        if self.is_dictionary_mode() {
+            if let Some(dict) = self.dictionary_properties.read().as_ref() {
+                keys.extend(dict.keys().cloned());
+            }
+        } else {
+            let shape_keys = self.shape.read().own_keys();
+            keys.reserve(shape_keys.len());
+            for key in shape_keys {
+                if self.get_own_property_descriptor(&key).is_some() {
+                    keys.push(key);
+                }
             }
         }
 
@@ -770,6 +935,17 @@ impl JsObject {
 
         // Frozen objects cannot have properties defined
         if flags.frozen {
+            return false;
+        }
+
+        // Dictionary mode: store directly in HashMap
+        if flags.is_dictionary {
+            drop(flags);
+            let mut dict = self.dictionary_properties.write();
+            if let Some(map) = dict.as_mut() {
+                map.insert(key, PropertyEntry { desc });
+                return true;
+            }
             return false;
         }
 
@@ -806,28 +982,50 @@ impl JsObject {
         if !flags.extensible || flags.sealed {
             return false;
         }
+        drop(flags);
 
         let mut shape_write = self.shape.write();
 
-        // Get current inline count
-        let inline = self.inline_properties.read();
-        let current_inline_count = inline.iter().filter(|v| v.is_some()).count();
-        drop(inline);
-
         // Transition to new shape
-        let next_shape = shape_write.transition(key);
+        let next_shape = shape_write.transition(key.clone());
+        let offset = next_shape
+            .offset
+            .expect("Shape transition should have an offset");
+
+        // Check if we should transition to dictionary mode
+        if offset >= DICTIONARY_THRESHOLD {
+            drop(shape_write);
+            self.transition_to_dictionary();
+            // Store in dictionary
+            let mut dict = self.dictionary_properties.write();
+            if let Some(map) = dict.as_mut() {
+                map.insert(key, PropertyEntry { desc });
+                return true;
+            }
+            return false;
+        }
+
         *shape_write = next_shape;
 
         let entry = PropertyEntry { desc };
 
-        if current_inline_count < INLINE_PROPERTY_COUNT {
+        if offset < INLINE_PROPERTY_COUNT {
             // Store in inline slot
             let mut inline = self.inline_properties.write();
-            inline[current_inline_count] = Some(entry);
+            inline[offset] = Some(entry);
         } else {
             // Store in overflow
             let mut overflow = self.overflow_properties.write();
-            overflow.push(entry);
+            let overflow_idx = offset - INLINE_PROPERTY_COUNT;
+            if overflow_idx >= overflow.len() {
+                overflow.resize(
+                    overflow_idx + 1,
+                    PropertyEntry {
+                        desc: PropertyDescriptor::Deleted,
+                    },
+                );
+            }
+            overflow[overflow_idx] = entry;
         }
         true
     }
@@ -864,6 +1062,8 @@ impl JsObject {
         }
 
         *self.prototype.write() = prototype;
+        // Bump global proto epoch to invalidate any cached prototype chain lookups
+        bump_proto_epoch();
         true
     }
 
@@ -978,6 +1178,10 @@ impl JsObject {
 
     pub(crate) fn get_elements_storage(&self) -> &RwLock<Vec<Value>> {
         &self.elements
+    }
+
+    pub(crate) fn get_prototype_storage(&self) -> &RwLock<Option<GcRef<JsObject>>> {
+        &self.prototype
     }
 }
 
@@ -1178,14 +1382,8 @@ mod tests {
     fn test_prototype_cycle_prevention() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         let obj1 = GcRef::new(JsObject::new(None, Arc::clone(&memory_manager)));
-        let obj2 = GcRef::new(JsObject::new(
-            Some(obj1),
-            Arc::clone(&memory_manager),
-        ));
-        let obj3 = GcRef::new(JsObject::new(
-            Some(obj2),
-            Arc::clone(&memory_manager),
-        ));
+        let obj2 = GcRef::new(JsObject::new(Some(obj1), Arc::clone(&memory_manager)));
+        let obj3 = GcRef::new(JsObject::new(Some(obj2), Arc::clone(&memory_manager)));
 
         // Attempting to create a cycle should fail
         // obj1 -> obj2 -> obj3 -> obj1 would be a cycle

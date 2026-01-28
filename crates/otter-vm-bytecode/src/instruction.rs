@@ -166,6 +166,8 @@ pub enum Opcode {
     ConstructSpread = 0x88,
     /// Call function with explicit receiver: dst = func.call(this, args...)
     CallWithReceiver = 0x89,
+    /// Create arguments object: dst = arguments
+    CreateArguments = 0x8A,
 
     // ==================== Control Flow ====================
     /// Unconditional jump
@@ -218,6 +220,8 @@ pub enum Opcode {
     AsyncClosure = 0xD2,
     /// Create generator function
     GeneratorClosure = 0xD3,
+    /// Create async generator function
+    AsyncGeneratorClosure = 0xD4,
 
     // ==================== Misc ====================
     /// Move register: dst = src
@@ -320,6 +324,7 @@ impl Opcode {
             0x87 => Some(Self::CallSpread),
             0x88 => Some(Self::ConstructSpread),
             0x89 => Some(Self::CallWithReceiver),
+            0x8A => Some(Self::CreateArguments),
 
             0x90 => Some(Self::Jump),
             0x91 => Some(Self::JumpIfTrue),
@@ -346,6 +351,7 @@ impl Opcode {
             0xD1 => Some(Self::Await),
             0xD2 => Some(Self::AsyncClosure),
             0xD3 => Some(Self::GeneratorClosure),
+            0xD4 => Some(Self::AsyncGeneratorClosure),
 
             0xE0 => Some(Self::Move),
             0xE1 => Some(Self::Nop),
@@ -447,6 +453,7 @@ impl Opcode {
             Self::CallSpread => "CallSpread",
             Self::ConstructSpread => "ConstructSpread",
             Self::CallWithReceiver => "CallWithReceiver",
+            Self::CreateArguments => "CreateArguments",
             // Control flow
             Self::Jump => "Jump",
             Self::JumpIfTrue => "JumpIfTrue",
@@ -473,6 +480,7 @@ impl Opcode {
             Self::Await => "Await",
             Self::AsyncClosure => "AsyncClosure",
             Self::GeneratorClosure => "GeneratorClosure",
+            Self::AsyncGeneratorClosure => "AsyncGeneratorClosure",
             // Misc
             Self::Move => "Move",
             Self::Nop => "Nop",
@@ -556,26 +564,80 @@ pub enum Instruction {
         local_idx: LocalIndex,
     },
 
-    // Arithmetic
+    // Arithmetic (generic, with type feedback)
     Add {
         dst: Register,
         lhs: Register,
         rhs: Register,
+        feedback_index: u16,
     },
     Sub {
         dst: Register,
         lhs: Register,
         rhs: Register,
+        feedback_index: u16,
     },
     Mul {
         dst: Register,
         lhs: Register,
         rhs: Register,
+        feedback_index: u16,
     },
     Div {
         dst: Register,
         lhs: Register,
         rhs: Register,
+        feedback_index: u16,
+    },
+
+    // Quickened arithmetic (type-specialized, no type checks needed)
+    AddI32 {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        feedback_index: u16,
+    },
+    SubI32 {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        feedback_index: u16,
+    },
+    MulI32 {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        feedback_index: u16,
+    },
+    DivI32 {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        feedback_index: u16,
+    },
+    AddF64 {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        feedback_index: u16,
+    },
+    SubF64 {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        feedback_index: u16,
+    },
+    MulF64 {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        feedback_index: u16,
+    },
+    DivF64 {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        feedback_index: u16,
     },
     Mod {
         dst: Register,
@@ -697,11 +759,15 @@ pub enum Instruction {
         dst: Register,
         lhs: Register,
         rhs: Register,
+        /// Index into the feedback vector for Inline Cache (caches prototype lookup)
+        ic_index: u16,
     },
     In {
         dst: Register,
         lhs: Register,
         rhs: Register,
+        /// Index into the feedback vector for Inline Cache (caches property existence)
+        ic_index: u16,
     },
     /// ToNumber conversion
     ToNumber {
@@ -773,11 +839,15 @@ pub enum Instruction {
         dst: Register,
         arr: Register,
         idx: Register,
+        /// Index into the feedback vector for Inline Cache
+        ic_index: u16,
     },
     SetElem {
         arr: Register,
         idx: Register,
         val: Register,
+        /// Index into the feedback vector for Inline Cache
+        ic_index: u16,
     },
     Spread {
         dst: Register,
@@ -801,6 +871,10 @@ pub enum Instruction {
         argc: u8,
         /// Index into the feedback vector for Inline Cache
         ic_index: u16,
+    },
+    /// Create arguments object for current function
+    CreateArguments {
+        dst: Register,
     },
     CallWithReceiver {
         dst: Register,
@@ -945,6 +1019,10 @@ pub enum Instruction {
         func: FunctionIndex,
     },
     GeneratorClosure {
+        dst: Register,
+        func: FunctionIndex,
+    },
+    AsyncGeneratorClosure {
         dst: Register,
         func: FunctionIndex,
     },

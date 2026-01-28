@@ -1878,10 +1878,12 @@ impl Compiler {
                     });
 
                     let elem_reg = self.codegen.alloc_reg();
+                    let ic_index = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::GetElem {
                         dst: elem_reg,
                         arr: source_reg,
                         idx: idx_reg,
+                        ic_index,
                     });
                     self.codegen.free_reg(idx_reg);
 
@@ -1991,10 +1993,12 @@ impl Compiler {
                             dst: idx_reg,
                             value: i as i32,
                         });
+                        let ic_index_elem = self.codegen.alloc_ic();
                         self.codegen.emit(Instruction::SetElem {
                             arr: excluded_array,
                             idx: idx_reg,
                             val: *key_reg,
+                            ic_index: ic_index_elem,
                         });
                         self.codegen.free_reg(idx_reg);
                         self.codegen.free_reg(*key_reg);
@@ -2166,10 +2170,12 @@ impl Compiler {
                     });
 
                     let elem_reg = self.codegen.alloc_reg();
+                    let ic_index = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::GetElem {
                         dst: elem_reg,
                         arr: source_reg,
                         idx: idx_reg,
+                        ic_index,
                     });
                     self.codegen.free_reg(idx_reg);
 
@@ -2420,10 +2426,12 @@ impl Compiler {
                             dst: idx_reg,
                             value: i as i32,
                         });
+                        let ic_index_elem = self.codegen.alloc_ic();
                         self.codegen.emit(Instruction::SetElem {
                             arr: excluded_array,
                             idx: idx_reg,
                             val: *key_reg,
+                            ic_index: ic_index_elem,
                         });
                         self.codegen.free_reg(idx_reg);
                         self.codegen.free_reg(*key_reg);
@@ -2748,7 +2756,12 @@ impl Compiler {
             && let Some(ResolvedBinding::Local(idx)) = self.codegen.resolve_variable(&n)
         {
             let dst = self.codegen.alloc_reg();
-            if is_generator {
+            if is_async && is_generator {
+                self.codegen.emit(Instruction::AsyncGeneratorClosure {
+                    dst,
+                    func: otter_vm_bytecode::FunctionIndex(func_idx),
+                });
+            } else if is_generator {
                 self.codegen.emit(Instruction::GeneratorClosure {
                     dst,
                     func: otter_vm_bytecode::FunctionIndex(func_idx),
@@ -2927,7 +2940,12 @@ impl Compiler {
 
         // Create closure
         let dst = self.codegen.alloc_reg();
-        if is_generator {
+        if is_async && is_generator {
+            self.codegen.emit(Instruction::AsyncGeneratorClosure {
+                dst,
+                func: otter_vm_bytecode::FunctionIndex(func_idx),
+            });
+        } else if is_generator {
             self.codegen.emit(Instruction::GeneratorClosure {
                 dst,
                 func: otter_vm_bytecode::FunctionIndex(func_idx),
@@ -3488,10 +3506,12 @@ impl Compiler {
                     None => str_reg,
                     Some(acc) => {
                         let dst = self.codegen.alloc_reg();
+                        let feedback_index = self.codegen.alloc_ic();
                         self.codegen.emit(Instruction::Add {
                             dst,
                             lhs: acc,
                             rhs: str_reg,
+                            feedback_index,
                         });
                         self.codegen.free_reg(acc);
                         self.codegen.free_reg(str_reg);
@@ -3508,10 +3528,12 @@ impl Compiler {
                     None => expr_reg,
                     Some(acc) => {
                         let dst = self.codegen.alloc_reg();
+                        let feedback_index = self.codegen.alloc_ic();
                         self.codegen.emit(Instruction::Add {
                             dst,
                             lhs: acc,
                             rhs: expr_reg,
+                            feedback_index,
                         });
                         self.codegen.free_reg(acc);
                         self.codegen.free_reg(expr_reg);
@@ -3635,6 +3657,26 @@ impl Compiler {
                 });
             }
             Some(ResolvedBinding::Global(name)) => {
+                // Handle 'arguments' object
+                if name == "arguments" {
+                    // Start simple: only handle for current function (not arrow functions yet)
+                    // In a proper implementation, arrow functions would resolve 'arguments'
+                    // from the parent scope via upvalues.
+                    // If we are here, it means it wasn't found in scope, so we are likely
+                    // in the function that owns these arguments.
+                    // TODO: Handle arrow functions/nested scopes properly
+                    if !self.codegen.current.flags.is_arrow {
+                        if let Some(reg) = self.codegen.current.arguments_register {
+                            return Ok(reg);
+                        } else {
+                            let dst = self.codegen.alloc_reg();
+                            self.codegen.emit(Instruction::CreateArguments { dst });
+                            self.codegen.current.arguments_register = Some(dst);
+                            return Ok(dst);
+                        }
+                    }
+                }
+
                 let name_idx = self.codegen.add_string(&name);
                 let ic_index = self.codegen.alloc_ic();
                 self.codegen.emit(Instruction::GetGlobal {
@@ -3652,6 +3694,26 @@ impl Compiler {
                 });
             }
             None => {
+                // Handle 'arguments' object
+                if name == "arguments" {
+                    // Start simple: only handle for current function (not arrow functions yet)
+                    // In a proper implementation, arrow functions would resolve 'arguments'
+                    // from the parent scope via upvalues.
+                    // If we are here, it means it wasn't found in scope, so we are likely
+                    // in the function that owns these arguments.
+                    // TODO: Handle arrow functions/nested scopes properly
+                    if !self.codegen.current.flags.is_arrow {
+                        if let Some(reg) = self.codegen.current.arguments_register {
+                            return Ok(reg);
+                        } else {
+                            let dst = self.codegen.alloc_reg();
+                            self.codegen.emit(Instruction::CreateArguments { dst });
+                            self.codegen.current.arguments_register = Some(dst);
+                            return Ok(dst);
+                        }
+                    }
+                }
+
                 let name_idx = self.codegen.add_string(name);
                 let ic_index = self.codegen.alloc_ic();
                 self.codegen.emit(Instruction::GetGlobal {
@@ -3671,33 +3733,66 @@ impl Compiler {
         let rhs = self.compile_expression(&binary.right)?;
         let dst = self.codegen.alloc_reg();
 
-        let instruction = match binary.operator {
-            BinaryOperator::Addition => Instruction::Add { dst, lhs, rhs },
-            BinaryOperator::Subtraction => Instruction::Sub { dst, lhs, rhs },
-            BinaryOperator::Multiplication => Instruction::Mul { dst, lhs, rhs },
-            BinaryOperator::Division => Instruction::Div { dst, lhs, rhs },
-            BinaryOperator::Remainder => Instruction::Mod { dst, lhs, rhs },
-            BinaryOperator::LessThan => Instruction::Lt { dst, lhs, rhs },
-            BinaryOperator::LessEqualThan => Instruction::Le { dst, lhs, rhs },
-            BinaryOperator::GreaterThan => Instruction::Gt { dst, lhs, rhs },
-            BinaryOperator::GreaterEqualThan => Instruction::Ge { dst, lhs, rhs },
-            BinaryOperator::Equality => Instruction::Eq { dst, lhs, rhs },
-            BinaryOperator::Inequality => Instruction::Ne { dst, lhs, rhs },
-            BinaryOperator::StrictEquality => Instruction::StrictEq { dst, lhs, rhs },
-            BinaryOperator::StrictInequality => Instruction::StrictNe { dst, lhs, rhs },
-            BinaryOperator::BitwiseAnd => Instruction::BitAnd { dst, lhs, rhs },
-            BinaryOperator::BitwiseOR => Instruction::BitOr { dst, lhs, rhs },
-            BinaryOperator::BitwiseXOR => Instruction::BitXor { dst, lhs, rhs },
-            BinaryOperator::ShiftLeft => Instruction::Shl { dst, lhs, rhs },
-            BinaryOperator::ShiftRight => Instruction::Shr { dst, lhs, rhs },
-            BinaryOperator::ShiftRightZeroFill => Instruction::Ushr { dst, lhs, rhs },
-            BinaryOperator::Instanceof => Instruction::InstanceOf { dst, lhs, rhs },
-            BinaryOperator::In => Instruction::In { dst, lhs, rhs },
-            BinaryOperator::Exponential => Instruction::Pow { dst, lhs, rhs },
-            _ => unreachable!("Exhaustive match for BinaryOperator"),
-        };
+        // Handle instanceof and in specially to allocate IC indices
+        match binary.operator {
+            BinaryOperator::Instanceof => {
+                let ic_index = self.codegen.alloc_ic();
+                self.codegen.emit(Instruction::InstanceOf {
+                    dst,
+                    lhs,
+                    rhs,
+                    ic_index,
+                });
+            }
+            BinaryOperator::In => {
+                let ic_index = self.codegen.alloc_ic();
+                self.codegen.emit(Instruction::In {
+                    dst,
+                    lhs,
+                    rhs,
+                    ic_index,
+                });
+            }
+            _ => {
+                let instruction = match binary.operator {
+                    BinaryOperator::Addition => {
+                        let feedback_index = self.codegen.alloc_ic();
+                        Instruction::Add { dst, lhs, rhs, feedback_index }
+                    }
+                    BinaryOperator::Subtraction => {
+                        let feedback_index = self.codegen.alloc_ic();
+                        Instruction::Sub { dst, lhs, rhs, feedback_index }
+                    }
+                    BinaryOperator::Multiplication => {
+                        let feedback_index = self.codegen.alloc_ic();
+                        Instruction::Mul { dst, lhs, rhs, feedback_index }
+                    }
+                    BinaryOperator::Division => {
+                        let feedback_index = self.codegen.alloc_ic();
+                        Instruction::Div { dst, lhs, rhs, feedback_index }
+                    }
+                    BinaryOperator::Remainder => Instruction::Mod { dst, lhs, rhs },
+                    BinaryOperator::LessThan => Instruction::Lt { dst, lhs, rhs },
+                    BinaryOperator::LessEqualThan => Instruction::Le { dst, lhs, rhs },
+                    BinaryOperator::GreaterThan => Instruction::Gt { dst, lhs, rhs },
+                    BinaryOperator::GreaterEqualThan => Instruction::Ge { dst, lhs, rhs },
+                    BinaryOperator::Equality => Instruction::Eq { dst, lhs, rhs },
+                    BinaryOperator::Inequality => Instruction::Ne { dst, lhs, rhs },
+                    BinaryOperator::StrictEquality => Instruction::StrictEq { dst, lhs, rhs },
+                    BinaryOperator::StrictInequality => Instruction::StrictNe { dst, lhs, rhs },
+                    BinaryOperator::BitwiseAnd => Instruction::BitAnd { dst, lhs, rhs },
+                    BinaryOperator::BitwiseOR => Instruction::BitOr { dst, lhs, rhs },
+                    BinaryOperator::BitwiseXOR => Instruction::BitXor { dst, lhs, rhs },
+                    BinaryOperator::ShiftLeft => Instruction::Shl { dst, lhs, rhs },
+                    BinaryOperator::ShiftRight => Instruction::Shr { dst, lhs, rhs },
+                    BinaryOperator::ShiftRightZeroFill => Instruction::Ushr { dst, lhs, rhs },
+                    BinaryOperator::Exponential => Instruction::Pow { dst, lhs, rhs },
+                    _ => unreachable!("Exhaustive match for BinaryOperator"),
+                };
+                self.codegen.emit(instruction);
+            }
+        }
 
-        self.codegen.emit(instruction);
         self.codegen.free_reg(lhs);
         self.codegen.free_reg(rhs);
 
@@ -3787,6 +3882,15 @@ impl Compiler {
                         return Ok(dst);
                     }
                     Some(ResolvedBinding::Global(_)) | None => {
+                        // Special handling for 'arguments' - compile it as identifier to trigger object creation
+                        if ident.name == "arguments" && !self.codegen.current.flags.is_arrow {
+                            let src = self.compile_identifier(&ident.name)?;
+                            let dst = self.codegen.alloc_reg();
+                            self.codegen.emit(Instruction::TypeOf { dst, src });
+                            self.codegen.free_reg(src);
+                            return Ok(dst);
+                        }
+
                         let dst = self.codegen.alloc_reg();
                         let name_idx = self.codegen.add_string(&ident.name);
                         self.codegen.emit(Instruction::TypeOfName {
@@ -3995,16 +4099,20 @@ impl Compiler {
         let dst = self.codegen.alloc_reg();
         match op {
             AssignmentOperator::Addition => {
-                self.codegen.emit(Instruction::Add { dst, lhs, rhs });
+                let feedback_index = self.codegen.alloc_ic();
+                self.codegen.emit(Instruction::Add { dst, lhs, rhs, feedback_index });
             }
             AssignmentOperator::Subtraction => {
-                self.codegen.emit(Instruction::Sub { dst, lhs, rhs });
+                let feedback_index = self.codegen.alloc_ic();
+                self.codegen.emit(Instruction::Sub { dst, lhs, rhs, feedback_index });
             }
             AssignmentOperator::Multiplication => {
-                self.codegen.emit(Instruction::Mul { dst, lhs, rhs });
+                let feedback_index = self.codegen.alloc_ic();
+                self.codegen.emit(Instruction::Mul { dst, lhs, rhs, feedback_index });
             }
             AssignmentOperator::Division => {
-                self.codegen.emit(Instruction::Div { dst, lhs, rhs });
+                let feedback_index = self.codegen.alloc_ic();
+                self.codegen.emit(Instruction::Div { dst, lhs, rhs, feedback_index });
             }
             AssignmentOperator::Remainder => {
                 self.codegen.emit(Instruction::Mod { dst, lhs, rhs });
@@ -4356,10 +4464,12 @@ impl Compiler {
                         });
 
                         // Set element at current length
+                        let ic_index_elem = self.codegen.alloc_ic();
                         self.codegen.emit(Instruction::SetElem {
                             arr: args_arr,
                             idx: len_reg,
                             val: arg_val,
+                            ic_index: ic_index_elem,
                         });
 
                         self.codegen.free_reg(len_reg);
@@ -4477,10 +4587,12 @@ impl Compiler {
                     });
 
                     // Set element at current length
+                    let ic_index_elem = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::SetElem {
                         arr: args_arr,
                         idx: len_reg,
                         val: arg_val,
+                        ic_index: ic_index_elem,
                     });
 
                     self.codegen.free_reg(len_reg);
@@ -5204,10 +5316,12 @@ impl Compiler {
                             dst: idx_reg,
                             value: i as i32,
                         });
+                        let ic_index_elem = self.codegen.alloc_ic();
                         self.codegen.emit(Instruction::SetElem {
                             arr: dst,
                             idx: idx_reg,
                             val: value,
+                            ic_index: ic_index_elem,
                         });
                         self.codegen.free_reg(idx_reg);
                         self.codegen.free_reg(value);
@@ -5242,10 +5356,12 @@ impl Compiler {
                         name: length_key,
                         ic_index,
                     });
+                    let ic_index_elem = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::SetElem {
                         arr: dst,
                         idx: idx_reg,
                         val: value,
+                        ic_index: ic_index_elem,
                     });
                     self.codegen.free_reg(idx_reg);
                     self.codegen.free_reg(value);

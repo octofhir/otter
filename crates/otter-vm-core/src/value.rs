@@ -26,6 +26,8 @@
 //! - False:      0x7FF8_0000_0000_0003
 //! ```
 
+use crate::array_buffer::JsArrayBuffer;
+use crate::data_view::JsDataView;
 use crate::gc::GcRef;
 use crate::generator::JsGenerator;
 use crate::object::JsObject;
@@ -34,6 +36,7 @@ use crate::proxy::JsProxy;
 use crate::regexp::JsRegExp;
 use crate::shared_buffer::SharedArrayBuffer;
 use crate::string::JsString;
+use crate::typed_array::JsTypedArray;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -130,6 +133,12 @@ pub enum HeapRef {
     Proxy(Arc<JsProxy>),
     /// Generator object
     Generator(Arc<JsGenerator>),
+    /// ArrayBuffer (raw binary data buffer)
+    ArrayBuffer(Arc<JsArrayBuffer>),
+    /// TypedArray (view over ArrayBuffer)
+    TypedArray(Arc<JsTypedArray>),
+    /// DataView (arbitrary byte-order access to ArrayBuffer)
+    DataView(Arc<JsDataView>),
     /// SharedArrayBuffer (can be shared between workers)
     SharedArrayBuffer(Arc<SharedArrayBuffer>),
     /// Native function (implemented in Rust)
@@ -150,6 +159,9 @@ impl std::fmt::Debug for HeapRef {
             HeapRef::Promise(p) => f.debug_tuple("Promise").field(p).finish(),
             HeapRef::Proxy(p) => f.debug_tuple("Proxy").field(p).finish(),
             HeapRef::Generator(g) => f.debug_tuple("Generator").field(g).finish(),
+            HeapRef::ArrayBuffer(a) => f.debug_tuple("ArrayBuffer").field(a).finish(),
+            HeapRef::TypedArray(t) => f.debug_tuple("TypedArray").field(t).finish(),
+            HeapRef::DataView(d) => f.debug_tuple("DataView").field(d).finish(),
             HeapRef::SharedArrayBuffer(s) => f.debug_tuple("SharedArrayBuffer").field(s).finish(),
             HeapRef::NativeFunction(_) => f.debug_tuple("NativeFunction").finish(),
             HeapRef::RegExp(r) => f.debug_tuple("RegExp").field(r).finish(),
@@ -168,6 +180,8 @@ pub struct Closure {
     pub upvalues: Vec<UpvalueCell>,
     /// Is this an async function
     pub is_async: bool,
+    /// Is this a generator function
+    pub is_generator: bool,
     /// Function object for properties like `.prototype` (GC-managed)
     pub object: GcRef<JsObject>,
 }
@@ -333,6 +347,33 @@ impl Value {
         }
     }
 
+    /// Create ArrayBuffer value
+    pub fn array_buffer(ab: Arc<JsArrayBuffer>) -> Self {
+        let ptr = Arc::as_ptr(&ab) as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::ArrayBuffer(ab)),
+        }
+    }
+
+    /// Create TypedArray value
+    pub fn typed_array(ta: Arc<JsTypedArray>) -> Self {
+        let ptr = Arc::as_ptr(&ta) as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::TypedArray(ta)),
+        }
+    }
+
+    /// Create DataView value
+    pub fn data_view(dv: Arc<JsDataView>) -> Self {
+        let ptr = Arc::as_ptr(&dv) as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::DataView(dv)),
+        }
+    }
+
     /// Create SharedArrayBuffer value
     pub fn shared_array_buffer(sab: Arc<SharedArrayBuffer>) -> Self {
         let ptr = Arc::as_ptr(&sab) as u64;
@@ -479,6 +520,24 @@ impl Value {
         matches!(&self.heap_ref, Some(HeapRef::Generator(_)))
     }
 
+    /// Check if value is an ArrayBuffer
+    #[inline]
+    pub fn is_array_buffer(&self) -> bool {
+        matches!(&self.heap_ref, Some(HeapRef::ArrayBuffer(_)))
+    }
+
+    /// Check if value is a TypedArray
+    #[inline]
+    pub fn is_typed_array(&self) -> bool {
+        matches!(&self.heap_ref, Some(HeapRef::TypedArray(_)))
+    }
+
+    /// Check if value is a DataView
+    #[inline]
+    pub fn is_data_view(&self) -> bool {
+        matches!(&self.heap_ref, Some(HeapRef::DataView(_)))
+    }
+
     /// Check if value is a SharedArrayBuffer
     #[inline]
     pub fn is_shared_array_buffer(&self) -> bool {
@@ -562,6 +621,7 @@ impl Value {
             Some(HeapRef::Array(a)) => Some(*a),
             Some(HeapRef::Function(f)) => Some(f.object),
             Some(HeapRef::NativeFunction(n)) => Some(n.object),
+            Some(HeapRef::Generator(g)) => Some(g.object),
             Some(HeapRef::RegExp(r)) => Some(r.object),
             _ => None,
         }
@@ -623,6 +683,30 @@ impl Value {
         }
     }
 
+    /// Get as ArrayBuffer
+    pub fn as_array_buffer(&self) -> Option<&Arc<JsArrayBuffer>> {
+        match &self.heap_ref {
+            Some(HeapRef::ArrayBuffer(ab)) => Some(ab),
+            _ => None,
+        }
+    }
+
+    /// Get as TypedArray
+    pub fn as_typed_array(&self) -> Option<&Arc<JsTypedArray>> {
+        match &self.heap_ref {
+            Some(HeapRef::TypedArray(ta)) => Some(ta),
+            _ => None,
+        }
+    }
+
+    /// Get as DataView
+    pub fn as_data_view(&self) -> Option<&Arc<JsDataView>> {
+        match &self.heap_ref {
+            Some(HeapRef::DataView(dv)) => Some(dv),
+            _ => None,
+        }
+    }
+
     /// Get as SharedArrayBuffer
     pub fn as_shared_array_buffer(&self) -> Option<&Arc<SharedArrayBuffer>> {
         match &self.heap_ref {
@@ -657,12 +741,15 @@ impl Value {
             Some(HeapRef::Function(f)) => Some(f.object.header() as *const _),
             Some(HeapRef::NativeFunction(n)) => Some(n.object.header() as *const _),
             Some(HeapRef::RegExp(r)) => Some(r.object.header() as *const _),
+            Some(HeapRef::Generator(g)) => Some(g.object.header() as *const _),
             // These types use Arc, not GcRef, so they don't have GcHeaders
             Some(HeapRef::Symbol(_))
             | Some(HeapRef::BigInt(_))
             | Some(HeapRef::Promise(_))
             | Some(HeapRef::Proxy(_))
-            | Some(HeapRef::Generator(_))
+            | Some(HeapRef::ArrayBuffer(_))
+            | Some(HeapRef::TypedArray(_))
+            | Some(HeapRef::DataView(_))
             | Some(HeapRef::SharedArrayBuffer(_)) => None,
             None => None,
         }
@@ -722,6 +809,9 @@ impl Value {
                     | HeapRef::Promise(_)
                     | HeapRef::Proxy(_)
                     | HeapRef::Generator(_)
+                    | HeapRef::ArrayBuffer(_)
+                    | HeapRef::TypedArray(_)
+                    | HeapRef::DataView(_)
                     | HeapRef::SharedArrayBuffer(_),
                 ) => "object",
                 None => "undefined", // Should not happen
@@ -763,6 +853,15 @@ impl std::fmt::Debug for Value {
                     }
                 }
                 Some(HeapRef::BigInt(b)) => write!(f, "{}n", b.value),
+                Some(HeapRef::ArrayBuffer(ab)) => {
+                    write!(f, "ArrayBuffer({})", ab.byte_length())
+                }
+                Some(HeapRef::TypedArray(ta)) => {
+                    write!(f, "{}({})", ta.kind().name(), ta.length())
+                }
+                Some(HeapRef::DataView(dv)) => {
+                    write!(f, "DataView({})", dv.byte_length())
+                }
                 Some(HeapRef::SharedArrayBuffer(sab)) => {
                     write!(f, "SharedArrayBuffer({})", sab.byte_length())
                 }

@@ -1,9 +1,13 @@
 //! Function bytecode representation
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::instruction::Instruction;
 use crate::operand::LocalIndex;
+
+/// Threshold for marking a function as "hot" (candidate for JIT compilation)
+pub const HOT_FUNCTION_THRESHOLD: u32 = 1000;
 
 /// Function flags
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +116,75 @@ impl TypeFlags {
             + self.seen_function as u8;
         (2..=4).contains(&count)
     }
+
+    /// Check if only int32 has been seen
+    #[inline]
+    pub fn is_int32_only(&self) -> bool {
+        self.seen_int32 && !self.seen_number && !self.seen_undefined && !self.seen_null
+            && !self.seen_boolean && !self.seen_string && !self.seen_object && !self.seen_function
+    }
+
+    /// Check if only number (f64) has been seen
+    #[inline]
+    pub fn is_number_only(&self) -> bool {
+        self.seen_number && !self.seen_int32 && !self.seen_undefined && !self.seen_null
+            && !self.seen_boolean && !self.seen_string && !self.seen_object && !self.seen_function
+    }
+
+    /// Check if only numeric types (int32 or number) have been seen
+    #[inline]
+    pub fn is_numeric_only(&self) -> bool {
+        (self.seen_int32 || self.seen_number) && !self.seen_undefined && !self.seen_null
+            && !self.seen_boolean && !self.seen_string && !self.seen_object && !self.seen_function
+    }
+
+    /// Record seeing undefined
+    #[inline]
+    pub fn observe_undefined(&mut self) {
+        self.seen_undefined = true;
+    }
+
+    /// Record seeing null
+    #[inline]
+    pub fn observe_null(&mut self) {
+        self.seen_null = true;
+    }
+
+    /// Record seeing boolean
+    #[inline]
+    pub fn observe_boolean(&mut self) {
+        self.seen_boolean = true;
+    }
+
+    /// Record seeing int32
+    #[inline]
+    pub fn observe_int32(&mut self) {
+        self.seen_int32 = true;
+    }
+
+    /// Record seeing number (f64)
+    #[inline]
+    pub fn observe_number(&mut self) {
+        self.seen_number = true;
+    }
+
+    /// Record seeing string
+    #[inline]
+    pub fn observe_string(&mut self) {
+        self.seen_string = true;
+    }
+
+    /// Record seeing object
+    #[inline]
+    pub fn observe_object(&mut self) {
+        self.seen_object = true;
+    }
+
+    /// Record seeing function
+    #[inline]
+    pub fn observe_function(&mut self) {
+        self.seen_function = true;
+    }
 }
 
 /// Metadata for a single IC slot (instruction-level profiling)
@@ -123,6 +196,10 @@ pub struct InstructionMetadata {
     pub hit_count: u32,
     /// Type observations for values at this site
     pub type_observations: TypeFlags,
+    /// Prototype epoch at cache time (for invalidation).
+    /// When prototype chains change, the global proto_epoch is bumped.
+    /// IC entries are invalidated when their cached proto_epoch doesn't match.
+    pub proto_epoch: u64,
 }
 
 impl InstructionMetadata {
@@ -142,9 +219,27 @@ impl InstructionMetadata {
         self.ic_state = InlineCacheState::Monomorphic { shape_id, offset };
     }
 
+    /// Transition IC to monomorphic state with proto epoch
+    pub fn transition_to_monomorphic_with_epoch(&mut self, shape_id: u64, offset: u32, proto_epoch: u64) {
+        self.ic_state = InlineCacheState::Monomorphic { shape_id, offset };
+        self.proto_epoch = proto_epoch;
+    }
+
     /// Transition IC to megamorphic state
     pub fn transition_to_megamorphic(&mut self) {
         self.ic_state = InlineCacheState::Megamorphic;
+    }
+
+    /// Check if proto_epoch matches (for invalidation)
+    #[inline]
+    pub fn proto_epoch_matches(&self, current_epoch: u64) -> bool {
+        self.proto_epoch == current_epoch
+    }
+
+    /// Update proto_epoch
+    #[inline]
+    pub fn update_proto_epoch(&mut self, epoch: u64) {
+        self.proto_epoch = epoch;
     }
 }
 
@@ -174,7 +269,8 @@ pub struct Function {
     pub instructions: Vec<Instruction>,
 
     /// Feedback vector for Inline Caches (mutable at runtime)
-    pub feedback_vector: parking_lot::RwLock<Vec<InlineCacheState>>,
+    /// Contains IC state and statistics for each IC site
+    pub feedback_vector: parking_lot::RwLock<Vec<InstructionMetadata>>,
 
     /// Source location mapping (instruction index -> source offset)
     pub source_map: Option<SourceMap>,
@@ -184,6 +280,15 @@ pub struct Function {
 
     /// Local variable names (for debugging)
     pub local_names: Vec<String>,
+
+    /// Call count for hot function detection (atomic for thread safety)
+    /// Used to determine when a function should be JIT compiled
+    #[serde(skip)]
+    pub call_count: AtomicU32,
+
+    /// Whether this function has been marked as hot (candidate for JIT)
+    #[serde(skip)]
+    pub is_hot: std::sync::atomic::AtomicBool,
 }
 
 impl Function {
@@ -226,6 +331,46 @@ impl Function {
     pub fn is_strict(&self) -> bool {
         self.flags.is_strict
     }
+
+    /// Increment the call count and check if the function should be marked as hot.
+    /// Returns `true` if this call caused the function to become hot (first time crossing threshold).
+    #[inline]
+    pub fn record_call(&self) -> bool {
+        let prev_count = self.call_count.fetch_add(1, Ordering::Relaxed);
+        let new_count = prev_count.saturating_add(1);
+
+        // Check if we just crossed the hot threshold
+        if new_count >= HOT_FUNCTION_THRESHOLD && prev_count < HOT_FUNCTION_THRESHOLD {
+            // Try to mark as hot (only succeeds once)
+            if self.is_hot.compare_exchange(
+                false,
+                true,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ).is_ok() {
+                return true; // First time becoming hot
+            }
+        }
+        false
+    }
+
+    /// Get the current call count
+    #[inline]
+    pub fn get_call_count(&self) -> u32 {
+        self.call_count.load(Ordering::Relaxed)
+    }
+
+    /// Check if this function has been marked as hot
+    #[inline]
+    pub fn is_hot_function(&self) -> bool {
+        self.is_hot.load(Ordering::Relaxed)
+    }
+
+    /// Manually mark this function as hot (e.g., for testing or forced JIT)
+    #[inline]
+    pub fn mark_hot(&self) {
+        self.is_hot.store(true, Ordering::Release);
+    }
 }
 
 impl Clone for Function {
@@ -242,6 +387,9 @@ impl Clone for Function {
             source_map: self.source_map.clone(),
             param_names: self.param_names.clone(),
             local_names: self.local_names.clone(),
+            // Clone resets call statistics (new clone starts fresh)
+            call_count: AtomicU32::new(0),
+            is_hot: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -256,7 +404,7 @@ pub struct FunctionBuilder {
     flags: FunctionFlags,
     upvalues: Vec<UpvalueCapture>,
     instructions: Vec<Instruction>,
-    feedback_vector: Vec<InlineCacheState>,
+    feedback_vector: Vec<InstructionMetadata>,
     source_map: Option<SourceMap>,
     param_names: Vec<String>,
     local_names: Vec<String>,
@@ -348,7 +496,7 @@ impl FunctionBuilder {
 
     /// Set feedback vector size
     pub fn feedback_vector_size(mut self, size: usize) -> Self {
-        self.feedback_vector = vec![InlineCacheState::Uninitialized; size];
+        self.feedback_vector = vec![InstructionMetadata::new(); size];
         self
     }
 
@@ -384,6 +532,8 @@ impl FunctionBuilder {
             source_map: self.source_map,
             param_names: self.param_names,
             local_names: self.local_names,
+            call_count: AtomicU32::new(0),
+            is_hot: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }

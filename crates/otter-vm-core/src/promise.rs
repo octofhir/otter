@@ -42,7 +42,7 @@ type ResolveCallback = Box<dyn FnOnce(Value) + Send>;
 /// A JavaScript Promise
 pub struct JsPromise {
     /// Current state
-    state: Mutex<PromiseState>,
+    pub(crate) state: Mutex<PromiseState>,
     /// Callbacks to run on fulfillment
     on_fulfilled: Mutex<Vec<ResolveCallback>>,
     /// Callbacks to run on rejection

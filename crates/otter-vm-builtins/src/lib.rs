@@ -21,8 +21,10 @@
 #![warn(clippy::all)]
 
 pub mod array;
+pub mod array_buffer;
 pub mod boolean;
 pub mod console;
+pub mod data_view;
 pub mod date;
 pub mod error;
 pub mod fetch;
@@ -42,6 +44,7 @@ pub mod set;
 pub mod string;
 pub mod symbol;
 pub mod temporal;
+pub mod typed_array;
 
 pub use array::ArrayBuiltin;
 pub use console::{ConsoleAdapter, LogLevel, StdConsole};
@@ -78,6 +81,7 @@ pub fn create_builtins_extension_with_console<A: ConsoleAdapter>(adapter: A) -> 
 
     ops.extend(object::ops());
     ops.extend(array::ops());
+    ops.extend(array_buffer::ops());
     ops.extend(boolean::ops());
     ops.extend(date::ops());
     ops.extend(error::ops());
@@ -95,6 +99,8 @@ pub fn create_builtins_extension_with_console<A: ConsoleAdapter>(adapter: A) -> 
     ops.extend(string::ops());
     ops.extend(symbol::ops());
     ops.extend(temporal::ops());
+    ops.extend(typed_array::ops());
+    ops.extend(data_view::ops());
     ops.extend(console::console_ops_with_adapter(adapter));
     ops.extend(fetch::ops());
 

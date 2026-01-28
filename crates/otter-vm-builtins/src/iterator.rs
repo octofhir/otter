@@ -81,22 +81,19 @@ fn native_generator_next(
     }
 
     // Get the value to send to the generator
-    let sent_value = args.get(1).cloned().unwrap_or(VmValue::undefined());
+    // Note: In Otter, the interpreter handles generator resumption in CallMethod.
+    // This native implementation is a fallback - sent_value is captured but unused here.
+    let _sent_value = args.get(1).cloned().unwrap_or(VmValue::undefined());
 
     // Set the sent value for the generator to receive
-    generator.set_sent_value(sent_value);
-
     // The actual execution and yielding happens in the interpreter
-    // Here we just return a placeholder - the real implementation
-    // would need to integrate with the interpreter's execution loop
-    // For now, mark as executing and return a pending result
-    if generator.is_suspended() {
-        generator.start_executing();
-    }
+    // which we will trigger via the runtime logic.
+    // However, since this is a native function, we return a result
+    // and let the caller/interpreter handle the resumption if needed.
+    // In Otter, the interpreter handles the specific "special" methods
+    // in CallMethod (interpreter.rs:2056).
+    // This native implementation is a fallback or for direct calls.
 
-    // Return a yielded result (the interpreter handles the actual value)
-    // This is a simplified implementation - full implementation needs
-    // integration with the bytecode interpreter
     Ok(create_iterator_result(VmValue::undefined(), false, mm))
 }
 
@@ -127,7 +124,7 @@ fn native_generator_return(
 /// Args: [generator, exception]
 fn native_generator_throw(
     args: &[VmValue],
-    _mm: Arc<memory::MemoryManager>,
+    mm: Arc<memory::MemoryManager>,
 ) -> Result<VmValue, String> {
     let generator_val = args
         .first()
@@ -139,17 +136,23 @@ fn native_generator_throw(
 
     let exception = args.get(1).cloned().unwrap_or(VmValue::undefined());
 
-    // If generator is completed, rethrow the exception
+    // If generator is completed, throw the exception as per spec
+    // https://tc39.es/ecma262/#sec-generator.prototype.throw
     if generator.is_completed() {
+        // Re-throw: return an error that will be caught by the VM's error handling
         return Err(format!("Generator already completed: {:?}", exception));
     }
 
-    // Complete the generator with error
-    generator.complete();
+    // Note: The actual resumption with throw is handled in interpreter.rs
+    // in the CallMethod instruction (around line 2088).
+    // This native version serves as a fallback or for direct calls.
+    // To make it work here if called directly from JS (bpassing CallMethod optimization),
+    // we would need access to the VmContext to execute the generator.
+    // For now, we return a placeholder that indicate the generator is still running.
 
-    // The exception should be thrown inside the generator
-    // For now, we just return an error
-    Err(format!("Generator exception: {:?}", exception))
+    generator.set_pending_throw(exception);
+
+    Ok(create_iterator_result(VmValue::undefined(), false, mm))
 }
 
 /// Check if value is a generator
@@ -197,7 +200,8 @@ mod tests {
     #[test]
     fn test_generator_return() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let generator = JsGenerator::new(0, vec![]);
+        let obj = GcRef::new(JsObject::new(None, mm.clone()));
+        let generator = JsGenerator::new_simple(0, vec![], obj);
         let result = native_generator_return(
             &[VmValue::generator(generator.clone()), VmValue::number(99.0)],
             mm,
@@ -213,7 +217,8 @@ mod tests {
     #[test]
     fn test_is_generator() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let generator = JsGenerator::new(0, vec![]);
+        let obj = GcRef::new(JsObject::new(None, mm.clone()));
+        let generator = JsGenerator::new_simple(0, vec![], obj);
         let result = native_is_generator(&[VmValue::generator(generator)], mm.clone()).unwrap();
         assert_eq!(result.as_boolean(), Some(true));
 
@@ -224,7 +229,8 @@ mod tests {
     #[test]
     fn test_generator_next_on_completed() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let generator = JsGenerator::new(0, vec![]);
+        let obj = GcRef::new(JsObject::new(None, mm.clone()));
+        let generator = JsGenerator::new_simple(0, vec![], obj);
         generator.complete();
 
         let result = native_generator_next(&[VmValue::generator(generator)], mm).unwrap();

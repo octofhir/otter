@@ -190,9 +190,10 @@ impl Extension {
         }
 
         self.compiled_js.clear();
-        for js in &self.js {
+        for (idx, js) in self.js.iter().enumerate() {
             let compiler = otter_vm_compiler::Compiler::new();
-            let module = compiler.compile(js, "setup.js").map_err(|e| {
+            let source_url = format!("setup-{}-{}.js", self.name, idx);
+            let module = compiler.compile(js, &source_url).map_err(|e| {
                 format!("Failed to compile extension JS for '{}': {}", self.name, e)
             })?;
             self.compiled_js.push(Arc::new(module));

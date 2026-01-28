@@ -19,6 +19,8 @@ use std::sync::Arc;
 /// Get Function ops for extension registration
 pub fn ops() -> Vec<Op> {
     vec![
+        op_native("__Function_call", function_call),
+        op_native("__Function_apply", function_apply),
         op_native("__Function_toString", function_to_string),
         op_native("__Function_getName", function_get_name),
         op_native("__Function_getLength", function_get_length),
@@ -30,6 +32,18 @@ pub fn ops() -> Vec<Op> {
 // =============================================================================
 // Function methods
 // =============================================================================
+
+/// Function.prototype.call(thisArg, ...args)
+/// Actual dispatch is handled in the interpreter for correct `this` binding.
+fn function_call(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+    Err("Function.call is internal".to_string())
+}
+
+/// Function.prototype.apply(thisArg, argsArray)
+/// Actual dispatch is handled in the interpreter for correct `this` binding.
+fn function_apply(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+    Err("Function.apply is internal".to_string())
+}
 
 /// Function.prototype.toString() - returns string representation
 fn function_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {

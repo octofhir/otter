@@ -14,8 +14,10 @@
 // Allow unsafe for NaN-boxing and GC operations
 // All unsafe code must have SAFETY comments
 
+pub mod array_buffer;
 pub mod async_context;
 pub mod context;
+pub mod data_view;
 pub mod drop_guard;
 pub mod error;
 pub mod gc;
@@ -32,23 +34,31 @@ pub mod shape;
 pub mod shared_buffer;
 pub mod string;
 pub mod structured_clone;
+pub mod typed_array;
 pub mod value;
 
 pub use async_context::{AsyncContext, SavedFrame, VmExecutionResult};
 pub use context::{
     DEFAULT_MAX_NATIVE_DEPTH, DEFAULT_MAX_STACK_DEPTH, INTERRUPT_CHECK_INTERVAL, VmContext,
+    VmContextSnapshot,
 };
 pub use error::{VmError, VmResult};
 pub use gc::GcRef;
-pub use generator::{GeneratorContext, GeneratorState, IteratorResult, JsGenerator};
-pub use interpreter::Interpreter;
+pub use generator::{
+    CompletionType, GeneratorContext, GeneratorFrame, GeneratorState, IteratorResult, JsGenerator,
+    TryEntry,
+};
+pub use interpreter::{GeneratorResult, Interpreter};
 pub use memory::MemoryManager;
 pub use object::{JsObject, PropertyKey};
 pub use promise::{JsPromise, PromiseState, PromiseWithResolvers};
 pub use proxy::{JsProxy, RevocableProxy};
 pub use runtime::VmRuntime;
 pub use shape::Shape;
+pub use array_buffer::JsArrayBuffer;
+pub use data_view::JsDataView;
 pub use shared_buffer::SharedArrayBuffer;
+pub use typed_array::{JsTypedArray, TypedArrayKind};
 pub use string::JsString;
 pub use structured_clone::{StructuredCloneError, StructuredCloner, structured_clone};
 pub use value::{NativeFn, Symbol, Value};

@@ -3,8 +3,11 @@
 //! Provides Array static methods and prototype methods per ECMAScript 2024/2025.
 
 use otter_macros::dive;
-use otter_vm_runtime::{Op, op_sync};
+use otter_vm_core::object::{JsObject, PropertyKey};
+use otter_vm_core::value::Value as VmValue;
+use otter_vm_runtime::{Op, op_native_with_mm as op_native, op_sync};
 use serde_json::Value as JsonValue;
+use std::sync::Arc;
 
 /// Array constructor and methods
 pub struct ArrayBuiltin;
@@ -52,6 +55,8 @@ pub fn ops() -> Vec<Op> {
         op_sync("__Array_join", __otter_dive_array_join),
         op_sync("__Array_toString", __otter_dive_array_to_string),
         op_sync("__Array_length", __otter_dive_array_length),
+        // Native ops
+        op_native("__Array_push_native", native_array_push),
         // ES2023 immutable methods
         op_sync("__Array_toReversed", __otter_dive_array_to_reversed),
         op_sync("__Array_toSorted", __otter_dive_array_to_sorted),
@@ -126,6 +131,45 @@ fn array_shift(arr: JsonValue) -> Result<JsonValue, String> {
 fn array_unshift(arr: JsonValue, items: Vec<JsonValue>) -> Result<usize, String> {
     let existing = arr.as_array().ok_or("First argument must be array")?;
     Ok(items.len() + existing.len())
+}
+
+/// Native Array.prototype.push() - mutates the array
+fn native_array_push(
+    args: &[VmValue],
+    _mm: Arc<otter_vm_core::memory::MemoryManager>,
+) -> Result<VmValue, String> {
+    let arr_val = args
+        .get(0)
+        .ok_or("Array.prototype.push requires a target")?;
+    let items = args
+        .get(1)
+        .and_then(|v| v.as_object())
+        .ok_or("Array.prototype.push items must be an array")?;
+
+    let Some(arr) = arr_val.as_object() else {
+        return Err("Array.prototype.push called on non-object".to_string());
+    };
+
+    let items_len_val = items
+        .get(&PropertyKey::string("length"))
+        .ok_or("Items must be an array")?;
+    let items_len = items_len_val
+        .as_number()
+        .ok_or("Items length must be a number")? as usize;
+
+    let initial_len_val = arr
+        .get(&PropertyKey::string("length"))
+        .unwrap_or(VmValue::int32(0));
+    let initial_len = initial_len_val.as_number().unwrap_or(0.0) as usize;
+
+    for i in 0..items_len {
+        if let Some(item) = items.get(&PropertyKey::Index(i as u32)) {
+            arr.set(PropertyKey::Index((initial_len + i) as u32), item);
+        }
+    }
+
+    let new_len = initial_len + items_len;
+    Ok(VmValue::number(new_len as f64))
 }
 
 /// Arguments for Array.splice

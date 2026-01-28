@@ -159,6 +159,12 @@ Pure Rust implementation - no external JavaScript engine dependencies.
 - Logs: CLI uses `tracing`; try `RUST_LOG=debug cargo run -p otterjs -- run examples/basic.ts`.
 - Long-running scripts/servers: use `--timeout 0` (disables the timeout).
 - When editing embedded JS shims: they are compiled in via `include_str!` and passed through `CString::new(...)` (no `\0` bytes).
+- Test262 watchdog dumps (for hangs):
+  - Run: `cargo run -p otter-test262 -- --filter <pattern> --verbose --timeout 20`
+  - On timeout the runner prints `WATCHDOG: ...` with `stack_depth`, `try_stack_depth`, `pc`, `instruction`, `function_index`, `function_name`, and `module_url`.
+  - `module_url=setup-<extension>-<idx>.js` means the hang is in extension JS (e.g., `setup-builtins-1.js` → `builtins.js`, `setup-test262-1.js` → `assert.js`).
+  - `module_url=main.js` is the test body.
+  - `instruction=` is the bytecode at the current `pc` and helps pinpoint loops or stuck ops.
 
 ## Security Model
 

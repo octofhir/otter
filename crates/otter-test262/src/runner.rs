@@ -1,12 +1,15 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use walkdir::WalkDir;
 
-use otter_engine::{EngineBuilder, Otter, OtterError, PropertyKey, Value};
+use otter_engine::{EngineBuilder, Otter, OtterError, PropertyKey, Value, VmContextSnapshot};
 
 use crate::metadata::TestMetadata;
 
@@ -281,7 +284,7 @@ impl Test262Runner {
         &self,
         source: &str,
         metadata: &TestMetadata,
-        _test_name: &str,
+        test_name: &str,
         timeout: Option<Duration>,
     ) -> (TestOutcome, Option<String>) {
         let mut engine = EngineBuilder::new()
@@ -289,7 +292,10 @@ impl Test262Runner {
             .extension(crate::harness::create_harness_extension())
             .build();
 
-        match self.run_with_timeout(&mut engine, source, timeout).await {
+        match self
+            .run_with_timeout(&mut engine, source, timeout, test_name)
+            .await
+        {
             Ok(value) => {
                 if !value.is_undefined() {
                     // println!("RESULT {}: {}", test_name, format_value(&value));
@@ -320,7 +326,7 @@ impl Test262Runner {
                 OtterError::Runtime(msg) => {
                     if metadata.expects_runtime_error() {
                         (TestOutcome::Pass, None)
-                    } else if msg == "Test timed out" {
+                    } else if msg == "Test timed out" || msg.contains("Execution interrupted") {
                         (TestOutcome::Timeout, None)
                     } else {
                         (TestOutcome::Fail, Some(msg))
@@ -336,16 +342,100 @@ impl Test262Runner {
         engine: &mut Otter,
         source: &str,
         timeout: Option<Duration>,
+        test_name: &str,
     ) -> Result<Value, OtterError> {
         if let Some(duration) = timeout {
-            match tokio::time::timeout(duration, engine.eval(source)).await {
-                Ok(result) => result,
-                Err(_) => Err(OtterError::Runtime("Test timed out".to_string())),
+            let interrupt_flag = engine.interrupt_flag();
+            let snapshot_handle = engine.debug_snapshot_handle();
+            let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            let timed_out_thread = Arc::clone(&timed_out);
+            let done_thread = Arc::clone(&done);
+            let test_name = test_name.to_string();
+            thread::spawn(move || {
+                thread::sleep(duration);
+                if done_thread.load(Ordering::Relaxed) {
+                    return;
+                }
+                timed_out_thread.store(true, Ordering::Relaxed);
+                interrupt_flag.store(true, Ordering::Relaxed);
+                let snapshot = snapshot_handle.lock().clone();
+                eprintln!(
+                    "WATCHDOG: timeout after {:?} in {}. VM snapshot: {}",
+                    duration,
+                    test_name,
+                    format_snapshot(&snapshot)
+                );
+                let _ = std::io::stderr().flush();
+            });
+
+            let result = engine.eval(source).await;
+            done.store(true, Ordering::Relaxed);
+
+            if timed_out.load(Ordering::Relaxed) {
+                Err(OtterError::Runtime("Test timed out".to_string()))
+            } else {
+                result
             }
         } else {
             engine.eval(source).await
         }
     }
+}
+
+fn format_snapshot(snapshot: &VmContextSnapshot) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!("stack_depth={}", snapshot.stack_depth));
+    parts.push(format!("try_stack_depth={}", snapshot.try_stack_depth));
+    parts.push(format!("instruction_count={}", snapshot.instruction_count));
+    parts.push(format!("native_call_depth={}", snapshot.native_call_depth));
+    if let Some(pc) = snapshot.pc {
+        parts.push(format!("pc={}", pc));
+    }
+    if let Some(ref instruction) = snapshot.instruction {
+        parts.push(format!("instruction={}", instruction));
+    }
+    if let Some(function_index) = snapshot.function_index {
+        parts.push(format!("function_index={}", function_index));
+    }
+    if let Some(ref name) = snapshot.function_name {
+        parts.push(format!("function_name={}", name));
+    }
+    if let Some(ref module_url) = snapshot.module_url {
+        parts.push(format!("module_url={}", module_url));
+    }
+    if let Some(is_async) = snapshot.is_async {
+        parts.push(format!("is_async={}", is_async));
+    }
+    if let Some(is_generator) = snapshot.is_generator {
+        parts.push(format!("is_generator={}", is_generator));
+    }
+    if let Some(is_construct) = snapshot.is_construct {
+        parts.push(format!("is_construct={}", is_construct));
+    }
+    if !snapshot.frames.is_empty() {
+        let frames = snapshot
+            .frames
+            .iter()
+            .map(|frame| {
+                format!(
+                    "[fn={} name={} pc={} instr={} module={} async={} gen={} construct={}]",
+                    frame.function_index,
+                    frame.function_name.clone().unwrap_or_default(),
+                    frame.pc,
+                    frame.instruction.clone().unwrap_or_default(),
+                    frame.module_url,
+                    frame.is_async,
+                    frame.is_generator,
+                    frame.is_construct
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        parts.push(format!("frames={}", frames));
+    }
+    parts.join(", ")
 }
 
 fn format_value(value: &Value) -> String {

@@ -77,6 +77,8 @@ pub struct SavedFrame {
     pub is_async: bool,
     /// Unique frame ID for tracking
     pub frame_id: usize,
+    /// Number of arguments passed to this function
+    pub argc: usize,
 }
 
 impl SavedFrame {
@@ -93,6 +95,7 @@ impl SavedFrame {
         is_construct: bool,
         is_async: bool,
         frame_id: usize,
+        argc: usize,
     ) -> Self {
         Self {
             function_index,
@@ -106,6 +109,7 @@ impl SavedFrame {
             is_construct,
             is_async,
             frame_id,
+            argc,
         }
     }
 }

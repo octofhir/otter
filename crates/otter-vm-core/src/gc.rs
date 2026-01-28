@@ -639,6 +639,60 @@ impl Trace for crate::value::Closure {
     }
 }
 
+// Implement Trace for GeneratorFrame
+impl Trace for crate::generator::GeneratorFrame {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        for val in &self.locals {
+            tracer.mark_value(val);
+        }
+        for val in &self.registers {
+            tracer.mark_value(val);
+        }
+        for cell in &self.upvalues {
+            cell.trace(tracer);
+        }
+        tracer.mark_value(&self.this_value);
+        if let Some(val) = &self.received_value {
+            tracer.mark_value(val);
+        }
+        if let Some(val) = &self.pending_throw {
+            tracer.mark_value(val);
+        }
+    }
+}
+
+// Implement Trace for JsGenerator
+impl Trace for crate::generator::JsGenerator {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        // Trace the associated object
+        tracer.mark(self.object.as_ref());
+
+        // Trace upvalues
+        for cell in &self.upvalues {
+            cell.trace(tracer);
+        }
+
+        // Trace initial arguments and this
+        for val in &*self.initial_args.lock() {
+            tracer.mark_value(val);
+        }
+        tracer.mark_value(&*self.initial_this.lock());
+
+        // Trace abrupt return/throw
+        if let Some(val) = &*self.abrupt_return.lock() {
+            tracer.mark_value(val);
+        }
+        if let Some(val) = &*self.abrupt_throw.lock() {
+            tracer.mark_value(val);
+        }
+
+        // Trace saved frame
+        if let Some(frame) = &*self.frame.lock() {
+            frame.trace(tracer);
+        }
+    }
+}
+
 // Implement Trace for UpvalueCell
 impl Trace for crate::value::UpvalueCell {
     fn trace(&self, tracer: &mut dyn Tracer) {
@@ -751,8 +805,73 @@ impl Trace for otter_vm_bytecode::function::Function {
     fn trace(&self, tracer: &mut dyn Tracer) {
         let feedback = self.feedback_vector.read();
         for ic in feedback.iter() {
-            ic.trace(tracer);
+            ic.ic_state.trace(tracer);
         }
+    }
+}
+
+// Implement Trace for JsProxy
+impl Trace for crate::proxy::JsProxy {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        tracer.mark(self.target.as_ref());
+        tracer.mark(self.handler.as_ref());
+    }
+}
+
+// Implement Trace for JsPromise
+impl Trace for crate::promise::JsPromise {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        // Trace state
+        let state = self.state.lock();
+        match &*state {
+            crate::promise::PromiseState::Pending => {}
+            crate::promise::PromiseState::Fulfilled(value) => tracer.mark_value(value),
+            crate::promise::PromiseState::Rejected(value) => tracer.mark_value(value),
+        }
+        // Note: we cannot trace callbacks in Box<dyn Fn> as they are opaque.
+        // This is a known limitation.
+    }
+}
+
+// Implement Trace for JsArrayBuffer
+impl Trace for crate::array_buffer::JsArrayBuffer {
+    fn trace(&self, _tracer: &mut dyn Tracer) {
+        // Raw data, no pointers
+    }
+}
+
+// Implement Trace for SharedArrayBuffer
+impl Trace for crate::shared_buffer::SharedArrayBuffer {
+    fn trace(&self, _tracer: &mut dyn Tracer) {
+        // Raw data, no pointers
+    }
+}
+
+// Implement Trace for Symbol
+impl Trace for crate::value::Symbol {
+    fn trace(&self, _tracer: &mut dyn Tracer) {
+        // Only string description, no pointers
+    }
+}
+
+// Implement Trace for BigInt
+impl Trace for crate::value::BigInt {
+    fn trace(&self, _tracer: &mut dyn Tracer) {
+        // Only string value, no pointers
+    }
+}
+
+// Implement Trace for JsTypedArray
+impl Trace for crate::typed_array::JsTypedArray {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        self.buffer().trace(tracer);
+    }
+}
+
+// Implement Trace for JsDataView
+impl Trace for crate::data_view::JsDataView {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        self.buffer().trace(tracer);
     }
 }
 

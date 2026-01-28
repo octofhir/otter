@@ -56,6 +56,8 @@ pub struct CallFrame {
     pub is_async: bool,
     /// Unique frame ID for tracking open upvalues
     pub frame_id: usize,
+    /// Number of arguments passed to this function
+    pub argc: usize,
 }
 
 /// Source location for error reporting
@@ -118,12 +120,58 @@ pub struct VmContext {
     root_slots: Vec<Value>,
     /// Scope boundaries (stack of base indices for nested HandleScopes)
     scope_markers: Vec<usize>,
+    /// Optional debug snapshot target for watchdogs
+    debug_snapshot: Option<Arc<Mutex<VmContextSnapshot>>>,
 }
 
 #[derive(Debug, Clone)]
 struct TryHandler {
     catch_pc: usize,
     frame_depth: usize,
+}
+
+/// Lightweight debug snapshot of VM execution state.
+#[derive(Debug, Clone)]
+pub struct FrameSnapshot {
+    pub function_index: u32,
+    pub function_name: Option<String>,
+    pub pc: usize,
+    pub instruction: Option<String>,
+    pub module_url: String,
+    pub is_async: bool,
+    pub is_generator: bool,
+    pub is_construct: bool,
+}
+
+/// Lightweight debug snapshot of VM execution state.
+#[derive(Debug, Clone, Default)]
+pub struct VmContextSnapshot {
+    /// Current call stack depth
+    pub stack_depth: usize,
+    /// Current try stack depth
+    pub try_stack_depth: usize,
+    /// Instruction counter since last interrupt check
+    pub instruction_count: u32,
+    /// Current native call depth
+    pub native_call_depth: usize,
+    /// Program counter of the current frame (if any)
+    pub pc: Option<usize>,
+    /// Debug string for the current instruction (if available)
+    pub instruction: Option<String>,
+    /// Function index of the current frame (if any)
+    pub function_index: Option<u32>,
+    /// Function name of the current frame (if known)
+    pub function_name: Option<String>,
+    /// Module URL of the current frame (if known)
+    pub module_url: Option<String>,
+    /// Whether the current frame is async (if any)
+    pub is_async: Option<bool>,
+    /// Whether the current frame is a generator (if any)
+    pub is_generator: Option<bool>,
+    /// Whether the current frame is a constructor call (if any)
+    pub is_construct: Option<bool>,
+    /// Top stack frames (most recent first) for debugging
+    pub frames: Vec<FrameSnapshot>,
 }
 
 impl VmContext {
@@ -166,12 +214,27 @@ impl VmContext {
             memory_manager,
             root_slots: Vec::new(),
             scope_markers: Vec::new(),
+            debug_snapshot: None,
         }
     }
 
     /// Get the memory manager
     pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
         &self.memory_manager
+    }
+
+    /// Attach a debug snapshot target to update periodically.
+    pub fn set_debug_snapshot_target(
+        &mut self,
+        target: Option<Arc<Mutex<VmContextSnapshot>>>,
+    ) {
+        self.debug_snapshot = target;
+        self.update_debug_snapshot();
+    }
+
+    /// Get the current debug snapshot (if enabled).
+    pub fn debug_snapshot(&self) -> Option<VmContextSnapshot> {
+        self.debug_snapshot.as_ref().map(|snapshot| snapshot.lock().clone())
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -284,6 +347,7 @@ impl VmContext {
         self.instruction_count += 1;
         if self.instruction_count >= INTERRUPT_CHECK_INTERVAL {
             self.instruction_count = 0;
+            self.update_debug_snapshot();
             true
         } else {
             false
@@ -317,6 +381,56 @@ impl VmContext {
     /// Clear the interrupt flag
     pub fn clear_interrupt(&self) {
         self.interrupt_flag.store(false, Ordering::Relaxed);
+    }
+
+    fn update_debug_snapshot(&self) {
+        let Some(target) = &self.debug_snapshot else {
+            return;
+        };
+
+        let mut snapshot = VmContextSnapshot::default();
+        snapshot.stack_depth = self.call_stack.len();
+        snapshot.try_stack_depth = self.try_stack.len();
+        snapshot.instruction_count = self.instruction_count;
+        snapshot.native_call_depth = self.native_call_depth();
+
+        if let Some(frame) = self.call_stack.last() {
+            snapshot.pc = Some(frame.pc);
+            snapshot.function_index = Some(frame.function_index);
+            snapshot.module_url = Some(frame.module.source_url.clone());
+            snapshot.is_async = Some(frame.is_async);
+            snapshot.is_construct = Some(frame.is_construct);
+            if let Some(func) = frame.module.function(frame.function_index) {
+                snapshot.function_name = func.name.clone();
+                snapshot.is_generator = Some(func.flags.is_generator);
+                if frame.pc < func.instructions.len() {
+                    snapshot.instruction = Some(format!("{:?}", func.instructions[frame.pc]));
+                }
+            }
+        }
+
+        // Capture a few top frames for better watchdog debugging.
+        for frame in self.call_stack.iter().rev().take(5) {
+            if let Some(func) = frame.module.function(frame.function_index) {
+                let instruction = if frame.pc < func.instructions.len() {
+                    Some(format!("{:?}", func.instructions[frame.pc]))
+                } else {
+                    None
+                };
+                snapshot.frames.push(FrameSnapshot {
+                    function_index: frame.function_index,
+                    function_name: func.name.clone(),
+                    pc: frame.pc,
+                    instruction,
+                    module_url: frame.module.source_url.clone(),
+                    is_async: frame.is_async,
+                    is_generator: func.flags.is_generator,
+                    is_construct: frame.is_construct,
+                });
+            }
+        }
+
+        *target.lock() = snapshot;
     }
 
     // ==================== Profiling Methods ====================
@@ -444,6 +558,37 @@ impl VmContext {
         Some((handler.frame_depth, handler.catch_pc))
     }
 
+    /// Peek the nearest try handler without popping it.
+    pub fn peek_nearest_try(&self) -> Option<(usize, usize)> {
+        self.try_stack.last().map(|h| (h.frame_depth, h.catch_pc))
+    }
+
+    /// Get try handlers for the current frame (for generator frame serialization).
+    ///
+    /// Returns a vector of (catch_pc, frame_depth) tuples for all try handlers
+    /// that belong to the current frame.
+    pub fn get_try_handlers_for_current_frame(&self) -> Vec<(usize, usize)> {
+        let current_depth = self.call_stack.len();
+        self.try_stack
+            .iter()
+            .filter(|h| h.frame_depth == current_depth)
+            .map(|h| (h.catch_pc, h.frame_depth))
+            .collect()
+    }
+
+    /// Restore try handlers (for generator frame restoration).
+    ///
+    /// Takes a vector of (catch_pc, frame_depth) tuples and pushes them
+    /// onto the try stack.
+    pub fn restore_try_handlers(&mut self, handlers: &[(usize, usize)]) {
+        for (catch_pc, frame_depth) in handlers {
+            self.try_stack.push(TryHandler {
+                catch_pc: *catch_pc,
+                frame_depth: *frame_depth,
+            });
+        }
+    }
+
     /// Get global variable
     pub fn get_global(&self, name: &str) -> Option<Value> {
         use crate::object::PropertyKey;
@@ -479,6 +624,7 @@ impl VmContext {
         return_register: Option<u16>,
         is_construct: bool,
         is_async: bool,
+        argc: usize,
     ) -> VmResult<()> {
         if self.call_stack.len() >= self.max_stack_depth {
             return Err(VmError::StackOverflow);
@@ -498,10 +644,38 @@ impl VmContext {
 
         // Take pending arguments and copy to locals
         let args = self.take_pending_args();
-        let mut locals = vec![Value::undefined(); local_count as usize];
+        let func = &module.functions[function_index as usize];
+        let param_count = func.param_count as usize;
+        let has_rest = func.flags.has_rest;
+
+        // If the function has a rest parameter, the interpreter packages the rest args
+        // into an array and passes it as the last argument. This rest array should
+        // be mapped to the rest parameter's local slot (at index param_count).
+        // So effective_param_count is param_count + 1 when has_rest is true.
+        let effective_param_count = if has_rest { param_count + 1 } else { param_count };
+
+        let extra_args_count = if args.len() > effective_param_count {
+            args.len() - effective_param_count
+        } else {
+            0
+        };
+
+        let total_locals = local_count as usize + extra_args_count;
+        let mut locals = vec![Value::undefined(); total_locals];
+
         for (i, arg) in args.into_iter().enumerate() {
-            if i < locals.len() {
-                locals[i] = arg;
+            if i < effective_param_count {
+                // Regular argument (or rest array) -> mapped to parameter local
+                if i < locals.len() {
+                    locals[i] = arg;
+                }
+            } else {
+                // Extra argument -> stored after all regular locals (including vars)
+                // This ensures we don't overwrite local variables with extra arguments
+                let target_idx = local_count as usize + (i - effective_param_count);
+                if target_idx < locals.len() {
+                    locals[target_idx] = arg;
+                }
             }
         }
 
@@ -528,8 +702,8 @@ impl VmContext {
             is_construct,
             is_async,
             frame_id,
+            argc,
         });
-
         Ok(())
     }
 
@@ -806,6 +980,7 @@ impl VmContext {
                     frame.is_construct,
                     frame.is_async,
                     frame.frame_id,
+                    frame.argc,
                 )
             })
             .collect()
@@ -850,6 +1025,7 @@ impl VmContext {
                 is_construct: saved.is_construct,
                 is_async: saved.is_async,
                 frame_id: saved.frame_id,
+                argc: saved.argc,
             });
 
             // Update next_frame_id to be greater than any restored frame
@@ -918,16 +1094,9 @@ impl VmContext {
     ///
     /// Returns true if a collection was performed.
     pub fn maybe_collect_garbage(&self) -> bool {
-        // Check both GC registry threshold and memory manager conditions
-        let should_gc = otter_vm_gc::global_registry().should_gc()
-            || self.memory_manager.should_collect_garbage();
-
-        if should_gc {
-            self.collect_garbage();
-            true
-        } else {
-            false
-        }
+        // TEMPORARILY DISABLED - GC causes performance issues
+        // Memory is still tracked, just not collected automatically
+        false
     }
 
     /// Request an explicit GC cycle
@@ -1198,10 +1367,16 @@ impl SharedContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otter_vm_bytecode::Module;
+    use otter_vm_bytecode::{Function, Instruction, Module, Register};
 
     fn dummy_module() -> Arc<Module> {
-        Arc::new(Module::builder("test.js").build())
+        let mut builder = Module::builder("test.js");
+        let func = Function::builder()
+            .name("main")
+            .instruction(Instruction::Return { src: Register(0) })
+            .build();
+        builder.add_function(func);
+        Arc::new(builder.build())
     }
 
     #[test]
@@ -1210,7 +1385,7 @@ mod tests {
         let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
         let mut ctx = VmContext::new(global, memory_manager);
 
-        ctx.push_frame(0, dummy_module(), 0, None, false, false)
+        ctx.push_frame(0, dummy_module(), 0, None, false, false, 0)
             .unwrap();
         ctx.set_register(0, Value::int32(42));
 
@@ -1223,7 +1398,7 @@ mod tests {
         let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
         let mut ctx = VmContext::new(global, memory_manager);
 
-        ctx.push_frame(0, dummy_module(), 3, None, false, false)
+        ctx.push_frame(0, dummy_module(), 3, None, false, false, 0)
             .unwrap();
         ctx.set_local(0, Value::int32(1)).unwrap();
         ctx.set_local(1, Value::int32(2)).unwrap();
@@ -1249,13 +1424,13 @@ mod tests {
         let module = dummy_module();
 
         // Push frames until overflow
-        for i in 0..test_max_depth {
-            ctx.push_frame(i as u32, Arc::clone(&module), 0, None, false, false)
+        for _ in 0..test_max_depth {
+            ctx.push_frame(0, Arc::clone(&module), 0, None, false, false, 0)
                 .unwrap();
         }
 
         // Next push should fail
-        let result = ctx.push_frame(0, module, 0, None, false, false);
+        let result = ctx.push_frame(0, module, 0, None, false, false, 0);
         assert!(matches!(result, Err(VmError::StackOverflow)));
     }
 
@@ -1284,7 +1459,7 @@ mod tests {
         let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
         let mut ctx = VmContext::new(global, memory_manager);
 
-        ctx.push_frame(0, dummy_module(), 0, None, false, false)
+        ctx.push_frame(0, dummy_module(), 0, None, false, false, 0)
             .unwrap();
         assert_eq!(ctx.pc(), 0);
 

@@ -9,6 +9,7 @@
 //! - Supports SharedArrayBuffer transfer (shares, not copies)
 //! - Throws on non-cloneable values (functions, symbols, etc.)
 
+use crate::array_buffer::JsArrayBuffer;
 use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyKey};
 use crate::value::{HeapRef, Value};
@@ -28,6 +29,8 @@ pub enum StructuredCloneError {
     NotCloneable(&'static str),
     /// Circular reference detected (internal, should be handled)
     CircularReference,
+    /// Data Clone Error (e.g. detached buffer)
+    DataCloneError(&'static str),
 }
 
 impl std::fmt::Display for StructuredCloneError {
@@ -35,6 +38,7 @@ impl std::fmt::Display for StructuredCloneError {
         match self {
             Self::NotCloneable(typ) => write!(f, "Cannot clone {}", typ),
             Self::CircularReference => write!(f, "Circular reference detected"),
+            Self::DataCloneError(msg) => write!(f, "DataCloneError: {}", msg),
         }
     }
 }
@@ -123,6 +127,25 @@ impl StructuredCloner {
             }
 
             Some(HeapRef::Generator(_)) => Err(StructuredCloneError::NotCloneable("generator")),
+            Some(HeapRef::ArrayBuffer(ab)) => {
+                let len = ab.byte_length();
+                // Slice creates a copy
+                if let Some(new_ab) = ab.slice(0, len) {
+                    Ok(Value::array_buffer(Arc::new(new_ab)))
+                } else {
+                    Err(StructuredCloneError::DataCloneError(
+                        "ArrayBuffer is detached",
+                    ))
+                }
+            }
+            Some(HeapRef::TypedArray(_)) => {
+                // TODO: Implement proper TypedArray cloning (copy underlying buffer)
+                Err(StructuredCloneError::NotCloneable("TypedArray"))
+            }
+            Some(HeapRef::DataView(_)) => {
+                // TODO: Implement proper DataView cloning (copy underlying buffer)
+                Err(StructuredCloneError::NotCloneable("DataView"))
+            }
 
             None => Ok(Value::undefined()),
         }
@@ -278,6 +301,7 @@ mod tests {
             module: dummy_module,
             upvalues: vec![],
             is_async: false,
+            is_generator: false,
             object: GcRef::new(JsObject::new(None, memory_manager.clone())),
         }));
 

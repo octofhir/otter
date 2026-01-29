@@ -73,6 +73,10 @@ impl Interpreter {
         // Execute loop
         let result = self.run_loop(ctx);
 
+        // Pop the entry frame that we pushed above.
+        // run_loop returns without popping at stack_depth==1.
+        ctx.pop_frame();
+
         ctx.set_running(false);
         result
     }
@@ -174,6 +178,10 @@ impl Interpreter {
         ctx.set_pending_args(args.to_vec());
         ctx.set_pending_this(this_value);
         ctx.set_pending_upvalues(closure.upvalues.clone());
+        // Propagate home_object from closure to the new call frame
+        if let Some(ref ho) = closure.home_object {
+            ctx.set_pending_home_object(ho.clone());
+        }
 
         let argc = args.len();
         ctx.push_frame(
@@ -1242,6 +1250,14 @@ impl Interpreter {
             }
 
             Instruction::LoadThis { dst } => {
+                // In derived constructors, `this` is not available until super() is called
+                if let Some(frame) = ctx.current_frame() {
+                    if frame.is_derived && !frame.this_initialized {
+                        return Err(VmError::ReferenceError(
+                            "Must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string(),
+                        ));
+                    }
+                }
                 let this_value = ctx.this_value();
                 ctx.set_register(dst.0, this_value);
                 Ok(InstructionResult::Continue)
@@ -2285,6 +2301,7 @@ impl Interpreter {
                     is_async: func_def.is_async(),
                     is_generator: false,
                     object: func_obj,
+                    home_object: None,
                 });
                 let func_value = Value::function(closure);
                 func_obj.set(PropertyKey::string("prototype"), Value::object(proto));
@@ -2352,6 +2369,7 @@ impl Interpreter {
                     is_async: true,
                     is_generator: false,
                     object: func_obj,
+                    home_object: None,
                 });
                 let func_value = Value::function(closure);
                 func_obj.set(PropertyKey::string("prototype"), Value::object(proto));
@@ -2424,6 +2442,7 @@ impl Interpreter {
                     is_async: false,
                     is_generator: true,
                     object: func_obj,
+                    home_object: None,
                 });
                 let func_value = Value::function(closure);
                 func_obj.set(PropertyKey::string("prototype"), Value::object(proto));
@@ -2498,6 +2517,7 @@ impl Interpreter {
                     is_async: true,
                     is_generator: true,
                     object: func_obj,
+                    home_object: None,
                 });
                 let func_value = Value::function(closure);
                 func_obj.set(PropertyKey::string("prototype"), Value::object(proto));
@@ -2743,14 +2763,14 @@ impl Interpreter {
 
                 // Check if it's a callable constructor
                 if let Some(closure) = func_value.as_function() {
-                    // Create a new object with prototype = ctor.prototype (if any).
-                    let ctor_proto = func_value
-                        .as_object()
-                        .and_then(|o| o.get(&PropertyKey::string("prototype")))
-                        .and_then(|v| v.as_object());
-                    let new_obj =
-                        GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
-                    let new_obj_value = Value::object(new_obj.clone());
+                    // Check if this is a derived constructor (class extends)
+                    let func_def = closure
+                        .module
+                        .functions
+                        .get(closure.function_index as usize);
+                    let is_derived = func_def
+                        .map(|f| f.flags.is_derived)
+                        .unwrap_or(false);
 
                     // Copy arguments from caller registers
                     let mut args = Vec::with_capacity(*argc as usize);
@@ -2759,13 +2779,43 @@ impl Interpreter {
                         args.push(arg);
                     }
 
-                    // Store args and the new object (as `this`) for new frame
-                    ctx.set_pending_args(args);
-                    ctx.set_pending_this(new_obj_value.clone());
+                    if is_derived {
+                        // Derived constructor: `this` is NOT created here.
+                        // It will be created by super() call inside the constructor.
+                        // Set pending_is_derived so the CallFrame knows.
+                        ctx.set_pending_args(args);
+                        ctx.set_pending_this(Value::undefined());
+                        ctx.set_pending_is_derived(true);
 
-                    // For simplicity, return the new object directly for now
-                    // A proper implementation would call the constructor and return `this`
-                    ctx.set_register(dst.0, new_obj_value);
+                        // Set home_object = the constructor's .prototype
+                        // (used by super() to find the parent constructor)
+                        if let Some(ctor_obj) = func_value.as_object() {
+                            let proto_key = PropertyKey::string("prototype");
+                            if let Some(proto_val) = ctor_obj.get(&proto_key) {
+                                if let Some(proto_obj) = proto_val.as_object() {
+                                    ctx.set_pending_home_object(proto_obj);
+                                }
+                            }
+                        }
+
+                        // Pre-set dst to undefined; super() will update this_value on the frame
+                        ctx.set_register(dst.0, Value::undefined());
+                    } else {
+                        // Base constructor: create new object with prototype = ctor.prototype
+                        let ctor_proto = func_value
+                            .as_object()
+                            .and_then(|o| o.get(&PropertyKey::string("prototype")))
+                            .and_then(|v| v.as_object());
+                        let new_obj =
+                            GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
+                        let new_obj_value = Value::object(new_obj.clone());
+
+                        ctx.set_pending_args(args);
+                        ctx.set_pending_this(new_obj_value.clone());
+
+                        // Pre-set dst to the new object (will be returned if constructor returns undefined)
+                        ctx.set_register(dst.0, new_obj_value);
+                    }
 
                     Ok(InstructionResult::Call {
                         func_index: closure.function_index,
@@ -3095,10 +3145,44 @@ impl Interpreter {
 
             Instruction::Return { src } => {
                 let value = ctx.get_register(src.0).clone();
+                // In derived constructors:
+                // - returning an object is OK
+                // - returning undefined after super() was called: return this
+                // - returning non-object or undefined without super(): error
+                if let Some(frame) = ctx.current_frame() {
+                    if frame.is_derived {
+                        if value.is_object() {
+                            // Explicit object return is fine
+                        } else if value.is_undefined() && frame.this_initialized {
+                            // Implicit/explicit undefined return → return this
+                            return Ok(InstructionResult::Return(frame.this_value.clone()));
+                        } else if !frame.this_initialized {
+                            return Err(VmError::ReferenceError(
+                                "Must call super constructor in derived class before returning from derived constructor".to_string(),
+                            ));
+                        }
+                        // Non-object, non-undefined explicit return in derived: TypeError per spec
+                        // but for now treat as returning undefined → this
+                    }
+                }
                 Ok(InstructionResult::Return(value))
             }
 
-            Instruction::ReturnUndefined => Ok(InstructionResult::Return(Value::undefined())),
+            Instruction::ReturnUndefined => {
+                // In derived constructors, implicit return should return `this`
+                if let Some(frame) = ctx.current_frame() {
+                    if frame.is_derived {
+                        if !frame.this_initialized {
+                            return Err(VmError::ReferenceError(
+                                "Must call super constructor in derived class before returning from derived constructor".to_string(),
+                            ));
+                        }
+                        // Return this_value (the object created by super())
+                        return Ok(InstructionResult::Return(frame.this_value.clone()));
+                    }
+                }
+                Ok(InstructionResult::Return(Value::undefined()))
+            }
 
             Instruction::CallSpread {
                 dst,
@@ -5135,6 +5219,303 @@ impl Interpreter {
             // - [ ] Update Interpreter to handle polymorphic cache hits [ ]
             // - [ ] Optimize Array indexing (`elements` access bypass) [ ]
             // - [ ] Verify performance on polymorphic benchmarks [ ]
+            // ==================== Class ====================
+            Instruction::DefineClass {
+                dst,
+                name: _name,
+                ctor,
+                super_class,
+            } => {
+                let ctor_value = ctx.get_register(ctor.0).clone();
+                let mm = ctx.memory_manager().clone();
+
+                if let Some(super_reg) = super_class {
+                    // Derived class: set up prototype chain
+                    let super_value = ctx.get_register(super_reg.0).clone();
+
+                    // Validate superclass is callable (or null for extends null)
+                    if super_value.is_null() {
+                        // extends null: create prototype with null __proto__
+                        let derived_proto =
+                            GcRef::new(JsObject::new(None, mm.clone()));
+
+                        // Set ctor.prototype = derived_proto
+                        let proto_key = PropertyKey::string("prototype");
+                        if let Some(ctor_obj) = ctor_value.as_object() {
+                            ctor_obj.set(proto_key, Value::object(derived_proto.clone()));
+                            // Set derived_proto.constructor = ctor
+                            let ctor_key = PropertyKey::string("constructor");
+                            derived_proto.set(ctor_key, ctor_value.clone());
+                        }
+                    } else if let Some(super_obj) = super_value.as_object() {
+                        // Get super.prototype
+                        let proto_key = PropertyKey::string("prototype");
+                        let super_proto_val = super_obj
+                            .get(&proto_key)
+                            .unwrap_or_else(Value::undefined);
+
+                        // super.prototype must be object or null
+                        let super_proto = if super_proto_val.is_null() {
+                            None
+                        } else if let Some(proto_obj) = super_proto_val.as_object() {
+                            Some(proto_obj)
+                        } else if super_proto_val.is_undefined() {
+                            // No .prototype property — treat as undefined → create with no parent
+                            None
+                        } else {
+                            return Err(VmError::TypeError(
+                                "Class extends value does not have valid prototype property"
+                                    .to_string(),
+                            ));
+                        };
+
+                        // Create derived prototype: Object.create(super.prototype)
+                        let derived_proto =
+                            GcRef::new(JsObject::new(super_proto, mm.clone()));
+
+                        // Set ctor.prototype = derived_proto
+                        if let Some(ctor_obj) = ctor_value.as_object() {
+                            ctor_obj.set(
+                                PropertyKey::string("prototype"),
+                                Value::object(derived_proto.clone()),
+                            );
+                            // Set derived_proto.constructor = ctor
+                            derived_proto.set(
+                                PropertyKey::string("constructor"),
+                                ctor_value.clone(),
+                            );
+                            // Static inheritance: ctor.__proto__ = super
+                            ctor_obj.set_prototype(Some(super_obj));
+                        }
+                    } else if super_value.is_function() || super_value.is_native_function() {
+                        // Superclass is a function (but not an object with .prototype on HeapRef::Object)
+                        // This handles NativeFunction or Function HeapRef variants
+                        // For now, create a basic prototype chain
+                        let derived_proto =
+                            GcRef::new(JsObject::new(None, mm.clone()));
+                        if let Some(ctor_obj) = ctor_value.as_object() {
+                            ctor_obj.set(
+                                PropertyKey::string("prototype"),
+                                Value::object(derived_proto.clone()),
+                            );
+                            derived_proto.set(
+                                PropertyKey::string("constructor"),
+                                ctor_value.clone(),
+                            );
+                        }
+                    } else {
+                        return Err(VmError::TypeError(
+                            "Class extends value is not a constructor or null".to_string(),
+                        ));
+                    }
+                } else {
+                    // Base class: ctor already has a .prototype from Closure creation
+                    // Just ensure ctor.prototype.constructor = ctor
+                    if let Some(ctor_obj) = ctor_value.as_object() {
+                        let proto_key = PropertyKey::string("prototype");
+                        if let Some(proto_val) = ctor_obj.get(&proto_key) {
+                            if let Some(proto_obj) = proto_val.as_object() {
+                                proto_obj.set(
+                                    PropertyKey::string("constructor"),
+                                    ctor_value.clone(),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                ctx.set_register(dst.0, ctor_value);
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::CallSuper { dst, args: args_base, argc } => {
+                // Get the current frame's home_object to find the superclass
+                let frame = ctx
+                    .current_frame()
+                    .ok_or_else(|| VmError::internal("no frame for CallSuper"))?;
+
+                let home_object = frame.home_object.clone().ok_or_else(|| {
+                    VmError::ReferenceError(
+                        "'super' keyword unexpected here".to_string(),
+                    )
+                })?;
+
+                // new_target_proto is the prototype for the object being created.
+                // In the outermost derived constructor, this is home_object (e.g., C.prototype).
+                // In deeper levels (multi-level), it was propagated from above.
+                let new_target_proto = frame.new_target_proto.clone()
+                    .unwrap_or_else(|| home_object.clone());
+
+                // Get the superclass constructor: Object.getPrototypeOf(home_object)
+                let super_proto = home_object.prototype().ok_or_else(|| {
+                    VmError::TypeError(
+                        "Super constructor is not a constructor".to_string(),
+                    )
+                })?;
+
+                // The super constructor is the .constructor of the prototype's prototype
+                let ctor_key = PropertyKey::string("constructor");
+                let super_ctor_val = super_proto
+                    .get(&ctor_key)
+                    .unwrap_or_else(Value::undefined);
+
+                // Collect arguments from registers
+                let mut args = Vec::with_capacity(*argc as usize);
+                for i in 0..(*argc as u16) {
+                    args.push(ctx.get_register(args_base.0 + i).clone());
+                }
+                let mm = ctx.memory_manager().clone();
+
+                // Check if the super constructor is also a derived class
+                let super_is_derived = super_ctor_val.as_function().and_then(|c| {
+                    c.module.function(c.function_index).map(|f| f.flags.is_derived)
+                }).unwrap_or(false);
+
+                let this_value = if super_is_derived {
+                    // Multi-level inheritance: super constructor is also derived.
+                    // Don't create the object here. Propagate new_target_proto
+                    // and let the chain continue until the base constructor.
+                    if let Some(super_closure) = super_ctor_val.as_function() {
+                        ctx.set_pending_is_derived(true);
+                        // Propagate new_target_proto for the eventual object creation
+                        ctx.set_pending_new_target_proto(new_target_proto);
+                        let proto_key = PropertyKey::string("prototype");
+                        if let Some(proto_val) = super_closure.object.get(&proto_key) {
+                            if let Some(proto_obj) = proto_val.as_object() {
+                                ctx.set_pending_home_object(proto_obj);
+                            }
+                        }
+                    }
+
+                    let result = self.call_function(
+                        ctx,
+                        &super_ctor_val,
+                        Value::undefined(),
+                        &args,
+                    )?;
+
+                    if result.is_object() { result } else { Value::undefined() }
+                } else {
+                    // Base case: super constructor is NOT derived.
+                    // Create the object with new_target_proto as [[Prototype]].
+                    let new_obj = GcRef::new(JsObject::new(
+                        Some(new_target_proto),
+                        mm.clone(),
+                    ));
+                    let new_obj_value = Value::object(new_obj);
+
+                    let result = self.call_function(
+                        ctx,
+                        &super_ctor_val,
+                        new_obj_value.clone(),
+                        &args,
+                    )?;
+
+                    if result.is_object() { result } else { new_obj_value }
+                };
+
+                // Set this_initialized and update this_value on current frame
+                if let Some(frame) = ctx.current_frame_mut() {
+                    frame.this_value = this_value.clone();
+                    frame.this_initialized = true;
+                }
+
+                ctx.set_register(dst.0, this_value);
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::GetSuper { dst } => {
+                let frame = ctx
+                    .current_frame()
+                    .ok_or_else(|| VmError::internal("no frame for GetSuper"))?;
+
+                let home_object = frame.home_object.clone().ok_or_else(|| {
+                    VmError::ReferenceError(
+                        "'super' keyword unexpected here".to_string(),
+                    )
+                })?;
+
+                // super = Object.getPrototypeOf(home_object)
+                let result = match home_object.prototype() {
+                    Some(proto) => Value::object(proto),
+                    None => Value::null(),
+                };
+
+                ctx.set_register(dst.0, result);
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::GetSuperProp { dst, name } => {
+                let frame = ctx
+                    .current_frame()
+                    .ok_or_else(|| VmError::internal("no frame for GetSuperProp"))?;
+
+                let home_object = frame.home_object.clone().ok_or_else(|| {
+                    VmError::ReferenceError(
+                        "'super' keyword unexpected here".to_string(),
+                    )
+                })?;
+
+                // Get super prototype (Object.getPrototypeOf(home_object))
+                let super_proto = home_object.prototype();
+
+                // Look up property on super prototype, handling accessors
+                let name_const = module
+                    .constants
+                    .get(name.0)
+                    .ok_or_else(|| VmError::internal("GetSuperProp: constant not found"))?;
+                let name_units = name_const
+                    .as_string()
+                    .ok_or_else(|| VmError::internal("GetSuperProp: expected string constant"))?;
+                let key = Self::utf16_key(name_units);
+
+                // Get the current this value (super property access uses current this, not prototype)
+                let this_value = ctx.current_frame()
+                    .map(|f| f.this_value.clone())
+                    .unwrap_or_else(Value::undefined);
+
+                let value = if let Some(proto) = super_proto {
+                    // Use lookup_property_descriptor to find accessor properties
+                    match proto.lookup_property_descriptor(&key) {
+                        Some(crate::object::PropertyDescriptor::Data { value, .. }) => value,
+                        Some(crate::object::PropertyDescriptor::Accessor { get: Some(getter), .. }) => {
+                            // Invoke the getter with the current this
+                            self.call_function(ctx, &getter, this_value, &[])?
+                        }
+                        Some(crate::object::PropertyDescriptor::Accessor { get: None, .. }) => {
+                            Value::undefined()
+                        }
+                        _ => Value::undefined(),
+                    }
+                } else {
+                    Value::undefined()
+                };
+
+                ctx.set_register(dst.0, value);
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::SetHomeObject { func, obj } => {
+                let func_val = ctx.get_register(func.0).clone();
+                let obj_val = ctx.get_register(obj.0).clone();
+                if let Some(closure) = func_val.as_function() {
+                    if let Some(obj_ref) = obj_val.as_object() {
+                        // Create a new closure with home_object set
+                        let new_closure = Closure {
+                            function_index: closure.function_index,
+                            module: Arc::clone(&closure.module),
+                            upvalues: closure.upvalues.clone(),
+                            is_async: closure.is_async,
+                            is_generator: closure.is_generator,
+                            object: closure.object.clone(),
+                            home_object: Some(obj_ref),
+                        };
+                        ctx.set_register(func.0, Value::function(Arc::new(new_closure)));
+                    }
+                }
+                Ok(InstructionResult::Continue)
+            }
+
             _ => Err(VmError::internal(format!(
                 "Unimplemented instruction: {:?}",
                 instruction
@@ -5493,6 +5874,10 @@ impl Interpreter {
             let argc = current_args.len() as u8;
             ctx.set_pending_this(current_this);
             ctx.set_pending_args(current_args);
+            // Propagate home_object from closure to the new call frame
+            if let Some(ref ho) = closure.home_object {
+                ctx.set_pending_home_object(ho.clone());
+            }
             return Ok(InstructionResult::Call {
                 func_index: closure.function_index,
                 module: Arc::clone(&closure.module),

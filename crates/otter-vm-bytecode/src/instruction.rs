@@ -210,6 +210,8 @@ pub enum Opcode {
     CallSuper = 0xC2,
     /// Get super property: dst = super\[key\]
     GetSuperProp = 0xC3,
+    /// Set [[HomeObject]] on a closure for super resolution
+    SetHomeObject = 0xC4,
 
     // ==================== Generators/Async ====================
     /// Yield value
@@ -346,6 +348,7 @@ impl Opcode {
             0xC1 => Some(Self::GetSuper),
             0xC2 => Some(Self::CallSuper),
             0xC3 => Some(Self::GetSuperProp),
+            0xC4 => Some(Self::SetHomeObject),
 
             0xD0 => Some(Self::Yield),
             0xD1 => Some(Self::Await),
@@ -475,6 +478,7 @@ impl Opcode {
             Self::GetSuper => "GetSuper",
             Self::CallSuper => "CallSuper",
             Self::GetSuperProp => "GetSuperProp",
+            Self::SetHomeObject => "SetHomeObject",
             // Generators/Async
             Self::Yield => "Yield",
             Self::Await => "Await",
@@ -992,17 +996,28 @@ pub enum Instruction {
     DefineClass {
         dst: Register,
         name: ConstantIndex,
+        /// Constructor closure register (already compiled)
+        ctor: Register,
+        /// Superclass register (None = base class)
+        super_class: Option<Register>,
     },
     GetSuper {
         dst: Register,
     },
     CallSuper {
         dst: Register,
+        /// Base register where arguments start
+        args: Register,
         argc: u8,
     },
     GetSuperProp {
         dst: Register,
         name: ConstantIndex,
+    },
+    /// Set [[HomeObject]] on a closure: func.home_object = obj
+    SetHomeObject {
+        func: Register,
+        obj: Register,
     },
 
     // Generators/Async

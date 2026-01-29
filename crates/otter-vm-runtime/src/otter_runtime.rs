@@ -542,8 +542,8 @@ impl Otter {
             self.execute_js(&mut ctx, js, "setup.js")?;
         }
 
-        // Compile and execute
-        self.execute_js(&mut ctx, code, "eval.js")
+        // Compile and execute with eval semantics (return last expression value)
+        self.execute_js_eval(&mut ctx, code, "eval.js")
     }
 
     /// Wrap code for top-level await support
@@ -854,6 +854,23 @@ impl Otter {
         let compiler = Compiler::new();
         let module = compiler
             .compile(code, source_url)
+            .map_err(|e| OtterError::Compile(e.to_string()))?;
+
+        self.vm
+            .execute_module_with_context(&module, ctx)
+            .map_err(|e| OtterError::Runtime(e.to_string()))
+    }
+
+    /// Execute JS code with eval semantics (returns last expression value)
+    fn execute_js_eval(
+        &self,
+        ctx: &mut VmContext,
+        code: &str,
+        source_url: &str,
+    ) -> Result<Value, OtterError> {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile_eval(code, source_url)
             .map_err(|e| OtterError::Compile(e.to_string()))?;
 
         self.vm

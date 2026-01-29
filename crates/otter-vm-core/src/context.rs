@@ -59,6 +59,16 @@ pub struct CallFrame {
     pub frame_id: usize,
     /// Number of arguments passed to this function
     pub argc: usize,
+    /// Home object for methods (used for `super` resolution)
+    pub home_object: Option<GcRef<JsObject>>,
+    /// The prototype to use when creating `this` in super() chain (new.target.prototype).
+    /// Propagated from the outermost derived constructor through the chain.
+    pub new_target_proto: Option<GcRef<JsObject>>,
+    /// Whether `this` has been initialized in a derived constructor
+    /// (super() must be called before accessing `this`)
+    pub this_initialized: bool,
+    /// Whether this is a derived constructor (class extends)
+    pub is_derived: bool,
 }
 
 /// Source location for error reporting
@@ -96,6 +106,12 @@ pub struct VmContext {
     pending_this: Option<Value>,
     /// Pending upvalues for next call (captured closure cells)
     pending_upvalues: Vec<UpvalueCell>,
+    /// Pending home object for next call (for super resolution in methods)
+    pending_home_object: Option<GcRef<JsObject>>,
+    /// Pending is_derived flag for next call
+    pending_is_derived: bool,
+    /// Pending new_target_proto for multi-level super() chain
+    pending_new_target_proto: Option<GcRef<JsObject>>,
     /// Open upvalues: maps (frame_id, local_idx) to the cell.
     /// When a closure captures a local, we create/reuse a cell here.
     /// Multiple closures in the same frame share the same cell.
@@ -208,6 +224,9 @@ impl VmContext {
             pending_args: Vec::new(),
             pending_this: None,
             pending_upvalues: Vec::new(),
+            pending_home_object: None,
+            pending_is_derived: false,
+            pending_new_target_proto: None,
             open_upvalues: HashMap::new(),
             next_frame_id: 0,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
@@ -715,6 +734,10 @@ impl VmContext {
         // Take pending upvalues (captured closure cells)
         let upvalues = self.take_pending_upvalues();
 
+        // Take pending home object and derived flag
+        let home_object = self.pending_home_object.take();
+        let is_derived = std::mem::take(&mut self.pending_is_derived);
+
         // Assign a unique frame ID
         let frame_id = self.next_frame_id;
         self.next_frame_id += 1;
@@ -733,6 +756,11 @@ impl VmContext {
             is_async,
             frame_id,
             argc,
+            home_object,
+            new_target_proto: self.pending_new_target_proto.take(),
+            // In derived constructors, this is NOT initialized until super() is called
+            this_initialized: !is_derived,
+            is_derived,
         });
         Ok(())
     }
@@ -843,6 +871,20 @@ impl VmContext {
     /// Take pending upvalues (transfers ownership)
     pub fn take_pending_upvalues(&mut self) -> Vec<UpvalueCell> {
         std::mem::take(&mut self.pending_upvalues)
+    }
+
+    /// Set pending home object for next function call (for super resolution)
+    pub fn set_pending_home_object(&mut self, home_object: GcRef<JsObject>) {
+        self.pending_home_object = Some(home_object);
+    }
+
+    /// Set pending is_derived flag for next function call
+    pub fn set_pending_is_derived(&mut self, is_derived: bool) {
+        self.pending_is_derived = is_derived;
+    }
+
+    pub fn set_pending_new_target_proto(&mut self, proto: GcRef<JsObject>) {
+        self.pending_new_target_proto = Some(proto);
     }
 
     /// Get an upvalue value from the current call frame
@@ -1056,6 +1098,10 @@ impl VmContext {
                 is_async: saved.is_async,
                 frame_id: saved.frame_id,
                 argc: saved.argc,
+                home_object: None,
+                new_target_proto: None,
+                this_initialized: true,
+                is_derived: false,
             });
 
             // Update next_frame_id to be greater than any restored frame

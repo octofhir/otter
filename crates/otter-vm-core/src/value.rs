@@ -184,6 +184,9 @@ pub struct Closure {
     pub is_generator: bool,
     /// Function object for properties like `.prototype` (GC-managed)
     pub object: GcRef<JsObject>,
+    /// Home object for methods (ES2015 [[HomeObject]] internal slot)
+    /// Used for `super` property access in class methods
+    pub home_object: Option<GcRef<JsObject>>,
 }
 
 /// A native function with an attached object for properties.

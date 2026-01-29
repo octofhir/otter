@@ -729,6 +729,15 @@ impl Trace for crate::context::CallFrame {
 
         // Trace the `this` value
         tracer.mark_value(&self.this_value);
+
+        // Trace home_object (for super resolution)
+        if let Some(ref home) = self.home_object {
+            tracer.mark_header(home.header() as *const GcHeader);
+        }
+        // Trace new_target_proto (for multi-level inheritance)
+        if let Some(ref ntp) = self.new_target_proto {
+            tracer.mark_header(ntp.header() as *const GcHeader);
+        }
     }
 }
 

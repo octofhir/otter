@@ -34,6 +34,8 @@ pub struct FunctionFlags {
     pub is_setter: bool,
     /// Has rest parameter (...args)
     pub has_rest: bool,
+    /// Is a derived constructor (class extends)
+    pub is_derived: bool,
 }
 
 /// Upvalue capture mode
@@ -606,6 +608,7 @@ mod tests {
                 dst: Register(0),
                 lhs: Register(1),
                 rhs: Register(2),
+                feedback_index: 0,
             })
             .instruction(Instruction::Return { src: Register(0) })
             .build();

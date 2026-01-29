@@ -42,6 +42,7 @@ bun benchmarks/cpu/fibonacci.ts
 ### CPU (`cpu/`)
 - `fibonacci.ts` - Recursive and iterative computation
 - `json.ts` - JSON parsing and serialization
+- `flamegraph.ts` - Mixed workload for profiling and flamegraphs
 
 ### Memory (`memory/`)
 - `allocation.ts` - Object and array allocation patterns

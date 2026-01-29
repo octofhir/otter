@@ -303,6 +303,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             object: GcRef::new(JsObject::new(None, memory_manager.clone())),
+            home_object: None,
         }));
 
         let result = cloner.clone(&func);

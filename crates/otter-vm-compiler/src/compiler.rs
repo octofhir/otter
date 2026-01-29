@@ -34,6 +34,12 @@ pub struct Compiler {
     private_envs: Vec<std::collections::HashMap<String, u64>>,
     /// Counter for generating unique private name IDs
     next_private_id: u64,
+    /// Whether we are compiling inside a derived class constructor (for super() support)
+    in_derived_class: bool,
+    /// Set to true when compile_program emits an explicit Return for the last expression
+    last_was_return: bool,
+    /// When true, the last expression statement's value is returned (eval semantics)
+    eval_mode: bool,
 }
 
 #[derive(Debug)]
@@ -63,6 +69,9 @@ impl Compiler {
             pending_labels: Vec::new(),
             private_envs: Vec::new(),
             next_private_id: 1,
+            in_derived_class: false,
+            last_was_return: false,
+            eval_mode: false,
         }
     }
 
@@ -128,8 +137,26 @@ impl Compiler {
         self.depth = self.depth.saturating_sub(1);
     }
 
+    /// Compile source code for eval — returns last expression value
+    pub fn compile_eval(
+        mut self,
+        source: &str,
+        source_url: &str,
+    ) -> CompileResult<otter_vm_bytecode::Module> {
+        self.eval_mode = true;
+        self.compile_inner(source, source_url)
+    }
+
     /// Compile source code to a module
     pub fn compile(
+        mut self,
+        source: &str,
+        source_url: &str,
+    ) -> CompileResult<otter_vm_bytecode::Module> {
+        self.compile_inner(source, source_url)
+    }
+
+    fn compile_inner(
         mut self,
         source: &str,
         source_url: &str,
@@ -156,8 +183,10 @@ impl Compiler {
         let program = result.program;
         self.compile_program(&program)?;
 
-        // Ensure we return something
-        self.codegen.emit(Instruction::ReturnUndefined);
+        // Ensure we return something (unless last expression already emitted Return)
+        if !self.last_was_return {
+            self.codegen.emit(Instruction::ReturnUndefined);
+        }
 
         Ok(self.codegen.finish(source_url))
     }
@@ -184,11 +213,27 @@ impl Compiler {
         // Hoist function declarations before compiling any statements
         let hoisted = self.hoist_function_declarations(&program.body)?;
 
-        // Compile statements, skipping hoisted function declarations
+        // Compile statements, skipping hoisted function declarations.
+        // Track the last expression statement's register so eval_sync can return it.
+        let total = program.body.len();
         for (idx, stmt) in program.body.iter().enumerate() {
-            if !hoisted.contains(&idx) {
-                self.compile_statement(stmt)?;
+            if hoisted.contains(&idx) {
+                continue;
             }
+            let is_last = idx == total - 1;
+            if is_last && self.eval_mode {
+                if let Statement::ExpressionStatement(expr_stmt) = stmt {
+                    // Last statement is an expression — compile it and emit Return
+                    let reg = self.compile_expression(&expr_stmt.expression)?;
+                    self.codegen
+                        .emit(Instruction::Return { src: reg });
+                    self.codegen.free_reg(reg);
+                    // Mark that we already returned so compile() doesn't add ReturnUndefined
+                    self.last_was_return = true;
+                    continue;
+                }
+            }
+            self.compile_statement(stmt)?;
         }
         Ok(())
     }
@@ -958,9 +1003,7 @@ impl Compiler {
         super_class: Option<&Expression>,
         body: &ClassBody,
     ) -> CompileResult<Register> {
-        if super_class.is_some() {
-            return Err(CompileError::unsupported("Class extends"));
-        }
+        let has_super = super_class.is_some();
 
         // Find an explicit constructor, if present, and collect field initializers.
         let mut constructor: Option<&oxc_ast::ast::Function> = None;
@@ -1027,23 +1070,56 @@ impl Compiler {
             }
         }
 
+        // Track whether we're compiling a derived class (for super() support)
+        let prev_in_derived_class = self.in_derived_class;
+        self.in_derived_class = has_super;
+
         // Compile constructor (or a default empty constructor).
-        let ctor = if let Some(func) = constructor {
+        let ctor_reg = if let Some(func) = constructor {
             self.compile_function_expression_internal(func, Some(&instance_fields))?
+        } else if has_super {
+            // Default derived constructor: constructor(...args) { super(...args); }
+            // For now, compile an empty constructor; DefineClass will handle the default behavior
+            self.compile_empty_function_internal(Some(&instance_fields))?
         } else {
             self.compile_empty_function_internal(Some(&instance_fields))?
         };
 
-        // Get prototype object for instance methods: ctor.prototype
+        self.in_derived_class = prev_in_derived_class;
+
+        // Compile superclass expression (if present)
+        let super_class_reg = if let Some(super_expr) = super_class {
+            Some(self.compile_expression(super_expr)?)
+        } else {
+            None
+        };
+
+        // Emit DefineClass instruction to set up prototype chain
+        let class_name = self.codegen.add_string(""); // name will be set by caller
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::DefineClass {
+            dst,
+            name: class_name,
+            ctor: ctor_reg,
+            super_class: super_class_reg,
+        });
+
+        // Get prototype object for instance methods: dst.prototype
         let proto = self.codegen.alloc_reg();
         let proto_key = self.codegen.add_string("prototype");
         let ic_index = self.codegen.alloc_ic();
         self.codegen.emit(Instruction::GetPropConst {
             dst: proto,
-            obj: ctor,
+            obj: dst,
             name: proto_key,
             ic_index,
         });
+
+        // Free intermediate registers
+        self.codegen.free_reg(ctor_reg);
+        if let Some(super_reg) = super_class_reg {
+            self.codegen.free_reg(super_reg);
+        }
 
         // Initialize static fields and methods
         for elem in static_elements {
@@ -1060,7 +1136,7 @@ impl Compiler {
                     let key_reg = self.compile_property_key(&prop.key)?;
                     let ic_index = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::SetProp {
-                        obj: ctor,
+                        obj: dst,
                         key: key_reg,
                         val: value_reg,
                         ic_index,
@@ -1071,13 +1147,20 @@ impl Compiler {
                 }
                 ClassElement::MethodDefinition(method) => {
                     let func_reg = self.compile_function_expression(&method.value)?;
+
+                    // Set [[HomeObject]] on the static method closure for super resolution
+                    self.codegen.emit(Instruction::SetHomeObject {
+                        func: func_reg,
+                        obj: dst,
+                    });
+
                     let key_reg = self.compile_property_key(&method.key)?;
 
                     match method.kind {
                         MethodDefinitionKind::Method => {
                             let ic_index = self.codegen.alloc_ic();
                             self.codegen.emit(Instruction::SetProp {
-                                obj: ctor,
+                                obj: dst,
                                 key: key_reg,
                                 val: func_reg,
                                 ic_index,
@@ -1085,14 +1168,14 @@ impl Compiler {
                         }
                         MethodDefinitionKind::Get => {
                             self.codegen.emit(Instruction::DefineGetter {
-                                obj: ctor,
+                                obj: dst,
                                 key: key_reg,
                                 func: func_reg,
                             });
                         }
                         MethodDefinitionKind::Set => {
                             self.codegen.emit(Instruction::DefineSetter {
-                                obj: ctor,
+                                obj: dst,
                                 key: key_reg,
                                 func: func_reg,
                             });
@@ -1105,14 +1188,14 @@ impl Compiler {
                 }
                 ClassElement::StaticBlock(block) => {
                     let func_reg = self.compile_static_block(block)?;
-                    let dst = self.codegen.alloc_reg();
+                    let sb_dst = self.codegen.alloc_reg();
                     self.codegen.emit(Instruction::CallWithReceiver {
-                        dst,
+                        dst: sb_dst,
                         func: func_reg,
-                        this: ctor,
+                        this: dst,
                         argc: 0,
                     });
-                    self.codegen.free_reg(dst);
+                    self.codegen.free_reg(sb_dst);
                     self.codegen.free_reg(func_reg);
                 }
                 _ => unreachable!(),
@@ -1128,8 +1211,14 @@ impl Compiler {
                 continue;
             }
 
-            let target = if method.r#static { ctor } else { proto };
+            let target = if method.r#static { dst } else { proto };
             let func_reg = self.compile_function_expression(&method.value)?;
+
+            // Set [[HomeObject]] on the method closure for super resolution
+            self.codegen.emit(Instruction::SetHomeObject {
+                func: func_reg,
+                obj: target,
+            });
 
             // Compile the property key
             let key_reg = self.compile_property_key(&method.key)?;
@@ -1168,7 +1257,7 @@ impl Compiler {
 
         self.codegen.free_reg(proto);
         self.private_envs.pop();
-        Ok(ctor)
+        Ok(dst)
     }
 
     fn compile_empty_function(&mut self) -> Register {
@@ -3186,6 +3275,11 @@ impl Compiler {
         self.codegen.enter_function(name);
         self.codegen.current.flags.is_async = is_async;
         self.codegen.current.flags.is_generator = is_generator;
+        // Mark as derived constructor if we're inside a derived class
+        if self.in_derived_class && field_initializers.is_some() {
+            // field_initializers is Some only for constructors
+            self.codegen.current.flags.is_derived = true;
+        }
 
         // Declare parameters and collect defaults
         let mut param_defaults: Vec<(u16, &Expression)> = Vec::new();
@@ -3649,7 +3743,12 @@ impl Compiler {
                 self.codegen.emit(Instruction::LoadThis { dst });
                 Ok(dst)
             }
-            Expression::Super(_) => Err(CompileError::unsupported("Super")),
+            Expression::Super(_) => {
+                // `super` as a standalone expression - emit GetSuper
+                let dst = self.codegen.alloc_reg();
+                self.codegen.emit(Instruction::GetSuper { dst });
+                Ok(dst)
+            }
             Expression::ClassExpression(class_expr) => self.compile_class_expression(class_expr),
 
             Expression::PrivateFieldExpression(field_expr) => {
@@ -4648,8 +4747,16 @@ impl Compiler {
 
     /// Compile a call expression
     fn compile_call_expression(&mut self, call: &CallExpression) -> CompileResult<Register> {
-        // Check if this is a method call (obj.method() or obj["method"]())
+        // Check for super() call in derived constructor
+        if matches!(&call.callee, Expression::Super(_)) {
+            return self.compile_super_call(call);
+        }
+
+        // Check if this is a super.method() call
         if let Expression::StaticMemberExpression(member) = &call.callee {
+            if matches!(&member.object, Expression::Super(_)) {
+                return self.compile_super_method_call(call, member);
+            }
             return self.compile_method_call(call, member);
         }
 
@@ -4709,6 +4816,98 @@ impl Compiler {
 
             Ok(dst)
         }
+    }
+
+    /// Compile a super() call in a derived constructor
+    fn compile_super_call(&mut self, call: &CallExpression) -> CompileResult<Register> {
+        let argc = call.arguments.len() as u8;
+
+        // Allocate a contiguous block for arguments
+        let args_base = self.codegen.alloc_fresh_block(argc.max(1));
+
+        // Compile arguments into contiguous registers
+        for (i, arg) in call.arguments.iter().enumerate() {
+            let arg_reg = self.compile_expression(arg.to_expression())?;
+            if arg_reg.0 != args_base.0 + i as u16 {
+                self.codegen.emit(Instruction::Move {
+                    dst: Register(args_base.0 + i as u16),
+                    src: arg_reg,
+                });
+            }
+            self.codegen.free_reg(arg_reg);
+        }
+
+        // Emit CallSuper instruction
+        let dst = self.codegen.alloc_reg();
+        self.codegen
+            .emit(Instruction::CallSuper { dst, args: args_base, argc });
+
+        // Free arg block
+        for i in 0..argc.max(1) as u16 {
+            self.codegen.free_reg(Register(args_base.0 + i));
+        }
+
+        Ok(dst)
+    }
+
+    /// Compile a super.method() call
+    fn compile_super_method_call(
+        &mut self,
+        call: &CallExpression,
+        member: &oxc_ast::ast::StaticMemberExpression,
+    ) -> CompileResult<Register> {
+        // Get the property from super's prototype
+        let method_name = member.property.name.as_str();
+        let name_idx = self.codegen.add_string(method_name);
+
+        let func_reg = self.codegen.alloc_reg();
+        self.codegen
+            .emit(Instruction::GetSuperProp { dst: func_reg, name: name_idx });
+
+        // Get `this` for the call receiver
+        let this_reg = self.codegen.alloc_reg();
+        self.codegen
+            .emit(Instruction::LoadThis { dst: this_reg });
+
+        // Compile arguments
+        let argc = call.arguments.len() as u8;
+        let mut arg_regs = Vec::with_capacity(call.arguments.len());
+        for arg in &call.arguments {
+            arg_regs.push(self.compile_expression(arg.to_expression())?);
+        }
+
+        // Set up call convention: func, this, args in contiguous registers
+        let frame = self.codegen.alloc_fresh_block(1 + argc);
+        self.codegen.emit(Instruction::Move {
+            dst: frame,
+            src: func_reg,
+        });
+        for (i, arg_reg) in arg_regs.iter().copied().enumerate() {
+            self.codegen.emit(Instruction::Move {
+                dst: Register(frame.0 + 1 + i as u16),
+                src: arg_reg,
+            });
+        }
+
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::CallWithReceiver {
+            dst,
+            func: frame,
+            this: this_reg,
+            argc,
+        });
+
+        // Free temporaries
+        self.codegen.free_reg(func_reg);
+        self.codegen.free_reg(this_reg);
+        for reg in &arg_regs {
+            self.codegen.free_reg(*reg);
+        }
+        for i in 0..(1 + argc as u16) {
+            self.codegen.free_reg(Register(frame.0 + i));
+        }
+
+        Ok(dst)
     }
 
     /// Compile a method call (obj.method(...))
@@ -5395,6 +5594,15 @@ impl Compiler {
         &mut self,
         member: &StaticMemberExpression,
     ) -> CompileResult<Register> {
+        // Handle super.prop access
+        if matches!(&member.object, Expression::Super(_)) {
+            let dst = self.codegen.alloc_reg();
+            let name_idx = self.codegen.add_string(&member.property.name);
+            self.codegen
+                .emit(Instruction::GetSuperProp { dst, name: name_idx });
+            return Ok(dst);
+        }
+
         let obj = self.compile_expression(&member.object)?;
         let dst = self.codegen.alloc_reg();
         let name_idx = self.codegen.add_string(&member.property.name);

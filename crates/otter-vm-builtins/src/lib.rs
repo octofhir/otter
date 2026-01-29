@@ -29,6 +29,7 @@ pub mod date;
 pub mod error;
 pub mod fetch;
 pub mod function;
+pub mod global;
 pub mod http;
 pub mod iterator;
 pub mod json;
@@ -86,6 +87,7 @@ pub fn create_builtins_extension_with_console<A: ConsoleAdapter>(adapter: A) -> 
     ops.extend(date::ops());
     ops.extend(error::ops());
     ops.extend(function::ops());
+    ops.extend(global::ops());
     ops.extend(iterator::ops());
     ops.extend(json::ops());
     ops.extend(map::ops());

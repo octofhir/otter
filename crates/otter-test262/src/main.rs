@@ -201,16 +201,36 @@ impl RunSummary {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Spawn the async main on a thread with a large stack to avoid
+    // stack overflow in the VM interpreter/compiler on deeply nested tests.
+    const STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MB
+    let builder = std::thread::Builder::new()
+        .name("test262-main".into())
+        .stack_size(STACK_SIZE);
+    let handler = builder
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async_main())
+        })
+        .expect("failed to spawn main thread");
+    handler.join().unwrap();
+}
+
+async fn async_main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("warn".parse().unwrap()))
         .init();
 
     let args = Args::parse();
 
-    println!("{}", "Otter Test262 Runner".bold().cyan());
-    println!("Test directory: {}", args.test_dir.display());
+    if !args.json {
+        println!("{}", "Otter Test262 Runner".bold().cyan());
+        println!("Test directory: {}", args.test_dir.display());
+    }
 
     // Initialize memory tracking if requested
     let mut memory_tracker = if args.memory_stats {
@@ -226,7 +246,7 @@ async fn main() {
 
     if let Some(ref filter) = args.filter {
         runner = runner.with_filter(filter.clone());
-        println!("Filter: {}", filter);
+        if !args.json { println!("Filter: {}", filter); }
     }
 
     // List-only mode
@@ -245,15 +265,17 @@ async fn main() {
     }
 
     // Run tests
-    println!("\nRunning tests...");
+    if !args.json {
+        println!("\nRunning tests...");
+    }
     use std::io::Write;
     std::io::stdout().flush().unwrap();
 
     let mut tests = if !args.files.is_empty() {
-        println!("Running {} specific test files", args.files.len());
+        if !args.json { println!("Running {} specific test files", args.files.len()); }
         args.files.iter().map(PathBuf::from).collect()
     } else if let Some(ref subdir) = args.subdir {
-        println!("Subdirectory: {}", subdir);
+        if !args.json { println!("Subdirectory: {}", subdir); }
         runner.list_tests_dir(subdir)
     } else {
         runner.list_tests()
@@ -263,30 +285,32 @@ async fn main() {
         tests.truncate(max);
     }
 
-    let mut summary = RunSummary::new(10);
+    let mut summary = RunSummary::new(if args.json { 5000 } else { 10 });
 
     for path in tests {
-        if args.verbose {
+        if args.verbose && !args.json {
             println!("RUNNING: {}", path.display());
         }
         let timeout = args.timeout.map(std::time::Duration::from_secs);
         let result = runner.run_test(&path, timeout).await;
 
-        match result.outcome {
-            TestOutcome::Fail | TestOutcome::Crash => {
-                println!(
-                    "\n{}: {} - {:?}",
-                    "FAIL".red().bold(),
-                    result.path,
-                    result.error
-                );
+        if !args.json {
+            match result.outcome {
+                TestOutcome::Fail | TestOutcome::Crash => {
+                    eprintln!(
+                        "\n{}: {} - {:?}",
+                        "FAIL".red().bold(),
+                        result.path,
+                        result.error
+                    );
+                }
+                _ => {}
             }
-            _ => {}
         }
 
         summary.record(&result);
 
-        if summary.total % 100 == 0 {
+        if !args.json && summary.total % 100 == 0 {
             use std::io::Write;
             print!(".");
             std::io::stdout().flush().unwrap();
@@ -299,7 +323,7 @@ async fn main() {
         }
     }
 
-    println!(); // Newline after progress dots
+    if !args.json { println!(); } // Newline after progress dots
 
     if let Some(ref mut tracker) = memory_tracker {
         tracker.update();

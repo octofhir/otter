@@ -325,14 +325,28 @@ impl<T> GcRef<T> {
 
     /// Create a GcRef by allocating a new GcBox on the heap.
     ///
-    /// This allocates memory using Box (temporary - will use GC heap later).
+    /// This registers the allocation with the global GC registry.
     /// The returned GcRef owns the allocation.
-    pub fn new(value: T) -> Self {
-        // For now, allocate via Box. In the future, this will use GcHeap.
-        let boxed = Box::new(GcBox::new(value));
-        let ptr = NonNull::new(Box::into_raw(boxed)).unwrap();
+    pub fn new(value: T) -> Self
+    where
+        T: otter_vm_gc::GcTraceable + 'static,
+    {
+        // Allocate and register with GC
+        // gc_alloc returns *mut T (pointer to value after header)
+        let value_ptr = unsafe { otter_vm_gc::gc_alloc(value) };
+
+        // Calculate pointer to GcBox<T> (which starts at the header)
+        // GcBox is #[repr(C)] with header first, then value
+        // So: GcBox address = value address - offset_of(value in GcBox)
+        let box_ptr = unsafe {
+            let offset = std::mem::offset_of!(GcBox<T>, value);
+            (value_ptr as *mut u8).sub(offset) as *mut GcBox<T>
+        };
+
+        let non_null = NonNull::new(box_ptr).unwrap();
+
         Self {
-            gc: unsafe { Gc::from_raw(ptr) },
+            gc: unsafe { Gc::from_raw(non_null) },
         }
     }
 

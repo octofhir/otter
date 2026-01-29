@@ -181,8 +181,14 @@ impl Compiler {
                 .validate_string_literal(&d.expression)?;
         }
 
-        for stmt in &program.body {
-            self.compile_statement(stmt)?;
+        // Hoist function declarations before compiling any statements
+        let hoisted = self.hoist_function_declarations(&program.body)?;
+
+        // Compile statements, skipping hoisted function declarations
+        for (idx, stmt) in program.body.iter().enumerate() {
+            if !hoisted.contains(&idx) {
+                self.compile_statement(stmt)?;
+            }
         }
         Ok(())
     }
@@ -203,6 +209,179 @@ impl Compiler {
             }
         }
         false
+    }
+
+    /// Hoist function and var declarations to the top of the current scope.
+    /// This implements JavaScript's hoisting behavior where:
+    /// - `var` declarations are hoisted (name only, value is undefined)
+    /// - `function` declarations are hoisted (name and body are available)
+    /// Returns a set of statement indices that were hoisted and should be skipped during
+    /// normal compilation.
+    fn hoist_function_declarations(&mut self, statements: &[Statement]) -> CompileResult<Vec<usize>> {
+        let mut hoisted_indices = Vec::new();
+
+        // Phase 0: Hoist all `var` declarations (name only) so they are visible
+        // to function bodies compiled in Phase 2. Per ES2023 §14.3.2, var declarations
+        // are hoisted to the enclosing function scope before any code executes.
+        self.hoist_var_declarations(statements)?;
+
+        // Phase 1: Declare all function names first
+        // This ensures that all functions can reference each other
+        for (idx, stmt) in statements.iter().enumerate() {
+            if let Statement::FunctionDeclaration(func) = stmt {
+                if let Some(id) = &func.id {
+                    let name = id.name.to_string();
+                    self.codegen.declare_variable(&name, false)?;
+                }
+                hoisted_indices.push(idx);
+            }
+        }
+
+        // Phase 2: Compile and assign all functions
+        // Now that all var and function names are declared, function bodies can
+        // reference variables from the enclosing scope via upvalues.
+        for stmt in statements.iter() {
+            if let Statement::FunctionDeclaration(func) = stmt {
+                // Compile the function (skip the declare step since we already did it)
+                self.compile_function_declaration_body(func)?;
+            }
+        }
+
+        Ok(hoisted_indices)
+    }
+
+    /// Collect and declare all `var`-declared names from a statement list.
+    /// This recursively scans blocks, if/else, for, while, switch, try/catch, etc.
+    /// but does NOT descend into nested function bodies (they have their own scope).
+    fn hoist_var_declarations(&mut self, statements: &[Statement]) -> CompileResult<()> {
+        for stmt in statements {
+            self.hoist_var_declarations_from_stmt(stmt)?;
+        }
+        Ok(())
+    }
+
+    /// Recursively collect var-declared names from a single statement.
+    fn hoist_var_declarations_from_stmt(&mut self, stmt: &Statement) -> CompileResult<()> {
+        use crate::scope::VariableKind;
+        match stmt {
+            Statement::VariableDeclaration(decl) => {
+                if decl.kind == VariableDeclarationKind::Var {
+                    for declarator in &decl.declarations {
+                        self.hoist_var_names_from_binding(&declarator.id)?;
+                    }
+                }
+            }
+            Statement::BlockStatement(block) => {
+                for s in &block.body {
+                    self.hoist_var_declarations_from_stmt(s)?;
+                }
+            }
+            Statement::IfStatement(if_stmt) => {
+                self.hoist_var_declarations_from_stmt(&if_stmt.consequent)?;
+                if let Some(alt) = &if_stmt.alternate {
+                    self.hoist_var_declarations_from_stmt(alt)?;
+                }
+            }
+            Statement::ForStatement(for_stmt) => {
+                if let Some(ForStatementInit::VariableDeclaration(decl)) = &for_stmt.init {
+                    if decl.kind == VariableDeclarationKind::Var {
+                        for declarator in &decl.declarations {
+                            self.hoist_var_names_from_binding(&declarator.id)?;
+                        }
+                    }
+                }
+                self.hoist_var_declarations_from_stmt(&for_stmt.body)?;
+            }
+            Statement::ForInStatement(for_in) => {
+                if let ForStatementLeft::VariableDeclaration(decl) = &for_in.left {
+                    if decl.kind == VariableDeclarationKind::Var {
+                        for declarator in &decl.declarations {
+                            self.hoist_var_names_from_binding(&declarator.id)?;
+                        }
+                    }
+                }
+                self.hoist_var_declarations_from_stmt(&for_in.body)?;
+            }
+            Statement::ForOfStatement(for_of) => {
+                if let ForStatementLeft::VariableDeclaration(decl) = &for_of.left {
+                    if decl.kind == VariableDeclarationKind::Var {
+                        for declarator in &decl.declarations {
+                            self.hoist_var_names_from_binding(&declarator.id)?;
+                        }
+                    }
+                }
+                self.hoist_var_declarations_from_stmt(&for_of.body)?;
+            }
+            Statement::WhileStatement(while_stmt) => {
+                self.hoist_var_declarations_from_stmt(&while_stmt.body)?;
+            }
+            Statement::DoWhileStatement(do_while) => {
+                self.hoist_var_declarations_from_stmt(&do_while.body)?;
+            }
+            Statement::SwitchStatement(switch) => {
+                for case in &switch.cases {
+                    for s in &case.consequent {
+                        self.hoist_var_declarations_from_stmt(s)?;
+                    }
+                }
+            }
+            Statement::TryStatement(try_stmt) => {
+                for s in &try_stmt.block.body {
+                    self.hoist_var_declarations_from_stmt(s)?;
+                }
+                if let Some(handler) = &try_stmt.handler {
+                    for s in &handler.body.body {
+                        self.hoist_var_declarations_from_stmt(s)?;
+                    }
+                }
+                if let Some(finalizer) = &try_stmt.finalizer {
+                    for s in &finalizer.body {
+                        self.hoist_var_declarations_from_stmt(s)?;
+                    }
+                }
+            }
+            Statement::LabeledStatement(labeled) => {
+                self.hoist_var_declarations_from_stmt(&labeled.body)?;
+            }
+            Statement::WithStatement(with_stmt) => {
+                self.hoist_var_declarations_from_stmt(&with_stmt.body)?;
+            }
+            // Function declarations are NOT scanned for var (they have their own scope)
+            // Other statements (expression, return, throw, break, continue, etc.) cannot contain var
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Extract var-declared names from a binding pattern and declare them.
+    fn hoist_var_names_from_binding(&mut self, pattern: &BindingPattern) -> CompileResult<()> {
+        use crate::scope::VariableKind;
+        match pattern {
+            BindingPattern::BindingIdentifier(ident) => {
+                self.codegen
+                    .declare_variable_with_kind(&ident.name, VariableKind::Var)?;
+            }
+            BindingPattern::ObjectPattern(obj) => {
+                for prop in &obj.properties {
+                    self.hoist_var_names_from_binding(&prop.value)?;
+                }
+                if let Some(rest) = &obj.rest {
+                    self.hoist_var_names_from_binding(&rest.argument)?;
+                }
+            }
+            BindingPattern::ArrayPattern(arr) => {
+                for elem in arr.elements.iter().flatten() {
+                    self.hoist_var_names_from_binding(elem)?;
+                }
+                if let Some(rest) = &arr.rest {
+                    self.hoist_var_names_from_binding(&rest.argument)?;
+                }
+            }
+            BindingPattern::AssignmentPattern(assign) => {
+                self.hoist_var_names_from_binding(&assign.left)?;
+            }
+        }
+        Ok(())
     }
 
     /// Compile a statement
@@ -238,8 +417,13 @@ impl Compiler {
 
             Statement::BlockStatement(block) => {
                 self.codegen.enter_scope();
-                for stmt in &block.body {
-                    self.compile_statement(stmt)?;
+                // Hoist function declarations in block
+                let hoisted = self.hoist_function_declarations(&block.body)?;
+                // Compile statements, skipping hoisted function declarations
+                for (idx, stmt) in block.body.iter().enumerate() {
+                    if !hoisted.contains(&idx) {
+                        self.compile_statement(stmt)?;
+                    }
                 }
                 self.codegen.exit_scope();
                 Ok(())
@@ -2738,8 +2922,189 @@ impl Compiler {
                     .validate_string_literal(&d.expression)?;
             }
 
-            for stmt in &body.statements {
-                self.compile_statement(stmt)?;
+            // Hoist function declarations in function body
+            let hoisted = self.hoist_function_declarations(&body.statements)?;
+
+            // Compile statements, skipping hoisted function declarations
+            for (idx, stmt) in body.statements.iter().enumerate() {
+                if !hoisted.contains(&idx) {
+                    self.compile_statement(stmt)?;
+                }
+            }
+
+            self.set_strict_mode(saved_strict);
+        }
+
+        // Ensure return
+        self.codegen.emit(Instruction::ReturnUndefined);
+
+        // Exit function and get index
+        let func_idx = self.codegen.exit_function();
+
+        // Create closure and store in variable
+        if let Some(n) = name
+            && let Some(ResolvedBinding::Local(idx)) = self.codegen.resolve_variable(&n)
+        {
+            let dst = self.codegen.alloc_reg();
+            if is_async && is_generator {
+                self.codegen.emit(Instruction::AsyncGeneratorClosure {
+                    dst,
+                    func: otter_vm_bytecode::FunctionIndex(func_idx),
+                });
+            } else if is_generator {
+                self.codegen.emit(Instruction::GeneratorClosure {
+                    dst,
+                    func: otter_vm_bytecode::FunctionIndex(func_idx),
+                });
+            } else if is_async {
+                self.codegen.emit(Instruction::AsyncClosure {
+                    dst,
+                    func: otter_vm_bytecode::FunctionIndex(func_idx),
+                });
+            } else {
+                self.codegen.emit(Instruction::Closure {
+                    dst,
+                    func: otter_vm_bytecode::FunctionIndex(func_idx),
+                });
+            }
+            self.codegen.emit(Instruction::SetLocal {
+                idx: LocalIndex(idx),
+                src: dst,
+            });
+            if self.codegen.current.name.as_deref() == Some("main") {
+                let name_idx = self.codegen.add_string(&n);
+                let ic_index = self.codegen.alloc_ic();
+                self.codegen.emit(Instruction::SetGlobal {
+                    name: name_idx,
+                    src: dst,
+                    ic_index,
+                });
+            }
+            self.codegen.free_reg(dst);
+        }
+
+        self.loop_stack = saved_loop_stack;
+        Ok(())
+    }
+
+    /// Compile a function declaration body (assumes name is already declared)
+    /// This is used during the hoisting phase where names are declared in phase 1
+    /// and bodies are compiled in phase 2.
+    fn compile_function_declaration_body(&mut self, func: &oxc_ast::ast::Function) -> CompileResult<()> {
+        let name = func.id.as_ref().map(|id| id.name.to_string());
+        let is_async = func.r#async;
+        let is_generator = func.generator;
+
+        let saved_loop_stack = std::mem::take(&mut self.loop_stack);
+
+        // Name is already declared in hoisting phase 1, so skip declare_variable
+
+        // Enter function context
+        self.codegen.enter_function(name.clone());
+        self.codegen.current.flags.is_async = is_async;
+        self.codegen.current.flags.is_generator = is_generator;
+
+        // Declare parameters and collect defaults
+        let mut param_defaults: Vec<(u16, &Expression)> = Vec::new();
+        for param in &func.params.items {
+            match &param.pattern {
+                BindingPattern::BindingIdentifier(ident) => {
+                    self.check_identifier_early_error(&ident.name)?;
+                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                    self.codegen.current.param_count += 1;
+                    if let Some(init) = &param.initializer {
+                        param_defaults.push((local_idx, init));
+                    }
+                }
+                BindingPattern::AssignmentPattern(assign) => {
+                    if let BindingPattern::BindingIdentifier(ident) = &assign.left {
+                        self.check_identifier_early_error(&ident.name)?;
+                        let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                        self.codegen.current.param_count += 1;
+                        param_defaults.push((local_idx, &assign.right));
+                    } else {
+                        let param_reg = self.codegen.alloc_reg();
+                        self.codegen.current.param_count += 1;
+                        self.compile_binding_init(&assign.left, param_reg, false)?;
+                    }
+                }
+                _ => {
+                    let param_reg = self.codegen.alloc_reg();
+                    self.codegen.current.param_count += 1;
+                    self.compile_binding_init(&param.pattern, param_reg, false)?;
+                }
+            }
+        }
+
+        // Check for rest parameter at function level
+        if let Some(rest) = &func.params.rest {
+            if let BindingPattern::BindingIdentifier(ident) = &rest.rest.argument {
+                self.check_identifier_early_error(&ident.name)?;
+                self.codegen.declare_variable(&ident.name, false)?;
+                self.codegen.current.flags.has_rest = true;
+            } else {
+                return Err(CompileError::unsupported("Complex rest parameter pattern"));
+            }
+        }
+
+        // Emit default parameter initializers
+        for (local_idx, default_expr) in param_defaults {
+            let cur = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::GetLocal {
+                dst: cur,
+                idx: LocalIndex(local_idx),
+            });
+            let undef = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::LoadUndefined { dst: undef });
+            let cond = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::StrictEq {
+                dst: cond,
+                lhs: cur,
+                rhs: undef,
+            });
+            let jump_skip = self.codegen.emit_jump_if_false(cond);
+            self.codegen.free_reg(cond);
+            self.codegen.free_reg(undef);
+            self.codegen.free_reg(cur);
+
+            let value = self.compile_expression(default_expr)?;
+            self.codegen.emit(Instruction::SetLocal {
+                idx: LocalIndex(local_idx),
+                src: value,
+            });
+            self.codegen.free_reg(value);
+
+            let end_offset = self.codegen.current_index() as i32 - jump_skip as i32;
+            self.codegen.patch_jump(jump_skip, end_offset);
+        }
+
+        // Compile function body
+        if let Some(body) = &func.body {
+            let saved_strict = self.is_strict_mode();
+            let has_use_strict = body
+                .directives
+                .iter()
+                .any(|d| d.directive.as_str() == "use strict");
+            let has_use_strict = has_use_strict || self.has_use_strict_directive(&body.statements);
+
+            if has_use_strict {
+                self.set_strict_mode(true);
+            }
+
+            // Validate directives
+            for d in &body.directives {
+                self.literal_validator
+                    .validate_string_literal(&d.expression)?;
+            }
+
+            // Hoist function declarations in function body
+            let hoisted = self.hoist_function_declarations(&body.statements)?;
+
+            // Compile statements, skipping hoisted function declarations
+            for (idx, stmt) in body.statements.iter().enumerate() {
+                if !hoisted.contains(&idx) {
+                    self.compile_statement(stmt)?;
+                }
             }
 
             self.set_strict_mode(saved_strict);
@@ -2925,8 +3290,14 @@ impl Compiler {
                     .validate_string_literal(&d.expression)?;
             }
 
-            for stmt in &body.statements {
-                self.compile_statement(stmt)?;
+            // Hoist function declarations in function body
+            let hoisted = self.hoist_function_declarations(&body.statements)?;
+
+            // Compile statements, skipping hoisted function declarations
+            for (idx, stmt) in body.statements.iter().enumerate() {
+                if !hoisted.contains(&idx) {
+                    self.compile_statement(stmt)?;
+                }
             }
 
             self.set_strict_mode(saved_strict);
@@ -3090,8 +3461,13 @@ impl Compiler {
             }
         } else {
             // Statement body: `(x) => { return x + 1; }`
-            for stmt in &arrow.body.statements {
-                self.compile_statement(stmt)?;
+            // Hoist function declarations in arrow function body
+            let hoisted = self.hoist_function_declarations(&arrow.body.statements)?;
+            // Compile statements, skipping hoisted function declarations
+            for (idx, stmt) in arrow.body.statements.iter().enumerate() {
+                if !hoisted.contains(&idx) {
+                    self.compile_statement(stmt)?;
+                }
             }
             self.codegen.emit(Instruction::ReturnUndefined);
         }

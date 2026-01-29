@@ -84,6 +84,15 @@ globalThis.eval = function (code) {
     return result ? result.value : undefined;
 };
 
+// Annex B - Legacy global functions
+globalThis.escape = function (string) {
+    return __global_escape(String(string));
+};
+
+globalThis.unescape = function (string) {
+    return __global_unescape(String(string));
+};
+
 
 function __markNonConstructor(fn) {
     if (typeof fn !== 'function') {
@@ -812,6 +821,53 @@ String.prototype = {
     localeCompare: function (compareString, locales, options) {
         return __String_localeCompare(this, compareString, locales, options);
     },
+
+    // Annex B - Legacy/deprecated methods
+    substr: function (start, length) {
+        return __String_substr(this, start, length);
+    },
+
+    // Annex B - HTML wrapper methods
+    anchor: function (name) {
+        return __String_anchor(this, name);
+    },
+    big: function () {
+        return __String_big(this);
+    },
+    blink: function () {
+        return __String_blink(this);
+    },
+    bold: function () {
+        return __String_bold(this);
+    },
+    fixed: function () {
+        return __String_fixed(this);
+    },
+    fontcolor: function (color) {
+        return __String_fontcolor(this, color);
+    },
+    fontsize: function (size) {
+        return __String_fontsize(this, size);
+    },
+    italics: function () {
+        return __String_italics(this);
+    },
+    link: function (url) {
+        return __String_link(this, url);
+    },
+    small: function () {
+        return __String_small(this);
+    },
+    strike: function () {
+        return __String_strike(this);
+    },
+    sub: function () {
+        return __String_sub(this);
+    },
+    sup: function () {
+        return __String_sup(this);
+    },
+
     get length() {
         return __String_length(this);
     },
@@ -1733,81 +1789,69 @@ Error.captureStackTrace = function (targetObject, constructorOpt) {
 };
 
 // Function built-in
-// Define Function constructor first
+// Save the Rust-side intrinsic %Function.prototype% before replacing the constructor.
+var __fnProtoIntrinsic = globalThis.Function.prototype;
 globalThis.Function = function Function(...args) {
     // The Function constructor creates a new function from strings
     // This is a security-sensitive operation; for now we throw
     throw new Error('Function constructor is not supported');
 };
+// Restore the intrinsic so all native functions share the same prototype object.
+globalThis.Function.prototype = __fnProtoIntrinsic;
+globalThis.Function.prototype.call = function (thisArg, ...args) {
+    return __Function_call(this, thisArg, args);
+};
 
-// Now set up Function.prototype
-globalThis.Function.prototype = {
-    // Function.prototype.call(thisArg, ...args)
-    call: function (thisArg, ...args) {
-        return __Function_call(this, thisArg, args);
-    },
+globalThis.Function.prototype.apply = function (thisArg, argsArray) {
+    return __Function_apply(this, thisArg, argsArray);
+};
 
-    // Function.prototype.apply(thisArg, argsArray)
-    apply: function (thisArg, argsArray) {
-        return __Function_apply(this, thisArg, argsArray);
-    },
+// Function.prototype.bind(thisArg, ...boundArgs)
+// Creates a bound function per ES2023 §20.2.3.2.
+// Uses explicit parameters (up to 8 bound args) since rest params
+// would interfere with thisArg extraction.
+globalThis.Function.prototype.bind = function (thisArg, a0, a1, a2, a3, a4, a5, a6, a7) {
+    const fn = this;
 
-    // Function.prototype.bind(thisArg, a0, a1, a2, a3, a4, a5, a6, a7)
-    // Creates a bound function using native __Function_createBound
-    // Supports up to 8 bound arguments (common use cases)
-    bind: function (thisArg, a0, a1, a2, a3, a4, a5, a6, a7) {
-        const fn = this;
+    if (typeof fn !== 'function') {
+        throw new TypeError('Bind must be called on a function');
+    }
 
-        if (typeof fn !== 'function') {
-            throw new TypeError('Bind must be called on a function');
-        }
+    // Collect non-undefined bound args
+    const boundArgs = [];
+    if (a0 !== undefined) boundArgs[boundArgs.length] = a0;
+    if (a1 !== undefined) boundArgs[boundArgs.length] = a1;
+    if (a2 !== undefined) boundArgs[boundArgs.length] = a2;
+    if (a3 !== undefined) boundArgs[boundArgs.length] = a3;
+    if (a4 !== undefined) boundArgs[boundArgs.length] = a4;
+    if (a5 !== undefined) boundArgs[boundArgs.length] = a5;
+    if (a6 !== undefined) boundArgs[boundArgs.length] = a6;
+    if (a7 !== undefined) boundArgs[boundArgs.length] = a7;
 
-        // Collect non-undefined bound args
-        const boundArgs = [];
-        if (a0 !== undefined) boundArgs[boundArgs.length] = a0;
-        if (a1 !== undefined) boundArgs[boundArgs.length] = a1;
-        if (a2 !== undefined) boundArgs[boundArgs.length] = a2;
-        if (a3 !== undefined) boundArgs[boundArgs.length] = a3;
-        if (a4 !== undefined) boundArgs[boundArgs.length] = a4;
-        if (a5 !== undefined) boundArgs[boundArgs.length] = a5;
-        if (a6 !== undefined) boundArgs[boundArgs.length] = a6;
-        if (a7 !== undefined) boundArgs[boundArgs.length] = a7;
+    // Use native bound function creation
+    if (boundArgs.length === 0) {
+        return __Function_createBound(fn, thisArg);
+    } else if (boundArgs.length === 1) {
+        return __Function_createBound(fn, thisArg, boundArgs[0]);
+    } else if (boundArgs.length === 2) {
+        return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1]);
+    } else if (boundArgs.length === 3) {
+        return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2]);
+    } else if (boundArgs.length === 4) {
+        return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2], boundArgs[3]);
+    } else if (boundArgs.length === 5) {
+        return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2], boundArgs[3], boundArgs[4]);
+    } else if (boundArgs.length === 6) {
+        return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2], boundArgs[3], boundArgs[4], boundArgs[5]);
+    } else if (boundArgs.length === 7) {
+        return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2], boundArgs[3], boundArgs[4], boundArgs[5], boundArgs[6]);
+    } else {
+        return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2], boundArgs[3], boundArgs[4], boundArgs[5], boundArgs[6], boundArgs[7]);
+    }
+};
 
-        // Use native bound function creation
-        if (boundArgs.length === 0) {
-            return __Function_createBound(fn, thisArg);
-        } else if (boundArgs.length === 1) {
-            return __Function_createBound(fn, thisArg, boundArgs[0]);
-        } else if (boundArgs.length === 2) {
-            return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1]);
-        } else if (boundArgs.length === 3) {
-            return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2]);
-        } else if (boundArgs.length === 4) {
-            return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2], boundArgs[3]);
-        } else if (boundArgs.length === 5) {
-            return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2], boundArgs[3], boundArgs[4]);
-        } else if (boundArgs.length === 6) {
-            return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2], boundArgs[3], boundArgs[4], boundArgs[5]);
-        } else if (boundArgs.length === 7) {
-            return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2], boundArgs[3], boundArgs[4], boundArgs[5], boundArgs[6]);
-        } else {
-            return __Function_createBound(fn, thisArg, boundArgs[0], boundArgs[1], boundArgs[2], boundArgs[3], boundArgs[4], boundArgs[5], boundArgs[6], boundArgs[7]);
-        }
-    },
-
-    toString: function () {
-        return __Function_toString(this);
-    },
-
-    // Function.prototype.name getter
-    get name() {
-        return __Function_getName(this);
-    },
-
-    // Function.prototype.length getter
-    get length() {
-        return __Function_getLength(this);
-    },
+globalThis.Function.prototype.toString = function () {
+    return __Function_toString(this);
 };
 
 

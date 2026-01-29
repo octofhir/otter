@@ -62,7 +62,7 @@ impl Test262Runner {
         let start = Instant::now();
         // Initialize engine once with all standard builtins and harness extensions
         let engine = EngineBuilder::new()
-            .with_http()
+            // .with_http() // TEMPORARILY DISABLED to test CPU usage
             .extension(crate::harness::create_harness_extension())
             .build();
         println!("Engine initialized in {:.2?}", start.elapsed());
@@ -233,22 +233,20 @@ impl Test262Runner {
         }
 
         // Add harness files to source
-        for include in includes {
+        for include in &includes {
             let harness_path = self.test_dir.join("harness").join(&include);
             match fs::read_to_string(&harness_path) {
                 Ok(harness_content) => {
+                    // Successfully loaded harness file
                     test_source.push_str(&harness_content);
                     test_source.push('\n');
                 }
                 Err(e) => {
-                    // Only warn for explicit includes failing
-                    if metadata.includes.contains(&include) {
-                        eprintln!(
-                            "Warning: Failed to read harness file {}: {}",
-                            harness_path.display(),
-                            e
-                        );
-                    }
+                    eprintln!(
+                        "ERROR: Failed to read harness file {} (required by test): {}",
+                        harness_path.display(),
+                        e
+                    );
                 }
             }
         }
@@ -287,12 +285,10 @@ impl Test262Runner {
         test_name: &str,
         timeout: Option<Duration>,
     ) -> (TestOutcome, Option<String>) {
-        let mut engine = EngineBuilder::new()
-            .with_http()
-            .extension(crate::harness::create_harness_extension())
-            .build();
+        // Use shared engine instead of creating a new one each time
+        let mut engine = self.engine.lock().await;
 
-        match self
+        let result = match self
             .run_with_timeout(&mut engine, source, timeout, test_name)
             .await
         {
@@ -301,12 +297,11 @@ impl Test262Runner {
                     // println!("RESULT {}: {}", test_name, format_value(&value));
                 }
                 if metadata.expects_early_error() {
-                    return (
+                    (
                         TestOutcome::Fail,
                         Some("Expected parse/early error but compilation succeeded".to_string()),
-                    );
-                }
-                if metadata.expects_runtime_error() {
+                    )
+                } else if metadata.expects_runtime_error() {
                     (
                         TestOutcome::Fail,
                         Some("Expected runtime error but execution succeeded".to_string()),
@@ -334,7 +329,8 @@ impl Test262Runner {
                 }
                 OtterError::PermissionDenied(msg) => (TestOutcome::Fail, Some(msg)),
             },
-        }
+        };
+        result
     }
 
     async fn run_with_timeout(

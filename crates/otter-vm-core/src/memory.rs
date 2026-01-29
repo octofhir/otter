@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 const MIN_GC_THRESHOLD: usize = 1024 * 1024;
 
 /// Default allocation count threshold for triggering GC
+/// Increased from 1,000 to reduce GC frequency (GC was taking 43% CPU)
 const DEFAULT_ALLOCATION_COUNT_THRESHOLD: usize = 10_000;
 
 /// Manages memory limits and accounting for a VM instance
@@ -27,6 +28,8 @@ pub struct MemoryManager {
     gc_requested: AtomicBool,
     /// Allocation count threshold for triggering GC
     allocation_count_threshold: AtomicUsize,
+    /// Cached GC threshold (updated after each GC)
+    cached_gc_threshold: AtomicUsize,
 }
 
 impl MemoryManager {
@@ -39,6 +42,7 @@ impl MemoryManager {
             last_live_size: AtomicUsize::new(0),
             gc_requested: AtomicBool::new(false),
             allocation_count_threshold: AtomicUsize::new(DEFAULT_ALLOCATION_COUNT_THRESHOLD),
+            cached_gc_threshold: AtomicUsize::new(MIN_GC_THRESHOLD),
         }
     }
 
@@ -48,25 +52,28 @@ impl MemoryManager {
     }
 
     /// Try to book 'size' bytes. Returns Err(VmError::OutOfMemory) if limit exceeded.
+    #[inline]
     pub fn alloc(&self, size: usize) -> VmResult<()> {
+        // Fast path: check limit (common case: allocations succeed)
         let current = self.allocated.load(Ordering::Relaxed);
         if current + size > self.limit {
             return Err(VmError::OutOfMemory);
         }
 
-        // Use a loop with compare_exchange if we want strict accuracy,
-        // but fetch_add is usually fine for accounting.
+        // Update counters with relaxed ordering for performance
         self.allocated.fetch_add(size, Ordering::Relaxed);
         self.allocation_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     /// Record deallocation of 'size' bytes
+    #[inline]
     pub fn free(&self, size: usize) {
         self.allocated.fetch_sub(size, Ordering::Relaxed);
     }
 
     /// Get current allocated bytes
+    #[inline]
     pub fn allocated(&self) -> usize {
         self.allocated.load(Ordering::Relaxed)
     }
@@ -107,24 +114,28 @@ impl MemoryManager {
     /// Check if GC should be triggered based on memory pressure
     ///
     /// Returns true if any of these conditions are met:
-    /// 1. Heap size exceeds adaptive threshold (2x live set)
+    /// 1. Explicit GC was requested
     /// 2. Allocation count exceeds threshold
-    /// 3. Explicit GC was requested
+    /// 3. Heap size exceeds adaptive threshold (2x live set)
+    ///
+    /// Optimized with early exits and cached threshold for performance.
+    #[inline]
     pub fn should_collect_garbage(&self) -> bool {
-        // Check explicit request
+        // Fast path: check explicit request first (single atomic load, most urgent)
         if self.gc_requested.load(Ordering::Relaxed) {
             return true;
         }
 
-        // Check allocation count threshold
+        // Fast path: check allocation count (single load, cheap comparison)
         let alloc_count = self.allocation_count.load(Ordering::Relaxed);
-        let alloc_threshold = self.allocation_count_threshold.load(Ordering::Relaxed);
-        if alloc_count >= alloc_threshold {
+        if alloc_count >= self.allocation_count_threshold.load(Ordering::Relaxed) {
             return true;
         }
 
-        // Check heap size threshold (delegate to GC registry's threshold)
-        false
+        // Slower path: check heap size against cached threshold
+        let allocated = self.allocated.load(Ordering::Relaxed);
+        let threshold = self.cached_gc_threshold.load(Ordering::Relaxed);
+        allocated >= threshold
     }
 
     /// Request an explicit GC cycle
@@ -142,6 +153,9 @@ impl MemoryManager {
         self.reset_allocation_count();
         self.set_last_live_size(live_bytes);
         self.clear_gc_request();
+        // Update cached threshold
+        let new_threshold = usize::max(MIN_GC_THRESHOLD, live_bytes.saturating_mul(2));
+        self.cached_gc_threshold.store(new_threshold, Ordering::Relaxed);
     }
 
     /// Set the allocation count threshold

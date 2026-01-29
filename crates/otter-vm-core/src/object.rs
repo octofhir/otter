@@ -1409,3 +1409,61 @@ mod tests {
         assert!(obj1.set_prototype(Some(unrelated)));
     }
 }
+
+// ============================================================================
+// GC Tracing Implementation
+// ============================================================================
+
+impl otter_vm_gc::GcTraceable for JsObject {
+    const NEEDS_TRACE: bool = true;
+
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // Trace prototype
+        if let Some(proto) = self.prototype.read().as_ref() {
+            tracer(proto.header() as *const _);
+        }
+
+        // Trace values in inline properties
+        for entry_opt in self.inline_properties.read().iter() {
+            if let Some(entry) = entry_opt {
+                entry.desc.trace(tracer);
+            }
+        }
+
+        // Trace values in overflow properties
+        for entry in self.overflow_properties.read().iter() {
+            entry.desc.trace(tracer);
+        }
+
+        // Trace values in dictionary properties
+        if let Some(dict) = self.dictionary_properties.read().as_ref() {
+            for entry in dict.values() {
+                entry.desc.trace(tracer);
+            }
+        }
+
+        // Trace array elements
+        for value in self.elements.read().iter() {
+            value.trace(tracer);
+        }
+    }
+}
+
+impl PropertyDescriptor {
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        match self {
+            PropertyDescriptor::Data { value, .. } => {
+                value.trace(tracer);
+            }
+            PropertyDescriptor::Accessor { get, set, .. } => {
+                if let Some(getter) = get {
+                    getter.trace(tracer);
+                }
+                if let Some(setter) = set {
+                    setter.trace(tracer);
+                }
+            }
+            PropertyDescriptor::Deleted => {}
+        }
+    }
+}

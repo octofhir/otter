@@ -2,11 +2,11 @@ use otter_engine::{Extension, GcRef, JsObject, PropertyKey, Value, VmContext};
 use std::sync::Arc;
 
 /// Create a Test262 harness extension
+/// Note: sta.js, assert.js, and other harness files are loaded by the runner
+/// from test262/harness/ based on test metadata includes.
+/// This extension only provides native ops needed by those files.
 pub fn create_harness_extension() -> Extension {
     Extension::new("test262")
-        .with_js(include_str!("harness/sta.js"))
-        .with_js(include_str!("harness/assert.js"))
-        .with_js(include_str!("harness/donePrintHandle.js"))
         .with_ops(vec![
             otter_engine::op_native("__test262_print", |args| {
                 for arg in args {

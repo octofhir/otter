@@ -5,16 +5,12 @@
 //! Object.preventExtensions(), Object.isExtensible(), Object.defineProperty(), Object.create(),
 //! Object.is()
 
-use otter_macros::dive;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory::{self, MemoryManager};
 use otter_vm_core::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value as VmValue;
-use otter_vm_core::{VmContext, VmResult};
-use otter_vm_runtime::{Op, op_native_with_mm as op_native, op_sync};
-use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::sync::Arc;
 
 /// Object constructor and methods
@@ -23,13 +19,13 @@ pub struct ObjectBuiltin;
 /// Get Object ops for extension registration
 pub fn ops() -> Vec<Op> {
     vec![
-        // JSON-based ops (work with serialized data)
-        op_sync("__Object_keys", __otter_dive_object_keys),
-        op_sync("__Object_values", __otter_dive_object_values),
-        op_sync("__Object_entries", __otter_dive_object_entries),
-        op_sync("__Object_assign", __otter_dive_object_assign),
-        op_sync("__Object_hasOwn", __otter_dive_object_has_own),
-        // Native ops (require object identity)
+        // All ops now use native Value (no JSON conversion)
+        op_native("__Object_keys", native_object_keys),
+        op_native("__Object_values", native_object_values),
+        op_native("__Object_entries", native_object_entries),
+        op_native("__Object_assign", native_object_assign),
+        op_native("__Object_hasOwn", native_object_has_own),
+        // Object identity ops
         op_native("__Object_freeze", native_object_freeze),
         op_native("__Object_isFrozen", native_object_is_frozen),
         op_native("__Object_seal", native_object_seal),
@@ -55,7 +51,6 @@ pub fn ops() -> Vec<Op> {
             "__Object_getOwnPropertyDescriptors",
             native_object_get_own_property_descriptors,
         ),
-        op_native("__native_Object_keys", native_object_keys),
     ]
 }
 
@@ -390,140 +385,12 @@ fn native_object_is(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result
 }
 
 // ============================================================================
-// Dive Functions - Each becomes a callable JS function via #[dive(swift)]
-// Note: Original functions appear unused because #[dive] copies their body
-// into generated wrappers. They are used in tests.
+// All functions now use native Value directly (no JSON conversion)
 // ============================================================================
-
-/// Object.keys() - returns array of object's own enumerable property names
-#[dive(swift)]
-#[allow(dead_code)]
-fn object_keys(obj: JsonValue) -> Vec<String> {
-    match obj {
-        JsonValue::Object(map) => map.keys().cloned().collect(),
-        _ => vec![],
-    }
-}
-
-/// Object.values() - returns array of object's own enumerable property values
-#[dive(swift)]
-#[allow(dead_code)]
-fn object_values(obj: JsonValue) -> Vec<JsonValue> {
-    match obj {
-        JsonValue::Object(map) => map.values().cloned().collect(),
-        _ => vec![],
-    }
-}
-
-/// Entry type for Object.entries()
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObjectEntry(String, JsonValue);
-
-/// Object.entries() - returns array of [key, value] pairs
-#[dive(swift)]
-#[allow(dead_code)]
-fn object_entries(obj: JsonValue) -> Vec<(String, JsonValue)> {
-    match obj {
-        JsonValue::Object(map) => map.into_iter().collect(),
-        _ => vec![],
-    }
-}
-
-/// Arguments for Object.assign
-#[derive(Debug, Clone, Deserialize)]
-pub struct AssignArgs {
-    pub target: JsonValue,
-    pub sources: Vec<JsonValue>,
-}
-
-/// Object.assign() - copies properties from sources to target
-#[dive(swift)]
-#[allow(dead_code)]
-fn object_assign(args: AssignArgs) -> Result<JsonValue, String> {
-    let mut result = match args.target {
-        JsonValue::Object(map) => map,
-        _ => return Err("Target must be an object".to_string()),
-    };
-
-    for source in args.sources {
-        if let JsonValue::Object(map) = source {
-            for (k, v) in map {
-                result.insert(k, v);
-            }
-        }
-    }
-
-    Ok(JsonValue::Object(result))
-}
-
-/// Object.hasOwn() - returns true if object has own property
-#[dive(swift)]
-#[allow(dead_code)]
-fn object_has_own(obj: JsonValue, key: String) -> bool {
-    match obj {
-        JsonValue::Object(map) => map.contains_key(&key),
-        _ => false,
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn test_object_keys() {
-        let obj = json!({"a": 1, "b": 2});
-        let keys = object_keys(obj);
-        assert_eq!(keys.len(), 2);
-    }
-
-    #[test]
-    fn test_object_values() {
-        let obj = json!({"a": 1, "b": 2});
-        let values = object_values(obj);
-        assert_eq!(values.len(), 2);
-    }
-
-    #[test]
-    fn test_object_entries() {
-        let obj = json!({"a": 1});
-        let entries = object_entries(obj);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, "a");
-        assert_eq!(entries[0].1, json!(1));
-    }
-
-    #[test]
-    fn test_object_assign() {
-        let args = AssignArgs {
-            target: json!({"a": 1}),
-            sources: vec![json!({"b": 2})],
-        };
-        let result = object_assign(args).unwrap();
-        let obj = result.as_object().unwrap();
-        assert_eq!(obj.len(), 2);
-        assert_eq!(obj.get("a"), Some(&json!(1)));
-        assert_eq!(obj.get("b"), Some(&json!(2)));
-    }
-
-    #[test]
-    fn test_object_assign_overwrite() {
-        let args = AssignArgs {
-            target: json!({"a": 1}),
-            sources: vec![json!({"a": 2})],
-        };
-        let result = object_assign(args).unwrap();
-        let obj = result.as_object().unwrap();
-        assert_eq!(obj.get("a"), Some(&json!(2)));
-    }
-
-    #[test]
-    fn test_object_has_own() {
-        let obj = json!({"a": 1});
-        assert!(object_has_own(obj.clone(), "a".to_string()));
-        assert!(!object_has_own(obj, "b".to_string()));
-    }
 
     #[test]
     fn test_native_object_freeze() {
@@ -743,6 +610,119 @@ fn native_object_keys(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValu
     }
 
     Ok(VmValue::array(result))
+}
+
+/// Object.values(obj) - native implementation
+fn native_object_values(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+    let obj_val = args.get(0).ok_or("Object.values requires an object")?;
+    let obj = obj_val
+        .as_object()
+        .ok_or("Object.values argument must be an object")?;
+
+    let keys = obj.own_keys();
+    let mut values = Vec::new();
+
+    for key in keys {
+        if let PropertyKey::String(s) = &key {
+            if let Some(desc) = obj.get_own_property_descriptor(&PropertyKey::String(s.clone())) {
+                if desc.enumerable() {
+                    if let Some(value) = obj.get(&PropertyKey::String(s.clone())) {
+                        values.push(value);
+                    }
+                }
+            }
+        }
+    }
+
+    let result = GcRef::new(JsObject::array(values.len(), Arc::clone(&mm)));
+    for (i, value) in values.into_iter().enumerate() {
+        result.set(PropertyKey::Index(i as u32), value);
+    }
+
+    Ok(VmValue::array(result))
+}
+
+/// Object.entries(obj) - native implementation
+fn native_object_entries(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+    let obj_val = args.get(0).ok_or("Object.entries requires an object")?;
+    let obj = obj_val
+        .as_object()
+        .ok_or("Object.entries argument must be an object")?;
+
+    let keys = obj.own_keys();
+    let mut entries = Vec::new();
+
+    for key in keys {
+        if let PropertyKey::String(s) = &key {
+            if let Some(desc) = obj.get_own_property_descriptor(&PropertyKey::String(s.clone())) {
+                if desc.enumerable() {
+                    if let Some(value) = obj.get(&PropertyKey::String(s.clone())) {
+                        // Create [key, value] array
+                        let entry = GcRef::new(JsObject::array(2, Arc::clone(&mm)));
+                        entry.set(PropertyKey::Index(0), VmValue::string(s.clone()));
+                        entry.set(PropertyKey::Index(1), value);
+                        entries.push(VmValue::array(entry));
+                    }
+                }
+            }
+        }
+    }
+
+    let result = GcRef::new(JsObject::array(entries.len(), Arc::clone(&mm)));
+    for (i, entry) in entries.into_iter().enumerate() {
+        result.set(PropertyKey::Index(i as u32), entry);
+    }
+
+    Ok(VmValue::array(result))
+}
+
+/// Object.assign(target, ...sources) - native implementation
+fn native_object_assign(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+    let target_val = args.get(0).ok_or("Object.assign requires at least one argument")?;
+    let target = target_val
+        .as_object()
+        .ok_or("Object.assign target must be an object")?;
+
+    // Copy properties from each source to target
+    for source_val in &args[1..] {
+        if source_val.is_null() || source_val.is_undefined() {
+            continue; // Skip null/undefined sources
+        }
+
+        if let Some(source) = source_val.as_object() {
+            for key in source.own_keys() {
+                if let Some(value) = source.get(&key) {
+                    target.set(key, value);
+                }
+            }
+        }
+    }
+
+    Ok(target_val.clone())
+}
+
+/// Object.hasOwn(obj, prop) - native implementation
+fn native_object_has_own(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+    let obj_val = args.get(0).ok_or("Object.hasOwn requires two arguments")?;
+    let prop_val = args.get(1).ok_or("Object.hasOwn requires two arguments")?;
+
+    let obj = obj_val
+        .as_object()
+        .ok_or("Object.hasOwn first argument must be an object")?;
+
+    // Convert property to key
+    let key = if let Some(s) = prop_val.as_string() {
+        PropertyKey::String(s.clone())
+    } else if let Some(sym) = prop_val.as_symbol() {
+        PropertyKey::Symbol(sym.id)
+    } else {
+        // Convert to string
+        let s = JsString::intern(&format!("{:?}", prop_val));
+        PropertyKey::String(s)
+    };
+
+    let has_own = obj.has_own(&key);
+    Ok(VmValue::boolean(has_own))
 }
 
 /// Object.getOwnPropertySymbols(obj) - native implementation

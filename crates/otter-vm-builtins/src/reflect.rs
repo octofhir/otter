@@ -265,64 +265,42 @@ fn native_reflect_get_own_property_descriptor(
         .ok_or("Reflect.getOwnPropertyDescriptor requires a propertyKey argument")?;
 
     let key = to_property_key(property_key);
-    let key_str = match &key {
-        PropertyKey::String(s) => Some(s.as_str()),
-        _ => None,
+
+    // Try to get as object (works for objects, functions, native functions, etc.)
+    let obj = match target.as_object() {
+        Some(o) => o,
+        None => {
+            // If not an object, use get_target_object which handles proxies
+            get_target_object(target)?
+        }
     };
 
-    // Handle function objects - check the closure's object for all properties
-    if let Some(closure) = target.as_function() {
-        // Check the actual object first (including length, name, prototype)
-        use otter_vm_core::object::PropertyDescriptor;
-        if let Some(prop_desc) = closure.object.lookup_property_descriptor(&key) {
-            match prop_desc {
-                PropertyDescriptor::Data { value, attributes } => {
-                    let desc = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
-                    desc.set("value".into(), value);
-                    desc.set("writable".into(), VmValue::boolean(attributes.writable));
-                    desc.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
-                    desc.set("configurable".into(), VmValue::boolean(attributes.configurable));
-                    return Ok(VmValue::object(desc));
-                }
-                PropertyDescriptor::Accessor { get, set, attributes } => {
-                    let desc = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
-                    desc.set("get".into(), get.unwrap_or(VmValue::undefined()));
-                    desc.set("set".into(), set.unwrap_or(VmValue::undefined()));
-                    desc.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
-                    desc.set("configurable".into(), VmValue::boolean(attributes.configurable));
-                    return Ok(VmValue::object(desc));
-                }
-                PropertyDescriptor::Deleted => {
-                    // Property was deleted
-                    return Ok(VmValue::undefined());
-                }
+    // Check property descriptor first (for proper attribute handling)
+    use otter_vm_core::object::PropertyDescriptor;
+    if let Some(prop_desc) = obj.lookup_property_descriptor(&key) {
+        match prop_desc {
+            PropertyDescriptor::Data { value, attributes } => {
+                let desc = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+                desc.set("value".into(), value);
+                desc.set("writable".into(), VmValue::boolean(attributes.writable));
+                desc.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
+                desc.set("configurable".into(), VmValue::boolean(attributes.configurable));
+                return Ok(VmValue::object(desc));
+            }
+            PropertyDescriptor::Accessor { get, set, attributes } => {
+                let desc = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+                desc.set("get".into(), get.unwrap_or(VmValue::undefined()));
+                desc.set("set".into(), set.unwrap_or(VmValue::undefined()));
+                desc.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
+                desc.set("configurable".into(), VmValue::boolean(attributes.configurable));
+                return Ok(VmValue::object(desc));
+            }
+            PropertyDescriptor::Deleted => {
+                // Property was deleted
+                return Ok(VmValue::undefined());
             }
         }
-        return Ok(VmValue::undefined());
     }
-
-    // Native functions - return default descriptors for length and name
-    if target.as_native_function().is_some() {
-        if key_str == Some("length") {
-            let desc = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
-            desc.set("value".into(), VmValue::int32(0)); // Default length is 0
-            desc.set("writable".into(), VmValue::boolean(false));
-            desc.set("enumerable".into(), VmValue::boolean(false));
-            desc.set("configurable".into(), VmValue::boolean(true));
-            return Ok(VmValue::object(desc));
-        }
-        if key_str == Some("name") {
-            let desc = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
-            desc.set("value".into(), VmValue::string(JsString::intern("")));
-            desc.set("writable".into(), VmValue::boolean(false));
-            desc.set("enumerable".into(), VmValue::boolean(false));
-            desc.set("configurable".into(), VmValue::boolean(true));
-            return Ok(VmValue::object(desc));
-        }
-        return Ok(VmValue::undefined());
-    }
-
-    let obj = get_target_object(target)?;
 
     // Check if property exists
     if let Some(value) = obj.get(&key) {

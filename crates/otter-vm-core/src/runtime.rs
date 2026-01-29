@@ -29,6 +29,9 @@ pub struct VmRuntime {
     config: RuntimeConfig,
     /// Memory manager for this runtime
     memory_manager: Arc<crate::memory::MemoryManager>,
+    /// Intrinsic `%Function.prototype%` object (ES2023 §10.3.1).
+    /// Created once at runtime init, shared across contexts.
+    function_prototype: GcRef<JsObject>,
 }
 
 /// Runtime configuration
@@ -61,12 +64,20 @@ impl VmRuntime {
     /// Create a new runtime with custom configuration
     pub fn with_config(config: RuntimeConfig) -> Self {
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(config.max_heap_size));
+
+        // Create intrinsic %Function.prototype% FIRST, before any other objects.
+        // Per ES2023 §10.3.1, every built-in function object must have this
+        // as its [[Prototype]]. By creating it up-front, all native functions
+        // can receive it at construction time (BOA/V8/SpiderMonkey pattern).
+        let function_prototype = GcRef::new(JsObject::new(None, memory_manager.clone()));
+
         let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
-        globals::setup_global_object(global);
+        globals::setup_global_object(global, function_prototype);
 
         Self {
             modules: DashMap::new(),
             global_template: global,
+            function_prototype,
             memory_manager,
             config,
         }
@@ -90,13 +101,20 @@ impl VmRuntime {
         // Clone global object for isolation
         // TODO: Proper cloning with prototype chain
         let global = GcRef::new(JsObject::new(None, self.memory_manager.clone()));
-        globals::setup_global_object(global);
-        VmContext::with_config(
+        globals::setup_global_object(global, self.function_prototype);
+        let mut ctx = VmContext::with_config(
             global,
             self.config.max_stack_depth,
             crate::context::DEFAULT_MAX_NATIVE_DEPTH,
             Arc::clone(&self.memory_manager),
-        )
+        );
+        ctx.set_function_prototype_intrinsic(self.function_prototype);
+        ctx
+    }
+
+    /// Get the intrinsic `%Function.prototype%` object.
+    pub fn function_prototype(&self) -> GcRef<JsObject> {
+        self.function_prototype
     }
 
     /// Execute a module

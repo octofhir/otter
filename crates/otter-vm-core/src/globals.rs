@@ -14,8 +14,13 @@ use crate::regexp::JsRegExp;
 use crate::string::JsString;
 use crate::value::Value;
 
-/// Set up all standard global properties on the global object
-pub fn setup_global_object(global: GcRef<JsObject>) {
+/// Set up all standard global properties on the global object.
+///
+/// `fn_proto` is the intrinsic `%Function.prototype%` created by VmRuntime.
+/// All native functions receive it as their `[[Prototype]]` per ES2023 §10.3.1.
+pub fn setup_global_object(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>) {
+    let mm = global.memory_manager().clone();
+
     // globalThis - self-referencing
     global.set(PropertyKey::string("globalThis"), Value::object(global));
 
@@ -27,52 +32,54 @@ pub fn setup_global_object(global: GcRef<JsObject>) {
         Value::number(f64::INFINITY),
     );
 
-    // Global functions
+    // Global functions — all get fn_proto as [[Prototype]]
     global.set(
         PropertyKey::string("eval"),
-        Value::native_function(global_eval, global.memory_manager().clone()),
+        Value::native_function_with_proto(global_eval, mm.clone(), fn_proto),
     );
     global.set(
         PropertyKey::string("isFinite"),
-        Value::native_function(global_is_finite, global.memory_manager().clone()),
+        Value::native_function_with_proto(global_is_finite, mm.clone(), fn_proto),
     );
     global.set(
         PropertyKey::string("isNaN"),
-        Value::native_function(global_is_nan, global.memory_manager().clone()),
+        Value::native_function_with_proto(global_is_nan, mm.clone(), fn_proto),
     );
     global.set(
         PropertyKey::string("parseInt"),
-        Value::native_function(global_parse_int, global.memory_manager().clone()),
+        Value::native_function_with_proto(global_parse_int, mm.clone(), fn_proto),
     );
     global.set(
         PropertyKey::string("parseFloat"),
-        Value::native_function(global_parse_float, global.memory_manager().clone()),
+        Value::native_function_with_proto(global_parse_float, mm.clone(), fn_proto),
     );
 
     // URI encoding/decoding functions
     global.set(
         PropertyKey::string("encodeURI"),
-        Value::native_function(global_encode_uri, global.memory_manager().clone()),
+        Value::native_function_with_proto(global_encode_uri, mm.clone(), fn_proto),
     );
     global.set(
         PropertyKey::string("decodeURI"),
-        Value::native_function(global_decode_uri, global.memory_manager().clone()),
+        Value::native_function_with_proto(global_decode_uri, mm.clone(), fn_proto),
     );
     global.set(
         PropertyKey::string("encodeURIComponent"),
-        Value::native_function(global_encode_uri_component, global.memory_manager().clone()),
+        Value::native_function_with_proto(global_encode_uri_component, mm.clone(), fn_proto),
     );
     global.set(
         PropertyKey::string("decodeURIComponent"),
-        Value::native_function(global_decode_uri_component, global.memory_manager().clone()),
+        Value::native_function_with_proto(global_decode_uri_component, mm.clone(), fn_proto),
     );
 
     // Standard built-in objects
-    setup_builtin_constructors(global);
+    setup_builtin_constructors(global, fn_proto);
 }
 
-/// Set up standard built-in constructors and their prototypes
-fn setup_builtin_constructors(global: GcRef<JsObject>) {
+/// Set up standard built-in constructors and their prototypes.
+/// `fn_proto` is the intrinsic `%Function.prototype%` — used as-is for `Function.prototype`
+/// and as `[[Prototype]]` for all native function objects.
+fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>) {
     let mm = global.memory_manager().clone();
     let builtins = [
         "Object",
@@ -119,10 +126,18 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
     ];
 
     for name in builtins {
-        let proto = GcRef::new(JsObject::new(None, mm.clone()));
-        // Create constructor based on type
+        // For the "Function" constructor, use the intrinsic fn_proto
+        // instead of creating a fresh object. This is the BOA/V8 pattern:
+        // Function.prototype is created once and shared.
+        let proto = if name == "Function" {
+            fn_proto
+        } else {
+            GcRef::new(JsObject::new(None, mm.clone()))
+        };
+
+        // Create constructor based on type — all get fn_proto as [[Prototype]]
         let ctor = if name == "Boolean" {
-            Value::native_function(
+            Value::native_function_with_proto(
                 |args: &[Value], _mm| {
                     let b = if let Some(val) = args.get(0) {
                         to_boolean(val)
@@ -132,10 +147,11 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
                     Ok(Value::boolean(b))
                 },
                 mm.clone(),
+                fn_proto,
             )
         } else if name == "RegExp" {
             let mm_clone = mm.clone();
-            Value::native_function(
+            Value::native_function_with_proto(
                 move |args: &[Value], mm_inner| {
                     let pattern = args
                         .get(0)
@@ -151,9 +167,10 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
                     Ok(Value::regex(regex))
                 },
                 mm_clone,
+                fn_proto,
             )
         } else if name == "BigInt" {
-            Value::native_function(
+            Value::native_function_with_proto(
                 |args: &[Value], _mm| {
                     if let Some(val) = args.get(0) {
                         if let Some(n) = val.as_number() {
@@ -184,10 +201,11 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
                     }
                 },
                 mm.clone(),
+                fn_proto,
             )
         } else {
             let mm_clone = mm.clone();
-            Value::native_function(
+            Value::native_function_with_proto(
                 move |args: &[Value], mm_inner| {
                     // If called as a constructor (which we assume for now for these builtins),
                     // and arguments are present, we might want to set properties.
@@ -200,6 +218,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
                     Ok(Value::undefined())
                 },
                 mm_clone,
+                fn_proto,
             )
         };
 
@@ -207,27 +226,29 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
         if name == "Object" {
             proto.set(
                 PropertyKey::string("toString"),
-                Value::native_function(
+                Value::native_function_with_proto(
                     |_, _mm| Ok(Value::string(JsString::intern("[object Object]"))),
                     mm.clone(),
+                    fn_proto,
                 ),
             );
         } else if name == "Function" {
             proto.set(
                 PropertyKey::string("toString"),
-                Value::native_function(
+                Value::native_function_with_proto(
                     |_, _mm| {
                         Ok(Value::string(JsString::intern(
                             "function () { [native code] }",
                         )))
                     },
                     mm.clone(),
+                    fn_proto,
                 ),
             );
         } else if name == "String" {
             proto.set(
                 PropertyKey::string("toString"),
-                Value::native_function(
+                Value::native_function_with_proto(
                     |args: &[Value], _mm| {
                         if let Some(this_val) = args.get(0) {
                             return Ok(Value::string(JsString::intern(&to_string(this_val))));
@@ -235,6 +256,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
                         Ok(Value::string(JsString::intern("")))
                     },
                     mm.clone(),
+                    fn_proto,
                 ),
             );
         }
@@ -250,17 +272,15 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
             if name == "String" {
                 ctor_obj.set(
                     PropertyKey::string("fromCharCode"),
-                    Value::native_function(
+                    Value::native_function_with_proto(
                         |args: &[Value], _mm| {
                             let mut result = String::new();
                             for arg in args {
                                 let n = if let Some(n) = arg.as_number() {
                                     n
                                 } else if let Some(s) = arg.as_string() {
-                                    // Basic ToNumber for strings (decimal only for now)
                                     s.as_str().parse::<f64>().unwrap_or(f64::NAN)
                                 } else {
-                                    // Default to 0 for others (simplified)
                                     0.0
                                 };
 
@@ -273,6 +293,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
                             Ok(Value::string(JsString::intern(&result)))
                         },
                         mm.clone(),
+                        fn_proto,
                     ),
                 );
             }
@@ -282,7 +303,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
         if name == "String" {
             proto.set(
                 PropertyKey::string("indexOf"),
-                Value::native_function(
+                Value::native_function_with_proto(
                     |args: &[Value], _mm| {
                         if let (Some(this_val), Some(search_val)) = (args.get(0), args.get(1)) {
                             let this_str = to_string(this_val);
@@ -294,11 +315,12 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
                         Ok(Value::number(-1.0))
                     },
                     mm.clone(),
+                    fn_proto,
                 ),
             );
             proto.set(
                 PropertyKey::string("valueOf"),
-                Value::native_function(
+                Value::native_function_with_proto(
                     |args: &[Value], _mm| {
                         if let Some(this_val) = args.get(0) {
                             return Ok::<Value, String>(this_val.clone());
@@ -306,12 +328,13 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
                         Ok(Value::undefined())
                     },
                     mm.clone(),
+                    fn_proto,
                 ),
             );
         } else if name == "RegExp" {
             proto.set(
                 PropertyKey::string("test"),
-                Value::native_function(
+                Value::native_function_with_proto(
                     |args: &[Value], _mm| {
                         let regex = args.get(0).and_then(|v| v.as_regex()).ok_or_else(|| {
                             "TypeError: RegExp.prototype.test called on incompatible receiver"
@@ -324,11 +347,12 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
                         Ok(Value::boolean(regex.exec(&input_js, 0).is_some()))
                     },
                     mm.clone(),
+                    fn_proto,
                 ),
             );
             proto.set(
                 PropertyKey::string("exec"),
-                Value::native_function(
+                Value::native_function_with_proto(
                     |args: &[Value], mm_inner| {
                         let this_val_opt = args.get(0);
                         let regex = this_val_opt.and_then(|v| v.as_regex()).ok_or_else(|| {
@@ -342,7 +366,6 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
                             .unwrap_or_else(|| JsString::intern("undefined"));
 
                         if let Some(mat) = regex.exec(&input_js, 0) {
-                            // Create result array
                             let mut out = Vec::with_capacity(mat.captures.len() + 1);
                             for idx in 0..=mat.captures.len() {
                                 let val = mat
@@ -372,12 +395,13 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
                         }
                     },
                     mm.clone(),
+                    fn_proto,
                 ),
             );
         } else if name == "Object" {
             proto.set(
                 PropertyKey::string("valueOf"),
-                Value::native_function(
+                Value::native_function_with_proto(
                     |args: &[Value], _mm| {
                         if let Some(this_val) = args.get(0) {
                             return Ok::<Value, String>(this_val.clone());
@@ -385,6 +409,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>) {
                         Ok(Value::undefined())
                     },
                     mm.clone(),
+                    fn_proto,
                 ),
             );
         }
@@ -783,8 +808,9 @@ mod tests {
     #[test]
     fn test_global_this_setup() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let global = GcRef::new(JsObject::new(None, memory_manager));
-        setup_global_object(global);
+        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let fn_proto = GcRef::new(JsObject::new(None, memory_manager));
+        setup_global_object(global, fn_proto);
 
         // globalThis should reference the global object itself
         let global_this = global.get(&PropertyKey::string("globalThis"));

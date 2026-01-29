@@ -2249,6 +2249,12 @@ impl Interpreter {
                 let func_obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
                 let proto = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
 
+                // Set [[Prototype]] to Function.prototype so methods like
+                // .bind(), .call(), .apply() are inherited per ES2023 §10.2.4.
+                if let Some(fn_proto) = ctx.function_prototype() {
+                    func_obj.set_prototype(Some(fn_proto));
+                }
+
                 // Set function length and name properties with correct attributes
                 // (writable: false, enumerable: false, configurable: true)
                 let fn_attrs = crate::object::PropertyAttributes {
@@ -2311,6 +2317,11 @@ impl Interpreter {
 
                 let func_obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
                 let proto = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+
+                // Set [[Prototype]] to Function.prototype
+                if let Some(fn_proto) = ctx.function_prototype() {
+                    func_obj.set_prototype(Some(fn_proto));
+                }
 
                 // Set function length and name properties
                 let fn_attrs = crate::object::PropertyAttributes {

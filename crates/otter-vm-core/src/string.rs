@@ -20,7 +20,9 @@ use std::sync::{Arc, OnceLock};
 /// Stores `GcRef<JsString>` which are Copy (raw pointers).
 /// The backing `GcBox` memory is leaked (kept alive forever) for interned strings.
 /// This is acceptable since interned strings are typically long-lived.
-static STRING_TABLE: std::sync::LazyLock<DashMap<u64, GcRef<JsString>>> =
+///
+/// Uses a Vec to handle hash collisions by chaining.
+static STRING_TABLE: std::sync::LazyLock<DashMap<u64, Vec<GcRef<JsString>>>> =
     std::sync::LazyLock::new(DashMap::new);
 
 /// String interning table for explicit management
@@ -28,7 +30,7 @@ static STRING_TABLE: std::sync::LazyLock<DashMap<u64, GcRef<JsString>>> =
 /// This provides an instance-based alternative to the global STRING_TABLE.
 /// Useful for VM instances that want isolated string tables.
 pub struct StringTable {
-    strings: DashMap<u64, GcRef<JsString>>,
+    strings: DashMap<u64, Vec<GcRef<JsString>>>,
 }
 
 impl StringTable {
@@ -45,10 +47,12 @@ impl StringTable {
         let hash = JsString::compute_hash_units(&units);
 
         // Check if already interned
-        if let Some(existing) = self.strings.get(&hash)
-            && existing.data.as_ref() == units.as_slice()
-        {
-            return *existing;
+        if let Some(bucket) = self.strings.get(&hash) {
+            for existing in bucket.iter() {
+                if existing.data.as_ref() == units.as_slice() {
+                    return *existing;
+                }
+            }
         }
 
         // Create new interned string
@@ -58,7 +62,11 @@ impl StringTable {
             hash,
         });
 
-        self.strings.insert(hash, js_str);
+        // Add to the hash bucket
+        self.strings
+            .entry(hash)
+            .or_insert_with(Vec::new)
+            .push(js_str);
         js_str
     }
 
@@ -66,16 +74,27 @@ impl StringTable {
     pub fn is_interned(&self, s: &str) -> bool {
         let units: Vec<u16> = s.encode_utf16().collect();
         let hash = JsString::compute_hash_units(&units);
-        self.strings.contains_key(&hash)
+        if let Some(bucket) = self.strings.get(&hash) {
+            for existing in bucket.iter() {
+                if existing.data.as_ref() == units.as_slice() {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Intern a UTF-16 string in this table
     pub fn intern_utf16(&self, units: &[u16]) -> GcRef<JsString> {
         let hash = JsString::compute_hash_units(units);
-        if let Some(existing) = self.strings.get(&hash)
-            && existing.data.as_ref() == units
-        {
-            return *existing;
+
+        // Check if already interned
+        if let Some(bucket) = self.strings.get(&hash) {
+            for existing in bucket.iter() {
+                if existing.data.as_ref() == units {
+                    return *existing;
+                }
+            }
         }
 
         let js_str = GcRef::new(JsString {
@@ -83,7 +102,12 @@ impl StringTable {
             utf8: OnceLock::new(),
             hash,
         });
-        self.strings.insert(hash, js_str);
+
+        // Add to the hash bucket
+        self.strings
+            .entry(hash)
+            .or_insert_with(Vec::new)
+            .push(js_str);
         js_str
     }
 
@@ -126,13 +150,11 @@ impl JsString {
         let hash = Self::compute_hash_units(&units);
 
         // Check if already interned
-        if let Some(existing) = STRING_TABLE.get(&hash) {
-            if existing.data.as_ref() == units.as_slice() {
-                return *existing;
-            } else {
-                // HASH COLLISION DETECTED!
-                eprintln!("HASH COLLISION: '{}' and '{}' have the same hash {}",
-                         existing.as_str(), s, hash);
+        if let Some(bucket) = STRING_TABLE.get(&hash) {
+            for existing in bucket.iter() {
+                if existing.data.as_ref() == units.as_slice() {
+                    return *existing;
+                }
             }
         }
 
@@ -143,7 +165,11 @@ impl JsString {
             hash,
         });
 
-        STRING_TABLE.insert(hash, js_str);
+        // Add to the hash bucket
+        STRING_TABLE
+            .entry(hash)
+            .or_insert_with(Vec::new)
+            .push(js_str);
         js_str
     }
 
@@ -173,10 +199,14 @@ impl JsString {
     /// Create or retrieve an interned string from UTF-16 code units
     pub fn intern_utf16(units: &[u16]) -> GcRef<Self> {
         let hash = Self::compute_hash_units(units);
-        if let Some(existing) = STRING_TABLE.get(&hash)
-            && existing.data.as_ref() == units
-        {
-            return *existing;
+
+        // Check if already interned
+        if let Some(bucket) = STRING_TABLE.get(&hash) {
+            for existing in bucket.iter() {
+                if existing.data.as_ref() == units {
+                    return *existing;
+                }
+            }
         }
 
         let js_str = GcRef::new(Self {
@@ -185,7 +215,11 @@ impl JsString {
             hash,
         });
 
-        STRING_TABLE.insert(hash, js_str);
+        // Add to the hash bucket
+        STRING_TABLE
+            .entry(hash)
+            .or_insert_with(Vec::new)
+            .push(js_str);
         js_str
     }
 
@@ -472,5 +506,18 @@ mod tests {
 
         // Should be interned in the table
         assert!(table.is_interned("hello world"));
+    }
+}
+
+// ============================================================================
+// GC Tracing Implementation
+// ============================================================================
+
+impl otter_vm_gc::GcTraceable for JsString {
+    // Strings don't contain GC references
+    const NEEDS_TRACE: bool = false;
+
+    fn trace(&self, _tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // No references to trace
     }
 }

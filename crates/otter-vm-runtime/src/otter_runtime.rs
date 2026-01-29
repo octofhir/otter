@@ -227,12 +227,16 @@ impl Otter {
         // Expose interrupt flag to JS for the wrapper to see
         // We use a getter so it's always up to date
         let flag = Arc::clone(&self.interrupt_flag);
+        let fn_proto = self.vm.function_prototype();
         ctx.global().define_property(
             PropertyKey::string("__otter_interrupted"),
-            otter_vm_core::object::PropertyDescriptor::getter(Value::native_function(
-                move |_, _| Ok(Value::boolean(flag.load(Ordering::Relaxed))),
-                self.vm.memory_manager().clone(),
-            )),
+            otter_vm_core::object::PropertyDescriptor::getter(
+                Value::native_function_with_proto(
+                    move |_, _| Ok(Value::boolean(flag.load(Ordering::Relaxed))),
+                    self.vm.memory_manager().clone(),
+                    fn_proto,
+                ),
+            ),
         );
 
         // 5. Execute setup JS from extensions (using pre-compiled modules if available)
@@ -254,7 +258,11 @@ impl Otter {
         // 6. Wrap code for top-level await support
         let wrapped = Self::wrap_for_top_level_await(code);
 
-        // 7. Compile and execute main code with suspension support
+        // 7. Set top-level `this` to the global object per ES2023 §19.2.1.
+        // Arrow functions in the wrapper inherit this lexical `this`.
+        ctx.set_pending_this(Value::object(ctx.global().clone()));
+
+        // 9. Compile and execute main code with suspension support
         let result_promise = JsPromise::new();
         let mut exec_result = self.execute_with_suspension(
             &mut ctx,
@@ -263,7 +271,7 @@ impl Otter {
             Arc::clone(&result_promise),
         )?;
 
-        // 8. Handle execution result with proper async resume loop
+        // 10. Handle execution result with proper async resume loop
         let final_value = loop {
             match exec_result {
                 VmExecutionResult::Complete(value) => {
@@ -554,10 +562,10 @@ impl Otter {
         format!(
             r#"{strict_prefix}
             try {{
-                globalThis.__otter_main_promise = (async () => {{
+                globalThis.__otter_main_promise = (async function() {{
                     {code_body}
-                }})();
-                globalThis.__otter_main_promise.catch((err) => {{
+                }}).call(this);
+                globalThis.__otter_main_promise.catch(function(err) {{
                     if (globalThis.__otter_interrupted) {{
                         globalThis.__otter_script_error = "Execution interrupted (timeout)";
                     }} else {{
@@ -578,6 +586,7 @@ impl Otter {
     fn register_ops_in_context(&self, ctx: &mut VmContext) {
         let global = ctx.global().clone();
         let pending_ops = self.event_loop.get_pending_async_ops_count();
+        let fn_proto = self.vm.function_prototype();
 
         for op_name in self.extensions.op_names() {
             if let Some(handler) = self.extensions.get_op(op_name) {
@@ -586,13 +595,14 @@ impl Otter {
                     handler.clone(),
                     Arc::clone(&pending_ops),
                     self.vm.memory_manager().clone(),
+                    fn_proto,
                 );
                 global.set(PropertyKey::string(op_name), native_fn);
             }
         }
 
         // Also register environment access if capabilities allow
-        self.register_env_access(global);
+        self.register_env_access(global, fn_proto);
 
         let ctx_ptr = ctx as *mut VmContext as usize;
         let vm_ptr = &self.vm as *const VmRuntime as usize;
@@ -600,7 +610,7 @@ impl Otter {
         let mm_eval_closure = mm_eval.clone();
         global.set(
             PropertyKey::string("__otter_eval"),
-            Value::native_function(
+            Value::native_function_with_proto(
                 move |args: &[Value], _mm| {
                     let mm_result = mm_eval_closure.clone();
                     let result_ok = |value: Value| {
@@ -666,6 +676,7 @@ impl Otter {
                     }
                 },
                 mm_eval,
+                fn_proto,
             ),
         );
     }
@@ -677,18 +688,23 @@ impl Otter {
         handler: OpHandler,
         pending_ops: Arc<std::sync::atomic::AtomicU64>,
         mm: Arc<otter_vm_core::MemoryManager>,
+        fn_proto: GcRef<JsObject>,
     ) -> Value {
         let _name = name.to_string();
 
         match handler {
             OpHandler::Native(native_fn) => {
                 // Native ops work directly with Value
-                Value::native_function(move |args, mm_inner| native_fn(args, mm_inner), mm)
+                Value::native_function_with_proto(
+                    move |args, mm_inner| native_fn(args, mm_inner),
+                    mm,
+                    fn_proto,
+                )
             }
             OpHandler::Sync(sync_fn) => {
                 // Sync JSON ops need Value -> JSON -> Value conversion
                 let mm_inner = mm.clone();
-                Value::native_function(
+                Value::native_function_with_proto(
                     move |args, _mm_ignored| {
                         let json_args: Vec<serde_json::Value> =
                             args.iter().map(value_to_json).collect();
@@ -696,36 +712,31 @@ impl Otter {
                         Ok(json_to_value(&result, mm_inner.clone()))
                     },
                     mm,
+                    fn_proto,
                 )
             }
             OpHandler::Async(async_fn) => {
                 // Async ops return a Promise and spawn a tokio task
-                // The event loop will wait for pending async ops to complete
                 let async_fn: AsyncOpFn = async_fn.clone();
                 let pending_ops = Arc::clone(&pending_ops);
                 let mm_outer = mm.clone();
                 let mm_outer_closure = mm_outer.clone();
-                Value::native_function(
+                Value::native_function_with_proto(
                     move |args, _mm_ignored| {
-                        // Create Promise with resolve/reject handles
                         let mm_promise = mm_outer_closure.clone();
                         let resolvers = JsPromise::with_resolvers(mm_promise.clone());
                         let promise = resolvers.promise.clone();
                         let resolve = resolvers.resolve.clone();
                         let reject = resolvers.reject.clone();
 
-                        // Convert args to JSON for the async op
                         let json_args: Vec<serde_json::Value> =
                             args.iter().map(value_to_json).collect();
 
-                        // Create the future by calling the async function
                         let future = async_fn(&json_args);
 
-                        // Increment pending ops counter
                         let pending_ops_clone = Arc::clone(&pending_ops);
                         pending_ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                        // Spawn async task that will resolve/reject the Promise
                         let mm_spawn = mm_outer_closure.clone();
                         tokio::spawn(async move {
                             match future.await {
@@ -738,21 +749,20 @@ impl Otter {
                                     reject(error);
                                 }
                             }
-                            // Decrement pending ops counter when done
                             pending_ops_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         });
 
-                        // Return the pending Promise - VM will suspend on await
                         Ok(Value::promise(promise))
                     },
                     mm_outer,
+                    fn_proto,
                 )
             }
         }
     }
 
     /// Register environment variable access functions
-    fn register_env_access(&self, global: GcRef<JsObject>) {
+    fn register_env_access(&self, global: GcRef<JsObject>, fn_proto: GcRef<JsObject>) {
         let env_store = Arc::clone(&self.env_store);
         let caps = self.capabilities.clone();
 
@@ -762,7 +772,7 @@ impl Otter {
         let mm_env = self.vm.memory_manager().clone();
         global.set(
             PropertyKey::string("__env_get"),
-            Value::native_function(
+            Value::native_function_with_proto(
                 move |args: &[Value], _mm| {
                     let key = args
                         .first()
@@ -770,7 +780,6 @@ impl Otter {
                         .map(|s| s.as_str().to_string())
                         .ok_or_else(|| "env_get requires a string key".to_string())?;
 
-                    // Check capabilities
                     if !caps_get.can_env(&key) {
                         return Err(format!("Permission denied: env access to '{}'", key));
                     }
@@ -783,6 +792,7 @@ impl Otter {
                     }
                 },
                 mm_env.clone(),
+                fn_proto,
             ),
         );
 
@@ -791,7 +801,7 @@ impl Otter {
         let mm_keys_closure = mm_keys.clone();
         global.set(
             PropertyKey::string("__env_keys"),
-            Value::native_function(
+            Value::native_function_with_proto(
                 move |_args: &[Value], _mm| {
                     let keys = env_store_keys.keys();
                     let arr = JsObject::array(keys.len(), mm_keys_closure.clone());
@@ -804,6 +814,7 @@ impl Otter {
                     Ok(Value::object(GcRef::new(arr)))
                 },
                 mm_keys,
+                fn_proto,
             ),
         );
 
@@ -813,7 +824,7 @@ impl Otter {
         let mm_has = self.vm.memory_manager().clone();
         global.set(
             PropertyKey::string("__env_has"),
-            Value::native_function(
+            Value::native_function_with_proto(
                 move |args: &[Value], _mm| {
                     let key = args
                         .first()
@@ -821,7 +832,6 @@ impl Otter {
                         .map(|s| s.as_str().to_string())
                         .ok_or_else(|| "env_has requires a string key".to_string())?;
 
-                    // Check capabilities
                     if !caps_has.can_env(&key) {
                         return Ok(Value::boolean(false));
                     }
@@ -829,6 +839,7 @@ impl Otter {
                     Ok(Value::boolean(env_store_has.contains(&key)))
                 },
                 mm_has,
+                fn_proto,
             ),
         );
     }

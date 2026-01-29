@@ -429,6 +429,31 @@ impl Value {
         }
     }
 
+    /// Create a native function value with a specific [[Prototype]].
+    ///
+    /// Per ES2023 §10.3.1, built-in function objects must have
+    /// `%Function.prototype%` as their `[[Prototype]]`. Use this
+    /// constructor when `Function.prototype` is already available.
+    pub fn native_function_with_proto<F>(
+        f: F,
+        memory_manager: Arc<crate::memory::MemoryManager>,
+        prototype: GcRef<JsObject>,
+    ) -> Self
+    where
+        F: Fn(&[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, String>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let func: NativeFn = Arc::new(f);
+        let object = GcRef::new(JsObject::new(Some(prototype), memory_manager));
+        let native = Arc::new(NativeFunctionObject { func, object });
+        Self {
+            bits: TAG_POINTER,
+            heap_ref: Some(HeapRef::NativeFunction(native)),
+        }
+    }
+
     /// Check if value is undefined
     #[inline]
     pub fn is_undefined(&self) -> bool {
@@ -639,6 +664,17 @@ impl Value {
     pub fn as_function(&self) -> Option<&Arc<Closure>> {
         match &self.heap_ref {
             Some(HeapRef::Function(f)) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// Get the inner `JsObject` attached to a function (closure or native).
+    /// This is the object that holds properties like `.prototype`, `.name`, `.length`
+    /// and carries the `[[Prototype]]` internal slot (should be `Function.prototype`).
+    pub fn function_inner_object(&self) -> Option<GcRef<JsObject>> {
+        match &self.heap_ref {
+            Some(HeapRef::Function(f)) => Some(f.object),
+            Some(HeapRef::NativeFunction(n)) => Some(n.object),
             _ => None,
         }
     }
@@ -980,5 +1016,39 @@ mod tests {
     fn test_value_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Value>();
+    }
+}
+
+// ============================================================================
+// GC Tracing Implementation
+// ============================================================================
+
+impl Value {
+    /// Trace GC references in this value
+    pub(crate) fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        if let Some(heap_ref) = &self.heap_ref {
+            match heap_ref {
+                HeapRef::String(s) => {
+                    tracer(s.header() as *const _);
+                }
+                HeapRef::Object(o) | HeapRef::Array(o) => {
+                    tracer(o.header() as *const _);
+                }
+                HeapRef::Function(f) => {
+                    tracer(f.object.header() as *const _);
+                }
+                HeapRef::NativeFunction(n) => {
+                    tracer(n.object.header() as *const _);
+                }
+                HeapRef::RegExp(r) => {
+                    tracer(r.object.header() as *const _);
+                }
+                HeapRef::Generator(g) => {
+                    tracer(g.object.header() as *const _);
+                }
+                // Other types use Arc, not GcRef, so no GC tracing needed
+                _ => {}
+            }
+        }
     }
 }

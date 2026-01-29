@@ -27,7 +27,8 @@ pub const DEFAULT_MAX_NATIVE_DEPTH: usize = 100;
 const MAX_REGISTERS: usize = 65536;
 
 /// Interval for interrupt checking in hot loops (every N instructions)
-pub const INTERRUPT_CHECK_INTERVAL: u32 = 1000;
+/// Increased from 1000 to reduce GC check overhead (GC was taking 43% CPU)
+pub const INTERRUPT_CHECK_INTERVAL: u32 = 10_000;
 
 /// A call stack frame
 #[derive(Debug)]
@@ -122,6 +123,11 @@ pub struct VmContext {
     scope_markers: Vec<usize>,
     /// Optional debug snapshot target for watchdogs
     debug_snapshot: Option<Arc<Mutex<VmContextSnapshot>>>,
+    /// Intrinsic `%Function.prototype%` (ES2023 §10.3.1).
+    /// Set during context creation from VmRuntime so that the
+    /// interpreter can assign it as [[Prototype]] on closures
+    /// and native functions without a global lookup.
+    function_prototype_intrinsic: Option<GcRef<JsObject>>,
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +221,7 @@ impl VmContext {
             root_slots: Vec::new(),
             scope_markers: Vec::new(),
             debug_snapshot: None,
+            function_prototype_intrinsic: None,
         }
     }
 
@@ -587,6 +594,29 @@ impl VmContext {
                 frame_depth: *frame_depth,
             });
         }
+    }
+
+    /// Get the intrinsic `%Function.prototype%` object (ES2023 §10.3.1).
+    ///
+    /// Returns the intrinsic if set, otherwise falls back to looking up
+    /// `globalThis.Function.prototype` for backwards compatibility.
+    pub fn function_prototype(&self) -> Option<GcRef<JsObject>> {
+        if let Some(ref fp) = self.function_prototype_intrinsic {
+            return Some(*fp);
+        }
+        // Fallback: dynamic lookup (used when intrinsic hasn't been set yet)
+        use crate::object::PropertyKey;
+        self.global
+            .get(&PropertyKey::string("Function"))
+            .and_then(|v| v.as_object())
+            .and_then(|func_obj| func_obj.get(&PropertyKey::string("prototype")))
+            .and_then(|v| v.as_object())
+    }
+
+    /// Set the intrinsic `%Function.prototype%` object.
+    /// Called by VmRuntime during context creation.
+    pub fn set_function_prototype_intrinsic(&mut self, proto: GcRef<JsObject>) {
+        self.function_prototype_intrinsic = Some(proto);
     }
 
     /// Get global variable
@@ -1094,9 +1124,15 @@ impl VmContext {
     ///
     /// Returns true if a collection was performed.
     pub fn maybe_collect_garbage(&self) -> bool {
-        // TEMPORARILY DISABLED - GC causes performance issues
-        // Memory is still tracked, just not collected automatically
-        false
+        if self.memory_manager.should_collect_garbage() {
+            let before = self.heap_size();
+            let reclaimed = self.collect_garbage();
+            let after = self.heap_size();
+            eprintln!("[GC] Collected {} bytes (heap: {} -> {})", reclaimed, before, after);
+            true
+        } else {
+            false
+        }
     }
 
     /// Request an explicit GC cycle

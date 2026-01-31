@@ -6,6 +6,7 @@
 //! - `Generator.prototype.throw(exception)`
 //! - Iterator helpers for creating iterator results
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyKey};
@@ -46,7 +47,7 @@ fn create_iterator_result(value: VmValue, done: bool, mm: Arc<memory::MemoryMana
 fn native_iterator_result(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let value = args.first().cloned().unwrap_or(VmValue::undefined());
     Ok(create_iterator_result(value, false, mm))
 }
@@ -56,7 +57,7 @@ fn native_iterator_result(
 fn native_iterator_done(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let value = args.first().cloned().unwrap_or(VmValue::undefined());
     Ok(create_iterator_result(value, true, mm))
 }
@@ -66,7 +67,7 @@ fn native_iterator_done(
 fn native_generator_next(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let generator_val = args
         .first()
         .ok_or("Generator.next requires a generator argument")?;
@@ -102,7 +103,7 @@ fn native_generator_next(
 fn native_generator_return(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let generator_val = args
         .first()
         .ok_or("Generator.return requires a generator argument")?;
@@ -125,7 +126,7 @@ fn native_generator_return(
 fn native_generator_throw(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let generator_val = args
         .first()
         .ok_or("Generator.throw requires a generator argument")?;
@@ -140,7 +141,7 @@ fn native_generator_throw(
     // https://tc39.es/ecma262/#sec-generator.prototype.throw
     if generator.is_completed() {
         // Re-throw: return an error that will be caught by the VM's error handling
-        return Err(format!("Generator already completed: {:?}", exception));
+        return Err(VmError::type_error(format!("Generator already completed: {:?}", exception)));
     }
 
     // Note: The actual resumption with throw is handled in interpreter.rs
@@ -160,7 +161,7 @@ fn native_generator_throw(
 fn native_is_generator(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let value = args.first().ok_or("Missing value argument")?;
     Ok(VmValue::boolean(value.is_generator()))
 }

@@ -26,6 +26,7 @@
 //!
 //! - **Reflect.apply** and **Reflect.construct**: Work with native functions but not with closures/bytecode functions (requires VmContext)
 
+use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyKey, PropertyDescriptor, PropertyAttributes};
 use crate::value::Value;
@@ -233,7 +234,7 @@ pub fn install_reflect_namespace(
         let key = to_property_key(property_key);
 
         let Some(attr_obj) = attributes.as_object() else {
-            return Err("Reflect.defineProperty requires attributes to be an object".to_string());
+            return Err(VmError::type_error("Reflect.defineProperty requires attributes to be an object"));
         };
 
         let read_bool = |name: &str, default: bool| -> bool {
@@ -304,7 +305,7 @@ pub fn install_reflect_namespace(
         } else if let Some(proto_obj) = prototype.as_object() {
             Some(proto_obj)
         } else {
-            return Err("Prototype must be an object or null".to_string());
+            return Err(VmError::type_error("Prototype must be an object or null"));
         };
 
         let success = obj.set_prototype(new_proto);
@@ -340,7 +341,7 @@ pub fn install_reflect_namespace(
 
         // Check if target is a function
         if !target.is_function() {
-            return Err("Reflect.apply target must be a function".to_string());
+            return Err(VmError::type_error("Reflect.apply target must be a function"));
         }
 
         // Convert argumentsList to array of Values
@@ -354,10 +355,10 @@ pub fn install_reflect_namespace(
                 }
                 call_args
             } else {
-                return Err("Reflect.apply argumentsList must be an array".to_string());
+                return Err(VmError::type_error("Reflect.apply argumentsList must be an array"));
             }
         } else {
-            return Err("Reflect.apply argumentsList must be an object".to_string());
+            return Err(VmError::type_error("Reflect.apply argumentsList must be an object"));
         };
 
         // Call the function
@@ -367,9 +368,9 @@ pub fn install_reflect_namespace(
         } else if let Some(_closure) = target.as_function() {
             // Closure call - not fully supported yet in intrinsics
             // Would require VmContext to execute bytecode
-            Err("Reflect.apply with closures not yet supported in intrinsics context".to_string())
+            Err(VmError::type_error("Reflect.apply with closures not yet supported in intrinsics context"))
         } else {
-            Err("Reflect.apply target is not callable".to_string())
+            Err(VmError::type_error("Reflect.apply target is not callable"))
         }
     });
 
@@ -381,7 +382,7 @@ pub fn install_reflect_namespace(
 
         // Check if target is a function
         if !target.is_function() {
-            return Err("Reflect.construct target must be a constructor".to_string());
+            return Err(VmError::type_error("Reflect.construct target must be a constructor"));
         }
 
         // Convert argumentsList to array of Values
@@ -395,10 +396,10 @@ pub fn install_reflect_namespace(
                 }
                 call_args
             } else {
-                return Err("Reflect.construct argumentsList must be an array".to_string());
+                return Err(VmError::type_error("Reflect.construct argumentsList must be an array"));
             }
         } else {
-            return Err("Reflect.construct argumentsList must be an object".to_string());
+            return Err(VmError::type_error("Reflect.construct argumentsList must be an object"));
         };
 
         // Create new instance
@@ -418,9 +419,9 @@ pub fn install_reflect_namespace(
             }
         } else if let Some(_closure) = target.as_function() {
             // Closure constructor - not fully supported yet
-            Err("Reflect.construct with closures not yet supported in intrinsics context".to_string())
+            Err(VmError::type_error("Reflect.construct with closures not yet supported in intrinsics context"))
         } else {
-            Err("Reflect.construct target is not a constructor".to_string())
+            Err(VmError::type_error("Reflect.construct target is not a constructor"))
         }
     });
 

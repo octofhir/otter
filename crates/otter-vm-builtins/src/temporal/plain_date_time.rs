@@ -1,8 +1,8 @@
 //! Temporal.PlainDateTime - date and time without timezone
 
 use chrono::{Datelike, NaiveDateTime, Timelike};
-use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
+use otter_vm_core::{VmError, string::JsString};
 use otter_vm_runtime::{Op, op_native};
 
 pub fn ops() -> Vec<Op> {
@@ -89,21 +89,24 @@ fn format_date_time(dt: NaiveDateTime, nanos: u32) -> String {
     )
 }
 
-fn plain_date_time_from(args: &[Value]) -> Result<Value, String> {
+fn plain_date_time_from(args: &[Value]) -> Result<Value, VmError> {
     let s = args
         .first()
         .and_then(|v| v.as_string())
-        .ok_or("PlainDateTime.from requires a string")?;
+        .ok_or(VmError::type_error("PlainDateTime.from requires a string"))?;
 
     match parse_date_time(s.as_str()) {
         Some((dt, nanos)) => Ok(Value::string(JsString::intern(&format_date_time(
             dt, nanos,
         )))),
-        None => Err(format!("Invalid PlainDateTime string: {}", s)),
+        None => Err(VmError::type_error(format!(
+            "Invalid PlainDateTime string: {}",
+            s
+        ))),
     }
 }
 
-fn plain_date_time_compare(args: &[Value]) -> Result<Value, String> {
+fn plain_date_time_compare(args: &[Value]) -> Result<Value, VmError> {
     let dt1 = get_date_time(args);
     let dt2 = args
         .get(1)
@@ -119,54 +122,54 @@ fn plain_date_time_compare(args: &[Value]) -> Result<Value, String> {
                 std::cmp::Ordering::Greater => 1,
             }))
         }
-        _ => Err("Invalid PlainDateTime for comparison".to_string()),
+        _ => Err(VmError::type_error("Invalid PlainDateTime for comparison")),
     }
 }
 
-fn plain_date_time_year(args: &[Value]) -> Result<Value, String> {
+fn plain_date_time_year(args: &[Value]) -> Result<Value, VmError> {
     get_date_time(args)
         .map(|(dt, _)| Value::int32(dt.year()))
-        .ok_or_else(|| "Invalid PlainDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDateTime"))
 }
 
-fn plain_date_time_month(args: &[Value]) -> Result<Value, String> {
+fn plain_date_time_month(args: &[Value]) -> Result<Value, VmError> {
     get_date_time(args)
         .map(|(dt, _)| Value::int32(dt.month() as i32))
-        .ok_or_else(|| "Invalid PlainDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDateTime"))
 }
 
-fn plain_date_time_day(args: &[Value]) -> Result<Value, String> {
+fn plain_date_time_day(args: &[Value]) -> Result<Value, VmError> {
     get_date_time(args)
         .map(|(dt, _)| Value::int32(dt.day() as i32))
-        .ok_or_else(|| "Invalid PlainDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDateTime"))
 }
 
-fn plain_date_time_hour(args: &[Value]) -> Result<Value, String> {
+fn plain_date_time_hour(args: &[Value]) -> Result<Value, VmError> {
     get_date_time(args)
         .map(|(dt, _)| Value::int32(dt.hour() as i32))
-        .ok_or_else(|| "Invalid PlainDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDateTime"))
 }
 
-fn plain_date_time_minute(args: &[Value]) -> Result<Value, String> {
+fn plain_date_time_minute(args: &[Value]) -> Result<Value, VmError> {
     get_date_time(args)
         .map(|(dt, _)| Value::int32(dt.minute() as i32))
-        .ok_or_else(|| "Invalid PlainDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDateTime"))
 }
 
-fn plain_date_time_second(args: &[Value]) -> Result<Value, String> {
+fn plain_date_time_second(args: &[Value]) -> Result<Value, VmError> {
     get_date_time(args)
         .map(|(dt, _)| Value::int32(dt.second() as i32))
-        .ok_or_else(|| "Invalid PlainDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDateTime"))
 }
 
-fn plain_date_time_millisecond(args: &[Value]) -> Result<Value, String> {
+fn plain_date_time_millisecond(args: &[Value]) -> Result<Value, VmError> {
     get_date_time(args)
         .map(|(_, nanos)| Value::int32((nanos / 1_000_000) as i32))
-        .ok_or_else(|| "Invalid PlainDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDateTime"))
 }
 
-fn plain_date_time_add(args: &[Value]) -> Result<Value, String> {
-    let (dt, nanos) = get_date_time(args).ok_or("Invalid PlainDateTime")?;
+fn plain_date_time_add(args: &[Value]) -> Result<Value, VmError> {
+    let (dt, nanos) = get_date_time(args).ok_or(VmError::type_error("Invalid PlainDateTime"))?;
     let add_days = args.get(1).and_then(|v| v.as_int32()).unwrap_or(0) as i64;
 
     let new_dt = dt + chrono::Duration::days(add_days);
@@ -175,8 +178,8 @@ fn plain_date_time_add(args: &[Value]) -> Result<Value, String> {
     ))))
 }
 
-fn plain_date_time_subtract(args: &[Value]) -> Result<Value, String> {
-    let (dt, nanos) = get_date_time(args).ok_or("Invalid PlainDateTime")?;
+fn plain_date_time_subtract(args: &[Value]) -> Result<Value, VmError> {
+    let (dt, nanos) = get_date_time(args).ok_or(VmError::type_error("Invalid PlainDateTime"))?;
     let sub_days = args.get(1).and_then(|v| v.as_int32()).unwrap_or(0) as i64;
 
     let new_dt = dt - chrono::Duration::days(sub_days);
@@ -185,8 +188,8 @@ fn plain_date_time_subtract(args: &[Value]) -> Result<Value, String> {
     ))))
 }
 
-fn plain_date_time_with(args: &[Value]) -> Result<Value, String> {
-    let (dt, nanos) = get_date_time(args).ok_or("Invalid PlainDateTime")?;
+fn plain_date_time_with(args: &[Value]) -> Result<Value, VmError> {
+    let (dt, nanos) = get_date_time(args).ok_or(VmError::type_error("Invalid PlainDateTime"))?;
 
     let year = args.get(1).and_then(|v| v.as_int32()).unwrap_or(dt.year());
     let month = args
@@ -218,10 +221,10 @@ fn plain_date_time_with(args: &[Value]) -> Result<Value, String> {
     chrono::NaiveDate::from_ymd_opt(year, month, day)
         .and_then(|d| d.and_hms_opt(hour, minute, second))
         .map(|new_dt| Value::string(JsString::intern(&format_date_time(new_dt, nanos))))
-        .ok_or_else(|| "Invalid datetime components".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid datetime components"))
 }
 
-fn plain_date_time_equals(args: &[Value]) -> Result<Value, String> {
+fn plain_date_time_equals(args: &[Value]) -> Result<Value, VmError> {
     let dt1 = get_date_time(args);
     let dt2 = args
         .get(1)
@@ -231,23 +234,23 @@ fn plain_date_time_equals(args: &[Value]) -> Result<Value, String> {
     Ok(Value::boolean(dt1 == dt2))
 }
 
-fn plain_date_time_to_string(args: &[Value]) -> Result<Value, String> {
+fn plain_date_time_to_string(args: &[Value]) -> Result<Value, VmError> {
     get_date_time(args)
         .map(|(dt, nanos)| Value::string(JsString::intern(&format_date_time(dt, nanos))))
-        .ok_or_else(|| "Invalid PlainDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDateTime"))
 }
 
-fn plain_date_time_to_json(args: &[Value]) -> Result<Value, String> {
+fn plain_date_time_to_json(args: &[Value]) -> Result<Value, VmError> {
     plain_date_time_to_string(args)
 }
 
-fn plain_date_time_to_plain_date(args: &[Value]) -> Result<Value, String> {
+fn plain_date_time_to_plain_date(args: &[Value]) -> Result<Value, VmError> {
     get_date_time(args)
         .map(|(dt, _)| Value::string(JsString::intern(&dt.format("%Y-%m-%d").to_string())))
-        .ok_or_else(|| "Invalid PlainDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDateTime"))
 }
 
-fn plain_date_time_to_plain_time(args: &[Value]) -> Result<Value, String> {
+fn plain_date_time_to_plain_time(args: &[Value]) -> Result<Value, VmError> {
     get_date_time(args)
         .map(|(dt, nanos)| {
             Value::string(JsString::intern(&format!(
@@ -258,16 +261,16 @@ fn plain_date_time_to_plain_time(args: &[Value]) -> Result<Value, String> {
                 nanos
             )))
         })
-        .ok_or_else(|| "Invalid PlainDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDateTime"))
 }
 
-fn plain_date_time_to_zoned_date_time(args: &[Value]) -> Result<Value, String> {
-    let (dt, nanos) = get_date_time(args).ok_or("Invalid PlainDateTime")?;
+fn plain_date_time_to_zoned_date_time(args: &[Value]) -> Result<Value, VmError> {
+    let (dt, nanos) = get_date_time(args).ok_or(VmError::type_error("Invalid PlainDateTime"))?;
     let tz = args
         .get(1)
         .and_then(|v| v.as_string())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string()));
+        .unwrap_or_else(|| iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_owned()));
 
     // For simplicity, just append the timezone
     let s = format!(

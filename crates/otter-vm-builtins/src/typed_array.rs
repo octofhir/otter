@@ -4,6 +4,7 @@
 //! Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array,
 //! Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::memory;
 use otter_vm_core::string::JsString;
 use otter_vm_core::typed_array::{JsTypedArray, TypedArrayKind};
@@ -83,7 +84,7 @@ fn parse_kind(kind_str: &str) -> Option<TypedArrayKind> {
 fn native_typed_array_create(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ab = args
         .first()
         .and_then(|v| v.as_array_buffer())
@@ -98,7 +99,7 @@ fn native_typed_array_create(
     let kind = parse_kind(kind_str.as_str()).ok_or("TypeError: invalid TypedArray kind")?;
 
     if ab.is_detached() {
-        return Err("TypeError: ArrayBuffer is detached".to_string());
+        return Err(VmError::type_error("ArrayBuffer is detached"));
     }
 
     let byte_offset = args
@@ -116,10 +117,10 @@ fn native_typed_array_create(
 
     // Validate byte offset alignment
     if byte_offset % elem_size != 0 {
-        return Err(format!(
-            "RangeError: byte offset must be a multiple of {}",
+        return Err(VmError::range_error(format!(
+            "byte offset must be a multiple of {}",
             elem_size
-        ));
+        )));
     }
 
     let length = args.get(3).and_then(|v| {
@@ -135,17 +136,17 @@ fn native_typed_array_create(
         None => {
             let remaining = ab.byte_length().saturating_sub(byte_offset);
             if remaining % elem_size != 0 {
-                return Err(format!(
-                    "RangeError: buffer length minus offset must be a multiple of {}",
+                return Err(VmError::range_error(format!(
+                    "buffer length minus offset must be a multiple of {}",
                     elem_size
-                ));
+                )));
             }
             remaining / elem_size
         }
     };
 
     let ta = JsTypedArray::new(ab, kind, byte_offset, actual_length)
-        .map_err(|e| format!("RangeError: {}", e))?;
+        .map_err(|e| VmError::range_error(format!("{}", e)))?;
 
     Ok(VmValue::typed_array(Arc::new(ta)))
 }
@@ -155,7 +156,7 @@ fn native_typed_array_create(
 fn native_typed_array_create_from_length(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let length = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
 
     let kind_str = args
@@ -174,7 +175,7 @@ fn native_typed_array_create_from_length(
 fn native_typed_array_create_from_array(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let values = args.first().ok_or("TypeError: values required")?;
 
     let kind_str = args
@@ -221,7 +222,7 @@ fn native_typed_array_create_from_array(
 fn native_typed_array_buffer(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ta = args
         .first()
         .and_then(|v| v.as_typed_array())
@@ -234,7 +235,7 @@ fn native_typed_array_buffer(
 fn native_typed_array_byte_length(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ta = args
         .first()
         .and_then(|v| v.as_typed_array())
@@ -247,7 +248,7 @@ fn native_typed_array_byte_length(
 fn native_typed_array_byte_offset(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ta = args
         .first()
         .and_then(|v| v.as_typed_array())
@@ -264,7 +265,7 @@ fn native_typed_array_byte_offset(
 fn native_typed_array_length(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ta = args
         .first()
         .and_then(|v| v.as_typed_array())
@@ -282,7 +283,7 @@ fn native_typed_array_length(
 fn native_typed_array_get(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ta = args
         .first()
         .and_then(|v| v.as_typed_array())
@@ -291,7 +292,7 @@ fn native_typed_array_get(
     let index = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
 
     if ta.is_detached() {
-        return Err("TypeError: ArrayBuffer is detached".to_string());
+        return Err(VmError::type_error("ArrayBuffer is detached"));
     }
 
     if ta.kind().is_bigint() {
@@ -312,7 +313,7 @@ fn native_typed_array_get(
 fn native_typed_array_set(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ta = args
         .first()
         .and_then(|v| v.as_typed_array())
@@ -321,7 +322,7 @@ fn native_typed_array_set(
     let index = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
 
     if ta.is_detached() {
-        return Err("TypeError: ArrayBuffer is detached".to_string());
+        return Err(VmError::type_error("ArrayBuffer is detached"));
     }
 
     if ta.kind().is_bigint() {
@@ -349,7 +350,7 @@ fn native_typed_array_set(
 fn native_typed_array_subarray(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ta = args
         .first()
         .and_then(|v| v.as_typed_array())
@@ -378,7 +379,7 @@ fn native_typed_array_subarray(
 fn native_typed_array_slice(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ta = args
         .first()
         .and_then(|v| v.as_typed_array())
@@ -407,14 +408,14 @@ fn native_typed_array_slice(
 fn native_typed_array_fill(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ta = args
         .first()
         .and_then(|v| v.as_typed_array())
         .ok_or("TypeError: not a TypedArray")?;
 
     if ta.is_detached() {
-        return Err("TypeError: ArrayBuffer is detached".to_string());
+        return Err(VmError::type_error("ArrayBuffer is detached"));
     }
 
     let value = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0);
@@ -450,14 +451,14 @@ fn native_typed_array_fill(
 fn native_typed_array_copy_within(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ta = args
         .first()
         .and_then(|v| v.as_typed_array())
         .ok_or("TypeError: not a TypedArray")?;
 
     if ta.is_detached() {
-        return Err("TypeError: ArrayBuffer is detached".to_string());
+        return Err(VmError::type_error("ArrayBuffer is detached"));
     }
 
     let target = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i64;
@@ -483,14 +484,14 @@ fn native_typed_array_copy_within(
 fn native_typed_array_reverse(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ta = args
         .first()
         .and_then(|v| v.as_typed_array())
         .ok_or("TypeError: not a TypedArray")?;
 
     if ta.is_detached() {
-        return Err("TypeError: ArrayBuffer is detached".to_string());
+        return Err(VmError::type_error("ArrayBuffer is detached"));
     }
 
     ta.reverse();
@@ -503,14 +504,14 @@ fn native_typed_array_reverse(
 fn native_typed_array_set_array(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ta = args
         .first()
         .and_then(|v| v.as_typed_array())
         .ok_or("TypeError: not a TypedArray")?;
 
     if ta.is_detached() {
-        return Err("TypeError: ArrayBuffer is detached".to_string());
+        return Err(VmError::type_error("ArrayBuffer is detached"));
     }
 
     let source = args.get(1).ok_or("TypeError: source required")?;
@@ -526,7 +527,7 @@ fn native_typed_array_set_array(
     let src_len = length_val.as_number().unwrap_or(0.0) as usize;
 
     if offset + src_len > ta.length() {
-        return Err("RangeError: source is too large".to_string());
+        return Err(VmError::range_error("source is too large"));
     }
 
     // Copy values
@@ -554,7 +555,7 @@ fn native_typed_array_set_array(
 fn native_typed_array_is_typed_array(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let is_ta = args.first().map(|v| v.is_typed_array()).unwrap_or(false);
     Ok(VmValue::boolean(is_ta))
 }
@@ -563,7 +564,7 @@ fn native_typed_array_is_typed_array(
 fn native_typed_array_kind(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ta = args
         .first()
         .and_then(|v| v.as_typed_array())

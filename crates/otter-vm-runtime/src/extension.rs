@@ -9,6 +9,7 @@
 //! - **Native ops** (`op_native`): Work with VM `Value` directly, needed for object identity
 //!   operations like `Object.freeze()`, `WeakMap`, etc.
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::value::Value as VmValue;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -20,7 +21,7 @@ use std::sync::Arc;
 pub type OpResult = Result<JsonValue, String>;
 
 /// Result type for native operations (works with VM Value)
-pub type NativeOpResult = Result<VmValue, String>;
+pub type NativeOpResult = Result<VmValue, VmError>;
 
 /// Future type for async operations
 pub type OpFuture = Pin<Box<dyn Future<Output = OpResult> + Send>>;
@@ -65,8 +66,8 @@ impl OpHandler {
     ) -> NativeOpResult {
         match self {
             OpHandler::Native(f) => f(args, memory_manager),
-            OpHandler::Sync(_) => Err("Cannot call JSON op with native args".to_string()),
-            OpHandler::Async(_) => Err("Cannot call async op with native args".to_string()),
+            OpHandler::Sync(_) => Err(VmError::type_error("Cannot call JSON op with native args")),
+            OpHandler::Async(_) => Err(VmError::type_error("Cannot call async op with native args")),
         }
     }
 

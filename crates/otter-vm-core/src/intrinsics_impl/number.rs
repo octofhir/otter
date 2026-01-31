@@ -2,6 +2,7 @@
 //!
 //! All Number object methods for ES2026 standard.
 
+use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
@@ -34,12 +35,12 @@ pub fn init_number_prototype(
                     } else if let Some(i) = this_val.as_int32() {
                         i as f64
                     } else {
-                        return Err("Number.prototype.toString requires a number".to_string());
+                        return Err(VmError::type_error("Number.prototype.toString requires a number"));
                     };
 
                     let radix = args.first().and_then(|v| v.as_int32()).unwrap_or(10);
                     if radix < 2 || radix > 36 {
-                        return Err("radix must be between 2 and 36".to_string());
+                        return Err(VmError::type_error("radix must be between 2 and 36"));
                     }
 
                     let result = if n.is_nan() {
@@ -102,7 +103,7 @@ pub fn init_number_prototype(
                     } else if let Some(i) = this_val.as_int32() {
                         i as f64
                     } else {
-                        return Err("Number.prototype.toFixed requires a number".to_string());
+                        return Err(VmError::type_error("Number.prototype.toFixed requires a number"));
                     };
 
                     let digits = args
@@ -144,7 +145,7 @@ pub fn init_number_prototype(
                         i as f64
                     } else {
                         return Err(
-                            "Number.prototype.toExponential requires a number".to_string()
+                            VmError::type_error("Number.prototype.toExponential requires a number")
                         );
                     };
 
@@ -187,7 +188,7 @@ pub fn init_number_prototype(
                         i as f64
                     } else {
                         return Err(
-                            "Number.prototype.toPrecision requires a number".to_string()
+                            VmError::type_error("Number.prototype.toPrecision requires a number")
                         );
                     };
 
@@ -234,7 +235,7 @@ pub fn init_number_prototype(
                         i as f64
                     } else {
                         return Err(
-                            "Number.prototype.toLocaleString requires a number".to_string()
+                            VmError::type_error("Number.prototype.toLocaleString requires a number")
                         );
                     };
                     // Simplified: just use toString for now

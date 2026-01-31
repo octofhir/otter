@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use crate::array_buffer::JsArrayBuffer;
+use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::regexp::JsRegExp;
@@ -176,10 +177,10 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                     if let Some(val) = args.get(0) {
                         if let Some(n) = val.as_number() {
                             if n.is_nan() || n.is_infinite() {
-                                return Err("RangeError: invalid BigInt".to_string());
+                                return Err(VmError::type_error("RangeError: invalid BigInt"));
                             }
                             if n.trunc() != n {
-                                return Err("RangeError: The number cannot be converted to a BigInt because it is not an integer".to_string());
+                                return Err(VmError::type_error("RangeError: The number cannot be converted to a BigInt because it is not an integer"));
                             }
                             return Ok(Value::bigint(format!("{:.0}", n)));
                         }
@@ -198,7 +199,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                         let s = to_string(val);
                         Ok(Value::bigint(s))
                     } else {
-                        Err("TypeError: Cannot convert undefined to a BigInt".to_string())
+                        Err(VmError::type_error("TypeError: Cannot convert undefined to a BigInt"))
                     }
                 },
                 mm.clone(),
@@ -356,7 +357,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                 PropertyKey::string("valueOf"),
                 Value::native_function_with_proto(
                     |this_val, _args, _mm| {
-                        Ok::<Value, String>(this_val.clone())
+                        Ok::<Value, VmError>(this_val.clone())
                     },
                     mm.clone(),
                     fn_proto,
@@ -433,7 +434,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                 PropertyKey::string("valueOf"),
                 Value::native_function_with_proto(
                     |this_val, _args, _mm| {
-                        Ok::<Value, String>(this_val.clone())
+                        Ok::<Value, VmError>(this_val.clone())
                     },
                     mm.clone(),
                     fn_proto,
@@ -448,7 +449,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                         if let Some(this) = this_val.as_array_buffer() {
                             Ok(Value::number(this.byte_length() as f64))
                         } else {
-                             Err("TypeError: ArrayBuffer.prototype.byteLength called on incompatible receiver".to_string())
+                             Err(VmError::type_error("TypeError: ArrayBuffer.prototype.byteLength called on incompatible receiver"))
                         }
                     },
                     mm.clone(),
@@ -511,13 +512,13 @@ fn get_arg(args: &[Value], index: usize) -> Value {
 ///
 /// Note: Direct eval is not supported in this VM for security reasons.
 /// Indirect eval throws an error.
-fn global_eval(_this: &Value, args: &[Value], _mm: Arc<crate::memory::MemoryManager>) -> Result<Value, String> {
+fn global_eval(_this: &Value, args: &[Value], _mm: Arc<crate::memory::MemoryManager>) -> Result<Value, VmError> {
     // Per spec: if argument is not a string, return it unchanged
     let arg = get_arg(args, 0);
 
     if arg.is_string() {
         // eval() of a string is not supported in this VM
-        Err("eval() is not supported".to_string())
+        Err(VmError::type_error("eval() is not supported"))
     } else {
         // Non-string argument: return it unchanged
         Ok(arg)
@@ -529,14 +530,14 @@ fn global_is_finite(
     _this: &Value,
     args: &[Value],
     _mm: Arc<crate::memory::MemoryManager>,
-) -> Result<Value, String> {
+) -> Result<Value, VmError> {
     let value = get_arg(args, 0);
     let num = to_number(&value);
     Ok(Value::boolean(num.is_finite()))
 }
 
 /// `isNaN(number)` - Determines whether a value is NaN.
-fn global_is_nan(_this: &Value, args: &[Value], _mm: Arc<crate::memory::MemoryManager>) -> Result<Value, String> {
+fn global_is_nan(_this: &Value, args: &[Value], _mm: Arc<crate::memory::MemoryManager>) -> Result<Value, VmError> {
     let value = get_arg(args, 0);
     let num = to_number(&value);
     Ok(Value::boolean(num.is_nan()))
@@ -547,7 +548,7 @@ fn global_parse_int(
     _this: &Value,
     args: &[Value],
     _mm: Arc<crate::memory::MemoryManager>,
-) -> Result<Value, String> {
+) -> Result<Value, VmError> {
     let input = get_arg(args, 0);
     let radix_arg = args.get(1);
 
@@ -624,7 +625,7 @@ fn global_parse_float(
     _this: &Value,
     args: &[Value],
     _mm: Arc<crate::memory::MemoryManager>,
-) -> Result<Value, String> {
+) -> Result<Value, VmError> {
     let input = get_arg(args, 0);
     let input_str = to_string(&input);
     let trimmed = input_str.trim();
@@ -674,7 +675,7 @@ fn global_encode_uri(
     _this: &Value,
     args: &[Value],
     _mm: Arc<crate::memory::MemoryManager>,
-) -> Result<Value, String> {
+) -> Result<Value, VmError> {
     let input = get_arg(args, 0);
     let uri = to_string(&input);
 
@@ -700,7 +701,7 @@ fn global_decode_uri(
     _this: &Value,
     args: &[Value],
     _mm: Arc<crate::memory::MemoryManager>,
-) -> Result<Value, String> {
+) -> Result<Value, VmError> {
     let input = get_arg(args, 0);
     let encoded = to_string(&input);
 
@@ -712,7 +713,7 @@ fn global_encode_uri_component(
     _this: &Value,
     args: &[Value],
     _mm: Arc<crate::memory::MemoryManager>,
-) -> Result<Value, String> {
+) -> Result<Value, VmError> {
     let input = get_arg(args, 0);
     let component = to_string(&input);
 
@@ -738,7 +739,7 @@ fn global_decode_uri_component(
     _this: &Value,
     args: &[Value],
     _mm: Arc<crate::memory::MemoryManager>,
-) -> Result<Value, String> {
+) -> Result<Value, VmError> {
     let input = get_arg(args, 0);
     let encoded = to_string(&input);
 
@@ -746,7 +747,7 @@ fn global_decode_uri_component(
 }
 
 /// Common implementation for decodeURI and decodeURIComponent
-fn decode_uri_impl(encoded: &str, preserve_reserved: bool) -> Result<Value, String> {
+fn decode_uri_impl(encoded: &str, preserve_reserved: bool) -> Result<Value, VmError> {
     let mut result = Vec::with_capacity(encoded.len());
     let mut chars = encoded.chars().peekable();
 
@@ -757,7 +758,7 @@ fn decode_uri_impl(encoded: &str, preserve_reserved: bool) -> Result<Value, Stri
             for _ in 0..2 {
                 match chars.next() {
                     Some(h) if h.is_ascii_hexdigit() => hex_chars.push(h),
-                    _ => return Err("URIError: malformed URI sequence".to_string()),
+                    _ => return Err(VmError::type_error("URIError: malformed URI sequence")),
                 }
             }
 

@@ -2,6 +2,7 @@
 //!
 //! Provides Array static methods and prototype methods per ECMAScript 2024/2025.
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory::MemoryManager;
 use otter_vm_core::object::{JsObject, PropertyKey};
@@ -111,7 +112,7 @@ fn value_to_string(v: &VmValue) -> String {
 // Static Methods
 // =============================================================================
 
-fn native_array_is_array(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_is_array(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let val = args.get(0);
     let is_array = val
         .and_then(|v| v.as_object())
@@ -120,7 +121,7 @@ fn native_array_is_array(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<Vm
     Ok(VmValue::boolean(is_array))
 }
 
-fn native_array_from(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_from(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let val = args.get(0).ok_or("Array.from requires an argument")?;
 
     if let Some(arr) = val.as_object() {
@@ -154,7 +155,7 @@ fn native_array_from(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue
     Ok(VmValue::array(GcRef::new(JsObject::array(0, mm))))
 }
 
-fn native_array_of(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_of(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr = GcRef::new(JsObject::array(args.len(), Arc::clone(&mm)));
     for (i, item) in args.iter().enumerate() {
         arr.set(PropertyKey::Index(i as u32), item.clone());
@@ -166,7 +167,7 @@ fn native_array_of(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, 
 // Mutating Methods
 // =============================================================================
 
-fn native_array_push(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_push(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.push requires a target")?;
     let arr = arr_val
         .as_object()
@@ -184,7 +185,7 @@ fn native_array_push(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValu
     Ok(VmValue::number(new_len as f64))
 }
 
-fn native_array_pop(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_pop(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.pop requires a target")?;
     let arr = arr_val
         .as_object()
@@ -203,7 +204,7 @@ fn native_array_pop(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue
     Ok(last)
 }
 
-fn native_array_shift(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_shift(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.shift requires a target")?;
     let arr = arr_val
         .as_object()
@@ -232,7 +233,7 @@ fn native_array_shift(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmVal
     Ok(first)
 }
 
-fn native_array_unshift(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_unshift(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.unshift requires a target")?;
     let arr = arr_val
         .as_object()
@@ -259,7 +260,7 @@ fn native_array_unshift(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmV
     Ok(VmValue::number(new_len as f64))
 }
 
-fn native_array_splice(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_splice(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.splice requires a target")?;
     let arr = arr_val
         .as_object()
@@ -327,7 +328,7 @@ fn native_array_splice(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmVal
     Ok(VmValue::array(deleted))
 }
 
-fn native_array_reverse(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_reverse(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.reverse requires a target")?;
     let arr = arr_val
         .as_object()
@@ -359,7 +360,7 @@ fn native_array_reverse(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmV
     Ok(arr_val.clone())
 }
 
-fn native_array_sort(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_sort(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.sort requires a target")?;
     let arr = arr_val
         .as_object()
@@ -389,7 +390,7 @@ fn native_array_sort(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValu
     Ok(arr_val.clone())
 }
 
-fn native_array_fill(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_fill(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.fill requires a target")?;
     let arr = arr_val
         .as_object()
@@ -428,7 +429,7 @@ fn native_array_fill(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValu
     Ok(arr_val.clone())
 }
 
-fn native_array_copy_within(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_copy_within(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.copyWithin requires a target")?;
     let arr = arr_val
         .as_object()
@@ -491,7 +492,7 @@ fn native_array_copy_within(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result
 // Non-mutating Methods
 // =============================================================================
 
-fn native_array_slice(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_slice(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.slice requires a target")?;
     let arr = arr_val
         .as_object()
@@ -532,7 +533,7 @@ fn native_array_slice(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValu
     Ok(VmValue::array(new_arr))
 }
 
-fn native_array_concat(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_concat(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.concat requires a target")?;
     let arr = arr_val
         .as_object()
@@ -573,7 +574,7 @@ fn native_array_concat(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmVal
     Ok(VmValue::array(new_arr))
 }
 
-fn native_array_flat(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_flat(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.flat requires a target")?;
     let arr = arr_val
         .as_object()
@@ -615,16 +616,16 @@ fn native_array_flat(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue
     Ok(VmValue::array(new_arr))
 }
 
-fn native_array_flat_map(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_flat_map(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     // Simplified: flatMap requires callback, which is handled in builtins.js
-    Err("Array.flatMap not yet implemented in native ops".to_string())
+    Err(VmError::type_error("Array.flatMap not yet implemented in native ops"))
 }
 
 // =============================================================================
 // Search Methods
 // =============================================================================
 
-fn native_array_index_of(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_index_of(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.indexOf requires a target")?;
     let arr = arr_val
         .as_object()
@@ -655,7 +656,7 @@ fn native_array_index_of(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<Vm
     Ok(VmValue::int32(-1))
 }
 
-fn native_array_last_index_of(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_last_index_of(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.lastIndexOf requires a target")?;
     let arr = arr_val
         .as_object()
@@ -686,7 +687,7 @@ fn native_array_last_index_of(args: &[VmValue], _mm: Arc<MemoryManager>) -> Resu
     Ok(VmValue::int32(-1))
 }
 
-fn native_array_includes(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_includes(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.includes requires a target")?;
     let arr = arr_val
         .as_object()
@@ -717,27 +718,27 @@ fn native_array_includes(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<Vm
     Ok(VmValue::boolean(false))
 }
 
-fn native_array_find(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_find(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     // Requires callback, handled in builtins.js
-    Err("Array.find not yet implemented in native ops".to_string())
+    Err(VmError::type_error("Array.find not yet implemented in native ops"))
 }
 
-fn native_array_find_index(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_find_index(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     // Requires callback, handled in builtins.js
-    Err("Array.findIndex not yet implemented in native ops".to_string())
+    Err(VmError::type_error("Array.findIndex not yet implemented in native ops"))
 }
 
-fn native_array_find_last(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_find_last(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     // Requires callback, handled in builtins.js
-    Err("Array.findLast not yet implemented in native ops".to_string())
+    Err(VmError::type_error("Array.findLast not yet implemented in native ops"))
 }
 
-fn native_array_find_last_index(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_find_last_index(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     // Requires callback, handled in builtins.js
-    Err("Array.findLastIndex not yet implemented in native ops".to_string())
+    Err(VmError::type_error("Array.findLastIndex not yet implemented in native ops"))
 }
 
-fn native_array_at(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_at(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.at requires a target")?;
     let arr = arr_val
         .as_object()
@@ -768,39 +769,39 @@ fn native_array_at(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue,
 // Iteration Methods (callback-based, simplified)
 // =============================================================================
 
-fn native_array_for_each(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
-    Err("Array.forEach not yet implemented in native ops".to_string())
+fn native_array_for_each(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+    Err(VmError::type_error("Array.forEach not yet implemented in native ops"))
 }
 
-fn native_array_map(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
-    Err("Array.map not yet implemented in native ops".to_string())
+fn native_array_map(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+    Err(VmError::type_error("Array.map not yet implemented in native ops"))
 }
 
-fn native_array_filter(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
-    Err("Array.filter not yet implemented in native ops".to_string())
+fn native_array_filter(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+    Err(VmError::type_error("Array.filter not yet implemented in native ops"))
 }
 
-fn native_array_reduce(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
-    Err("Array.reduce not yet implemented in native ops".to_string())
+fn native_array_reduce(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+    Err(VmError::type_error("Array.reduce not yet implemented in native ops"))
 }
 
-fn native_array_reduce_right(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
-    Err("Array.reduceRight not yet implemented in native ops".to_string())
+fn native_array_reduce_right(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+    Err(VmError::type_error("Array.reduceRight not yet implemented in native ops"))
 }
 
-fn native_array_every(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
-    Err("Array.every not yet implemented in native ops".to_string())
+fn native_array_every(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+    Err(VmError::type_error("Array.every not yet implemented in native ops"))
 }
 
-fn native_array_some(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
-    Err("Array.some not yet implemented in native ops".to_string())
+fn native_array_some(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+    Err(VmError::type_error("Array.some not yet implemented in native ops"))
 }
 
 // =============================================================================
 // Conversion Methods
 // =============================================================================
 
-fn native_array_join(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_join(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.join requires a target")?;
     let arr = arr_val
         .as_object()
@@ -830,12 +831,12 @@ fn native_array_join(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValu
     Ok(VmValue::string(JsString::intern(&parts.join(&separator))))
 }
 
-fn native_array_to_string(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_to_string(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     // toString() just calls join()
     native_array_join(args, mm)
 }
 
-fn native_array_length(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_length(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.length requires a target")?;
     let arr = arr_val
         .as_object()
@@ -849,7 +850,7 @@ fn native_array_length(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmVa
 // ES2023 Immutable Methods
 // =============================================================================
 
-fn native_array_to_reversed(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_to_reversed(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.toReversed requires a target")?;
     let arr = arr_val
         .as_object()
@@ -867,7 +868,7 @@ fn native_array_to_reversed(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<
     Ok(VmValue::array(new_arr))
 }
 
-fn native_array_to_sorted(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_to_sorted(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.toSorted requires a target")?;
     let arr = arr_val
         .as_object()
@@ -904,7 +905,7 @@ fn native_array_to_sorted(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<Vm
     Ok(VmValue::array(new_arr))
 }
 
-fn native_array_to_spliced(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_to_spliced(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.toSpliced requires a target")?;
     let arr = arr_val
         .as_object()
@@ -957,7 +958,7 @@ fn native_array_to_spliced(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<V
     Ok(VmValue::array(new_arr))
 }
 
-fn native_array_with(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_array_with(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.with requires a target")?;
     let arr = arr_val
         .as_object()
@@ -973,7 +974,7 @@ fn native_array_with(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue
     let actual_index = if index < 0 { len + index } else { index };
 
     if actual_index < 0 || actual_index >= len {
-        return Err(format!("Index {} out of bounds for array of length {}", index, len));
+        return Err(VmError::range_error(format!("Index {} out of bounds for array of length {}", index, len)));
     }
 
     let new_arr = GcRef::new(JsObject::array(len as usize, Arc::clone(&mm)));

@@ -1,8 +1,8 @@
 //! Temporal.Now - utilities for getting current time
 
 use chrono::{Local, Utc};
-use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
+use otter_vm_core::{VmError, string::JsString};
 use otter_vm_runtime::{Op, op_native};
 
 pub fn ops() -> Vec<Op> {
@@ -17,7 +17,7 @@ pub fn ops() -> Vec<Op> {
 }
 
 /// Temporal.Now.instant() - returns current time as epochNanoseconds string
-fn now_instant(_args: &[Value]) -> Result<Value, String> {
+fn now_instant(_args: &[Value]) -> Result<Value, VmError> {
     let now = Utc::now();
     let nanos = now.timestamp_nanos_opt().unwrap_or(0);
     // Return as string since i128 doesn't fit in f64
@@ -25,14 +25,14 @@ fn now_instant(_args: &[Value]) -> Result<Value, String> {
 }
 
 /// Temporal.Now.timeZoneId() - returns current timezone IANA name
-fn now_timezone_id(_args: &[Value]) -> Result<Value, String> {
+fn now_timezone_id(_args: &[Value]) -> Result<Value, VmError> {
     // Get system timezone name
     let tz = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string());
     Ok(Value::string(JsString::intern(&tz)))
 }
 
 /// Temporal.Now.zonedDateTimeISO() - returns current ZonedDateTime in ISO calendar
-fn now_zoned_date_time_iso(_args: &[Value]) -> Result<Value, String> {
+fn now_zoned_date_time_iso(_args: &[Value]) -> Result<Value, VmError> {
     let now = Local::now();
     let tz = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string());
 
@@ -54,7 +54,7 @@ fn now_zoned_date_time_iso(_args: &[Value]) -> Result<Value, String> {
 }
 
 /// Temporal.Now.plainDateTimeISO() - returns current PlainDateTime in ISO calendar
-fn now_plain_date_time_iso(_args: &[Value]) -> Result<Value, String> {
+fn now_plain_date_time_iso(_args: &[Value]) -> Result<Value, VmError> {
     let now = Local::now();
     let nanos = now.timestamp_subsec_nanos();
     let s = format!(
@@ -71,14 +71,14 @@ fn now_plain_date_time_iso(_args: &[Value]) -> Result<Value, String> {
 }
 
 /// Temporal.Now.plainDateISO() - returns current PlainDate in ISO calendar
-fn now_plain_date_iso(_args: &[Value]) -> Result<Value, String> {
+fn now_plain_date_iso(_args: &[Value]) -> Result<Value, VmError> {
     let now = Local::now();
     let s = format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
     Ok(Value::string(JsString::intern(&s)))
 }
 
 /// Temporal.Now.plainTimeISO() - returns current PlainTime in ISO calendar
-fn now_plain_time_iso(_args: &[Value]) -> Result<Value, String> {
+fn now_plain_time_iso(_args: &[Value]) -> Result<Value, VmError> {
     let now = Local::now();
     let nanos = now.timestamp_subsec_nanos();
     let s = format!(

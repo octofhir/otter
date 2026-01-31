@@ -1,5 +1,6 @@
 //! Temporal.Instant - fixed point in time (nanosecond precision)
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
 use otter_vm_runtime::{Op, op_native};
@@ -66,10 +67,14 @@ fn parse_nanos(args: &[Value]) -> Option<i128> {
 }
 
 /// Temporal.Instant.from(thing) - create from ISO string or another Instant
-fn instant_from(args: &[Value]) -> Result<Value, String> {
+fn instant_from(args: &[Value]) -> Result<Value, VmError> {
     let s = match args.first() {
         Some(v) if v.is_string() => v.as_string().unwrap().to_string(),
-        _ => return Err("Temporal.Instant.from requires a string".to_string()),
+        _ => {
+            return Err(VmError::type_error(
+                "Temporal.Instant.from requires a string",
+            ));
+        }
     };
 
     // Parse ISO 8601 instant format: 2026-01-23T12:30:45.123456789Z
@@ -88,11 +93,14 @@ fn instant_from(args: &[Value]) -> Result<Value, String> {
         }
     }
 
-    Err(format!("Invalid Instant string: {}", s))
+    Err(VmError::type_error(format!(
+        "Invalid Instant string: {}",
+        s
+    )))
 }
 
 /// Temporal.Instant.fromEpochSeconds(epochSeconds)
-fn instant_from_epoch_seconds(args: &[Value]) -> Result<Value, String> {
+fn instant_from_epoch_seconds(args: &[Value]) -> Result<Value, VmError> {
     let secs = args
         .first()
         .and_then(|v| v.as_number().or_else(|| v.as_int32().map(|n| n as f64)))
@@ -103,7 +111,7 @@ fn instant_from_epoch_seconds(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Temporal.Instant.fromEpochMilliseconds(epochMilliseconds)
-fn instant_from_epoch_milliseconds(args: &[Value]) -> Result<Value, String> {
+fn instant_from_epoch_milliseconds(args: &[Value]) -> Result<Value, VmError> {
     let ms = args
         .first()
         .and_then(|v| v.as_number().or_else(|| v.as_int32().map(|n| n as f64)))
@@ -114,7 +122,7 @@ fn instant_from_epoch_milliseconds(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Temporal.Instant.fromEpochMicroseconds(epochMicroseconds)
-fn instant_from_epoch_microseconds(args: &[Value]) -> Result<Value, String> {
+fn instant_from_epoch_microseconds(args: &[Value]) -> Result<Value, VmError> {
     let us = args
         .first()
         .and_then(|v| v.as_string().and_then(|s| s.as_str().parse::<i128>().ok()))
@@ -126,7 +134,7 @@ fn instant_from_epoch_microseconds(args: &[Value]) -> Result<Value, String> {
 }
 
 /// Temporal.Instant.fromEpochNanoseconds(epochNanoseconds)
-fn instant_from_epoch_nanoseconds(args: &[Value]) -> Result<Value, String> {
+fn instant_from_epoch_nanoseconds(args: &[Value]) -> Result<Value, VmError> {
     let nanos = args
         .first()
         .and_then(|v| v.as_string().and_then(|s| s.as_str().parse::<i128>().ok()))
@@ -137,42 +145,42 @@ fn instant_from_epoch_nanoseconds(args: &[Value]) -> Result<Value, String> {
 }
 
 /// instant.epochSeconds
-fn instant_epoch_seconds(args: &[Value]) -> Result<Value, String> {
+fn instant_epoch_seconds(args: &[Value]) -> Result<Value, VmError> {
     match parse_nanos(args) {
         Some(nanos) => Ok(Value::number((nanos / 1_000_000_000) as f64)),
-        None => Err("Invalid Instant".to_string()),
+        None => Err(VmError::type_error("Invalid Instant")),
     }
 }
 
 /// instant.epochMilliseconds
-fn instant_epoch_milliseconds(args: &[Value]) -> Result<Value, String> {
+fn instant_epoch_milliseconds(args: &[Value]) -> Result<Value, VmError> {
     match parse_nanos(args) {
         Some(nanos) => Ok(Value::number((nanos / 1_000_000) as f64)),
-        None => Err("Invalid Instant".to_string()),
+        None => Err(VmError::type_error("Invalid Instant")),
     }
 }
 
 /// instant.epochMicroseconds (returns string for precision)
-fn instant_epoch_microseconds(args: &[Value]) -> Result<Value, String> {
+fn instant_epoch_microseconds(args: &[Value]) -> Result<Value, VmError> {
     match parse_nanos(args) {
         Some(nanos) => Ok(Value::string(JsString::intern(
             &(nanos / 1_000).to_string(),
         ))),
-        None => Err("Invalid Instant".to_string()),
+        None => Err(VmError::type_error("Invalid Instant")),
     }
 }
 
 /// instant.epochNanoseconds (returns string for precision)
-fn instant_epoch_nanoseconds(args: &[Value]) -> Result<Value, String> {
+fn instant_epoch_nanoseconds(args: &[Value]) -> Result<Value, VmError> {
     match parse_nanos(args) {
         Some(nanos) => Ok(Value::string(JsString::intern(&nanos.to_string()))),
-        None => Err("Invalid Instant".to_string()),
+        None => Err(VmError::type_error("Invalid Instant")),
     }
 }
 
 /// instant.add(duration) - returns new Instant
-fn instant_add(args: &[Value]) -> Result<Value, String> {
-    let nanos = parse_nanos(args).ok_or("Invalid Instant")?;
+fn instant_add(args: &[Value]) -> Result<Value, VmError> {
+    let nanos = parse_nanos(args).ok_or(VmError::type_error("Invalid Instant"))?;
 
     // Duration is passed as nanoseconds string in second arg
     let duration_nanos = args
@@ -186,8 +194,8 @@ fn instant_add(args: &[Value]) -> Result<Value, String> {
 }
 
 /// instant.subtract(duration) - returns new Instant
-fn instant_subtract(args: &[Value]) -> Result<Value, String> {
-    let nanos = parse_nanos(args).ok_or("Invalid Instant")?;
+fn instant_subtract(args: &[Value]) -> Result<Value, VmError> {
+    let nanos = parse_nanos(args).ok_or(VmError::type_error("Invalid Instant"))?;
 
     let duration_nanos = args
         .get(1)
@@ -200,34 +208,34 @@ fn instant_subtract(args: &[Value]) -> Result<Value, String> {
 }
 
 /// instant.until(other) - returns Duration as nanoseconds string
-fn instant_until(args: &[Value]) -> Result<Value, String> {
-    let nanos = parse_nanos(args).ok_or("Invalid Instant")?;
+fn instant_until(args: &[Value]) -> Result<Value, VmError> {
+    let nanos = parse_nanos(args).ok_or(VmError::type_error("Invalid Instant"))?;
 
     let other_nanos = args
         .get(1)
         .and_then(|v| v.as_string().and_then(|s| s.as_str().parse::<i128>().ok()))
-        .ok_or("Invalid target Instant")?;
+        .ok_or(VmError::type_error("Invalid target Instant"))?;
 
     let diff = other_nanos - nanos;
     Ok(Value::string(JsString::intern(&diff.to_string())))
 }
 
 /// instant.since(other) - returns Duration as nanoseconds string
-fn instant_since(args: &[Value]) -> Result<Value, String> {
-    let nanos = parse_nanos(args).ok_or("Invalid Instant")?;
+fn instant_since(args: &[Value]) -> Result<Value, VmError> {
+    let nanos = parse_nanos(args).ok_or(VmError::type_error("Invalid Instant"))?;
 
     let other_nanos = args
         .get(1)
         .and_then(|v| v.as_string().and_then(|s| s.as_str().parse::<i128>().ok()))
-        .ok_or("Invalid target Instant")?;
+        .ok_or(VmError::type_error("Invalid target Instant"))?;
 
     let diff = nanos - other_nanos;
     Ok(Value::string(JsString::intern(&diff.to_string())))
 }
 
 /// instant.round(options) - round to nearest unit
-fn instant_round(args: &[Value]) -> Result<Value, String> {
-    let nanos = parse_nanos(args).ok_or("Invalid Instant")?;
+fn instant_round(args: &[Value]) -> Result<Value, VmError> {
+    let nanos = parse_nanos(args).ok_or(VmError::type_error("Invalid Instant"))?;
 
     // Get smallest unit from options (simplified - just support common units)
     let unit = args
@@ -248,7 +256,7 @@ fn instant_round(args: &[Value]) -> Result<Value, String> {
 }
 
 /// instant.equals(other)
-fn instant_equals(args: &[Value]) -> Result<Value, String> {
+fn instant_equals(args: &[Value]) -> Result<Value, VmError> {
     let nanos = parse_nanos(args);
     let other_nanos = args
         .get(1)
@@ -261,8 +269,8 @@ fn instant_equals(args: &[Value]) -> Result<Value, String> {
 }
 
 /// instant.toString() - returns ISO 8601 string
-fn instant_to_string(args: &[Value]) -> Result<Value, String> {
-    let nanos = parse_nanos(args).ok_or("Invalid Instant")?;
+fn instant_to_string(args: &[Value]) -> Result<Value, VmError> {
+    let nanos = parse_nanos(args).ok_or(VmError::type_error("Invalid Instant"))?;
 
     let secs = nanos / 1_000_000_000;
     let sub_nanos = (nanos % 1_000_000_000) as u32;
@@ -271,23 +279,25 @@ fn instant_to_string(args: &[Value]) -> Result<Value, String> {
         let s = dt.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string();
         Ok(Value::string(JsString::intern(&s)))
     } else {
-        Err("Invalid timestamp".to_string())
+        Err(VmError::type_error("Invalid timestamp"))
     }
 }
 
 /// instant.toJSON() - same as toString
-fn instant_to_json(args: &[Value]) -> Result<Value, String> {
+fn instant_to_json(args: &[Value]) -> Result<Value, VmError> {
     instant_to_string(args)
 }
 
 /// instant.valueOf() - throws TypeError (Temporal types are not comparable with <, >)
-fn instant_value_of(_args: &[Value]) -> Result<Value, String> {
-    Err("TypeError: Temporal.Instant cannot be converted to a primitive".to_string())
+fn instant_value_of(_args: &[Value]) -> Result<Value, VmError> {
+    Err(VmError::type_error(
+        "Temporal.Instant cannot be converted to a primitive",
+    ))
 }
 
 /// instant.toZonedDateTimeISO(timeZone) - convert to ZonedDateTime
-fn instant_to_zoned_date_time_iso(args: &[Value]) -> Result<Value, String> {
-    let nanos = parse_nanos(args).ok_or("Invalid Instant")?;
+fn instant_to_zoned_date_time_iso(args: &[Value]) -> Result<Value, VmError> {
+    let nanos = parse_nanos(args).ok_or(VmError::type_error("Invalid Instant"))?;
     let tz = args
         .get(1)
         .and_then(|v| v.as_string())
@@ -318,7 +328,7 @@ fn instant_to_zoned_date_time_iso(args: &[Value]) -> Result<Value, String> {
         }
     }
 
-    Err("Invalid timezone or timestamp".to_string())
+    Err(VmError::type_error("Invalid timezone or timestamp"))
 }
 
 use chrono::{Datelike, Timelike};

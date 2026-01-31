@@ -1,8 +1,8 @@
 //! Temporal.PlainMonthDay - month and day only (e.g., birthdays, holidays)
 
 use chrono::{Datelike, NaiveDate};
-use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
+use otter_vm_core::{VmError, string::JsString};
 use otter_vm_runtime::{Op, op_native};
 
 pub fn ops() -> Vec<Op> {
@@ -51,40 +51,43 @@ fn get_month_day(args: &[Value]) -> Option<(u32, u32)> {
         .and_then(|s| parse_month_day(s.as_str()))
 }
 
-fn plain_month_day_from(args: &[Value]) -> Result<Value, String> {
+fn plain_month_day_from(args: &[Value]) -> Result<Value, VmError> {
     let s = args
         .first()
         .and_then(|v| v.as_string())
-        .ok_or("PlainMonthDay.from requires a string")?;
+        .ok_or(VmError::type_error("PlainMonthDay.from requires a string"))?;
 
     match parse_month_day(s.as_str()) {
         Some((month, day)) => Ok(Value::string(JsString::intern(&format!(
             "--{:02}-{:02}",
             month, day
         )))),
-        None => Err(format!("Invalid PlainMonthDay string: {}", s)),
+        None => Err(VmError::type_error(format!(
+            "Invalid PlainMonthDay string: {}",
+            s
+        ))),
     }
 }
 
-fn plain_month_day_month(args: &[Value]) -> Result<Value, String> {
+fn plain_month_day_month(args: &[Value]) -> Result<Value, VmError> {
     get_month_day(args)
         .map(|(month, _)| Value::int32(month as i32))
-        .ok_or_else(|| "Invalid PlainMonthDay".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainMonthDay"))
 }
 
-fn plain_month_day_month_code(args: &[Value]) -> Result<Value, String> {
+fn plain_month_day_month_code(args: &[Value]) -> Result<Value, VmError> {
     get_month_day(args)
         .map(|(month, _)| Value::string(JsString::intern(&format!("M{:02}", month))))
-        .ok_or_else(|| "Invalid PlainMonthDay".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainMonthDay"))
 }
 
-fn plain_month_day_day(args: &[Value]) -> Result<Value, String> {
+fn plain_month_day_day(args: &[Value]) -> Result<Value, VmError> {
     get_month_day(args)
         .map(|(_, day)| Value::int32(day as i32))
-        .ok_or_else(|| "Invalid PlainMonthDay".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainMonthDay"))
 }
 
-fn plain_month_day_equals(args: &[Value]) -> Result<Value, String> {
+fn plain_month_day_equals(args: &[Value]) -> Result<Value, VmError> {
     let md1 = get_month_day(args);
     let md2 = args
         .get(1)
@@ -94,18 +97,18 @@ fn plain_month_day_equals(args: &[Value]) -> Result<Value, String> {
     Ok(Value::boolean(md1 == md2))
 }
 
-fn plain_month_day_to_string(args: &[Value]) -> Result<Value, String> {
+fn plain_month_day_to_string(args: &[Value]) -> Result<Value, VmError> {
     get_month_day(args)
         .map(|(month, day)| Value::string(JsString::intern(&format!("--{:02}-{:02}", month, day))))
-        .ok_or_else(|| "Invalid PlainMonthDay".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainMonthDay"))
 }
 
-fn plain_month_day_to_json(args: &[Value]) -> Result<Value, String> {
+fn plain_month_day_to_json(args: &[Value]) -> Result<Value, VmError> {
     plain_month_day_to_string(args)
 }
 
-fn plain_month_day_to_plain_date(args: &[Value]) -> Result<Value, String> {
-    let (month, day) = get_month_day(args).ok_or("Invalid PlainMonthDay")?;
+fn plain_month_day_to_plain_date(args: &[Value]) -> Result<Value, VmError> {
+    let (month, day) = get_month_day(args).ok_or(VmError::type_error("Invalid PlainMonthDay"))?;
     let year = args
         .get(1)
         .and_then(|v| v.as_int32())
@@ -113,7 +116,9 @@ fn plain_month_day_to_plain_date(args: &[Value]) -> Result<Value, String> {
 
     NaiveDate::from_ymd_opt(year, month, day)
         .map(|d| Value::string(JsString::intern(&d.format("%Y-%m-%d").to_string())))
-        .ok_or_else(|| format!("Invalid date: {}-{:02}-{:02}", year, month, day))
+        .ok_or_else(|| {
+            VmError::type_error(format!("Invalid date: {}-{:02}-{:02}", year, month, day))
+        })
 }
 
 #[cfg(test)]

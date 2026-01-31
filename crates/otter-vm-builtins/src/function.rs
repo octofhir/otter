@@ -8,6 +8,7 @@
 //! - name - returns function name
 //! - length - returns function parameter count
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyKey};
@@ -38,9 +39,9 @@ pub fn ops() -> Vec<Op> {
 /// The interpreter checks for the existence of this global op to detect
 /// Function.prototype.call and intercept it (see interpreter.rs:5647).
 /// This function should NEVER be called - the interpreter handles it specially.
-fn function_call(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn function_call(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     // If this is ever called, it means interpreter interception failed
-    Err("INTERNAL ERROR: Function.prototype.call stub was called - interpreter interception failed".to_string())
+    Err(VmError::internal("Function.prototype.call stub was called - interpreter interception failed"))
 }
 
 /// Function.prototype.apply(thisArg, argsArray)
@@ -48,13 +49,13 @@ fn function_call(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Val
 /// The interpreter checks for the existence of this global op to detect
 /// Function.prototype.apply and intercept it (see interpreter.rs:5651).
 /// This function should NEVER be called - the interpreter handles it specially.
-fn function_apply(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn function_apply(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     // If this is ever called, it means interpreter interception failed
-    Err("INTERNAL ERROR: Function.prototype.apply stub was called - interpreter interception failed".to_string())
+    Err(VmError::internal("Function.prototype.apply stub was called - interpreter interception failed"))
 }
 
 /// Function.prototype.toString() - returns string representation
-fn function_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn function_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let func = args
         .first()
         .ok_or("Function.toString requires a function")?;
@@ -77,17 +78,17 @@ fn function_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result
         if obj.get(&PropertyKey::string("__boundFunction__")).is_some() {
             "function() { [bound] }".to_string()
         } else {
-            return Err("Function.toString requires a function".to_string());
+            return Err(VmError::type_error("Function.toString requires a function"));
         }
     } else {
-        return Err("Function.toString requires a function".to_string());
+        return Err(VmError::type_error("Function.toString requires a function"));
     };
 
     Ok(Value::string(JsString::intern(&result)))
 }
 
 /// Get function name
-fn function_get_name(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn function_get_name(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let func = args.first().ok_or("Function.name requires a function")?;
 
     // Check for bound function first
@@ -102,12 +103,12 @@ fn function_get_name(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<
     if func.is_function() || func.is_native_function() {
         Ok(Value::string(JsString::intern("")))
     } else {
-        Err("Function.name requires a function".to_string())
+        Err(VmError::type_error("Function.name requires a function"))
     }
 }
 
 /// Get function parameter count (length)
-fn function_get_length(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn function_get_length(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let func = args.first().ok_or("Function.length requires a function")?;
 
     // Check for bound function first
@@ -122,12 +123,12 @@ fn function_get_length(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Resul
     if func.is_function() || func.is_native_function() {
         Ok(Value::int32(0))
     } else {
-        Err("Function.length requires a function".to_string())
+        Err(VmError::type_error("Function.length requires a function"))
     }
 }
 
 /// Check if value is a function
-fn function_is_function(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn function_is_function(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let val = args.first().ok_or("isFunction requires an argument")?;
 
     let is_func = val.is_callable()
@@ -141,7 +142,7 @@ fn function_is_function(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Resu
 
 /// Create a bound function object
 /// Args: [originalFunc, thisArg, ...boundArgs]
-fn function_create_bound(args: &[Value], mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn function_create_bound(args: &[Value], mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let original = args.first().ok_or("bind requires a function")?.clone();
 
     let this_arg = args.get(1).cloned().unwrap_or_else(Value::undefined);

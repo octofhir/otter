@@ -6,9 +6,9 @@
 //! - Symbol.keyFor() - get key from global symbol
 //! - Well-known symbols: iterator, asyncIterator, toStringTag, hasInstance, toPrimitive
 
-use otter_vm_core::memory;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::{Symbol, Value};
+use otter_vm_core::{VmError, memory};
 use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,7 +67,7 @@ pub fn ops() -> Vec<Op> {
 
 /// Create a new unique symbol with optional description
 /// Args: [description: string | undefined]
-fn symbol_create(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn symbol_create(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let description = args.first().and_then(|v| {
         if v.is_undefined() {
             None
@@ -86,7 +86,7 @@ fn symbol_create(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Valu
 
 /// Symbol.for(key) - get or create global symbol
 /// Args: [key: string]
-fn symbol_for(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn symbol_for(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let key = args
         .first()
         .and_then(|v| v.as_string())
@@ -123,7 +123,7 @@ fn symbol_for(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, 
 
 /// Symbol.keyFor(symbol) - get key for global symbol
 /// Args: [symbol: symbol]
-fn symbol_key_for(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn symbol_key_for(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let sym = args
         .first()
         .and_then(|v| v.as_symbol())
@@ -143,7 +143,7 @@ fn symbol_key_for(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Val
 }
 
 /// Symbol.prototype.toString() - returns "Symbol(description)"
-fn symbol_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn symbol_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let sym = args
         .first()
         .and_then(|v| v.as_symbol())
@@ -159,18 +159,18 @@ fn symbol_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<V
 }
 
 /// Symbol.prototype.valueOf() - returns the symbol itself
-fn symbol_value_of(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn symbol_value_of(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let val = args.first().ok_or("Symbol.valueOf requires a symbol")?;
 
     if val.is_symbol() {
         Ok(val.clone())
     } else {
-        Err("Symbol.valueOf requires a symbol".to_string())
+        Err(VmError::type_error("Symbol.valueOf requires a symbol"))
     }
 }
 
 /// Symbol.prototype.description getter
-fn symbol_description(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn symbol_description(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let sym = args
         .first()
         .and_then(|v| v.as_symbol())
@@ -184,7 +184,10 @@ fn symbol_description(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result
 
 /// Get well-known symbol by name
 /// Args: [name: string]
-fn symbol_get_well_known(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn symbol_get_well_known(
+    args: &[Value],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<Value, VmError> {
     let name_js = args
         .first()
         .and_then(|v| v.as_string())
@@ -208,7 +211,7 @@ fn symbol_get_well_known(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Res
         "split" => (well_known::SPLIT, "Symbol.split"),
         "species" => (well_known::SPECIES, "Symbol.species"),
         "unscopables" => (well_known::UNSCOPABLES, "Symbol.unscopables"),
-        _ => return Err(format!("Unknown well-known symbol: {}", name)),
+        _ => return Err(VmError::type_error(format!("Unknown well-known symbol: {}", name))),
     };
 
     let sym = Arc::new(Symbol {
@@ -220,7 +223,7 @@ fn symbol_get_well_known(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Res
 }
 
 /// Get symbol ID (for internal use, e.g., property key conversion)
-fn symbol_get_id(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn symbol_get_id(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let sym = args
         .first()
         .and_then(|v| v.as_symbol())

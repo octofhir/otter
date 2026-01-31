@@ -5,6 +5,7 @@
 //! Object.preventExtensions(), Object.isExtensible(), Object.defineProperty(), Object.create(),
 //! Object.is()
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory::{self, MemoryManager};
 use otter_vm_core::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
@@ -62,7 +63,7 @@ pub fn ops() -> Vec<Op> {
 fn native_object_freeze(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let obj = args.first().ok_or("Object.freeze requires an argument")?;
     if let Some(obj_ref) = obj.as_object() {
         obj_ref.freeze();
@@ -75,7 +76,7 @@ fn native_object_freeze(
 fn native_object_is_frozen(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let obj = args.first().ok_or("Object.isFrozen requires an argument")?;
     let is_frozen = obj.as_object().map(|o| o.is_frozen()).unwrap_or(true); // Non-objects are considered frozen
     Ok(VmValue::boolean(is_frozen))
@@ -85,7 +86,7 @@ fn native_object_is_frozen(
 fn native_object_seal(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let obj = args.first().ok_or("Object.seal requires an argument")?;
     if let Some(obj_ref) = obj.as_object() {
         obj_ref.seal();
@@ -97,7 +98,7 @@ fn native_object_seal(
 fn native_object_is_sealed(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let obj = args.first().ok_or("Object.isSealed requires an argument")?;
     let is_sealed = obj.as_object().map(|o| o.is_sealed()).unwrap_or(true); // Non-objects are considered sealed
     Ok(VmValue::boolean(is_sealed))
@@ -107,7 +108,7 @@ fn native_object_is_sealed(
 fn native_object_prevent_extensions(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let obj = args
         .first()
         .ok_or("Object.preventExtensions requires an argument")?;
@@ -121,7 +122,7 @@ fn native_object_prevent_extensions(
 fn native_object_is_extensible(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let obj = args
         .first()
         .ok_or("Object.isExtensible requires an argument")?;
@@ -164,7 +165,7 @@ fn to_property_key(value: &VmValue) -> PropertyKey {
 fn native_object_define_property(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let obj_val = args
         .first()
         .ok_or("Object.defineProperty requires an object")?;
@@ -183,7 +184,7 @@ fn native_object_define_property(
     let key = to_property_key(key_val);
 
     let Some(attr_obj) = descriptor.as_object() else {
-        return Err("Property descriptor must be an object".to_string());
+        return Err(VmError::type_error("Property descriptor must be an object"));
     };
 
     // Helper to read boolean fields
@@ -257,7 +258,7 @@ fn native_object_define_property(
 fn native_object_create(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let proto_val = args
         .first()
         .ok_or("Object.create requires a prototype argument")?;
@@ -268,7 +269,7 @@ fn native_object_create(
     } else if let Some(proto_obj) = proto_val.as_object() {
         Some(proto_obj)
     } else {
-        return Err("Object prototype may only be an Object or null".to_string());
+        return Err(VmError::type_error("Object prototype may only be an Object or null"));
     };
 
     let new_obj = GcRef::new(JsObject::new(prototype, mm));
@@ -342,7 +343,7 @@ fn native_object_create(
 }
 
 /// Object.is(value1, value2) - SameValue algorithm
-fn native_object_is(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_object_is(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let v1 = args.first().cloned().unwrap_or(VmValue::undefined());
     let v2 = args.get(1).cloned().unwrap_or(VmValue::undefined());
 
@@ -491,7 +492,7 @@ mod tests {
 }
 
 /// Object rest helper: copy own enumerable properties from source excluding keys in excluded_keys_array
-fn native_object_rest(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_object_rest(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let source = args.first().ok_or("Object rest requires a source object")?;
     let excluded_keys_val = args
         .get(1)
@@ -499,7 +500,7 @@ fn native_object_rest(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
 
     // If source is null or undefined, throw TypeError (spec requires ObjectCoerce)
     if source.is_nullish() {
-        return Err("Cannot destructure null or undefined".to_string());
+        return Err(VmError::type_error("Cannot destructure null or undefined"));
     }
 
     // Coerce to object
@@ -551,7 +552,7 @@ fn native_object_rest(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
 fn native_object_get_own_property_names(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let obj_val = args
         .first()
         .ok_or("Object.getOwnPropertyNames requires an argument")?;
@@ -585,7 +586,7 @@ fn native_object_get_own_property_names(
 }
 
 /// Object.keys(obj) - native implementation
-fn native_object_keys(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_object_keys(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let obj_val = args.get(0).ok_or("Object.keys requires an object")?;
     let obj = obj_val
         .as_object()
@@ -613,7 +614,7 @@ fn native_object_keys(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValu
 }
 
 /// Object.values(obj) - native implementation
-fn native_object_values(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_object_values(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let obj_val = args.get(0).ok_or("Object.values requires an object")?;
     let obj = obj_val
         .as_object()
@@ -643,7 +644,7 @@ fn native_object_values(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmVa
 }
 
 /// Object.entries(obj) - native implementation
-fn native_object_entries(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_object_entries(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let obj_val = args.get(0).ok_or("Object.entries requires an object")?;
     let obj = obj_val
         .as_object()
@@ -677,7 +678,7 @@ fn native_object_entries(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmV
 }
 
 /// Object.assign(target, ...sources) - native implementation
-fn native_object_assign(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_object_assign(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let target_val = args.get(0).ok_or("Object.assign requires at least one argument")?;
     let target = target_val
         .as_object()
@@ -702,7 +703,7 @@ fn native_object_assign(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmV
 }
 
 /// Object.hasOwn(obj, prop) - native implementation
-fn native_object_has_own(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, String> {
+fn native_object_has_own(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let obj_val = args.get(0).ok_or("Object.hasOwn requires two arguments")?;
     let prop_val = args.get(1).ok_or("Object.hasOwn requires two arguments")?;
 
@@ -729,7 +730,7 @@ fn native_object_has_own(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<Vm
 fn native_object_get_own_property_symbols(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let obj_val = args
         .first()
         .ok_or("Object.getOwnPropertySymbols requires an argument")?;
@@ -802,7 +803,7 @@ fn descriptor_to_object(
 fn native_object_get_own_property_descriptors(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let obj_val = args
         .first()
         .ok_or("Object.getOwnPropertyDescriptors requires a target")?;

@@ -4,6 +4,7 @@
 //! - valueOf - returns primitive boolean value
 //! - toString - returns "true" or "false"
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::memory;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
@@ -46,7 +47,7 @@ fn to_boolean(val: &Value) -> bool {
 // =============================================================================
 
 /// Boolean.prototype.valueOf() - returns the primitive value of a Boolean object
-fn boolean_value_of(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn boolean_value_of(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     match args.first() {
         Some(v) if v.is_boolean() => Ok(v.clone()),
         Some(v) => {
@@ -58,7 +59,7 @@ fn boolean_value_of(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<V
 }
 
 /// Boolean.prototype.toString() - returns a string representing the boolean
-fn boolean_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn boolean_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let b = match args.first() {
         Some(v) if v.is_boolean() => v.as_boolean().unwrap(),
         Some(v) => to_boolean(v),

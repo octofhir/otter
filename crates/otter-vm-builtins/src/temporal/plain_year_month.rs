@@ -1,8 +1,8 @@
 //! Temporal.PlainYearMonth - year and month only
 
 use chrono::NaiveDate;
-use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
+use otter_vm_core::{VmError, string::JsString};
 use otter_vm_runtime::{Op, op_native};
 
 pub fn ops() -> Vec<Op> {
@@ -71,11 +71,11 @@ fn get_year_month(args: &[Value]) -> Option<(i32, u32)> {
         .and_then(|s| parse_year_month(s.as_str()))
 }
 
-fn plain_year_month_from(args: &[Value]) -> Result<Value, String> {
+fn plain_year_month_from(args: &[Value]) -> Result<Value, VmError> {
     let s = args
         .first()
         .and_then(|v| v.as_string())
-        .ok_or("PlainYearMonth.from requires a string")?;
+        .ok_or(VmError::type_error("PlainYearMonth.from requires a string"))?;
 
     // Extract YYYY-MM from various formats
     let ym_str = s.as_str().split('T').next().unwrap_or(s.as_str());
@@ -92,10 +92,13 @@ fn plain_year_month_from(args: &[Value]) -> Result<Value, String> {
         }
     }
 
-    Err(format!("Invalid PlainYearMonth string: {}", s))
+    Err(VmError::type_error(format!(
+        "Invalid PlainYearMonth string: {}",
+        s
+    )))
 }
 
-fn plain_year_month_compare(args: &[Value]) -> Result<Value, String> {
+fn plain_year_month_compare(args: &[Value]) -> Result<Value, VmError> {
     let ym1 = get_year_month(args);
     let ym2 = args
         .get(1)
@@ -111,29 +114,29 @@ fn plain_year_month_compare(args: &[Value]) -> Result<Value, String> {
                 std::cmp::Ordering::Greater => 1,
             }))
         }
-        _ => Err("Invalid PlainYearMonth for comparison".to_string()),
+        _ => Err(VmError::type_error("Invalid PlainYearMonth for comparison")),
     }
 }
 
-fn plain_year_month_year(args: &[Value]) -> Result<Value, String> {
+fn plain_year_month_year(args: &[Value]) -> Result<Value, VmError> {
     get_year_month(args)
         .map(|(year, _)| Value::int32(year))
-        .ok_or_else(|| "Invalid PlainYearMonth".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainYearMonth"))
 }
 
-fn plain_year_month_month(args: &[Value]) -> Result<Value, String> {
+fn plain_year_month_month(args: &[Value]) -> Result<Value, VmError> {
     get_year_month(args)
         .map(|(_, month)| Value::int32(month as i32))
-        .ok_or_else(|| "Invalid PlainYearMonth".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainYearMonth"))
 }
 
-fn plain_year_month_month_code(args: &[Value]) -> Result<Value, String> {
+fn plain_year_month_month_code(args: &[Value]) -> Result<Value, VmError> {
     get_year_month(args)
         .map(|(_, month)| Value::string(JsString::intern(&format!("M{:02}", month))))
-        .ok_or_else(|| "Invalid PlainYearMonth".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainYearMonth"))
 }
 
-fn plain_year_month_days_in_month(args: &[Value]) -> Result<Value, String> {
+fn plain_year_month_days_in_month(args: &[Value]) -> Result<Value, VmError> {
     get_year_month(args)
         .and_then(|(year, month)| {
             let first = NaiveDate::from_ymd_opt(year, month, 1)?;
@@ -144,32 +147,33 @@ fn plain_year_month_days_in_month(args: &[Value]) -> Result<Value, String> {
             };
             Some(Value::int32((next - first).num_days() as i32))
         })
-        .ok_or_else(|| "Invalid PlainYearMonth".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainYearMonth"))
 }
 
-fn plain_year_month_days_in_year(args: &[Value]) -> Result<Value, String> {
+fn plain_year_month_days_in_year(args: &[Value]) -> Result<Value, VmError> {
     get_year_month(args)
         .and_then(|(year, _)| {
             NaiveDate::from_ymd_opt(year, 1, 1)
                 .map(|d| Value::int32(if d.leap_year() { 366 } else { 365 }))
         })
-        .ok_or_else(|| "Invalid PlainYearMonth".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainYearMonth"))
 }
 
-fn plain_year_month_months_in_year(_args: &[Value]) -> Result<Value, String> {
+fn plain_year_month_months_in_year(_args: &[Value]) -> Result<Value, VmError> {
     Ok(Value::int32(12))
 }
 
-fn plain_year_month_in_leap_year(args: &[Value]) -> Result<Value, String> {
+fn plain_year_month_in_leap_year(args: &[Value]) -> Result<Value, VmError> {
     get_year_month(args)
         .and_then(|(year, _)| {
             NaiveDate::from_ymd_opt(year, 1, 1).map(|d| Value::boolean(d.leap_year()))
         })
-        .ok_or_else(|| "Invalid PlainYearMonth".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainYearMonth"))
 }
 
-fn plain_year_month_add(args: &[Value]) -> Result<Value, String> {
-    let (year, month) = get_year_month(args).ok_or("Invalid PlainYearMonth")?;
+fn plain_year_month_add(args: &[Value]) -> Result<Value, VmError> {
+    let (year, month) =
+        get_year_month(args).ok_or(VmError::type_error("Invalid PlainYearMonth"))?;
     let add_months = args.get(1).and_then(|v| v.as_int32()).unwrap_or(0);
 
     let total_months = year * 12 + (month as i32 - 1) + add_months;
@@ -182,8 +186,9 @@ fn plain_year_month_add(args: &[Value]) -> Result<Value, String> {
     ))))
 }
 
-fn plain_year_month_subtract(args: &[Value]) -> Result<Value, String> {
-    let (year, month) = get_year_month(args).ok_or("Invalid PlainYearMonth")?;
+fn plain_year_month_subtract(args: &[Value]) -> Result<Value, VmError> {
+    let (year, month) =
+        get_year_month(args).ok_or(VmError::type_error("Invalid PlainYearMonth"))?;
     let sub_months = args.get(1).and_then(|v| v.as_int32()).unwrap_or(0);
 
     let total_months = year * 12 + (month as i32 - 1) - sub_months;
@@ -196,7 +201,7 @@ fn plain_year_month_subtract(args: &[Value]) -> Result<Value, String> {
     ))))
 }
 
-fn plain_year_month_equals(args: &[Value]) -> Result<Value, String> {
+fn plain_year_month_equals(args: &[Value]) -> Result<Value, VmError> {
     let ym1 = get_year_month(args);
     let ym2 = args
         .get(1)
@@ -206,23 +211,24 @@ fn plain_year_month_equals(args: &[Value]) -> Result<Value, String> {
     Ok(Value::boolean(ym1 == ym2))
 }
 
-fn plain_year_month_to_string(args: &[Value]) -> Result<Value, String> {
+fn plain_year_month_to_string(args: &[Value]) -> Result<Value, VmError> {
     get_year_month(args)
         .map(|(year, month)| Value::string(JsString::intern(&format!("{:04}-{:02}", year, month))))
-        .ok_or_else(|| "Invalid PlainYearMonth".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainYearMonth"))
 }
 
-fn plain_year_month_to_json(args: &[Value]) -> Result<Value, String> {
+fn plain_year_month_to_json(args: &[Value]) -> Result<Value, VmError> {
     plain_year_month_to_string(args)
 }
 
-fn plain_year_month_to_plain_date(args: &[Value]) -> Result<Value, String> {
-    let (year, month) = get_year_month(args).ok_or("Invalid PlainYearMonth")?;
+fn plain_year_month_to_plain_date(args: &[Value]) -> Result<Value, VmError> {
+    let (year, month) =
+        get_year_month(args).ok_or(VmError::type_error("Invalid PlainYearMonth"))?;
     let day = args.get(1).and_then(|v| v.as_int32()).unwrap_or(1) as u32;
 
     NaiveDate::from_ymd_opt(year, month, day)
         .map(|d| Value::string(JsString::intern(&d.format("%Y-%m-%d").to_string())))
-        .ok_or_else(|| "Invalid day for month".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid day for month"))
 }
 
 #[cfg(test)]

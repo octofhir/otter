@@ -2,6 +2,7 @@
 //!
 //! Provides Set and WeakSet collections with full ES2026 support.
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyKey};
@@ -88,7 +89,7 @@ fn str_to_key(s: &str) -> PropertyKey {
 // ============================================================================
 
 /// Create a new Set
-fn native_set_new(_args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_set_new(_args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let set_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
 
     // Create internal values storage
@@ -101,7 +102,7 @@ fn native_set_new(_args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<V
 }
 
 /// Set.prototype.add(value)
-fn native_set_add(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_set_add(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("Set.add requires a Set")?;
     let value = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -112,7 +113,7 @@ fn native_set_add(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<V
         .get(&str_to_key(IS_SET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_set.as_boolean() != Some(true) {
-        return Err("Method Set.prototype.add called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method Set.prototype.add called on incompatible receiver"));
     }
 
     let values = set_obj
@@ -145,7 +146,7 @@ fn native_set_add(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<V
 }
 
 /// Set.prototype.has(value)
-fn native_set_has(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_set_has(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("Set.has requires a Set")?;
     let value = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -155,7 +156,7 @@ fn native_set_has(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<V
         .get(&str_to_key(IS_SET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_set.as_boolean() != Some(true) {
-        return Err("Method Set.prototype.has called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method Set.prototype.has called on incompatible receiver"));
     }
 
     let values = set_obj
@@ -172,7 +173,7 @@ fn native_set_has(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<V
 }
 
 /// Set.prototype.delete(value)
-fn native_set_delete(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_set_delete(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("Set.delete requires a Set")?;
     let value = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -182,7 +183,7 @@ fn native_set_delete(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Resul
         .get(&str_to_key(IS_SET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_set.as_boolean() != Some(true) {
-        return Err("Method Set.prototype.delete called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method Set.prototype.delete called on incompatible receiver"));
     }
 
     let values = set_obj
@@ -215,7 +216,7 @@ fn native_set_delete(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Resul
 }
 
 /// Set.prototype.clear()
-fn native_set_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_set_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("Set.clear requires a Set")?;
 
     let set_obj = set.as_object().ok_or("First argument must be a Set")?;
@@ -224,7 +225,7 @@ fn native_set_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<
         .get(&str_to_key(IS_SET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_set.as_boolean() != Some(true) {
-        return Err("Method Set.prototype.clear called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method Set.prototype.clear called on incompatible receiver"));
     }
 
     // Replace values with new empty object
@@ -236,7 +237,7 @@ fn native_set_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<
 }
 
 /// Set.prototype.size getter
-fn native_set_size(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_set_size(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("Set.size requires a Set")?;
 
     let set_obj = set.as_object().ok_or("First argument must be a Set")?;
@@ -245,7 +246,7 @@ fn native_set_size(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<
         .get(&str_to_key(IS_SET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_set.as_boolean() != Some(true) {
-        return Err("get Set.prototype.size called on incompatible receiver".to_string());
+        return Err(VmError::type_error("get Set.prototype.size called on incompatible receiver"));
     }
 
     let size = set_obj
@@ -255,7 +256,7 @@ fn native_set_size(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<
 }
 
 /// Set.prototype.values() - returns an iterator over values
-fn native_set_values(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_set_values(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("Set.values requires a Set")?;
 
     let set_obj = set.as_object().ok_or("First argument must be a Set")?;
@@ -264,7 +265,7 @@ fn native_set_values(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result
         .get(&str_to_key(IS_SET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_set.as_boolean() != Some(true) {
-        return Err("Method Set.prototype.values called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method Set.prototype.values called on incompatible receiver"));
     }
 
     let values = set_obj
@@ -291,7 +292,7 @@ fn native_set_values(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result
 }
 
 /// Set.prototype.keys() - same as values() per spec
-fn native_set_keys(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_set_keys(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     native_set_values(args, mm)
 }
 
@@ -299,7 +300,7 @@ fn native_set_keys(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<V
 fn native_set_entries(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("Set.entries requires a Set")?;
 
     let set_obj = set.as_object().ok_or("First argument must be a Set")?;
@@ -308,7 +309,7 @@ fn native_set_entries(
         .get(&str_to_key(IS_SET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_set.as_boolean() != Some(true) {
-        return Err("Method Set.prototype.entries called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method Set.prototype.entries called on incompatible receiver"));
     }
 
     let values = set_obj
@@ -341,7 +342,7 @@ fn native_set_entries(
 }
 
 /// Set.prototype.forEach - returns values for JS to iterate
-fn native_set_foreach(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_set_foreach(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     native_set_values(args, mm)
 }
 
@@ -350,14 +351,14 @@ fn native_set_foreach(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
 // ============================================================================
 
 /// Helper to get all values from a Set
-fn get_set_values(set: &VmValue) -> Result<Vec<VmValue>, String> {
+fn get_set_values(set: &VmValue) -> Result<Vec<VmValue>, VmError> {
     let set_obj = set.as_object().ok_or("Expected a Set")?;
 
     let is_set = set_obj
         .get(&str_to_key(IS_SET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_set.as_boolean() != Some(true) {
-        return Err("Expected a Set".to_string());
+        return Err(VmError::type_error("Expected a Set"));
     }
 
     let values = set_obj
@@ -378,7 +379,7 @@ fn get_set_values(set: &VmValue) -> Result<Vec<VmValue>, String> {
 }
 
 /// Set.prototype.union(other)
-fn native_set_union(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_set_union(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let this_values = get_set_values(args.first().ok_or("Missing this")?)?;
     let other_values = get_set_values(args.get(1).ok_or("Missing other Set")?)?;
 
@@ -399,7 +400,7 @@ fn native_set_union(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<
 fn native_set_intersection(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("Missing this")?;
     let other = args.get(1).ok_or("Missing other Set")?;
     let this_values = get_set_values(set)?;
@@ -420,7 +421,7 @@ fn native_set_intersection(
 fn native_set_difference(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("Missing this")?;
     let other = args.get(1).ok_or("Missing other Set")?;
     let this_values = get_set_values(set)?;
@@ -441,7 +442,7 @@ fn native_set_difference(
 fn native_set_symmetric_difference(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("Missing this")?;
     let other = args.get(1).ok_or("Missing other Set")?;
     let this_values = get_set_values(set)?;
@@ -472,7 +473,7 @@ fn native_set_symmetric_difference(
 fn native_set_is_subset_of(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("Missing this")?;
     let other = args.get(1).ok_or("Missing other Set")?;
     let this_values = get_set_values(set)?;
@@ -491,7 +492,7 @@ fn native_set_is_subset_of(
 fn native_set_is_superset_of(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("Missing this")?;
     let other = args.get(1).ok_or("Missing other Set")?;
     let other_values = get_set_values(other)?;
@@ -510,7 +511,7 @@ fn native_set_is_superset_of(
 fn native_set_is_disjoint_from(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("Missing this")?;
     let other = args.get(1).ok_or("Missing other Set")?;
     let this_values = get_set_values(set)?;
@@ -533,7 +534,7 @@ fn native_set_is_disjoint_from(
 fn native_weakset_new(
     _args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let set_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
 
     let values_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
@@ -544,11 +545,11 @@ fn native_weakset_new(
 }
 
 /// Helper to validate WeakSet value (must be object or symbol)
-fn validate_weakset_value(value: &VmValue) -> Result<(), String> {
+fn validate_weakset_value(value: &VmValue) -> Result<(), VmError> {
     if value.is_object() || value.is_symbol() || value.is_function() {
         Ok(())
     } else {
-        Err("Invalid value used in weak set".to_string())
+        Err(VmError::type_error("Invalid value used in weak set"))
     }
 }
 
@@ -556,7 +557,7 @@ fn validate_weakset_value(value: &VmValue) -> Result<(), String> {
 fn native_weakset_add(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("WeakSet.add requires a WeakSet")?;
     let value = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -566,7 +567,7 @@ fn native_weakset_add(
         .get(&str_to_key(IS_WEAKSET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_weakset.as_boolean() != Some(true) {
-        return Err("Method WeakSet.prototype.add called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method WeakSet.prototype.add called on incompatible receiver"));
     }
 
     validate_weakset_value(&value)?;
@@ -588,7 +589,7 @@ fn native_weakset_add(
 fn native_weakset_has(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("WeakSet.has requires a WeakSet")?;
     let value = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -598,7 +599,7 @@ fn native_weakset_has(
         .get(&str_to_key(IS_WEAKSET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_weakset.as_boolean() != Some(true) {
-        return Err("Method WeakSet.prototype.has called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method WeakSet.prototype.has called on incompatible receiver"));
     }
 
     if !value.is_object() && !value.is_symbol() && !value.is_function() {
@@ -622,7 +623,7 @@ fn native_weakset_has(
 fn native_weakset_delete(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("WeakSet.delete requires a WeakSet")?;
     let value = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -632,7 +633,7 @@ fn native_weakset_delete(
         .get(&str_to_key(IS_WEAKSET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_weakset.as_boolean() != Some(true) {
-        return Err("Method WeakSet.prototype.delete called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method WeakSet.prototype.delete called on incompatible receiver"));
     }
 
     if !value.is_object() && !value.is_symbol() && !value.is_function() {

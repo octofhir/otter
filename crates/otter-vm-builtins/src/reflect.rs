@@ -15,6 +15,7 @@
 //! - `Reflect.apply(target, thisArgument, argumentsList)`
 //! - `Reflect.construct(target, argumentsList, newTarget?)`
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::string::JsString;
@@ -81,20 +82,20 @@ fn to_property_key(value: &VmValue) -> PropertyKey {
 }
 
 /// Get object from value, checking for proxy first
-fn get_target_object(value: &VmValue) -> Result<GcRef<JsObject>, String> {
+fn get_target_object(value: &VmValue) -> Result<GcRef<JsObject>, VmError> {
     // Check if it's a proxy first
     if let Some(proxy) = value.as_proxy() {
         return proxy
             .target()
-            .ok_or_else(|| "Cannot perform operation on a revoked proxy".to_string());
+            .ok_or_else(|| VmError::type_error("Cannot perform operation on a revoked proxy"));
     }
 
     value.as_object().ok_or_else(|| {
-        format!(
+        VmError::type_error(format!(
             "Reflect method requires an object target (got {}: {:?})",
             value.type_of(),
             value
-        )
+        ))
     })
 }
 
@@ -107,7 +108,7 @@ fn get_target_object(value: &VmValue) -> Result<GcRef<JsObject>, String> {
 fn native_reflect_get(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let target = args
         .first()
         .ok_or("Reflect.get requires a target argument")?;
@@ -127,7 +128,7 @@ fn native_reflect_get(
 fn native_reflect_set(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let target = args
         .first()
         .ok_or("Reflect.set requires a target argument")?;
@@ -149,7 +150,7 @@ fn native_reflect_set(
 fn native_reflect_has(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let target = args
         .first()
         .ok_or("Reflect.has requires a target argument")?;
@@ -168,7 +169,7 @@ fn native_reflect_has(
 fn native_reflect_delete_property(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let target = args
         .first()
         .ok_or("Reflect.deleteProperty requires a target argument")?;
@@ -188,7 +189,7 @@ fn native_reflect_delete_property(
 fn native_reflect_own_keys(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let target = args
         .first()
         .ok_or("Reflect.ownKeys requires a target argument")?;
@@ -256,7 +257,7 @@ fn native_reflect_own_keys(
 fn native_reflect_get_own_property_descriptor(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let target = args
         .first()
         .ok_or("Reflect.getOwnPropertyDescriptor requires a target argument")?;
@@ -320,7 +321,7 @@ fn native_reflect_get_own_property_descriptor(
 fn native_reflect_define_property(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let target = args
         .first()
         .ok_or("Reflect.defineProperty requires a target argument")?;
@@ -335,7 +336,7 @@ fn native_reflect_define_property(
     let key = to_property_key(property_key);
 
     let Some(attr_obj) = attributes.as_object() else {
-        return Err("Reflect.defineProperty requires attributes to be an object".to_string());
+        return Err(VmError::type_error("Reflect.defineProperty requires attributes to be an object"));
     };
 
     // Helper to read boolean fields with default true (the common case for builtins)
@@ -407,7 +408,7 @@ fn native_reflect_define_property(
 fn native_reflect_get_prototype_of(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let target = args
         .first()
         .ok_or("Reflect.getPrototypeOf requires a target argument")?;
@@ -425,7 +426,7 @@ fn native_reflect_get_prototype_of(
 fn native_reflect_set_prototype_of(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let target = args
         .first()
         .ok_or("Reflect.setPrototypeOf requires a target argument")?;
@@ -440,7 +441,7 @@ fn native_reflect_set_prototype_of(
     } else if let Some(proto_obj) = prototype.as_object() {
         Some(proto_obj)
     } else {
-        return Err("Prototype must be an object or null".to_string());
+        return Err(VmError::type_error("Prototype must be an object or null"));
     };
 
     let success = obj.set_prototype(new_proto);
@@ -452,7 +453,7 @@ fn native_reflect_set_prototype_of(
 fn native_reflect_is_extensible(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let target = args
         .first()
         .ok_or("Reflect.isExtensible requires a target argument")?;
@@ -466,7 +467,7 @@ fn native_reflect_is_extensible(
 fn native_reflect_prevent_extensions(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let target = args
         .first()
         .ok_or("Reflect.preventExtensions requires a target argument")?;

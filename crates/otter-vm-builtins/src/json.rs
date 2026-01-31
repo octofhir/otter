@@ -6,6 +6,7 @@
 //! - `JSON.rawJSON(string)` - create raw JSON wrapper (ES2024+)
 //! - `JSON.isRawJSON(value)` - check if value is raw JSON (ES2024+)
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyKey};
@@ -31,8 +32,8 @@ pub fn ops() -> Vec<Op> {
 // =============================================================================
 
 /// Parse JSON string with optional depth limit to prevent stack overflow
-fn parse_json_safe(text: &str) -> Result<JsonValue, String> {
-    serde_json::from_str(text).map_err(|e| format!("SyntaxError: {}", e))
+fn parse_json_safe(text: &str) -> Result<JsonValue, VmError> {
+    serde_json::from_str(text).map_err(|e| VmError::type_error(format!("SyntaxError: {}", e)))
 }
 
 fn json_to_value(value: &JsonValue, mm: Arc<memory::MemoryManager>) -> Value {
@@ -67,7 +68,7 @@ fn json_to_value(value: &JsonValue, mm: Arc<memory::MemoryManager>) -> Value {
 
 /// JSON.parse(text, reviver?)
 /// Parse a JSON string, returning the JavaScript value or object described by the string.
-fn json_parse(args: &[Value], mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn json_parse(args: &[Value], mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let text = args
         .first()
         .and_then(|v| v.as_string())
@@ -81,7 +82,7 @@ fn json_parse(args: &[Value], mm: Arc<memory::MemoryManager>) -> Result<Value, S
 
 /// JSON.stringify(value, replacer?, space?)
 /// Convert a JavaScript value to a JSON string.
-fn json_stringify(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn json_stringify(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     // Get the value as JSON string from JS side
     let value_str = args
         .first()
@@ -120,7 +121,7 @@ fn json_stringify(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Val
         let indent_str = " ".repeat(indent);
         format_json_pretty(&parsed, &indent_str)
     } else {
-        serde_json::to_string(&parsed).map_err(|e| format!("TypeError: {}", e))?
+        serde_json::to_string(&parsed).map_err(|e| VmError::type_error(format!("TypeError: {}", e)))?
     };
 
     Ok(Value::string(JsString::intern(&result)))
@@ -141,7 +142,7 @@ fn format_json_pretty(value: &JsonValue, indent: &str) -> String {
 /// JSON.rawJSON(string) - ES2024+
 /// Creates a "raw JSON" object that can be serialized without modification.
 /// Used for exact numeric representation (BigInt, high-precision numbers).
-fn json_raw_json(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn json_raw_json(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let text = args
         .first()
         .and_then(|v| v.as_string())
@@ -156,7 +157,7 @@ fn json_raw_json(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Valu
     // rawJSON only accepts primitives (string, number, boolean, null)
     match &parsed {
         JsonValue::Object(_) | JsonValue::Array(_) => {
-            return Err("SyntaxError: JSON.rawJSON only accepts JSON primitives".to_string());
+            return Err(VmError::SyntaxError("JSON.rawJSON only accepts JSON primitives".to_string()));
         }
         _ => {}
     }
@@ -172,7 +173,7 @@ fn json_raw_json(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Valu
 
 /// JSON.isRawJSON(value) - ES2024+
 /// Tests whether a value is an object returned by JSON.rawJSON().
-fn json_is_raw_json(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn json_is_raw_json(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let value = match args.first() {
         Some(v) => v,
         None => return Ok(Value::boolean(false)),

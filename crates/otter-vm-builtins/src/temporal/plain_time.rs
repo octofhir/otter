@@ -1,8 +1,8 @@
 //! Temporal.PlainTime - time without date or timezone
 
 use chrono::NaiveTime;
-use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
+use otter_vm_core::{VmError, string::JsString};
 use otter_vm_runtime::{Op, op_native};
 
 pub fn ops() -> Vec<Op> {
@@ -72,11 +72,11 @@ fn format_time(t: NaiveTime, nanos: u32) -> String {
     )
 }
 
-fn plain_time_from(args: &[Value]) -> Result<Value, String> {
+fn plain_time_from(args: &[Value]) -> Result<Value, VmError> {
     let s = args
         .first()
         .and_then(|v| v.as_string())
-        .ok_or("PlainTime.from requires a string")?;
+        .ok_or(VmError::type_error("PlainTime.from requires a string"))?;
 
     // Extract time part if ISO datetime
     let time_str = if s.as_str().contains('T') {
@@ -92,11 +92,11 @@ fn plain_time_from(args: &[Value]) -> Result<Value, String> {
 
     match parse_time(time_str) {
         Some((t, nanos)) => Ok(Value::string(JsString::intern(&format_time(t, nanos)))),
-        None => Err(format!("Invalid time string: {}", s)),
+        None => Err(VmError::type_error(format!("Invalid time string: {}", s))),
     }
 }
 
-fn plain_time_compare(args: &[Value]) -> Result<Value, String> {
+fn plain_time_compare(args: &[Value]) -> Result<Value, VmError> {
     let t1 = get_time(args);
     let t2 = args
         .get(1)
@@ -112,48 +112,48 @@ fn plain_time_compare(args: &[Value]) -> Result<Value, String> {
                 std::cmp::Ordering::Greater => 1,
             }))
         }
-        _ => Err("Invalid times for comparison".to_string()),
+        _ => Err(VmError::type_error("Invalid times for comparison")),
     }
 }
 
-fn plain_time_hour(args: &[Value]) -> Result<Value, String> {
+fn plain_time_hour(args: &[Value]) -> Result<Value, VmError> {
     get_time(args)
         .map(|(t, _)| Value::int32(t.hour() as i32))
-        .ok_or_else(|| "Invalid PlainTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainTime"))
 }
 
-fn plain_time_minute(args: &[Value]) -> Result<Value, String> {
+fn plain_time_minute(args: &[Value]) -> Result<Value, VmError> {
     get_time(args)
         .map(|(t, _)| Value::int32(t.minute() as i32))
-        .ok_or_else(|| "Invalid PlainTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainTime"))
 }
 
-fn plain_time_second(args: &[Value]) -> Result<Value, String> {
+fn plain_time_second(args: &[Value]) -> Result<Value, VmError> {
     get_time(args)
         .map(|(t, _)| Value::int32(t.second() as i32))
-        .ok_or_else(|| "Invalid PlainTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainTime"))
 }
 
-fn plain_time_millisecond(args: &[Value]) -> Result<Value, String> {
+fn plain_time_millisecond(args: &[Value]) -> Result<Value, VmError> {
     get_time(args)
         .map(|(_, nanos)| Value::int32((nanos / 1_000_000) as i32))
-        .ok_or_else(|| "Invalid PlainTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainTime"))
 }
 
-fn plain_time_microsecond(args: &[Value]) -> Result<Value, String> {
+fn plain_time_microsecond(args: &[Value]) -> Result<Value, VmError> {
     get_time(args)
         .map(|(_, nanos)| Value::int32(((nanos / 1_000) % 1_000) as i32))
-        .ok_or_else(|| "Invalid PlainTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainTime"))
 }
 
-fn plain_time_nanosecond(args: &[Value]) -> Result<Value, String> {
+fn plain_time_nanosecond(args: &[Value]) -> Result<Value, VmError> {
     get_time(args)
         .map(|(_, nanos)| Value::int32((nanos % 1_000) as i32))
-        .ok_or_else(|| "Invalid PlainTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainTime"))
 }
 
-fn plain_time_add(args: &[Value]) -> Result<Value, String> {
-    let (time, nanos) = get_time(args).ok_or("Invalid PlainTime")?;
+fn plain_time_add(args: &[Value]) -> Result<Value, VmError> {
+    let (time, nanos) = get_time(args).ok_or(VmError::type_error("Invalid PlainTime"))?;
     let add_nanos = args.get(1).and_then(|v| v.as_int32()).unwrap_or(0) as i64;
 
     let total_nanos =
@@ -169,8 +169,8 @@ fn plain_time_add(args: &[Value]) -> Result<Value, String> {
     ))))
 }
 
-fn plain_time_subtract(args: &[Value]) -> Result<Value, String> {
-    let (time, nanos) = get_time(args).ok_or("Invalid PlainTime")?;
+fn plain_time_subtract(args: &[Value]) -> Result<Value, VmError> {
+    let (time, nanos) = get_time(args).ok_or(VmError::type_error("Invalid PlainTime"))?;
     let sub_nanos = args.get(1).and_then(|v| v.as_int32()).unwrap_or(0) as i64;
 
     let total_nanos =
@@ -186,13 +186,13 @@ fn plain_time_subtract(args: &[Value]) -> Result<Value, String> {
     ))))
 }
 
-fn plain_time_until(args: &[Value]) -> Result<Value, String> {
-    let (t1, n1) = get_time(args).ok_or("Invalid PlainTime")?;
+fn plain_time_until(args: &[Value]) -> Result<Value, VmError> {
+    let (t1, n1) = get_time(args).ok_or(VmError::type_error("Invalid PlainTime"))?;
     let (t2, n2) = args
         .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_time(s.as_str()))
-        .ok_or("Invalid target time")?;
+        .ok_or(VmError::type_error("Invalid target time"))?;
 
     let nanos1 = t1.num_seconds_from_midnight() as i64 * 1_000_000_000 + n1 as i64;
     let nanos2 = t2.num_seconds_from_midnight() as i64 * 1_000_000_000 + n2 as i64;
@@ -202,13 +202,13 @@ fn plain_time_until(args: &[Value]) -> Result<Value, String> {
     )))
 }
 
-fn plain_time_since(args: &[Value]) -> Result<Value, String> {
-    let (t1, n1) = get_time(args).ok_or("Invalid PlainTime")?;
+fn plain_time_since(args: &[Value]) -> Result<Value, VmError> {
+    let (t1, n1) = get_time(args).ok_or(VmError::type_error("Invalid PlainTime"))?;
     let (t2, n2) = args
         .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_time(s.as_str()))
-        .ok_or("Invalid target time")?;
+        .ok_or(VmError::type_error("Invalid target time"))?;
 
     let nanos1 = t1.num_seconds_from_midnight() as i64 * 1_000_000_000 + n1 as i64;
     let nanos2 = t2.num_seconds_from_midnight() as i64 * 1_000_000_000 + n2 as i64;
@@ -218,8 +218,8 @@ fn plain_time_since(args: &[Value]) -> Result<Value, String> {
     )))
 }
 
-fn plain_time_with(args: &[Value]) -> Result<Value, String> {
-    let (time, nanos) = get_time(args).ok_or("Invalid PlainTime")?;
+fn plain_time_with(args: &[Value]) -> Result<Value, VmError> {
+    let (time, nanos) = get_time(args).ok_or(VmError::type_error("Invalid PlainTime"))?;
 
     let hour = args
         .get(1)
@@ -244,11 +244,11 @@ fn plain_time_with(args: &[Value]) -> Result<Value, String> {
 
     NaiveTime::from_hms_opt(hour, minute, second)
         .map(|t| Value::string(JsString::intern(&format_time(t, new_nanos))))
-        .ok_or_else(|| "Invalid time components".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid time components"))
 }
 
-fn plain_time_round(args: &[Value]) -> Result<Value, String> {
-    let (time, nanos) = get_time(args).ok_or("Invalid PlainTime")?;
+fn plain_time_round(args: &[Value]) -> Result<Value, VmError> {
+    let (time, nanos) = get_time(args).ok_or(VmError::type_error("Invalid PlainTime"))?;
     let unit = args
         .get(1)
         .and_then(|v| v.as_string())
@@ -274,7 +274,7 @@ fn plain_time_round(args: &[Value]) -> Result<Value, String> {
     ))))
 }
 
-fn plain_time_equals(args: &[Value]) -> Result<Value, String> {
+fn plain_time_equals(args: &[Value]) -> Result<Value, VmError> {
     let t1 = get_time(args);
     let t2 = args
         .get(1)
@@ -284,23 +284,23 @@ fn plain_time_equals(args: &[Value]) -> Result<Value, String> {
     Ok(Value::boolean(t1 == t2))
 }
 
-fn plain_time_to_string(args: &[Value]) -> Result<Value, String> {
+fn plain_time_to_string(args: &[Value]) -> Result<Value, VmError> {
     get_time(args)
         .map(|(t, nanos)| Value::string(JsString::intern(&format_time(t, nanos))))
-        .ok_or_else(|| "Invalid PlainTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainTime"))
 }
 
-fn plain_time_to_json(args: &[Value]) -> Result<Value, String> {
+fn plain_time_to_json(args: &[Value]) -> Result<Value, VmError> {
     plain_time_to_string(args)
 }
 
-fn plain_time_to_plain_date_time(args: &[Value]) -> Result<Value, String> {
-    let (time, nanos) = get_time(args).ok_or("Invalid PlainTime")?;
+fn plain_time_to_plain_date_time(args: &[Value]) -> Result<Value, VmError> {
+    let (time, nanos) = get_time(args).ok_or(VmError::type_error("Invalid PlainTime"))?;
     let date = args
         .get(1)
         .and_then(|v| v.as_string())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| "1970-01-01".to_string());
+        .unwrap_or_else(|| "1970-01-01".to_owned());
 
     Ok(Value::string(JsString::intern(&format!(
         "{}T{}",

@@ -2,8 +2,8 @@
 
 use chrono::{Datelike, TimeZone, Timelike};
 use chrono_tz::Tz;
-use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
+use otter_vm_core::{VmError, string::JsString};
 use otter_vm_runtime::{Op, op_native};
 
 pub fn ops() -> Vec<Op> {
@@ -145,19 +145,22 @@ fn format_zoned_date_time(c: &ZonedDateTimeComponents) -> String {
     )
 }
 
-fn zoned_date_time_from(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_from(args: &[Value]) -> Result<Value, VmError> {
     let s = args
         .first()
         .and_then(|v| v.as_string())
-        .ok_or("ZonedDateTime.from requires a string")?;
+        .ok_or(VmError::type_error("ZonedDateTime.from requires a string"))?;
 
     match parse_zoned_date_time(s.as_str()) {
         Some(c) => Ok(Value::string(JsString::intern(&format_zoned_date_time(&c)))),
-        None => Err(format!("Invalid ZonedDateTime string: {}", s)),
+        None => Err(VmError::type_error(format!(
+            "Invalid ZonedDateTime string: {}",
+            s
+        ))),
     }
 }
 
-fn zoned_date_time_compare(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_compare(args: &[Value]) -> Result<Value, VmError> {
     // Compare by epoch nanoseconds
     let ns1 = get_epoch_nanos(args);
     let ns2 = args
@@ -172,7 +175,7 @@ fn zoned_date_time_compare(args: &[Value]) -> Result<Value, String> {
             std::cmp::Ordering::Equal => 0,
             std::cmp::Ordering::Greater => 1,
         })),
-        _ => Err("Invalid ZonedDateTime for comparison".to_string()),
+        _ => Err(VmError::type_error("Invalid ZonedDateTime for comparison")),
     }
 }
 
@@ -188,91 +191,91 @@ fn compute_epoch_nanos(c: &ZonedDateTimeComponents) -> Option<i128> {
     Some(dt.timestamp_nanos_opt()? as i128)
 }
 
-fn zoned_date_time_year(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_year(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
         .map(|c| Value::int32(c.year))
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_month(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_month(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
         .map(|c| Value::int32(c.month as i32))
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_day(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_day(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
         .map(|c| Value::int32(c.day as i32))
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_hour(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_hour(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
         .map(|c| Value::int32(c.hour as i32))
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_minute(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_minute(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
         .map(|c| Value::int32(c.minute as i32))
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_second(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_second(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
         .map(|c| Value::int32(c.second as i32))
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_millisecond(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_millisecond(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
         .map(|c| Value::int32((c.nanos / 1_000_000) as i32))
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_timezone_id(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_timezone_id(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
         .map(|c| Value::string(JsString::intern(&c.timezone)))
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_offset(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_offset(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
         .map(|c| Value::string(JsString::intern(&c.offset)))
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_epoch_seconds(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_epoch_seconds(args: &[Value]) -> Result<Value, VmError> {
     get_epoch_nanos(args)
         .map(|ns| Value::number((ns / 1_000_000_000) as f64))
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_epoch_milliseconds(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_epoch_milliseconds(args: &[Value]) -> Result<Value, VmError> {
     get_epoch_nanos(args)
         .map(|ns| Value::number((ns / 1_000_000) as f64))
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_epoch_nanoseconds(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_epoch_nanoseconds(args: &[Value]) -> Result<Value, VmError> {
     get_epoch_nanos(args)
         .map(|ns| Value::string(JsString::intern(&ns.to_string())))
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_add(args: &[Value]) -> Result<Value, String> {
-    let c = get_zoned_date_time(args).ok_or("Invalid ZonedDateTime")?;
+fn zoned_date_time_add(args: &[Value]) -> Result<Value, VmError> {
+    let c = get_zoned_date_time(args).ok_or(VmError::type_error("Invalid ZonedDateTime"))?;
     let add_days = args.get(1).and_then(|v| v.as_int32()).unwrap_or(0) as i64;
 
     let tz: Tz = c.timezone.parse().map_err(|_| "Invalid timezone")?;
     let naive = chrono::NaiveDate::from_ymd_opt(c.year, c.month, c.day)
         .and_then(|d| d.and_hms_nano_opt(c.hour, c.minute, c.second, c.nanos))
-        .ok_or("Invalid date")?;
+        .ok_or(VmError::type_error("Invalid date"))?;
 
     let dt = tz
         .from_local_datetime(&naive)
         .single()
-        .ok_or("Ambiguous local time")?;
+        .ok_or(VmError::type_error("Ambiguous local time"))?;
     let new_dt = dt + chrono::Duration::days(add_days);
 
     let new_c = ZonedDateTimeComponents {
@@ -292,19 +295,19 @@ fn zoned_date_time_add(args: &[Value]) -> Result<Value, String> {
     ))))
 }
 
-fn zoned_date_time_subtract(args: &[Value]) -> Result<Value, String> {
-    let c = get_zoned_date_time(args).ok_or("Invalid ZonedDateTime")?;
+fn zoned_date_time_subtract(args: &[Value]) -> Result<Value, VmError> {
+    let c = get_zoned_date_time(args).ok_or(VmError::type_error("Invalid ZonedDateTime"))?;
     let sub_days = args.get(1).and_then(|v| v.as_int32()).unwrap_or(0) as i64;
 
     let tz: Tz = c.timezone.parse().map_err(|_| "Invalid timezone")?;
     let naive = chrono::NaiveDate::from_ymd_opt(c.year, c.month, c.day)
         .and_then(|d| d.and_hms_nano_opt(c.hour, c.minute, c.second, c.nanos))
-        .ok_or("Invalid date")?;
+        .ok_or(VmError::type_error("Invalid date"))?;
 
     let dt = tz
         .from_local_datetime(&naive)
         .single()
-        .ok_or("Ambiguous local time")?;
+        .ok_or(VmError::type_error("Ambiguous local time"))?;
     let new_dt = dt - chrono::Duration::days(sub_days);
 
     let new_c = ZonedDateTimeComponents {
@@ -324,8 +327,8 @@ fn zoned_date_time_subtract(args: &[Value]) -> Result<Value, String> {
     ))))
 }
 
-fn zoned_date_time_with(args: &[Value]) -> Result<Value, String> {
-    let c = get_zoned_date_time(args).ok_or("Invalid ZonedDateTime")?;
+fn zoned_date_time_with(args: &[Value]) -> Result<Value, VmError> {
+    let c = get_zoned_date_time(args).ok_or(VmError::type_error("Invalid ZonedDateTime"))?;
 
     let year = args.get(1).and_then(|v| v.as_int32()).unwrap_or(c.year);
     let month = args
@@ -356,12 +359,14 @@ fn zoned_date_time_with(args: &[Value]) -> Result<Value, String> {
     ))))
 }
 
-fn zoned_date_time_with_timezone(args: &[Value]) -> Result<Value, String> {
-    let c = get_zoned_date_time(args).ok_or("Invalid ZonedDateTime")?;
+fn zoned_date_time_with_timezone(args: &[Value]) -> Result<Value, VmError> {
+    let c = get_zoned_date_time(args).ok_or(VmError::type_error("Invalid ZonedDateTime"))?;
     let new_tz = args
         .get(1)
         .and_then(|v| v.as_string())
-        .ok_or("withTimeZone requires a timezone string")?;
+        .ok_or(VmError::type_error(
+            "withTimeZone requires a timezone string",
+        ))?;
 
     // Convert to instant and then to new timezone
     let old_tz: Tz = c
@@ -375,12 +380,12 @@ fn zoned_date_time_with_timezone(args: &[Value]) -> Result<Value, String> {
 
     let naive = chrono::NaiveDate::from_ymd_opt(c.year, c.month, c.day)
         .and_then(|d| d.and_hms_nano_opt(c.hour, c.minute, c.second, c.nanos))
-        .ok_or("Invalid date")?;
+        .ok_or(VmError::type_error("Invalid date"))?;
 
     let old_dt = old_tz
         .from_local_datetime(&naive)
         .single()
-        .ok_or("Ambiguous local time")?;
+        .ok_or(VmError::type_error("Ambiguous local time"))?;
     let new_dt = old_dt.with_timezone(&new_tz_obj);
 
     let new_c = ZonedDateTimeComponents {
@@ -400,7 +405,7 @@ fn zoned_date_time_with_timezone(args: &[Value]) -> Result<Value, String> {
     ))))
 }
 
-fn zoned_date_time_equals(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_equals(args: &[Value]) -> Result<Value, VmError> {
     let ns1 = get_epoch_nanos(args);
     let ns2 = args
         .get(1)
@@ -411,23 +416,23 @@ fn zoned_date_time_equals(args: &[Value]) -> Result<Value, String> {
     Ok(Value::boolean(ns1 == ns2))
 }
 
-fn zoned_date_time_to_string(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_to_string(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
         .map(|c| Value::string(JsString::intern(&format_zoned_date_time(&c))))
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_to_json(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_to_json(args: &[Value]) -> Result<Value, VmError> {
     zoned_date_time_to_string(args)
 }
 
-fn zoned_date_time_to_instant(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_to_instant(args: &[Value]) -> Result<Value, VmError> {
     get_epoch_nanos(args)
         .map(|ns| Value::string(JsString::intern(&ns.to_string())))
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_to_plain_date_time(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_to_plain_date_time(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
         .map(|c| {
             Value::string(JsString::intern(&format!(
@@ -435,10 +440,10 @@ fn zoned_date_time_to_plain_date_time(args: &[Value]) -> Result<Value, String> {
                 c.year, c.month, c.day, c.hour, c.minute, c.second, c.nanos
             )))
         })
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_to_plain_date(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_to_plain_date(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
         .map(|c| {
             Value::string(JsString::intern(&format!(
@@ -446,10 +451,10 @@ fn zoned_date_time_to_plain_date(args: &[Value]) -> Result<Value, String> {
                 c.year, c.month, c.day
             )))
         })
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
-fn zoned_date_time_to_plain_time(args: &[Value]) -> Result<Value, String> {
+fn zoned_date_time_to_plain_time(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
         .map(|c| {
             Value::string(JsString::intern(&format!(
@@ -457,7 +462,7 @@ fn zoned_date_time_to_plain_time(args: &[Value]) -> Result<Value, String> {
                 c.hour, c.minute, c.second, c.nanos
             )))
         })
-        .ok_or_else(|| "Invalid ZonedDateTime".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
 #[cfg(test)]

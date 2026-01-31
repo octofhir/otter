@@ -1,5 +1,6 @@
 //! Temporal.Duration - represents a span of time
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
 use otter_vm_runtime::{Op, op_native};
@@ -202,19 +203,22 @@ fn format_duration(d: &DurationComponents) -> String {
     result
 }
 
-fn duration_from(args: &[Value]) -> Result<Value, String> {
+fn duration_from(args: &[Value]) -> Result<Value, VmError> {
     let s = args
         .first()
         .and_then(|v| v.as_string())
-        .ok_or("Duration.from requires a string")?;
+        .ok_or(VmError::type_error("Duration.from requires a string"))?;
 
     match parse_duration(s.as_str()) {
         Some(d) => Ok(Value::string(JsString::intern(&format_duration(&d)))),
-        None => Err(format!("Invalid Duration string: {}", s)),
+        None => Err(VmError::type_error(format!(
+            "Invalid Duration string: {}",
+            s
+        ))),
     }
 }
 
-fn duration_compare(args: &[Value]) -> Result<Value, String> {
+fn duration_compare(args: &[Value]) -> Result<Value, VmError> {
     let d1 = get_duration(args);
     let d2 = args
         .get(1)
@@ -230,83 +234,83 @@ fn duration_compare(args: &[Value]) -> Result<Value, String> {
                 std::cmp::Ordering::Greater => 1,
             }))
         }
-        _ => Err("Invalid Duration for comparison".to_string()),
+        _ => Err(VmError::type_error("Invalid Duration for comparison")),
     }
 }
 
-fn duration_years(args: &[Value]) -> Result<Value, String> {
+fn duration_years(args: &[Value]) -> Result<Value, VmError> {
     get_duration(args)
         .map(|d| Value::int32(d.years))
-        .ok_or_else(|| "Invalid Duration".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid Duration"))
 }
 
-fn duration_months(args: &[Value]) -> Result<Value, String> {
+fn duration_months(args: &[Value]) -> Result<Value, VmError> {
     get_duration(args)
         .map(|d| Value::int32(d.months))
-        .ok_or_else(|| "Invalid Duration".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid Duration"))
 }
 
-fn duration_weeks(args: &[Value]) -> Result<Value, String> {
+fn duration_weeks(args: &[Value]) -> Result<Value, VmError> {
     get_duration(args)
         .map(|d| Value::int32(d.weeks))
-        .ok_or_else(|| "Invalid Duration".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid Duration"))
 }
 
-fn duration_days(args: &[Value]) -> Result<Value, String> {
+fn duration_days(args: &[Value]) -> Result<Value, VmError> {
     get_duration(args)
         .map(|d| Value::int32(d.days))
-        .ok_or_else(|| "Invalid Duration".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid Duration"))
 }
 
-fn duration_hours(args: &[Value]) -> Result<Value, String> {
+fn duration_hours(args: &[Value]) -> Result<Value, VmError> {
     get_duration(args)
         .map(|d| Value::int32(d.hours))
-        .ok_or_else(|| "Invalid Duration".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid Duration"))
 }
 
-fn duration_minutes(args: &[Value]) -> Result<Value, String> {
+fn duration_minutes(args: &[Value]) -> Result<Value, VmError> {
     get_duration(args)
         .map(|d| Value::int32(d.minutes))
-        .ok_or_else(|| "Invalid Duration".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid Duration"))
 }
 
-fn duration_seconds(args: &[Value]) -> Result<Value, String> {
+fn duration_seconds(args: &[Value]) -> Result<Value, VmError> {
     get_duration(args)
         .map(|d| Value::int32(d.seconds))
-        .ok_or_else(|| "Invalid Duration".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid Duration"))
 }
 
-fn duration_milliseconds(args: &[Value]) -> Result<Value, String> {
+fn duration_milliseconds(args: &[Value]) -> Result<Value, VmError> {
     get_duration(args)
         .map(|d| Value::int32(d.milliseconds))
-        .ok_or_else(|| "Invalid Duration".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid Duration"))
 }
 
-fn duration_microseconds(args: &[Value]) -> Result<Value, String> {
+fn duration_microseconds(args: &[Value]) -> Result<Value, VmError> {
     get_duration(args)
         .map(|d| Value::int32(d.microseconds))
-        .ok_or_else(|| "Invalid Duration".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid Duration"))
 }
 
-fn duration_nanoseconds(args: &[Value]) -> Result<Value, String> {
+fn duration_nanoseconds(args: &[Value]) -> Result<Value, VmError> {
     get_duration(args)
         .map(|d| Value::int32(d.nanoseconds as i32))
-        .ok_or_else(|| "Invalid Duration".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid Duration"))
 }
 
-fn duration_sign(args: &[Value]) -> Result<Value, String> {
+fn duration_sign(args: &[Value]) -> Result<Value, VmError> {
     get_duration(args)
         .map(|d| Value::int32(d.sign()))
-        .ok_or_else(|| "Invalid Duration".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid Duration"))
 }
 
-fn duration_blank(args: &[Value]) -> Result<Value, String> {
+fn duration_blank(args: &[Value]) -> Result<Value, VmError> {
     get_duration(args)
         .map(|d| Value::boolean(d.is_blank()))
-        .ok_or_else(|| "Invalid Duration".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid Duration"))
 }
 
-fn duration_negated(args: &[Value]) -> Result<Value, String> {
+fn duration_negated(args: &[Value]) -> Result<Value, VmError> {
     get_duration(args)
         .map(|d| {
             let neg = DurationComponents {
@@ -323,10 +327,10 @@ fn duration_negated(args: &[Value]) -> Result<Value, String> {
             };
             Value::string(JsString::intern(&format_duration(&neg)))
         })
-        .ok_or_else(|| "Invalid Duration".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid Duration"))
 }
 
-fn duration_abs(args: &[Value]) -> Result<Value, String> {
+fn duration_abs(args: &[Value]) -> Result<Value, VmError> {
     get_duration(args)
         .map(|d| {
             let abs = DurationComponents {
@@ -343,16 +347,16 @@ fn duration_abs(args: &[Value]) -> Result<Value, String> {
             };
             Value::string(JsString::intern(&format_duration(&abs)))
         })
-        .ok_or_else(|| "Invalid Duration".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid Duration"))
 }
 
-fn duration_add(args: &[Value]) -> Result<Value, String> {
-    let d1 = get_duration(args).ok_or("Invalid Duration")?;
+fn duration_add(args: &[Value]) -> Result<Value, VmError> {
+    let d1 = get_duration(args).ok_or(VmError::type_error("Invalid Duration"))?;
     let d2 = args
         .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_duration(s.as_str()))
-        .ok_or("Invalid Duration to add")?;
+        .ok_or(VmError::type_error("Invalid Duration to add"))?;
 
     let sum = DurationComponents {
         years: d1.years + d2.years,
@@ -370,13 +374,13 @@ fn duration_add(args: &[Value]) -> Result<Value, String> {
     Ok(Value::string(JsString::intern(&format_duration(&sum))))
 }
 
-fn duration_subtract(args: &[Value]) -> Result<Value, String> {
-    let d1 = get_duration(args).ok_or("Invalid Duration")?;
+fn duration_subtract(args: &[Value]) -> Result<Value, VmError> {
+    let d1 = get_duration(args).ok_or(VmError::type_error("Invalid Duration"))?;
     let d2 = args
         .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_duration(s.as_str()))
-        .ok_or("Invalid Duration to subtract")?;
+        .ok_or(VmError::type_error("Invalid Duration to subtract"))?;
 
     let diff = DurationComponents {
         years: d1.years - d2.years,
@@ -394,8 +398,8 @@ fn duration_subtract(args: &[Value]) -> Result<Value, String> {
     Ok(Value::string(JsString::intern(&format_duration(&diff))))
 }
 
-fn duration_round(args: &[Value]) -> Result<Value, String> {
-    let d = get_duration(args).ok_or("Invalid Duration")?;
+fn duration_round(args: &[Value]) -> Result<Value, VmError> {
+    let d = get_duration(args).ok_or(VmError::type_error("Invalid Duration"))?;
     let unit = args
         .get(1)
         .and_then(|v| v.as_string())
@@ -407,8 +411,8 @@ fn duration_round(args: &[Value]) -> Result<Value, String> {
     Ok(Value::string(JsString::intern(&format_duration(&d))))
 }
 
-fn duration_total(args: &[Value]) -> Result<Value, String> {
-    let d = get_duration(args).ok_or("Invalid Duration")?;
+fn duration_total(args: &[Value]) -> Result<Value, VmError> {
+    let d = get_duration(args).ok_or(VmError::type_error("Invalid Duration"))?;
     let unit = args
         .get(1)
         .and_then(|v| v.as_string())
@@ -431,13 +435,13 @@ fn duration_total(args: &[Value]) -> Result<Value, String> {
     Ok(Value::number(result))
 }
 
-fn duration_to_string(args: &[Value]) -> Result<Value, String> {
+fn duration_to_string(args: &[Value]) -> Result<Value, VmError> {
     get_duration(args)
         .map(|d| Value::string(JsString::intern(&format_duration(&d))))
-        .ok_or_else(|| "Invalid Duration".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid Duration"))
 }
 
-fn duration_to_json(args: &[Value]) -> Result<Value, String> {
+fn duration_to_json(args: &[Value]) -> Result<Value, VmError> {
     duration_to_string(args)
 }
 

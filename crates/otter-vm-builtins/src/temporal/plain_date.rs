@@ -1,8 +1,8 @@
 //! Temporal.PlainDate - calendar date without time or timezone
 
 use chrono::{Datelike, NaiveDate};
-use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
+use otter_vm_core::{VmError, string::JsString};
 use otter_vm_runtime::{Op, op_native};
 
 pub fn ops() -> Vec<Op> {
@@ -59,11 +59,11 @@ fn get_date(args: &[Value]) -> Option<NaiveDate> {
 }
 
 /// Temporal.PlainDate.from(thing)
-fn plain_date_from(args: &[Value]) -> Result<Value, String> {
+fn plain_date_from(args: &[Value]) -> Result<Value, VmError> {
     let s = args
         .first()
         .and_then(|v| v.as_string())
-        .ok_or("PlainDate.from requires a string")?;
+        .ok_or(VmError::type_error("PlainDate.from requires a string"))?;
 
     // Parse YYYY-MM-DD or ISO date part
     let date_str = s.as_str().split('T').next().unwrap_or(s.as_str());
@@ -72,12 +72,12 @@ fn plain_date_from(args: &[Value]) -> Result<Value, String> {
         Some(d) => Ok(Value::string(JsString::intern(
             &d.format("%Y-%m-%d").to_string(),
         ))),
-        None => Err(format!("Invalid date string: {}", s)),
+        None => Err(VmError::type_error(format!("Invalid date string: {}", s))),
     }
 }
 
 /// Temporal.PlainDate.compare(one, two)
-fn plain_date_compare(args: &[Value]) -> Result<Value, String> {
+fn plain_date_compare(args: &[Value]) -> Result<Value, VmError> {
     let d1 = args
         .first()
         .and_then(|v| v.as_string())
@@ -96,53 +96,53 @@ fn plain_date_compare(args: &[Value]) -> Result<Value, String> {
                 std::cmp::Ordering::Greater => 1,
             }))
         }
-        _ => Err("Invalid dates for comparison".to_string()),
+        _ => Err(VmError::type_error("Invalid dates for comparison")),
     }
 }
 
-fn plain_date_year(args: &[Value]) -> Result<Value, String> {
+fn plain_date_year(args: &[Value]) -> Result<Value, VmError> {
     get_date(args)
         .map(|d| Value::int32(d.year()))
-        .ok_or_else(|| "Invalid PlainDate".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDate"))
 }
 
-fn plain_date_month(args: &[Value]) -> Result<Value, String> {
+fn plain_date_month(args: &[Value]) -> Result<Value, VmError> {
     get_date(args)
         .map(|d| Value::int32(d.month() as i32))
-        .ok_or_else(|| "Invalid PlainDate".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDate"))
 }
 
-fn plain_date_month_code(args: &[Value]) -> Result<Value, String> {
+fn plain_date_month_code(args: &[Value]) -> Result<Value, VmError> {
     get_date(args)
         .map(|d| Value::string(JsString::intern(&format!("M{:02}", d.month()))))
-        .ok_or_else(|| "Invalid PlainDate".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDate"))
 }
 
-fn plain_date_day(args: &[Value]) -> Result<Value, String> {
+fn plain_date_day(args: &[Value]) -> Result<Value, VmError> {
     get_date(args)
         .map(|d| Value::int32(d.day() as i32))
-        .ok_or_else(|| "Invalid PlainDate".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDate"))
 }
 
-fn plain_date_day_of_week(args: &[Value]) -> Result<Value, String> {
+fn plain_date_day_of_week(args: &[Value]) -> Result<Value, VmError> {
     get_date(args)
         .map(|d| Value::int32(d.weekday().num_days_from_monday() as i32 + 1)) // 1=Mon, 7=Sun
-        .ok_or_else(|| "Invalid PlainDate".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDate"))
 }
 
-fn plain_date_day_of_year(args: &[Value]) -> Result<Value, String> {
+fn plain_date_day_of_year(args: &[Value]) -> Result<Value, VmError> {
     get_date(args)
         .map(|d| Value::int32(d.ordinal() as i32))
-        .ok_or_else(|| "Invalid PlainDate".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDate"))
 }
 
-fn plain_date_week_of_year(args: &[Value]) -> Result<Value, String> {
+fn plain_date_week_of_year(args: &[Value]) -> Result<Value, VmError> {
     get_date(args)
         .map(|d| Value::int32(d.iso_week().week() as i32))
-        .ok_or_else(|| "Invalid PlainDate".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDate"))
 }
 
-fn plain_date_days_in_month(args: &[Value]) -> Result<Value, String> {
+fn plain_date_days_in_month(args: &[Value]) -> Result<Value, VmError> {
     get_date(args)
         .map(|d| {
             let days = if d.month() == 12 {
@@ -157,31 +157,31 @@ fn plain_date_days_in_month(args: &[Value]) -> Result<Value, String> {
             .unwrap_or(30);
             Value::int32(days as i32)
         })
-        .ok_or_else(|| "Invalid PlainDate".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDate"))
 }
 
-fn plain_date_days_in_year(args: &[Value]) -> Result<Value, String> {
+fn plain_date_days_in_year(args: &[Value]) -> Result<Value, VmError> {
     get_date(args)
         .map(|d| {
             let days = if d.leap_year() { 366 } else { 365 };
             Value::int32(days)
         })
-        .ok_or_else(|| "Invalid PlainDate".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDate"))
 }
 
-fn plain_date_months_in_year(_args: &[Value]) -> Result<Value, String> {
+fn plain_date_months_in_year(_args: &[Value]) -> Result<Value, VmError> {
     Ok(Value::int32(12)) // ISO calendar always has 12 months
 }
 
-fn plain_date_in_leap_year(args: &[Value]) -> Result<Value, String> {
+fn plain_date_in_leap_year(args: &[Value]) -> Result<Value, VmError> {
     get_date(args)
         .map(|d| Value::boolean(d.leap_year()))
-        .ok_or_else(|| "Invalid PlainDate".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDate"))
 }
 
 /// plainDate.add(duration)
-fn plain_date_add(args: &[Value]) -> Result<Value, String> {
-    let date = get_date(args).ok_or("Invalid PlainDate")?;
+fn plain_date_add(args: &[Value]) -> Result<Value, VmError> {
+    let date = get_date(args).ok_or(VmError::type_error("Invalid PlainDate"))?;
 
     // Duration passed as JSON object with years, months, days
     let days = args.get(1).and_then(|v| v.as_int32()).unwrap_or(0);
@@ -193,8 +193,8 @@ fn plain_date_add(args: &[Value]) -> Result<Value, String> {
 }
 
 /// plainDate.subtract(duration)
-fn plain_date_subtract(args: &[Value]) -> Result<Value, String> {
-    let date = get_date(args).ok_or("Invalid PlainDate")?;
+fn plain_date_subtract(args: &[Value]) -> Result<Value, VmError> {
+    let date = get_date(args).ok_or(VmError::type_error("Invalid PlainDate"))?;
     let days = args.get(1).and_then(|v| v.as_int32()).unwrap_or(0);
 
     let new_date = date - chrono::Duration::days(days as i64);
@@ -204,34 +204,34 @@ fn plain_date_subtract(args: &[Value]) -> Result<Value, String> {
 }
 
 /// plainDate.until(other)
-fn plain_date_until(args: &[Value]) -> Result<Value, String> {
-    let d1 = get_date(args).ok_or("Invalid PlainDate")?;
+fn plain_date_until(args: &[Value]) -> Result<Value, VmError> {
+    let d1 = get_date(args).ok_or(VmError::type_error("Invalid PlainDate"))?;
     let d2 = args
         .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_date(s.as_str()))
-        .ok_or("Invalid target date")?;
+        .ok_or(VmError::type_error("Invalid target date"))?;
 
     let days = d2.signed_duration_since(d1).num_days();
     Ok(Value::int32(days as i32))
 }
 
 /// plainDate.since(other)
-fn plain_date_since(args: &[Value]) -> Result<Value, String> {
-    let d1 = get_date(args).ok_or("Invalid PlainDate")?;
+fn plain_date_since(args: &[Value]) -> Result<Value, VmError> {
+    let d1 = get_date(args).ok_or(VmError::type_error("Invalid PlainDate"))?;
     let d2 = args
         .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_date(s.as_str()))
-        .ok_or("Invalid target date")?;
+        .ok_or(VmError::type_error("Invalid target date"))?;
 
     let days = d1.signed_duration_since(d2).num_days();
     Ok(Value::int32(days as i32))
 }
 
 /// plainDate.with(partialPlainDate)
-fn plain_date_with(args: &[Value]) -> Result<Value, String> {
-    let date = get_date(args).ok_or("Invalid PlainDate")?;
+fn plain_date_with(args: &[Value]) -> Result<Value, VmError> {
+    let date = get_date(args).ok_or(VmError::type_error("Invalid PlainDate"))?;
 
     // Get replacement values (simplified - expect year, month, day as separate args)
     let year = args
@@ -251,10 +251,10 @@ fn plain_date_with(args: &[Value]) -> Result<Value, String> {
 
     NaiveDate::from_ymd_opt(year, month, day)
         .map(|d| Value::string(JsString::intern(&d.format("%Y-%m-%d").to_string())))
-        .ok_or_else(|| "Invalid date components".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid date components"))
 }
 
-fn plain_date_equals(args: &[Value]) -> Result<Value, String> {
+fn plain_date_equals(args: &[Value]) -> Result<Value, VmError> {
     let d1 = get_date(args);
     let d2 = args
         .get(1)
@@ -264,19 +264,19 @@ fn plain_date_equals(args: &[Value]) -> Result<Value, String> {
     Ok(Value::boolean(d1 == d2))
 }
 
-fn plain_date_to_string(args: &[Value]) -> Result<Value, String> {
+fn plain_date_to_string(args: &[Value]) -> Result<Value, VmError> {
     get_date(args)
         .map(|d| Value::string(JsString::intern(&d.format("%Y-%m-%d").to_string())))
-        .ok_or_else(|| "Invalid PlainDate".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDate"))
 }
 
-fn plain_date_to_json(args: &[Value]) -> Result<Value, String> {
+fn plain_date_to_json(args: &[Value]) -> Result<Value, VmError> {
     plain_date_to_string(args)
 }
 
 /// plainDate.toPlainDateTime(plainTime?)
-fn plain_date_to_plain_date_time(args: &[Value]) -> Result<Value, String> {
-    let date = get_date(args).ok_or("Invalid PlainDate")?;
+fn plain_date_to_plain_date_time(args: &[Value]) -> Result<Value, VmError> {
+    let date = get_date(args).ok_or(VmError::type_error("Invalid PlainDate"))?;
     let time = args
         .get(1)
         .and_then(|v| v.as_string())
@@ -291,14 +291,14 @@ fn plain_date_to_plain_date_time(args: &[Value]) -> Result<Value, String> {
 }
 
 /// plainDate.toPlainYearMonth()
-fn plain_date_to_plain_year_month(args: &[Value]) -> Result<Value, String> {
+fn plain_date_to_plain_year_month(args: &[Value]) -> Result<Value, VmError> {
     get_date(args)
         .map(|d| Value::string(JsString::intern(&d.format("%Y-%m").to_string())))
-        .ok_or_else(|| "Invalid PlainDate".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDate"))
 }
 
 /// plainDate.toPlainMonthDay()
-fn plain_date_to_plain_month_day(args: &[Value]) -> Result<Value, String> {
+fn plain_date_to_plain_month_day(args: &[Value]) -> Result<Value, VmError> {
     get_date(args)
         .map(|d| {
             Value::string(JsString::intern(&format!(
@@ -307,7 +307,7 @@ fn plain_date_to_plain_month_day(args: &[Value]) -> Result<Value, String> {
                 d.day()
             )))
         })
-        .ok_or_else(|| "Invalid PlainDate".to_string())
+        .ok_or_else(|| VmError::type_error("Invalid PlainDate"))
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 //!
 //! Provides all ES2025 Math methods and constants.
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::memory;
 use otter_vm_core::value::Value;
 use otter_vm_runtime::{Op, op_native_with_mm as op_native};
@@ -82,22 +83,22 @@ fn get_arg(args: &[Value], idx: usize) -> f64 {
 // Basic Methods
 // ============================================================================
 
-fn math_abs(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_abs(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.abs()))
 }
 
-fn math_ceil(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_ceil(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.ceil()))
 }
 
-fn math_floor(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_floor(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.floor()))
 }
 
-fn math_round(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_round(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     // JavaScript round: round half towards +infinity
     // e.g., round(-0.5) = -0, round(0.5) = 1
@@ -109,12 +110,12 @@ fn math_round(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, 
     Ok(Value::number(rounded))
 }
 
-fn math_trunc(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_trunc(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.trunc()))
 }
 
-fn math_sign(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_sign(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     let result = if x.is_nan() {
         f64::NAN
@@ -132,23 +133,23 @@ fn math_sign(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, S
 // Roots and Powers
 // ============================================================================
 
-fn math_sqrt(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_sqrt(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.sqrt()))
 }
 
-fn math_cbrt(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_cbrt(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.cbrt()))
 }
 
-fn math_pow(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_pow(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let base = get_arg(args, 0);
     let exp = get_arg(args, 1);
     Ok(Value::number(base.powf(exp)))
 }
 
-fn math_hypot(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_hypot(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     // hypot(...values) - returns sqrt(sum(x^2))
     if args.is_empty() {
         return Ok(Value::number(0.0));
@@ -179,32 +180,32 @@ fn math_hypot(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, 
 // Exponentials and Logarithms
 // ============================================================================
 
-fn math_exp(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_exp(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.exp()))
 }
 
-fn math_expm1(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_expm1(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.exp_m1()))
 }
 
-fn math_log(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_log(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.ln()))
 }
 
-fn math_log1p(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_log1p(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.ln_1p()))
 }
 
-fn math_log2(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_log2(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.log2()))
 }
 
-fn math_log10(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_log10(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.log10()))
 }
@@ -213,37 +214,37 @@ fn math_log10(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, 
 // Trigonometry
 // ============================================================================
 
-fn math_sin(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_sin(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.sin()))
 }
 
-fn math_cos(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_cos(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.cos()))
 }
 
-fn math_tan(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_tan(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.tan()))
 }
 
-fn math_asin(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_asin(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.asin()))
 }
 
-fn math_acos(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_acos(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.acos()))
 }
 
-fn math_atan(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_atan(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.atan()))
 }
 
-fn math_atan2(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_atan2(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let y = get_arg(args, 0);
     let x = get_arg(args, 1);
     Ok(Value::number(y.atan2(x)))
@@ -253,32 +254,32 @@ fn math_atan2(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, 
 // Hyperbolic
 // ============================================================================
 
-fn math_sinh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_sinh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.sinh()))
 }
 
-fn math_cosh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_cosh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.cosh()))
 }
 
-fn math_tanh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_tanh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.tanh()))
 }
 
-fn math_asinh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_asinh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.asinh()))
 }
 
-fn math_acosh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_acosh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.acosh()))
 }
 
-fn math_atanh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_atanh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     Ok(Value::number(x.atanh()))
 }
@@ -287,7 +288,7 @@ fn math_atanh(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, 
 // Min/Max/Random
 // ============================================================================
 
-fn math_min(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_min(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     if args.is_empty() {
         return Ok(Value::number(f64::INFINITY));
     }
@@ -306,7 +307,7 @@ fn math_min(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, St
     Ok(Value::number(result))
 }
 
-fn math_max(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_max(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     if args.is_empty() {
         return Ok(Value::number(f64::NEG_INFINITY));
     }
@@ -325,7 +326,7 @@ fn math_max(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, St
     Ok(Value::number(result))
 }
 
-fn math_random(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_random(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     // Simple xorshift64 PRNG (for demonstration; real impl should use thread_rng)
     use std::cell::Cell;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -360,7 +361,7 @@ fn math_random(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value
 // Special Methods
 // ============================================================================
 
-fn math_clz32(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_clz32(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     // ToUint32
     let n = if x.is_nan() || x.is_infinite() {
@@ -371,7 +372,7 @@ fn math_clz32(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, 
     Ok(Value::number(n.leading_zeros() as f64))
 }
 
-fn math_imul(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_imul(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let a = get_arg(args, 0);
     let b = get_arg(args, 1);
 
@@ -392,14 +393,14 @@ fn math_imul(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, S
     Ok(Value::number(result as f64))
 }
 
-fn math_fround(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_fround(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
     // Round to 32-bit float and back
     let f32_val = x as f32;
     Ok(Value::number(f32_val as f64))
 }
 
-fn math_f16round(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn math_f16round(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let x = get_arg(args, 0);
 
     // Handle special cases

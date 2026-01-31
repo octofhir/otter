@@ -7,6 +7,7 @@
 //! - `.transfer()`, `.transferToFixedLength(newLength)`, `.resize(newLength)` (ES2024)
 //! - `ArrayBuffer.isView(arg)` (static)
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::array_buffer::JsArrayBuffer;
 use otter_vm_core::memory;
 use otter_vm_core::value::Value as VmValue;
@@ -49,7 +50,7 @@ pub fn ops() -> Vec<Op> {
 fn native_array_buffer_create(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let byte_length = args
         .first()
         .and_then(|v| v.as_number())
@@ -66,7 +67,7 @@ fn native_array_buffer_create(
 
     let ab = if let Some(max) = max_byte_length {
         if byte_length > max {
-            return Err("RangeError: byteLength exceeds maxByteLength".to_string());
+            return Err(VmError::range_error("byteLength exceeds maxByteLength"));
         }
         JsArrayBuffer::new_resizable(byte_length, max, None, _mm)
     } else {
@@ -85,7 +86,7 @@ fn native_array_buffer_create(
 fn native_array_buffer_byte_length(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ab = args
         .first()
         .and_then(|v| v.as_array_buffer())
@@ -99,7 +100,7 @@ fn native_array_buffer_byte_length(
 fn native_array_buffer_max_byte_length(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ab = args
         .first()
         .and_then(|v| v.as_array_buffer())
@@ -116,7 +117,7 @@ fn native_array_buffer_max_byte_length(
 fn native_array_buffer_resizable(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ab = args
         .first()
         .and_then(|v| v.as_array_buffer())
@@ -130,7 +131,7 @@ fn native_array_buffer_resizable(
 fn native_array_buffer_detached(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ab = args
         .first()
         .and_then(|v| v.as_array_buffer())
@@ -148,14 +149,14 @@ fn native_array_buffer_detached(
 fn native_array_buffer_slice(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ab = args
         .first()
         .and_then(|v| v.as_array_buffer())
         .ok_or("TypeError: not an ArrayBuffer")?;
 
     if ab.is_detached() {
-        return Err("TypeError: ArrayBuffer is detached".to_string());
+        return Err(VmError::type_error("ArrayBuffer is detached"));
     }
 
     let len = ab.byte_length() as i64;
@@ -198,14 +199,14 @@ fn native_array_buffer_slice(
 fn native_array_buffer_transfer(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ab = args
         .first()
         .and_then(|v| v.as_array_buffer())
         .ok_or("TypeError: not an ArrayBuffer")?;
 
     if ab.is_detached() {
-        return Err("TypeError: ArrayBuffer is already detached".to_string());
+        return Err(VmError::type_error("ArrayBuffer is already detached"));
     }
 
     let new_ab = ab.transfer().ok_or("TypeError: ArrayBuffer is detached")?;
@@ -218,14 +219,14 @@ fn native_array_buffer_transfer(
 fn native_array_buffer_transfer_to_fixed_length(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ab = args
         .first()
         .and_then(|v| v.as_array_buffer())
         .ok_or("TypeError: not an ArrayBuffer")?;
 
     if ab.is_detached() {
-        return Err("TypeError: ArrayBuffer is already detached".to_string());
+        return Err(VmError::type_error("ArrayBuffer is already detached"));
     }
 
     let new_length = args
@@ -252,7 +253,7 @@ fn native_array_buffer_transfer_to_fixed_length(
 fn native_array_buffer_resize(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ab = args
         .first()
         .and_then(|v| v.as_array_buffer())
@@ -280,7 +281,7 @@ fn native_array_buffer_resize(
 fn native_array_buffer_is_view(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     // Check for TypedArray or DataView
     let is_view = args
         .first()

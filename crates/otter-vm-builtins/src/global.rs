@@ -46,7 +46,8 @@ fn global_escape(args: &[JsonValue]) -> Result<JsonValue, String> {
             || ch == 0x2B  // +
             || ch == 0x2D  // -
             || ch == 0x2E  // .
-            || ch == 0x2F  // /
+            || ch == 0x2F
+        // /
         {
             // Safe to convert single UTF-16 unit to char for ASCII
             if let Some(c) = char::from_u32(ch) {

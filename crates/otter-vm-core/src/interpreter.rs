@@ -5575,8 +5575,7 @@ impl Interpreter {
         args: &[Value],
     ) -> VmResult<Value> {
         ctx.enter_native_call()?;
-        let result =
-            native_fn(this_value, args, ctx.memory_manager().clone()).map_err(VmError::type_error);
+        let result = native_fn(this_value, args, ctx.memory_manager().clone());
         ctx.exit_native_call();
         result
     }
@@ -5643,68 +5642,7 @@ impl Interpreter {
                 }
             };
 
-            // Intercept Function.prototype.call/apply
-            let fn_op = if let Some(value) = ctx.get_global("__Function_call")
-                && is_same_native(&value)
-            {
-                Some("call")
-            } else if let Some(value) = ctx.get_global("__Function_apply")
-                && is_same_native(&value)
-            {
-                Some("apply")
-            } else {
-                None
-            };
-
-            if let Some(_op) = fn_op {
-                let target = current_args
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| VmError::type_error("Function.call requires a target"))?;
-                let mut intercepted_this = current_args
-                    .get(1)
-                    .cloned()
-                    .unwrap_or_else(Value::undefined);
-                let args_list = current_args
-                    .get(2)
-                    .cloned()
-                    .unwrap_or_else(Value::undefined);
-
-                if intercepted_this.is_nullish() {
-                    intercepted_this = Value::object(ctx.global());
-                }
-
-                let mut call_args = Vec::new();
-                if !args_list.is_nullish() {
-                    if let Some(obj) = args_list.as_object() {
-                        let len = obj
-                            .get(&PropertyKey::string("length"))
-                            .and_then(|v| v.as_int32())
-                            .unwrap_or(0);
-                        if len > 0 {
-                            call_args.reserve(len as usize);
-                            for i in 0..len {
-                                call_args.push(
-                                    obj.get(&PropertyKey::Index(i as u32))
-                                        .unwrap_or_else(Value::undefined),
-                                );
-                            }
-                        }
-                    } else {
-                        return Err(VmError::type_error(
-                            "Internal Error: Function helper expects an array-like object",
-                        ));
-                    }
-                }
-
-                return self.handle_call_value(
-                    ctx,
-                    &target,
-                    intercepted_this,
-                    call_args,
-                    return_reg,
-                );
-            }
+            // OLD interception code removed - now using error-based interception in native functions
 
             // Intercept Generator ops
             let gen_op = if let Some(value) = ctx.get_global("__Generator_next")
@@ -5821,10 +5759,151 @@ impl Interpreter {
                 return Ok(InstructionResult::Continue);
             }
 
-            // Normal native function execution
-            let result = self.call_native_fn(ctx, native_fn, &current_this, &current_args)?;
-            ctx.set_register(return_reg, result);
-            return Ok(InstructionResult::Continue);
+            // Normal native function execution with interception support
+            match self.call_native_fn(ctx, native_fn, &current_this, &current_args) {
+                Ok(result) => {
+                    ctx.set_register(return_reg, result);
+                    return Ok(InstructionResult::Continue);
+                }
+                Err(VmError::Interception(signal)) => {
+                    // Handle interception signals for Function.prototype.call/apply
+                    use crate::error::InterceptionSignal;
+
+                    match signal {
+                        InterceptionSignal::FunctionCall => {
+                            // Function.prototype.call(thisArg, ...args)
+                            // current_this = the function to call
+                            // current_args[0] = thisArg
+                            // current_args[1..] = the arguments
+                            let target = current_this;
+                            let this_arg = current_args.first().cloned().unwrap_or(Value::undefined());
+                            let call_args = if current_args.len() > 1 {
+                                current_args[1..].to_vec()
+                            } else {
+                                vec![]
+                            };
+
+                            return self.handle_call_value(ctx, &target, this_arg, call_args, return_reg);
+                        }
+                        InterceptionSignal::FunctionApply => {
+                            // Function.prototype.apply(thisArg, argsArray)
+                            // current_this = the function to call
+                            // current_args[0] = thisArg
+                            // current_args[1] = argsArray
+                            let target = current_this;
+                            let this_arg = current_args.first().cloned().unwrap_or(Value::undefined());
+                            let args_array = current_args.get(1).cloned().unwrap_or(Value::undefined());
+
+                            // Extract arguments from array
+                            let call_args = if args_array.is_undefined() || args_array.is_null() {
+                                vec![]
+                            } else if let Some(arr_obj) = args_array.as_object() {
+                                if arr_obj.is_array() {
+                                    let len = arr_obj.array_length();
+                                    let mut extracted = Vec::with_capacity(len);
+                                    for i in 0..len {
+                                        extracted.push(
+                                            arr_obj.get(&PropertyKey::Index(i as u32))
+                                                .unwrap_or(Value::undefined())
+                                        );
+                                    }
+                                    extracted
+                                } else {
+                                    return Err(VmError::type_error("Function.prototype.apply: argumentsList must be an array"));
+                                }
+                            } else {
+                                return Err(VmError::type_error("Function.prototype.apply: argumentsList must be an object"));
+                            };
+
+                            return self.handle_call_value(ctx, &target, this_arg, call_args, return_reg);
+                        }
+                        InterceptionSignal::ReflectApply => {
+                            // Reflect.apply(target, thisArg, argsArray)
+                            // current_args[0] = target
+                            // current_args[1] = thisArg
+                            // current_args[2] = argsArray
+                            if current_args.len() < 3 {
+                                return Err(VmError::type_error("Reflect.apply requires 3 arguments"));
+                            }
+
+                            let target = &current_args[0];
+                            let this_arg = current_args[1].clone();
+                            let args_array = &current_args[2];
+
+                            // Extract arguments from array
+                            let call_args = if let Some(arr_obj) = args_array.as_object() {
+                                if arr_obj.is_array() {
+                                    let len = arr_obj.array_length();
+                                    let mut extracted = Vec::with_capacity(len);
+                                    for i in 0..len {
+                                        extracted.push(
+                                            arr_obj.get(&PropertyKey::Index(i as u32))
+                                                .unwrap_or(Value::undefined())
+                                        );
+                                    }
+                                    extracted
+                                } else {
+                                    return Err(VmError::type_error("Reflect.apply: argumentsList must be an array"));
+                                }
+                            } else {
+                                return Err(VmError::type_error("Reflect.apply: argumentsList must be an object"));
+                            };
+
+                            return self.handle_call_value(ctx, target, this_arg, call_args, return_reg);
+                        }
+                        InterceptionSignal::ReflectConstruct => {
+                            // Reflect.construct(target, argsArray [, newTarget])
+                            // current_args[0] = target
+                            // current_args[1] = argsArray
+                            // current_args[2] = newTarget (optional, not implemented yet)
+                            if current_args.len() < 2 {
+                                return Err(VmError::type_error("Reflect.construct requires at least 2 arguments"));
+                            }
+
+                            let target = &current_args[0];
+                            let args_array = &current_args[1];
+
+                            // Extract arguments from array
+                            let call_args = if let Some(arr_obj) = args_array.as_object() {
+                                if arr_obj.is_array() {
+                                    let len = arr_obj.array_length();
+                                    let mut extracted = Vec::with_capacity(len);
+                                    for i in 0..len {
+                                        extracted.push(
+                                            arr_obj.get(&PropertyKey::Index(i as u32))
+                                                .unwrap_or(Value::undefined())
+                                        );
+                                    }
+                                    extracted
+                                } else {
+                                    return Err(VmError::type_error("Reflect.construct: argumentsList must be an array"));
+                                }
+                            } else {
+                                return Err(VmError::type_error("Reflect.construct: argumentsList must be an object"));
+                            };
+
+                            // Create new object for this
+                            let new_obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                            let this_value = Value::object(new_obj.clone());
+
+                            // Call constructor
+                            self.handle_call_value(ctx, target, this_value.clone(), call_args, return_reg)?;
+
+                            // Get result from register
+                            let ctor_result = ctx.get_register(return_reg);
+
+                            // Return object or this
+                            if ctor_result.is_object() {
+                                ctx.set_register(return_reg, ctor_result.clone());
+                            } else {
+                                ctx.set_register(return_reg, this_value);
+                            }
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         // 3. Handle closures

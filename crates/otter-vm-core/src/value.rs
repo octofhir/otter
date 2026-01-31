@@ -110,7 +110,7 @@ unsafe impl Sync for Value {}
 
 /// Native function handler type
 pub type NativeFn = Arc<
-    dyn Fn(&Value, &[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, String>
+    dyn Fn(&Value, &[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, crate::error::VmError>
         + Send
         + Sync,
 >;
@@ -420,7 +420,7 @@ impl Value {
     /// Create native function value
     pub fn native_function<F>(f: F, memory_manager: Arc<crate::memory::MemoryManager>) -> Self
     where
-        F: Fn(&Value, &[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, String>
+        F: Fn(&Value, &[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, crate::error::VmError>
             + Send
             + Sync
             + 'static,
@@ -446,7 +446,7 @@ impl Value {
         prototype: GcRef<JsObject>,
     ) -> Self
     where
-        F: Fn(&Value, &[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, String>
+        F: Fn(&Value, &[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, crate::error::VmError>
             + Send
             + Sync
             + 'static,

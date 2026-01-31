@@ -6,6 +6,7 @@
 //! - toFixed, toExponential, toPrecision
 //! - toString, toLocaleString, valueOf
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::memory;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
@@ -77,7 +78,7 @@ fn get_arg_int(args: &[Value], idx: usize) -> Option<i64> {
 // =============================================================================
 
 /// Number.isFinite() - determines whether the passed value is a finite number
-fn number_is_finite(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn number_is_finite(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let val = args.first();
     match val {
         Some(v) if v.is_number() => {
@@ -93,7 +94,7 @@ fn number_is_finite(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<V
 }
 
 /// Number.isInteger() - determines whether the passed value is an integer
-fn number_is_integer(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn number_is_integer(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let val = args.first();
     match val {
         Some(v) if v.is_int32() => Ok(Value::boolean(true)),
@@ -106,7 +107,7 @@ fn number_is_integer(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<
 }
 
 /// Number.isNaN() - determines whether the passed value is NaN
-fn number_is_nan(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn number_is_nan(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let val = args.first();
     match val {
         Some(v) if v.is_number() => {
@@ -122,7 +123,7 @@ fn number_is_nan(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Valu
 fn number_is_safe_integer(
     args: &[Value],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<Value, String> {
+) -> Result<Value, VmError> {
     const MAX_SAFE_INTEGER: f64 = 9007199254740991.0; // 2^53 - 1
     const MIN_SAFE_INTEGER: f64 = -9007199254740991.0;
 
@@ -144,7 +145,7 @@ fn number_is_safe_integer(
 }
 
 /// Number.parseFloat() - parses a string argument and returns a floating point number
-fn number_parse_float(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn number_parse_float(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let s = match args.first() {
         Some(v) if v.is_string() => v.as_string().unwrap().to_string(),
         Some(v) => {
@@ -224,7 +225,7 @@ fn number_parse_float(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result
 }
 
 /// Number.parseInt() - parses a string argument and returns an integer
-fn number_parse_int(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn number_parse_int(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let s = match args.first() {
         Some(v) if v.is_string() => v.as_string().unwrap().to_string(),
         Some(v) if v.is_number() => {
@@ -304,12 +305,12 @@ fn number_parse_int(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<V
 // =============================================================================
 
 /// Number.prototype.toFixed() - formats a number using fixed-point notation
-fn number_to_fixed(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn number_to_fixed(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let num = get_arg_number(args, 0);
     let digits = get_arg_int(args, 1).unwrap_or(0) as usize;
 
     if digits > 100 {
-        return Err("toFixed() digits argument must be between 0 and 100".to_string());
+        return Err(VmError::type_error("toFixed() digits argument must be between 0 and 100"));
     }
 
     if num.is_nan() {
@@ -331,7 +332,10 @@ fn number_to_fixed(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Va
 }
 
 /// Number.prototype.toExponential() - returns a string in exponential notation
-fn number_to_exponential(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn number_to_exponential(
+    args: &[Value],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<Value, VmError> {
     let num = get_arg_number(args, 0);
     let fraction_digits = get_arg_int(args, 1);
 
@@ -348,7 +352,7 @@ fn number_to_exponential(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Res
 
     match fraction_digits {
         Some(digits) if !(0..=100).contains(&digits) => {
-            Err("toExponential() argument must be between 0 and 100".to_string())
+            Err(VmError::range_error("toExponential() argument must be between 0 and 100"))
         }
         Some(digits) => Ok(Value::string(JsString::intern(&format!(
             "{:.precision$e}",
@@ -360,7 +364,7 @@ fn number_to_exponential(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Res
 }
 
 /// Number.prototype.toPrecision() - returns a string representing the number to a specified precision
-fn number_to_precision(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn number_to_precision(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let num = get_arg_number(args, 0);
     let precision = get_arg_int(args, 1);
 
@@ -378,7 +382,7 @@ fn number_to_precision(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Resul
     match precision {
         None => Ok(Value::string(JsString::intern(&num.to_string()))),
         Some(p) if !(1..=100).contains(&p) => {
-            Err("toPrecision() argument must be between 1 and 100".to_string())
+            Err(VmError::range_error("toPrecision() argument must be between 1 and 100"))
         }
         Some(p) => {
             let p = p as usize;
@@ -413,12 +417,12 @@ fn number_to_precision(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Resul
 }
 
 /// Number.prototype.toString() - returns a string representing the number
-fn number_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn number_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     let num = get_arg_number(args, 0);
     let radix = get_arg_int(args, 1).unwrap_or(10) as u32;
 
     if !(2..=36).contains(&radix) {
-        return Err("toString() radix must be between 2 and 36".to_string());
+        return Err(VmError::type_error("toString() radix must be between 2 and 36"));
     }
 
     if num.is_nan() {
@@ -477,7 +481,7 @@ fn format_radix(mut n: u64, radix: u32) -> String {
 fn number_to_locale_string(
     args: &[Value],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<Value, String> {
+) -> Result<Value, VmError> {
     let num = get_arg_number(args, 0);
     // Simplified: just return toString result (no locale support yet)
     if num.is_nan() {
@@ -494,11 +498,11 @@ fn number_to_locale_string(
 }
 
 /// Number.prototype.valueOf() - returns the primitive value of the number
-fn number_value_of(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
+fn number_value_of(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     match args.first() {
         Some(v) if v.is_number() => Ok(v.clone()),
         Some(v) if v.is_int32() => Ok(v.clone()),
-        _ => Err("valueOf requires a number".to_string()),
+        _ => Err(VmError::type_error("valueOf requires a number")),
     }
 }
 

@@ -3,6 +3,7 @@
 //! Provides DataView constructor and methods for arbitrary byte-order access
 //! to ArrayBuffer data.
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::data_view::JsDataView;
 use otter_vm_core::memory;
 use otter_vm_core::value::{BigInt, HeapRef, Value as VmValue};
@@ -58,7 +59,7 @@ fn get_bigint_value(value: &VmValue) -> Option<&Arc<BigInt>> {
 fn native_data_view_create(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let ab = args
         .first()
         .and_then(|v| v.as_array_buffer())
@@ -90,7 +91,7 @@ fn native_data_view_create(
 fn native_data_view_get_buffer(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -104,14 +105,14 @@ fn native_data_view_get_buffer(
 fn native_data_view_get_byte_offset(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
         .ok_or("TypeError: not a DataView")?;
 
     if dv.is_detached() {
-        return Err("TypeError: ArrayBuffer is detached".to_string());
+        return Err(VmError::type_error("ArrayBuffer is detached"));
     }
 
     Ok(VmValue::number(dv.byte_offset() as f64))
@@ -122,14 +123,14 @@ fn native_data_view_get_byte_offset(
 fn native_data_view_get_byte_length(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
         .ok_or("TypeError: not a DataView")?;
 
     if dv.is_detached() {
-        return Err("TypeError: ArrayBuffer is detached".to_string());
+        return Err(VmError::type_error("ArrayBuffer is detached"));
     }
 
     Ok(VmValue::number(dv.byte_length() as f64))
@@ -141,7 +142,7 @@ fn native_data_view_get_byte_length(
 fn native_data_view_get_int8(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -157,7 +158,7 @@ fn native_data_view_get_int8(
 fn native_data_view_get_uint8(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -173,7 +174,7 @@ fn native_data_view_get_uint8(
 fn native_data_view_get_int16(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -192,7 +193,7 @@ fn native_data_view_get_int16(
 fn native_data_view_get_uint16(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -211,7 +212,7 @@ fn native_data_view_get_uint16(
 fn native_data_view_get_int32(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -230,7 +231,7 @@ fn native_data_view_get_int32(
 fn native_data_view_get_uint32(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -249,7 +250,7 @@ fn native_data_view_get_uint32(
 fn native_data_view_get_float32(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -268,7 +269,7 @@ fn native_data_view_get_float32(
 fn native_data_view_get_float64(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -287,7 +288,7 @@ fn native_data_view_get_float64(
 fn native_data_view_get_big_int64(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -306,7 +307,7 @@ fn native_data_view_get_big_int64(
 fn native_data_view_get_big_uint64(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -327,7 +328,7 @@ fn native_data_view_get_big_uint64(
 fn native_data_view_set_int8(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -345,7 +346,7 @@ fn native_data_view_set_int8(
 fn native_data_view_set_uint8(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -363,7 +364,7 @@ fn native_data_view_set_uint8(
 fn native_data_view_set_int16(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -382,7 +383,7 @@ fn native_data_view_set_int16(
 fn native_data_view_set_uint16(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -401,7 +402,7 @@ fn native_data_view_set_uint16(
 fn native_data_view_set_int32(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -420,7 +421,7 @@ fn native_data_view_set_int32(
 fn native_data_view_set_uint32(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -439,7 +440,7 @@ fn native_data_view_set_uint32(
 fn native_data_view_set_float32(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -458,7 +459,7 @@ fn native_data_view_set_float32(
 fn native_data_view_set_float64(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -477,7 +478,7 @@ fn native_data_view_set_float64(
 fn native_data_view_set_big_int64(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -500,7 +501,7 @@ fn native_data_view_set_big_int64(
 fn native_data_view_set_big_uint64(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let dv = args
         .first()
         .and_then(|v| v.as_data_view())
@@ -523,7 +524,7 @@ fn native_data_view_set_big_uint64(
 fn native_data_view_is_data_view(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let is_dv = args.first().map(|v| v.is_data_view()).unwrap_or(false);
     Ok(VmValue::boolean(is_dv))
 }

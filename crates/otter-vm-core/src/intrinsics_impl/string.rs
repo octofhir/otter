@@ -2,6 +2,7 @@
 //!
 //! All String object methods for ES2026 standard.
 
+use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
@@ -358,7 +359,7 @@ pub fn init_string_prototype(
                         .and_then(|v| v.as_number())
                         .unwrap_or(0.0);
                     if count < 0.0 || count.is_infinite() {
-                        return Err("RangeError: Invalid count".to_string());
+                        return Err(VmError::type_error("RangeError: Invalid count"));
                     }
                     let n = count as usize;
                     Ok(Value::string(JsString::intern(&s.as_str().repeat(n))))

@@ -9,6 +9,8 @@
 //! - `string` - String.prototype methods (all ES2026 methods)
 //! - `number` - Number.prototype methods (all ES2026 methods)
 //! - `array` - Array.prototype methods (all ES2026 methods)
+//! - `function` - Function.prototype methods (call, apply, bind, toString)
+//! - `boolean` - Boolean constructor and prototype methods
 //! - `temporal` - Temporal namespace initialization (Instant, PlainDate, etc.)
 //! - `math` - Math namespace initialization (constants and methods)
 
@@ -17,6 +19,8 @@ pub mod date;
 pub mod string;
 pub mod number;
 pub mod array;
+pub mod function;
+pub mod boolean;
 pub mod temporal;
 pub mod math;
 pub mod reflect;

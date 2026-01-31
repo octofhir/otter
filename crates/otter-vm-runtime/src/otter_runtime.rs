@@ -823,7 +823,7 @@ impl Otter {
                         .ok_or_else(|| "env_get requires a string key".to_string())?;
 
                     if !caps_get.can_env(&key) {
-                        return Err(format!("Permission denied: env access to '{}'", key));
+                        return Err(VmError::type_error(format!("Permission denied: env access to '{}'", key)));
                     }
 
                     match env_store_get.get(&key) {

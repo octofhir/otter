@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 
+use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::memory::MemoryManager;
 use crate::object::JsObject;
@@ -420,130 +421,10 @@ impl Intrinsics {
             )),
         );
 
-        // ====================================================================
-        // Function.prototype methods (non-enumerable)
-        // ====================================================================
-
-        // Function.prototype.toString
-        fn_proto.define_property(
-            PropertyKey::string("toString"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, _args, _mm| {
-                    if this_val.is_function() {
-                        if let Some(closure) = this_val.as_function() {
-                            return Ok(Value::string(JsString::intern(&format!(
-                                "function {}() {{ [native code] }}",
-                                if closure.is_async { "async " } else { "" }
-                            ))));
-                        }
-                    }
-                    if this_val.is_native_function() {
-                        return Ok(Value::string(JsString::intern(
-                            "function () { [native code] }",
-                        )));
-                    }
-                    if let Some(obj) = this_val.as_object() {
-                        if obj.get(&PropertyKey::string("__boundFunction__")).is_some() {
-                            return Ok(Value::string(JsString::intern(
-                                "function () { [bound] }",
-                            )));
-                        }
-                    }
-                    Ok(Value::string(JsString::intern(
-                        "function () { [native code] }",
-                    )))
-                },
-                mm.clone(),
-                fn_proto,
-            )),
-        );
-
-        // Function.prototype.call - stub, actual dispatch handled by interpreter
-        fn_proto.define_property(
-            PropertyKey::string("call"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, _args, _mm| {
-                    Err("Function.prototype.call: interpreter interception failed".to_string())
-                },
-                mm.clone(),
-                fn_proto,
-            )),
-        );
-
-        // Function.prototype.apply - stub, actual dispatch handled by interpreter
-        fn_proto.define_property(
-            PropertyKey::string("apply"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, _args, _mm| {
-                    Err("Function.prototype.apply: interpreter interception failed".to_string())
-                },
-                mm.clone(),
-                fn_proto,
-            )),
-        );
-
-        // Function.prototype.bind
-        fn_proto.define_property(
-            PropertyKey::string("bind"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, mm_inner| {
-                    // this_val is the function being bound
-                    let this_arg = args.first().cloned().unwrap_or(Value::undefined());
-
-                    let bound = GcRef::new(JsObject::new(None, mm_inner.clone()));
-
-                    // Store the original function
-                    bound.set(
-                        PropertyKey::string("__boundFunction__"),
-                        this_val.clone(),
-                    );
-                    // Store the thisArg
-                    bound.set(PropertyKey::string("__boundThis__"), this_arg);
-
-                    // Store bound arguments (if any)
-                    if args.len() > 1 {
-                        let arr = GcRef::new(JsObject::new(None, mm_inner));
-                        for (i, arg) in args[1..].iter().enumerate() {
-                            arr.set(PropertyKey::Index(i as u32), arg.clone());
-                        }
-                        arr.set(
-                            PropertyKey::string("length"),
-                            Value::int32((args.len() - 1) as i32),
-                        );
-                        bound.set(
-                            PropertyKey::string("__boundArgs__"),
-                            Value::object(arr),
-                        );
-                    }
-
-                    // Set name
-                    bound.set(
-                        PropertyKey::string("__boundName__"),
-                        Value::string(JsString::intern("bound ")),
-                    );
-
-                    // Set length (original length - bound args count, min 0)
-                    let bound_args_len =
-                        if args.len() > 1 { args.len() - 1 } else { 0 };
-                    let new_length =
-                        0i32.saturating_sub(bound_args_len as i32).max(0);
-                    bound.set(
-                        PropertyKey::string("__boundLength__"),
-                        Value::int32(new_length),
-                    );
-
-                    // Mark as callable
-                    bound.set(
-                        PropertyKey::string("__isCallable__"),
-                        Value::boolean(true),
-                    );
-
-                    Ok(Value::object(bound))
-                },
-                mm.clone(),
-                fn_proto,
-            )),
-        );
+        // ===================================================================
+        // Function.prototype methods (extracted to intrinsics_impl/function.rs)
+        // ===================================================================
+        crate::intrinsics_impl::function::init_function_prototype(fn_proto, mm);
 
         // ====================================================================
         // Error.prototype properties
@@ -661,7 +542,7 @@ impl Intrinsics {
                         };
                         if !obj.set_prototype(proto) {
                             return Err(
-                                "TypeError: Object.setPrototypeOf failed".to_string()
+                                VmError::type_error("Object.setPrototypeOf failed")
                             );
                         }
                     }
@@ -1146,7 +1027,7 @@ impl Intrinsics {
                         Some(proto_obj)
                     } else {
                         return Err(
-                            "Object prototype may only be an Object or null".to_string()
+                            VmError::type_error("Object prototype may only be an Object or null")
                         );
                     };
                     let new_obj = GcRef::new(JsObject::new(prototype, mm_inner.clone()));
@@ -1535,17 +1416,10 @@ impl Intrinsics {
         // ===================================================================
         crate::intrinsics_impl::number::init_number_prototype(self.number_prototype, fn_proto, mm);
 
-        // ====================================================================
-        // Boolean.prototype core methods
-        // ====================================================================
-        self.boolean_prototype.define_property(
-            PropertyKey::string("valueOf"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, _args, _mm| Ok(this_val.clone()),
-                mm.clone(),
-                fn_proto,
-            )),
-        );
+        // ===================================================================
+        // Boolean.prototype methods (extracted to intrinsics_impl/boolean.rs)
+        // ===================================================================
+        crate::intrinsics_impl::boolean::init_boolean_prototype(self.boolean_prototype, fn_proto, mm);
 
 
         // ===================================================================
@@ -1591,7 +1465,7 @@ impl Intrinsics {
                        proto: GcRef<JsObject>,
                        ctor_fn: Option<
             Box<
-                dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, String>
+                dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError>
                     + Send
                     + Sync,
             >,
@@ -1718,12 +1592,12 @@ impl Intrinsics {
                             0
                         };
                         if code > 0x10FFFF {
-                            return Err(format!("Invalid code point: {}", code));
+                            return Err(VmError::type_error(format!("Invalid code point: {}", code)));
                         }
                         if let Some(ch) = char::from_u32(code) {
                             result.push(ch);
                         } else {
-                            return Err(format!("Invalid code point: {}", code));
+                            return Err(VmError::type_error(format!("Invalid code point: {}", code)));
                         }
                     }
                     Ok(Value::string(JsString::intern(&result)))
@@ -1931,7 +1805,8 @@ impl Intrinsics {
 
         // Boolean
         let boolean_ctor = alloc_ctor();
-        install("Boolean", boolean_ctor, self.boolean_prototype, None);
+        let boolean_ctor_fn = crate::intrinsics_impl::boolean::create_boolean_constructor();
+        install("Boolean", boolean_ctor, self.boolean_prototype, Some(boolean_ctor_fn));
 
         // Symbol
         let symbol_ctor = alloc_ctor();

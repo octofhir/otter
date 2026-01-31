@@ -3,6 +3,23 @@
 use crate::value::Value;
 use thiserror::Error;
 
+/// Interception signals for internal VM operations
+///
+/// These are used to signal the interpreter that a special operation needs to be performed
+/// with full VM context (call stack, upvalues, etc.). Instead of using magic strings,
+/// we use a strongly-typed enum for type safety and performance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterceptionSignal {
+    /// Function.prototype.call with a closure (requires VM context to execute)
+    FunctionCall,
+    /// Function.prototype.apply with a closure (requires VM context to execute)
+    FunctionApply,
+    /// Reflect.apply with a closure (requires VM context to execute)
+    ReflectApply,
+    /// Reflect.construct with a closure (requires VM context to execute)
+    ReflectConstruct,
+}
+
 /// VM execution errors
 #[derive(Debug, Error)]
 pub enum VmError {
@@ -45,6 +62,16 @@ pub enum VmError {
     /// Execution was interrupted (timeout/cancellation)
     #[error("Execution interrupted")]
     Interrupted,
+
+    /// Internal interception signal (not a real error)
+    ///
+    /// This is used to signal the interpreter that a special operation needs VM context.
+    /// For example, calling Function.prototype.call with a closure requires access to
+    /// the call stack and upvalues, which native functions don't have.
+    ///
+    /// This is NOT displayed to users - it's caught and handled by the interpreter.
+    #[error("Internal interception: {0:?}")]
+    Interception(InterceptionSignal),
 }
 
 /// A thrown JavaScript value
@@ -115,6 +142,25 @@ impl VmError {
             value,
             stack: Vec::new(),
         }))
+    }
+
+    /// Create an interception signal for internal VM operations
+    pub fn interception(signal: InterceptionSignal) -> Self {
+        Self::Interception(signal)
+    }
+}
+
+// Automatic conversion from String to VmError for backwards compatibility
+// This allows existing code using ? with String errors to compile
+impl From<String> for VmError {
+    fn from(s: String) -> Self {
+        VmError::type_error(s)
+    }
+}
+
+impl From<&str> for VmError {
+    fn from(s: &str) -> Self {
+        VmError::type_error(s)
     }
 }
 

@@ -6,6 +6,7 @@
 //!
 //! Proxy traps are called from JavaScript via the handler object.
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
 use otter_vm_core::object::JsObject;
@@ -34,7 +35,7 @@ pub fn ops() -> Vec<Op> {
 fn native_proxy_create(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let target = args.first().ok_or("Proxy requires a target argument")?;
     let handler = args.get(1).ok_or("Proxy requires a handler argument")?;
 
@@ -56,7 +57,7 @@ fn native_proxy_create(
 fn native_proxy_revocable(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let target = args
         .first()
         .ok_or("Proxy.revocable requires a target argument")?;
@@ -97,14 +98,14 @@ fn native_proxy_revocable(
 fn native_proxy_get_target(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let proxy_val = args.first().ok_or("Missing proxy argument")?;
 
     let proxy = proxy_val.as_proxy().ok_or("Argument must be a proxy")?;
 
     match proxy.target() {
         Some(target) => Ok(VmValue::object(target)),
-        None => Err("Cannot perform operation on a revoked proxy".to_string()),
+        None => Err(VmError::type_error("Cannot perform operation on a revoked proxy")),
     }
 }
 
@@ -114,14 +115,14 @@ fn native_proxy_get_target(
 fn native_proxy_get_handler(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let proxy_val = args.first().ok_or("Missing proxy argument")?;
 
     let proxy = proxy_val.as_proxy().ok_or("Argument must be a proxy")?;
 
     match proxy.handler() {
         Some(handler) => Ok(VmValue::object(handler)),
-        None => Err("Cannot perform operation on a revoked proxy".to_string()),
+        None => Err(VmError::type_error("Cannot perform operation on a revoked proxy")),
     }
 }
 
@@ -131,7 +132,7 @@ fn native_proxy_get_handler(
 fn native_proxy_is_revoked(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let proxy_val = args.first().ok_or("Missing proxy argument")?;
 
     let proxy = proxy_val.as_proxy().ok_or("Argument must be a proxy")?;

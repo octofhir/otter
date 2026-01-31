@@ -2,6 +2,7 @@
 //!
 //! Provides Map and WeakMap collections with full ES2026 support.
 
+use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyKey};
@@ -83,7 +84,7 @@ fn str_to_key(s: &str) -> PropertyKey {
 // ============================================================================
 
 /// Create a new Map
-fn native_map_new(_args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_map_new(_args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let map_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
 
     // Create internal entries storage as a nested object
@@ -96,7 +97,7 @@ fn native_map_new(_args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<V
 }
 
 /// Map.prototype.get(key)
-fn native_map_get(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_map_get(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let map = args.first().ok_or("Map.get requires a Map")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -107,7 +108,7 @@ fn native_map_get(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<V
         .get(&str_to_key(IS_MAP_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_map.as_boolean() != Some(true) {
-        return Err("Method Map.prototype.get called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method Map.prototype.get called on incompatible receiver"));
     }
 
     let entries = map_obj
@@ -135,7 +136,7 @@ fn native_map_get(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<V
 }
 
 /// Map.prototype.set(key, value)
-fn native_map_set(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_map_set(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let map = args.first().ok_or("Map.set requires a Map")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
     let value = args.get(2).cloned().unwrap_or_else(VmValue::undefined);
@@ -147,7 +148,7 @@ fn native_map_set(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<Vm
         .get(&str_to_key(IS_MAP_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_map.as_boolean() != Some(true) {
-        return Err("Method Map.prototype.set called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method Map.prototype.set called on incompatible receiver"));
     }
 
     let entries = map_obj
@@ -183,7 +184,7 @@ fn native_map_set(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<Vm
 }
 
 /// Map.prototype.has(key)
-fn native_map_has(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_map_has(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let map = args.first().ok_or("Map.has requires a Map")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -193,7 +194,7 @@ fn native_map_has(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<V
         .get(&str_to_key(IS_MAP_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_map.as_boolean() != Some(true) {
-        return Err("Method Map.prototype.has called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method Map.prototype.has called on incompatible receiver"));
     }
 
     let entries = map_obj
@@ -210,7 +211,7 @@ fn native_map_has(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<V
 }
 
 /// Map.prototype.delete(key)
-fn native_map_delete(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_map_delete(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let map = args.first().ok_or("Map.delete requires a Map")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -220,7 +221,7 @@ fn native_map_delete(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Resul
         .get(&str_to_key(IS_MAP_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_map.as_boolean() != Some(true) {
-        return Err("Method Map.prototype.delete called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method Map.prototype.delete called on incompatible receiver"));
     }
 
     let entries = map_obj
@@ -253,7 +254,7 @@ fn native_map_delete(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Resul
 }
 
 /// Map.prototype.clear()
-fn native_map_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_map_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let map = args.first().ok_or("Map.clear requires a Map")?;
 
     let map_obj = map.as_object().ok_or("First argument must be a Map")?;
@@ -262,7 +263,7 @@ fn native_map_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<
         .get(&str_to_key(IS_MAP_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_map.as_boolean() != Some(true) {
-        return Err("Method Map.prototype.clear called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method Map.prototype.clear called on incompatible receiver"));
     }
 
     // Replace entries with new empty object
@@ -274,7 +275,7 @@ fn native_map_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<
 }
 
 /// Map.prototype.size getter
-fn native_map_size(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_map_size(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let map = args.first().ok_or("Map.size requires a Map")?;
 
     let map_obj = map.as_object().ok_or("First argument must be a Map")?;
@@ -283,7 +284,7 @@ fn native_map_size(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<
         .get(&str_to_key(IS_MAP_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_map.as_boolean() != Some(true) {
-        return Err("get Map.prototype.size called on incompatible receiver".to_string());
+        return Err(VmError::type_error("get Map.prototype.size called on incompatible receiver"));
     }
 
     let size = map_obj
@@ -293,7 +294,7 @@ fn native_map_size(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<
 }
 
 /// Map.prototype.keys() - returns an iterator over keys
-fn native_map_keys(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_map_keys(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let map = args.first().ok_or("Map.keys requires a Map")?;
 
     let map_obj = map.as_object().ok_or("First argument must be a Map")?;
@@ -302,7 +303,7 @@ fn native_map_keys(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<V
         .get(&str_to_key(IS_MAP_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_map.as_boolean() != Some(true) {
-        return Err("Method Map.prototype.keys called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method Map.prototype.keys called on incompatible receiver"));
     }
 
     let entries = map_obj
@@ -335,7 +336,7 @@ fn native_map_keys(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<V
 }
 
 /// Map.prototype.values() - returns an iterator over values
-fn native_map_values(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_map_values(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let map = args.first().ok_or("Map.values requires a Map")?;
 
     let map_obj = map.as_object().ok_or("First argument must be a Map")?;
@@ -344,7 +345,7 @@ fn native_map_values(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result
         .get(&str_to_key(IS_MAP_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_map.as_boolean() != Some(true) {
-        return Err("Method Map.prototype.values called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method Map.prototype.values called on incompatible receiver"));
     }
 
     let entries = map_obj
@@ -377,7 +378,7 @@ fn native_map_values(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result
 }
 
 /// Map.prototype.entries() - returns an iterator over [key, value] pairs
-fn native_map_entries(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_map_entries(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let map = args.first().ok_or("Map.entries requires a Map")?;
 
     let map_obj = map.as_object().ok_or("First argument must be a Map")?;
@@ -386,7 +387,7 @@ fn native_map_entries(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
         .get(&str_to_key(IS_MAP_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_map.as_boolean() != Some(true) {
-        return Err("Method Map.prototype.entries called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method Map.prototype.entries called on incompatible receiver"));
     }
 
     let entries = map_obj
@@ -429,7 +430,7 @@ fn native_map_entries(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
 }
 
 /// Map.prototype.forEach(callback, thisArg) - just returns entries for JS to iterate
-fn native_map_foreach(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, String> {
+fn native_map_foreach(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     // The actual forEach iteration is done in JS
     // We just return the entries array here
     native_map_entries(args, mm)
@@ -443,7 +444,7 @@ fn native_map_foreach(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
 fn native_weakmap_new(
     _args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let map_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
 
     // WeakMap uses the same internal structure but only allows object keys
@@ -455,11 +456,11 @@ fn native_weakmap_new(
 }
 
 /// Helper to validate WeakMap key (must be object or symbol)
-fn validate_weakmap_key(key: &VmValue) -> Result<(), String> {
+fn validate_weakmap_key(key: &VmValue) -> Result<(), VmError> {
     if key.is_object() || key.is_symbol() || key.is_function() {
         Ok(())
     } else {
-        Err("Invalid value used as weak map key".to_string())
+        Err(VmError::type_error("Invalid value used as weak map key"))
     }
 }
 
@@ -467,7 +468,7 @@ fn validate_weakmap_key(key: &VmValue) -> Result<(), String> {
 fn native_weakmap_get(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let map = args.first().ok_or("WeakMap.get requires a WeakMap")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -477,7 +478,7 @@ fn native_weakmap_get(
         .get(&str_to_key(IS_WEAKMAP_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_weakmap.as_boolean() != Some(true) {
-        return Err("Method WeakMap.prototype.get called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method WeakMap.prototype.get called on incompatible receiver"));
     }
 
     // WeakMap keys must be objects or symbols
@@ -512,7 +513,7 @@ fn native_weakmap_get(
 fn native_weakmap_set(
     args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let map = args.first().ok_or("WeakMap.set requires a WeakMap")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
     let value = args.get(2).cloned().unwrap_or_else(VmValue::undefined);
@@ -523,7 +524,7 @@ fn native_weakmap_set(
         .get(&str_to_key(IS_WEAKMAP_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_weakmap.as_boolean() != Some(true) {
-        return Err("Method WeakMap.prototype.set called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method WeakMap.prototype.set called on incompatible receiver"));
     }
 
     validate_weakmap_key(&key)?;
@@ -551,7 +552,7 @@ fn native_weakmap_set(
 fn native_weakmap_has(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let map = args.first().ok_or("WeakMap.has requires a WeakMap")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -561,7 +562,7 @@ fn native_weakmap_has(
         .get(&str_to_key(IS_WEAKMAP_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_weakmap.as_boolean() != Some(true) {
-        return Err("Method WeakMap.prototype.has called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method WeakMap.prototype.has called on incompatible receiver"));
     }
 
     if !key.is_object() && !key.is_symbol() && !key.is_function() {
@@ -585,7 +586,7 @@ fn native_weakmap_has(
 fn native_weakmap_delete(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, String> {
+) -> Result<VmValue, VmError> {
     let map = args.first().ok_or("WeakMap.delete requires a WeakMap")?;
     let key = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -595,7 +596,7 @@ fn native_weakmap_delete(
         .get(&str_to_key(IS_WEAKMAP_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_weakmap.as_boolean() != Some(true) {
-        return Err("Method WeakMap.prototype.delete called on incompatible receiver".to_string());
+        return Err(VmError::type_error("Method WeakMap.prototype.delete called on incompatible receiver"));
     }
 
     if !key.is_object() && !key.is_symbol() && !key.is_function() {

@@ -1,4 +1,4 @@
-use otter_engine::{Extension, GcRef, JsObject, PropertyKey, Value, VmContext};
+use otter_engine::{Extension, GcRef, JsObject, PropertyKey, Value, VmContext, VmError};
 use std::sync::{Arc, Mutex};
 
 /// JS bootstrap executed by the extension to set up `print`, `$262`, etc.
@@ -183,7 +183,7 @@ pub fn setup_harness(ctx: &mut VmContext) {
                 if let Some(err) = args.first() {
                     if !err.is_undefined() && !err.is_null() {
                         // Test failed
-                        return Err(format!("Test failed via $DONE: {:?}", err));
+                        return Err(VmError::type_error(format!("Test failed via $DONE: {:?}", err)));
                     }
                 }
                 // Test passed

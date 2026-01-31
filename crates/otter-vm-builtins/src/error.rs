@@ -9,6 +9,7 @@
 //! - URIError - URI errors
 //! - EvalError - eval errors
 
+use otter_vm_core::VmError;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::string::JsString;
@@ -37,7 +38,7 @@ pub fn ops() -> Vec<Op> {
 fn error_create(
     args: &[Value],
     mm: Arc<otter_vm_core::memory::MemoryManager>,
-) -> Result<Value, String> {
+) -> Result<Value, VmError> {
     let name = args
         .first()
         .and_then(|v| v.as_string())
@@ -111,7 +112,7 @@ fn error_create(
 fn error_get_message(
     args: &[Value],
     _mm: Arc<otter_vm_core::memory::MemoryManager>,
-) -> Result<Value, String> {
+) -> Result<Value, VmError> {
     let obj = args
         .first()
         .and_then(|v| v.as_object())
@@ -128,7 +129,7 @@ fn error_get_message(
 fn error_get_name(
     args: &[Value],
     _mm: Arc<otter_vm_core::memory::MemoryManager>,
-) -> Result<Value, String> {
+) -> Result<Value, VmError> {
     let obj = args
         .first()
         .and_then(|v| v.as_object())
@@ -145,7 +146,7 @@ fn error_get_name(
 fn error_get_stack(
     args: &[Value],
     _mm: Arc<otter_vm_core::memory::MemoryManager>,
-) -> Result<Value, String> {
+) -> Result<Value, VmError> {
     let obj = args
         .first()
         .and_then(|v| v.as_object())
@@ -162,7 +163,7 @@ fn error_get_stack(
 fn error_set_stack(
     args: &[Value],
     _mm: Arc<otter_vm_core::memory::MemoryManager>,
-) -> Result<Value, String> {
+) -> Result<Value, VmError> {
     let obj = args
         .first()
         .and_then(|v| v.as_object())
@@ -179,7 +180,7 @@ fn error_set_stack(
 fn error_to_string(
     args: &[Value],
     _mm: Arc<otter_vm_core::memory::MemoryManager>,
-) -> Result<Value, String> {
+) -> Result<Value, VmError> {
     let obj = args
         .first()
         .and_then(|v| v.as_object())

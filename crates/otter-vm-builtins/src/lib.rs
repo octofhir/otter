@@ -80,13 +80,14 @@ pub fn create_builtins_extension() -> Extension {
 pub fn create_builtins_extension_with_console<A: ConsoleAdapter>(adapter: A) -> Extension {
     let mut ops = Vec::new();
 
+    ops.extend(console::console_ops_with_adapter(adapter));
     ops.extend(object::ops());
     ops.extend(array::ops());
     ops.extend(array_buffer::ops());
     ops.extend(boolean::ops());
     ops.extend(date::ops());
     ops.extend(error::ops());
-    ops.extend(function::ops());
+    // ops.extend(function::ops()); // Removed - conflicts with intrinsics
     ops.extend(global::ops());
     ops.extend(iterator::ops());
     ops.extend(json::ops());
@@ -103,14 +104,9 @@ pub fn create_builtins_extension_with_console<A: ConsoleAdapter>(adapter: A) -> 
     ops.extend(temporal::ops());
     ops.extend(typed_array::ops());
     ops.extend(data_view::ops());
-    ops.extend(console::console_ops_with_adapter(adapter));
     ops.extend(fetch::ops());
 
-    Extension::new("builtins")
-        .with_js(include_str!("console_shim.js"))
-        .with_ops(ops)
-        .with_js(include_str!("builtins.js"))
-        .with_js(fetch::JS_SHIM)
+    Extension::new("builtins").with_ops(ops)
 }
 
 /// Create HTTP server extension

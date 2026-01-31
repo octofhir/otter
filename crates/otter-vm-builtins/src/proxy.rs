@@ -80,7 +80,7 @@ fn native_proxy_revocable(
     result.set(
         "revoke".into(),
         VmValue::native_function(
-            move |_args: &[VmValue], _mm: Arc<memory::MemoryManager>| {
+            move |_this: &VmValue, _args: &[VmValue], _mm: Arc<memory::MemoryManager>| {
                 revoke_fn();
                 Ok(VmValue::undefined())
             },

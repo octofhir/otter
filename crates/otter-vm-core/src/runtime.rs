@@ -12,6 +12,7 @@ use crate::error::VmResult;
 use crate::gc::GcRef;
 use crate::globals;
 use crate::interpreter::Interpreter;
+use crate::intrinsics::Intrinsics;
 use crate::object::JsObject;
 use crate::value::Value;
 
@@ -32,6 +33,9 @@ pub struct VmRuntime {
     /// Intrinsic `%Function.prototype%` object (ES2023 §10.3.1).
     /// Created once at runtime init, shared across contexts.
     function_prototype: GcRef<JsObject>,
+    /// All intrinsic objects and well-known symbols.
+    /// Created once at runtime init, shared across contexts.
+    intrinsics: Intrinsics,
 }
 
 /// Runtime configuration
@@ -71,13 +75,23 @@ impl VmRuntime {
         // can receive it at construction time (BOA/V8/SpiderMonkey pattern).
         let function_prototype = GcRef::new(JsObject::new(None, memory_manager.clone()));
 
+        // Stage 1: Allocate all intrinsic objects (empty, no properties yet)
+        let intrinsics = Intrinsics::allocate(&memory_manager, function_prototype);
+        // Stage 2: Wire prototype chains (Object.prototype -> null, etc.)
+        intrinsics.wire_prototype_chains();
+        // Stage 3: Initialize core intrinsic properties (toString, valueOf, etc.)
+        intrinsics.init_core(&memory_manager);
+
         let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
         globals::setup_global_object(global, function_prototype);
+        // Install intrinsic constructors on global (Object, Function, etc.)
+        intrinsics.install_on_global(global, &memory_manager);
 
         Self {
             modules: DashMap::new(),
             global_template: global,
             function_prototype,
+            intrinsics,
             memory_manager,
             config,
         }
@@ -102,6 +116,9 @@ impl VmRuntime {
         // TODO: Proper cloning with prototype chain
         let global = GcRef::new(JsObject::new(None, self.memory_manager.clone()));
         globals::setup_global_object(global, self.function_prototype);
+        // Install intrinsic constructors on the new global
+        self.intrinsics
+            .install_on_global(global, &self.memory_manager);
         let mut ctx = VmContext::with_config(
             global,
             self.config.max_stack_depth,
@@ -115,6 +132,11 @@ impl VmRuntime {
     /// Get the intrinsic `%Function.prototype%` object.
     pub fn function_prototype(&self) -> GcRef<JsObject> {
         self.function_prototype
+    }
+
+    /// Get the intrinsics registry (all intrinsic objects and well-known symbols).
+    pub fn intrinsics(&self) -> &Intrinsics {
+        &self.intrinsics
     }
 
     /// Execute a module

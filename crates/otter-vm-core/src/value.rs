@@ -109,8 +109,11 @@ unsafe impl Send for Value {}
 unsafe impl Sync for Value {}
 
 /// Native function handler type
-pub type NativeFn =
-    Arc<dyn Fn(&[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, String> + Send + Sync>;
+pub type NativeFn = Arc<
+    dyn Fn(&Value, &[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, String>
+        + Send
+        + Sync,
+>;
 
 /// Reference to heap-allocated data
 #[derive(Clone)]
@@ -417,7 +420,7 @@ impl Value {
     /// Create native function value
     pub fn native_function<F>(f: F, memory_manager: Arc<crate::memory::MemoryManager>) -> Self
     where
-        F: Fn(&[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, String>
+        F: Fn(&Value, &[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, String>
             + Send
             + Sync
             + 'static,
@@ -443,13 +446,29 @@ impl Value {
         prototype: GcRef<JsObject>,
     ) -> Self
     where
-        F: Fn(&[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, String>
+        F: Fn(&Value, &[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, String>
             + Send
             + Sync
             + 'static,
     {
         let func: NativeFn = Arc::new(f);
         let object = GcRef::new(JsObject::new(Some(prototype), memory_manager));
+        let native = Arc::new(NativeFunctionObject { func, object });
+        Self {
+            bits: TAG_POINTER,
+            heap_ref: Some(HeapRef::NativeFunction(native)),
+        }
+    }
+
+    /// Create a native function value with a specific `[[Prototype]]` and
+    /// a pre-existing object for properties (e.g., one that already has
+    /// `length` and `name` set by `BuiltInBuilder`).
+    pub fn native_function_with_proto_and_object(
+        func: NativeFn,
+        _memory_manager: Arc<crate::memory::MemoryManager>,
+        _prototype: GcRef<JsObject>,
+        object: GcRef<JsObject>,
+    ) -> Self {
         let native = Arc::new(NativeFunctionObject { func, object });
         Self {
             bits: TAG_POINTER,
@@ -651,6 +670,7 @@ impl Value {
             Some(HeapRef::NativeFunction(n)) => Some(n.object),
             Some(HeapRef::Generator(g)) => Some(g.object),
             Some(HeapRef::RegExp(r)) => Some(r.object),
+            Some(HeapRef::ArrayBuffer(ab)) => Some(ab.object),
             _ => None,
         }
     }
@@ -1048,6 +1068,15 @@ impl Value {
                 }
                 HeapRef::Generator(g) => {
                     tracer(g.object.header() as *const _);
+                }
+                HeapRef::ArrayBuffer(ab) => {
+                    tracer(ab.object.header() as *const _);
+                }
+                HeapRef::TypedArray(ta) => {
+                    tracer(ta.buffer().object.header() as *const _);
+                }
+                HeapRef::DataView(dv) => {
+                    tracer(dv.buffer().object.header() as *const _);
                 }
                 // Other types use Arc, not GcRef, so no GC tracing needed
                 _ => {}

@@ -8,7 +8,7 @@ use otter_vm_core::memory;
 use otter_vm_core::string::JsString;
 use otter_vm_core::typed_array::{JsTypedArray, TypedArrayKind};
 use otter_vm_core::value::{BigInt, HeapRef, Value as VmValue};
-use otter_vm_runtime::{Op, op_native_with_mm as op_native};
+use otter_vm_runtime::{op_native_with_mm as op_native, Op};
 use std::sync::Arc;
 
 /// Get TypedArray ops for extension registration
@@ -40,7 +40,10 @@ pub fn ops() -> Vec<Op> {
         op_native("__TypedArray_reverse", native_typed_array_reverse),
         op_native("__TypedArray_set_array", native_typed_array_set_array),
         // Type check
-        op_native("__TypedArray_isTypedArray", native_typed_array_is_typed_array),
+        op_native(
+            "__TypedArray_isTypedArray",
+            native_typed_array_is_typed_array,
+        ),
         op_native("__TypedArray_kind", native_typed_array_kind),
     ]
 }
@@ -153,10 +156,7 @@ fn native_typed_array_create_from_length(
     args: &[VmValue],
     _mm: Arc<memory::MemoryManager>,
 ) -> Result<VmValue, String> {
-    let length = args
-        .first()
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0) as usize;
+    let length = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
 
     let kind_str = args
         .get(1)
@@ -165,7 +165,7 @@ fn native_typed_array_create_from_length(
 
     let kind = parse_kind(kind_str.as_str()).ok_or("TypeError: invalid TypedArray kind")?;
 
-    let ta = JsTypedArray::with_length(kind, length);
+    let ta = JsTypedArray::with_length(kind, length, None, _mm);
     Ok(VmValue::typed_array(Arc::new(ta)))
 }
 
@@ -185,13 +185,15 @@ fn native_typed_array_create_from_array(
     let kind = parse_kind(kind_str.as_str()).ok_or("TypeError: invalid TypedArray kind")?;
 
     // Get length from array
-    let arr_obj = values.as_object().ok_or("TypeError: values must be array-like")?;
+    let arr_obj = values
+        .as_object()
+        .ok_or("TypeError: values must be array-like")?;
     let length_val = arr_obj
         .get(&otter_vm_core::object::PropertyKey::string("length"))
         .ok_or("TypeError: values must have length")?;
     let length = length_val.as_number().unwrap_or(0.0) as usize;
 
-    let ta = JsTypedArray::with_length(kind, length);
+    let ta = JsTypedArray::with_length(kind, length, None, _mm);
 
     // Copy values
     for i in 0..length {
@@ -323,9 +325,11 @@ fn native_typed_array_set(
     }
 
     if ta.kind().is_bigint() {
-        let arg = args.get(2).ok_or("TypeError: BigInt expected for BigInt typed array")?;
-        let bigint = get_bigint_value(arg)
+        let arg = args
+            .get(2)
             .ok_or("TypeError: BigInt expected for BigInt typed array")?;
+        let bigint =
+            get_bigint_value(arg).ok_or("TypeError: BigInt expected for BigInt typed array")?;
         let int_val: i64 = bigint.value.parse().unwrap_or(0);
         ta.set_bigint(index, int_val);
     } else {
@@ -352,15 +356,20 @@ fn native_typed_array_subarray(
         .ok_or("TypeError: not a TypedArray")?;
 
     let begin = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i64;
-    let end = args.get(2).and_then(|v| {
-        if v.is_undefined() {
-            None
-        } else {
-            v.as_number()
-        }
-    }).map(|n| n as i64);
+    let end = args
+        .get(2)
+        .and_then(|v| {
+            if v.is_undefined() {
+                None
+            } else {
+                v.as_number()
+            }
+        })
+        .map(|n| n as i64);
 
-    let new_ta = ta.subarray(begin, end).map_err(|e| format!("TypeError: {}", e))?;
+    let new_ta = ta
+        .subarray(begin, end)
+        .map_err(|e| format!("TypeError: {}", e))?;
     Ok(VmValue::typed_array(Arc::new(new_ta)))
 }
 
@@ -376,15 +385,20 @@ fn native_typed_array_slice(
         .ok_or("TypeError: not a TypedArray")?;
 
     let begin = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i64;
-    let end = args.get(2).and_then(|v| {
-        if v.is_undefined() {
-            None
-        } else {
-            v.as_number()
-        }
-    }).map(|n| n as i64);
+    let end = args
+        .get(2)
+        .and_then(|v| {
+            if v.is_undefined() {
+                None
+            } else {
+                v.as_number()
+            }
+        })
+        .map(|n| n as i64);
 
-    let new_ta = ta.slice(begin, end).map_err(|e| format!("TypeError: {}", e))?;
+    let new_ta = ta
+        .slice(begin, end)
+        .map_err(|e| format!("TypeError: {}", e))?;
     Ok(VmValue::typed_array(Arc::new(new_ta)))
 }
 
@@ -404,20 +418,26 @@ fn native_typed_array_fill(
     }
 
     let value = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0);
-    let start = args.get(2).and_then(|v| {
-        if v.is_undefined() {
-            None
-        } else {
-            v.as_number()
-        }
-    }).map(|n| n as i64);
-    let end = args.get(3).and_then(|v| {
-        if v.is_undefined() {
-            None
-        } else {
-            v.as_number()
-        }
-    }).map(|n| n as i64);
+    let start = args
+        .get(2)
+        .and_then(|v| {
+            if v.is_undefined() {
+                None
+            } else {
+                v.as_number()
+            }
+        })
+        .map(|n| n as i64);
+    let end = args
+        .get(3)
+        .and_then(|v| {
+            if v.is_undefined() {
+                None
+            } else {
+                v.as_number()
+            }
+        })
+        .map(|n| n as i64);
 
     ta.fill(value, start, end);
 
@@ -442,13 +462,16 @@ fn native_typed_array_copy_within(
 
     let target = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i64;
     let start = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i64;
-    let end = args.get(3).and_then(|v| {
-        if v.is_undefined() {
-            None
-        } else {
-            v.as_number()
-        }
-    }).map(|n| n as i64);
+    let end = args
+        .get(3)
+        .and_then(|v| {
+            if v.is_undefined() {
+                None
+            } else {
+                v.as_number()
+            }
+        })
+        .map(|n| n as i64);
 
     ta.copy_within(target, start, end);
 
@@ -494,7 +517,9 @@ fn native_typed_array_set_array(
     let offset = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
 
     // Get source length
-    let src_obj = source.as_object().ok_or("TypeError: source must be array-like")?;
+    let src_obj = source
+        .as_object()
+        .ok_or("TypeError: source must be array-like")?;
     let length_val = src_obj
         .get(&otter_vm_core::object::PropertyKey::string("length"))
         .ok_or("TypeError: source must have length")?;
@@ -558,7 +583,10 @@ mod tests {
     #[test]
     fn test_create_from_length() {
         let result = native_typed_array_create_from_length(
-            &[VmValue::number(10.0), VmValue::string(JsString::intern("Int32Array"))],
+            &[
+                VmValue::number(10.0),
+                VmValue::string(JsString::intern("Int32Array")),
+            ],
             mm(),
         )
         .unwrap();
@@ -572,14 +600,20 @@ mod tests {
     #[test]
     fn test_get_set() {
         let ta_val = native_typed_array_create_from_length(
-            &[VmValue::number(4.0), VmValue::string(JsString::intern("Int32Array"))],
+            &[
+                VmValue::number(4.0),
+                VmValue::string(JsString::intern("Int32Array")),
+            ],
             mm(),
         )
         .unwrap();
 
         // Set value
-        native_typed_array_set(&[ta_val.clone(), VmValue::number(0.0), VmValue::number(42.0)], mm())
-            .unwrap();
+        native_typed_array_set(
+            &[ta_val.clone(), VmValue::number(0.0), VmValue::number(42.0)],
+            mm(),
+        )
+        .unwrap();
 
         // Get value
         let result = native_typed_array_get(&[ta_val, VmValue::number(0.0)], mm()).unwrap();
@@ -589,7 +623,10 @@ mod tests {
     #[test]
     fn test_subarray() {
         let ta_val = native_typed_array_create_from_length(
-            &[VmValue::number(10.0), VmValue::string(JsString::intern("Int32Array"))],
+            &[
+                VmValue::number(10.0),
+                VmValue::string(JsString::intern("Int32Array")),
+            ],
             mm(),
         )
         .unwrap();
@@ -597,7 +634,11 @@ mod tests {
         // Set some values
         for i in 0..10 {
             native_typed_array_set(
-                &[ta_val.clone(), VmValue::number(i as f64), VmValue::number(i as f64)],
+                &[
+                    ta_val.clone(),
+                    VmValue::number(i as f64),
+                    VmValue::number(i as f64),
+                ],
                 mm(),
             )
             .unwrap();
@@ -620,14 +661,21 @@ mod tests {
     #[test]
     fn test_slice() {
         let ta_val = native_typed_array_create_from_length(
-            &[VmValue::number(10.0), VmValue::string(JsString::intern("Int32Array"))],
+            &[
+                VmValue::number(10.0),
+                VmValue::string(JsString::intern("Int32Array")),
+            ],
             mm(),
         )
         .unwrap();
 
         for i in 0..10 {
             native_typed_array_set(
-                &[ta_val.clone(), VmValue::number(i as f64), VmValue::number(i as f64)],
+                &[
+                    ta_val.clone(),
+                    VmValue::number(i as f64),
+                    VmValue::number(i as f64),
+                ],
                 mm(),
             )
             .unwrap();
@@ -656,7 +704,10 @@ mod tests {
     #[test]
     fn test_fill() {
         let ta_val = native_typed_array_create_from_length(
-            &[VmValue::number(5.0), VmValue::string(JsString::intern("Int32Array"))],
+            &[
+                VmValue::number(5.0),
+                VmValue::string(JsString::intern("Int32Array")),
+            ],
             mm(),
         )
         .unwrap();
@@ -672,14 +723,21 @@ mod tests {
     #[test]
     fn test_reverse() {
         let ta_val = native_typed_array_create_from_length(
-            &[VmValue::number(5.0), VmValue::string(JsString::intern("Int32Array"))],
+            &[
+                VmValue::number(5.0),
+                VmValue::string(JsString::intern("Int32Array")),
+            ],
             mm(),
         )
         .unwrap();
 
         for i in 0..5 {
             native_typed_array_set(
-                &[ta_val.clone(), VmValue::number(i as f64), VmValue::number(i as f64)],
+                &[
+                    ta_val.clone(),
+                    VmValue::number(i as f64),
+                    VmValue::number(i as f64),
+                ],
                 mm(),
             )
             .unwrap();

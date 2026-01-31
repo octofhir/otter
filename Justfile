@@ -95,7 +95,7 @@ test262-filter filter:
 
 # Run Test262 for specific directory (e.g., "language/expressions")
 test262-dir dir:
-    cargo run -p otter-test262 -- --subdir {{dir}} --verbose
+    cargo run -p otter-test262 --bin test262 -- --subdir {{dir}} --verbose
 
 # List Test262 tests (with optional filter)
 test262-list filter="":

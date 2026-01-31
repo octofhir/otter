@@ -232,7 +232,7 @@ impl Otter {
             PropertyKey::string("__otter_interrupted"),
             otter_vm_core::object::PropertyDescriptor::getter(
                 Value::native_function_with_proto(
-                    move |_, _| Ok(Value::boolean(flag.load(Ordering::Relaxed))),
+                    move |_, _, _| Ok(Value::boolean(flag.load(Ordering::Relaxed))),
                     self.vm.memory_manager().clone(),
                     fn_proto,
                 ),
@@ -256,7 +256,9 @@ impl Otter {
         }
 
         // 6. Wrap code for top-level await support
-        let wrapped = Self::wrap_for_top_level_await(code);
+        // TEMPORARILY DISABLED for debugging
+        let wrapped = code.to_string();
+        // let wrapped = Self::wrap_for_top_level_await(code);
 
         // 7. Set top-level `this` to the global object per ES2023 §19.2.1.
         // Arrow functions in the wrapper inherit this lexical `this`.
@@ -611,7 +613,7 @@ impl Otter {
         global.set(
             PropertyKey::string("__otter_eval"),
             Value::native_function_with_proto(
-                move |args: &[Value], _mm| {
+                move |_this: &Value, args: &[Value], _mm| {
                     let mm_result = mm_eval_closure.clone();
                     let result_ok = |value: Value| {
                         let obj = JsObject::new(None, mm_result.clone());
@@ -679,6 +681,46 @@ impl Otter {
                 fn_proto,
             ),
         );
+
+        // Create console object from __console_* ops
+        use otter_vm_core::object::PropertyDescriptor;
+        let console_obj = GcRef::new(JsObject::new(None, self.vm.memory_manager().clone()));
+
+        // Helper to wire console methods from global __console_* functions
+        let wire_console = |method_name: &str, global_name: &str| {
+            if let Some(func) = global.get(&PropertyKey::string(global_name)) {
+                console_obj.set(PropertyKey::string(method_name), func);
+            }
+        };
+
+        wire_console("log", "__console_log");
+        wire_console("error", "__console_error");
+        wire_console("warn", "__console_warn");
+        wire_console("info", "__console_info");
+        wire_console("debug", "__console_debug");
+        wire_console("trace", "__console_trace");
+        wire_console("time", "__console_time");
+        wire_console("timeEnd", "__console_timeEnd");
+        wire_console("timeLog", "__console_timeLog");
+        wire_console("assert", "__console_assert");
+        wire_console("clear", "__console_clear");
+        wire_console("count", "__console_count");
+        wire_console("countReset", "__console_countReset");
+        wire_console("table", "__console_table");
+        wire_console("dir", "__console_dir");
+        wire_console("dirxml", "__console_dirxml");
+
+        // group/groupCollapsed/groupEnd alias to log
+        if let Some(log_fn) = global.get(&PropertyKey::string("__console_log")) {
+            console_obj.set(PropertyKey::string("group"), log_fn.clone());
+            console_obj.set(PropertyKey::string("groupCollapsed"), log_fn.clone());
+            console_obj.set(PropertyKey::string("groupEnd"), log_fn);
+        }
+
+        // Install console on global
+        global.set(PropertyKey::string("console"), Value::object(console_obj));
+
+        // NOTE: Temporal namespace creation moved to intrinsics.rs install_on_global()
     }
 
     /// Create a native function wrapper for an op handler
@@ -696,7 +738,7 @@ impl Otter {
             OpHandler::Native(native_fn) => {
                 // Native ops work directly with Value
                 Value::native_function_with_proto(
-                    move |args, mm_inner| native_fn(args, mm_inner),
+                    move |_this, args, mm_inner| native_fn(args, mm_inner),
                     mm,
                     fn_proto,
                 )
@@ -705,7 +747,7 @@ impl Otter {
                 // Sync JSON ops need Value -> JSON -> Value conversion
                 let mm_inner = mm.clone();
                 Value::native_function_with_proto(
-                    move |args, _mm_ignored| {
+                    move |_this, args, _mm_ignored| {
                         let json_args: Vec<serde_json::Value> =
                             args.iter().map(value_to_json).collect();
                         let result = sync_fn(&json_args)?;
@@ -722,7 +764,7 @@ impl Otter {
                 let mm_outer = mm.clone();
                 let mm_outer_closure = mm_outer.clone();
                 Value::native_function_with_proto(
-                    move |args, _mm_ignored| {
+                    move |_this, args, _mm_ignored| {
                         let mm_promise = mm_outer_closure.clone();
                         let resolvers = JsPromise::with_resolvers(mm_promise.clone());
                         let promise = resolvers.promise.clone();
@@ -773,7 +815,7 @@ impl Otter {
         global.set(
             PropertyKey::string("__env_get"),
             Value::native_function_with_proto(
-                move |args: &[Value], _mm| {
+                move |_this: &Value, args: &[Value], _mm| {
                     let key = args
                         .first()
                         .and_then(|v| v.as_string())
@@ -802,7 +844,7 @@ impl Otter {
         global.set(
             PropertyKey::string("__env_keys"),
             Value::native_function_with_proto(
-                move |_args: &[Value], _mm| {
+                move |_this: &Value, _args: &[Value], _mm| {
                     let keys = env_store_keys.keys();
                     let arr = JsObject::array(keys.len(), mm_keys_closure.clone());
                     for (i, key) in keys.into_iter().enumerate() {
@@ -825,7 +867,7 @@ impl Otter {
         global.set(
             PropertyKey::string("__env_has"),
             Value::native_function_with_proto(
-                move |args: &[Value], _mm| {
+                move |_this: &Value, args: &[Value], _mm| {
                     let key = args
                         .first()
                         .and_then(|v| v.as_string())

@@ -1,28 +1,138 @@
 use otter_engine::{Extension, GcRef, JsObject, PropertyKey, Value, VmContext};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-/// Create a Test262 harness extension
-/// Note: sta.js, assert.js, and other harness files are loaded by the runner
-/// from test262/harness/ based on test metadata includes.
-/// This extension only provides native ops needed by those files.
-pub fn create_harness_extension() -> Extension {
-    Extension::new("test262")
+/// JS bootstrap executed by the extension to set up `print`, `$262`, etc.
+/// Runs BEFORE any test262 harness files (sta.js, assert.js) are prepended.
+/// Uses native ops `__test262_print`, `__test262_done`, `__otter_eval`.
+const HARNESS_SETUP_JS: &str = r#"
+// print() - routes to native __test262_print for output capture
+var print = function() {
+    for (var i = 0; i < arguments.length; i++) {
+        __test262_print(arguments[i]);
+    }
+};
+
+// $262 host object (test262 host-defined)
+var $262 = {
+    global: this,
+    gc: function() { /* no-op */ },
+    evalScript: function(code) {
+        if (typeof __otter_eval === 'function') {
+            var result = __otter_eval(code);
+            if (result && result.ok === false) {
+                throw new Error(result.message || 'evalScript failed');
+            }
+            return result && result.value !== undefined ? result.value : undefined;
+        }
+        throw new Error('$262.evalScript not supported');
+    },
+    detachArrayBuffer: function(buffer) {
+        if (typeof __test262_detach_array_buffer === 'function') {
+            __test262_detach_array_buffer(buffer);
+        }
+    },
+    createRealm: function() {
+        return {
+            global: {},
+            evalScript: function(code) {
+                return $262.evalScript(code);
+            }
+        };
+    }
+};
+"#;
+
+/// Shared state for capturing async test results and print output.
+///
+/// Created once at engine build time, shared via `Arc<Mutex<...>>` with
+/// the native op closures. The runner clears it before each test and
+/// reads it after `eval()` completes.
+#[derive(Debug, Clone)]
+pub struct TestHarnessState {
+    inner: Arc<Mutex<TestHarnessInner>>,
+}
+
+#[derive(Debug, Default)]
+struct TestHarnessInner {
+    /// Captured print output lines
+    print_output: Vec<String>,
+    /// Result from $DONE: None = not called, Some(Ok(())) = pass, Some(Err(msg)) = fail
+    done_result: Option<Result<(), String>>,
+}
+
+impl TestHarnessState {
+    /// Create a new shared harness state.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(TestHarnessInner::default())),
+        }
+    }
+
+    /// Clear state before running a new test.
+    pub fn clear(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.print_output.clear();
+        inner.done_result = None;
+    }
+
+    /// Check whether `$DONE` was called. Returns:
+    /// - `None` if `$DONE` was never called
+    /// - `Some(Ok(()))` if `$DONE()` was called with no error
+    /// - `Some(Err(msg))` if `$DONE(error)` was called
+    pub fn done_result(&self) -> Option<Result<(), String>> {
+        self.inner.lock().unwrap().done_result.clone()
+    }
+
+    /// Get all captured print output lines.
+    pub fn print_output(&self) -> Vec<String> {
+        self.inner.lock().unwrap().print_output.clone()
+    }
+}
+
+/// Create a Test262 harness extension with shared state for output capture.
+///
+/// The returned `TestHarnessState` handle should be stored on the runner
+/// and used to inspect async test results after each `eval()`.
+pub fn create_harness_extension_with_state() -> (Extension, TestHarnessState) {
+    let state = TestHarnessState::new();
+
+    let print_state = state.inner.clone();
+    let done_state = state.inner.clone();
+
+    let ext = Extension::new("test262")
         .with_ops(vec![
-            otter_engine::op_native("__test262_print", |args| {
+            otter_engine::op_native("__test262_print", move |args| {
+                let mut inner = print_state.lock().unwrap();
                 for arg in args {
-                    println!("{}", format_value(arg));
+                    let line = format_value(arg);
+                    inner.print_output.push(line);
                 }
                 Ok(Value::undefined())
             }),
-            otter_engine::op_native("__test262_done", |args| {
+            otter_engine::op_native("__test262_done", move |args| {
+                let mut inner = done_state.lock().unwrap();
                 if let Some(err) = args.first() {
                     if !err.is_undefined() && !err.is_null() {
-                        return Err(format!("Test failed via $DONE: {:?}", err));
+                        let msg = format_value(err);
+                        inner.done_result = Some(Err(msg));
+                        // Don't return Err — that would abort the VM.
+                        // Instead, store the failure for the runner to read.
+                        return Ok(Value::undefined());
                     }
                 }
+                inner.done_result = Some(Ok(()));
                 Ok(Value::undefined())
             }),
-        ])
+        ]);
+        // TEMPORARILY DISABLED for debugging
+        // .with_js(HARNESS_SETUP_JS);
+
+    (ext, state)
+}
+
+/// Create a Test262 harness extension (legacy, without state capture).
+pub fn create_harness_extension() -> Extension {
+    create_harness_extension_with_state().0
 }
 
 /// Set up the Test262 harness on a context
@@ -40,9 +150,9 @@ pub fn setup_harness(ctx: &mut VmContext) {
     obj_262.set(
         PropertyKey::string("gc"),
         Value::native_function(
-            |_args, _mm| {
-            // Trigger VM GC if supported
-            Ok(Value::undefined())
+            |_this, _args, _mm| {
+                // Trigger VM GC if supported
+                Ok(Value::undefined())
             },
             Arc::clone(&mm),
         ),
@@ -54,7 +164,7 @@ pub fn setup_harness(ctx: &mut VmContext) {
     global.set(
         PropertyKey::string("print"),
         Value::native_function(
-            |args, _mm| {
+            |_this, args, _mm| {
                 for arg in args {
                     println!("{}", format_value(arg));
                 }
@@ -69,7 +179,7 @@ pub fn setup_harness(ctx: &mut VmContext) {
     global.set(
         PropertyKey::string("$DONE"),
         Value::native_function(
-            |args, _mm| {
+            |_this: &Value, args: &[Value], _mm| {
                 if let Some(err) = args.first() {
                     if !err.is_undefined() && !err.is_null() {
                         // Test failed
@@ -83,8 +193,8 @@ pub fn setup_harness(ctx: &mut VmContext) {
         ),
     );
 
-    // Set up assert functions
-    setup_assert(global);
+    // Note: assert object is created by assert.js harness file, not here.
+    // This allows assert to be a function with methods (sameValue, throws, etc.)
 }
 
 fn format_value(value: &Value) -> String {
@@ -98,19 +208,6 @@ fn format_value(value: &Value) -> String {
         return s.as_str().to_string();
     }
     format!("{:?}", value)
-}
-
-/// Set up assert helpers
-fn setup_assert(global: GcRef<JsObject>) {
-    let mm = Arc::clone(global.memory_manager());
-    let assert_obj = GcRef::new(JsObject::new(None, mm));
-
-    // assert(condition, message) - Basic assertion
-    // assert.sameValue(actual, expected, message) - Strict equality assertion
-    // assert.notSameValue(actual, expected, message) - Strict inequality assertion
-    // assert.throws(errorType, fn, message) - Exception assertion
-
-    global.set(PropertyKey::string("assert"), Value::object(assert_obj));
 }
 
 /// Standard harness files content
@@ -155,7 +252,27 @@ mod tests {
         // Check $262 exists
         assert!(ctx.global().has(&PropertyKey::string("$262")));
 
-        // Check assert exists
-        assert!(ctx.global().has(&PropertyKey::string("assert")));
+        // Note: assert is created by assert.js harness file, not setup_harness
+    }
+
+    #[test]
+    fn test_harness_state() {
+        let state = TestHarnessState::new();
+        assert!(state.done_result().is_none());
+        assert!(state.print_output().is_empty());
+
+        // Simulate $DONE() success
+        {
+            let mut inner = state.inner.lock().unwrap();
+            inner.done_result = Some(Ok(()));
+            inner.print_output.push("hello".to_string());
+        }
+        assert_eq!(state.done_result(), Some(Ok(())));
+        assert_eq!(state.print_output(), vec!["hello".to_string()]);
+
+        // Clear resets everything
+        state.clear();
+        assert!(state.done_result().is_none());
+        assert!(state.print_output().is_empty());
     }
 }

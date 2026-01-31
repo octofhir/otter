@@ -125,7 +125,7 @@ pub struct PropertyAttributes {
 }
 
 impl PropertyAttributes {
-    /// Default data property attributes
+    /// Default data property attributes (all true — use only for user-created properties)
     pub const fn data() -> Self {
         Self {
             writable: true,
@@ -149,6 +149,67 @@ impl PropertyAttributes {
             writable: false,
             enumerable: false,
             configurable: false,
+        }
+    }
+
+    /// Builtin method attributes: `{ writable: true, enumerable: false, configurable: true }`
+    ///
+    /// Per ES2023 §10.4.1, built-in function properties on prototypes are
+    /// writable and configurable but NOT enumerable.
+    pub const fn builtin_method() -> Self {
+        Self {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        }
+    }
+
+    /// Function `length` and `name` property attributes:
+    /// `{ writable: false, enumerable: false, configurable: true }`
+    ///
+    /// Per ES2023 §10.2.8, the `length` and `name` properties of built-in
+    /// function objects are not writable and not enumerable, but configurable.
+    pub const fn function_length() -> Self {
+        Self {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        }
+    }
+
+    /// Constructor link attributes (same as builtin_method):
+    /// `{ writable: true, enumerable: false, configurable: true }`
+    ///
+    /// Used for the `constructor` property on prototype objects.
+    pub const fn constructor_link() -> Self {
+        Self {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        }
+    }
+
+    /// Permanent constant attributes:
+    /// `{ writable: false, enumerable: false, configurable: false }`
+    ///
+    /// Used for well-known symbols on `Symbol` constructor and similar constants.
+    pub const fn permanent() -> Self {
+        Self {
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        }
+    }
+
+    /// Non-enumerable accessor attributes:
+    /// `{ enumerable: false, configurable: true }`
+    ///
+    /// Used for builtin accessors (getters/setters) on prototypes.
+    pub const fn builtin_accessor() -> Self {
+        Self {
+            writable: false, // Not applicable to accessors
+            enumerable: false,
+            configurable: true,
         }
     }
 }
@@ -180,7 +241,7 @@ pub enum PropertyDescriptor {
 }
 
 impl PropertyDescriptor {
-    /// Create a data property
+    /// Create a data property (default: all-true attributes — for user code)
     pub fn data(value: Value) -> Self {
         Self::Data {
             value,
@@ -191,6 +252,32 @@ impl PropertyDescriptor {
     /// Create a data property with specific attributes
     pub fn data_with_attrs(value: Value, attributes: PropertyAttributes) -> Self {
         Self::Data { value, attributes }
+    }
+
+    /// Create a builtin method property (non-enumerable, writable, configurable)
+    pub fn builtin_method(value: Value) -> Self {
+        Self::Data {
+            value,
+            attributes: PropertyAttributes::builtin_method(),
+        }
+    }
+
+    /// Create a builtin data property (non-enumerable, writable, configurable)
+    /// Same attributes as builtin_method but semantically for data values.
+    pub fn builtin_data(value: Value) -> Self {
+        Self::Data {
+            value,
+            attributes: PropertyAttributes::builtin_method(),
+        }
+    }
+
+    /// Create a non-writable, non-enumerable, configurable property
+    /// (for function `length` and `name` properties)
+    pub fn function_length(value: Value) -> Self {
+        Self::Data {
+            value,
+            attributes: PropertyAttributes::function_length(),
+        }
     }
 
     /// Get the value (for data properties)

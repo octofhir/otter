@@ -16,6 +16,7 @@
 
 pub mod array_buffer;
 pub mod async_context;
+pub mod builtin_builder;
 pub mod context;
 pub mod data_view;
 pub mod drop_guard;
@@ -24,6 +25,8 @@ pub mod gc;
 pub mod generator;
 pub mod globals;
 pub mod interpreter;
+pub mod intrinsics_impl;
+pub mod intrinsics;
 pub mod memory;
 pub mod object;
 pub mod promise;
@@ -38,6 +41,8 @@ pub mod typed_array;
 pub mod value;
 
 pub use async_context::{AsyncContext, SavedFrame, VmExecutionResult};
+pub use builtin_builder::{BuiltInBuilder, NamespaceBuilder};
+pub use intrinsics::Intrinsics;
 pub use context::{
     DEFAULT_MAX_NATIVE_DEPTH, DEFAULT_MAX_STACK_DEPTH, INTERRUPT_CHECK_INTERVAL, VmContext,
     VmContextSnapshot,

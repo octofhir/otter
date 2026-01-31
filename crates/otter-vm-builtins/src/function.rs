@@ -34,15 +34,23 @@ pub fn ops() -> Vec<Op> {
 // =============================================================================
 
 /// Function.prototype.call(thisArg, ...args)
-/// Actual dispatch is handled in the interpreter for correct `this` binding.
+/// IMPORTANT: This is a STUB for interpreter interception detection.
+/// The interpreter checks for the existence of this global op to detect
+/// Function.prototype.call and intercept it (see interpreter.rs:5647).
+/// This function should NEVER be called - the interpreter handles it specially.
 fn function_call(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
-    Err("Function.call is internal".to_string())
+    // If this is ever called, it means interpreter interception failed
+    Err("INTERNAL ERROR: Function.prototype.call stub was called - interpreter interception failed".to_string())
 }
 
 /// Function.prototype.apply(thisArg, argsArray)
-/// Actual dispatch is handled in the interpreter for correct `this` binding.
+/// IMPORTANT: This is a STUB for interpreter interception detection.
+/// The interpreter checks for the existence of this global op to detect
+/// Function.prototype.apply and intercept it (see interpreter.rs:5651).
+/// This function should NEVER be called - the interpreter handles it specially.
 fn function_apply(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, String> {
-    Err("Function.apply is internal".to_string())
+    // If this is ever called, it means interpreter interception failed
+    Err("INTERNAL ERROR: Function.prototype.apply stub was called - interpreter interception failed".to_string())
 }
 
 /// Function.prototype.toString() - returns string representation

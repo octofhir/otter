@@ -10,7 +10,7 @@
 use otter_vm_core::array_buffer::JsArrayBuffer;
 use otter_vm_core::memory;
 use otter_vm_core::value::Value as VmValue;
-use otter_vm_runtime::{Op, op_native_with_mm as op_native};
+use otter_vm_runtime::{op_native_with_mm as op_native, Op};
 use std::sync::Arc;
 
 /// Get ArrayBuffer ops for extension registration
@@ -68,9 +68,9 @@ fn native_array_buffer_create(
         if byte_length > max {
             return Err("RangeError: byteLength exceeds maxByteLength".to_string());
         }
-        JsArrayBuffer::new_resizable(byte_length, max)
+        JsArrayBuffer::new_resizable(byte_length, max, None, _mm)
     } else {
-        JsArrayBuffer::new(byte_length)
+        JsArrayBuffer::new(byte_length, None, _mm)
     };
 
     Ok(VmValue::array_buffer(Arc::new(ab)))
@@ -208,9 +208,7 @@ fn native_array_buffer_transfer(
         return Err("TypeError: ArrayBuffer is already detached".to_string());
     }
 
-    let new_ab = ab
-        .transfer()
-        .ok_or("TypeError: ArrayBuffer is detached")?;
+    let new_ab = ab.transfer().ok_or("TypeError: ArrayBuffer is detached")?;
 
     Ok(VmValue::array_buffer(Arc::new(new_ab)))
 }
@@ -266,7 +264,8 @@ fn native_array_buffer_resize(
         .map(|n| n as usize)
         .ok_or("TypeError: newLength is required")?;
 
-    ab.resize(new_length).map_err(|e| format!("TypeError: {}", e))?;
+    ab.resize(new_length)
+        .map_err(|e| format!("TypeError: {}", e))?;
 
     Ok(VmValue::undefined())
 }
@@ -329,11 +328,9 @@ mod tests {
     #[test]
     fn test_slice() {
         let ab = native_array_buffer_create(&[VmValue::number(16.0)], mm()).unwrap();
-        let slice = native_array_buffer_slice(
-            &[ab, VmValue::number(4.0), VmValue::number(12.0)],
-            mm(),
-        )
-        .unwrap();
+        let slice =
+            native_array_buffer_slice(&[ab, VmValue::number(4.0), VmValue::number(12.0)], mm())
+                .unwrap();
         let slice_ab = slice.as_array_buffer().unwrap();
         assert_eq!(slice_ab.byte_length(), 8);
     }
@@ -358,9 +355,8 @@ mod tests {
 
     #[test]
     fn test_resize() {
-        let ab =
-            native_array_buffer_create(&[VmValue::number(8.0), VmValue::number(16.0)], mm())
-                .unwrap();
+        let ab = native_array_buffer_create(&[VmValue::number(8.0), VmValue::number(16.0)], mm())
+            .unwrap();
 
         // Resize to larger
         native_array_buffer_resize(&[ab.clone(), VmValue::number(12.0)], mm()).unwrap();
@@ -375,9 +371,8 @@ mod tests {
 
     #[test]
     fn test_resize_exceeds_max() {
-        let ab =
-            native_array_buffer_create(&[VmValue::number(8.0), VmValue::number(16.0)], mm())
-                .unwrap();
+        let ab = native_array_buffer_create(&[VmValue::number(8.0), VmValue::number(16.0)], mm())
+            .unwrap();
 
         let result = native_array_buffer_resize(&[ab, VmValue::number(20.0)], mm());
         assert!(result.is_err());

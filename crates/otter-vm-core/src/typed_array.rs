@@ -4,6 +4,9 @@
 //! All 11 types share common implementation via TypedArrayKind.
 
 use crate::array_buffer::JsArrayBuffer;
+use crate::gc::GcRef;
+use crate::memory::MemoryManager;
+use crate::object::JsObject;
 use std::sync::Arc;
 
 /// The kind of TypedArray - determines element size and interpretation
@@ -113,9 +116,14 @@ impl JsTypedArray {
     }
 
     /// Create a new TypedArray with its own buffer
-    pub fn with_length(kind: TypedArrayKind, length: usize) -> Self {
+    pub fn with_length(
+        kind: TypedArrayKind,
+        length: usize,
+        prototype: Option<GcRef<JsObject>>,
+        memory_manager: Arc<MemoryManager>,
+    ) -> Self {
         let byte_length = length * kind.element_size();
-        let buffer = Arc::new(JsArrayBuffer::new(byte_length));
+        let buffer = Arc::new(JsArrayBuffer::new(byte_length, prototype, memory_manager));
         Self {
             buffer,
             byte_offset: 0,
@@ -175,12 +183,8 @@ impl JsTypedArray {
             match self.kind {
                 TypedArrayKind::Int8 => bytes[0] as i8 as f64,
                 TypedArrayKind::Uint8 | TypedArrayKind::Uint8Clamped => bytes[0] as f64,
-                TypedArrayKind::Int16 => {
-                    i16::from_le_bytes([bytes[0], bytes[1]]) as f64
-                }
-                TypedArrayKind::Uint16 => {
-                    u16::from_le_bytes([bytes[0], bytes[1]]) as f64
-                }
+                TypedArrayKind::Int16 => i16::from_le_bytes([bytes[0], bytes[1]]) as f64,
+                TypedArrayKind::Uint16 => u16::from_le_bytes([bytes[0], bytes[1]]) as f64,
                 TypedArrayKind::Int32 => {
                     i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64
                 }
@@ -362,7 +366,14 @@ impl JsTypedArray {
         let elem_size = self.kind.element_size();
         let new_byte_length = new_length * elem_size;
 
-        let new_buffer = Arc::new(JsArrayBuffer::new(new_byte_length));
+        // Get prototype and memory_manager from existing buffer
+        let prototype = self.buffer.object.prototype();
+        let memory_manager = self.buffer.object.memory_manager().clone();
+        let new_buffer = Arc::new(JsArrayBuffer::new(
+            new_byte_length,
+            prototype,
+            memory_manager,
+        ));
 
         // Copy data
         let src_offset = self.byte_offset + start * elem_size;
@@ -487,10 +498,15 @@ impl JsTypedArray {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::MemoryManager;
+
+    fn make_mm() -> Arc<MemoryManager> {
+        Arc::new(MemoryManager::new(1024 * 1024))
+    }
 
     #[test]
     fn test_create_int32_array() {
-        let buf = Arc::new(JsArrayBuffer::new(16));
+        let buf = Arc::new(JsArrayBuffer::new(16, None, make_mm()));
         let arr = JsTypedArray::new(buf, TypedArrayKind::Int32, 0, 4).unwrap();
         assert_eq!(arr.length(), 4);
         assert_eq!(arr.byte_length(), 16);
@@ -499,14 +515,14 @@ mod tests {
 
     #[test]
     fn test_with_length() {
-        let arr = JsTypedArray::with_length(TypedArrayKind::Float64, 10);
+        let arr = JsTypedArray::with_length(TypedArrayKind::Float64, 10, None, make_mm());
         assert_eq!(arr.length(), 10);
         assert_eq!(arr.byte_length(), 80);
     }
 
     #[test]
     fn test_get_set_int32() {
-        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 4);
+        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 4, None, make_mm());
         arr.set(0, 42.0);
         arr.set(1, -100.0);
         arr.set(2, 0.0);
@@ -520,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_uint8_clamped() {
-        let arr = JsTypedArray::with_length(TypedArrayKind::Uint8Clamped, 4);
+        let arr = JsTypedArray::with_length(TypedArrayKind::Uint8Clamped, 4, None, make_mm());
         arr.set(0, 300.0); // Should clamp to 255
         arr.set(1, -50.0); // Should clamp to 0
         arr.set(2, 127.5); // Should round to 128
@@ -532,7 +548,7 @@ mod tests {
 
     #[test]
     fn test_subarray() {
-        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 10);
+        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 10, None, make_mm());
         for i in 0..10 {
             arr.set(i, i as f64);
         }
@@ -550,7 +566,7 @@ mod tests {
 
     #[test]
     fn test_slice() {
-        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 10);
+        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 10, None, make_mm());
         for i in 0..10 {
             arr.set(i, i as f64);
         }
@@ -566,7 +582,7 @@ mod tests {
 
     #[test]
     fn test_fill() {
-        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 5);
+        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 5, None, make_mm());
         arr.fill(42.0, None, None);
 
         for i in 0..5 {
@@ -576,7 +592,7 @@ mod tests {
 
     #[test]
     fn test_reverse() {
-        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 5);
+        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 5, None, make_mm());
         for i in 0..5 {
             arr.set(i, i as f64);
         }
@@ -592,7 +608,7 @@ mod tests {
 
     #[test]
     fn test_detached_buffer() {
-        let buf = Arc::new(JsArrayBuffer::new(16));
+        let buf = Arc::new(JsArrayBuffer::new(16, None, make_mm()));
         let arr = JsTypedArray::new(buf.clone(), TypedArrayKind::Int32, 0, 4).unwrap();
 
         arr.set(0, 42.0);
@@ -608,7 +624,7 @@ mod tests {
 
     #[test]
     fn test_alignment_error() {
-        let buf = Arc::new(JsArrayBuffer::new(16));
+        let buf = Arc::new(JsArrayBuffer::new(16, None, make_mm()));
         let result = JsTypedArray::new(buf, TypedArrayKind::Int32, 1, 3);
         assert!(result.is_err());
     }

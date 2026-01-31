@@ -225,8 +225,7 @@ impl Compiler {
                 if let Statement::ExpressionStatement(expr_stmt) = stmt {
                     // Last statement is an expression — compile it and emit Return
                     let reg = self.compile_expression(&expr_stmt.expression)?;
-                    self.codegen
-                        .emit(Instruction::Return { src: reg });
+                    self.codegen.emit(Instruction::Return { src: reg });
                     self.codegen.free_reg(reg);
                     // Mark that we already returned so compile() doesn't add ReturnUndefined
                     self.last_was_return = true;
@@ -262,7 +261,10 @@ impl Compiler {
     /// - `function` declarations are hoisted (name and body are available)
     /// Returns a set of statement indices that were hoisted and should be skipped during
     /// normal compilation.
-    fn hoist_function_declarations(&mut self, statements: &[Statement]) -> CompileResult<Vec<usize>> {
+    fn hoist_function_declarations(
+        &mut self,
+        statements: &[Statement],
+    ) -> CompileResult<Vec<usize>> {
         let mut hoisted_indices = Vec::new();
 
         // Phase 0: Hoist all `var` declarations (name only) so they are visible
@@ -3079,7 +3081,10 @@ impl Compiler {
     /// Compile a function declaration body (assumes name is already declared)
     /// This is used during the hoisting phase where names are declared in phase 1
     /// and bodies are compiled in phase 2.
-    fn compile_function_declaration_body(&mut self, func: &oxc_ast::ast::Function) -> CompileResult<()> {
+    fn compile_function_declaration_body(
+        &mut self,
+        func: &oxc_ast::ast::Function,
+    ) -> CompileResult<()> {
         let name = func.id.as_ref().map(|id| id.name.to_string());
         let is_async = func.r#async;
         let is_generator = func.generator;
@@ -4142,7 +4147,8 @@ impl Compiler {
                     // TODO: Handle arrow functions/nested scopes properly
                     if !self.codegen.current.flags.is_arrow {
                         if let Some(reg) = self.codegen.current.arguments_register {
-                            return Ok(reg);
+                            self.codegen.emit(Instruction::Move { dst, src: reg });
+                            return Ok(dst);
                         } else {
                             let dst = self.codegen.alloc_reg();
                             self.codegen.emit(Instruction::CreateArguments { dst });
@@ -4179,7 +4185,8 @@ impl Compiler {
                     // TODO: Handle arrow functions/nested scopes properly
                     if !self.codegen.current.flags.is_arrow {
                         if let Some(reg) = self.codegen.current.arguments_register {
-                            return Ok(reg);
+                            self.codegen.emit(Instruction::Move { dst, src: reg });
+                            return Ok(dst);
                         } else {
                             let dst = self.codegen.alloc_reg();
                             self.codegen.emit(Instruction::CreateArguments { dst });
@@ -4232,19 +4239,39 @@ impl Compiler {
                 let instruction = match binary.operator {
                     BinaryOperator::Addition => {
                         let feedback_index = self.codegen.alloc_ic();
-                        Instruction::Add { dst, lhs, rhs, feedback_index }
+                        Instruction::Add {
+                            dst,
+                            lhs,
+                            rhs,
+                            feedback_index,
+                        }
                     }
                     BinaryOperator::Subtraction => {
                         let feedback_index = self.codegen.alloc_ic();
-                        Instruction::Sub { dst, lhs, rhs, feedback_index }
+                        Instruction::Sub {
+                            dst,
+                            lhs,
+                            rhs,
+                            feedback_index,
+                        }
                     }
                     BinaryOperator::Multiplication => {
                         let feedback_index = self.codegen.alloc_ic();
-                        Instruction::Mul { dst, lhs, rhs, feedback_index }
+                        Instruction::Mul {
+                            dst,
+                            lhs,
+                            rhs,
+                            feedback_index,
+                        }
                     }
                     BinaryOperator::Division => {
                         let feedback_index = self.codegen.alloc_ic();
-                        Instruction::Div { dst, lhs, rhs, feedback_index }
+                        Instruction::Div {
+                            dst,
+                            lhs,
+                            rhs,
+                            feedback_index,
+                        }
                     }
                     BinaryOperator::Remainder => Instruction::Mod { dst, lhs, rhs },
                     BinaryOperator::LessThan => Instruction::Lt { dst, lhs, rhs },
@@ -4575,19 +4602,39 @@ impl Compiler {
         match op {
             AssignmentOperator::Addition => {
                 let feedback_index = self.codegen.alloc_ic();
-                self.codegen.emit(Instruction::Add { dst, lhs, rhs, feedback_index });
+                self.codegen.emit(Instruction::Add {
+                    dst,
+                    lhs,
+                    rhs,
+                    feedback_index,
+                });
             }
             AssignmentOperator::Subtraction => {
                 let feedback_index = self.codegen.alloc_ic();
-                self.codegen.emit(Instruction::Sub { dst, lhs, rhs, feedback_index });
+                self.codegen.emit(Instruction::Sub {
+                    dst,
+                    lhs,
+                    rhs,
+                    feedback_index,
+                });
             }
             AssignmentOperator::Multiplication => {
                 let feedback_index = self.codegen.alloc_ic();
-                self.codegen.emit(Instruction::Mul { dst, lhs, rhs, feedback_index });
+                self.codegen.emit(Instruction::Mul {
+                    dst,
+                    lhs,
+                    rhs,
+                    feedback_index,
+                });
             }
             AssignmentOperator::Division => {
                 let feedback_index = self.codegen.alloc_ic();
-                self.codegen.emit(Instruction::Div { dst, lhs, rhs, feedback_index });
+                self.codegen.emit(Instruction::Div {
+                    dst,
+                    lhs,
+                    rhs,
+                    feedback_index,
+                });
             }
             AssignmentOperator::Remainder => {
                 self.codegen.emit(Instruction::Mod { dst, lhs, rhs });
@@ -4839,8 +4886,11 @@ impl Compiler {
 
         // Emit CallSuper instruction
         let dst = self.codegen.alloc_reg();
-        self.codegen
-            .emit(Instruction::CallSuper { dst, args: args_base, argc });
+        self.codegen.emit(Instruction::CallSuper {
+            dst,
+            args: args_base,
+            argc,
+        });
 
         // Free arg block
         for i in 0..argc.max(1) as u16 {
@@ -4861,13 +4911,14 @@ impl Compiler {
         let name_idx = self.codegen.add_string(method_name);
 
         let func_reg = self.codegen.alloc_reg();
-        self.codegen
-            .emit(Instruction::GetSuperProp { dst: func_reg, name: name_idx });
+        self.codegen.emit(Instruction::GetSuperProp {
+            dst: func_reg,
+            name: name_idx,
+        });
 
         // Get `this` for the call receiver
         let this_reg = self.codegen.alloc_reg();
-        self.codegen
-            .emit(Instruction::LoadThis { dst: this_reg });
+        self.codegen.emit(Instruction::LoadThis { dst: this_reg });
 
         // Compile arguments
         let argc = call.arguments.len() as u8;
@@ -5598,8 +5649,10 @@ impl Compiler {
         if matches!(&member.object, Expression::Super(_)) {
             let dst = self.codegen.alloc_reg();
             let name_idx = self.codegen.add_string(&member.property.name);
-            self.codegen
-                .emit(Instruction::GetSuperProp { dst, name: name_idx });
+            self.codegen.emit(Instruction::GetSuperProp {
+                dst,
+                name: name_idx,
+            });
             return Ok(dst);
         }
 

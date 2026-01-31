@@ -156,7 +156,7 @@ impl Interpreter {
     ) -> VmResult<Value> {
         // Check if it's a native function
         if let Some(native_fn) = func.as_native_function() {
-            return self.call_native_fn(ctx, native_fn, args);
+            return self.call_native_fn(ctx, native_fn, &this_value, args);
         }
 
         // Regular closure call
@@ -2580,7 +2580,7 @@ impl Interpreter {
                     }
 
                     // Call the native function with depth tracking
-                    let result = self.call_native_fn(ctx, native_fn, &args)?;
+                    let result = self.call_native_fn(ctx, native_fn, &Value::undefined(), &args)?;
                     ctx.set_register(dst.0, result);
                     return Ok(InstructionResult::Continue);
                 }
@@ -2629,7 +2629,8 @@ impl Interpreter {
                         if let Some(native_fn) = bound_fn.as_native_function() {
                             // For native functions, we can't set 'this' directly
                             // but most native functions don't use 'this'
-                            let result = self.call_native_fn(ctx, native_fn, &all_args)?;
+                            let result =
+                                self.call_native_fn(ctx, native_fn, &this_arg, &all_args)?;
                             ctx.set_register(dst.0, result);
                             return Ok(InstructionResult::Continue);
                         } else if let Some(closure) = bound_fn.as_function() {
@@ -2687,7 +2688,7 @@ impl Interpreter {
                         let arg = ctx.get_register(func.0 + 1 + i).clone();
                         args.push(arg);
                     }
-                    let result = self.call_native_fn(ctx, native_fn, &args)?;
+                    let result = self.call_native_fn(ctx, native_fn, &Value::undefined(), &args)?;
                     return Ok(InstructionResult::Return(result));
                 }
 
@@ -2751,7 +2752,7 @@ impl Interpreter {
                     let new_obj_value = Value::object(new_obj);
 
                     // Call native constructor with depth tracking
-                    let result = self.call_native_fn(ctx, native_fn, &args)?;
+                    let result = self.call_native_fn(ctx, native_fn, &new_obj_value, &args)?;
                     let final_value = if result.is_object() {
                         result
                     } else {
@@ -2768,9 +2769,7 @@ impl Interpreter {
                         .module
                         .functions
                         .get(closure.function_index as usize);
-                    let is_derived = func_def
-                        .map(|f| f.flags.is_derived)
-                        .unwrap_or(false);
+                    let is_derived = func_def.map(|f| f.flags.is_derived).unwrap_or(false);
 
                     // Copy arguments from caller registers
                     let mut args = Vec::with_capacity(*argc as usize);
@@ -3219,7 +3218,7 @@ impl Interpreter {
                 // Check if it's a native function first
                 if let Some(native_fn) = func_value.as_native_function() {
                     // Call the native function with depth tracking
-                    let result = self.call_native_fn(ctx, native_fn, &args)?;
+                    let result = self.call_native_fn(ctx, native_fn, &Value::undefined(), &args)?;
                     ctx.set_register(dst.0, result);
                     return Ok(InstructionResult::Continue);
                 }
@@ -3283,7 +3282,7 @@ impl Interpreter {
                         GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
                     let new_obj_value = Value::object(new_obj);
 
-                    let result = self.call_native_fn(ctx, native_fn, &args)?;
+                    let result = self.call_native_fn(ctx, native_fn, &Value::undefined(), &args)?;
                     let final_value = if result.is_object() {
                         result
                     } else {
@@ -3624,7 +3623,7 @@ impl Interpreter {
                             };
 
                             if let Some(native_fn) = getter.as_native_function() {
-                                let result = self.call_native_fn(ctx, native_fn, &[])?;
+                                let result = self.call_native_fn(ctx, native_fn, &receiver, &[])?;
                                 ctx.set_register(dst.0, result);
                                 Ok(InstructionResult::Continue)
                             } else if let Some(closure) = getter.as_function() {
@@ -3794,7 +3793,7 @@ impl Interpreter {
                             };
 
                             if let Some(native_fn) = setter.as_native_function() {
-                                self.call_native_fn(ctx, native_fn, &[val_val])?;
+                                self.call_native_fn(ctx, native_fn, &object, &[val_val])?;
                                 Ok(InstructionResult::Continue)
                             } else if let Some(closure) = setter.as_function() {
                                 ctx.set_pending_args(vec![val_val]);
@@ -4071,7 +4070,7 @@ impl Interpreter {
                             };
 
                             if let Some(native_fn) = getter.as_native_function() {
-                                let result = self.call_native_fn(ctx, native_fn, &[])?;
+                                let result = self.call_native_fn(ctx, native_fn, &receiver, &[])?;
                                 ctx.set_register(dst.0, result);
                                 Ok(InstructionResult::Continue)
                             } else if let Some(closure) = getter.as_function() {
@@ -4243,7 +4242,7 @@ impl Interpreter {
                             };
 
                             if let Some(native_fn) = setter.as_native_function() {
-                                self.call_native_fn(ctx, native_fn, &[val_val])?;
+                                self.call_native_fn(ctx, native_fn, &object, &[val_val])?;
                                 Ok(InstructionResult::Continue)
                             } else if let Some(closure) = setter.as_function() {
                                 ctx.set_pending_args(vec![val_val]);
@@ -5074,8 +5073,7 @@ impl Interpreter {
                 // Call the iterator method with obj as `this`
                 if let Some(native_fn) = iterator_fn.as_native_function() {
                     // Native iterator methods take the receiver as their first argument.
-                    let iterator =
-                        self.call_native_fn(ctx, native_fn, std::slice::from_ref(&obj))?;
+                    let iterator = self.call_native_fn(ctx, native_fn, &obj, &[])?;
                     ctx.set_register(dst.0, iterator);
                     Ok(InstructionResult::Continue)
                 } else if let Some(closure) = iterator_fn.as_function() {
@@ -5127,8 +5125,7 @@ impl Interpreter {
 
                 // Call the iterator method with obj as `this`
                 if let Some(native_fn) = iterator_fn.as_native_function() {
-                    let iterator =
-                        self.call_native_fn(ctx, native_fn, std::slice::from_ref(&obj))?;
+                    let iterator = self.call_native_fn(ctx, native_fn, &obj, &[])?;
                     ctx.set_register(dst.0, iterator);
                     Ok(InstructionResult::Continue)
                 } else if let Some(closure) = iterator_fn.as_function() {
@@ -5184,7 +5181,7 @@ impl Interpreter {
 
                 // Call next()
                 let result = if let Some(native_fn) = next_fn.as_native_function() {
-                    self.call_native_fn(ctx, native_fn, std::slice::from_ref(&iterator))?
+                    self.call_native_fn(ctx, native_fn, &iterator, &[])?
                 } else {
                     return Err(VmError::type_error("next is not a function"));
                 };
@@ -5236,8 +5233,7 @@ impl Interpreter {
                     // Validate superclass is callable (or null for extends null)
                     if super_value.is_null() {
                         // extends null: create prototype with null __proto__
-                        let derived_proto =
-                            GcRef::new(JsObject::new(None, mm.clone()));
+                        let derived_proto = GcRef::new(JsObject::new(None, mm.clone()));
 
                         // Set ctor.prototype = derived_proto
                         let proto_key = PropertyKey::string("prototype");
@@ -5250,9 +5246,8 @@ impl Interpreter {
                     } else if let Some(super_obj) = super_value.as_object() {
                         // Get super.prototype
                         let proto_key = PropertyKey::string("prototype");
-                        let super_proto_val = super_obj
-                            .get(&proto_key)
-                            .unwrap_or_else(Value::undefined);
+                        let super_proto_val =
+                            super_obj.get(&proto_key).unwrap_or_else(Value::undefined);
 
                         // super.prototype must be object or null
                         let super_proto = if super_proto_val.is_null() {
@@ -5270,8 +5265,7 @@ impl Interpreter {
                         };
 
                         // Create derived prototype: Object.create(super.prototype)
-                        let derived_proto =
-                            GcRef::new(JsObject::new(super_proto, mm.clone()));
+                        let derived_proto = GcRef::new(JsObject::new(super_proto, mm.clone()));
 
                         // Set ctor.prototype = derived_proto
                         if let Some(ctor_obj) = ctor_value.as_object() {
@@ -5280,10 +5274,8 @@ impl Interpreter {
                                 Value::object(derived_proto.clone()),
                             );
                             // Set derived_proto.constructor = ctor
-                            derived_proto.set(
-                                PropertyKey::string("constructor"),
-                                ctor_value.clone(),
-                            );
+                            derived_proto
+                                .set(PropertyKey::string("constructor"), ctor_value.clone());
                             // Static inheritance: ctor.__proto__ = super
                             ctor_obj.set_prototype(Some(super_obj));
                         }
@@ -5291,17 +5283,14 @@ impl Interpreter {
                         // Superclass is a function (but not an object with .prototype on HeapRef::Object)
                         // This handles NativeFunction or Function HeapRef variants
                         // For now, create a basic prototype chain
-                        let derived_proto =
-                            GcRef::new(JsObject::new(None, mm.clone()));
+                        let derived_proto = GcRef::new(JsObject::new(None, mm.clone()));
                         if let Some(ctor_obj) = ctor_value.as_object() {
                             ctor_obj.set(
                                 PropertyKey::string("prototype"),
                                 Value::object(derived_proto.clone()),
                             );
-                            derived_proto.set(
-                                PropertyKey::string("constructor"),
-                                ctor_value.clone(),
-                            );
+                            derived_proto
+                                .set(PropertyKey::string("constructor"), ctor_value.clone());
                         }
                     } else {
                         return Err(VmError::TypeError(
@@ -5315,10 +5304,8 @@ impl Interpreter {
                         let proto_key = PropertyKey::string("prototype");
                         if let Some(proto_val) = ctor_obj.get(&proto_key) {
                             if let Some(proto_obj) = proto_val.as_object() {
-                                proto_obj.set(
-                                    PropertyKey::string("constructor"),
-                                    ctor_value.clone(),
-                                );
+                                proto_obj
+                                    .set(PropertyKey::string("constructor"), ctor_value.clone());
                             }
                         }
                     }
@@ -5328,36 +5315,36 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::CallSuper { dst, args: args_base, argc } => {
+            Instruction::CallSuper {
+                dst,
+                args: args_base,
+                argc,
+            } => {
                 // Get the current frame's home_object to find the superclass
                 let frame = ctx
                     .current_frame()
                     .ok_or_else(|| VmError::internal("no frame for CallSuper"))?;
 
                 let home_object = frame.home_object.clone().ok_or_else(|| {
-                    VmError::ReferenceError(
-                        "'super' keyword unexpected here".to_string(),
-                    )
+                    VmError::ReferenceError("'super' keyword unexpected here".to_string())
                 })?;
 
                 // new_target_proto is the prototype for the object being created.
                 // In the outermost derived constructor, this is home_object (e.g., C.prototype).
                 // In deeper levels (multi-level), it was propagated from above.
-                let new_target_proto = frame.new_target_proto.clone()
+                let new_target_proto = frame
+                    .new_target_proto
+                    .clone()
                     .unwrap_or_else(|| home_object.clone());
 
                 // Get the superclass constructor: Object.getPrototypeOf(home_object)
                 let super_proto = home_object.prototype().ok_or_else(|| {
-                    VmError::TypeError(
-                        "Super constructor is not a constructor".to_string(),
-                    )
+                    VmError::TypeError("Super constructor is not a constructor".to_string())
                 })?;
 
                 // The super constructor is the .constructor of the prototype's prototype
                 let ctor_key = PropertyKey::string("constructor");
-                let super_ctor_val = super_proto
-                    .get(&ctor_key)
-                    .unwrap_or_else(Value::undefined);
+                let super_ctor_val = super_proto.get(&ctor_key).unwrap_or_else(Value::undefined);
 
                 // Collect arguments from registers
                 let mut args = Vec::with_capacity(*argc as usize);
@@ -5367,9 +5354,14 @@ impl Interpreter {
                 let mm = ctx.memory_manager().clone();
 
                 // Check if the super constructor is also a derived class
-                let super_is_derived = super_ctor_val.as_function().and_then(|c| {
-                    c.module.function(c.function_index).map(|f| f.flags.is_derived)
-                }).unwrap_or(false);
+                let super_is_derived = super_ctor_val
+                    .as_function()
+                    .and_then(|c| {
+                        c.module
+                            .function(c.function_index)
+                            .map(|f| f.flags.is_derived)
+                    })
+                    .unwrap_or(false);
 
                 let this_value = if super_is_derived {
                     // Multi-level inheritance: super constructor is also derived.
@@ -5387,31 +5379,28 @@ impl Interpreter {
                         }
                     }
 
-                    let result = self.call_function(
-                        ctx,
-                        &super_ctor_val,
-                        Value::undefined(),
-                        &args,
-                    )?;
+                    let result =
+                        self.call_function(ctx, &super_ctor_val, Value::undefined(), &args)?;
 
-                    if result.is_object() { result } else { Value::undefined() }
+                    if result.is_object() {
+                        result
+                    } else {
+                        Value::undefined()
+                    }
                 } else {
                     // Base case: super constructor is NOT derived.
                     // Create the object with new_target_proto as [[Prototype]].
-                    let new_obj = GcRef::new(JsObject::new(
-                        Some(new_target_proto),
-                        mm.clone(),
-                    ));
+                    let new_obj = GcRef::new(JsObject::new(Some(new_target_proto), mm.clone()));
                     let new_obj_value = Value::object(new_obj);
 
-                    let result = self.call_function(
-                        ctx,
-                        &super_ctor_val,
-                        new_obj_value.clone(),
-                        &args,
-                    )?;
+                    let result =
+                        self.call_function(ctx, &super_ctor_val, new_obj_value.clone(), &args)?;
 
-                    if result.is_object() { result } else { new_obj_value }
+                    if result.is_object() {
+                        result
+                    } else {
+                        new_obj_value
+                    }
                 };
 
                 // Set this_initialized and update this_value on current frame
@@ -5430,9 +5419,7 @@ impl Interpreter {
                     .ok_or_else(|| VmError::internal("no frame for GetSuper"))?;
 
                 let home_object = frame.home_object.clone().ok_or_else(|| {
-                    VmError::ReferenceError(
-                        "'super' keyword unexpected here".to_string(),
-                    )
+                    VmError::ReferenceError("'super' keyword unexpected here".to_string())
                 })?;
 
                 // super = Object.getPrototypeOf(home_object)
@@ -5451,9 +5438,7 @@ impl Interpreter {
                     .ok_or_else(|| VmError::internal("no frame for GetSuperProp"))?;
 
                 let home_object = frame.home_object.clone().ok_or_else(|| {
-                    VmError::ReferenceError(
-                        "'super' keyword unexpected here".to_string(),
-                    )
+                    VmError::ReferenceError("'super' keyword unexpected here".to_string())
                 })?;
 
                 // Get super prototype (Object.getPrototypeOf(home_object))
@@ -5470,7 +5455,8 @@ impl Interpreter {
                 let key = Self::utf16_key(name_units);
 
                 // Get the current this value (super property access uses current this, not prototype)
-                let this_value = ctx.current_frame()
+                let this_value = ctx
+                    .current_frame()
                     .map(|f| f.this_value.clone())
                     .unwrap_or_else(Value::undefined);
 
@@ -5478,7 +5464,10 @@ impl Interpreter {
                     // Use lookup_property_descriptor to find accessor properties
                     match proto.lookup_property_descriptor(&key) {
                         Some(crate::object::PropertyDescriptor::Data { value, .. }) => value,
-                        Some(crate::object::PropertyDescriptor::Accessor { get: Some(getter), .. }) => {
+                        Some(crate::object::PropertyDescriptor::Accessor {
+                            get: Some(getter),
+                            ..
+                        }) => {
                             // Invoke the getter with the current this
                             self.call_function(ctx, &getter, this_value, &[])?
                         }
@@ -5582,10 +5571,12 @@ impl Interpreter {
         &self,
         ctx: &VmContext,
         native_fn: &crate::value::NativeFn,
+        this_value: &Value,
         args: &[Value],
     ) -> VmResult<Value> {
         ctx.enter_native_call()?;
-        let result = native_fn(args, ctx.memory_manager().clone()).map_err(VmError::type_error);
+        let result =
+            native_fn(this_value, args, ctx.memory_manager().clone()).map_err(VmError::type_error);
         ctx.exit_native_call();
         result
     }
@@ -5831,16 +5822,7 @@ impl Interpreter {
             }
 
             // Normal native function execution
-            let mut native_args;
-            let args_ref = if current_this.is_undefined() || current_this.is_callable() {
-                &current_args
-            } else {
-                native_args = Vec::with_capacity(current_args.len() + 1);
-                native_args.push(current_this);
-                native_args.extend(current_args);
-                &native_args
-            };
-            let result = self.call_native_fn(ctx, native_fn, args_ref)?;
+            let result = self.call_native_fn(ctx, native_fn, &current_this, &current_args)?;
             ctx.set_register(return_reg, result);
             return Ok(InstructionResult::Continue);
         }
@@ -5967,7 +5949,7 @@ impl Interpreter {
         }
 
         if let Some(native_fn) = method_value.as_native_function() {
-            let result = self.call_native_fn(ctx, native_fn, &args)?;
+            let result = self.call_native_fn(ctx, native_fn, &receiver, &args)?;
             ctx.set_register(return_reg, result);
             return Ok(InstructionResult::Continue);
         }

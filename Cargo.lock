@@ -1979,8 +1979,10 @@ dependencies = [
 name = "otter-vm-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "criterion",
  "dashmap",
+ "half",
  "num-bigint",
  "num-traits",
  "otter-profiler",

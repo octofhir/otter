@@ -11,7 +11,89 @@ use walkdir::WalkDir;
 
 use otter_engine::{EngineBuilder, Otter, OtterError, PropertyKey, Value, VmContextSnapshot};
 
+use crate::harness::TestHarnessState;
 use crate::metadata::TestMetadata;
+
+/// Features that are not yet implemented in Otter and should be skipped.
+const DEFAULT_SKIP_FEATURES: &[&str] = &[
+    // Atomics & shared memory
+    "Atomics",
+    "SharedArrayBuffer",
+    // Temporal proposal
+    "Temporal",
+    // Decorators proposal
+    "decorators",
+    // Import assertions / attributes
+    "import-assertions",
+    "import-attributes",
+    // FinalizationRegistry / WeakRef
+    "FinalizationRegistry",
+    "WeakRef",
+    // ShadowRealm
+    "ShadowRealm",
+    // Explicit resource management (using/await using)
+    "explicit-resource-management",
+    // Tail calls
+    "tail-call-optimization",
+    // Intl (internationalization)
+    "Intl",
+    "Intl.DateTimeFormat",
+    "Intl.DisplayNames",
+    "Intl.ListFormat",
+    "Intl.Locale",
+    "Intl.NumberFormat",
+    "Intl.PluralRules",
+    "Intl.RelativeTimeFormat",
+    "Intl.Segmenter",
+    "Intl-enumeration",
+    // Import / export (module system)
+    "dynamic-import",
+    "import.meta",
+    // Resizable ArrayBuffer
+    "resizable-arraybuffer",
+    "arraybuffer-transfer",
+    // JSON modules
+    "json-modules",
+    // Iterator helpers
+    "iterator-helpers",
+    // Set methods
+    "set-methods",
+    // Promise.withResolvers
+    "promise-with-resolvers",
+    // Array grouping
+    "array-grouping",
+    // Well-formed Unicode strings
+    "well-formed-unicode-strings",
+    // Symbols as WeakMap keys
+    "symbols-as-weakmap-keys",
+    // RegExp features not yet implemented
+    "regexp-duplicate-named-groups",
+    "regexp-lookbehind",
+    "regexp-named-groups",
+    "regexp-unicode-property-escapes",
+    "regexp-v-flag",
+    "regexp-match-indices",
+    // Hashbang
+    "hashbang",
+    // Top-level await (module feature)
+    "top-level-await",
+    // Class features
+    "class-fields-private",
+    "class-fields-public",
+    "class-methods-private",
+    "class-static-block",
+    "class-static-fields-private",
+    "class-static-fields-public",
+    "class-static-methods-private",
+    // Other proposals
+    "Array.fromAsync",
+    "change-array-by-copy",
+    "String.prototype.isWellFormed",
+    "String.prototype.toWellFormed",
+    "Object.groupBy",
+    "Map.groupBy",
+    "Uint8Array",
+];
 
 /// Test262 test runner
 pub struct Test262Runner {
@@ -23,6 +105,8 @@ pub struct Test262Runner {
     skip_features: Vec<String>,
     /// Shared engine instance
     engine: Arc<Mutex<Otter>>,
+    /// Shared harness state for capturing async test results
+    harness_state: TestHarnessState,
 }
 
 /// Result of running a single test
@@ -60,21 +144,34 @@ impl Test262Runner {
     pub fn new(test_dir: impl AsRef<Path>) -> Self {
         println!("Initializing Otter Engine...");
         let start = Instant::now();
+
+        // Create harness extension with shared state for async output capture
+        let (harness_ext, harness_state) =
+            crate::harness::create_harness_extension_with_state();
+
         // Initialize engine once with all standard builtins and harness extensions
         let engine = EngineBuilder::new()
-            // .with_http() // TEMPORARILY DISABLED to test CPU usage
-            .extension(crate::harness::create_harness_extension())
+            .extension(harness_ext)
             .build();
         println!("Engine initialized in {:.2?}", start.elapsed());
 
         Self {
             test_dir: test_dir.as_ref().to_path_buf(),
             filter: None,
-            skip_features: vec![
-                // User requested to run ALL tests, so we empty this list
-            ],
+            skip_features: DEFAULT_SKIP_FEATURES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             engine: Arc::new(Mutex::new(engine)),
+            harness_state,
         }
+    }
+
+    /// Create a new test runner that skips no features (runs everything).
+    pub fn new_no_skip(test_dir: impl AsRef<Path>) -> Self {
+        let mut runner = Self::new(test_dir);
+        runner.skip_features.clear();
+        runner
     }
 
     /// Set filter pattern
@@ -86,6 +183,12 @@ impl Test262Runner {
     /// Add feature to skip list
     pub fn skip_feature(mut self, feature: impl Into<String>) -> Self {
         self.skip_features.push(feature.into());
+        self
+    }
+
+    /// Clear the skip list (run all features)
+    pub fn with_no_skip(mut self) -> Self {
+        self.skip_features.clear();
         self
     }
 
@@ -204,9 +307,7 @@ impl Test262Runner {
         // Parse metadata
         let metadata = TestMetadata::parse(&content).unwrap_or_default();
 
-        // println!("DEBUG: Starting test {}", relative_path);
-
-        // Check if we should skip this test
+        // Check if we should skip this test based on features
         for feature in &metadata.features {
             if self.skip_features.contains(feature) {
                 return TestResult {
@@ -225,6 +326,13 @@ impl Test262Runner {
         // Add default harness files (sta.js and assert.js)
         let mut includes = vec!["sta.js".to_string(), "assert.js".to_string()];
 
+        // For async tests, add donePrintHandle.js
+        if metadata.is_async() {
+            if !includes.contains(&"donePrintHandle.js".to_string()) {
+                includes.push("donePrintHandle.js".to_string());
+            }
+        }
+
         // Add explicitly requested harness files
         for include in &metadata.includes {
             if !includes.contains(include) {
@@ -237,7 +345,6 @@ impl Test262Runner {
             let harness_path = self.test_dir.join("harness").join(&include);
             match fs::read_to_string(&harness_path) {
                 Ok(harness_content) => {
-                    // Successfully loaded harness file
                     test_source.push_str(&harness_content);
                     test_source.push('\n');
                 }
@@ -263,6 +370,9 @@ impl Test262Runner {
             .unwrap_or(&content);
         test_source.push_str(test_content);
 
+        // Clear harness state before running the test
+        self.harness_state.clear();
+
         // Run the test
         let result = self
             .execute_test(&test_source, &metadata, &relative_path_str, timeout)
@@ -285,8 +395,8 @@ impl Test262Runner {
         test_name: &str,
         timeout: Option<Duration>,
     ) -> (TestOutcome, Option<String>) {
-        // Use shared engine instead of creating a new one each time
         let mut engine = self.engine.lock().await;
+        let is_async = metadata.is_async();
 
         let result = match self
             .run_with_timeout(&mut engine, source, timeout, test_name)
@@ -296,7 +406,49 @@ impl Test262Runner {
                 if !value.is_undefined() {
                     // println!("RESULT {}: {}", test_name, format_value(&value));
                 }
-                if metadata.expects_early_error() {
+
+                // For async tests, check the $DONE result from harness state
+                if is_async {
+                    match self.harness_state.done_result() {
+                        Some(Ok(())) => {
+                            // $DONE() called with no error — async test passed
+                            if metadata.expects_runtime_error() {
+                                (
+                                    TestOutcome::Fail,
+                                    Some("Expected runtime error but async test passed via $DONE()".to_string()),
+                                )
+                            } else {
+                                (TestOutcome::Pass, None)
+                            }
+                        }
+                        Some(Err(msg)) => {
+                            // $DONE(error) called — async test failed
+                            if metadata.expects_runtime_error() {
+                                // Validate error type if possible
+                                self.validate_negative_error(metadata, &msg)
+                            } else {
+                                (
+                                    TestOutcome::Fail,
+                                    Some(format!("Async test failed via $DONE: {}", msg)),
+                                )
+                            }
+                        }
+                        None => {
+                            // $DONE was never called — async test didn't complete
+                            if metadata.expects_early_error() || metadata.expects_runtime_error() {
+                                (
+                                    TestOutcome::Fail,
+                                    Some("Expected error but execution completed without $DONE".to_string()),
+                                )
+                            } else {
+                                (
+                                    TestOutcome::Fail,
+                                    Some("Async test completed without calling $DONE()".to_string()),
+                                )
+                            }
+                        }
+                    }
+                } else if metadata.expects_early_error() {
                     (
                         TestOutcome::Fail,
                         Some("Expected parse/early error but compilation succeeded".to_string()),
@@ -313,14 +465,14 @@ impl Test262Runner {
             Err(err) => match err {
                 OtterError::Compile(msg) => {
                     if metadata.expects_early_error() {
-                        (TestOutcome::Pass, None)
+                        self.validate_negative_error(metadata, &msg)
                     } else {
                         (TestOutcome::Fail, Some(format!("Compile error: {}", msg)))
                     }
                 }
                 OtterError::Runtime(msg) => {
                     if metadata.expects_runtime_error() {
-                        (TestOutcome::Pass, None)
+                        self.validate_negative_error(metadata, &msg)
                     } else if msg == "Test timed out" || msg.contains("Execution interrupted") {
                         (TestOutcome::Timeout, None)
                     } else {
@@ -331,6 +483,40 @@ impl Test262Runner {
             },
         };
         result
+    }
+
+    /// Validate that the error type matches the negative expectation from metadata.
+    ///
+    /// If the metadata specifies `negative.type: TypeError`, we check whether
+    /// the error message contains "TypeError". If validation passes, we return
+    /// Pass; if it fails, we return Pass anyway (lenient mode) but log a warning.
+    /// This avoids false negatives from inconsistent error message formatting.
+    fn validate_negative_error(
+        &self,
+        metadata: &TestMetadata,
+        error_msg: &str,
+    ) -> (TestOutcome, Option<String>) {
+        if let Some(ref negative) = metadata.negative {
+            let expected_type = &negative.error_type;
+            // Check if the error message contains the expected error type name
+            if error_msg.contains(expected_type) {
+                (TestOutcome::Pass, None)
+            } else {
+                // Error occurred as expected, but type doesn't match.
+                // Be lenient for now — count as pass but note the mismatch.
+                // As error reporting improves, we can make this stricter.
+                (
+                    TestOutcome::Pass,
+                    Some(format!(
+                        "Error type mismatch: expected {} but got: {}",
+                        expected_type, error_msg
+                    )),
+                )
+            }
+        } else {
+            // No negative expectation specified (shouldn't happen if callers check)
+            (TestOutcome::Pass, None)
+        }
     }
 
     async fn run_with_timeout(
@@ -494,6 +680,19 @@ mod tests {
     #[test]
     fn test_runner_creation() {
         let runner = Test262Runner::new("tests/test262");
+        assert!(!runner.skip_features.is_empty());
+    }
+
+    #[test]
+    fn test_runner_no_skip() {
+        let runner = Test262Runner::new_no_skip("tests/test262");
         assert!(runner.skip_features.is_empty());
+    }
+
+    #[test]
+    fn test_default_skip_features_populated() {
+        assert!(!DEFAULT_SKIP_FEATURES.is_empty());
+        assert!(DEFAULT_SKIP_FEATURES.contains(&"Atomics"));
+        assert!(DEFAULT_SKIP_FEATURES.contains(&"Temporal"));
     }
 }

@@ -31,6 +31,7 @@ pub mod memory;
 pub mod object;
 pub mod promise;
 pub mod proxy;
+pub mod proxy_operations;
 pub mod regexp;
 pub mod runtime;
 pub mod shape;

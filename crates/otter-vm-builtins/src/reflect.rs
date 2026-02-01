@@ -117,6 +117,13 @@ fn native_reflect_get(
         .ok_or("Reflect.get requires a propertyKey argument")?;
     // receiver is optional (args[2]) - used for getter's this value
 
+    // If target is a proxy, signal the interpreter to handle it
+    if target.as_proxy().is_some() {
+        return Err(VmError::interception(
+            otter_vm_core::error::InterceptionSignal::ReflectGetProxy,
+        ));
+    }
+
     let obj = get_target_object(target)?;
     let key = to_property_key(property_key);
 
@@ -137,6 +144,13 @@ fn native_reflect_set(
         .ok_or("Reflect.set requires a propertyKey argument")?;
     let value = args.get(2).cloned().unwrap_or(VmValue::undefined());
     // receiver is optional (args[3])
+
+    // If target is a proxy, signal the interpreter to handle it
+    if target.as_proxy().is_some() {
+        return Err(VmError::interception(
+            otter_vm_core::error::InterceptionSignal::ReflectSetProxy,
+        ));
+    }
 
     let obj = get_target_object(target)?;
     let key = to_property_key(property_key);

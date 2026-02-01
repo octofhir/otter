@@ -23,6 +23,8 @@ All builtins live in `crates/otter-vm-core/src/intrinsics.rs` + `intrinsics_impl
 | `temporal.rs` | ~150 | Temporal namespace |
 | `generator.rs` | ~280 | Generator.prototype + AsyncGenerator.prototype (ES2026) |
 | `typed_array.rs` | ~850 | TypedArray.prototype + all 11 typed array types (ES2026) |
+| `proxy.rs` | ~150 | Proxy constructor + Proxy.revocable() |
+| `proxy_operations.rs` | ~1050 | All 13 ES2026 proxy handler traps + invariant validation (ES §9.5) |
 
 Intrinsics initialization: 4 stages in `intrinsics.rs`:
 1. `allocate()` — pre-allocate all prototype objects + well-known symbols
@@ -49,9 +51,18 @@ Callback dispatch uses `InterceptionSignal` enum: native function detects closur
 
 ✅ **Iterator protocol completeness** (2026-02-01) — Map/Set/String iterators fully implemented with `%IteratorPrototype%` chain, Symbol.iterator support, UTF-16 surrogate pair handling for strings, and snapshot semantics for stable iteration.
 
-### Medium Priority
+✅ **Proxy handler traps** (2026-02-01) — Complete ES2026-compliant Proxy implementation with all 13 handler traps. Includes:
+  - **Phase 1**: get, set traps with invariant validation for non-configurable/non-writable properties
+  - **Phase 2**: has, deleteProperty, ownKeys, getOwnPropertyDescriptor, defineProperty traps with non-extensible target validation
+  - **Phase 3**: getPrototypeOf, setPrototypeOf, isExtensible, preventExtensions traps with extensibility invariants
+  - **Phase 4**: apply, construct traps for function call/constructor interception
+  - New module `proxy_operations.rs` (~1050 LOC) with all trap implementations and invariant checks
+  - InterceptionSignal pattern for Reflect.* methods (10 new signals: ReflectGetProxy, ReflectSetProxy, etc.)
+  - Full integration with interpreter instructions (GetProp, SetProp, DeleteProp, In, Call, Construct)
+  - ES §9.5.1-14 spec compliance with proper error messages for invariant violations
+  - Revoked proxy handling, proxy chains support, and proper trap invocation with handler as 'this'
 
-1. **Proxy handler traps** — Proxy constructor exists but not all handler traps are fully validated.
+### Medium Priority
 
 ### Low Priority
 

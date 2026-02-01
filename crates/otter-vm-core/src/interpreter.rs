@@ -2057,8 +2057,31 @@ impl Interpreter {
                 rhs,
                 ic_index,
             } => {
-                let left = ctx.get_register(lhs.0);
-                let right = ctx.get_register(rhs.0);
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
+
+                // Proxy check - must be first
+                if let Some(proxy) = right.as_proxy() {
+                    let key = if let Some(n) = left.as_int32() {
+                        PropertyKey::Index(n as u32)
+                    } else if let Some(s) = left.as_string() {
+                        PropertyKey::from_js_string(s)
+                    } else if let Some(sym) = left.as_symbol() {
+                        PropertyKey::Symbol(sym.id)
+                    } else {
+                        let idx_str = self.to_string(&left);
+                        PropertyKey::string(&idx_str)
+                    };
+                    let result = crate::proxy_operations::proxy_has(
+                        self,
+                        ctx,
+                        proxy,
+                        &key,
+                        left.clone(),
+                    )?;
+                    ctx.set_register(dst.0, Value::boolean(result));
+                    return Ok(InstructionResult::Continue);
+                }
 
                 let Some(right_obj) = right.as_object() else {
                     return Err(VmError::type_error(
@@ -2073,7 +2096,7 @@ impl Interpreter {
                 } else if let Some(sym) = left.as_symbol() {
                     PropertyKey::Symbol(sym.id)
                 } else {
-                    let idx_str = self.to_string(left);
+                    let idx_str = self.to_string(&left);
                     PropertyKey::string(&idx_str)
                 };
 
@@ -2571,6 +2594,19 @@ impl Interpreter {
                     args.push(arg);
                 }
 
+                // Check if it's a proxy with apply trap
+                if let Some(proxy) = func_value.as_proxy() {
+                    let result = crate::proxy_operations::proxy_apply(
+                        self,
+                        ctx,
+                        proxy,
+                        Value::undefined(),
+                        &args,
+                    )?;
+                    ctx.set_register(dst.0, result);
+                    return Ok(InstructionResult::Continue);
+                }
+
                 // Check if it's a native function first
                 if let Some(native_fn) = func_value.as_native_function() {
                     // Some native ops need interpreter-level dispatch (call/apply, generator ops).
@@ -2749,6 +2785,24 @@ impl Interpreter {
 
             Instruction::Construct { dst, func, argc } => {
                 let func_value = ctx.get_register(func.0).clone();
+
+                // Check if it's a proxy with construct trap
+                if let Some(proxy) = func_value.as_proxy() {
+                    let mut args = Vec::with_capacity(*argc as usize);
+                    for i in 0..(*argc as u16) {
+                        let arg = ctx.get_register(func.0 + 1 + i).clone();
+                        args.push(arg);
+                    }
+                    let result = crate::proxy_operations::proxy_construct(
+                        self,
+                        ctx,
+                        proxy,
+                        &args,
+                        func_value.clone(), // new.target
+                    )?;
+                    ctx.set_register(dst.0, result);
+                    return Ok(InstructionResult::Continue);
+                }
 
                 if let Some(func_obj) = func_value.as_object() {
                     if func_obj
@@ -3524,6 +3578,16 @@ impl Interpreter {
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
 
+                // Proxy check - must be first
+                if let Some(proxy) = object.as_proxy() {
+                    let key = Self::utf16_key(name_str);
+                    let key_value = Value::string(JsString::intern_utf16(name_str));
+                    let receiver = object.clone();
+                    let result = crate::proxy_operations::proxy_get(self, ctx, proxy, &key, key_value, receiver)?;
+                    ctx.set_register(dst.0, result);
+                    return Ok(InstructionResult::Continue);
+                }
+
                 // Generator property access
                 if let Some(generator) = object.as_generator() {
                     let key = Self::utf16_key(name_str);
@@ -3824,6 +3888,15 @@ impl Interpreter {
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
                 let val_val = ctx.get_register(val.0).clone();
 
+                // Proxy check - must be first
+                if let Some(proxy) = object.as_proxy() {
+                    let key = Self::utf16_key(name_str);
+                    let key_value = Value::string(JsString::intern_utf16(name_str));
+                    let receiver = object.clone();
+                    crate::proxy_operations::proxy_set(self, ctx, proxy, &key, key_value, val_val, receiver)?;
+                    return Ok(InstructionResult::Continue);
+                }
+
                 if let Some(obj) = object.as_object() {
                     let key = Self::utf16_key(name_str);
 
@@ -3977,8 +4050,31 @@ impl Interpreter {
             }
 
             Instruction::DeleteProp { dst, obj, key } => {
-                let object = ctx.get_register(obj.0);
-                let key_value = ctx.get_register(key.0);
+                let object = ctx.get_register(obj.0).clone();
+                let key_value = ctx.get_register(key.0).clone();
+
+                // Proxy check - must be first
+                if let Some(proxy) = object.as_proxy() {
+                    let prop_key = if let Some(n) = key_value.as_int32() {
+                        PropertyKey::Index(n as u32)
+                    } else if let Some(s) = key_value.as_string() {
+                        PropertyKey::from_js_string(s)
+                    } else if let Some(sym) = key_value.as_symbol() {
+                        PropertyKey::Symbol(sym.id)
+                    } else {
+                        let key_str = self.to_string(&key_value);
+                        PropertyKey::string(&key_str)
+                    };
+                    let result = crate::proxy_operations::proxy_delete_property(
+                        self,
+                        ctx,
+                        proxy,
+                        &prop_key,
+                        key_value,
+                    )?;
+                    ctx.set_register(dst.0, Value::boolean(result));
+                    return Ok(InstructionResult::Continue);
+                }
 
                 // Convert key to PropertyKey
                 let prop_key = if let Some(n) = key_value.as_int32() {
@@ -3988,7 +4084,7 @@ impl Interpreter {
                 } else if let Some(sym) = key_value.as_symbol() {
                     PropertyKey::Symbol(sym.id)
                 } else {
-                    let key_str = self.to_string(key_value);
+                    let key_str = self.to_string(&key_value);
                     PropertyKey::string(&key_str)
                 };
 
@@ -4021,6 +4117,24 @@ impl Interpreter {
             } => {
                 let object = ctx.get_register(obj.0).clone();
                 let key_value = ctx.get_register(key.0).clone();
+
+                // Proxy check - must be first
+                if let Some(proxy) = object.as_proxy() {
+                    let prop_key = if let Some(n) = key_value.as_int32() {
+                        PropertyKey::Index(n as u32)
+                    } else if let Some(s) = key_value.as_string() {
+                        PropertyKey::from_js_string(s)
+                    } else if let Some(sym) = key_value.as_symbol() {
+                        PropertyKey::Symbol(sym.id)
+                    } else {
+                        let key_str = self.to_string(&key_value);
+                        PropertyKey::string(&key_str)
+                    };
+                    let receiver = object.clone();
+                    let result = crate::proxy_operations::proxy_get(self, ctx, proxy, &prop_key, key_value.clone(), receiver)?;
+                    ctx.set_register(dst.0, result);
+                    return Ok(InstructionResult::Continue);
+                }
 
                 if let Some(str_ref) = object.as_string() {
                     let key = if let Some(n) = key_value.as_int32() {
@@ -4331,6 +4445,23 @@ impl Interpreter {
                 let object = ctx.get_register(obj.0).clone();
                 let key_value = ctx.get_register(key.0).clone();
                 let val_val = ctx.get_register(val.0).clone();
+
+                // Proxy check - must be first
+                if let Some(proxy) = object.as_proxy() {
+                    let prop_key = if let Some(n) = key_value.as_int32() {
+                        PropertyKey::Index(n as u32)
+                    } else if let Some(s) = key_value.as_string() {
+                        PropertyKey::from_js_string(s)
+                    } else if let Some(sym) = key_value.as_symbol() {
+                        PropertyKey::Symbol(sym.id)
+                    } else {
+                        let key_str = self.to_string(&key_value);
+                        PropertyKey::string(&key_str)
+                    };
+                    let receiver = object.clone();
+                    crate::proxy_operations::proxy_set(self, ctx, proxy, &prop_key, key_value.clone(), val_val, receiver)?;
+                    return Ok(InstructionResult::Continue);
+                }
 
                 if let Some(obj) = object.as_object() {
                     let key = if let Some(n) = key_value.as_int32() {
@@ -6614,6 +6745,602 @@ impl Interpreter {
                                 obj.set(PropertyKey::Index(i as u32), val);
                             }
                             ctx.set_register(return_reg, current_this);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ReflectGetProxy => {
+                            // Reflect.get(proxy, propertyKey, receiver?)
+                            // current_args[0] = proxy (target)
+                            // current_args[1] = propertyKey
+                            // current_args[2] = receiver (optional)
+                            if current_args.len() < 2 {
+                                return Err(VmError::type_error("Reflect.get requires at least 2 arguments"));
+                            }
+
+                            let target = &current_args[0];
+                            let property_key = &current_args[1];
+                            let receiver = if current_args.len() > 2 {
+                                current_args[2].clone()
+                            } else {
+                                target.clone()
+                            };
+
+                            // Get proxy from target
+                            let proxy = target.as_proxy()
+                                .ok_or_else(|| VmError::type_error("Reflect.get: target is not a proxy"))?;
+
+                            // Convert key to PropertyKey
+                            let key = if let Some(n) = property_key.as_int32() {
+                                PropertyKey::Index(n as u32)
+                            } else if let Some(s) = property_key.as_string() {
+                                PropertyKey::from_js_string(s)
+                            } else if let Some(sym) = property_key.as_symbol() {
+                                PropertyKey::Symbol(sym.id)
+                            } else {
+                                let key_str = self.to_string(property_key);
+                                PropertyKey::string(&key_str)
+                            };
+
+                            // Call proxy_get
+                            let result = crate::proxy_operations::proxy_get(
+                                self,
+                                ctx,
+                                proxy,
+                                &key,
+                                property_key.clone(),
+                                receiver,
+                            )?;
+
+                            ctx.set_register(return_reg, result);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ReflectSetProxy => {
+                            // Reflect.set(proxy, propertyKey, value, receiver?)
+                            // current_args[0] = proxy (target)
+                            // current_args[1] = propertyKey
+                            // current_args[2] = value
+                            // current_args[3] = receiver (optional)
+                            if current_args.len() < 3 {
+                                return Err(VmError::type_error("Reflect.set requires at least 3 arguments"));
+                            }
+
+                            let target = &current_args[0];
+                            let property_key = &current_args[1];
+                            let value = current_args[2].clone();
+                            let receiver = if current_args.len() > 3 {
+                                current_args[3].clone()
+                            } else {
+                                target.clone()
+                            };
+
+                            // Get proxy from target
+                            let proxy = target.as_proxy()
+                                .ok_or_else(|| VmError::type_error("Reflect.set: target is not a proxy"))?;
+
+                            // Convert key to PropertyKey
+                            let key = if let Some(n) = property_key.as_int32() {
+                                PropertyKey::Index(n as u32)
+                            } else if let Some(s) = property_key.as_string() {
+                                PropertyKey::from_js_string(s)
+                            } else if let Some(sym) = property_key.as_symbol() {
+                                PropertyKey::Symbol(sym.id)
+                            } else {
+                                let key_str = self.to_string(property_key);
+                                PropertyKey::string(&key_str)
+                            };
+
+                            // Call proxy_set
+                            let success = crate::proxy_operations::proxy_set(
+                                self,
+                                ctx,
+                                proxy,
+                                &key,
+                                property_key.clone(),
+                                value,
+                                receiver,
+                            )?;
+
+                            ctx.set_register(return_reg, Value::boolean(success));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ReflectHasProxy => {
+                            // Reflect.has(proxy, propertyKey)
+                            // current_args[0] = proxy (target)
+                            // current_args[1] = propertyKey
+                            if current_args.len() < 2 {
+                                return Err(VmError::type_error("Reflect.has requires at least 2 arguments"));
+                            }
+
+                            let target = &current_args[0];
+                            let property_key = &current_args[1];
+
+                            // Get proxy from target
+                            let proxy = target.as_proxy()
+                                .ok_or_else(|| VmError::type_error("Reflect.has: target is not a proxy"))?;
+
+                            // Convert key to PropertyKey
+                            let key = if let Some(n) = property_key.as_int32() {
+                                PropertyKey::Index(n as u32)
+                            } else if let Some(s) = property_key.as_string() {
+                                PropertyKey::from_js_string(s)
+                            } else if let Some(sym) = property_key.as_symbol() {
+                                PropertyKey::Symbol(sym.id)
+                            } else {
+                                let key_str = self.to_string(property_key);
+                                PropertyKey::string(&key_str)
+                            };
+
+                            // Call proxy_has
+                            let result = crate::proxy_operations::proxy_has(
+                                self,
+                                ctx,
+                                proxy,
+                                &key,
+                                property_key.clone(),
+                            )?;
+
+                            ctx.set_register(return_reg, Value::boolean(result));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ReflectDeletePropertyProxy => {
+                            // Reflect.deleteProperty(proxy, propertyKey)
+                            // current_args[0] = proxy (target)
+                            // current_args[1] = propertyKey
+                            if current_args.len() < 2 {
+                                return Err(VmError::type_error("Reflect.deleteProperty requires at least 2 arguments"));
+                            }
+
+                            let target = &current_args[0];
+                            let property_key = &current_args[1];
+
+                            // Get proxy from target
+                            let proxy = target.as_proxy()
+                                .ok_or_else(|| VmError::type_error("Reflect.deleteProperty: target is not a proxy"))?;
+
+                            // Convert key to PropertyKey
+                            let key = if let Some(n) = property_key.as_int32() {
+                                PropertyKey::Index(n as u32)
+                            } else if let Some(s) = property_key.as_string() {
+                                PropertyKey::from_js_string(s)
+                            } else if let Some(sym) = property_key.as_symbol() {
+                                PropertyKey::Symbol(sym.id)
+                            } else {
+                                let key_str = self.to_string(property_key);
+                                PropertyKey::string(&key_str)
+                            };
+
+                            // Call proxy_delete_property
+                            let result = crate::proxy_operations::proxy_delete_property(
+                                self,
+                                ctx,
+                                proxy,
+                                &key,
+                                property_key.clone(),
+                            )?;
+
+                            ctx.set_register(return_reg, Value::boolean(result));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ReflectOwnKeysProxy => {
+                            // Reflect.ownKeys(proxy)
+                            // current_args[0] = proxy (target)
+                            if current_args.is_empty() {
+                                return Err(VmError::type_error("Reflect.ownKeys requires at least 1 argument"));
+                            }
+
+                            let target = &current_args[0];
+
+                            // Get proxy from target
+                            let proxy = target.as_proxy()
+                                .ok_or_else(|| VmError::type_error("Reflect.ownKeys: target is not a proxy"))?;
+
+                            // Call proxy_own_keys
+                            let keys = crate::proxy_operations::proxy_own_keys(
+                                self,
+                                ctx,
+                                proxy,
+                            )?;
+
+                            // Convert keys to array
+                            let result = GcRef::new(crate::object::JsObject::new(None, ctx.memory_manager().clone()));
+                            for (i, key) in keys.into_iter().enumerate() {
+                                let key_val = match key {
+                                    PropertyKey::String(s) => Value::string(s),
+                                    PropertyKey::Index(n) => Value::string(crate::string::JsString::intern(&n.to_string())),
+                                    PropertyKey::Symbol(sym_id) => {
+                                        // Create symbol value
+                                        Value::symbol(Arc::new(crate::value::Symbol {
+                                            description: None,
+                                            id: sym_id,
+                                        }))
+                                    }
+                                };
+                                result.set(PropertyKey::Index(i as u32), key_val);
+                            }
+                            result.set(PropertyKey::from("length"), Value::int32(result.own_keys().len() as i32));
+
+                            ctx.set_register(return_reg, Value::object(result));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ReflectGetOwnPropertyDescriptorProxy => {
+                            // Reflect.getOwnPropertyDescriptor(proxy, propertyKey)
+                            // current_args[0] = proxy (target)
+                            // current_args[1] = propertyKey
+                            if current_args.len() < 2 {
+                                return Err(VmError::type_error("Reflect.getOwnPropertyDescriptor requires at least 2 arguments"));
+                            }
+
+                            let target = &current_args[0];
+                            let property_key = &current_args[1];
+
+                            // Get proxy from target
+                            let proxy = target.as_proxy()
+                                .ok_or_else(|| VmError::type_error("Reflect.getOwnPropertyDescriptor: target is not a proxy"))?;
+
+                            // Convert key to PropertyKey
+                            let key = if let Some(n) = property_key.as_int32() {
+                                PropertyKey::Index(n as u32)
+                            } else if let Some(s) = property_key.as_string() {
+                                PropertyKey::from_js_string(s)
+                            } else if let Some(sym) = property_key.as_symbol() {
+                                PropertyKey::Symbol(sym.id)
+                            } else {
+                                let key_str = self.to_string(property_key);
+                                PropertyKey::string(&key_str)
+                            };
+
+                            // Call proxy_get_own_property_descriptor
+                            let result_desc = crate::proxy_operations::proxy_get_own_property_descriptor(
+                                self,
+                                ctx,
+                                proxy,
+                                &key,
+                                property_key.clone(),
+                            )?;
+
+                            // Convert descriptor to object or undefined
+                            let result = if let Some(desc) = result_desc {
+                                match desc {
+                                    crate::object::PropertyDescriptor::Data { value, attributes } => {
+                                        let desc_obj = GcRef::new(crate::object::JsObject::new(None, ctx.memory_manager().clone()));
+                                        desc_obj.set(PropertyKey::from("value"), value);
+                                        desc_obj.set(PropertyKey::from("writable"), Value::boolean(attributes.writable));
+                                        desc_obj.set(PropertyKey::from("enumerable"), Value::boolean(attributes.enumerable));
+                                        desc_obj.set(PropertyKey::from("configurable"), Value::boolean(attributes.configurable));
+                                        Value::object(desc_obj)
+                                    }
+                                    crate::object::PropertyDescriptor::Accessor { get, set, attributes } => {
+                                        let desc_obj = GcRef::new(crate::object::JsObject::new(None, ctx.memory_manager().clone()));
+                                        if let Some(getter) = get {
+                                            desc_obj.set(PropertyKey::from("get"), getter);
+                                        }
+                                        if let Some(setter) = set {
+                                            desc_obj.set(PropertyKey::from("set"), setter);
+                                        }
+                                        desc_obj.set(PropertyKey::from("enumerable"), Value::boolean(attributes.enumerable));
+                                        desc_obj.set(PropertyKey::from("configurable"), Value::boolean(attributes.configurable));
+                                        Value::object(desc_obj)
+                                    }
+                                    crate::object::PropertyDescriptor::Deleted => {
+                                        // Return undefined
+                                        Value::undefined()
+                                    }
+                                }
+                            } else {
+                                Value::undefined()
+                            };
+
+                            ctx.set_register(return_reg, result);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ReflectDefinePropertyProxy => {
+                            // Reflect.defineProperty(proxy, propertyKey, attributes)
+                            // current_args[0] = proxy (target)
+                            // current_args[1] = propertyKey
+                            // current_args[2] = attributes
+                            if current_args.len() < 3 {
+                                return Err(VmError::type_error("Reflect.defineProperty requires at least 3 arguments"));
+                            }
+
+                            let target = &current_args[0];
+                            let property_key = &current_args[1];
+                            let attributes = &current_args[2];
+
+                            // Get proxy from target
+                            let proxy = target.as_proxy()
+                                .ok_or_else(|| VmError::type_error("Reflect.defineProperty: target is not a proxy"))?;
+
+                            // Convert key to PropertyKey
+                            let key = if let Some(n) = property_key.as_int32() {
+                                PropertyKey::Index(n as u32)
+                            } else if let Some(s) = property_key.as_string() {
+                                PropertyKey::from_js_string(s)
+                            } else if let Some(sym) = property_key.as_symbol() {
+                                PropertyKey::Symbol(sym.id)
+                            } else {
+                                let key_str = self.to_string(property_key);
+                                PropertyKey::string(&key_str)
+                            };
+
+                            // Convert attributes object to PropertyDescriptor
+                            let attr_obj = attributes.as_object()
+                                .ok_or_else(|| VmError::type_error("Reflect.defineProperty requires attributes to be an object"))?;
+
+                            let has_value = attr_obj.has(&PropertyKey::from("value"));
+                            let has_writable = attr_obj.has(&PropertyKey::from("writable"));
+                            let has_get = attr_obj.has(&PropertyKey::from("get"));
+                            let has_set = attr_obj.has(&PropertyKey::from("set"));
+
+                            let enumerable = attr_obj
+                                .get(&PropertyKey::from("enumerable"))
+                                .map(|v| v.to_boolean())
+                                .unwrap_or(false);
+                            let configurable = attr_obj
+                                .get(&PropertyKey::from("configurable"))
+                                .map(|v| v.to_boolean())
+                                .unwrap_or(false);
+
+                            let desc = if has_value || has_writable {
+                                // Data descriptor
+                                let value = attr_obj.get(&PropertyKey::from("value")).unwrap_or(Value::undefined());
+                                let writable = attr_obj
+                                    .get(&PropertyKey::from("writable"))
+                                    .map(|v| v.to_boolean())
+                                    .unwrap_or(false);
+                                crate::object::PropertyDescriptor::Data {
+                                    value,
+                                    attributes: crate::object::PropertyAttributes {
+                                        writable,
+                                        enumerable,
+                                        configurable,
+                                    },
+                                }
+                            } else if has_get || has_set {
+                                // Accessor descriptor
+                                let get = attr_obj.get(&PropertyKey::from("get")).filter(|v| !v.is_undefined());
+                                let set = attr_obj.get(&PropertyKey::from("set")).filter(|v| !v.is_undefined());
+                                crate::object::PropertyDescriptor::Accessor {
+                                    get,
+                                    set,
+                                    attributes: crate::object::PropertyAttributes {
+                                        writable: false,
+                                        enumerable,
+                                        configurable,
+                                    },
+                                }
+                            } else {
+                                // Generic descriptor
+                                crate::object::PropertyDescriptor::Data {
+                                    value: Value::undefined(),
+                                    attributes: crate::object::PropertyAttributes {
+                                        writable: false,
+                                        enumerable,
+                                        configurable,
+                                    },
+                                }
+                            };
+
+                            // Call proxy_define_property
+                            let result = crate::proxy_operations::proxy_define_property(
+                                self,
+                                ctx,
+                                proxy,
+                                &key,
+                                property_key.clone(),
+                                &desc,
+                            )?;
+
+                            ctx.set_register(return_reg, Value::boolean(result));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ReflectGetPrototypeOfProxy => {
+                            // Reflect.getPrototypeOf(proxy)
+                            // current_args[0] = proxy (target)
+                            if current_args.is_empty() {
+                                return Err(VmError::type_error("Reflect.getPrototypeOf requires at least 1 argument"));
+                            }
+
+                            let target = &current_args[0];
+
+                            // Get proxy from target
+                            let proxy = target.as_proxy()
+                                .ok_or_else(|| VmError::type_error("Reflect.getPrototypeOf: target is not a proxy"))?;
+
+                            // Call proxy_get_prototype_of
+                            let result_proto = crate::proxy_operations::proxy_get_prototype_of(
+                                self,
+                                ctx,
+                                proxy,
+                            )?;
+
+                            // Convert to Value
+                            let result = match result_proto {
+                                Some(proto) => Value::object(proto),
+                                None => Value::null(),
+                            };
+
+                            ctx.set_register(return_reg, result);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ReflectSetPrototypeOfProxy => {
+                            // Reflect.setPrototypeOf(proxy, prototype)
+                            // current_args[0] = proxy (target)
+                            // current_args[1] = prototype
+                            if current_args.len() < 2 {
+                                return Err(VmError::type_error("Reflect.setPrototypeOf requires at least 2 arguments"));
+                            }
+
+                            let target = &current_args[0];
+                            let prototype = &current_args[1];
+
+                            // Get proxy from target
+                            let proxy = target.as_proxy()
+                                .ok_or_else(|| VmError::type_error("Reflect.setPrototypeOf: target is not a proxy"))?;
+
+                            // Convert prototype to Option<GcRef<JsObject>>
+                            let proto = if prototype.is_null() {
+                                None
+                            } else if let Some(proto_obj) = prototype.as_object() {
+                                Some(proto_obj)
+                            } else {
+                                return Err(VmError::type_error("Prototype must be an object or null"));
+                            };
+
+                            // Call proxy_set_prototype_of
+                            let result = crate::proxy_operations::proxy_set_prototype_of(
+                                self,
+                                ctx,
+                                proxy,
+                                proto,
+                            )?;
+
+                            ctx.set_register(return_reg, Value::boolean(result));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ReflectIsExtensibleProxy => {
+                            // Reflect.isExtensible(proxy)
+                            // current_args[0] = proxy (target)
+                            if current_args.is_empty() {
+                                return Err(VmError::type_error("Reflect.isExtensible requires at least 1 argument"));
+                            }
+
+                            let target = &current_args[0];
+
+                            // Get proxy from target
+                            let proxy = target.as_proxy()
+                                .ok_or_else(|| VmError::type_error("Reflect.isExtensible: target is not a proxy"))?;
+
+                            // Call proxy_is_extensible
+                            let result = crate::proxy_operations::proxy_is_extensible(
+                                self,
+                                ctx,
+                                proxy,
+                            )?;
+
+                            ctx.set_register(return_reg, Value::boolean(result));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ReflectPreventExtensionsProxy => {
+                            // Reflect.preventExtensions(proxy)
+                            // current_args[0] = proxy (target)
+                            if current_args.is_empty() {
+                                return Err(VmError::type_error("Reflect.preventExtensions requires at least 1 argument"));
+                            }
+
+                            let target = &current_args[0];
+
+                            // Get proxy from target
+                            let proxy = target.as_proxy()
+                                .ok_or_else(|| VmError::type_error("Reflect.preventExtensions: target is not a proxy"))?;
+
+                            // Call proxy_prevent_extensions
+                            let result = crate::proxy_operations::proxy_prevent_extensions(
+                                self,
+                                ctx,
+                                proxy,
+                            )?;
+
+                            ctx.set_register(return_reg, Value::boolean(result));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ReflectApplyProxy => {
+                            // Reflect.apply(proxy, thisArgument, argumentsList)
+                            // current_args[0] = proxy (target)
+                            // current_args[1] = thisArgument
+                            // current_args[2] = argumentsList
+                            if current_args.len() < 3 {
+                                return Err(VmError::type_error("Reflect.apply requires at least 3 arguments"));
+                            }
+
+                            let target = &current_args[0];
+                            let this_arg = current_args[1].clone();
+                            let args_list = &current_args[2];
+
+                            // Get proxy from target
+                            let proxy = target.as_proxy()
+                                .ok_or_else(|| VmError::type_error("Reflect.apply: target is not a proxy"))?;
+
+                            // Convert argumentsList to Vec<Value>
+                            let args_array = if let Some(arr_obj) = args_list.as_object() {
+                                let len = arr_obj.get(&PropertyKey::from("length"))
+                                    .and_then(|v| v.as_int32())
+                                    .unwrap_or(0) as usize;
+                                let mut call_args = Vec::with_capacity(len);
+                                for i in 0..len {
+                                    let val = arr_obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                                    call_args.push(val);
+                                }
+                                call_args
+                            } else {
+                                return Err(VmError::type_error("Reflect.apply argumentsList must be an object"));
+                            };
+
+                            // Call proxy_apply
+                            let result = crate::proxy_operations::proxy_apply(
+                                self,
+                                ctx,
+                                proxy,
+                                this_arg,
+                                &args_array,
+                            )?;
+
+                            ctx.set_register(return_reg, result);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ReflectConstructProxy => {
+                            // Reflect.construct(proxy, argumentsList, newTarget?)
+                            // current_args[0] = proxy (target)
+                            // current_args[1] = argumentsList
+                            // current_args[2] = newTarget (optional)
+                            if current_args.len() < 2 {
+                                return Err(VmError::type_error("Reflect.construct requires at least 2 arguments"));
+                            }
+
+                            let target = &current_args[0];
+                            let args_list = &current_args[1];
+                            let new_target = current_args.get(2).cloned().unwrap_or_else(|| target.clone());
+
+                            // Get proxy from target
+                            let proxy = target.as_proxy()
+                                .ok_or_else(|| VmError::type_error("Reflect.construct: target is not a proxy"))?;
+
+                            // Convert argumentsList to Vec<Value>
+                            let args_array = if let Some(arr_obj) = args_list.as_object() {
+                                let len = arr_obj.get(&PropertyKey::from("length"))
+                                    .and_then(|v| v.as_int32())
+                                    .unwrap_or(0) as usize;
+                                let mut call_args = Vec::with_capacity(len);
+                                for i in 0..len {
+                                    let val = arr_obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                                    call_args.push(val);
+                                }
+                                call_args
+                            } else {
+                                return Err(VmError::type_error("Reflect.construct argumentsList must be an object"));
+                            };
+
+                            // Call proxy_construct
+                            let result = crate::proxy_operations::proxy_construct(
+                                self,
+                                ctx,
+                                proxy,
+                                &args_array,
+                                new_target,
+                            )?;
+
+                            ctx.set_register(return_reg, result);
                             return Ok(InstructionResult::Continue);
                         }
                     }

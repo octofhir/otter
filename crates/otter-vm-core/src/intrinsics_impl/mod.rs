@@ -19,6 +19,7 @@
 //! - `promise` - Promise constructor statics and prototype methods (ES2026)
 //! - `generator` - Generator.prototype and AsyncGenerator.prototype methods (ES2026)
 //! - `typed_array` - %TypedArray%.prototype and all 11 typed array prototypes (ES2026)
+//! - `proxy` - Proxy constructor and static methods (ES2026)
 
 pub mod helpers;
 pub mod date;
@@ -35,3 +36,4 @@ pub mod regexp;
 pub mod promise;
 pub mod generator;
 pub mod typed_array;
+pub mod proxy;

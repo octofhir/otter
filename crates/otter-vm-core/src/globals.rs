@@ -402,6 +402,13 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                 mm_clone,
                 fn_proto,
             )
+        } else if name == "Proxy" {
+            // Proxy constructor
+            Value::native_function_with_proto(
+                crate::intrinsics_impl::proxy::proxy_constructor,
+                mm.clone(),
+                fn_proto,
+            )
         } else {
             let mm_clone = mm.clone();
             Value::native_function_with_proto(
@@ -749,6 +756,13 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                     fn_proto,
                 ),
             );
+        }
+
+        // Initialize Proxy constructor with static methods
+        if name == "Proxy" {
+            if let Some(ctor_obj) = ctor.as_object() {
+                crate::intrinsics_impl::proxy::init_proxy_constructor(ctor_obj, fn_proto, &mm);
+            }
         }
 
         global.define_property(PropertyKey::string(name), PropertyDescriptor::data(ctor));

@@ -120,6 +120,13 @@ pub fn install_reflect_namespace(
         let target = args.first().ok_or("Reflect.get requires a target argument")?;
         let property_key = args.get(1).ok_or("Reflect.get requires a propertyKey argument")?;
 
+        // If target is a proxy, signal the interpreter to handle it
+        if target.as_proxy().is_some() {
+            return Err(VmError::interception(
+                crate::error::InterceptionSignal::ReflectGetProxy,
+            ));
+        }
+
         let obj = get_target_object(target)?;
         let key = to_property_key(property_key);
 
@@ -131,6 +138,13 @@ pub fn install_reflect_namespace(
         let target = args.first().ok_or("Reflect.set requires a target argument")?;
         let property_key = args.get(1).ok_or("Reflect.set requires a propertyKey argument")?;
         let value = args.get(2).cloned().unwrap_or(Value::undefined());
+
+        // If target is a proxy, signal the interpreter to handle it
+        if target.as_proxy().is_some() {
+            return Err(VmError::interception(
+                crate::error::InterceptionSignal::ReflectSetProxy,
+            ));
+        }
 
         let obj = get_target_object(target)?;
         let key = to_property_key(property_key);
@@ -144,6 +158,13 @@ pub fn install_reflect_namespace(
         let target = args.first().ok_or("Reflect.has requires a target argument")?;
         let property_key = args.get(1).ok_or("Reflect.has requires a propertyKey argument")?;
 
+        // If target is a proxy, signal the interpreter to handle it
+        if target.as_proxy().is_some() {
+            return Err(VmError::interception(
+                crate::error::InterceptionSignal::ReflectHasProxy,
+            ));
+        }
+
         let obj = get_target_object(target)?;
         let key = to_property_key(property_key);
 
@@ -154,6 +175,13 @@ pub fn install_reflect_namespace(
     reflect_method!("deleteProperty", |_, args, _mm| {
         let target = args.first().ok_or("Reflect.deleteProperty requires a target argument")?;
         let property_key = args.get(1).ok_or("Reflect.deleteProperty requires a propertyKey argument")?;
+
+        // If target is a proxy, signal the interpreter to handle it
+        if target.as_proxy().is_some() {
+            return Err(VmError::interception(
+                crate::error::InterceptionSignal::ReflectDeletePropertyProxy,
+            ));
+        }
 
         let obj = get_target_object(target)?;
         let key = to_property_key(property_key);
@@ -167,6 +195,11 @@ pub fn install_reflect_namespace(
     // Reflect.ownKeys(target)
     reflect_method!("ownKeys", |_, args, mm| {
         let target = args.first().ok_or("Reflect.ownKeys requires a target argument")?;
+
+        // Check if target is a proxy
+        if target.as_proxy().is_some() {
+            return Err(VmError::interception(crate::error::InterceptionSignal::ReflectOwnKeysProxy));
+        }
 
         let obj = get_target_object(target)?;
         let keys = obj.own_keys();
@@ -188,6 +221,11 @@ pub fn install_reflect_namespace(
     reflect_method!("getOwnPropertyDescriptor", |_, args, mm| {
         let target = args.first().ok_or("Reflect.getOwnPropertyDescriptor requires a target argument")?;
         let property_key = args.get(1).ok_or("Reflect.getOwnPropertyDescriptor requires a propertyKey argument")?;
+
+        // Check if target is a proxy
+        if target.as_proxy().is_some() {
+            return Err(VmError::interception(crate::error::InterceptionSignal::ReflectGetOwnPropertyDescriptorProxy));
+        }
 
         let obj = get_target_object(target)?;
         let key = to_property_key(property_key);
@@ -229,6 +267,11 @@ pub fn install_reflect_namespace(
         let target = args.first().ok_or("Reflect.defineProperty requires a target argument")?;
         let property_key = args.get(1).ok_or("Reflect.defineProperty requires a propertyKey argument")?;
         let attributes = args.get(2).ok_or("Reflect.defineProperty requires an attributes argument")?;
+
+        // Check if target is a proxy
+        if target.as_proxy().is_some() {
+            return Err(VmError::interception(crate::error::InterceptionSignal::ReflectDefinePropertyProxy));
+        }
 
         let obj = get_target_object(target)?;
         let key = to_property_key(property_key);
@@ -285,6 +328,11 @@ pub fn install_reflect_namespace(
     reflect_method!("getPrototypeOf", |_, args, _mm| {
         let target = args.first().ok_or("Reflect.getPrototypeOf requires a target argument")?;
 
+        // Check if target is a proxy
+        if target.as_proxy().is_some() {
+            return Err(VmError::interception(crate::error::InterceptionSignal::ReflectGetPrototypeOfProxy));
+        }
+
         let obj = get_target_object(target)?;
 
         match obj.prototype() {
@@ -297,6 +345,11 @@ pub fn install_reflect_namespace(
     reflect_method!("setPrototypeOf", |_, args, _mm| {
         let target = args.first().ok_or("Reflect.setPrototypeOf requires a target argument")?;
         let prototype = args.get(1).ok_or("Reflect.setPrototypeOf requires a prototype argument")?;
+
+        // Check if target is a proxy
+        if target.as_proxy().is_some() {
+            return Err(VmError::interception(crate::error::InterceptionSignal::ReflectSetPrototypeOfProxy));
+        }
 
         let obj = get_target_object(target)?;
 
@@ -318,6 +371,11 @@ pub fn install_reflect_namespace(
     reflect_method!("isExtensible", |_, args, _mm| {
         let target = args.first().ok_or("Reflect.isExtensible requires a target argument")?;
 
+        // Check if target is a proxy
+        if target.as_proxy().is_some() {
+            return Err(VmError::interception(crate::error::InterceptionSignal::ReflectIsExtensibleProxy));
+        }
+
         let obj = get_target_object(target)?;
         Ok(Value::boolean(obj.is_extensible()))
     });
@@ -325,6 +383,11 @@ pub fn install_reflect_namespace(
     // Reflect.preventExtensions(target)
     reflect_method!("preventExtensions", |_, args, _mm| {
         let target = args.first().ok_or("Reflect.preventExtensions requires a target argument")?;
+
+        // Check if target is a proxy
+        if target.as_proxy().is_some() {
+            return Err(VmError::interception(crate::error::InterceptionSignal::ReflectPreventExtensionsProxy));
+        }
 
         let obj = get_target_object(target)?;
         obj.prevent_extensions();
@@ -338,6 +401,11 @@ pub fn install_reflect_namespace(
         let target = args.first().ok_or("Reflect.apply requires a target argument")?;
         let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
         let args_list = args.get(2).ok_or("Reflect.apply requires an argumentsList argument")?;
+
+        // Check if target is a proxy
+        if target.as_proxy().is_some() {
+            return Err(VmError::interception(crate::error::InterceptionSignal::ReflectApplyProxy));
+        }
 
         // Check if target is a function
         if !target.is_function() {
@@ -379,6 +447,11 @@ pub fn install_reflect_namespace(
         let target = args.first().ok_or("Reflect.construct requires a target argument")?;
         let args_list = args.get(1).ok_or("Reflect.construct requires an argumentsList argument")?;
         let _new_target = args.get(2); // Optional, for advanced use
+
+        // Check if target is a proxy
+        if target.as_proxy().is_some() {
+            return Err(VmError::interception(crate::error::InterceptionSignal::ReflectConstructProxy));
+        }
 
         // Check if target is a function
         if !target.is_function() {

@@ -47,6 +47,33 @@ pub enum InterceptionSignal {
     ArrayFlatMap,
     /// Array.prototype.sort with comparator
     ArraySort,
+    // ---- Reflect methods on proxies (require VM context to invoke traps) ----
+    /// Reflect.get on a proxy
+    ReflectGetProxy,
+    /// Reflect.set on a proxy
+    ReflectSetProxy,
+    /// Reflect.has on a proxy
+    ReflectHasProxy,
+    /// Reflect.deleteProperty on a proxy
+    ReflectDeletePropertyProxy,
+    /// Reflect.ownKeys on a proxy
+    ReflectOwnKeysProxy,
+    /// Reflect.getOwnPropertyDescriptor on a proxy
+    ReflectGetOwnPropertyDescriptorProxy,
+    /// Reflect.defineProperty on a proxy
+    ReflectDefinePropertyProxy,
+    /// Reflect.getPrototypeOf on a proxy
+    ReflectGetPrototypeOfProxy,
+    /// Reflect.setPrototypeOf on a proxy
+    ReflectSetPrototypeOfProxy,
+    /// Reflect.isExtensible on a proxy
+    ReflectIsExtensibleProxy,
+    /// Reflect.preventExtensions on a proxy
+    ReflectPreventExtensionsProxy,
+    /// Reflect.apply on a proxy
+    ReflectApplyProxy,
+    /// Reflect.construct on a proxy
+    ReflectConstructProxy,
 }
 
 /// VM execution errors

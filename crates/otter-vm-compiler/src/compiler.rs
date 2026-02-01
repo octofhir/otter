@@ -40,6 +40,9 @@ pub struct Compiler {
     last_was_return: bool,
     /// When true, the last expression statement's value is returned (eval semantics)
     eval_mode: bool,
+    /// Inferred name for anonymous function expressions (ES2023 §15.1.3).
+    /// Set before compiling an expression that might be an anonymous function.
+    pending_inferred_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -72,6 +75,7 @@ impl Compiler {
             in_derived_class: false,
             last_was_return: false,
             eval_mode: false,
+            pending_inferred_name: None,
         }
     }
 
@@ -79,6 +83,21 @@ impl Compiler {
     pub fn set_strict_mode(&mut self, strict_mode: bool) {
         self.codegen.current.flags.is_strict = strict_mode;
         self.literal_validator.set_strict_mode(strict_mode);
+    }
+
+    /// Returns true if the expression is an anonymous function definition
+    /// (ES2023 §IsAnonymousFunctionDefinition).
+    /// Also handles CoverParenthesizedExpression: `(function() {})` is still anonymous.
+    fn is_anonymous_function_definition(expr: &Expression) -> bool {
+        match expr {
+            Expression::FunctionExpression(f) => f.id.is_none(),
+            Expression::ArrowFunctionExpression(_) => true,
+            Expression::ClassExpression(c) => c.id.is_none(),
+            Expression::ParenthesizedExpression(paren) => {
+                Self::is_anonymous_function_definition(&paren.expression)
+            }
+            _ => false,
+        }
     }
 
     fn check_identifier_early_error(&self, name: &str) -> CompileResult<()> {
@@ -224,6 +243,21 @@ impl Compiler {
         for d in &program.directives {
             self.literal_validator
                 .validate_string_literal(&d.expression)?;
+        }
+
+        // In eval mode, if body is empty but there are directives, the source
+        // is something like `"hello"` which oxc parses as a directive.
+        // We need to treat the last directive as a string value and return it.
+        if self.eval_mode && program.body.is_empty() && !program.directives.is_empty() {
+            let last_directive = program.directives.last().unwrap();
+            let value = last_directive.directive.as_str();
+            let reg = self.codegen.alloc_reg();
+            let idx = self.codegen.add_string(value);
+            self.codegen.emit(Instruction::LoadConst { dst: reg, idx });
+            self.codegen.emit(Instruction::Return { src: reg });
+            self.codegen.free_reg(reg);
+            self.last_was_return = true;
+            return Ok(());
         }
 
         // Hoist function declarations before compiling any statements
@@ -1023,7 +1057,36 @@ impl Compiler {
         if class_expr.r#type != ClassType::ClassExpression {
             return Err(CompileError::internal("expected ClassExpression"));
         }
-        self.compile_class_parts(class_expr.super_class.as_ref(), &class_expr.body)
+        // Use explicit class name, or fall back to inferred name from variable binding.
+        // However, if the class has a `static name()` method, skip name inference
+        // because the static method should define the `.name` property instead.
+        let has_static_name = class_expr.body.body.iter().any(|elem| {
+            if let ClassElement::MethodDefinition(m) = elem {
+                if m.r#static {
+                    if let PropertyKey::StaticIdentifier(id) = &m.key {
+                        return id.name.as_str() == "name";
+                    }
+                }
+            }
+            false
+        });
+        let class_name = class_expr
+            .id
+            .as_ref()
+            .map(|id| id.name.to_string())
+            .or_else(|| {
+                if has_static_name {
+                    self.pending_inferred_name.take(); // consume but don't use
+                    None
+                } else {
+                    self.pending_inferred_name.take()
+                }
+            });
+        self.compile_class_parts(
+            class_expr.super_class.as_ref(),
+            &class_expr.body,
+            class_name.as_deref(),
+        )
     }
 
     fn compile_class_declaration_value(
@@ -1033,13 +1096,15 @@ impl Compiler {
         if class_decl.r#type != ClassType::ClassDeclaration {
             return Err(CompileError::internal("expected ClassDeclaration"));
         }
-        self.compile_class_parts(class_decl.super_class.as_ref(), &class_decl.body)
+        let name = class_decl.id.as_ref().map(|id| id.name.as_str());
+        self.compile_class_parts(class_decl.super_class.as_ref(), &class_decl.body, name)
     }
 
     fn compile_class_parts(
         &mut self,
         super_class: Option<&Expression>,
         body: &ClassBody,
+        class_name: Option<&str>,
     ) -> CompileResult<Register> {
         let has_super = super_class.is_some();
 
@@ -1113,6 +1178,10 @@ impl Compiler {
         self.in_derived_class = has_super;
 
         // Compile constructor (or a default empty constructor).
+        // Set pending_inferred_name so the constructor picks up the class name.
+        if let Some(cn) = class_name {
+            self.pending_inferred_name = Some(cn.to_string());
+        }
         let ctor_reg = if let Some(func) = constructor {
             self.compile_function_expression_internal(func, Some(&instance_fields))?
         } else if has_super {
@@ -1133,7 +1202,8 @@ impl Compiler {
         };
 
         // Emit DefineClass instruction to set up prototype chain
-        let class_name = self.codegen.add_string(""); // name will be set by caller
+        let class_name_str = class_name.unwrap_or("");
+        let class_name = self.codegen.add_string(class_name_str);
         let dst = self.codegen.alloc_reg();
         self.codegen.emit(Instruction::DefineClass {
             dst,
@@ -1307,8 +1377,9 @@ impl Compiler {
         field_initializers: Option<&[&PropertyDefinition]>,
     ) -> CompileResult<Register> {
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
+        let inferred_name = self.pending_inferred_name.take();
 
-        self.codegen.enter_function(None);
+        self.codegen.enter_function(inferred_name);
 
         if let Some(fields) = field_initializers {
             for field in fields {
@@ -1591,6 +1662,15 @@ impl Compiler {
             }
 
             // Compile initializer first
+            // Per ES2023 §14.3.2.4 step 7: if binding is a simple identifier
+            // and init is an anonymous function, set the function's name.
+            if let Some(init) = &declarator.init {
+                if let BindingPattern::BindingIdentifier(ident) = &declarator.id {
+                    if Self::is_anonymous_function_definition(init) {
+                        self.pending_inferred_name = Some(ident.name.to_string());
+                    }
+                }
+            }
             let init_reg = if let Some(init) = &declarator.init {
                 self.compile_expression(init)?
             } else {
@@ -1643,6 +1723,9 @@ impl Compiler {
                 }
             }
             BindingPattern::ObjectPattern(obj_pattern) => {
+                let has_rest = obj_pattern.rest.is_some();
+                let mut excluded_keys: Vec<Register> = Vec::new();
+
                 for prop in &obj_pattern.properties {
                     // Property is BindingProperty
                     // Use helper to compile key (handles static and computed)
@@ -1673,6 +1756,12 @@ impl Compiler {
                             let jump_if_def = self.codegen.emit_jump_if_false(is_undefined);
 
                             // It is undefined, evaluate default (right)
+                            // Per ES2023 §13.15.5.3: set function name if default is anonymous
+                            if let BindingPattern::BindingIdentifier(id) = &assign_pat.left {
+                                if Self::is_anonymous_function_definition(&assign_pat.right) {
+                                    self.pending_inferred_name = Some(id.name.to_string());
+                                }
+                            }
                             let default_val = self.compile_expression(&assign_pat.right)?;
                             self.codegen.emit(Instruction::Move {
                                 dst: prop_val,
@@ -1698,60 +1787,231 @@ impl Compiler {
                     }
 
                     self.codegen.free_reg(prop_val);
-                    self.codegen.free_reg(key_reg);
+                    if has_rest {
+                        // Keep key_reg alive for building excluded keys array
+                        excluded_keys.push(key_reg);
+                    } else {
+                        self.codegen.free_reg(key_reg);
+                    }
                 }
 
-                if let Some(_rest) = &obj_pattern.rest {
-                    // Unsupported rest for now
-                    return Err(CompileError::unsupported("Destructuring rest pattern"));
+                // Handle rest pattern: {...rest}
+                if let Some(rest) = &obj_pattern.rest {
+                    // Build excluded keys array
+                    let excluded_array = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::NewArray {
+                        dst: excluded_array,
+                        len: excluded_keys.len() as u16,
+                    });
+                    for (i, key_reg) in excluded_keys.iter().enumerate() {
+                        let idx_reg = self.codegen.alloc_reg();
+                        self.codegen.emit(Instruction::LoadInt32 {
+                            dst: idx_reg,
+                            value: i as i32,
+                        });
+                        let ic_index = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::SetElem {
+                            arr: excluded_array,
+                            idx: idx_reg,
+                            val: *key_reg,
+                            ic_index,
+                        });
+                        self.codegen.free_reg(idx_reg);
+                        self.codegen.free_reg(*key_reg);
+                    }
+
+                    // Call __Object_rest(source, excluded_array)
+                    let rest_helper_name = self.codegen.add_string("__Object_rest");
+                    let ic_index = self.codegen.alloc_ic();
+                    let func_reg = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::GetGlobal {
+                        dst: func_reg,
+                        name: rest_helper_name,
+                        ic_index,
+                    });
+
+                    let frame = self.codegen.alloc_fresh_block(3);
+                    self.codegen.emit(Instruction::Move {
+                        dst: frame,
+                        src: func_reg,
+                    });
+                    self.codegen.emit(Instruction::Move {
+                        dst: Register(frame.0 + 1),
+                        src: value_reg,
+                    });
+                    self.codegen.emit(Instruction::Move {
+                        dst: Register(frame.0 + 2),
+                        src: excluded_array,
+                    });
+
+                    let rest_reg = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::Call {
+                        dst: rest_reg,
+                        func: frame,
+                        argc: 2,
+                    });
+
+                    self.codegen.free_reg(func_reg);
+                    self.codegen.free_reg(excluded_array);
+
+                    self.compile_binding_pattern(&rest.argument, rest_reg, kind)?;
+                    self.codegen.free_reg(rest_reg);
                 }
             }
-            BindingPattern::ArrayPattern(_arr_pattern) => {
-                // Get iterator
-                let iter_reg = self.codegen.alloc_reg();
-                self.codegen.emit(Instruction::GetIterator {
-                    dst: iter_reg,
-                    src: value_reg, // Actually GetIterator might take src
+            BindingPattern::ArrayPattern(arr_pattern) => {
+                // Array destructuring via indexed access (GetElem).
+                // Per ES2023 §13.3.3.6 IteratorBindingInitialization.
+                for (i, elem) in arr_pattern.elements.iter().enumerate() {
+                    let Some(elem_pat) = elem else {
+                        // Hole / elision — skip this index
+                        continue;
+                    };
+
+                    // Load index and get element value
+                    let idx_reg = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::LoadInt32 {
+                        dst: idx_reg,
+                        value: i as i32,
+                    });
+                    let elem_val = self.codegen.alloc_reg();
+                    let ic_index = self.codegen.alloc_ic();
+                    self.codegen.emit(Instruction::GetElem {
+                        dst: elem_val,
+                        arr: value_reg,
+                        idx: idx_reg,
+                        ic_index,
+                    });
+                    self.codegen.free_reg(idx_reg);
+
+                    match elem_pat {
+                        BindingPattern::AssignmentPattern(assign_pat) => {
+                            // Element with default: [x = default]
+                            let undef_reg = self.codegen.alloc_reg();
+                            self.codegen
+                                .emit(Instruction::LoadUndefined { dst: undef_reg });
+                            let is_undef = self.codegen.alloc_reg();
+                            self.codegen.emit(Instruction::StrictEq {
+                                dst: is_undef,
+                                lhs: elem_val,
+                                rhs: undef_reg,
+                            });
+                            let jump_skip = self.codegen.emit_jump_if_false(is_undef);
+                            self.codegen.free_reg(is_undef);
+                            self.codegen.free_reg(undef_reg);
+
+                            // Value is undefined — evaluate default
+                            // Set inferred name if the default is an anonymous function
+                            if let BindingPattern::BindingIdentifier(id) = &assign_pat.left {
+                                if Self::is_anonymous_function_definition(&assign_pat.right) {
+                                    self.pending_inferred_name = Some(id.name.to_string());
+                                }
+                            }
+                            let default_val = self.compile_expression(&assign_pat.right)?;
+                            self.codegen.emit(Instruction::Move {
+                                dst: elem_val,
+                                src: default_val,
+                            });
+                            self.codegen.free_reg(default_val);
+
+                            let patch_off =
+                                self.codegen.current_index() as i32 - jump_skip as i32;
+                            self.codegen.patch_jump(jump_skip, patch_off);
+
+                            // Bind the inner pattern
+                            self.compile_binding_pattern(&assign_pat.left, elem_val, kind)?;
+                        }
+                        _ => {
+                            // No default — bind element directly
+                            self.compile_binding_pattern(elem_pat, elem_val, kind)?;
+                        }
+                    }
+
+                    self.codegen.free_reg(elem_val);
+                }
+
+                // Handle rest element: [...rest]
+                if let Some(rest_elem) = &arr_pattern.rest {
+                    let start_idx = arr_pattern.elements.len();
+
+                    // Call Array.prototype.slice(startIndex) on the source
+                    let frame = self.codegen.alloc_fresh_block(2);
+                    self.codegen.emit(Instruction::Move {
+                        dst: frame,
+                        src: value_reg,
+                    });
+                    let start_reg = Register(frame.0 + 1);
+                    self.codegen.emit(Instruction::LoadInt32 {
+                        dst: start_reg,
+                        value: start_idx as i32,
+                    });
+
+                    let slice_name = self.codegen.add_string("slice");
+                    let rest_reg = self.codegen.alloc_reg();
+                    let ic_index = self.codegen.alloc_ic();
+                    self.codegen.emit(Instruction::CallMethod {
+                        dst: rest_reg,
+                        obj: frame,
+                        method: slice_name,
+                        argc: 1,
+                        ic_index,
+                    });
+                    self.codegen.free_reg(frame);
+
+                    self.compile_binding_pattern(
+                        &rest_elem.argument,
+                        rest_reg,
+                        kind,
+                    )?;
+                    self.codegen.free_reg(rest_reg);
+                }
+            }
+            BindingPattern::AssignmentPattern(assign_pat) => {
+                // Pattern with default at top level: pattern = default
+                // If value is undefined, use default; otherwise use value.
+                let undef_reg = self.codegen.alloc_reg();
+                self.codegen
+                    .emit(Instruction::LoadUndefined { dst: undef_reg });
+                let is_undef = self.codegen.alloc_reg();
+                self.codegen.emit(Instruction::StrictEq {
+                    dst: is_undef,
+                    lhs: value_reg,
+                    rhs: undef_reg,
                 });
-                // Find GetIterator signature: dst: Register
-                // Wait, GetIterator usually takes an object and returns iterator.
-                // Let's check Instruction::GetIterator in bytecode again?
-                // Ah, Step 446 showed: GetIterator = 0xB0, dst = obj[Symbol.iterator]()
-                // But instruction definitions usually are `GetIterator { dst, obj }`? Not defined details in enum list, checking Instruction enum.
-                // Line 458 in file instruction.rs (Step 446 view) Showed `GetIterator` in Opcode.
-                // But Instruction struct?
-                // I need to check `Instruction` struct definition for `GetIterator` to be sure about operands.
-                // Assuming it takes `dst` and `src` (the object).
-                // Actually, I'll assume it's `dst, src`.
-                // But wait, the edit needs to be precise.
-                // Using `Instruction::GetIterator { dst: iter_reg, obj: value_reg }`?
-                // I will check `Instruction` definition quickly or guess-correct it.
-                // Actually, finding GetIterator in Instruction enum would be safer.
+                let jump_skip = self.codegen.emit_jump_if_false(is_undef);
+                self.codegen.free_reg(is_undef);
+                self.codegen.free_reg(undef_reg);
 
-                // Since I cannot check right now without breaking the tool call flow effectively (I am in Replace mode).
-                // I will use `Instruction::GetIterator { dst: iter_reg, obj: value_reg }` based on common sense, but if it fails I'll fix it.
-                // Actually, looking at `Instruction` list from Step 446, I missed `GetIterator` details in the truncated output.
-                // I will assume standard format given `GetProp`.
+                // Set inferred name for anonymous functions
+                if let BindingPattern::BindingIdentifier(id) = &assign_pat.left {
+                    if Self::is_anonymous_function_definition(&assign_pat.right) {
+                        self.pending_inferred_name = Some(id.name.to_string());
+                    }
+                }
+                let default_val = self.compile_expression(&assign_pat.right)?;
+                // Overwrite value_reg with default — but value_reg may be read-only
+                // from caller, so we use a temp and rebind.
+                let result_reg = self.codegen.alloc_reg();
+                self.codegen.emit(Instruction::Move {
+                    dst: result_reg,
+                    src: default_val,
+                });
+                self.codegen.free_reg(default_val);
 
-                // Re-implementation strategy: since I am not 100% sure on `GetIterator` fields, and Array Destructuring is complex (iterator loop/next),
-                // implementing ObjectPattern first is safer and covers `let {x} = y` which was the explicit request.
-                // I will include ArrayPattern stub returning Unsupported for now, or attempt basic implementation if possible.
-                // Actually, the user asked for "Destructuring patterns".
-                // I will implement ObjectPattern fully and ArrayPattern as "Unsupported" or "To Be Implemented" to avoid breaking build if I guess wrong.
-                // But wait, if I don't implement ArrayPattern, `let [x] = y` fails.
+                let jump_end = self.codegen.emit_jump();
+                let patch_off = self.codegen.current_index() as i32 - jump_skip as i32;
+                self.codegen.patch_jump(jump_skip, patch_off);
 
-                return Err(CompileError::unsupported("Array Destructuring"));
-            }
-            BindingPattern::AssignmentPattern(_) => {
-                // This wraps a pattern with a default value at top level?
-                // No, BindingPattern variants: BindingIdentifier, ObjectPattern, ArrayPattern, AssignmentPattern
-                // AssignmentPattern is `pattern = default`.
-                // It has `left` (pattern) and `right` (expression).
-                // Wait, if it's AssignmentPattern, it means default value at top level.
-                // Recursively handle it
-                // Logic: if value_reg is undefined, eval right, else value_reg.
-                // Then bind left.
-                return Err(CompileError::unsupported("Assignment Pattern in Binding"));
+                // Value is not undefined — use it
+                self.codegen.emit(Instruction::Move {
+                    dst: result_reg,
+                    src: value_reg,
+                });
+
+                let patch_end = self.codegen.current_index() as i32 - jump_end as i32;
+                self.codegen.patch_jump(jump_end, patch_end);
+
+                self.compile_binding_pattern(&assign_pat.left, result_reg, kind)?;
+                self.codegen.free_reg(result_reg);
             }
         }
         Ok(())
@@ -3322,7 +3582,11 @@ impl Compiler {
         func: &oxc_ast::ast::Function,
         field_initializers: Option<&[&PropertyDefinition]>,
     ) -> CompileResult<Register> {
-        let name = func.id.as_ref().map(|id| id.name.to_string());
+        let name = func
+            .id
+            .as_ref()
+            .map(|id| id.name.to_string())
+            .or_else(|| self.pending_inferred_name.take());
         let is_async = func.r#async;
         let is_generator = func.generator;
 
@@ -3494,11 +3758,12 @@ impl Compiler {
         arrow: &ArrowFunctionExpression,
     ) -> CompileResult<Register> {
         let is_async = arrow.r#async;
+        let inferred_name = self.pending_inferred_name.take();
 
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
 
         // Enter function context
-        self.codegen.enter_function(None);
+        self.codegen.enter_function(inferred_name);
         self.codegen.current.flags.is_arrow = true;
         self.codegen.current.flags.is_async = is_async;
 

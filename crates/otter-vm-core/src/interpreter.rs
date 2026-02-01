@@ -2777,7 +2777,15 @@ impl Interpreter {
                     let new_obj_value = Value::object(new_obj);
 
                     // Call native constructor with depth tracking
-                    let result = self.call_native_fn(ctx, native_fn, &new_obj_value, &args)?;
+                    let result = match self.call_native_fn(ctx, native_fn, &new_obj_value, &args) {
+                        Ok(v) => v,
+                        // eval (and similar non-constructors) throw Interception when called
+                        // with string args — treat as "not a constructor" in Construct context
+                        Err(VmError::Interception(_)) => {
+                            return Err(VmError::type_error("not a constructor"));
+                        }
+                        Err(e) => return Err(e),
+                    };
                     let final_value = if result.is_object() {
                         result
                     } else {
@@ -3489,16 +3497,16 @@ impl Interpreter {
                     return Ok(InstructionResult::Continue);
                 }
 
-                let source = code_value.to_string();
+                let js_str = code_value
+                    .as_string()
+                    .ok_or_else(|| VmError::type_error("eval argument is not a string"))?;
+                let source = js_str.as_str().to_string();
 
-                // Compile and execute eval code via the eval callback
-                match ctx.perform_eval(&source) {
-                    Ok(result) => {
-                        ctx.set_register(dst.0, result);
-                        Ok(InstructionResult::Continue)
-                    }
-                    Err(e) => Err(e),
-                }
+                // Compile eval code into a module
+                let eval_module = ctx.compile_eval(&source)?;
+                let result = self.execute_eval_module(ctx, &eval_module)?;
+                ctx.set_register(dst.0, result);
+                Ok(InstructionResult::Continue)
             }
 
             Instruction::GetPropConst {
@@ -5737,6 +5745,194 @@ impl Interpreter {
         }
     }
 
+    /// Execute an eval-compiled module within the current execution context.
+    ///
+    /// Unlike `execute()` / `run_loop()`, this method tracks the pre-eval
+    /// stack depth and returns when the eval frame finishes, without
+    /// consuming outer call frames. This is the same pattern used by
+    /// `call_function`.
+    fn execute_eval_module(
+        &mut self,
+        ctx: &mut VmContext,
+        module: &Module,
+    ) -> VmResult<Value> {
+        let module = Arc::new(module.clone());
+        let entry_func = module
+            .entry_function()
+            .ok_or_else(|| VmError::internal("eval: no entry function"))?;
+
+        let prev_stack_depth = ctx.stack_depth();
+
+        ctx.push_frame(
+            module.entry_point,
+            Arc::clone(&module),
+            entry_func.local_count,
+            None,
+            false,
+            entry_func.is_async(),
+            0,
+        )?;
+
+        // Mini run-loop that returns when eval frame completes
+        loop {
+            if ctx.should_check_interrupt() && ctx.is_interrupted() {
+                // Pop the eval frame before returning error
+                while ctx.stack_depth() > prev_stack_depth {
+                    ctx.pop_frame();
+                }
+                return Err(VmError::interrupted());
+            }
+
+            let frame = ctx
+                .current_frame()
+                .ok_or_else(|| VmError::internal("eval: no frame"))?;
+            let current_module = Arc::clone(&frame.module);
+            let func = current_module
+                .function(frame.function_index)
+                .ok_or_else(|| VmError::internal("eval: function not found"))?;
+
+            // End of function → implicit return undefined
+            if frame.pc >= func.instructions.len() {
+                if ctx.stack_depth() <= prev_stack_depth {
+                    return Ok(Value::undefined());
+                }
+                ctx.pop_frame();
+                continue;
+            }
+
+            let instruction = &func.instructions[frame.pc];
+            ctx.record_instruction();
+
+            match self.execute_instruction(instruction, &current_module, ctx) {
+                Ok(InstructionResult::Continue) => {
+                    ctx.advance_pc();
+                }
+                Ok(InstructionResult::Jump(offset)) => {
+                    ctx.jump(offset);
+                }
+                Ok(InstructionResult::Return(value)) => {
+                    if ctx.stack_depth() <= prev_stack_depth + 1 {
+                        ctx.pop_frame();
+                        return Ok(value);
+                    }
+                    let return_reg = ctx
+                        .current_frame()
+                        .and_then(|f| f.return_register)
+                        .unwrap_or(0);
+                    ctx.pop_frame();
+                    ctx.set_register(return_reg, value);
+                }
+                Ok(InstructionResult::Call {
+                    func_index,
+                    module: call_module,
+                    argc,
+                    return_reg,
+                    is_construct,
+                    is_async,
+                    upvalues,
+                }) => {
+                    ctx.advance_pc();
+                    let local_count = call_module
+                        .function(func_index)
+                        .ok_or_else(|| VmError::internal("eval: called function not found"))?
+                        .local_count;
+                    ctx.push_frame(
+                        func_index,
+                        call_module,
+                        local_count,
+                        Some(return_reg),
+                        is_construct,
+                        is_async,
+                        argc as usize,
+                    )?;
+                    // Set upvalues on the new frame
+                    if !upvalues.is_empty() {
+                        if let Some(frame) = ctx.current_frame_mut() {
+                            frame.upvalues = upvalues;
+                        }
+                    }
+                }
+                Ok(InstructionResult::Throw(value)) => {
+                    // Check if there's a try handler within the eval scope
+                    if let Some((target_depth, catch_pc)) = ctx.peek_nearest_try() {
+                        if target_depth > prev_stack_depth {
+                            // Handler is within eval scope — use it
+                            ctx.take_nearest_try();
+                            while ctx.stack_depth() > target_depth {
+                                ctx.pop_frame();
+                            }
+                            if let Some(frame) = ctx.current_frame_mut() {
+                                frame.pc = catch_pc;
+                            }
+                            ctx.set_register(0, value);
+                            continue;
+                        }
+                    }
+                    // No handler in eval scope — unwind and propagate to outer
+                    while ctx.stack_depth() > prev_stack_depth {
+                        ctx.pop_frame();
+                    }
+                    return Err(VmError::exception(value));
+                }
+                Ok(InstructionResult::TailCall { .. }) => {
+                    return Err(VmError::internal("tail call in eval not yet supported"));
+                }
+                Ok(InstructionResult::Suspend { .. }) => {
+                    return Err(VmError::internal("await in eval not yet supported"));
+                }
+                Ok(InstructionResult::Yield { .. }) => {
+                    return Err(VmError::internal("yield in eval not yet supported"));
+                }
+                Err(VmError::Exception(thrown)) => {
+                    let error_value = thrown.value;
+                    if let Some((target_depth, catch_pc)) = ctx.peek_nearest_try() {
+                        if target_depth > prev_stack_depth {
+                            ctx.take_nearest_try();
+                            while ctx.stack_depth() > target_depth {
+                                ctx.pop_frame();
+                            }
+                            if let Some(frame) = ctx.current_frame_mut() {
+                                frame.pc = catch_pc;
+                            }
+                            ctx.set_register(0, error_value);
+                            continue;
+                        }
+                    }
+                    while ctx.stack_depth() > prev_stack_depth {
+                        ctx.pop_frame();
+                    }
+                    return Err(VmError::exception(error_value));
+                }
+                Err(VmError::SyntaxError(msg)) => {
+                    let error_val = self.make_error(ctx, "SyntaxError", &msg);
+                    if let Some((target_depth, catch_pc)) = ctx.peek_nearest_try() {
+                        if target_depth > prev_stack_depth {
+                            ctx.take_nearest_try();
+                            while ctx.stack_depth() > target_depth {
+                                ctx.pop_frame();
+                            }
+                            if let Some(frame) = ctx.current_frame_mut() {
+                                frame.pc = catch_pc;
+                            }
+                            ctx.set_register(0, error_val);
+                            continue;
+                        }
+                    }
+                    while ctx.stack_depth() > prev_stack_depth {
+                        ctx.pop_frame();
+                    }
+                    return Err(VmError::exception(error_val));
+                }
+                Err(other) => {
+                    while ctx.stack_depth() > prev_stack_depth {
+                        ctx.pop_frame();
+                    }
+                    return Err(other);
+                }
+            }
+        }
+    }
+
     /// Call a native function with depth tracking to prevent Rust stack overflow.
     ///
     /// This method tracks the native call depth and returns an error if it exceeds
@@ -6082,8 +6278,15 @@ impl Interpreter {
                                 .first()
                                 .cloned()
                                 .unwrap_or(Value::undefined());
-                            let source = code_value.to_string();
-                            let result = ctx.perform_eval(&source)?;
+                            let js_str = code_value
+                                .as_string()
+                                .ok_or_else(|| {
+                                    VmError::type_error("eval argument is not a string")
+                                })?;
+                            let source = js_str.as_str().to_string();
+                            let eval_module = ctx.compile_eval(&source)?;
+                            let result =
+                                self.execute_eval_module(ctx, &eval_module)?;
                             ctx.set_register(return_reg, result);
                             return Ok(InstructionResult::Continue);
                         }

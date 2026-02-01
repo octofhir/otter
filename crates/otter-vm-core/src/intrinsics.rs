@@ -400,7 +400,7 @@ impl Intrinsics {
                         if let Some(key) = args.first() {
                             if let Some(s) = key.as_string() {
                                 return Ok(Value::boolean(
-                                    obj.has(&PropertyKey::string(s.as_str())),
+                                    obj.has_own(&PropertyKey::string(s.as_str())),
                                 ));
                             }
                         }

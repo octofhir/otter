@@ -3,8 +3,6 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-use crate::runner::DEFAULT_SKIP_FEATURES;
-
 /// Test262 runner configuration loaded from TOML file
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -15,7 +13,7 @@ pub struct Test262Config {
     /// Git commit SHA to pin test262 to
     pub test262_commit: Option<String>,
 
-    /// Features to skip (replaces DEFAULT_SKIP_FEATURES if non-empty)
+    /// Features to skip (tests requiring these features will be skipped)
     pub skip_features: Vec<String>,
 
     /// Test path patterns to ignore (glob-style)
@@ -36,10 +34,7 @@ impl Default for Test262Config {
         Self {
             test262_path: None,
             test262_commit: None,
-            skip_features: DEFAULT_SKIP_FEATURES
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            skip_features: Vec::new(),
             ignored_tests: Vec::new(),
             known_panics: Vec::new(),
             timeout_secs: None,

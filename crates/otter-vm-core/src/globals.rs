@@ -13,7 +13,38 @@ use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
+use crate::memory::MemoryManager;
 use crate::value::Value;
+
+/// Create a native function with proper `length` and `name` properties,
+/// and define it on the target object with builtin_method attributes
+/// (`{ writable: true, enumerable: false, configurable: true }`).
+fn define_global_fn<F>(
+    target: &GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+    fn_proto: GcRef<JsObject>,
+    func: F,
+    name: &str,
+    length: u32,
+) where
+    F: Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync + 'static,
+{
+    let fn_obj = GcRef::new(JsObject::new(Some(fn_proto), mm.clone()));
+    fn_obj.define_property(
+        PropertyKey::string("length"),
+        PropertyDescriptor::function_length(Value::number(length as f64)),
+    );
+    fn_obj.define_property(
+        PropertyKey::string("name"),
+        PropertyDescriptor::function_length(Value::string(JsString::intern(name))),
+    );
+    let native_fn: Arc<dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync> = Arc::new(func);
+    let value = Value::native_function_with_proto_and_object(native_fn, mm.clone(), fn_proto, fn_obj);
+    target.define_property(
+        PropertyKey::string(name),
+        PropertyDescriptor::builtin_method(value),
+    );
+}
 
 /// Set up all standard global properties on the global object.
 ///
@@ -33,45 +64,19 @@ pub fn setup_global_object(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>) {
         Value::number(f64::INFINITY),
     );
 
-    // Global functions — all get fn_proto as [[Prototype]]
-    global.set(
-        PropertyKey::string("eval"),
-        Value::native_function_with_proto(global_eval, mm.clone(), fn_proto),
-    );
-    global.set(
-        PropertyKey::string("isFinite"),
-        Value::native_function_with_proto(global_is_finite, mm.clone(), fn_proto),
-    );
-    global.set(
-        PropertyKey::string("isNaN"),
-        Value::native_function_with_proto(global_is_nan, mm.clone(), fn_proto),
-    );
-    global.set(
-        PropertyKey::string("parseInt"),
-        Value::native_function_with_proto(global_parse_int, mm.clone(), fn_proto),
-    );
-    global.set(
-        PropertyKey::string("parseFloat"),
-        Value::native_function_with_proto(global_parse_float, mm.clone(), fn_proto),
-    );
+    // Global functions — all get fn_proto as [[Prototype]] with proper length/name
+    // Per spec §19.2, these are { writable: true, enumerable: false, configurable: true }
+    define_global_fn(&global, &mm, fn_proto, global_eval, "eval", 1);
+    define_global_fn(&global, &mm, fn_proto, global_is_finite, "isFinite", 1);
+    define_global_fn(&global, &mm, fn_proto, global_is_nan, "isNaN", 1);
+    define_global_fn(&global, &mm, fn_proto, global_parse_int, "parseInt", 2);
+    define_global_fn(&global, &mm, fn_proto, global_parse_float, "parseFloat", 1);
 
     // URI encoding/decoding functions
-    global.set(
-        PropertyKey::string("encodeURI"),
-        Value::native_function_with_proto(global_encode_uri, mm.clone(), fn_proto),
-    );
-    global.set(
-        PropertyKey::string("decodeURI"),
-        Value::native_function_with_proto(global_decode_uri, mm.clone(), fn_proto),
-    );
-    global.set(
-        PropertyKey::string("encodeURIComponent"),
-        Value::native_function_with_proto(global_encode_uri_component, mm.clone(), fn_proto),
-    );
-    global.set(
-        PropertyKey::string("decodeURIComponent"),
-        Value::native_function_with_proto(global_decode_uri_component, mm.clone(), fn_proto),
-    );
+    define_global_fn(&global, &mm, fn_proto, global_encode_uri, "encodeURI", 1);
+    define_global_fn(&global, &mm, fn_proto, global_decode_uri, "decodeURI", 1);
+    define_global_fn(&global, &mm, fn_proto, global_encode_uri_component, "encodeURIComponent", 1);
+    define_global_fn(&global, &mm, fn_proto, global_decode_uri_component, "decodeURIComponent", 1);
 
     // Standard built-in objects
     setup_builtin_constructors(global, fn_proto);

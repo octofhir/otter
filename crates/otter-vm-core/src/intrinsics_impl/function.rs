@@ -42,6 +42,17 @@ pub fn init_function_prototype(
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
+    // Function.prototype.length = 0 (§20.2.3)
+    fn_proto.define_property(
+        PropertyKey::string("length"),
+        PropertyDescriptor::function_length(Value::number(0.0)),
+    );
+    // Function.prototype.name = "" (§20.2.3)
+    fn_proto.define_property(
+        PropertyKey::string("name"),
+        PropertyDescriptor::function_length(Value::string(JsString::intern(""))),
+    );
+
     // ====================================================================
     // Function.prototype.toString() §20.2.3.5
     // ====================================================================

@@ -227,6 +227,7 @@ impl Otter {
         let mut ctx = self.vm.create_context();
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
         ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
+        Self::configure_eval(&mut ctx);
 
         // 4. Register extension ops as global native functions
         self.register_ops_in_context(&mut ctx);
@@ -492,6 +493,7 @@ impl Otter {
         let mut ctx = self.vm.create_context();
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
         ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
+        Self::configure_eval(&mut ctx);
 
         // Register extension ops as global native functions
         self.register_ops_in_context(&mut ctx);
@@ -833,6 +835,7 @@ impl Otter {
         let mut ctx = self.vm.create_context();
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
         ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
+        Self::configure_eval(&mut ctx);
 
         // Register extension ops as global native functions
         self.register_ops_in_context(&mut ctx);
@@ -859,6 +862,18 @@ impl Otter {
         self.vm
             .execute_module_with_context(&module, ctx)
             .map_err(|e| OtterError::Runtime(e.to_string()))
+    }
+
+    /// Configure the eval compiler callback on a VmContext so that `eval()`
+    /// and `CallEval` bytecode can compile code at runtime.
+    /// The interpreter handles execution with proper stack depth tracking.
+    fn configure_eval(ctx: &mut VmContext) {
+        ctx.set_eval_fn(Arc::new(|code: &str| {
+            let compiler = Compiler::new();
+            compiler
+                .compile_eval(code, "<eval>")
+                .map_err(|e| VmError::SyntaxError(e.to_string()))
+        }));
     }
 
     /// Execute JS code with eval semantics (returns last expression value)

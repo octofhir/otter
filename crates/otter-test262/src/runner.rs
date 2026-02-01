@@ -15,86 +15,8 @@ use otter_engine::{EngineBuilder, Otter, OtterError, Value, VmContextSnapshot};
 use crate::harness::TestHarnessState;
 use crate::metadata::{ExecutionMode, TestMetadata};
 
-/// Features that are not yet implemented in Otter and should be skipped.
-pub const DEFAULT_SKIP_FEATURES: &[&str] = &[
-    // Atomics & shared memory
-    "Atomics",
-    "SharedArrayBuffer",
-    // Temporal proposal
-    "Temporal",
-    // Decorators proposal
-    "decorators",
-    // Import assertions / attributes
-    "import-assertions",
-    "import-attributes",
-    // FinalizationRegistry / WeakRef
-    "FinalizationRegistry",
-    "WeakRef",
-    // ShadowRealm
-    "ShadowRealm",
-    // Explicit resource management (using/await using)
-    "explicit-resource-management",
-    // Tail calls
-    "tail-call-optimization",
-    // Intl (internationalization)
-    "Intl",
-    "Intl.DateTimeFormat",
-    "Intl.DisplayNames",
-    "Intl.ListFormat",
-    "Intl.Locale",
-    "Intl.NumberFormat",
-    "Intl.PluralRules",
-    "Intl.RelativeTimeFormat",
-    "Intl.Segmenter",
-    "Intl-enumeration",
-    // Import / export (module system)
-    "dynamic-import",
-    "import.meta",
-    // Resizable ArrayBuffer
-    "resizable-arraybuffer",
-    "arraybuffer-transfer",
-    // JSON modules
-    "json-modules",
-    // Iterator helpers
-    "iterator-helpers",
-    // Set methods
-    "set-methods",
-    // Promise.withResolvers
-    "promise-with-resolvers",
-    // Array grouping
-    "array-grouping",
-    // Well-formed Unicode strings
-    "well-formed-unicode-strings",
-    // Symbols as WeakMap keys
-    "symbols-as-weakmap-keys",
-    // RegExp features not yet implemented
-    "regexp-duplicate-named-groups",
-    "regexp-lookbehind",
-    "regexp-named-groups",
-    "regexp-unicode-property-escapes",
-    "regexp-v-flag",
-    "regexp-match-indices",
-    // Hashbang
-    "hashbang",
-    // Top-level await (module feature)
-    "top-level-await",
-    // Class features
-    "class-fields-private",
-    "class-fields-public",
-    "class-methods-private",
-    "class-static-block",
-    "class-static-fields-private",
-    "class-static-fields-public",
-    "class-static-methods-private",
-    // Other proposals
-    "Array.fromAsync",
-    "change-array-by-copy",
-    "String.prototype.isWellFormed",
-    "String.prototype.toWellFormed",
-    "Object.groupBy",
-    "Map.groupBy",
-    "Uint8Array",
-];
+// Skip features are now configured exclusively via test262_config.toml.
+// No hardcoded defaults — the config file is the single source of truth.
 
 /// Test262 test runner
 pub struct Test262Runner {
@@ -173,10 +95,7 @@ impl Test262Runner {
         Self {
             test_dir: test_dir.as_ref().to_path_buf(),
             filter: None,
-            skip_features: DEFAULT_SKIP_FEATURES
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            skip_features: Vec::new(),
             engine: Arc::new(Mutex::new(engine)),
             harness_state,
         }
@@ -677,9 +596,9 @@ mod tests {
     }
 
     #[test]
-    fn test_default_skip_features_populated() {
-        assert!(!DEFAULT_SKIP_FEATURES.is_empty());
-        assert!(DEFAULT_SKIP_FEATURES.contains(&"Atomics"));
-        assert!(DEFAULT_SKIP_FEATURES.contains(&"Temporal"));
+    fn test_default_skip_features_empty() {
+        // Skip features are now config-driven only; default is empty
+        let runner = Test262Runner::new("tests/test262");
+        assert!(runner.skip_features.is_empty());
     }
 }

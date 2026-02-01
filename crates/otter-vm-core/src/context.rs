@@ -144,10 +144,10 @@ pub struct VmContext {
     /// interpreter can assign it as [[Prototype]] on closures
     /// and native functions without a global lookup.
     function_prototype_intrinsic: Option<GcRef<JsObject>>,
-    /// Eval callback: compiles and executes code in the current context.
+    /// Eval compiler callback: compiles eval source code into a Module.
     /// Set by otter-vm-runtime to bridge the compiler (which otter-vm-core
-    /// cannot depend on directly).
-    eval_fn: Option<Arc<dyn Fn(&str, &mut VmContext) -> VmResult<Value> + Send + Sync>>,
+    /// cannot depend on directly). The interpreter handles execution.
+    eval_fn: Option<Arc<dyn Fn(&str) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync>>,
 }
 
 #[derive(Debug, Clone)]
@@ -643,23 +643,26 @@ impl VmContext {
         self.function_prototype_intrinsic = Some(proto);
     }
 
-    /// Set the eval callback used by the interpreter to compile and execute
-    /// eval'd code. Called by otter-vm-runtime during context setup.
+    /// Set the eval compiler callback used by the interpreter to compile
+    /// eval code at runtime. Called by otter-vm-runtime during context setup.
+    /// The callback takes source code and returns a compiled Module.
     pub fn set_eval_fn(
         &mut self,
-        f: Arc<dyn Fn(&str, &mut VmContext) -> VmResult<Value> + Send + Sync>,
+        f: Arc<
+            dyn Fn(&str) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync,
+        >,
     ) {
         self.eval_fn = Some(f);
     }
 
-    /// Compile and execute eval code in this context.
+    /// Compile eval code into a Module using the registered eval compiler.
     /// Returns `VmError::TypeError` if the eval callback is not configured.
-    pub fn perform_eval(&mut self, code: &str) -> VmResult<Value> {
+    pub fn compile_eval(&self, code: &str) -> Result<otter_vm_bytecode::Module, VmError> {
         let eval_fn = self
             .eval_fn
-            .clone()
+            .as_ref()
             .ok_or_else(|| VmError::type_error("eval() is not available in this context"))?;
-        eval_fn(code, self)
+        eval_fn(code)
     }
 
     /// Get global variable

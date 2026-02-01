@@ -1170,7 +1170,7 @@ mod tests {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
         let fn_proto = GcRef::new(JsObject::new(None, memory_manager));
-        setup_global_object(global, fn_proto);
+        setup_global_object(global, fn_proto, None);
 
         // globalThis should reference the global object itself
         let global_this = global.get(&PropertyKey::string("globalThis"));

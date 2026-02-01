@@ -2827,8 +2827,17 @@ impl Interpreter {
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
                         .and_then(|v| v.as_object());
                     let new_obj =
-                        GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
-                    let new_obj_value = Value::object(new_obj);
+                        GcRef::new(JsObject::new(ctor_proto.clone(), ctx.memory_manager().clone()));
+                    let new_obj_value = Value::object(new_obj.clone());
+
+                    // Capture stack trace for Error objects
+                    if let Some(proto) = ctor_proto {
+                        if proto.get(&PropertyKey::string("__is_error__"))
+                            .and_then(|v| v.as_boolean()) == Some(true)
+                        {
+                            Self::capture_error_stack_trace(new_obj.clone(), ctx);
+                        }
+                    }
 
                     // Call native constructor with depth tracking
                     let result = match self.call_native_fn(ctx, native_fn, &new_obj_value, &args) {
@@ -2893,8 +2902,17 @@ impl Interpreter {
                             .and_then(|o| o.get(&PropertyKey::string("prototype")))
                             .and_then(|v| v.as_object());
                         let new_obj =
-                            GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
+                            GcRef::new(JsObject::new(ctor_proto.clone(), ctx.memory_manager().clone()));
                         let new_obj_value = Value::object(new_obj.clone());
+
+                        // Capture stack trace for Error objects
+                        if let Some(proto) = ctor_proto {
+                            if proto.get(&PropertyKey::string("__is_error__"))
+                                .and_then(|v| v.as_boolean()) == Some(true)
+                            {
+                                Self::capture_error_stack_trace(new_obj.clone(), ctx);
+                            }
+                        }
 
                         ctx.set_pending_args(args);
                         ctx.set_pending_this(new_obj_value.clone());
@@ -7950,6 +7968,63 @@ impl Interpreter {
         }
 
         Some(value)
+    }
+
+    /// Capture stack trace for Error objects
+    fn capture_error_stack_trace(error_obj: GcRef<JsObject>, ctx: &VmContext) {
+        use crate::object::PropertyKey;
+        use crate::string::JsString;
+
+        // Get call stack frames (skip the Error constructor itself)
+        let frames: Vec<_> = ctx.call_stack()
+            .iter()
+            .rev()
+            .skip(1)
+            .take(10)
+            .collect();
+
+        // Create array to hold stack frame objects
+        let frames_array = GcRef::new(JsObject::array(frames.len(), ctx.memory_manager().clone()));
+
+        for (i, frame) in frames.iter().enumerate() {
+            let frame_obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+
+            // Get function name
+            if let Some(func_def) = frame.module.functions.get(frame.function_index as usize) {
+                let func_name = func_def.name.clone().unwrap_or_else(|| "<anonymous>".to_string());
+                frame_obj.set(
+                    PropertyKey::string("function"),
+                    Value::string(JsString::intern(&func_name)),
+                );
+            } else {
+                frame_obj.set(
+                    PropertyKey::string("function"),
+                    Value::string(JsString::intern("<unknown>")),
+                );
+            }
+
+            // Get source file
+            let source_url = &frame.module.source_url;
+            if !source_url.is_empty() {
+                frame_obj.set(
+                    PropertyKey::string("file"),
+                    Value::string(JsString::intern(source_url)),
+                );
+            }
+
+            // TODO: Get line and column from source map if available
+            // For now, just set placeholder values
+            frame_obj.set(PropertyKey::string("line"), Value::number(0.0));
+            frame_obj.set(PropertyKey::string("column"), Value::number(0.0));
+
+            frames_array.set(PropertyKey::Index(i as u32), Value::object(frame_obj));
+        }
+
+        // Store frames array as hidden property
+        error_obj.set(
+            PropertyKey::string("__stack_frames__"),
+            Value::array(frames_array),
+        );
     }
 }
 

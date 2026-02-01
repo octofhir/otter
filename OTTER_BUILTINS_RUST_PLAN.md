@@ -25,6 +25,10 @@ All builtins live in `crates/otter-vm-core/src/intrinsics.rs` + `intrinsics_impl
 | `typed_array.rs` | ~850 | TypedArray.prototype + all 11 typed array types (ES2026) |
 | `proxy.rs` | ~150 | Proxy constructor + Proxy.revocable() |
 | `proxy_operations.rs` | ~1050 | All 13 ES2026 proxy handler traps + invariant validation (ES §9.5) |
+| `object.rs` | ~1025 | Object.prototype (5 methods) + Object static methods (21 methods) |
+| `error.rs` | ~233 | Error.prototype + 7 error types + stack trace support |
+
+**Core file**: `intrinsics.rs` (~1285 LOC) — orchestrates initialization in 4 stages:
 
 Intrinsics initialization: 4 stages in `intrinsics.rs`:
 1. `allocate()` — pre-allocate all prototype objects + well-known symbols
@@ -37,6 +41,16 @@ Callback dispatch uses `InterceptionSignal` enum: native function detects closur
 ## Remaining Work
 
 ### Completed Recently
+
+✅ **Object and Error intrinsics extraction + Stack Trace support** (2026-02-01) — Extracted Object and Error implementations from monolithic `intrinsics.rs` into dedicated modules. Includes:
+  - **`object.rs`** (~1025 LOC): All Object.prototype methods (toString, valueOf, hasOwnProperty, isPrototypeOf, propertyIsEnumerable) + 21 Object static methods (getPrototypeOf, setPrototypeOf, keys, values, entries, assign, freeze, seal, create, defineProperty, etc.)
+  - **`error.rs`** (~233 LOC): Error.prototype + all 7 error types (Error, TypeError, RangeError, ReferenceError, SyntaxError, URIError, EvalError)
+  - **Stack trace capture**: Automatic stack trace capture for all Error objects during construction
+  - **Error.prototype.stack getter**: Lazy formatting of stack traces with error name, message, and call frames
+  - **Inheritance support**: `class CustomError extends Error` automatically captures stack traces via super() calls
+  - **Implementation**: Stack capture in `Instruction::Construct` handler (interpreter.rs), triggered by `__is_error__` marker on Error prototypes
+  - **Impact**: `intrinsics.rs` reduced from 2353 to 1285 LOC (−1068 LOC, −45%)
+  - **All tests passing**: 155 unit tests + manual stack trace validation
 
 ✅ **TypedArray implementation** (2026-02-01) — Complete ES2026-compliant TypedArray implementation with all 11 types (Int8Array through BigUint64Array). Includes:
   - Full intrinsics system integration with %TypedArray%.prototype and 11 specific prototypes
@@ -64,11 +78,11 @@ Callback dispatch uses `InterceptionSignal` enum: native function detects closur
 
 ### Medium Priority
 
+(No items)
+
 ### Low Priority
 
-1. **Extract `intrinsics_impl/object.rs`** — Object.prototype and Object static methods currently inline in `intrinsics.rs`, could be extracted for maintainability.
-
-2. **Extract `intrinsics_impl/error.rs`** — Error hierarchy init is inline in `intrinsics.rs`.
+(No items)
 
 ## Task 2: Runtime Job/Microtask Drain Correctness
 

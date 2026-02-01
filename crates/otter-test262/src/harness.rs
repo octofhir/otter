@@ -30,14 +30,9 @@ var $262 = {
         }
     },
     evalScript: function(code) {
-        if (typeof __otter_eval === 'function') {
-            var result = __otter_eval(code);
-            if (result && result.ok === false) {
-                throw new Error(result.message || 'evalScript failed');
-            }
-            return result && result.value !== undefined ? result.value : undefined;
-        }
-        throw new Error('$262.evalScript not supported');
+        // Use indirect eval to execute in global scope (Test262 requirement)
+        // The (1, eval) pattern makes eval execute in global scope, not local
+        return (1, eval)(code);
     },
     detachArrayBuffer: function(buffer) {
         if (typeof __test262_detach_array_buffer === 'function') {
@@ -169,10 +164,20 @@ pub fn create_harness_extension_with_state() -> (Extension, TestHarnessState) {
                     Ok(Value::undefined())
                 })),
             },
-            // $262.detachArrayBuffer() - detaches an ArrayBuffer (stub until full TypedArray support)
-            otter_engine::op_native("__test262_detach_array_buffer", |_args| {
-                // TODO: implement actual ArrayBuffer detachment once TypedArray support lands
-                Ok(Value::undefined())
+            // $262.detachArrayBuffer() - detaches an ArrayBuffer
+            otter_engine::op_native("__test262_detach_array_buffer", |args| {
+                if let Some(buffer) = args.first() {
+                    if buffer.is_array_buffer() {
+                        if let Some(array_buffer) = buffer.as_array_buffer() {
+                            // Use the proper ArrayBuffer detach API
+                            array_buffer.detach();
+                            return Ok(Value::undefined());
+                        }
+                    }
+                }
+                Err(VmError::type_error(
+                    "detachArrayBuffer requires an ArrayBuffer",
+                ))
             }),
         ])
         .with_js(HARNESS_SETUP_JS);

@@ -77,7 +77,6 @@ skip_features = [
     # Other proposals
     "Array.fromAsync",
     "change-array-by-copy",
-    "Uint8Array",
 ]
 
 # Test path patterns to ignore (tests matching these patterns will be skipped)

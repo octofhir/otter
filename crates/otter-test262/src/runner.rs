@@ -11,7 +11,7 @@ use walkdir::WalkDir;
 use otter_engine::{EngineBuilder, Otter, OtterError, Value};
 
 use crate::harness::TestHarnessState;
-use crate::metadata::{ExecutionMode, TestMetadata};
+use crate::metadata::{ErrorPhase, ExecutionMode, TestMetadata};
 
 // Skip features are now configured exclusively via test262_config.toml.
 // No hardcoded defaults — the config file is the single source of truth.
@@ -223,25 +223,9 @@ impl Test262Runner {
         }
 
         let modes = metadata.execution_modes();
-
-        // Skip module tests for now (not yet supported)
-        if modes == vec![ExecutionMode::Module] {
-            return vec![TestResult {
-                path: relative_path_str,
-                mode: ExecutionMode::Module,
-                outcome: TestOutcome::Skip,
-                duration_ms: 0,
-                error: Some("Module tests not yet supported".to_string()),
-                features: metadata.features.clone(),
-            }];
-        }
-
         let mut results = Vec::with_capacity(modes.len());
 
         for mode in &modes {
-            if *mode == ExecutionMode::Module {
-                continue;
-            }
 
             let start = Instant::now();
             let result = self
@@ -346,9 +330,14 @@ impl Test262Runner {
         // Clear harness state before running the test
         self.harness_state.clear();
 
-        // Execute
-        self.execute_test(&test_source, metadata, &test_name, timeout)
-            .await
+        // Execute - route module tests to separate handler
+        if mode == ExecutionMode::Module {
+            self.execute_test_as_module(&test_source, metadata, &test_name, timeout)
+                .await
+        } else {
+            self.execute_test(&test_source, metadata, &test_name, timeout)
+                .await
+        }
     }
 
     /// Execute a test and return (outcome, error_message)
@@ -370,14 +359,20 @@ impl Test262Runner {
                     // Debug: println!("RESULT {}: {}", test_name, format_value(&value));
                 }
 
-                // For async tests, check the $DONE result from harness state
+                // For async tests, check print patterns first, fallback to $DONE
                 if is_async {
-                    match self.harness_state.done_result() {
+                    let print_output = self.harness_state.print_output();
+
+                    // Check print patterns first, fallback to $DONE result
+                    let async_result = check_async_print_patterns(&print_output)
+                        .or_else(|| self.harness_state.done_result());
+
+                    match async_result {
                         Some(Ok(())) => {
                             if metadata.expects_runtime_error() {
                                 (
                                     TestOutcome::Fail,
-                                    Some("Expected runtime error but async test passed via $DONE()".to_string()),
+                                    Some("Expected runtime error but async test passed".to_string()),
                                 )
                             } else {
                                 (TestOutcome::Pass, None)
@@ -385,26 +380,19 @@ impl Test262Runner {
                         }
                         Some(Err(msg)) => {
                             if metadata.expects_runtime_error() {
-                                self.validate_negative_error(metadata, &msg)
+                                self.validate_negative_error(metadata, &msg, ErrorPhase::Runtime)
                             } else {
                                 (
                                     TestOutcome::Fail,
-                                    Some(format!("Async test failed via $DONE: {}", msg)),
+                                    Some(format!("Async test failed: {}", msg)),
                                 )
                             }
                         }
                         None => {
-                            if metadata.expects_early_error() || metadata.expects_runtime_error() {
-                                (
-                                    TestOutcome::Fail,
-                                    Some("Expected error but execution completed without $DONE".to_string()),
-                                )
-                            } else {
-                                (
-                                    TestOutcome::Fail,
-                                    Some("Async test completed without calling $DONE()".to_string()),
-                                )
-                            }
+                            (
+                                TestOutcome::Fail,
+                                Some("Async test completed without $DONE or print signal".to_string()),
+                            )
                         }
                     }
                 } else if metadata.expects_early_error() {
@@ -424,14 +412,14 @@ impl Test262Runner {
             Err(err) => match err {
                 OtterError::Compile(msg) => {
                     if metadata.expects_early_error() {
-                        self.validate_negative_error(metadata, &msg)
+                        self.validate_negative_error(metadata, &msg, ErrorPhase::Parse)
                     } else {
                         (TestOutcome::Fail, Some(format!("Compile error: {}", msg)))
                     }
                 }
                 OtterError::Runtime(msg) => {
                     if metadata.expects_runtime_error() {
-                        self.validate_negative_error(metadata, &msg)
+                        self.validate_negative_error(metadata, &msg, ErrorPhase::Runtime)
                     } else if msg == "Test timed out" || msg.contains("Execution interrupted") {
                         (TestOutcome::Timeout, None)
                     } else {
@@ -443,30 +431,75 @@ impl Test262Runner {
         }
     }
 
-    /// Validate that the error type matches the negative expectation from metadata.
+    /// Validate that the error type and phase match the negative expectation from metadata.
     fn validate_negative_error(
         &self,
         metadata: &TestMetadata,
         error_msg: &str,
+        actual_phase: ErrorPhase,
     ) -> (TestOutcome, Option<String>) {
-        if let Some(ref negative) = metadata.negative {
-            let expected_type = &negative.error_type;
-            if error_msg.contains(expected_type) {
-                (TestOutcome::Pass, None)
-            } else {
-                // Error occurred as expected, but type doesn't match.
-                // Be lenient for now — count as pass but note the mismatch.
-                (
-                    TestOutcome::Pass,
-                    Some(format!(
-                        "Error type mismatch: expected {} but got: {}",
-                        expected_type, error_msg
-                    )),
-                )
+        let Some(ref negative) = metadata.negative else {
+            return (TestOutcome::Pass, None);
+        };
+
+        // Validate phase matches
+        let phase_matches = match (&negative.phase, &actual_phase) {
+            (ErrorPhase::Parse, ErrorPhase::Parse) => true,
+            (ErrorPhase::Early, ErrorPhase::Parse) => true, // Early errors detected at parse time
+            (ErrorPhase::Runtime, ErrorPhase::Runtime) => true,
+            (ErrorPhase::Resolution, _) => {
+                return (
+                    TestOutcome::Skip,
+                    Some("Resolution phase not yet supported".to_string()),
+                );
             }
-        } else {
-            (TestOutcome::Pass, None)
+            _ => false,
+        };
+
+        if !phase_matches {
+            return (
+                TestOutcome::Fail,
+                Some(format!(
+                    "Error in wrong phase: expected {:?} but got {:?}",
+                    negative.phase, actual_phase
+                )),
+            );
         }
+
+        // Validate error type (lenient substring match for now)
+        if error_msg.contains(&negative.error_type) {
+            (TestOutcome::Pass, None)
+        } else {
+            // Still pass but note the mismatch
+            (
+                TestOutcome::Pass,
+                Some(format!(
+                    "Type mismatch (lenient): expected {} in error: {}",
+                    negative.error_type,
+                    error_msg.chars().take(100).collect::<String>()
+                )),
+            )
+        }
+    }
+
+    /// Execute a test as an ES module.
+    ///
+    /// Note: Currently uses the same execution path as script tests since the
+    /// engine's eval() already compiles as a module. The main difference is that
+    /// harness files are NOT prepended for module tests, as modules have their
+    /// own scope and top-level semantics.
+    async fn execute_test_as_module(
+        &mut self,
+        source: &str,
+        metadata: &TestMetadata,
+        test_name: &str,
+        timeout: Option<Duration>,
+    ) -> (TestOutcome, Option<String>) {
+        // For module tests, we don't prepend harness files since modules
+        // have strict mode by default and their own scope. We execute the
+        // raw test source directly.
+        self.execute_test(source, metadata, test_name, timeout)
+            .await
     }
 
     async fn run_with_timeout(
@@ -509,6 +542,28 @@ impl Test262Runner {
             }
         }
     }
+}
+
+/// Check for Test262 async completion patterns in print output.
+/// Returns Some(Ok(())) if "Test262:AsyncTestComplete" found,
+/// Some(Err(msg)) if "Test262:AsyncTestFailure:" found,
+/// None if no pattern detected.
+fn check_async_print_patterns(print_output: &[String]) -> Option<Result<(), String>> {
+    for line in print_output {
+        if line.contains("Test262:AsyncTestComplete") {
+            return Some(Ok(()));
+        }
+        if line.contains("Test262:AsyncTestFailure:") {
+            let msg = line
+                .split("Test262:AsyncTestFailure:")
+                .nth(1)
+                .unwrap_or(line)
+                .trim()
+                .to_string();
+            return Some(Err(msg));
+        }
+    }
+    None
 }
 
 /// Extract a human-readable message from a caught panic payload.

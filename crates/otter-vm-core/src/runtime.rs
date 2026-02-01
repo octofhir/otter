@@ -74,6 +74,7 @@ impl VmRuntime {
         // as its [[Prototype]]. By creating it up-front, all native functions
         // can receive it at construction time (BOA/V8/SpiderMonkey pattern).
         let function_prototype = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        function_prototype.mark_as_intrinsic();
 
         // Stage 1: Allocate all intrinsic objects (empty, no properties yet)
         let intrinsics = Intrinsics::allocate(&memory_manager, function_prototype);
@@ -116,9 +117,11 @@ impl VmRuntime {
         // TODO: Proper cloning with prototype chain
         let global = GcRef::new(JsObject::new(None, self.memory_manager.clone()));
         globals::setup_global_object(global, self.function_prototype);
+
         // Install intrinsic constructors on the new global
         self.intrinsics
             .install_on_global(global, &self.memory_manager);
+
         let mut ctx = VmContext::with_config(
             global,
             self.config.max_stack_depth,

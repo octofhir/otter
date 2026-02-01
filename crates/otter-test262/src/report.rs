@@ -3,12 +3,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::metadata::ExecutionMode;
 use crate::runner::{TestOutcome, TestResult};
 
 /// Test run report
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestReport {
-    /// Total number of tests
+    /// Total number of test executions (counting each mode separately)
     pub total: usize,
     /// Number of passed tests
     pub passed: usize,
@@ -20,7 +21,7 @@ pub struct TestReport {
     pub timeout: usize,
     /// Number of crashed tests
     pub crashed: usize,
-    /// Pass rate as percentage
+    /// Pass rate as percentage (excluding skipped)
     pub pass_rate: f64,
     /// Results by feature
     pub by_feature: HashMap<String, FeatureReport>,
@@ -44,8 +45,10 @@ pub struct FeatureReport {
 /// Information about a failed test
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailureInfo {
-    /// Test path
+    /// Test path (including mode suffix)
     pub path: String,
+    /// Execution mode
+    pub mode: ExecutionMode,
     /// Error message
     pub error: String,
 }
@@ -72,6 +75,7 @@ impl TestReport {
                     report.failed += 1;
                     report.failures.push(FailureInfo {
                         path: result.path.clone(),
+                        mode: result.mode,
                         error: result.error.clone().unwrap_or_default(),
                     });
                 }
@@ -105,18 +109,31 @@ impl TestReport {
 
     /// Print a summary to stdout
     pub fn print_summary(&self) {
-        println!("\n=== Test262 Results ===");
+        use colored::*;
+
+        println!();
+        println!("{}", "=== Test262 Results ===".bold().cyan());
         println!("Total:   {}", self.total);
-        println!("Passed:  {} ({:.1}%)", self.passed, self.pass_rate);
-        println!("Failed:  {}", self.failed);
-        println!("Skipped: {}", self.skipped);
+        println!(
+            "Passed:  {} ({:.1}%)",
+            self.passed.to_string().green(),
+            self.pass_rate
+        );
+        println!("Failed:  {}", self.failed.to_string().red());
+        println!("Skipped: {}", self.skipped.to_string().yellow());
         println!("Timeout: {}", self.timeout);
         println!("Crashed: {}", self.crashed);
 
         if !self.failures.is_empty() {
-            println!("\n=== Failures (first 10) ===");
+            println!();
+            println!("{}", "=== Failures (first 10) ===".bold().red());
             for failure in self.failures.iter().take(10) {
-                println!("  {} - {}", failure.path, failure.error);
+                println!(
+                    "  {} ({}) - {}",
+                    failure.path.yellow(),
+                    failure.mode,
+                    failure.error
+                );
             }
             if self.failures.len() > 10 {
                 println!("  ... and {} more", self.failures.len() - 10);
@@ -130,32 +147,70 @@ impl TestReport {
     }
 }
 
+/// Persisted report for saving results to disk and comparing between runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedReport {
+    /// Timestamp of the run (ISO 8601)
+    pub timestamp: String,
+    /// Otter version
+    pub otter_version: String,
+    /// Test262 commit SHA (if known)
+    pub test262_commit: Option<String>,
+    /// Total duration of the run in seconds
+    pub duration_secs: f64,
+    /// Summary statistics
+    pub summary: TestReport,
+    /// Individual test results
+    pub results: Vec<TestResult>,
+}
+
+impl PersistedReport {
+    /// Save to a JSON file
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)
+            .map_err(std::io::Error::other)?;
+        std::fs::write(path, json)
+    }
+
+    /// Load from a JSON file
+    pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn test_report_generation() {
         let results = vec![
             TestResult {
                 path: "test1.js".to_string(),
+                mode: ExecutionMode::Strict,
                 outcome: TestOutcome::Pass,
-                duration: Duration::from_millis(10),
+                duration_ms: 10,
                 error: None,
                 features: vec!["arrow-function".to_string()],
             },
             TestResult {
                 path: "test2.js".to_string(),
+                mode: ExecutionMode::NonStrict,
                 outcome: TestOutcome::Fail,
-                duration: Duration::from_millis(10),
+                duration_ms: 10,
                 error: Some("Error".to_string()),
                 features: vec!["arrow-function".to_string()],
             },
             TestResult {
                 path: "test3.js".to_string(),
+                mode: ExecutionMode::NonStrict,
                 outcome: TestOutcome::Skip,
-                duration: Duration::from_millis(1),
+                duration_ms: 1,
                 error: None,
                 features: vec!["BigInt".to_string()],
             },

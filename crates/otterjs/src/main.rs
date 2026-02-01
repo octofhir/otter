@@ -277,8 +277,7 @@ async fn run_code(source: &str, _source_url: &str, cli: &Cli) -> Result<()> {
     // Create engine with builtins (EngineBuilder handles all setup)
     let mut engine = EngineBuilder::new()
         .capabilities(caps)
-        // TODO: Fix HTTP extension with Rust intrinsics
-        // .with_http() // Enable Otter.serve()
+        .with_http() // Enable Otter.serve()
         .build();
 
     // Set up timeout if specified (0 = no timeout)

@@ -144,7 +144,7 @@ impl Compiler {
         source_url: &str,
     ) -> CompileResult<otter_vm_bytecode::Module> {
         self.eval_mode = true;
-        self.compile_inner(source, source_url)
+        self.compile_inner(source, source_url, false)
     }
 
     /// Compile source code to a module
@@ -153,20 +153,36 @@ impl Compiler {
         source: &str,
         source_url: &str,
     ) -> CompileResult<otter_vm_bytecode::Module> {
-        self.compile_inner(source, source_url)
+        self.compile_inner(source, source_url, false)
+    }
+
+    /// Compile source code as an ES module.
+    ///
+    /// Module mode enables top-level await and implicit strict mode.
+    /// Top-level `this` should be `undefined` (handled by the runtime, not the compiler).
+    pub fn compile_as_module(
+        mut self,
+        source: &str,
+        source_url: &str,
+    ) -> CompileResult<otter_vm_bytecode::Module> {
+        self.compile_inner(source, source_url, true)
     }
 
     fn compile_inner(
         mut self,
         source: &str,
         source_url: &str,
+        force_module: bool,
     ) -> CompileResult<otter_vm_bytecode::Module> {
         // Parse with oxc
         let allocator = Allocator::default();
         let mut source_type = SourceType::from_path(source_url).unwrap_or_default();
 
-        // Force Script mode for .js files if not explicitly module, to allow Annex B (HTML comments)
-        if !source_type.is_module() {
+        if force_module {
+            // Module mode: allows top-level await, implicit strict mode
+            source_type = source_type.with_module(true);
+        } else if !source_type.is_module() {
+            // Force Script mode for .js files if not explicitly module, to allow Annex B (HTML comments)
             source_type = source_type.with_script(true);
         }
 
@@ -405,8 +421,28 @@ impl Compiler {
         use crate::scope::VariableKind;
         match pattern {
             BindingPattern::BindingIdentifier(ident) => {
-                self.codegen
-                    .declare_variable_with_kind(&ident.name, VariableKind::Var)?;
+                if self.codegen.current.name.as_deref() == Some("main") {
+                    // In the top-level "main" function (script mode), `var` declarations
+                    // must create bindings on the global object, not local variables.
+                    // Per ES2023 §16.1.7 GlobalDeclarationInstantiation: create the
+                    // global binding with `undefined` before any user code executes.
+                    // Later assignments (via `var x = expr;` or `this.x = expr`)
+                    // will overwrite this initial value.
+                    let undef_reg = self.codegen.alloc_reg();
+                    self.codegen
+                        .emit(Instruction::LoadUndefined { dst: undef_reg });
+                    let name_idx = self.codegen.add_string(&ident.name);
+                    let ic_index = self.codegen.alloc_ic();
+                    self.codegen.emit(Instruction::SetGlobal {
+                        name: name_idx,
+                        src: undef_reg,
+                        ic_index,
+                    });
+                    self.codegen.free_reg(undef_reg);
+                } else {
+                    self.codegen
+                        .declare_variable_with_kind(&ident.name, VariableKind::Var)?;
+                }
             }
             BindingPattern::ObjectPattern(obj) => {
                 for prop in &obj.properties {
@@ -1544,6 +1580,16 @@ impl Compiler {
         };
 
         for declarator in &decl.declarations {
+            // Per ES2023 §14.3.2: `var x;` (no initializer) in script top-level
+            // must NOT overwrite existing global values. The binding is created
+            // during GlobalDeclarationInstantiation, not at runtime.
+            if kind == VariableKind::Var
+                && declarator.init.is_none()
+                && self.codegen.current.name.as_deref() == Some("main")
+            {
+                continue;
+            }
+
             // Compile initializer first
             let init_reg = if let Some(init) = &declarator.init {
                 self.compile_expression(init)?
@@ -1572,21 +1618,27 @@ impl Compiler {
         match pattern {
             BindingPattern::BindingIdentifier(ident) => {
                 self.check_identifier_early_error(&ident.name)?;
-                let local_idx = self.codegen.declare_variable_with_kind(&ident.name, kind)?;
 
-                self.codegen.emit(Instruction::SetLocal {
-                    idx: LocalIndex(local_idx),
-                    src: value_reg,
-                });
-
-                // Top-level main hack for REPL/testing visibility
-                if self.codegen.current.name.as_deref() == Some("main") {
+                // Per ES2023 §15.1.11: in script top-level ("main"), `var`
+                // declarations are global bindings — reads and writes go
+                // through GetGlobal/SetGlobal, not local registers.
+                if kind == crate::scope::VariableKind::Var
+                    && self.codegen.current.name.as_deref() == Some("main")
+                {
                     let name_idx = self.codegen.add_string(&ident.name);
                     let ic_index = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::SetGlobal {
                         name: name_idx,
                         src: value_reg,
                         ic_index,
+                    });
+                } else {
+                    let local_idx =
+                        self.codegen.declare_variable_with_kind(&ident.name, kind)?;
+
+                    self.codegen.emit(Instruction::SetLocal {
+                        idx: LocalIndex(local_idx),
+                        src: value_reg,
                     });
                 }
             }
@@ -4126,7 +4178,9 @@ impl Compiler {
 
     /// Compile an identifier reference
     fn compile_identifier(&mut self, name: &str) -> CompileResult<Register> {
-        self.check_identifier_early_error(name)?;
+        // Note: do NOT call check_identifier_early_error here.
+        // Reading `eval` and `arguments` is legal in strict mode.
+        // The check only applies in binding/assignment contexts.
         let dst = self.codegen.alloc_reg();
 
         match self.codegen.resolve_variable(name) {
@@ -4810,6 +4864,26 @@ impl Compiler {
         // Check for computed member call (obj[key]())
         if let Expression::ComputedMemberExpression(member) = &call.callee {
             return self.compile_computed_method_call(call, member);
+        }
+
+        // Detect direct eval: eval(code)
+        // Per ECMAScript spec, a call where the callee is the identifier "eval"
+        // (not a member expression or aliased reference) is a "direct eval".
+        if let Expression::Identifier(ident) = &call.callee {
+            if ident.name == "eval" {
+                let code_reg = if let Some(arg) = call.arguments.first() {
+                    self.compile_expression(arg.to_expression())?
+                } else {
+                    let r = self.codegen.alloc_reg();
+                    self.codegen.emit(Instruction::LoadUndefined { dst: r });
+                    r
+                };
+                let dst = self.codegen.alloc_reg();
+                self.codegen
+                    .emit(Instruction::CallEval { dst, code: code_reg });
+                self.codegen.free_reg(code_reg);
+                return Ok(dst);
+            }
         }
 
         // Compile callee

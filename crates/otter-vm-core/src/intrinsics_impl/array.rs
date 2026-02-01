@@ -1,12 +1,18 @@
-//! Array.prototype methods implementation
+//! Array constructor statics and prototype methods (ES2026)
 //!
-//! All Array object methods for ES2026 standard.
+//! ## Constructor statics:
+//! - `Array.isArray()`, `Array.from()`, `Array.of()`
+//!
+//! ## Prototype methods:
+//! - push, pop, shift, unshift, indexOf, lastIndexOf, includes, join, toString,
+//!   slice, concat, reverse, at, fill, splice, flat, forEach, map, filter,
+//!   reduce, reduceRight, find, findIndex, every, some, sort, entries, keys, values, copyWithin
 
 use crate::gc::GcRef;
+use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
-use crate::memory::MemoryManager;
 use crate::intrinsics_impl::helpers::{same_value_zero, strict_equal};
 use std::sync::Arc;
 
@@ -619,4 +625,72 @@ pub fn init_array_prototype(
                 fn_proto,
             )),
         );
+}
+
+/// Install static methods on the Array constructor.
+pub fn install_array_statics(
+    ctor: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+) {
+    // Array.isArray(arg) — §23.1.2.2
+    ctor.define_property(
+        PropertyKey::string("isArray"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |_this, args, _mm| {
+                let is_arr = args
+                    .first()
+                    .and_then(|v| v.as_object())
+                    .map(|o| o.is_array())
+                    .unwrap_or(false);
+                Ok(Value::boolean(is_arr))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Array.from(arrayLike) — §23.1.2.1 (simplified)
+    ctor.define_property(
+        PropertyKey::string("from"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |_this, args, mm_inner| {
+                let source = args
+                    .first()
+                    .ok_or_else(|| "Array.from requires an argument".to_string())?;
+                if let Some(obj) = source.as_object() {
+                    if let Some(len_val) = obj.get(&PropertyKey::string("length")) {
+                        let len = len_val.as_number().unwrap_or(0.0) as usize;
+                        let result = GcRef::new(JsObject::array(len, mm_inner));
+                        for i in 0..len {
+                            let val = obj
+                                .get(&PropertyKey::Index(i as u32))
+                                .unwrap_or(Value::undefined());
+                            result.set(PropertyKey::Index(i as u32), val);
+                        }
+                        return Ok(Value::array(result));
+                    }
+                }
+                Ok(Value::array(GcRef::new(JsObject::array(0, mm_inner))))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Array.of(...items) — §23.1.2.3
+    ctor.define_property(
+        PropertyKey::string("of"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |_this, args, mm_inner| {
+                let result = GcRef::new(JsObject::array(args.len(), mm_inner));
+                for (i, arg) in args.iter().enumerate() {
+                    result.set(PropertyKey::Index(i as u32), arg.clone());
+                }
+                Ok(Value::array(result))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
 }

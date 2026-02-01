@@ -1,4 +1,4 @@
-use otter_engine::{Extension, GcRef, JsObject, PropertyKey, Value, VmContext, VmError};
+use otter_engine::{Extension, GcRef, JsObject, Op, OpHandler, PropertyKey, Value, VmContext, VmError};
 use std::sync::{Arc, Mutex};
 
 /// JS bootstrap executed by the extension to set up `print`, `$262`, etc.
@@ -12,10 +12,23 @@ var print = function() {
     }
 };
 
+// $DONE() - async test completion handler, routes to native __test262_done
+var $DONE = function(err) {
+    if (err) {
+        __test262_done(err);
+    } else {
+        __test262_done();
+    }
+};
+
 // $262 host object (test262 host-defined)
 var $262 = {
     global: this,
-    gc: function() { /* no-op */ },
+    gc: function() {
+        if (typeof __test262_gc === 'function') {
+            __test262_gc();
+        }
+    },
     evalScript: function(code) {
         if (typeof __otter_eval === 'function') {
             var result = __otter_eval(code);
@@ -38,6 +51,26 @@ var $262 = {
                 return $262.evalScript(code);
             }
         };
+    },
+    agent: {
+        start: function(script) {
+            // Stub: agent worker threads not yet supported
+            throw new Error('$262.agent.start not yet implemented');
+        },
+        broadcast: function(buffer) {
+            throw new Error('$262.agent.broadcast not yet implemented');
+        },
+        getReport: function() {
+            return null;
+        },
+        sleep: function(ms) {
+            // Busy-wait approximation (no real thread sleep in JS)
+            var end = Date.now() + ms;
+            while (Date.now() < end) {}
+        },
+        monotonicNow: function() {
+            return Date.now();
+        }
     }
 };
 "#;
@@ -60,12 +93,18 @@ struct TestHarnessInner {
     done_result: Option<Result<(), String>>,
 }
 
-impl TestHarnessState {
-    /// Create a new shared harness state.
-    pub fn new() -> Self {
+impl Default for TestHarnessState {
+    fn default() -> Self {
         Self {
             inner: Arc::new(Mutex::new(TestHarnessInner::default())),
         }
+    }
+}
+
+impl TestHarnessState {
+    /// Create a new shared harness state.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Clear state before running a new test.
@@ -111,21 +150,32 @@ pub fn create_harness_extension_with_state() -> (Extension, TestHarnessState) {
             }),
             otter_engine::op_native("__test262_done", move |args| {
                 let mut inner = done_state.lock().unwrap();
-                if let Some(err) = args.first() {
-                    if !err.is_undefined() && !err.is_null() {
+                if let Some(err) = args.first()
+                    && !err.is_undefined() && !err.is_null() {
                         let msg = format_value(err);
                         inner.done_result = Some(Err(msg));
                         // Don't return Err — that would abort the VM.
                         // Instead, store the failure for the runner to read.
                         return Ok(Value::undefined());
                     }
-                }
                 inner.done_result = Some(Ok(()));
                 Ok(Value::undefined())
             }),
-        ]);
-        // TEMPORARILY DISABLED for debugging
-        // .with_js(HARNESS_SETUP_JS);
+            // $262.gc() - triggers garbage collection via MemoryManager
+            Op {
+                name: "__test262_gc".into(),
+                handler: OpHandler::Native(Arc::new(|_args, memory_manager| {
+                    memory_manager.request_gc();
+                    Ok(Value::undefined())
+                })),
+            },
+            // $262.detachArrayBuffer() - detaches an ArrayBuffer (stub until full TypedArray support)
+            otter_engine::op_native("__test262_detach_array_buffer", |_args| {
+                // TODO: implement actual ArrayBuffer detachment once TypedArray support lands
+                Ok(Value::undefined())
+            }),
+        ])
+        .with_js(HARNESS_SETUP_JS);
 
     (ext, state)
 }
@@ -135,7 +185,11 @@ pub fn create_harness_extension() -> Extension {
     create_harness_extension_with_state().0
 }
 
-/// Set up the Test262 harness on a context
+/// Set up the Test262 harness on a context.
+///
+/// **Deprecated**: Use `create_harness_extension_with_state()` with the extension system instead.
+/// This legacy function does not capture async test results via `TestHarnessState`.
+#[deprecated(note = "Use create_harness_extension_with_state() with the extension system instead")]
 pub fn setup_harness(ctx: &mut VmContext) {
     let global = ctx.global();
     let mm = Arc::clone(global.memory_manager());
@@ -180,12 +234,11 @@ pub fn setup_harness(ctx: &mut VmContext) {
         PropertyKey::string("$DONE"),
         Value::native_function(
             |_this: &Value, args: &[Value], _mm| {
-                if let Some(err) = args.first() {
-                    if !err.is_undefined() && !err.is_null() {
+                if let Some(err) = args.first()
+                    && !err.is_undefined() && !err.is_null() {
                         // Test failed
                         return Err(VmError::type_error(format!("Test failed via $DONE: {:?}", err)));
                     }
-                }
                 // Test passed
                 Ok(Value::undefined())
             },
@@ -243,6 +296,7 @@ mod tests {
     use otter_engine::VmRuntime;
 
     #[test]
+    #[allow(deprecated)]
     fn test_harness_setup() {
         let runtime = VmRuntime::new();
         let mut ctx = runtime.create_context();

@@ -199,7 +199,14 @@ impl Otter {
         &self.event_loop
     }
 
-    /// Compile and execute JavaScript code
+    /// Compile and execute JavaScript code.
+    ///
+    /// Code is compiled as an ES module (allowing top-level await) and executed
+    /// directly in the global scope — no async IIFE wrapper. This preserves:
+    /// - `var` declarations creating global properties
+    /// - `function` declarations creating global properties
+    /// - Correct `this` binding (global object for scripts)
+    /// - Top-level `await` via the interpreter's suspension machinery
     pub async fn eval(&mut self, code: &str) -> Result<Value, OtterError> {
         // 0. Clear interrupt flag before starting (in case of re-use)
         self.clear_interrupt();
@@ -224,21 +231,6 @@ impl Otter {
         // 4. Register extension ops as global native functions
         self.register_ops_in_context(&mut ctx);
 
-        // Expose interrupt flag to JS for the wrapper to see
-        // We use a getter so it's always up to date
-        let flag = Arc::clone(&self.interrupt_flag);
-        let fn_proto = self.vm.function_prototype();
-        ctx.global().define_property(
-            PropertyKey::string("__otter_interrupted"),
-            otter_vm_core::object::PropertyDescriptor::getter(
-                Value::native_function_with_proto(
-                    move |_, _, _| Ok(Value::boolean(flag.load(Ordering::Relaxed))),
-                    self.vm.memory_manager().clone(),
-                    fn_proto,
-                ),
-            ),
-        );
-
         // 5. Execute setup JS from extensions (using pre-compiled modules if available)
         let compiled_modules = self.extensions.all_compiled_js();
         if !compiled_modules.is_empty() {
@@ -255,25 +247,21 @@ impl Otter {
             }
         }
 
-        // 6. Wrap code for top-level await support
-        // TEMPORARILY DISABLED for debugging
-        let wrapped = code.to_string();
-        // let wrapped = Self::wrap_for_top_level_await(code);
-
-        // 7. Set top-level `this` to the global object per ES2023 §19.2.1.
-        // Arrow functions in the wrapper inherit this lexical `this`.
+        // 6. Set top-level `this` to the global object per ES2023 §19.2.1.
         ctx.set_pending_this(Value::object(ctx.global().clone()));
 
-        // 9. Compile and execute main code with suspension support
+        // 7. Compile as module (allows top-level await) and execute directly.
+        //    No async IIFE wrapper — code runs at the top level so var/function
+        //    declarations correctly become global properties.
         let result_promise = JsPromise::new();
         let mut exec_result = self.execute_with_suspension(
             &mut ctx,
-            &wrapped,
+            code,
             "main.js",
             Arc::clone(&result_promise),
         )?;
 
-        // 10. Handle execution result with proper async resume loop
+        // 8. Handle execution result with async resume loop
         let final_value = loop {
             match exec_result {
                 VmExecutionResult::Complete(value) => {
@@ -341,40 +329,6 @@ impl Otter {
             return Err(OtterError::Runtime(
                 "Execution interrupted (timeout)".to_string(),
             ));
-        }
-
-        // 10. Check for script errors captured by the wrapper
-        let global = ctx.global();
-        if let Some(error) = global.get(&PropertyKey::string("__otter_script_error")) {
-            if !error.is_undefined() {
-                let msg = if let Some(obj) = error.as_object() {
-                    let name = obj
-                        .get(&PropertyKey::string("name"))
-                        .and_then(|v| v.as_string())
-                        .map(|s| s.as_str().to_string());
-
-                    let message = obj
-                        .get(&PropertyKey::string("message"))
-                        .and_then(|v| v.as_string())
-                        .map(|s| s.as_str().to_string());
-
-                    match (name, message) {
-                        (Some(n), Some(m)) => format!("{}: {}", n, m),
-                        (Some(n), None) => n,
-                        (None, Some(m)) => m,
-                        _ => format!("{:?}", error),
-                    }
-                } else if let Some(s) = error.as_string() {
-                    let s_str = s.as_str();
-                    if s_str == "Execution interrupted (timeout)" {
-                        return Err(OtterError::Runtime(s_str.to_string()));
-                    }
-                    s_str.to_string()
-                } else {
-                    format!("{:?}", error)
-                };
-                return Err(OtterError::Runtime(msg));
-            }
         }
 
         Ok(final_value)
@@ -474,7 +428,10 @@ impl Otter {
         }
     }
 
-    /// Execute JS code with suspension support
+    /// Execute JS code with suspension support.
+    ///
+    /// Compiles as an ES module to allow top-level await, then executes with
+    /// the interpreter's suspension machinery for async operations.
     fn execute_with_suspension(
         &self,
         ctx: &mut VmContext,
@@ -484,7 +441,7 @@ impl Otter {
     ) -> Result<VmExecutionResult, OtterError> {
         let compiler = Compiler::new();
         let module = compiler
-            .compile(code, source_url)
+            .compile_as_module(code, source_url)
             .map_err(|e| OtterError::Compile(e.to_string()))?;
 
         let module_arc = Arc::new(module);
@@ -544,44 +501,11 @@ impl Otter {
             self.execute_js(&mut ctx, js, "setup.js")?;
         }
 
+        // Set top-level `this` to the global object per ES2023 §19.2.1
+        ctx.set_pending_this(Value::object(ctx.global().clone()));
+
         // Compile and execute with eval semantics (return last expression value)
         self.execute_js_eval(&mut ctx, code, "eval.js")
-    }
-
-    /// Wrap code for top-level await support
-    fn wrap_for_top_level_await(code: &str) -> String {
-        let trimmed = code.trim_start();
-        let has_use_strict =
-            trimmed.starts_with("\"use strict\"") || trimmed.starts_with("'use strict'");
-        let (strict_prefix, code_body) = if has_use_strict {
-            let first_line_end = code.find('\n').unwrap_or(code.len());
-            let (prefix, rest) = code.split_at(first_line_end);
-            (format!("{};\n", prefix.trim()), rest)
-        } else {
-            ("".to_string(), code)
-        };
-
-        format!(
-            r#"{strict_prefix}
-            try {{
-                globalThis.__otter_main_promise = (async function() {{
-                    {code_body}
-                }}).call(this);
-                globalThis.__otter_main_promise.catch(function(err) {{
-                    if (globalThis.__otter_interrupted) {{
-                        globalThis.__otter_script_error = "Execution interrupted (timeout)";
-                    }} else {{
-                        globalThis.__otter_script_error = err;
-                    }}
-                }});
-            }} catch (err) {{
-                if (globalThis.__otter_interrupted) {{
-                    globalThis.__otter_script_error = "Execution interrupted (timeout)";
-                }} else {{
-                    globalThis.__otter_script_error = err;
-                }}
-            }}"#
-        )
     }
 
     /// Register extension ops as global native functions in context
@@ -898,6 +822,40 @@ impl Otter {
             .compile(code, source_url)
             .map_err(|e| OtterError::Compile(e.to_string()))?;
 
+        self.vm
+            .execute_module_with_context(&module, ctx)
+            .map_err(|e| OtterError::Runtime(e.to_string()))
+    }
+
+    /// Create a persistent execution context with all extensions registered.
+    /// The caller owns the context and can reuse it across multiple `eval_in_context` calls.
+    pub fn create_test_context(&self) -> Result<VmContext, OtterError> {
+        let mut ctx = self.vm.create_context();
+        ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
+        ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
+
+        // Register extension ops as global native functions
+        self.register_ops_in_context(&mut ctx);
+
+        // Execute setup JS from extensions
+        for js in self.extensions.all_js() {
+            self.execute_js(&mut ctx, js, "setup.js")?;
+        }
+
+        Ok(ctx)
+    }
+
+    /// Execute JS code in an existing context (no context creation/teardown).
+    pub fn eval_in_context(
+        &self,
+        ctx: &mut VmContext,
+        code: &str,
+    ) -> Result<Value, OtterError> {
+        self.clear_interrupt();
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile_eval(code, "eval.js")
+            .map_err(|e| OtterError::Compile(e.to_string()))?;
         self.vm
             .execute_module_with_context(&module, ctx)
             .map_err(|e| OtterError::Runtime(e.to_string()))

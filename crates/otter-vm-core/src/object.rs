@@ -382,6 +382,8 @@ pub struct ObjectFlags {
     pub frozen: bool,
     /// Is in dictionary mode (HashMap storage, IC-uncacheable)
     pub is_dictionary: bool,
+    /// Is an intrinsic/shared object (protected from teardown clearing)
+    pub is_intrinsic: bool,
 }
 
 impl JsObject {
@@ -542,6 +544,16 @@ impl JsObject {
         self.flags.read().is_dictionary
     }
 
+    /// Debug: get the number of keys in the shape
+    pub fn get_shape_key_count(&self) -> usize {
+        self.shape.read().own_keys().len()
+    }
+
+    /// Debug: get number of non-None inline property slots
+    pub fn get_inline_occupied_count(&self) -> usize {
+        self.inline_properties.read().iter().filter(|e| e.is_some()).count()
+    }
+
     /// Transition object to dictionary mode.
     /// This converts shape-based indexed storage to HashMap storage.
     /// Called when property count exceeds DICTIONARY_THRESHOLD or on delete operations.
@@ -669,7 +681,12 @@ impl JsObject {
 
     /// Extract all values held by this object and clear storage.
     /// Used for iterative destruction to prevent stack overflow.
+    /// Intrinsic objects (shared across contexts) are protected and return empty.
     pub fn clear_and_extract_values(&self) -> Vec<Value> {
+        // Intrinsic objects are shared across contexts and must not be cleared
+        if self.is_intrinsic() {
+            return Vec::new();
+        }
         let mut values = Vec::new();
 
         // Clear inline properties
@@ -1246,6 +1263,16 @@ impl JsObject {
     /// Check if object is extensible
     pub fn is_extensible(&self) -> bool {
         self.flags.read().extensible
+    }
+
+    /// Mark this object as intrinsic (shared across contexts, protected from teardown clearing)
+    pub fn mark_as_intrinsic(&self) {
+        self.flags.write().is_intrinsic = true;
+    }
+
+    /// Check if this object is an intrinsic
+    pub fn is_intrinsic(&self) -> bool {
+        self.flags.read().is_intrinsic
     }
 
     /// Get array length (for arrays)

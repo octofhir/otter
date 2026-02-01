@@ -299,7 +299,9 @@ impl AllocationRegistry {
         // Update total bytes
         self.total_bytes.fetch_sub(reclaimed, Ordering::Relaxed);
 
-        // Drop dead allocations outside the lock
+        // Drop the write lock before deallocation.
+        // This is safe because collect_lock serializes entire GC cycles,
+        // so no other thread can be marking headers while we deallocate.
         drop(allocations);
 
         for entry in dead_allocations {
@@ -335,12 +337,23 @@ pub struct RegistryStats {
     pub last_pause_time: Duration,
 }
 
-/// Global allocation registry for the GC
-static GLOBAL_REGISTRY: std::sync::OnceLock<AllocationRegistry> = std::sync::OnceLock::new();
+/// Thread-local allocation registry for the GC.
+///
+/// Each thread gets its own registry so that GC collections in one thread
+/// (with that thread's roots) don't sweep objects belonging to another thread.
+/// This prevents use-after-free when multiple VmContexts run in parallel
+/// (e.g. in test suites).
+///
+/// The registry is leaked (Box::leak) to produce a `&'static` reference that
+/// matches the existing API. Each thread leaks exactly one AllocationRegistry
+/// for the lifetime of the process — a bounded, negligible leak.
+thread_local! {
+    static THREAD_REGISTRY: &'static AllocationRegistry = Box::leak(Box::new(AllocationRegistry::new()));
+}
 
-/// Get the global allocation registry
+/// Get the thread-local allocation registry
 pub fn global_registry() -> &'static AllocationRegistry {
-    GLOBAL_REGISTRY.get_or_init(AllocationRegistry::new)
+    THREAD_REGISTRY.with(|r| *r)
 }
 
 /// Allocate a GC-managed value

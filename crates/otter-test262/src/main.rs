@@ -1,58 +1,97 @@
-use clap::Parser;
+use clap::{ArgAction, Parser, Subcommand};
 use colored::*;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tracing_subscriber::filter::EnvFilter;
 
-use otter_test262::{FeatureReport, Test262Runner, TestOutcome, TestReport, report::FailureInfo};
+use otter_test262::{
+    FeatureReport, PersistedReport, Test262Runner, TestOutcome, TestReport,
+    compare, config::Test262Config, editions, report::FailureInfo,
+};
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
 #[command(name = "test262")]
 #[command(about = "Run Test262 conformance tests against Otter VM")]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    // ---- Flags shared with `run` so bare `test262 --filter foo` still works ----
     /// Path to test262 directory
-    #[arg(short, long, default_value = "tests/test262")]
+    #[arg(short, long, default_value = "tests/test262", global = true)]
     test_dir: PathBuf,
 
     /// Filter tests by path pattern
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     filter: Option<String>,
 
     /// Run only tests in this subdirectory (e.g., "language/expressions")
-    #[arg(short = 'd', long)]
+    #[arg(short = 'd', long, global = true)]
     subdir: Option<String>,
 
     /// Output results as JSON
-    #[arg(long)]
+    #[arg(long, global = true)]
     json: bool,
 
-    /// Show verbose output
-    #[arg(short, long)]
-    verbose: bool,
+    /// Verbosity level: -v colored, -vv names, -vvv output
+    #[arg(short, long, action = ArgAction::Count, global = true)]
+    verbose: u8,
 
     /// Maximum number of tests to run
-    #[arg(short = 'n', long)]
+    #[arg(short = 'n', long, global = true)]
     max_tests: Option<usize>,
 
     /// Only list tests without running them
-    #[arg(long)]
+    #[arg(long, global = true)]
     list_only: bool,
 
     /// Show memory usage statistics
-    #[arg(long)]
+    #[arg(long, global = true)]
     memory_stats: bool,
 
     /// Timeout in seconds for each test
-    #[arg(long)]
+    #[arg(long, global = true)]
     timeout: Option<u64>,
 
+    /// Path to config file (default: test262_config.toml)
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
+    /// Save results to a JSON file
+    #[arg(long, global = true)]
+    save: Option<Option<PathBuf>>,
+
     /// Specific test files to run
-    #[arg(value_name = "FILES")]
+    #[arg(value_name = "FILES", global = true)]
     files: Vec<String>,
 }
 
-/// Memory statistics tracker
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Run test262 tests (default)
+    Run,
+    /// Compare two saved result files
+    Compare {
+        /// Base (older) result file
+        #[arg(long)]
+        base: PathBuf,
+        /// New (current) result file
+        #[arg(long, alias = "new")]
+        current: PathBuf,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Memory tracker
+// ---------------------------------------------------------------------------
+
 struct MemoryTracker {
     system: System,
     pid: Pid,
@@ -104,7 +143,6 @@ impl MemoryTracker {
         );
         self.system
             .process(self.pid)
-            // sysinfo reports memory in kibibytes (KiB)
             .map(|p| p.memory() as f64 / 1024.0)
             .unwrap_or(0.0)
     }
@@ -122,6 +160,10 @@ impl MemoryTracker {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Run summary (streaming accumulator)
+// ---------------------------------------------------------------------------
+
 struct RunSummary {
     total: usize,
     passed: usize,
@@ -130,7 +172,9 @@ struct RunSummary {
     timeout: usize,
     crashed: usize,
     by_feature: HashMap<String, FeatureReport>,
+    by_edition: HashMap<editions::EsEdition, editions::EditionReport>,
     failures: Vec<FailureInfo>,
+    all_results: Vec<otter_test262::TestResult>,
     max_failures: usize,
 }
 
@@ -144,12 +188,14 @@ impl RunSummary {
             timeout: 0,
             crashed: 0,
             by_feature: HashMap::new(),
+            by_edition: HashMap::new(),
             failures: Vec::new(),
+            all_results: Vec::new(),
             max_failures,
         }
     }
 
-    fn record(&mut self, result: &otter_test262::TestResult) {
+    fn record(&mut self, result: &otter_test262::TestResult, save_all: bool) {
         self.total += 1;
         match result.outcome {
             TestOutcome::Pass => self.passed += 1,
@@ -158,6 +204,7 @@ impl RunSummary {
                 if self.failures.len() < self.max_failures {
                     self.failures.push(FailureInfo {
                         path: result.path.clone(),
+                        mode: result.mode,
                         error: result.error.clone().unwrap_or_default(),
                     });
                 }
@@ -167,6 +214,7 @@ impl RunSummary {
             TestOutcome::Crash => self.crashed += 1,
         }
 
+        // Track by feature
         for feature in &result.features {
             let feature_report = self.by_feature.entry(feature.clone()).or_default();
             feature_report.total += 1;
@@ -176,10 +224,40 @@ impl RunSummary {
                 TestOutcome::Skip => feature_report.skipped += 1,
                 _ => {}
             }
+
+            // Track by edition
+            let edition = editions::feature_edition(feature);
+            let edition_report = self.by_edition.entry(edition).or_default();
+            edition_report.total += 1;
+            match result.outcome {
+                TestOutcome::Pass => edition_report.passed += 1,
+                TestOutcome::Fail => edition_report.failed += 1,
+                TestOutcome::Skip => edition_report.skipped += 1,
+                _ => {}
+            }
+        }
+
+        // For tests with no features, classify as ES5
+        if result.features.is_empty() {
+            let edition_report = self
+                .by_edition
+                .entry(editions::EsEdition::ES5)
+                .or_default();
+            edition_report.total += 1;
+            match result.outcome {
+                TestOutcome::Pass => edition_report.passed += 1,
+                TestOutcome::Fail => edition_report.failed += 1,
+                TestOutcome::Skip => edition_report.skipped += 1,
+                _ => {}
+            }
+        }
+
+        if save_all {
+            self.all_results.push(result.clone());
         }
     }
 
-    fn to_report(self) -> TestReport {
+    fn into_report(self) -> TestReport {
         let run_count = self.passed + self.failed + self.timeout + self.crashed;
         let pass_rate = if run_count > 0 {
             (self.passed as f64 / run_count as f64) * 100.0
@@ -201,9 +279,11 @@ impl RunSummary {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 fn main() {
-    // Spawn the async main on a thread with a large stack to avoid
-    // stack overflow in the VM interpreter/compiler on deeply nested tests.
     const STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MB
     let builder = std::thread::Builder::new()
         .name("test262-main".into())
@@ -225,33 +305,83 @@ async fn async_main() {
         .with_env_filter(EnvFilter::from_default_env().add_directive("warn".parse().unwrap()))
         .init();
 
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    if !args.json {
-        println!("{}", "Otter Test262 Runner".bold().cyan());
-        println!("Test directory: {}", args.test_dir.display());
+    match cli.command {
+        Some(Commands::Compare { base, current }) => {
+            run_compare(&base, &current);
+        }
+        Some(Commands::Run) | None => {
+            run_tests(cli).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compare command
+// ---------------------------------------------------------------------------
+
+fn run_compare(base: &std::path::Path, current: &std::path::Path) {
+    match compare::compare_files(base, current) {
+        Ok(comparison) => comparison.print(),
+        Err(e) => {
+            eprintln!("{}: {}", "Error".red().bold(), e);
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Run command
+// ---------------------------------------------------------------------------
+
+async fn run_tests(cli: Cli) {
+    let config = Test262Config::load_or_default(cli.config.as_deref());
+    let save_results = cli.save.is_some();
+    let save_path = cli
+        .save
+        .as_ref()
+        .and_then(|opt| opt.clone())
+        .or_else(|| {
+            if save_results {
+                Some(PathBuf::from("test262_results/latest.json"))
+            } else {
+                None
+            }
+        });
+
+    if !cli.json {
+        eprintln!("{}", "Otter Test262 Runner".bold().cyan());
+        eprintln!("Test directory: {}", cli.test_dir.display());
     }
 
     // Initialize memory tracking if requested
-    let mut memory_tracker = if args.memory_stats {
+    let mut memory_tracker = if cli.memory_stats {
         let tracker = MemoryTracker::new();
-        println!("Initial memory: {:.2} MB", tracker.initial_memory_mb());
+        eprintln!("Initial memory: {:.2} MB", tracker.initial_memory_mb());
         Some(tracker)
     } else {
         None
     };
 
-    // Create runner
-    let mut runner = Test262Runner::new(&args.test_dir);
+    // Create runner with config
+    let mut runner = Test262Runner::new(&cli.test_dir);
 
-    if let Some(ref filter) = args.filter {
+    // Apply skip features from config
+    if !config.skip_features.is_empty() {
+        runner = runner.with_skip_features(config.skip_features.clone());
+    }
+
+    if let Some(ref filter) = cli.filter {
         runner = runner.with_filter(filter.clone());
-        if !args.json { println!("Filter: {}", filter); }
+        if !cli.json {
+            eprintln!("Filter: {}", filter);
+        }
     }
 
     // List-only mode
-    if args.list_only {
-        let tests = if let Some(ref subdir) = args.subdir {
+    if cli.list_only {
+        let tests = if let Some(ref subdir) = cli.subdir {
             runner.list_tests_dir(subdir)
         } else {
             runner.list_tests()
@@ -264,122 +394,239 @@ async fn async_main() {
         return;
     }
 
-    // Run tests
-    if !args.json {
-        println!("\nRunning tests...");
-    }
-    use std::io::Write;
-    std::io::stdout().flush().unwrap();
-
-    let mut tests = if !args.files.is_empty() {
-        if !args.json { println!("Running {} specific test files", args.files.len()); }
-        args.files.iter().map(PathBuf::from).collect()
-    } else if let Some(ref subdir) = args.subdir {
-        if !args.json { println!("Subdirectory: {}", subdir); }
+    // Collect tests
+    let mut tests = if !cli.files.is_empty() {
+        if !cli.json {
+            eprintln!("Running {} specific test files", cli.files.len());
+        }
+        cli.files.iter().map(PathBuf::from).collect()
+    } else if let Some(ref subdir) = cli.subdir {
+        if !cli.json {
+            eprintln!("Subdirectory: {}", subdir);
+        }
         runner.list_tests_dir(subdir)
     } else {
         runner.list_tests()
     };
 
-    if let Some(max) = args.max_tests {
+    if let Some(max) = cli.max_tests {
         tests.truncate(max);
     }
 
-    let mut summary = RunSummary::new(if args.json { 5000 } else { 10 });
-
-    for path in tests {
-        if args.verbose && !args.json {
-            println!("RUNNING: {}", path.display());
-        }
-        let timeout = args.timeout.map(std::time::Duration::from_secs);
-        let result = runner.run_test(&path, timeout).await;
-
-        if !args.json {
-            match result.outcome {
-                TestOutcome::Fail | TestOutcome::Crash => {
-                    eprintln!(
-                        "\n{}: {} - {:?}",
-                        "FAIL".red().bold(),
-                        result.path,
-                        result.error
-                    );
-                }
-                _ => {}
-            }
-        }
-
-        summary.record(&result);
-
-        if !args.json && summary.total % 100 == 0 {
-            use std::io::Write;
-            print!(".");
-            std::io::stdout().flush().unwrap();
-        }
-
-        if let Some(ref mut tracker) = memory_tracker {
-            if summary.total % 100 == 0 {
-                tracker.update();
-            }
-        }
+    let test_count = tests.len();
+    if !cli.json {
+        eprintln!("Found {} test files", test_count);
     }
 
-    if !args.json { println!(); } // Newline after progress dots
+    // Set up progress bar (hidden in JSON mode or high verbosity)
+    let show_progress = !cli.json && cli.verbose < 2;
+    let pb = if show_progress {
+        let pb = ProgressBar::new(test_count as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}",
+                )
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        pb.set_message("starting...");
+        Some(pb)
+    } else {
+        None
+    };
+
+    let run_start = Instant::now();
+    let max_failures = if cli.json { 50000 } else { 200 };
+    let mut summary = RunSummary::new(max_failures);
+
+    let timeout = cli
+        .timeout
+        .or(config.timeout_secs)
+        .map(std::time::Duration::from_secs);
+
+    for path in tests {
+        // Check ignored/known-panic via config
+        let path_str = path.to_string_lossy();
+        if config.is_ignored(&path_str) {
+            continue;
+        }
+
+        let results = runner.run_test_all_modes(&path, timeout).await;
+
+        for result in &results {
+            // Verbosity output
+            if !cli.json {
+                match cli.verbose {
+                    0 => {} // progress bar handles it
+                    1 => {
+                        // Colored single-character indicators
+                        let ch = match result.outcome {
+                            TestOutcome::Pass => ".".green(),
+                            TestOutcome::Fail => "F".red(),
+                            TestOutcome::Skip => "S".yellow(),
+                            TestOutcome::Timeout => "T".magenta(),
+                            TestOutcome::Crash => "!".red().bold(),
+                        };
+                        eprint!("{}", ch);
+                        if summary.total % 80 == 79 {
+                            eprintln!();
+                        }
+                    }
+                    2 => {
+                        // Print test name and result
+                        let status = match result.outcome {
+                            TestOutcome::Pass => "PASS".green(),
+                            TestOutcome::Fail => "FAIL".red(),
+                            TestOutcome::Skip => "SKIP".yellow(),
+                            TestOutcome::Timeout => "TIME".magenta(),
+                            TestOutcome::Crash => "CRASH".red().bold(),
+                        };
+                        eprintln!(
+                            "[{}] {} ({}) {:?}",
+                            status,
+                            result.path,
+                            result.mode,
+                            result.duration()
+                        );
+                    }
+                    _ => {
+                        // vvv: Print test name, result, and captured output
+                        let status = match result.outcome {
+                            TestOutcome::Pass => "PASS".green(),
+                            TestOutcome::Fail => "FAIL".red(),
+                            TestOutcome::Skip => "SKIP".yellow(),
+                            TestOutcome::Timeout => "TIME".magenta(),
+                            TestOutcome::Crash => "CRASH".red().bold(),
+                        };
+                        eprintln!(
+                            "[{}] {} ({}) {:?}",
+                            status,
+                            result.path,
+                            result.mode,
+                            result.duration()
+                        );
+                        if let Some(ref err) = result.error {
+                            eprintln!("  Error: {}", err);
+                        }
+                        let output = runner.harness_state().print_output();
+                        if !output.is_empty() {
+                            eprintln!("  Output:");
+                            for line in &output {
+                                eprintln!("    {}", line);
+                            }
+                        }
+                    }
+                }
+            }
+
+            summary.record(result, save_results);
+        }
+
+        // Update progress bar
+        if let Some(ref pb) = pb {
+            pb.inc(1);
+            pb.set_message(format!(
+                "Pass: {} Fail: {} Skip: {}",
+                summary.passed, summary.failed, summary.skipped
+            ));
+        }
+
+        // Update memory tracker
+        if let Some(ref mut tracker) = memory_tracker
+            && summary.total.is_multiple_of(100) {
+                tracker.update();
+            }
+    }
+
+    // Finish progress
+    if let Some(ref pb) = pb {
+        pb.finish_and_clear();
+    }
+    if cli.verbose == 1 && !cli.json {
+        eprintln!();
+    }
+
+    let run_duration = run_start.elapsed();
 
     if let Some(ref mut tracker) = memory_tracker {
         tracker.update();
     }
 
-    let report = summary.to_report();
+    let by_edition = summary.by_edition.clone();
+    let all_results = if save_results {
+        summary.all_results.clone()
+    } else {
+        Vec::new()
+    };
+    let report = summary.into_report();
 
-    if args.json {
-        // Output JSON
+    if cli.json {
         match report.to_json() {
             Ok(json) => println!("{}", json),
             Err(e) => eprintln!("Failed to generate JSON: {}", e),
         }
     } else {
-        // Print summary
         report.print_summary();
 
+        // Print edition table
+        if !by_edition.is_empty() {
+            editions::print_edition_table(&by_edition);
+        }
+
         // Print detailed failures if verbose
-        if args.verbose && !report.failures.is_empty() {
-            println!("\n{}", "=== All Failures ===".bold().red());
+        if cli.verbose >= 1 && !report.failures.is_empty() {
+            println!();
+            println!("{}", "=== All Failures ===".bold().red());
             for failure in &report.failures {
-                println!("{}: {}", failure.path.yellow(), failure.error);
+                println!(
+                    "{} ({}) - {}",
+                    failure.path.yellow(),
+                    failure.mode,
+                    failure.error
+                );
             }
         }
     }
 
-    // Print memory statistics
+    // Memory statistics
     if let Some(ref mut tracker) = memory_tracker {
         println!();
-        println!("╭─────────────────────────────────────╮");
-        println!("│       Otter Profiling Report        │");
-        println!("├─────────────────────────────────────┤");
-        println!("│ Execution Statistics                │");
-        println!("│   Total Tests: {:>10}           │", report.total);
-        println!("│   Passed:      {:>10}           │", report.passed);
-        println!("│   Failed:      {:>10}           │", report.failed);
-        println!("│   Pass Rate:   {:>10.2}%          │", report.pass_rate);
-        println!("├─────────────────────────────────────┤");
-        println!("│ Memory Usage Metrics                │");
-        println!(
-            "│   Initial:     {:>10.2} MB       │",
-            tracker.initial_memory_mb()
-        );
-        println!(
-            "│   Peak:        {:>10.2} MB       │",
-            tracker.peak_memory_mb()
-        );
-        println!(
-            "│   Current:     {:>10.2} MB       │",
-            tracker.current_memory_mb()
-        );
-        println!(
-            "│   Increase:    {:>10.2} MB       │",
-            tracker.memory_increase_mb()
-        );
-        println!("╰─────────────────────────────────────╯");
+        println!("{}", "=== Memory Profile ===".bold().cyan());
+        println!("Initial:  {:.2} MB", tracker.initial_memory_mb());
+        println!("Peak:     {:.2} MB", tracker.peak_memory_mb());
+        println!("Current:  {:.2} MB", tracker.current_memory_mb());
+        println!("Increase: {:.2} MB", tracker.memory_increase_mb());
+    }
+
+    // Save results if requested
+    if let Some(save_path) = save_path {
+        let persisted = PersistedReport {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            otter_version: env!("CARGO_PKG_VERSION").to_string(),
+            test262_commit: None,
+            duration_secs: run_duration.as_secs_f64(),
+            summary: report.clone(),
+            results: all_results,
+        };
+
+        match persisted.save(&save_path) {
+            Ok(()) => {
+                if !cli.json {
+                    eprintln!("Results saved to {}", save_path.display());
+                }
+            }
+            Err(e) => eprintln!("Failed to save results: {}", e),
+        }
+
+        // Also save a timestamped copy
+        if let Some(parent) = save_path.parent() {
+            let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+            let timestamped = parent.join(format!("run_{}.json", ts));
+            if let Err(e) = persisted.save(&timestamped) {
+                eprintln!("Failed to save timestamped results: {}", e);
+            }
+        }
     }
 
     // Exit with error code if there were failures

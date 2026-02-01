@@ -7,10 +7,14 @@
 
 #![warn(clippy::all)]
 
+pub mod compare;
+pub mod config;
+pub mod editions;
 pub mod harness;
 pub mod metadata;
 pub mod report;
 pub mod runner;
 
-pub use report::{FeatureReport, TestReport};
+pub use metadata::ExecutionMode;
+pub use report::{FailureInfo, FeatureReport, PersistedReport, TestReport};
 pub use runner::{Test262Runner, TestOutcome, TestResult};

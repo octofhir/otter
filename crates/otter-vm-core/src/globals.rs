@@ -12,7 +12,6 @@ use crate::array_buffer::JsArrayBuffer;
 use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
-use crate::regexp::JsRegExp;
 use crate::string::JsString;
 use crate::value::Value;
 
@@ -151,26 +150,6 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                 mm.clone(),
                 fn_proto,
             )
-        } else if name == "RegExp" {
-            let mm_clone = mm.clone();
-            Value::native_function_with_proto(
-                move |_this, args: &[Value], mm_inner| {
-                    let pattern = args
-                        .get(0)
-                        .map(|v| to_string(v))
-                        .unwrap_or_else(|| "".to_string());
-                    let flags = args
-                        .get(1)
-                        .map(|v| to_string(v))
-                        .unwrap_or_else(|| "".to_string());
-
-                    // Construct RegExp object
-                    let regex = Arc::new(JsRegExp::new(pattern, flags, Some(proto), mm_inner));
-                    Ok(Value::regex(regex))
-                },
-                mm_clone,
-                fn_proto,
-            )
         } else if name == "BigInt" {
             Value::native_function_with_proto(
                 |_this, args: &[Value], _mm| {
@@ -296,18 +275,32 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                         |_this, args: &[Value], _mm| {
                             let mut result = String::new();
                             for arg in args {
+                                // Per ES2023 §22.1.2.1: ToUint16(ToNumber(arg))
                                 let n = if let Some(n) = arg.as_number() {
                                     n
+                                } else if let Some(i) = arg.as_int32() {
+                                    i as f64
                                 } else if let Some(s) = arg.as_string() {
-                                    s.as_str().parse::<f64>().unwrap_or(f64::NAN)
-                                } else {
-                                    0.0
-                                };
-
-                                if !n.is_nan() {
-                                    if let Some(c) = std::char::from_u32(n as u32) {
-                                        result.push(c);
+                                    let trimmed = s.as_str().trim();
+                                    if trimmed.is_empty() {
+                                        0.0
+                                    } else {
+                                        trimmed.parse::<f64>().unwrap_or(f64::NAN)
                                     }
+                                } else if let Some(b) = arg.as_boolean() {
+                                    if b { 1.0 } else { 0.0 }
+                                } else if arg.is_null() {
+                                    0.0
+                                } else {
+                                    f64::NAN
+                                };
+                                let code = if n.is_nan() || n.is_infinite() {
+                                    0u16
+                                } else {
+                                    (n.trunc() as i64 as u32 & 0xFFFF) as u16
+                                };
+                                if let Some(c) = std::char::from_u32(code as u32) {
+                                    result.push(c);
                                 }
                             }
                             Ok(Value::string(JsString::intern(&result)))
@@ -358,72 +351,6 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                 Value::native_function_with_proto(
                     |this_val, _args, _mm| {
                         Ok::<Value, VmError>(this_val.clone())
-                    },
-                    mm.clone(),
-                    fn_proto,
-                ),
-            );
-        } else if name == "RegExp" {
-            proto.set(
-                PropertyKey::string("test"),
-                Value::native_function_with_proto(
-                    |this_val, args, _mm| {
-                        let regex = this_val.as_regex().ok_or_else(|| {
-                            "TypeError: RegExp.prototype.test called on incompatible receiver"
-                                .to_string()
-                        })?;
-                        let input_js = args
-                            .get(0)
-                            .map(to_js_string)
-                            .unwrap_or_else(|| JsString::intern("undefined"));
-                        Ok(Value::boolean(regex.exec(&input_js, 0).is_some()))
-                    },
-                    mm.clone(),
-                    fn_proto,
-                ),
-            );
-            proto.set(
-                PropertyKey::string("exec"),
-                Value::native_function_with_proto(
-                    |this_val, args, mm_inner| {
-                        let regex = this_val.as_regex().ok_or_else(|| {
-                            "TypeError: RegExp.prototype.exec called on incompatible receiver"
-                                .to_string()
-                        })?;
-
-                        let input_js = args
-                            .get(0)
-                            .map(to_js_string)
-                            .unwrap_or_else(|| JsString::intern("undefined"));
-
-                        if let Some(mat) = regex.exec(&input_js, 0) {
-                            let mut out = Vec::with_capacity(mat.captures.len() + 1);
-                            for idx in 0..=mat.captures.len() {
-                                let val = mat
-                                    .group(idx)
-                                    .map(|range| {
-                                        let slice = &input_js.as_utf16()[range.start..range.end];
-                                        Value::string(JsString::intern_utf16(slice))
-                                    })
-                                    .unwrap_or(Value::undefined());
-                                out.push(val);
-                            }
-
-                            let arr = JsObject::array(out.len(), mm_inner);
-                            for (i, val) in out.into_iter().enumerate() {
-                                arr.set(PropertyKey::Index(i as u32), val);
-                            }
-                            arr.set(
-                                PropertyKey::string("index"),
-                                Value::number(mat.start() as f64),
-                            );
-                            arr.set(PropertyKey::string("input"), Value::string(input_js));
-                            arr.set(PropertyKey::string("groups"), Value::undefined());
-
-                            Ok(Value::array(GcRef::new(arr)))
-                        } else {
-                            Ok(Value::null())
-                        }
                     },
                     mm.clone(),
                     fn_proto,
@@ -510,17 +437,19 @@ fn get_arg(args: &[Value], index: usize) -> Value {
 
 /// `eval(x)` - Evaluates JavaScript code represented as a string.
 ///
-/// Note: Direct eval is not supported in this VM for security reasons.
-/// Indirect eval throws an error.
+/// For indirect eval (`var e = eval; e("...")` or `(0, eval)("...")`),
+/// this native function is called. It signals the interpreter via
+/// `InterceptionSignal::EvalCall` so the VM can compile and execute
+/// the code with full context access.
 fn global_eval(_this: &Value, args: &[Value], _mm: Arc<crate::memory::MemoryManager>) -> Result<Value, VmError> {
     // Per spec: if argument is not a string, return it unchanged
     let arg = get_arg(args, 0);
 
     if arg.is_string() {
-        // eval() of a string is not supported in this VM
-        Err(VmError::type_error("eval() is not supported"))
+        // Signal the interpreter to handle eval with full VM context
+        Err(VmError::interception(crate::error::InterceptionSignal::EvalCall))
     } else {
-        // Non-string argument: return it unchanged
+        // Non-string argument: return it unchanged (per spec §19.2.1.1)
         Ok(arg)
     }
 }
@@ -795,7 +724,7 @@ fn decode_uri_impl(encoded: &str, preserve_reserved: bool) -> Result<Value, VmEr
 // =============================================================================
 
 /// Convert a Value to a number (ToNumber abstract operation)
-fn to_number(value: &Value) -> f64 {
+pub fn to_number(value: &Value) -> f64 {
     if let Some(n) = value.as_number() {
         return n;
     }
@@ -840,7 +769,7 @@ fn to_boolean(value: &Value) -> bool {
     true // Objects are true
 }
 
-fn to_string(value: &Value) -> String {
+pub fn to_string(value: &Value) -> String {
     if let Some(s) = value.as_string() {
         return s.as_str().to_string();
     }

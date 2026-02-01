@@ -1,0 +1,1405 @@
+//! Map, Set, WeakMap, and WeakSet constructor and prototype implementations
+//!
+//! Complete ES2026 implementation:
+//! - Map: constructor + 10 prototype methods + Symbol.toStringTag
+//! - Set: constructor + 10 prototype methods + 7 ES2025 set methods + Symbol.toStringTag
+//! - WeakMap: constructor + 4 prototype methods + Symbol.toStringTag
+//! - WeakSet: constructor + 3 prototype methods + Symbol.toStringTag
+//!
+//! All methods use inline implementations for optimal performance.
+//! Internal storage uses the same pattern as `otter-vm-builtins/src/map.rs` and `set.rs`.
+
+use crate::gc::GcRef;
+use crate::memory::MemoryManager;
+use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
+use crate::string::JsString;
+use crate::value::Value;
+use std::sync::Arc;
+
+// ============================================================================
+// Internal storage keys (must match otter-vm-builtins/src/map.rs and set.rs)
+// ============================================================================
+const MAP_ENTRIES_KEY: &str = "__map_entries__";
+const MAP_SIZE_KEY: &str = "__map_size__";
+const IS_MAP_KEY: &str = "__is_map__";
+const IS_WEAKMAP_KEY: &str = "__is_weakmap__";
+
+const SET_VALUES_KEY: &str = "__set_values__";
+const SET_SIZE_KEY: &str = "__set_size__";
+const IS_SET_KEY: &str = "__is_set__";
+const IS_WEAKSET_KEY: &str = "__is_weakset__";
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Compute a hash key string for a value (for string-keyed internal storage).
+/// Must match `otter-vm-builtins/src/map.rs::value_to_key`.
+fn value_to_key(value: &Value) -> String {
+    if value.is_undefined() {
+        return "__undefined__".to_string();
+    }
+    if value.is_null() {
+        return "__null__".to_string();
+    }
+    if let Some(b) = value.as_boolean() {
+        return format!("__bool_{}__", b);
+    }
+    if let Some(n) = value.as_number() {
+        if n.is_nan() {
+            return "__nan__".to_string();
+        }
+        return format!("__num_{}__", n);
+    }
+    if let Some(s) = value.as_string() {
+        return format!("__str_{}__", s.as_str());
+    }
+    if let Some(sym) = value.as_symbol() {
+        return format!("__sym_{}__", sym.id);
+    }
+    if let Some(obj) = value.as_object() {
+        return format!("__obj_{:p}__", obj.as_ptr());
+    }
+    if let Some(func) = value.as_function() {
+        return format!("__func_{:p}__", Arc::as_ptr(func));
+    }
+    format!("__unknown_{:?}__", value)
+}
+
+/// Convert string to PropertyKey (intern for fast lookups).
+fn pk(s: &str) -> PropertyKey {
+    PropertyKey::String(JsString::intern(s))
+}
+
+/// Verify an object is a Map (has `__is_map__` = true).
+fn is_map(obj: &GcRef<JsObject>) -> bool {
+    obj.get(&pk(IS_MAP_KEY))
+        .and_then(|v| v.as_boolean())
+        == Some(true)
+}
+
+/// Verify an object is a Set (has `__is_set__` = true).
+fn is_set(obj: &GcRef<JsObject>) -> bool {
+    obj.get(&pk(IS_SET_KEY))
+        .and_then(|v| v.as_boolean())
+        == Some(true)
+}
+
+/// Verify an object is a WeakMap.
+fn is_weakmap(obj: &GcRef<JsObject>) -> bool {
+    obj.get(&pk(IS_WEAKMAP_KEY))
+        .and_then(|v| v.as_boolean())
+        == Some(true)
+}
+
+/// Verify an object is a WeakSet.
+fn is_weakset(obj: &GcRef<JsObject>) -> bool {
+    obj.get(&pk(IS_WEAKSET_KEY))
+        .and_then(|v| v.as_boolean())
+        == Some(true)
+}
+
+/// Get the entries object from a Map/WeakMap.
+fn get_entries(obj: &GcRef<JsObject>) -> Option<GcRef<JsObject>> {
+    obj.get(&pk(MAP_ENTRIES_KEY))
+        .and_then(|v| v.as_object())
+}
+
+/// Get the values object from a Set/WeakSet.
+fn get_set_values_obj(obj: &GcRef<JsObject>) -> Option<GcRef<JsObject>> {
+    obj.get(&pk(SET_VALUES_KEY))
+        .and_then(|v| v.as_object())
+}
+
+/// Get current size from a Map or Set.
+fn get_size(obj: &GcRef<JsObject>, key: &str) -> i32 {
+    obj.get(&pk(key))
+        .and_then(|v| v.as_int32())
+        .unwrap_or(0)
+}
+
+/// Check if a value is valid as a WeakMap/WeakSet key.
+fn is_valid_weak_key(value: &Value) -> bool {
+    value.is_object() || value.is_symbol() || value.is_function()
+}
+
+/// Initialize Map internal slots on an object.
+fn init_map_slots(obj: &GcRef<JsObject>, mm: &Arc<MemoryManager>) {
+    let entries = GcRef::new(JsObject::new(None, mm.clone()));
+    obj.set(pk(MAP_ENTRIES_KEY), Value::object(entries));
+    obj.set(pk(MAP_SIZE_KEY), Value::int32(0));
+    obj.set(pk(IS_MAP_KEY), Value::boolean(true));
+}
+
+/// Initialize Set internal slots on an object.
+fn init_set_slots(obj: &GcRef<JsObject>, mm: &Arc<MemoryManager>) {
+    let values = GcRef::new(JsObject::new(None, mm.clone()));
+    obj.set(pk(SET_VALUES_KEY), Value::object(values));
+    obj.set(pk(SET_SIZE_KEY), Value::int32(0));
+    obj.set(pk(IS_SET_KEY), Value::boolean(true));
+}
+
+// ============================================================================
+// Map.prototype
+// ============================================================================
+
+/// Initialize Map.prototype with all ES2026 methods.
+///
+/// # Methods
+/// - get, set, has, delete, clear
+/// - size (getter-like), keys, values, entries, forEach
+/// - Symbol.toStringTag = "Map"
+pub fn init_map_prototype(
+    map_proto: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+) {
+    // Map.prototype.get(key)
+    map_proto.define_property(
+        PropertyKey::string("get"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.get called on incompatible receiver"))?;
+                if !is_map(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Map.prototype.get called on incompatible receiver"));
+                }
+                let key = args.first().cloned().unwrap_or(Value::undefined());
+                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
+                let hash_key = value_to_key(&key);
+                if let Some(entry) = entries.get(&pk(&hash_key)) {
+                    if let Some(entry_obj) = entry.as_object() {
+                        return Ok(entry_obj.get(&pk("v")).unwrap_or(Value::undefined()));
+                    }
+                }
+                Ok(Value::undefined())
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Map.prototype.set(key, value)
+    map_proto.define_property(
+        PropertyKey::string("set"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.set called on incompatible receiver"))?;
+                if !is_map(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Map.prototype.set called on incompatible receiver"));
+                }
+                let key = args.first().cloned().unwrap_or(Value::undefined());
+                let value = args.get(1).cloned().unwrap_or(Value::undefined());
+                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
+                let hash_key = value_to_key(&key);
+                let is_new = entries.get(&pk(&hash_key)).is_none();
+
+                // Create entry object with k/v
+                let entry = GcRef::new(JsObject::new(None, mm));
+                entry.set(pk("k"), key);
+                entry.set(pk("v"), value);
+                entries.set(pk(&hash_key), Value::object(entry));
+
+                if is_new {
+                    let size = get_size(&obj, MAP_SIZE_KEY);
+                    obj.set(pk(MAP_SIZE_KEY), Value::int32(size + 1));
+                }
+                Ok(this_val.clone())
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Map.prototype.has(key)
+    map_proto.define_property(
+        PropertyKey::string("has"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.has called on incompatible receiver"))?;
+                if !is_map(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Map.prototype.has called on incompatible receiver"));
+                }
+                let key = args.first().cloned().unwrap_or(Value::undefined());
+                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
+                let hash_key = value_to_key(&key);
+                Ok(Value::boolean(entries.get(&pk(&hash_key)).is_some()))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Map.prototype.delete(key)
+    map_proto.define_property(
+        PropertyKey::string("delete"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.delete called on incompatible receiver"))?;
+                if !is_map(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Map.prototype.delete called on incompatible receiver"));
+                }
+                let key = args.first().cloned().unwrap_or(Value::undefined());
+                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
+                let hash_key = value_to_key(&key);
+                if entries.get(&pk(&hash_key)).is_none() {
+                    return Ok(Value::boolean(false));
+                }
+                entries.delete(&pk(&hash_key));
+                let size = get_size(&obj, MAP_SIZE_KEY);
+                if size > 0 {
+                    obj.set(pk(MAP_SIZE_KEY), Value::int32(size - 1));
+                }
+                Ok(Value::boolean(true))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Map.prototype.clear()
+    map_proto.define_property(
+        PropertyKey::string("clear"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.clear called on incompatible receiver"))?;
+                if !is_map(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Map.prototype.clear called on incompatible receiver"));
+                }
+                let new_entries = GcRef::new(JsObject::new(None, mm));
+                obj.set(pk(MAP_ENTRIES_KEY), Value::object(new_entries));
+                obj.set(pk(MAP_SIZE_KEY), Value::int32(0));
+                Ok(Value::undefined())
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Map.prototype.size (accessor getter per spec §24.1.3.10)
+    map_proto.define_property(
+        PropertyKey::string("size"),
+        PropertyDescriptor::Accessor {
+            get: Some(Value::native_function_with_proto(
+                |this_val, _args, _mm| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| crate::error::VmError::type_error("get Map.prototype.size called on incompatible receiver"))?;
+                    if !is_map(&obj) {
+                        return Err(crate::error::VmError::type_error("get Map.prototype.size called on incompatible receiver"));
+                    }
+                    Ok(Value::int32(get_size(&obj, MAP_SIZE_KEY)))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+            set: None,
+            attributes: PropertyAttributes {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        },
+    );
+
+    // Map.prototype.keys()
+    map_proto.define_property(
+        PropertyKey::string("keys"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.keys called on incompatible receiver"))?;
+                if !is_map(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Map.prototype.keys called on incompatible receiver"));
+                }
+                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
+                let keys_array = GcRef::new(JsObject::array(0, mm));
+                let props = entries.own_keys();
+                let mut index = 0i32;
+                for prop in props {
+                    if let Some(entry) = entries.get(&prop) {
+                        if let Some(entry_obj) = entry.as_object() {
+                            let key = entry_obj.get(&pk("k")).unwrap_or(Value::undefined());
+                            keys_array.set(pk(&index.to_string()), key);
+                            index += 1;
+                        }
+                    }
+                }
+                keys_array.set(pk("length"), Value::int32(index));
+                Ok(Value::array(keys_array))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Map.prototype.values()
+    map_proto.define_property(
+        PropertyKey::string("values"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.values called on incompatible receiver"))?;
+                if !is_map(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Map.prototype.values called on incompatible receiver"));
+                }
+                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
+                let values_array = GcRef::new(JsObject::array(0, mm));
+                let props = entries.own_keys();
+                let mut index = 0i32;
+                for prop in props {
+                    if let Some(entry) = entries.get(&prop) {
+                        if let Some(entry_obj) = entry.as_object() {
+                            let value = entry_obj.get(&pk("v")).unwrap_or(Value::undefined());
+                            values_array.set(pk(&index.to_string()), value);
+                            index += 1;
+                        }
+                    }
+                }
+                values_array.set(pk("length"), Value::int32(index));
+                Ok(Value::array(values_array))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Map.prototype.entries()
+    map_proto.define_property(
+        PropertyKey::string("entries"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.entries called on incompatible receiver"))?;
+                if !is_map(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Map.prototype.entries called on incompatible receiver"));
+                }
+                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
+                let entries_array = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
+                let props = entries.own_keys();
+                let mut index = 0i32;
+                for prop in props {
+                    if let Some(entry) = entries.get(&prop) {
+                        if let Some(entry_obj) = entry.as_object() {
+                            let key = entry_obj.get(&pk("k")).unwrap_or(Value::undefined());
+                            let value = entry_obj.get(&pk("v")).unwrap_or(Value::undefined());
+                            let pair = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
+                            pair.set(pk("0"), key);
+                            pair.set(pk("1"), value);
+                            pair.set(pk("length"), Value::int32(2));
+                            entries_array.set(pk(&index.to_string()), Value::array(pair));
+                            index += 1;
+                        }
+                    }
+                }
+                entries_array.set(pk("length"), Value::int32(index));
+                Ok(Value::array(entries_array))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Map.prototype.forEach(callback) — returns entries for JS-side iteration
+    map_proto.define_property(
+        PropertyKey::string("forEach"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.forEach called on incompatible receiver"))?;
+                if !is_map(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Map.prototype.forEach called on incompatible receiver"));
+                }
+                // Return entries array for JS-side iteration (same pattern as builtins)
+                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
+                let entries_array = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
+                let props = entries.own_keys();
+                let mut index = 0i32;
+                for prop in props {
+                    if let Some(entry) = entries.get(&prop) {
+                        if let Some(entry_obj) = entry.as_object() {
+                            let key = entry_obj.get(&pk("k")).unwrap_or(Value::undefined());
+                            let value = entry_obj.get(&pk("v")).unwrap_or(Value::undefined());
+                            let pair = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
+                            pair.set(pk("0"), key);
+                            pair.set(pk("1"), value);
+                            pair.set(pk("length"), Value::int32(2));
+                            entries_array.set(pk(&index.to_string()), Value::array(pair));
+                            index += 1;
+                        }
+                    }
+                }
+                entries_array.set(pk("length"), Value::int32(index));
+                Ok(Value::array(entries_array))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Map.prototype[Symbol.toStringTag] = "Map"
+    map_proto.define_property(
+        PropertyKey::Symbol(crate::intrinsics::well_known::TO_STRING_TAG),
+        PropertyDescriptor::data_with_attrs(
+            Value::string(JsString::intern("Map")),
+            PropertyAttributes {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        ),
+    );
+}
+
+// ============================================================================
+// Set.prototype
+// ============================================================================
+
+/// Initialize Set.prototype with all ES2026 + ES2025 methods.
+///
+/// # Methods
+/// - add, has, delete, clear
+/// - size (getter-like), values, keys (= values), entries, forEach
+/// - ES2025: union, intersection, difference, symmetricDifference,
+///   isSubsetOf, isSupersetOf, isDisjointFrom
+/// - Symbol.toStringTag = "Set"
+pub fn init_set_prototype(
+    set_proto: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+) {
+    // Set.prototype.add(value)
+    set_proto.define_property(
+        PropertyKey::string("add"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.add called on incompatible receiver"))?;
+                if !is_set(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Set.prototype.add called on incompatible receiver"));
+                }
+                let value = args.first().cloned().unwrap_or(Value::undefined());
+                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
+                let hash_key = value_to_key(&value);
+                let is_new = values.get(&pk(&hash_key)).is_none();
+                values.set(pk(&hash_key), value);
+                if is_new {
+                    let size = get_size(&obj, SET_SIZE_KEY);
+                    obj.set(pk(SET_SIZE_KEY), Value::int32(size + 1));
+                }
+                Ok(this_val.clone())
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Set.prototype.has(value)
+    set_proto.define_property(
+        PropertyKey::string("has"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.has called on incompatible receiver"))?;
+                if !is_set(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Set.prototype.has called on incompatible receiver"));
+                }
+                let value = args.first().cloned().unwrap_or(Value::undefined());
+                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
+                let hash_key = value_to_key(&value);
+                Ok(Value::boolean(values.get(&pk(&hash_key)).is_some()))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Set.prototype.delete(value)
+    set_proto.define_property(
+        PropertyKey::string("delete"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.delete called on incompatible receiver"))?;
+                if !is_set(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Set.prototype.delete called on incompatible receiver"));
+                }
+                let value = args.first().cloned().unwrap_or(Value::undefined());
+                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
+                let hash_key = value_to_key(&value);
+                if values.get(&pk(&hash_key)).is_none() {
+                    return Ok(Value::boolean(false));
+                }
+                values.delete(&pk(&hash_key));
+                let size = get_size(&obj, SET_SIZE_KEY);
+                if size > 0 {
+                    obj.set(pk(SET_SIZE_KEY), Value::int32(size - 1));
+                }
+                Ok(Value::boolean(true))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Set.prototype.clear()
+    set_proto.define_property(
+        PropertyKey::string("clear"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.clear called on incompatible receiver"))?;
+                if !is_set(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Set.prototype.clear called on incompatible receiver"));
+                }
+                let new_values = GcRef::new(JsObject::new(None, mm));
+                obj.set(pk(SET_VALUES_KEY), Value::object(new_values));
+                obj.set(pk(SET_SIZE_KEY), Value::int32(0));
+                Ok(Value::undefined())
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Set.prototype.size (accessor getter per spec §24.2.3.9)
+    set_proto.define_property(
+        PropertyKey::string("size"),
+        PropertyDescriptor::Accessor {
+            get: Some(Value::native_function_with_proto(
+                |this_val, _args, _mm| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| crate::error::VmError::type_error("get Set.prototype.size called on incompatible receiver"))?;
+                    if !is_set(&obj) {
+                        return Err(crate::error::VmError::type_error("get Set.prototype.size called on incompatible receiver"));
+                    }
+                    Ok(Value::int32(get_size(&obj, SET_SIZE_KEY)))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+            set: None,
+            attributes: PropertyAttributes {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        },
+    );
+
+    // Set.prototype.values()
+    set_proto.define_property(
+        PropertyKey::string("values"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.values called on incompatible receiver"))?;
+                if !is_set(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Set.prototype.values called on incompatible receiver"));
+                }
+                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
+                let values_array = GcRef::new(JsObject::array(0, mm));
+                let props = values.own_keys();
+                let mut index = 0i32;
+                for prop in props {
+                    if let Some(value) = values.get(&prop) {
+                        values_array.set(pk(&index.to_string()), value);
+                        index += 1;
+                    }
+                }
+                values_array.set(pk("length"), Value::int32(index));
+                Ok(Value::array(values_array))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Set.prototype.keys() — same as values() per spec
+    set_proto.define_property(
+        PropertyKey::string("keys"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.keys called on incompatible receiver"))?;
+                if !is_set(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Set.prototype.keys called on incompatible receiver"));
+                }
+                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
+                let values_array = GcRef::new(JsObject::array(0, mm));
+                let props = values.own_keys();
+                let mut index = 0i32;
+                for prop in props {
+                    if let Some(value) = values.get(&prop) {
+                        values_array.set(pk(&index.to_string()), value);
+                        index += 1;
+                    }
+                }
+                values_array.set(pk("length"), Value::int32(index));
+                Ok(Value::array(values_array))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Set.prototype.entries()
+    set_proto.define_property(
+        PropertyKey::string("entries"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.entries called on incompatible receiver"))?;
+                if !is_set(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Set.prototype.entries called on incompatible receiver"));
+                }
+                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
+                let entries_array = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
+                let props = values.own_keys();
+                let mut index = 0i32;
+                for prop in props {
+                    if let Some(value) = values.get(&prop) {
+                        let pair = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
+                        pair.set(pk("0"), value.clone());
+                        pair.set(pk("1"), value);
+                        pair.set(pk("length"), Value::int32(2));
+                        entries_array.set(pk(&index.to_string()), Value::array(pair));
+                        index += 1;
+                    }
+                }
+                entries_array.set(pk("length"), Value::int32(index));
+                Ok(Value::array(entries_array))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Set.prototype.forEach(callback) — returns values for JS-side iteration
+    set_proto.define_property(
+        PropertyKey::string("forEach"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.forEach called on incompatible receiver"))?;
+                if !is_set(&obj) {
+                    return Err(crate::error::VmError::type_error("Method Set.prototype.forEach called on incompatible receiver"));
+                }
+                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
+                let values_array = GcRef::new(JsObject::array(0, mm));
+                let props = values.own_keys();
+                let mut index = 0i32;
+                for prop in props {
+                    if let Some(value) = values.get(&prop) {
+                        values_array.set(pk(&index.to_string()), value);
+                        index += 1;
+                    }
+                }
+                values_array.set(pk("length"), Value::int32(index));
+                Ok(Value::array(values_array))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // ========================================================================
+    // ES2025 Set Methods (§24.2.3.x)
+    // ========================================================================
+
+    // Set.prototype.union(other)
+    set_proto.define_property(
+        PropertyKey::string("union"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, mm| {
+                let this_obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.union called on incompatible receiver"))?;
+                if !is_set(&this_obj) {
+                    return Err(crate::error::VmError::type_error("Method Set.prototype.union called on incompatible receiver"));
+                }
+                let other = args.first().ok_or_else(|| crate::error::VmError::type_error("Set.prototype.union requires argument"))?;
+                let other_obj = other
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Set.prototype.union requires a Set-like argument"))?;
+                if !is_set(&other_obj) {
+                    return Err(crate::error::VmError::type_error("Set.prototype.union requires a Set-like argument"));
+                }
+
+                // Create new set
+                let result = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+                init_set_slots(&result, &mm);
+                let result_values = get_set_values_obj(&result).unwrap();
+                let mut count = 0i32;
+
+                // Add all from this
+                let this_vals = get_set_values_obj(&this_obj).ok_or("Internal error")?;
+                for prop in this_vals.own_keys() {
+                    if let Some(value) = this_vals.get(&prop) {
+                        let hash = value_to_key(&value);
+                        if result_values.get(&pk(&hash)).is_none() {
+                            result_values.set(pk(&hash), value);
+                            count += 1;
+                        }
+                    }
+                }
+                // Add all from other
+                let other_vals = get_set_values_obj(&other_obj).ok_or("Internal error")?;
+                for prop in other_vals.own_keys() {
+                    if let Some(value) = other_vals.get(&prop) {
+                        let hash = value_to_key(&value);
+                        if result_values.get(&pk(&hash)).is_none() {
+                            result_values.set(pk(&hash), value);
+                            count += 1;
+                        }
+                    }
+                }
+                result.set(pk(SET_SIZE_KEY), Value::int32(count));
+                Ok(Value::object(result))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Set.prototype.intersection(other)
+    set_proto.define_property(
+        PropertyKey::string("intersection"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, mm| {
+                let this_obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.intersection called on incompatible receiver"))?;
+                if !is_set(&this_obj) {
+                    return Err(crate::error::VmError::type_error("Method Set.prototype.intersection called on incompatible receiver"));
+                }
+                let other = args.first().ok_or_else(|| crate::error::VmError::type_error("Set.prototype.intersection requires argument"))?;
+                let other_obj = other
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Set.prototype.intersection requires a Set-like argument"))?;
+                if !is_set(&other_obj) {
+                    return Err(crate::error::VmError::type_error("Set.prototype.intersection requires a Set-like argument"));
+                }
+
+                let result = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+                init_set_slots(&result, &mm);
+                let result_values = get_set_values_obj(&result).unwrap();
+                let mut count = 0i32;
+
+                let this_vals = get_set_values_obj(&this_obj).ok_or("Internal error")?;
+                let other_vals = get_set_values_obj(&other_obj).ok_or("Internal error")?;
+                for prop in this_vals.own_keys() {
+                    if let Some(value) = this_vals.get(&prop) {
+                        let hash = value_to_key(&value);
+                        if other_vals.get(&pk(&hash)).is_some() {
+                            result_values.set(pk(&hash), value);
+                            count += 1;
+                        }
+                    }
+                }
+                result.set(pk(SET_SIZE_KEY), Value::int32(count));
+                Ok(Value::object(result))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Set.prototype.difference(other)
+    set_proto.define_property(
+        PropertyKey::string("difference"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, mm| {
+                let this_obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.difference called on incompatible receiver"))?;
+                if !is_set(&this_obj) {
+                    return Err(crate::error::VmError::type_error("Method Set.prototype.difference called on incompatible receiver"));
+                }
+                let other = args.first().ok_or_else(|| crate::error::VmError::type_error("Set.prototype.difference requires argument"))?;
+                let other_obj = other
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Set.prototype.difference requires a Set-like argument"))?;
+                if !is_set(&other_obj) {
+                    return Err(crate::error::VmError::type_error("Set.prototype.difference requires a Set-like argument"));
+                }
+
+                let result = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+                init_set_slots(&result, &mm);
+                let result_values = get_set_values_obj(&result).unwrap();
+                let mut count = 0i32;
+
+                let this_vals = get_set_values_obj(&this_obj).ok_or("Internal error")?;
+                let other_vals = get_set_values_obj(&other_obj).ok_or("Internal error")?;
+                for prop in this_vals.own_keys() {
+                    if let Some(value) = this_vals.get(&prop) {
+                        let hash = value_to_key(&value);
+                        if other_vals.get(&pk(&hash)).is_none() {
+                            result_values.set(pk(&hash), value);
+                            count += 1;
+                        }
+                    }
+                }
+                result.set(pk(SET_SIZE_KEY), Value::int32(count));
+                Ok(Value::object(result))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Set.prototype.symmetricDifference(other)
+    set_proto.define_property(
+        PropertyKey::string("symmetricDifference"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, mm| {
+                let this_obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.symmetricDifference called on incompatible receiver"))?;
+                if !is_set(&this_obj) {
+                    return Err(crate::error::VmError::type_error("Method Set.prototype.symmetricDifference called on incompatible receiver"));
+                }
+                let other = args.first().ok_or_else(|| crate::error::VmError::type_error("Set.prototype.symmetricDifference requires argument"))?;
+                let other_obj = other
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Set.prototype.symmetricDifference requires a Set-like argument"))?;
+                if !is_set(&other_obj) {
+                    return Err(crate::error::VmError::type_error("Set.prototype.symmetricDifference requires a Set-like argument"));
+                }
+
+                let result = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+                init_set_slots(&result, &mm);
+                let result_values = get_set_values_obj(&result).unwrap();
+                let mut count = 0i32;
+
+                let this_vals = get_set_values_obj(&this_obj).ok_or("Internal error")?;
+                let other_vals = get_set_values_obj(&other_obj).ok_or("Internal error")?;
+
+                // In this but not other
+                for prop in this_vals.own_keys() {
+                    if let Some(value) = this_vals.get(&prop) {
+                        let hash = value_to_key(&value);
+                        if other_vals.get(&pk(&hash)).is_none() {
+                            result_values.set(pk(&hash), value);
+                            count += 1;
+                        }
+                    }
+                }
+                // In other but not this
+                for prop in other_vals.own_keys() {
+                    if let Some(value) = other_vals.get(&prop) {
+                        let hash = value_to_key(&value);
+                        if this_vals.get(&pk(&hash)).is_none() {
+                            result_values.set(pk(&hash), value);
+                            count += 1;
+                        }
+                    }
+                }
+                result.set(pk(SET_SIZE_KEY), Value::int32(count));
+                Ok(Value::object(result))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Set.prototype.isSubsetOf(other)
+    set_proto.define_property(
+        PropertyKey::string("isSubsetOf"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let this_obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.isSubsetOf called on incompatible receiver"))?;
+                if !is_set(&this_obj) {
+                    return Err(crate::error::VmError::type_error("Method Set.prototype.isSubsetOf called on incompatible receiver"));
+                }
+                let other = args.first().ok_or_else(|| crate::error::VmError::type_error("Set.prototype.isSubsetOf requires argument"))?;
+                let other_obj = other
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Set.prototype.isSubsetOf requires a Set-like argument"))?;
+                if !is_set(&other_obj) {
+                    return Err(crate::error::VmError::type_error("Set.prototype.isSubsetOf requires a Set-like argument"));
+                }
+
+                let this_vals = get_set_values_obj(&this_obj).ok_or("Internal error")?;
+                let other_vals = get_set_values_obj(&other_obj).ok_or("Internal error")?;
+                for prop in this_vals.own_keys() {
+                    if let Some(value) = this_vals.get(&prop) {
+                        let hash = value_to_key(&value);
+                        if other_vals.get(&pk(&hash)).is_none() {
+                            return Ok(Value::boolean(false));
+                        }
+                    }
+                }
+                Ok(Value::boolean(true))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Set.prototype.isSupersetOf(other)
+    set_proto.define_property(
+        PropertyKey::string("isSupersetOf"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let this_obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.isSupersetOf called on incompatible receiver"))?;
+                if !is_set(&this_obj) {
+                    return Err(crate::error::VmError::type_error("Method Set.prototype.isSupersetOf called on incompatible receiver"));
+                }
+                let other = args.first().ok_or_else(|| crate::error::VmError::type_error("Set.prototype.isSupersetOf requires argument"))?;
+                let other_obj = other
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Set.prototype.isSupersetOf requires a Set-like argument"))?;
+                if !is_set(&other_obj) {
+                    return Err(crate::error::VmError::type_error("Set.prototype.isSupersetOf requires a Set-like argument"));
+                }
+
+                let this_vals = get_set_values_obj(&this_obj).ok_or("Internal error")?;
+                let other_vals = get_set_values_obj(&other_obj).ok_or("Internal error")?;
+                for prop in other_vals.own_keys() {
+                    if let Some(value) = other_vals.get(&prop) {
+                        let hash = value_to_key(&value);
+                        if this_vals.get(&pk(&hash)).is_none() {
+                            return Ok(Value::boolean(false));
+                        }
+                    }
+                }
+                Ok(Value::boolean(true))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Set.prototype.isDisjointFrom(other)
+    set_proto.define_property(
+        PropertyKey::string("isDisjointFrom"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let this_obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.isDisjointFrom called on incompatible receiver"))?;
+                if !is_set(&this_obj) {
+                    return Err(crate::error::VmError::type_error("Method Set.prototype.isDisjointFrom called on incompatible receiver"));
+                }
+                let other = args.first().ok_or_else(|| crate::error::VmError::type_error("Set.prototype.isDisjointFrom requires argument"))?;
+                let other_obj = other
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Set.prototype.isDisjointFrom requires a Set-like argument"))?;
+                if !is_set(&other_obj) {
+                    return Err(crate::error::VmError::type_error("Set.prototype.isDisjointFrom requires a Set-like argument"));
+                }
+
+                let this_vals = get_set_values_obj(&this_obj).ok_or("Internal error")?;
+                let other_vals = get_set_values_obj(&other_obj).ok_or("Internal error")?;
+                for prop in this_vals.own_keys() {
+                    if let Some(value) = this_vals.get(&prop) {
+                        let hash = value_to_key(&value);
+                        if other_vals.get(&pk(&hash)).is_some() {
+                            return Ok(Value::boolean(false));
+                        }
+                    }
+                }
+                Ok(Value::boolean(true))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Set.prototype[Symbol.toStringTag] = "Set"
+    set_proto.define_property(
+        PropertyKey::Symbol(crate::intrinsics::well_known::TO_STRING_TAG),
+        PropertyDescriptor::data_with_attrs(
+            Value::string(JsString::intern("Set")),
+            PropertyAttributes {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        ),
+    );
+}
+
+// ============================================================================
+// WeakMap.prototype
+// ============================================================================
+
+/// Initialize WeakMap.prototype with all ES2026 methods.
+///
+/// # Methods
+/// - get, set, has, delete
+/// - Symbol.toStringTag = "WeakMap"
+pub fn init_weak_map_prototype(
+    wm_proto: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+) {
+    // WeakMap.prototype.get(key)
+    wm_proto.define_property(
+        PropertyKey::string("get"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method WeakMap.prototype.get called on incompatible receiver"))?;
+                if !is_weakmap(&obj) {
+                    return Err(crate::error::VmError::type_error("Method WeakMap.prototype.get called on incompatible receiver"));
+                }
+                let key = args.first().cloned().unwrap_or(Value::undefined());
+                if !is_valid_weak_key(&key) {
+                    return Ok(Value::undefined());
+                }
+                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
+                let hash_key = value_to_key(&key);
+                if let Some(entry) = entries.get(&pk(&hash_key)) {
+                    if let Some(entry_obj) = entry.as_object() {
+                        return Ok(entry_obj.get(&pk("v")).unwrap_or(Value::undefined()));
+                    }
+                }
+                Ok(Value::undefined())
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // WeakMap.prototype.set(key, value)
+    wm_proto.define_property(
+        PropertyKey::string("set"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method WeakMap.prototype.set called on incompatible receiver"))?;
+                if !is_weakmap(&obj) {
+                    return Err(crate::error::VmError::type_error("Method WeakMap.prototype.set called on incompatible receiver"));
+                }
+                let key = args.first().cloned().unwrap_or(Value::undefined());
+                if !is_valid_weak_key(&key) {
+                    return Err(crate::error::VmError::type_error("Invalid value used as weak map key"));
+                }
+                let value = args.get(1).cloned().unwrap_or(Value::undefined());
+                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
+                let hash_key = value_to_key(&key);
+
+                let entry = GcRef::new(JsObject::new(None, mm));
+                entry.set(pk("k"), key);
+                entry.set(pk("v"), value);
+                entries.set(pk(&hash_key), Value::object(entry));
+
+                Ok(this_val.clone())
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // WeakMap.prototype.has(key)
+    wm_proto.define_property(
+        PropertyKey::string("has"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method WeakMap.prototype.has called on incompatible receiver"))?;
+                if !is_weakmap(&obj) {
+                    return Err(crate::error::VmError::type_error("Method WeakMap.prototype.has called on incompatible receiver"));
+                }
+                let key = args.first().cloned().unwrap_or(Value::undefined());
+                if !is_valid_weak_key(&key) {
+                    return Ok(Value::boolean(false));
+                }
+                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
+                let hash_key = value_to_key(&key);
+                Ok(Value::boolean(entries.get(&pk(&hash_key)).is_some()))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // WeakMap.prototype.delete(key)
+    wm_proto.define_property(
+        PropertyKey::string("delete"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method WeakMap.prototype.delete called on incompatible receiver"))?;
+                if !is_weakmap(&obj) {
+                    return Err(crate::error::VmError::type_error("Method WeakMap.prototype.delete called on incompatible receiver"));
+                }
+                let key = args.first().cloned().unwrap_or(Value::undefined());
+                if !is_valid_weak_key(&key) {
+                    return Ok(Value::boolean(false));
+                }
+                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
+                let hash_key = value_to_key(&key);
+                if entries.get(&pk(&hash_key)).is_none() {
+                    return Ok(Value::boolean(false));
+                }
+                entries.delete(&pk(&hash_key));
+                Ok(Value::boolean(true))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // WeakMap.prototype[Symbol.toStringTag] = "WeakMap"
+    wm_proto.define_property(
+        PropertyKey::Symbol(crate::intrinsics::well_known::TO_STRING_TAG),
+        PropertyDescriptor::data_with_attrs(
+            Value::string(JsString::intern("WeakMap")),
+            PropertyAttributes {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        ),
+    );
+}
+
+// ============================================================================
+// WeakSet.prototype
+// ============================================================================
+
+/// Initialize WeakSet.prototype with all ES2026 methods.
+///
+/// # Methods
+/// - add, has, delete
+/// - Symbol.toStringTag = "WeakSet"
+pub fn init_weak_set_prototype(
+    ws_proto: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+) {
+    // WeakSet.prototype.add(value)
+    ws_proto.define_property(
+        PropertyKey::string("add"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method WeakSet.prototype.add called on incompatible receiver"))?;
+                if !is_weakset(&obj) {
+                    return Err(crate::error::VmError::type_error("Method WeakSet.prototype.add called on incompatible receiver"));
+                }
+                let value = args.first().cloned().unwrap_or(Value::undefined());
+                if !is_valid_weak_key(&value) {
+                    return Err(crate::error::VmError::type_error("Invalid value used in weak set"));
+                }
+                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
+                let hash_key = value_to_key(&value);
+                values.set(pk(&hash_key), value);
+                Ok(this_val.clone())
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // WeakSet.prototype.has(value)
+    ws_proto.define_property(
+        PropertyKey::string("has"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method WeakSet.prototype.has called on incompatible receiver"))?;
+                if !is_weakset(&obj) {
+                    return Err(crate::error::VmError::type_error("Method WeakSet.prototype.has called on incompatible receiver"));
+                }
+                let value = args.first().cloned().unwrap_or(Value::undefined());
+                if !is_valid_weak_key(&value) {
+                    return Ok(Value::boolean(false));
+                }
+                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
+                let hash_key = value_to_key(&value);
+                Ok(Value::boolean(values.get(&pk(&hash_key)).is_some()))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // WeakSet.prototype.delete(value)
+    ws_proto.define_property(
+        PropertyKey::string("delete"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| crate::error::VmError::type_error("Method WeakSet.prototype.delete called on incompatible receiver"))?;
+                if !is_weakset(&obj) {
+                    return Err(crate::error::VmError::type_error("Method WeakSet.prototype.delete called on incompatible receiver"));
+                }
+                let value = args.first().cloned().unwrap_or(Value::undefined());
+                if !is_valid_weak_key(&value) {
+                    return Ok(Value::boolean(false));
+                }
+                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
+                let hash_key = value_to_key(&value);
+                if values.get(&pk(&hash_key)).is_none() {
+                    return Ok(Value::boolean(false));
+                }
+                values.delete(&pk(&hash_key));
+                Ok(Value::boolean(true))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // WeakSet.prototype[Symbol.toStringTag] = "WeakSet"
+    ws_proto.define_property(
+        PropertyKey::Symbol(crate::intrinsics::well_known::TO_STRING_TAG),
+        PropertyDescriptor::data_with_attrs(
+            Value::string(JsString::intern("WeakSet")),
+            PropertyAttributes {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        ),
+    );
+}
+
+// ============================================================================
+// Constructor functions
+// ============================================================================
+
+/// Create Map constructor function.
+///
+/// - **new Map()** — Creates a new empty Map
+/// - **Map()** without new — TypeError (Map is not callable without new)
+pub fn create_map_constructor() -> Box<
+    dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, crate::error::VmError>
+        + Send
+        + Sync,
+> {
+    Box::new(|this_val, _args, mm| {
+        if this_val.is_undefined() {
+            return Err(crate::error::VmError::type_error(
+                "Constructor Map requires 'new'",
+            ));
+        }
+        if let Some(obj) = this_val.as_object() {
+            init_map_slots(&obj, &mm);
+            Ok(this_val.clone())
+        } else {
+            Err(crate::error::VmError::type_error(
+                "Constructor Map requires 'new'",
+            ))
+        }
+    })
+}
+
+/// Create Set constructor function.
+///
+/// - **new Set()** — Creates a new empty Set
+/// - **Set()** without new — TypeError (Set is not callable without new)
+pub fn create_set_constructor() -> Box<
+    dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, crate::error::VmError>
+        + Send
+        + Sync,
+> {
+    Box::new(|this_val, _args, mm| {
+        if this_val.is_undefined() {
+            return Err(crate::error::VmError::type_error(
+                "Constructor Set requires 'new'",
+            ));
+        }
+        if let Some(obj) = this_val.as_object() {
+            init_set_slots(&obj, &mm);
+            Ok(this_val.clone())
+        } else {
+            Err(crate::error::VmError::type_error(
+                "Constructor Set requires 'new'",
+            ))
+        }
+    })
+}
+
+/// Create WeakMap constructor function.
+///
+/// - **new WeakMap()** — Creates a new empty WeakMap
+/// - **WeakMap()** without new — TypeError
+pub fn create_weak_map_constructor() -> Box<
+    dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, crate::error::VmError>
+        + Send
+        + Sync,
+> {
+    Box::new(|this_val, _args, mm| {
+        if this_val.is_undefined() {
+            return Err(crate::error::VmError::type_error(
+                "Constructor WeakMap requires 'new'",
+            ));
+        }
+        if let Some(obj) = this_val.as_object() {
+            let entries = GcRef::new(JsObject::new(None, mm));
+            obj.set(pk(MAP_ENTRIES_KEY), Value::object(entries));
+            obj.set(pk(IS_WEAKMAP_KEY), Value::boolean(true));
+            Ok(this_val.clone())
+        } else {
+            Err(crate::error::VmError::type_error(
+                "Constructor WeakMap requires 'new'",
+            ))
+        }
+    })
+}
+
+/// Create WeakSet constructor function.
+///
+/// - **new WeakSet()** — Creates a new empty WeakSet
+/// - **WeakSet()** without new — TypeError
+pub fn create_weak_set_constructor() -> Box<
+    dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, crate::error::VmError>
+        + Send
+        + Sync,
+> {
+    Box::new(|this_val, _args, mm| {
+        if this_val.is_undefined() {
+            return Err(crate::error::VmError::type_error(
+                "Constructor WeakSet requires 'new'",
+            ));
+        }
+        if let Some(obj) = this_val.as_object() {
+            let values = GcRef::new(JsObject::new(None, mm));
+            obj.set(pk(SET_VALUES_KEY), Value::object(values));
+            obj.set(pk(IS_WEAKSET_KEY), Value::boolean(true));
+            Ok(this_val.clone())
+        } else {
+            Err(crate::error::VmError::type_error(
+                "Constructor WeakSet requires 'new'",
+            ))
+        }
+    })
+}

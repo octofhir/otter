@@ -144,6 +144,10 @@ pub struct VmContext {
     /// interpreter can assign it as [[Prototype]] on closures
     /// and native functions without a global lookup.
     function_prototype_intrinsic: Option<GcRef<JsObject>>,
+    /// Eval callback: compiles and executes code in the current context.
+    /// Set by otter-vm-runtime to bridge the compiler (which otter-vm-core
+    /// cannot depend on directly).
+    eval_fn: Option<Arc<dyn Fn(&str, &mut VmContext) -> VmResult<Value> + Send + Sync>>,
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +245,7 @@ impl VmContext {
             scope_markers: Vec::new(),
             debug_snapshot: None,
             function_prototype_intrinsic: None,
+            eval_fn: None,
         }
     }
 
@@ -636,6 +641,25 @@ impl VmContext {
     /// Called by VmRuntime during context creation.
     pub fn set_function_prototype_intrinsic(&mut self, proto: GcRef<JsObject>) {
         self.function_prototype_intrinsic = Some(proto);
+    }
+
+    /// Set the eval callback used by the interpreter to compile and execute
+    /// eval'd code. Called by otter-vm-runtime during context setup.
+    pub fn set_eval_fn(
+        &mut self,
+        f: Arc<dyn Fn(&str, &mut VmContext) -> VmResult<Value> + Send + Sync>,
+    ) {
+        self.eval_fn = Some(f);
+    }
+
+    /// Compile and execute eval code in this context.
+    /// Returns `VmError::TypeError` if the eval callback is not configured.
+    pub fn perform_eval(&mut self, code: &str) -> VmResult<Value> {
+        let eval_fn = self
+            .eval_fn
+            .clone()
+            .ok_or_else(|| VmError::type_error("eval() is not available in this context"))?;
+        eval_fn(code, self)
     }
 
     /// Get global variable

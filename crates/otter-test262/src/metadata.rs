@@ -48,6 +48,27 @@ pub struct NegativeExpectation {
     pub error_type: String,
 }
 
+/// Execution mode for a test
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum ExecutionMode {
+    /// Run in strict mode ("use strict" prepended)
+    Strict,
+    /// Run in non-strict (sloppy) mode
+    NonStrict,
+    /// Run as an ES module
+    Module,
+}
+
+impl std::fmt::Display for ExecutionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecutionMode::Strict => write!(f, "strict"),
+            ExecutionMode::NonStrict => write!(f, "non-strict"),
+            ExecutionMode::Module => write!(f, "module"),
+        }
+    }
+}
+
 /// Phase when an error is expected
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -106,6 +127,27 @@ impl TestMetadata {
                 ..
             })
         )
+    }
+
+    /// Get the execution modes this test should run in.
+    ///
+    /// Per the test262 spec:
+    /// - `onlyStrict` flag → strict mode only
+    /// - `noStrict` flag → non-strict mode only
+    /// - `module` flag → module mode only (skipped for now)
+    /// - no flag → both strict and non-strict
+    pub fn execution_modes(&self) -> Vec<ExecutionMode> {
+        if self.is_module() {
+            return vec![ExecutionMode::Module];
+        }
+        if self.is_strict() {
+            return vec![ExecutionMode::Strict];
+        }
+        if self.is_nostrict() {
+            return vec![ExecutionMode::NonStrict];
+        }
+        // Default: run in both modes
+        vec![ExecutionMode::Strict, ExecutionMode::NonStrict]
     }
 
     /// Check if test expects a runtime error

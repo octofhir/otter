@@ -197,7 +197,7 @@ impl Intrinsics {
             }))
         };
 
-        Self {
+        let result = Self {
             // Core prototypes
             object_prototype: alloc(),
             function_prototype: fn_proto, // Reuse existing intrinsic
@@ -251,7 +251,46 @@ impl Intrinsics {
             symbol_split: make_symbol(well_known::SPLIT, "Symbol.split"),
             symbol_species: make_symbol(well_known::SPECIES, "Symbol.species"),
             symbol_unscopables: make_symbol(well_known::UNSCOPABLES, "Symbol.unscopables"),
+        };
+
+        // Mark all intrinsic objects so they are protected from teardown clearing.
+        // When a VmContext is torn down, DropGuard calls clear_and_extract_values()
+        // on reachable objects; intrinsics are shared across contexts and must survive.
+        let all_intrinsic_objects: &[GcRef<JsObject>] = &[
+            result.object_prototype,
+            result.function_prototype,
+            result.object_constructor,
+            result.function_constructor,
+            result.string_prototype,
+            result.number_prototype,
+            result.boolean_prototype,
+            result.symbol_prototype,
+            result.bigint_prototype,
+            result.array_prototype,
+            result.map_prototype,
+            result.set_prototype,
+            result.weak_map_prototype,
+            result.weak_set_prototype,
+            result.error_prototype,
+            result.type_error_prototype,
+            result.range_error_prototype,
+            result.reference_error_prototype,
+            result.syntax_error_prototype,
+            result.uri_error_prototype,
+            result.eval_error_prototype,
+            result.promise_prototype,
+            result.regexp_prototype,
+            result.date_prototype,
+            result.array_buffer_prototype,
+            result.data_view_prototype,
+            result.iterator_prototype,
+            result.async_iterator_prototype,
+        ];
+        for obj in all_intrinsic_objects {
+            (*obj).mark_as_intrinsic();
         }
+
+        result
     }
 
     /// Stage 2: Wire up prototype chains for all intrinsic objects.
@@ -1447,6 +1486,24 @@ impl Intrinsics {
         // Array.prototype methods (extracted to intrinsics_impl/array.rs)
         // ===================================================================
         crate::intrinsics_impl::array::init_array_prototype(self.array_prototype, fn_proto, mm);
+
+        // ===================================================================
+        // Map/Set/WeakMap/WeakSet prototype methods (extracted to intrinsics_impl/map_set.rs)
+        // ===================================================================
+        crate::intrinsics_impl::map_set::init_map_prototype(self.map_prototype, fn_proto, mm);
+        crate::intrinsics_impl::map_set::init_set_prototype(self.set_prototype, fn_proto, mm);
+        crate::intrinsics_impl::map_set::init_weak_map_prototype(self.weak_map_prototype, fn_proto, mm);
+        crate::intrinsics_impl::map_set::init_weak_set_prototype(self.weak_set_prototype, fn_proto, mm);
+
+        // ===================================================================
+        // RegExp.prototype methods (extracted to intrinsics_impl/regexp.rs)
+        // ===================================================================
+        crate::intrinsics_impl::regexp::init_regexp_prototype(self.regexp_prototype, fn_proto, mm);
+
+        // ===================================================================
+        // Promise.prototype methods (extracted to intrinsics_impl/promise.rs)
+        // ===================================================================
+        crate::intrinsics_impl::promise::init_promise_prototype(self.promise_prototype, fn_proto, mm);
     }
 
     /// Install intrinsic constructors on the global object.
@@ -1526,7 +1583,25 @@ impl Intrinsics {
         // ====================================================================
         // Core constructors
         // ====================================================================
-        install("Object", self.object_constructor, self.object_prototype, None);
+        let object_ctor_fn: Box<
+            dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync,
+        > = Box::new(|_this, args, _mm_inner| {
+            // When called with an object argument, return it directly
+            if let Some(arg) = args.first() {
+                if arg.is_object() {
+                    return Ok(arg.clone());
+                }
+            }
+            // Return undefined so Construct handler uses new_obj_value
+            // (which has Object.prototype as [[Prototype]])
+            Ok(Value::undefined())
+        });
+        install(
+            "Object",
+            self.object_constructor,
+            self.object_prototype,
+            Some(object_ctor_fn),
+        );
         install("Function", self.function_constructor, self.function_prototype, None);
 
         // Register global aliases for interpreter interception
@@ -1550,7 +1625,17 @@ impl Intrinsics {
 
         // String
         let string_ctor = alloc_ctor();
-        install("String", string_ctor, self.string_prototype, None);
+        let string_ctor_fn: Box<
+            dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync,
+        > = Box::new(|_this, args, _mm| {
+            let s = if let Some(arg) = args.first() {
+                crate::globals::to_string(arg)
+            } else {
+                String::new()
+            };
+            Ok(Value::string(JsString::intern(&s)))
+        });
+        install("String", string_ctor, self.string_prototype, Some(string_ctor_fn));
 
         // String.fromCharCode(...codeUnits)
         string_ctor.define_property(
@@ -1559,12 +1644,29 @@ impl Intrinsics {
                 |_this, args, _mm| {
                     let mut result = String::new();
                     for arg in args {
-                        let code = if let Some(n) = arg.as_number() {
-                            (n as u32 & 0xFFFF) as u16
+                        // Per ES2023 §22.1.2.1: ToUint16(ToNumber(arg))
+                        let n = if let Some(n) = arg.as_number() {
+                            n
                         } else if let Some(i) = arg.as_int32() {
-                            (i as u32 & 0xFFFF) as u16
+                            i as f64
+                        } else if let Some(s) = arg.as_string() {
+                            let trimmed = s.as_str().trim();
+                            if trimmed.is_empty() {
+                                0.0
+                            } else {
+                                trimmed.parse::<f64>().unwrap_or(f64::NAN)
+                            }
+                        } else if let Some(b) = arg.as_boolean() {
+                            if b { 1.0 } else { 0.0 }
+                        } else if arg.is_null() {
+                            0.0
                         } else {
-                            0
+                            f64::NAN
+                        };
+                        let code = if n.is_nan() || n.is_infinite() {
+                            0u16
+                        } else {
+                            (n.trunc() as i64 as u32 & 0xFFFF) as u16
                         };
                         if let Some(ch) = char::from_u32(code as u32) {
                             result.push(ch);
@@ -1609,199 +1711,18 @@ impl Intrinsics {
 
         // Number
         let number_ctor = alloc_ctor();
-        install("Number", number_ctor, self.number_prototype, None);
-
-        // Number constants
-        number_ctor.define_property(
-            PropertyKey::string("EPSILON"),
-            PropertyDescriptor::data_with_attrs(
-                Value::number(f64::EPSILON),
-                PropertyAttributes::permanent(),
-            ),
-        );
-        number_ctor.define_property(
-            PropertyKey::string("MAX_VALUE"),
-            PropertyDescriptor::data_with_attrs(
-                Value::number(f64::MAX),
-                PropertyAttributes::permanent(),
-            ),
-        );
-        number_ctor.define_property(
-            PropertyKey::string("MIN_VALUE"),
-            PropertyDescriptor::data_with_attrs(
-                Value::number(f64::MIN_POSITIVE),
-                PropertyAttributes::permanent(),
-            ),
-        );
-        number_ctor.define_property(
-            PropertyKey::string("MAX_SAFE_INTEGER"),
-            PropertyDescriptor::data_with_attrs(
-                Value::number(9007199254740991.0), // 2^53 - 1
-                PropertyAttributes::permanent(),
-            ),
-        );
-        number_ctor.define_property(
-            PropertyKey::string("MIN_SAFE_INTEGER"),
-            PropertyDescriptor::data_with_attrs(
-                Value::number(-9007199254740991.0), // -(2^53 - 1)
-                PropertyAttributes::permanent(),
-            ),
-        );
-        number_ctor.define_property(
-            PropertyKey::string("POSITIVE_INFINITY"),
-            PropertyDescriptor::data_with_attrs(
-                Value::number(f64::INFINITY),
-                PropertyAttributes::permanent(),
-            ),
-        );
-        number_ctor.define_property(
-            PropertyKey::string("NEGATIVE_INFINITY"),
-            PropertyDescriptor::data_with_attrs(
-                Value::number(f64::NEG_INFINITY),
-                PropertyAttributes::permanent(),
-            ),
-        );
-        number_ctor.define_property(
-            PropertyKey::string("NaN"),
-            PropertyDescriptor::data_with_attrs(
-                Value::number(f64::NAN),
-                PropertyAttributes::permanent(),
-            ),
-        );
-
-        // Number.isFinite
-        number_ctor.define_property(
-            PropertyKey::string("isFinite"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, _mm| {
-                    let val = args.first();
-                    match val {
-                        Some(v) if v.is_number() => {
-                            let n = v.as_number().unwrap();
-                            Ok(Value::boolean(n.is_finite()))
-                        }
-                        Some(v) if v.is_int32() => Ok(Value::boolean(true)),
-                        _ => Ok(Value::boolean(false)),
-                    }
-                },
-                mm.clone(),
-                fn_proto,
-            )),
-        );
-
-        // Number.isInteger
-        number_ctor.define_property(
-            PropertyKey::string("isInteger"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, _mm| {
-                    let val = args.first();
-                    match val {
-                        Some(v) if v.is_int32() => Ok(Value::boolean(true)),
-                        Some(v) if v.is_number() => {
-                            let n = v.as_number().unwrap();
-                            Ok(Value::boolean(n.is_finite() && n.fract() == 0.0))
-                        }
-                        _ => Ok(Value::boolean(false)),
-                    }
-                },
-                mm.clone(),
-                fn_proto,
-            )),
-        );
-
-        // Number.isNaN
-        number_ctor.define_property(
-            PropertyKey::string("isNaN"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, _mm| {
-                    let val = args.first();
-                    match val {
-                        Some(v) if v.is_number() => {
-                            let n = v.as_number().unwrap();
-                            Ok(Value::boolean(n.is_nan()))
-                        }
-                        _ => Ok(Value::boolean(false)),
-                    }
-                },
-                mm.clone(),
-                fn_proto,
-            )),
-        );
-
-        // Number.isSafeInteger
-        number_ctor.define_property(
-            PropertyKey::string("isSafeInteger"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, _mm| {
-                    let val = args.first();
-                    match val {
-                        Some(v) if v.is_int32() => Ok(Value::boolean(true)),
-                        Some(v) if v.is_number() => {
-                            let n = v.as_number().unwrap();
-                            let max_safe = 9007199254740991.0; // 2^53 - 1
-                            Ok(Value::boolean(
-                                n.is_finite()
-                                    && n.fract() == 0.0
-                                    && n.abs() <= max_safe,
-                            ))
-                        }
-                        _ => Ok(Value::boolean(false)),
-                    }
-                },
-                mm.clone(),
-                fn_proto,
-            )),
-        );
-
-        // Number.parseFloat
-        number_ctor.define_property(
-            PropertyKey::string("parseFloat"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, _mm| {
-                    let val = args.first().ok_or("parseFloat requires an argument")?;
-                    if let Some(s) = val.as_string() {
-                        let trimmed = s.as_str().trim_start();
-                        if let Ok(n) = trimmed.parse::<f64>() {
-                            Ok(Value::number(n))
-                        } else {
-                            Ok(Value::number(f64::NAN))
-                        }
-                    } else {
-                        Ok(Value::number(f64::NAN))
-                    }
-                },
-                mm.clone(),
-                fn_proto,
-            )),
-        );
-
-        // Number.parseInt
-        number_ctor.define_property(
-            PropertyKey::string("parseInt"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, _mm| {
-                    let val = args.first().ok_or("parseInt requires an argument")?;
-                    let radix = args.get(1).and_then(|v| v.as_int32()).unwrap_or(10);
-
-                    if radix < 2 || radix > 36 {
-                        return Ok(Value::number(f64::NAN));
-                    }
-
-                    if let Some(s) = val.as_string() {
-                        let trimmed = s.as_str().trim_start();
-                        if let Ok(n) = i64::from_str_radix(trimmed, radix as u32) {
-                            Ok(Value::number(n as f64))
-                        } else {
-                            Ok(Value::number(f64::NAN))
-                        }
-                    } else {
-                        Ok(Value::number(f64::NAN))
-                    }
-                },
-                mm.clone(),
-                fn_proto,
-            )),
-        );
+        let number_ctor_fn: Box<
+            dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync,
+        > = Box::new(|_this, args, _mm| {
+            let n = if let Some(arg) = args.first() {
+                crate::globals::to_number(arg)
+            } else {
+                0.0
+            };
+            Ok(Value::number(n))
+        });
+        install("Number", number_ctor, self.number_prototype, Some(number_ctor_fn));
+        crate::intrinsics_impl::number::install_number_statics(number_ctor, fn_proto, mm);
 
         // Boolean
         let boolean_ctor = alloc_ctor();
@@ -1820,122 +1741,149 @@ impl Intrinsics {
         // Collection constructors
         // ====================================================================
         let array_ctor = alloc_ctor();
-        install("Array", array_ctor, self.array_prototype, None);
-
-        // Array.isArray
-        array_ctor.define_property(
-            PropertyKey::string("isArray"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, _mm| {
-                    let is_arr = args
-                        .first()
-                        .and_then(|v| v.as_object())
-                        .map(|o| o.is_array())
-                        .unwrap_or(false);
-                    Ok(Value::boolean(is_arr))
-                },
-                mm.clone(),
-                fn_proto,
-            )),
-        );
-
-        // Array.from (simplified - handles array-like objects)
-        array_ctor.define_property(
-            PropertyKey::string("from"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, mm_inner| {
-                    let source = args.first().ok_or_else(|| {
-                        "Array.from requires an argument".to_string()
-                    })?;
-                    // Handle array-like objects (with length)
-                    if let Some(obj) = source.as_object() {
-                        if let Some(len_val) =
-                            obj.get(&PropertyKey::string("length"))
-                        {
-                            let len = len_val.as_number().unwrap_or(0.0) as usize;
-                            let result =
-                                GcRef::new(JsObject::array(len, mm_inner));
-                            for i in 0..len {
-                                let val = obj
-                                    .get(&PropertyKey::Index(i as u32))
-                                    .unwrap_or(Value::undefined());
-                                result.set(PropertyKey::Index(i as u32), val);
-                            }
-                            return Ok(Value::array(result));
-                        }
+        let array_ctor_fn: Box<
+            dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync,
+        > = Box::new(|_this, args, mm_inner| {
+            if args.len() == 1 {
+                if let Some(n) = args[0].as_number() {
+                    let len = n as u32;
+                    if (len as f64) != n || n < 0.0 {
+                        return Err(VmError::type_error("Invalid array length"));
                     }
-                    // For non-array-like, return empty array
-                    Ok(Value::array(GcRef::new(JsObject::array(0, mm_inner))))
-                },
-                mm.clone(),
-                fn_proto,
-            )),
-        );
-
-        // Array.of
-        array_ctor.define_property(
-            PropertyKey::string("of"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, mm_inner| {
-                    let result =
-                        GcRef::new(JsObject::array(args.len(), mm_inner));
-                    for (i, arg) in args.iter().enumerate() {
-                        result.set(PropertyKey::Index(i as u32), arg.clone());
-                    }
-                    Ok(Value::array(result))
-                },
-                mm.clone(),
-                fn_proto,
-            )),
-        );
+                    let arr = GcRef::new(JsObject::array(len as usize, mm_inner));
+                    return Ok(Value::object(arr));
+                }
+            }
+            // Array(...items) — populate the array
+            let arr = GcRef::new(JsObject::array(args.len(), mm_inner));
+            for (i, arg) in args.iter().enumerate() {
+                arr.set(PropertyKey::index(i as u32), arg.clone());
+            }
+            Ok(Value::object(arr))
+        });
+        install("Array", array_ctor, self.array_prototype, Some(array_ctor_fn));
+        crate::intrinsics_impl::array::install_array_statics(array_ctor, fn_proto, mm);
 
         let map_ctor = alloc_ctor();
-        install("Map", map_ctor, self.map_prototype, None);
+        let map_ctor_fn = crate::intrinsics_impl::map_set::create_map_constructor();
+        install("Map", map_ctor, self.map_prototype, Some(map_ctor_fn));
 
         let set_ctor = alloc_ctor();
-        install("Set", set_ctor, self.set_prototype, None);
+        let set_ctor_fn = crate::intrinsics_impl::map_set::create_set_constructor();
+        install("Set", set_ctor, self.set_prototype, Some(set_ctor_fn));
 
         let weak_map_ctor = alloc_ctor();
-        install("WeakMap", weak_map_ctor, self.weak_map_prototype, None);
+        let weak_map_ctor_fn = crate::intrinsics_impl::map_set::create_weak_map_constructor();
+        install("WeakMap", weak_map_ctor, self.weak_map_prototype, Some(weak_map_ctor_fn));
 
         let weak_set_ctor = alloc_ctor();
-        install("WeakSet", weak_set_ctor, self.weak_set_prototype, None);
+        let weak_set_ctor_fn = crate::intrinsics_impl::map_set::create_weak_set_constructor();
+        install("WeakSet", weak_set_ctor, self.weak_set_prototype, Some(weak_set_ctor_fn));
 
         // ====================================================================
         // Error constructors
         // ====================================================================
+        // Helper to create error constructor functions
+        let make_error_ctor = |error_name: &'static str| -> Box<
+            dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync,
+        > {
+            Box::new(move |this, args, _mm_inner| {
+                // Set properties on `this` (the new object created by Construct
+                // which already has the correct ErrorType.prototype)
+                if let Some(obj) = this.as_object() {
+                    if let Some(msg) = args.first() {
+                        if !msg.is_undefined() {
+                            obj.set(
+                                PropertyKey::string("message"),
+                                Value::string(JsString::intern(&crate::globals::to_string(msg))),
+                            );
+                        }
+                    }
+                    obj.set(
+                        PropertyKey::string("name"),
+                        Value::string(JsString::intern(error_name)),
+                    );
+                }
+                // Return undefined so Construct uses new_obj_value with correct prototype
+                Ok(Value::undefined())
+            })
+        };
+
         let error_ctor = alloc_ctor();
-        install("Error", error_ctor, self.error_prototype, None);
+        install("Error", error_ctor, self.error_prototype, Some(make_error_ctor("Error")));
 
         let type_error_ctor = alloc_ctor();
-        install("TypeError", type_error_ctor, self.type_error_prototype, None);
+        install("TypeError", type_error_ctor, self.type_error_prototype, Some(make_error_ctor("TypeError")));
 
         let range_error_ctor = alloc_ctor();
-        install("RangeError", range_error_ctor, self.range_error_prototype, None);
+        install("RangeError", range_error_ctor, self.range_error_prototype, Some(make_error_ctor("RangeError")));
 
         let reference_error_ctor = alloc_ctor();
-        install("ReferenceError", reference_error_ctor, self.reference_error_prototype, None);
+        install("ReferenceError", reference_error_ctor, self.reference_error_prototype, Some(make_error_ctor("ReferenceError")));
 
         let syntax_error_ctor = alloc_ctor();
-        install("SyntaxError", syntax_error_ctor, self.syntax_error_prototype, None);
+        install("SyntaxError", syntax_error_ctor, self.syntax_error_prototype, Some(make_error_ctor("SyntaxError")));
 
         let uri_error_ctor = alloc_ctor();
-        install("URIError", uri_error_ctor, self.uri_error_prototype, None);
+        install("URIError", uri_error_ctor, self.uri_error_prototype, Some(make_error_ctor("URIError")));
 
         let eval_error_ctor = alloc_ctor();
-        install("EvalError", eval_error_ctor, self.eval_error_prototype, None);
+        install("EvalError", eval_error_ctor, self.eval_error_prototype, Some(make_error_ctor("EvalError")));
 
         // ====================================================================
         // Other builtins
         // ====================================================================
         let promise_ctor = alloc_ctor();
         install("Promise", promise_ctor, self.promise_prototype, None);
+        crate::intrinsics_impl::promise::install_promise_statics(promise_ctor, fn_proto, mm);
 
         let regexp_ctor = alloc_ctor();
-        install("RegExp", regexp_ctor, self.regexp_prototype, None);
+        let regexp_ctor_fn = crate::intrinsics_impl::regexp::create_regexp_constructor(self.regexp_prototype);
+        install("RegExp", regexp_ctor, self.regexp_prototype, Some(regexp_ctor_fn));
+
+        // RegExp.escape (ES2026 §22.2.4.1)
+        regexp_ctor.define_property(
+            PropertyKey::string("escape"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |_this, args, _mm| {
+                    let s = args
+                        .first()
+                        .and_then(|v| v.as_string())
+                        .ok_or_else(|| VmError::type_error("RegExp.escape requires a string argument"))?;
+                    Ok(Value::string(JsString::intern(&regress::escape(s.as_str()))))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
 
         let date_ctor = alloc_ctor();
-        install("Date", date_ctor, self.date_prototype, None);
+        let date_ctor_fn: Box<
+            dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync,
+        > = Box::new(|this, args, _mm_inner| {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let timestamp = if args.is_empty() {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as f64)
+                    .unwrap_or(0.0)
+            } else if let Some(n) = args[0].as_number() {
+                n
+            } else if args[0].as_string().is_some() {
+                f64::NAN // TODO: proper date parsing
+            } else {
+                f64::NAN
+            };
+            // Set timestamp on `this` (created by Construct with Date.prototype)
+            if let Some(obj) = this.as_object() {
+                obj.set(
+                    PropertyKey::string("__timestamp"),
+                    Value::number(timestamp),
+                );
+            }
+            Ok(Value::undefined())
+        });
+        install("Date", date_ctor, self.date_prototype, Some(date_ctor_fn));
 
         // Date.now() - returns current timestamp in milliseconds
         date_ctor.define_property(

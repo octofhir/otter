@@ -18,6 +18,8 @@ pub enum InterceptionSignal {
     ReflectApply,
     /// Reflect.construct with a closure (requires VM context to execute)
     ReflectConstruct,
+    /// eval() called indirectly — requires VM context to compile and execute code
+    EvalCall,
 }
 
 /// VM execution errors

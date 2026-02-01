@@ -1,0 +1,88 @@
+# Test262 Runner Configuration for Otter VM
+# This file configures the test262 conformance test runner.
+
+# Path to the test262 directory (relative to project root)
+# test262_path = "tests/test262"
+
+# Pin test262 to a specific commit (optional)
+# test262_commit = "abc123..."
+
+# Default timeout in seconds per test (optional)
+# timeout_secs = 30
+
+# Directory for saving results
+# results_dir = "test262_results"
+
+# Features to skip (tests requiring these features will be skipped).
+# These features are not yet implemented in Otter.
+skip_features = [
+    # Atomics & shared memory
+    "Atomics",
+    "SharedArrayBuffer",
+    # Decorators proposal
+    "decorators",
+    # Import assertions / attributes
+    "import-assertions",
+    "import-attributes",
+    # FinalizationRegistry / WeakRef
+    "FinalizationRegistry",
+    "WeakRef",
+    # ShadowRealm
+    "ShadowRealm",
+    # Explicit resource management (using/await using)
+    "explicit-resource-management",
+    # Tail calls
+    "tail-call-optimization",
+    # Intl (internationalization)
+    "Intl",
+    "Intl.DateTimeFormat",
+    "Intl.DisplayNames",
+    "Intl.ListFormat",
+    "Intl.Locale",
+    "Intl.NumberFormat",
+    "Intl.PluralRules",
+    "Intl.RelativeTimeFormat",
+    "Intl.Segmenter",
+    "Intl-enumeration",
+    # Import / export (module system)
+    "dynamic-import",
+    "import.meta",
+    # Resizable ArrayBuffer
+    "resizable-arraybuffer",
+    "arraybuffer-transfer",
+    # JSON modules
+    "json-modules",
+    # Iterator helpers
+    "iterator-helpers",
+    # Array grouping
+    "array-grouping",
+    # Symbols as WeakMap keys
+    "symbols-as-weakmap-keys",
+    # RegExp features not yet implemented
+    "regexp-duplicate-named-groups",
+    "regexp-lookbehind",
+    "regexp-named-groups",
+    "regexp-unicode-property-escapes",
+    "regexp-v-flag",
+    "regexp-match-indices",
+    # Hashbang
+    "hashbang",
+    # Class features
+    "class-fields-private",
+    "class-fields-public",
+    "class-methods-private",
+    "class-static-block",
+    "class-static-fields-private",
+    "class-static-fields-public",
+    "class-static-methods-private",
+    # Other proposals
+    "Array.fromAsync",
+    "change-array-by-copy",
+    "Uint8Array",
+]
+
+# Test path patterns to ignore (tests matching these patterns will be skipped)
+ignored_tests = []
+
+# Tests known to panic/crash the VM (will be skipped with a warning)
+known_panics = []

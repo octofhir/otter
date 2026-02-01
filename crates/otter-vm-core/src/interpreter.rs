@@ -2263,7 +2263,19 @@ impl Interpreter {
                 let captured_upvalues = self.capture_upvalues(ctx, &func_def.upvalues)?;
 
                 let func_obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
-                let proto = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+
+                // Get Object.prototype so function's .prototype object has correct chain
+                let obj_proto = ctx
+                    .global()
+                    .get(&PropertyKey::string("Object"))
+                    .and_then(|obj_ctor| {
+                        obj_ctor
+                            .as_object()
+                            .and_then(|o| o.get(&PropertyKey::string("prototype")))
+                    })
+                    .and_then(|proto_val| proto_val.as_object());
+
+                let proto = GcRef::new(JsObject::new(obj_proto, ctx.memory_manager().clone()));
 
                 // Set [[Prototype]] to Function.prototype so methods like
                 // .bind(), .call(), .apply() are inherited per ES2023 §10.2.4.
@@ -2333,7 +2345,19 @@ impl Interpreter {
                 let captured_upvalues = self.capture_upvalues(ctx, &func_def.upvalues)?;
 
                 let func_obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
-                let proto = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+
+                // Get Object.prototype for function's .prototype object
+                let obj_proto = ctx
+                    .global()
+                    .get(&PropertyKey::string("Object"))
+                    .and_then(|obj_ctor| {
+                        obj_ctor
+                            .as_object()
+                            .and_then(|o| o.get(&PropertyKey::string("prototype")))
+                    })
+                    .and_then(|proto_val| proto_val.as_object());
+
+                let proto = GcRef::new(JsObject::new(obj_proto, ctx.memory_manager().clone()));
 
                 // Set [[Prototype]] to Function.prototype
                 if let Some(fn_proto) = ctx.function_prototype() {
@@ -2565,6 +2589,7 @@ impl Interpreter {
                         "__Generator_next",
                         "__Generator_return",
                         "__Generator_throw",
+                        "eval",
                     ]
                     .iter()
                     .any(|name| ctx.get_global(name).is_some_and(|v| is_same_native(&v)));
@@ -2891,14 +2916,20 @@ impl Interpreter {
                 // For primitives/functions, emulate `ToObject` lookup by consulting the corresponding
                 // prototype object (e.g. `String.prototype`) but keep `this` as the primitive.
                 let method_value = if receiver.is_function() || receiver.is_native_function() {
-                    let function_obj = ctx
-                        .get_global("Function")
+                    let function_global = ctx.get_global("Function");
+                    let function_obj = function_global
+                        .as_ref()
                         .and_then(|v| v.as_object())
-                        .ok_or_else(|| VmError::type_error("Function is not defined"))?;
-                    let proto = function_obj
-                        .get(&PropertyKey::string("prototype"))
+                        .ok_or_else(|| {
+                            VmError::type_error("Function is not defined")
+                        })?;
+                    let proto_val = function_obj.get(&PropertyKey::string("prototype"));
+                    let proto = proto_val
+                        .as_ref()
                         .and_then(|v| v.as_object())
-                        .ok_or_else(|| VmError::type_error("Function.prototype is not defined"))?;
+                        .ok_or_else(|| {
+                            VmError::type_error("Function.prototype is not defined")
+                        })?;
                     if let Some(obj_ref) = receiver.as_object() {
                         obj_ref
                             .get(&Self::utf16_key(method_name))
@@ -3101,6 +3132,12 @@ impl Interpreter {
                         .and_then(|v| v.as_object())
                         .ok_or_else(|| VmError::type_error("Boolean.prototype is not defined"))?;
                     proto
+                        .get(&Self::utf16_key(method_name))
+                        .unwrap_or_else(Value::undefined)
+                } else if let Some(regex) = receiver.as_regex() {
+                    // RegExp: look up method on the regex's internal object (which has the prototype chain)
+                    regex
+                        .object
                         .get(&Self::utf16_key(method_name))
                         .unwrap_or_else(Value::undefined)
                 } else {
@@ -3443,6 +3480,27 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
+            Instruction::CallEval { dst, code } => {
+                let code_value = ctx.get_register(code.0).clone();
+
+                // Per spec §19.2.1.1: if argument is not a string, return it unchanged
+                if !code_value.is_string() {
+                    ctx.set_register(dst.0, code_value);
+                    return Ok(InstructionResult::Continue);
+                }
+
+                let source = code_value.to_string();
+
+                // Compile and execute eval code via the eval callback
+                match ctx.perform_eval(&source) {
+                    Ok(result) => {
+                        ctx.set_register(dst.0, result);
+                        Ok(InstructionResult::Continue)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+
             Instruction::GetPropConst {
                 dst,
                 obj,
@@ -3615,6 +3673,7 @@ impl Interpreter {
                 if let Some(obj) = object.as_object() {
                     let receiver = object.clone();
                     let key = Self::utf16_key(name_str);
+
                     match obj.lookup_property_descriptor(&key) {
                         Some(crate::object::PropertyDescriptor::Accessor { get, .. }) => {
                             let Some(getter) = get else {
@@ -3713,6 +3772,36 @@ impl Interpreter {
                             Ok(InstructionResult::Continue)
                         }
                     }
+                } else if object.is_number() {
+                    // Autobox number -> Number.prototype
+                    let key = Self::utf16_key(name_str);
+                    if let Some(number_obj) = ctx.get_global("Number").and_then(|v| v.as_object()) {
+                        if let Some(proto) = number_obj
+                            .get(&PropertyKey::string("prototype"))
+                            .and_then(|v| v.as_object())
+                        {
+                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                            ctx.set_register(dst.0, value);
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                    ctx.set_register(dst.0, Value::undefined());
+                    Ok(InstructionResult::Continue)
+                } else if object.is_boolean() {
+                    // Autobox boolean -> Boolean.prototype
+                    let key = Self::utf16_key(name_str);
+                    if let Some(boolean_obj) = ctx.get_global("Boolean").and_then(|v| v.as_object()) {
+                        if let Some(proto) = boolean_obj
+                            .get(&PropertyKey::string("prototype"))
+                            .and_then(|v| v.as_object())
+                        {
+                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                            ctx.set_register(dst.0, value);
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                    ctx.set_register(dst.0, Value::undefined());
+                    Ok(InstructionResult::Continue)
                 } else {
                     ctx.set_register(dst.0, Value::undefined());
                     Ok(InstructionResult::Continue)
@@ -4159,6 +4248,46 @@ impl Interpreter {
                             Ok(InstructionResult::Continue)
                         }
                     }
+                } else if object.is_number() {
+                    // Autobox number -> Number.prototype
+                    let key = if let Some(s) = key_value.as_string() {
+                        PropertyKey::from_js_string(s)
+                    } else {
+                        let key_str = self.to_string(&key_value);
+                        PropertyKey::string(&key_str)
+                    };
+                    if let Some(number_obj) = ctx.get_global("Number").and_then(|v| v.as_object()) {
+                        if let Some(proto) = number_obj
+                            .get(&PropertyKey::string("prototype"))
+                            .and_then(|v| v.as_object())
+                        {
+                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                            ctx.set_register(dst.0, value);
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                    ctx.set_register(dst.0, Value::undefined());
+                    Ok(InstructionResult::Continue)
+                } else if object.is_boolean() {
+                    // Autobox boolean -> Boolean.prototype
+                    let key = if let Some(s) = key_value.as_string() {
+                        PropertyKey::from_js_string(s)
+                    } else {
+                        let key_str = self.to_string(&key_value);
+                        PropertyKey::string(&key_str)
+                    };
+                    if let Some(boolean_obj) = ctx.get_global("Boolean").and_then(|v| v.as_object()) {
+                        if let Some(proto) = boolean_obj
+                            .get(&PropertyKey::string("prototype"))
+                            .and_then(|v| v.as_object())
+                        {
+                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                            ctx.set_register(dst.0, value);
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                    ctx.set_register(dst.0, Value::undefined());
+                    Ok(InstructionResult::Continue)
                 } else {
                     ctx.set_register(dst.0, Value::undefined());
                     Ok(InstructionResult::Continue)
@@ -5505,6 +5634,52 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
+            // ==================== Bitwise operators ====================
+            Instruction::BitAnd { dst, lhs, rhs } => {
+                let l = self.to_int32_from(self.coerce_number(ctx.get_register(lhs.0))?);
+                let r = self.to_int32_from(self.coerce_number(ctx.get_register(rhs.0))?);
+                ctx.set_register(dst.0, Value::number((l & r) as f64));
+                Ok(InstructionResult::Continue)
+            }
+            Instruction::BitOr { dst, lhs, rhs } => {
+                let l = self.to_int32_from(self.coerce_number(ctx.get_register(lhs.0))?);
+                let r = self.to_int32_from(self.coerce_number(ctx.get_register(rhs.0))?);
+                ctx.set_register(dst.0, Value::number((l | r) as f64));
+                Ok(InstructionResult::Continue)
+            }
+            Instruction::BitXor { dst, lhs, rhs } => {
+                let l = self.to_int32_from(self.coerce_number(ctx.get_register(lhs.0))?);
+                let r = self.to_int32_from(self.coerce_number(ctx.get_register(rhs.0))?);
+                ctx.set_register(dst.0, Value::number((l ^ r) as f64));
+                Ok(InstructionResult::Continue)
+            }
+            Instruction::BitNot { dst, src } => {
+                let v = self.to_int32_from(self.coerce_number(ctx.get_register(src.0))?);
+                ctx.set_register(dst.0, Value::number((!v) as f64));
+                Ok(InstructionResult::Continue)
+            }
+            Instruction::Shl { dst, lhs, rhs } => {
+                let l = self.to_int32_from(self.coerce_number(ctx.get_register(lhs.0))?);
+                let r = self.to_uint32_from(self.coerce_number(ctx.get_register(rhs.0))?);
+                let shift = (r & 0x1f) as u32;
+                ctx.set_register(dst.0, Value::number((l.wrapping_shl(shift)) as f64));
+                Ok(InstructionResult::Continue)
+            }
+            Instruction::Shr { dst, lhs, rhs } => {
+                let l = self.to_int32_from(self.coerce_number(ctx.get_register(lhs.0))?);
+                let r = self.to_uint32_from(self.coerce_number(ctx.get_register(rhs.0))?);
+                let shift = (r & 0x1f) as u32;
+                ctx.set_register(dst.0, Value::number((l.wrapping_shr(shift)) as f64));
+                Ok(InstructionResult::Continue)
+            }
+            Instruction::Ushr { dst, lhs, rhs } => {
+                let l = self.to_uint32_from(self.coerce_number(ctx.get_register(lhs.0))?);
+                let r = self.to_uint32_from(self.coerce_number(ctx.get_register(rhs.0))?);
+                let shift = (r & 0x1f) as u32;
+                ctx.set_register(dst.0, Value::number((l.wrapping_shr(shift)) as f64));
+                Ok(InstructionResult::Continue)
+            }
+
             _ => Err(VmError::internal(format!(
                 "Unimplemented instruction: {:?}",
                 instruction
@@ -5533,6 +5708,7 @@ impl Interpreter {
                 let regexp_ctor = global
                     .get(&PropertyKey::string("RegExp"))
                     .unwrap_or_else(Value::undefined);
+
                 let proto = if let Some(ctor) = regexp_ctor.as_object() {
                     ctor.get(&PropertyKey::string("prototype"))
                         .and_then(|v| v.as_object())
@@ -5900,6 +6076,17 @@ impl Interpreter {
                             }
                             return Ok(InstructionResult::Continue);
                         }
+                        InterceptionSignal::EvalCall => {
+                            // Indirect eval: compile and execute in global scope
+                            let code_value = current_args
+                                .first()
+                                .cloned()
+                                .unwrap_or(Value::undefined());
+                            let source = code_value.to_string();
+                            let result = ctx.perform_eval(&source)?;
+                            ctx.set_register(return_reg, result);
+                            return Ok(InstructionResult::Continue);
+                        }
                     }
                 }
                 Err(e) => return Err(e),
@@ -6185,6 +6372,25 @@ impl Interpreter {
             return trimmed.parse::<f64>().unwrap_or(f64::NAN);
         }
         f64::NAN
+    }
+
+    /// ES2023 §7.1.6 ToInt32 — convert f64 to 32-bit signed integer
+    fn to_int32_from(&self, n: f64) -> i32 {
+        if n.is_nan() || n.is_infinite() || n == 0.0 {
+            return 0;
+        }
+        // Truncate to integer, then wrap to i32 via u32
+        let i = n.trunc() as i64;
+        (i as u32) as i32
+    }
+
+    /// ES2023 §7.1.7 ToUint32 — convert f64 to 32-bit unsigned integer
+    fn to_uint32_from(&self, n: f64) -> u32 {
+        if n.is_nan() || n.is_infinite() || n == 0.0 {
+            return 0;
+        }
+        let i = n.trunc() as i64;
+        i as u32
     }
 
     fn make_error(&self, ctx: &VmContext, name: &str, message: &str) -> Value {

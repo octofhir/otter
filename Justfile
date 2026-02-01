@@ -85,21 +85,33 @@ check-project project:
 
 # === Test262 Conformance Tests ===
 
-# Run Test262 tests (all)
+# Run Test262 tests (all). Pass extra args: just test262 --filter foo -vv
 test262 *args:
-    cargo run -p otter-test262 --bin test262 -- {{args}}
+    cargo run -p otter-test262 --bin test262 -- run {{args}}
 
 # Run Test262 tests with filter (e.g., "literals")
 test262-filter filter:
-    cargo run -p otter-test262 --bin test262 -- --filter {{filter}} --verbose
+    cargo run -p otter-test262 --bin test262 -- run --filter {{filter}} -vv
 
 # Run Test262 for specific directory (e.g., "language/expressions")
 test262-dir dir:
-    cargo run -p otter-test262 --bin test262 -- --subdir {{dir}} --verbose
+    cargo run -p otter-test262 --bin test262 -- run --subdir {{dir}} -vv
 
 # List Test262 tests (with optional filter)
 test262-list filter="":
-    cargo run -p otter-test262 -- --list-only {{ if filter != "" { "--filter " + filter } else { "" } }}
+    cargo run -p otter-test262 -- run --list-only {{ if filter != "" { "--filter " + filter } else { "" } }}
+
+# Run Test262 tests and save results to JSON
+test262-save *args:
+    cargo run -p otter-test262 --bin test262 -- run --save {{args}}
+
+# Compare two saved Test262 result files
+test262-compare base new:
+    cargo run -p otter-test262 --bin test262 -- compare --base {{base}} --current {{new}}
+
+# Run Test262 with TOML config override
+test262-config config *args:
+    cargo run -p otter-test262 --bin test262 -- run --config {{config}} {{args}}
 
 # === Node.js Compatibility Tests ===
 

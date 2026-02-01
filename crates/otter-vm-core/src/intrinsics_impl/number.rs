@@ -1,13 +1,20 @@
-//! Number.prototype methods implementation
+//! Number constructor statics and prototype methods (ES2026)
 //!
-//! All Number object methods for ES2026 standard.
+//! ## Constructor statics:
+//! - Constants: EPSILON, MAX_VALUE, MIN_VALUE, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER,
+//!   POSITIVE_INFINITY, NEGATIVE_INFINITY, NaN
+//! - `Number.isFinite()`, `Number.isInteger()`, `Number.isNaN()`, `Number.isSafeInteger()`
+//! - `Number.parseFloat()`, `Number.parseInt()`
+//!
+//! ## Prototype methods:
+//! - `valueOf()`, `toString()`, `toFixed()`, `toPrecision()`, `toExponential()`, `toLocaleString()`
 
 use crate::error::VmError;
 use crate::gc::GcRef;
-use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
+use crate::memory::MemoryManager;
+use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
-use crate::memory::MemoryManager;
 use std::sync::Arc;
 
 /// Wire all Number.prototype methods to the prototype object
@@ -245,4 +252,168 @@ pub fn init_number_prototype(
                 fn_proto,
             )),
         );
+}
+
+/// Install constants and static methods on the Number constructor.
+pub fn install_number_statics(
+    ctor: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+) {
+    // ========================================================================
+    // Constants — §21.1.2.1–2.8
+    // ========================================================================
+    let constant = |name: &str, val: f64| {
+        ctor.define_property(
+            PropertyKey::string(name),
+            PropertyDescriptor::data_with_attrs(
+                Value::number(val),
+                PropertyAttributes::permanent(),
+            ),
+        );
+    };
+    constant("EPSILON", f64::EPSILON);
+    constant("MAX_VALUE", f64::MAX);
+    constant("MIN_VALUE", f64::MIN_POSITIVE);
+    constant("MAX_SAFE_INTEGER", 9007199254740991.0);  // 2^53 - 1
+    constant("MIN_SAFE_INTEGER", -9007199254740991.0); // -(2^53 - 1)
+    constant("POSITIVE_INFINITY", f64::INFINITY);
+    constant("NEGATIVE_INFINITY", f64::NEG_INFINITY);
+    constant("NaN", f64::NAN);
+
+    // ========================================================================
+    // Static methods
+    // ========================================================================
+
+    // Number.isFinite(value) — §21.1.2.2
+    ctor.define_property(
+        PropertyKey::string("isFinite"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |_this, args, _mm| {
+                let val = args.first();
+                match val {
+                    Some(v) if v.is_number() => {
+                        let n = v.as_number().unwrap();
+                        Ok(Value::boolean(n.is_finite()))
+                    }
+                    Some(v) if v.is_int32() => Ok(Value::boolean(true)),
+                    _ => Ok(Value::boolean(false)),
+                }
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Number.isInteger(value) — §21.1.2.3
+    ctor.define_property(
+        PropertyKey::string("isInteger"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |_this, args, _mm| {
+                let val = args.first();
+                match val {
+                    Some(v) if v.is_int32() => Ok(Value::boolean(true)),
+                    Some(v) if v.is_number() => {
+                        let n = v.as_number().unwrap();
+                        Ok(Value::boolean(n.is_finite() && n.fract() == 0.0))
+                    }
+                    _ => Ok(Value::boolean(false)),
+                }
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Number.isNaN(value) — §21.1.2.4
+    ctor.define_property(
+        PropertyKey::string("isNaN"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |_this, args, _mm| {
+                let val = args.first();
+                match val {
+                    Some(v) if v.is_number() => {
+                        let n = v.as_number().unwrap();
+                        Ok(Value::boolean(n.is_nan()))
+                    }
+                    _ => Ok(Value::boolean(false)),
+                }
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Number.isSafeInteger(value) — §21.1.2.5
+    ctor.define_property(
+        PropertyKey::string("isSafeInteger"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |_this, args, _mm| {
+                let val = args.first();
+                match val {
+                    Some(v) if v.is_int32() => Ok(Value::boolean(true)),
+                    Some(v) if v.is_number() => {
+                        let n = v.as_number().unwrap();
+                        let max_safe = 9007199254740991.0; // 2^53 - 1
+                        Ok(Value::boolean(
+                            n.is_finite() && n.fract() == 0.0 && n.abs() <= max_safe,
+                        ))
+                    }
+                    _ => Ok(Value::boolean(false)),
+                }
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Number.parseFloat(string) — §21.1.2.12
+    ctor.define_property(
+        PropertyKey::string("parseFloat"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |_this, args, _mm| {
+                let val = args.first().ok_or("parseFloat requires an argument")?;
+                if let Some(s) = val.as_string() {
+                    let trimmed = s.as_str().trim_start();
+                    if let Ok(n) = trimmed.parse::<f64>() {
+                        Ok(Value::number(n))
+                    } else {
+                        Ok(Value::number(f64::NAN))
+                    }
+                } else {
+                    Ok(Value::number(f64::NAN))
+                }
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Number.parseInt(string, radix) — §21.1.2.13
+    ctor.define_property(
+        PropertyKey::string("parseInt"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |_this, args, _mm| {
+                let val = args.first().ok_or("parseInt requires an argument")?;
+                let radix = args.get(1).and_then(|v| v.as_int32()).unwrap_or(10);
+
+                if radix < 2 || radix > 36 {
+                    return Ok(Value::number(f64::NAN));
+                }
+
+                if let Some(s) = val.as_string() {
+                    let trimmed = s.as_str().trim_start();
+                    if let Ok(n) = i64::from_str_radix(trimmed, radix as u32) {
+                        Ok(Value::number(n as f64))
+                    } else {
+                        Ok(Value::number(f64::NAN))
+                    }
+                } else {
+                    Ok(Value::number(f64::NAN))
+                }
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
 }

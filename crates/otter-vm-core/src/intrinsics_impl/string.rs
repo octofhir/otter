@@ -557,7 +557,7 @@ pub fn init_string_prototype(
             )),
         );
 
-        // String.prototype.split
+        // String.prototype.split (ES2026 §22.1.3.22)
         string_proto.define_property(
             PropertyKey::string("split"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
@@ -565,6 +565,24 @@ pub fn init_string_prototype(
                     let s = this_val
                         .as_string()
                         .ok_or_else(|| "String.prototype.split: not a string".to_string())?;
+
+                    // If separator is a RegExp, delegate to Symbol.split
+                    if let Some(sep) = args.first() {
+                        if let Some(regex) = sep.as_regex() {
+                            let method = regex
+                                .object
+                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::SPLIT))
+                                .unwrap_or_else(Value::undefined);
+                            if let Some(func) = method.as_native_function() {
+                                let mut sym_args = vec![Value::string(s.clone())];
+                                if let Some(limit) = args.get(1) {
+                                    sym_args.push(limit.clone());
+                                }
+                                return func(sep, &sym_args, mm_inner);
+                            }
+                        }
+                    }
+
                     let str_val = s.as_str();
                     let separator = args.first();
                     let limit = args
@@ -603,6 +621,260 @@ pub fn init_string_prototype(
                         );
                     }
                     Ok(Value::array(result))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // String.prototype.replace (ES2026 §22.1.3.19)
+        string_proto.define_property(
+            PropertyKey::string("replace"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let s = this_val
+                        .as_string()
+                        .ok_or_else(|| "String.prototype.replace: not a string".to_string())?;
+
+                    // If searchValue is a RegExp, delegate to Symbol.replace
+                    if let Some(search_val) = args.first() {
+                        if let Some(regex) = search_val.as_regex() {
+                            let method = regex
+                                .object
+                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::REPLACE))
+                                .unwrap_or_else(Value::undefined);
+                            if let Some(func) = method.as_native_function() {
+                                let mut sym_args = vec![Value::string(s.clone())];
+                                if let Some(replacement) = args.get(1) {
+                                    sym_args.push(replacement.clone());
+                                }
+                                return func(search_val, &sym_args, mm_inner);
+                            }
+                        }
+                    }
+
+                    // String-based replace (first occurrence only)
+                    let str_val = s.as_str();
+                    let search = args
+                        .first()
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_default();
+                    let replacement = args
+                        .get(1)
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_default();
+
+                    if let Some(pos) = str_val.find(&search) {
+                        let result = format!(
+                            "{}{}{}",
+                            &str_val[..pos],
+                            replacement,
+                            &str_val[pos + search.len()..]
+                        );
+                        Ok(Value::string(JsString::intern(&result)))
+                    } else {
+                        Ok(Value::string(s))
+                    }
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // String.prototype.replaceAll (ES2021 §22.1.3.20)
+        string_proto.define_property(
+            PropertyKey::string("replaceAll"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let s = this_val
+                        .as_string()
+                        .ok_or_else(|| "String.prototype.replaceAll: not a string".to_string())?;
+
+                    // If searchValue is a RegExp, it must have global flag
+                    if let Some(search_val) = args.first() {
+                        if let Some(regex) = search_val.as_regex() {
+                            if !regex.flags.contains('g') {
+                                return Err(VmError::type_error(
+                                    "String.prototype.replaceAll called with a non-global RegExp argument",
+                                ));
+                            }
+                            let method = regex
+                                .object
+                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::REPLACE))
+                                .unwrap_or_else(Value::undefined);
+                            if let Some(func) = method.as_native_function() {
+                                let mut sym_args = vec![Value::string(s.clone())];
+                                if let Some(replacement) = args.get(1) {
+                                    sym_args.push(replacement.clone());
+                                }
+                                return func(search_val, &sym_args, mm_inner);
+                            }
+                        }
+                    }
+
+                    // String-based replaceAll
+                    let str_val = s.as_str();
+                    let search = args
+                        .first()
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_default();
+                    let replacement = args
+                        .get(1)
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_default();
+
+                    let result = str_val.replace(&search, &replacement);
+                    Ok(Value::string(JsString::intern(&result)))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // String.prototype.search (ES2026 §22.1.3.21)
+        string_proto.define_property(
+            PropertyKey::string("search"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let s = this_val
+                        .as_string()
+                        .ok_or_else(|| "String.prototype.search: not a string".to_string())?;
+
+                    // If regexp is a RegExp, delegate to Symbol.search
+                    if let Some(search_val) = args.first() {
+                        if let Some(regex) = search_val.as_regex() {
+                            let method = regex
+                                .object
+                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::SEARCH))
+                                .unwrap_or_else(Value::undefined);
+                            if let Some(func) = method.as_native_function() {
+                                let sym_args = vec![Value::string(s.clone())];
+                                return func(search_val, &sym_args, mm_inner);
+                            }
+                        }
+                    }
+
+                    // String-based search (indexOf behavior)
+                    let str_val = s.as_str();
+                    let search = args
+                        .first()
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_default();
+                    match str_val.find(&search) {
+                        Some(pos) => Ok(Value::int32(pos as i32)),
+                        None => Ok(Value::int32(-1)),
+                    }
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // String.prototype.match (ES2026 §22.1.3.12)
+        string_proto.define_property(
+            PropertyKey::string("match"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let s = this_val
+                        .as_string()
+                        .ok_or_else(|| "String.prototype.match: not a string".to_string())?;
+
+                    // If regexp is a RegExp, delegate to Symbol.match
+                    if let Some(search_val) = args.first() {
+                        if let Some(regex) = search_val.as_regex() {
+                            let method = regex
+                                .object
+                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::MATCH))
+                                .unwrap_or_else(Value::undefined);
+                            if let Some(func) = method.as_native_function() {
+                                let sym_args = vec![Value::string(s.clone())];
+                                return func(search_val, &sym_args, mm_inner);
+                            }
+                        }
+                    }
+
+                    // String-based match: create a non-global RegExp and delegate
+                    // For now, simple indexOf-based fallback
+                    let str_val = s.as_str();
+                    let search = args
+                        .first()
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_default();
+                    match str_val.find(&search) {
+                        Some(pos) => {
+                            let arr = GcRef::new(JsObject::array(1, mm_inner));
+                            arr.set(PropertyKey::Index(0), Value::string(JsString::intern(&search)));
+                            arr.set(PropertyKey::string("index"), Value::number(pos as f64));
+                            arr.set(PropertyKey::string("input"), Value::string(s.clone()));
+                            arr.set(PropertyKey::string("groups"), Value::undefined());
+                            Ok(Value::array(arr))
+                        }
+                        None => Ok(Value::null()),
+                    }
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // String.prototype.matchAll (ES2020 §22.1.3.13)
+        string_proto.define_property(
+            PropertyKey::string("matchAll"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let s = this_val
+                        .as_string()
+                        .ok_or_else(|| "String.prototype.matchAll: not a string".to_string())?;
+
+                    // If regexp is a RegExp, delegate to Symbol.matchAll
+                    if let Some(search_val) = args.first() {
+                        if let Some(regex) = search_val.as_regex() {
+                            if !regex.flags.contains('g') {
+                                return Err(VmError::type_error(
+                                    "String.prototype.matchAll called with a non-global RegExp argument",
+                                ));
+                            }
+                            let method = regex
+                                .object
+                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::MATCH_ALL))
+                                .unwrap_or_else(Value::undefined);
+                            if let Some(func) = method.as_native_function() {
+                                let sym_args = vec![Value::string(s.clone())];
+                                return func(search_val, &sym_args, mm_inner);
+                            }
+                        }
+                    }
+
+                    // String-based matchAll: find all occurrences of string
+                    let str_val = s.as_str();
+                    let search = args
+                        .first()
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_default();
+                    let mut results = Vec::new();
+                    let mut start = 0;
+                    while let Some(pos) = str_val[start..].find(&search) {
+                        let abs_pos = start + pos;
+                        let match_arr = GcRef::new(JsObject::array(1, mm_inner.clone()));
+                        match_arr.set(PropertyKey::Index(0), Value::string(JsString::intern(&search)));
+                        match_arr.set(PropertyKey::string("index"), Value::number(abs_pos as f64));
+                        match_arr.set(PropertyKey::string("input"), Value::string(s.clone()));
+                        match_arr.set(PropertyKey::string("groups"), Value::undefined());
+                        results.push(Value::array(match_arr));
+                        start = abs_pos + search.len().max(1);
+                    }
+                    let arr = GcRef::new(JsObject::array(results.len(), mm_inner));
+                    for (i, val) in results.into_iter().enumerate() {
+                        arr.set(PropertyKey::Index(i as u32), val);
+                    }
+                    Ok(Value::array(arr))
                 },
                 mm.clone(),
                 fn_proto,

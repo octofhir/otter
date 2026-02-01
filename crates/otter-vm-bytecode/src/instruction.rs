@@ -168,6 +168,8 @@ pub enum Opcode {
     CallWithReceiver = 0x89,
     /// Create arguments object: dst = arguments
     CreateArguments = 0x8A,
+    /// Call eval: dst = eval(code)
+    CallEval = 0x8B,
 
     // ==================== Control Flow ====================
     /// Unconditional jump
@@ -327,6 +329,7 @@ impl Opcode {
             0x88 => Some(Self::ConstructSpread),
             0x89 => Some(Self::CallWithReceiver),
             0x8A => Some(Self::CreateArguments),
+            0x8B => Some(Self::CallEval),
 
             0x90 => Some(Self::Jump),
             0x91 => Some(Self::JumpIfTrue),
@@ -457,6 +460,7 @@ impl Opcode {
             Self::ConstructSpread => "ConstructSpread",
             Self::CallWithReceiver => "CallWithReceiver",
             Self::CreateArguments => "CreateArguments",
+            Self::CallEval => "CallEval",
             // Control flow
             Self::Jump => "Jump",
             Self::JumpIfTrue => "JumpIfTrue",
@@ -879,6 +883,11 @@ pub enum Instruction {
     /// Create arguments object for current function
     CreateArguments {
         dst: Register,
+    },
+    /// Call eval: dst = eval(code_reg)
+    CallEval {
+        dst: Register,
+        code: Register,
     },
     CallWithReceiver {
         dst: Register,

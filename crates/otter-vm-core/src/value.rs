@@ -683,6 +683,7 @@ impl Value {
             Some(HeapRef::Generator(g)) => Some(g.object),
             Some(HeapRef::RegExp(r)) => Some(r.object),
             Some(HeapRef::ArrayBuffer(ab)) => Some(ab.object),
+            Some(HeapRef::TypedArray(ta)) => Some(ta.object),
             _ => None,
         }
     }

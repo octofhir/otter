@@ -17,6 +17,8 @@
 //! - `map_set` - Map/Set/WeakMap/WeakSet constructors and prototype methods (ES2026)
 //! - `regexp` - RegExp constructor and prototype methods (ES2026)
 //! - `promise` - Promise constructor statics and prototype methods (ES2026)
+//! - `generator` - Generator.prototype and AsyncGenerator.prototype methods (ES2026)
+//! - `typed_array` - %TypedArray%.prototype and all 11 typed array prototypes (ES2026)
 
 pub mod helpers;
 pub mod date;
@@ -31,3 +33,5 @@ pub mod reflect;
 pub mod map_set;
 pub mod regexp;
 pub mod promise;
+pub mod generator;
+pub mod typed_array;

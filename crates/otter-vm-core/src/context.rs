@@ -144,6 +144,10 @@ pub struct VmContext {
     /// interpreter can assign it as [[Prototype]] on closures
     /// and native functions without a global lookup.
     function_prototype_intrinsic: Option<GcRef<JsObject>>,
+    /// Intrinsic `%GeneratorPrototype%` object (ES2026 §27.5.1).
+    generator_prototype_intrinsic: Option<GcRef<JsObject>>,
+    /// Intrinsic `%AsyncGeneratorPrototype%` object (ES2026 §27.6.1).
+    async_generator_prototype_intrinsic: Option<GcRef<JsObject>>,
     /// Eval compiler callback: compiles eval source code into a Module.
     /// Set by otter-vm-runtime to bridge the compiler (which otter-vm-core
     /// cannot depend on directly). The interpreter handles execution.
@@ -245,6 +249,8 @@ impl VmContext {
             scope_markers: Vec::new(),
             debug_snapshot: None,
             function_prototype_intrinsic: None,
+            generator_prototype_intrinsic: None,
+            async_generator_prototype_intrinsic: None,
             eval_fn: None,
         }
     }
@@ -648,6 +654,26 @@ impl VmContext {
     /// Called by VmRuntime during context creation.
     pub fn set_function_prototype_intrinsic(&mut self, proto: GcRef<JsObject>) {
         self.function_prototype_intrinsic = Some(proto);
+    }
+
+    /// Set the intrinsic `%GeneratorPrototype%` object.
+    pub fn set_generator_prototype_intrinsic(&mut self, proto: GcRef<JsObject>) {
+        self.generator_prototype_intrinsic = Some(proto);
+    }
+
+    /// Get the intrinsic `%GeneratorPrototype%` object.
+    pub fn generator_prototype_intrinsic(&self) -> Option<GcRef<JsObject>> {
+        self.generator_prototype_intrinsic
+    }
+
+    /// Set the intrinsic `%AsyncGeneratorPrototype%` object.
+    pub fn set_async_generator_prototype_intrinsic(&mut self, proto: GcRef<JsObject>) {
+        self.async_generator_prototype_intrinsic = Some(proto);
+    }
+
+    /// Get the intrinsic `%AsyncGeneratorPrototype%` object.
+    pub fn async_generator_prototype_intrinsic(&self) -> Option<GcRef<JsObject>> {
+        self.async_generator_prototype_intrinsic
     }
 
     /// Set the eval compiler callback used by the interpreter to compile

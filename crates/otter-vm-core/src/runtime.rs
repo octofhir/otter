@@ -84,7 +84,7 @@ impl VmRuntime {
         intrinsics.init_core(&memory_manager);
 
         let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
-        globals::setup_global_object(global, function_prototype);
+        globals::setup_global_object(global, function_prototype, Some(&intrinsics));
         // Install intrinsic constructors on global (Object, Function, etc.)
         intrinsics.install_on_global(global, &memory_manager);
 
@@ -116,7 +116,7 @@ impl VmRuntime {
         // Clone global object for isolation
         // TODO: Proper cloning with prototype chain
         let global = GcRef::new(JsObject::new(None, self.memory_manager.clone()));
-        globals::setup_global_object(global, self.function_prototype);
+        globals::setup_global_object(global, self.function_prototype, Some(&self.intrinsics));
 
         // Install intrinsic constructors on the new global
         self.intrinsics
@@ -129,6 +129,8 @@ impl VmRuntime {
             Arc::clone(&self.memory_manager),
         );
         ctx.set_function_prototype_intrinsic(self.function_prototype);
+        ctx.set_generator_prototype_intrinsic(self.intrinsics.generator_prototype);
+        ctx.set_async_generator_prototype_intrinsic(self.intrinsics.async_generator_prototype);
         ctx
     }
 

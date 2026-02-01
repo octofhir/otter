@@ -92,6 +92,16 @@ impl Test262Runner {
         }
     }
 
+    /// Rebuild engine after a panic to restore consistent state.
+    fn rebuild_engine(&mut self) {
+        let (harness_ext, harness_state) =
+            crate::harness::create_harness_extension_with_state();
+        self.engine = EngineBuilder::new()
+            .extension(harness_ext)
+            .build();
+        self.harness_state = harness_state;
+    }
+
     /// Create a new test runner that skips no features (runs everything).
     pub fn new_no_skip(test_dir: impl AsRef<Path>) -> Self {
         let mut runner = Self::new(test_dir);
@@ -465,7 +475,7 @@ impl Test262Runner {
         timeout: Option<Duration>,
         _test_name: &str,
     ) -> Result<Value, OtterError> {
-        if let Some(duration) = timeout {
+        let result = if let Some(duration) = timeout {
             // Cooperative timeout: spawn a tokio task as watchdog on a separate
             // worker thread (runtime is multi-threaded). It sets the interrupt
             // flag after the deadline; the VM checks it every ~10K instructions.
@@ -477,11 +487,7 @@ impl Test262Runner {
 
             let result = AssertUnwindSafe(self.engine.eval(source))
                 .catch_unwind()
-                .await
-                .unwrap_or_else(|panic| {
-                    let msg = extract_panic_message(&panic);
-                    Err(OtterError::Runtime(format!("VM panic: {}", msg)))
-                });
+                .await;
 
             // Cancel watchdog if test finished before timeout
             watchdog.abort();
@@ -491,10 +497,16 @@ impl Test262Runner {
             AssertUnwindSafe(self.engine.eval(source))
                 .catch_unwind()
                 .await
-                .unwrap_or_else(|panic| {
-                    let msg = extract_panic_message(&panic);
-                    Err(OtterError::Runtime(format!("VM panic: {}", msg)))
-                })
+        };
+
+        match result {
+            Ok(val) => val,
+            Err(panic) => {
+                let msg = extract_panic_message(&panic);
+                // Engine state may be corrupted after a panic — rebuild it.
+                self.rebuild_engine();
+                Err(OtterError::Runtime(format!("VM panic: {}", msg)))
+            }
         }
     }
 }

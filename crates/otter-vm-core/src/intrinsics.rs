@@ -147,6 +147,42 @@ pub struct Intrinsics {
     pub async_iterator_prototype: GcRef<JsObject>,
 
     // ========================================================================
+    // Generator prototypes
+    // ========================================================================
+    /// `%GeneratorPrototype%` — ES2026 §27.5.1
+    pub generator_prototype: GcRef<JsObject>,
+    /// `%AsyncGeneratorPrototype%` — ES2026 §27.6.1
+    pub async_generator_prototype: GcRef<JsObject>,
+
+    // ========================================================================
+    // TypedArray prototypes
+    // ========================================================================
+    /// `%TypedArray%.prototype` — ES2026 §22.2.3 (common prototype for all typed arrays)
+    pub typed_array_prototype: GcRef<JsObject>,
+    /// `Int8Array.prototype`
+    pub int8_array_prototype: GcRef<JsObject>,
+    /// `Uint8Array.prototype`
+    pub uint8_array_prototype: GcRef<JsObject>,
+    /// `Uint8ClampedArray.prototype`
+    pub uint8_clamped_array_prototype: GcRef<JsObject>,
+    /// `Int16Array.prototype`
+    pub int16_array_prototype: GcRef<JsObject>,
+    /// `Uint16Array.prototype`
+    pub uint16_array_prototype: GcRef<JsObject>,
+    /// `Int32Array.prototype`
+    pub int32_array_prototype: GcRef<JsObject>,
+    /// `Uint32Array.prototype`
+    pub uint32_array_prototype: GcRef<JsObject>,
+    /// `Float32Array.prototype`
+    pub float32_array_prototype: GcRef<JsObject>,
+    /// `Float64Array.prototype`
+    pub float64_array_prototype: GcRef<JsObject>,
+    /// `BigInt64Array.prototype`
+    pub bigint64_array_prototype: GcRef<JsObject>,
+    /// `BigUint64Array.prototype`
+    pub biguint64_array_prototype: GcRef<JsObject>,
+
+    // ========================================================================
     // Well-known symbols (Value::symbol)
     // ========================================================================
     /// `Symbol.iterator`
@@ -234,6 +270,22 @@ impl Intrinsics {
             // Iterators
             iterator_prototype: alloc(),
             async_iterator_prototype: alloc(),
+            // Generators
+            generator_prototype: alloc(),
+            async_generator_prototype: alloc(),
+            // TypedArrays
+            typed_array_prototype: alloc(),
+            int8_array_prototype: alloc(),
+            uint8_array_prototype: alloc(),
+            uint8_clamped_array_prototype: alloc(),
+            int16_array_prototype: alloc(),
+            uint16_array_prototype: alloc(),
+            int32_array_prototype: alloc(),
+            uint32_array_prototype: alloc(),
+            float32_array_prototype: alloc(),
+            float64_array_prototype: alloc(),
+            bigint64_array_prototype: alloc(),
+            biguint64_array_prototype: alloc(),
             // Well-known symbols
             symbol_iterator: make_symbol(well_known::ITERATOR, "Symbol.iterator"),
             symbol_async_iterator: make_symbol(well_known::ASYNC_ITERATOR, "Symbol.asyncIterator"),
@@ -285,6 +337,20 @@ impl Intrinsics {
             result.data_view_prototype,
             result.iterator_prototype,
             result.async_iterator_prototype,
+            result.generator_prototype,
+            result.async_generator_prototype,
+            result.typed_array_prototype,
+            result.int8_array_prototype,
+            result.uint8_array_prototype,
+            result.uint8_clamped_array_prototype,
+            result.int16_array_prototype,
+            result.uint16_array_prototype,
+            result.int32_array_prototype,
+            result.uint32_array_prototype,
+            result.float32_array_prototype,
+            result.float64_array_prototype,
+            result.bigint64_array_prototype,
+            result.biguint64_array_prototype,
         ];
         for obj in all_intrinsic_objects {
             (*obj).mark_as_intrinsic();
@@ -347,6 +413,36 @@ impl Intrinsics {
         // AsyncIteratorPrototype.[[Prototype]] = Object.prototype
         self.async_iterator_prototype
             .set_prototype(Some(self.object_prototype));
+
+        // Generator.prototype.[[Prototype]] = Iterator.prototype (ES2026 §27.5.1)
+        self.generator_prototype
+            .set_prototype(Some(self.iterator_prototype));
+
+        // AsyncGenerator.prototype.[[Prototype]] = AsyncIterator.prototype
+        self.async_generator_prototype
+            .set_prototype(Some(self.async_iterator_prototype));
+
+        // %TypedArray%.prototype.[[Prototype]] = Object.prototype (ES2026 §22.2.3)
+        self.typed_array_prototype
+            .set_prototype(Some(self.object_prototype));
+
+        // All specific TypedArray prototypes chain to %TypedArray%.prototype
+        let typed_array_protos = [
+            self.int8_array_prototype,
+            self.uint8_array_prototype,
+            self.uint8_clamped_array_prototype,
+            self.int16_array_prototype,
+            self.uint16_array_prototype,
+            self.int32_array_prototype,
+            self.uint32_array_prototype,
+            self.float32_array_prototype,
+            self.float64_array_prototype,
+            self.bigint64_array_prototype,
+            self.biguint64_array_prototype,
+        ];
+        for proto in &typed_array_protos {
+            proto.set_prototype(Some(self.typed_array_prototype));
+        }
 
         // Constructor objects: [[Prototype]] = Function.prototype
         let ctors = [self.object_constructor, self.function_constructor];
@@ -1445,7 +1541,13 @@ impl Intrinsics {
         // ===================================================================
         // String.prototype methods (extracted to intrinsics_impl/string.rs)
         // ===================================================================
-        crate::intrinsics_impl::string::init_string_prototype(self.string_prototype, fn_proto, mm);
+        crate::intrinsics_impl::string::init_string_prototype(
+            self.string_prototype,
+            fn_proto,
+            mm,
+            self.iterator_prototype,
+            well_known::ITERATOR,
+        );
 
 
         // ====================================================================
@@ -1496,8 +1598,20 @@ impl Intrinsics {
         // ===================================================================
         // Map/Set/WeakMap/WeakSet prototype methods (extracted to intrinsics_impl/map_set.rs)
         // ===================================================================
-        crate::intrinsics_impl::map_set::init_map_prototype(self.map_prototype, fn_proto, mm);
-        crate::intrinsics_impl::map_set::init_set_prototype(self.set_prototype, fn_proto, mm);
+        crate::intrinsics_impl::map_set::init_map_prototype(
+            self.map_prototype,
+            fn_proto,
+            mm,
+            self.iterator_prototype,
+            well_known::ITERATOR,
+        );
+        crate::intrinsics_impl::map_set::init_set_prototype(
+            self.set_prototype,
+            fn_proto,
+            mm,
+            self.iterator_prototype,
+            well_known::ITERATOR,
+        );
         crate::intrinsics_impl::map_set::init_weak_map_prototype(self.weak_map_prototype, fn_proto, mm);
         crate::intrinsics_impl::map_set::init_weak_set_prototype(self.weak_set_prototype, fn_proto, mm);
 
@@ -1510,6 +1624,94 @@ impl Intrinsics {
         // Promise.prototype methods (extracted to intrinsics_impl/promise.rs)
         // ===================================================================
         crate::intrinsics_impl::promise::init_promise_prototype(self.promise_prototype, fn_proto, mm);
+
+        // ===================================================================
+        // Generator.prototype and AsyncGenerator.prototype methods
+        // ===================================================================
+        crate::intrinsics_impl::generator::init_generator_prototype(
+            self.generator_prototype,
+            fn_proto,
+            mm,
+            well_known::ITERATOR,
+            well_known::TO_STRING_TAG,
+        );
+
+        crate::intrinsics_impl::generator::init_async_generator_prototype(
+            self.async_generator_prototype,
+            fn_proto,
+            mm,
+            well_known::ASYNC_ITERATOR,
+            well_known::TO_STRING_TAG,
+        );
+
+        // ===================================================================
+        // %TypedArray%.prototype and all specific TypedArray prototypes
+        // ===================================================================
+        crate::intrinsics_impl::typed_array::init_typed_array_prototype(
+            self.typed_array_prototype,
+            fn_proto,
+            mm,
+            well_known::ITERATOR,
+            well_known::TO_STRING_TAG,
+        );
+
+        // Initialize each specific typed array prototype
+        use crate::typed_array::TypedArrayKind;
+        crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
+            self.int8_array_prototype,
+            TypedArrayKind::Int8,
+            well_known::TO_STRING_TAG,
+        );
+        crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
+            self.uint8_array_prototype,
+            TypedArrayKind::Uint8,
+            well_known::TO_STRING_TAG,
+        );
+        crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
+            self.uint8_clamped_array_prototype,
+            TypedArrayKind::Uint8Clamped,
+            well_known::TO_STRING_TAG,
+        );
+        crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
+            self.int16_array_prototype,
+            TypedArrayKind::Int16,
+            well_known::TO_STRING_TAG,
+        );
+        crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
+            self.uint16_array_prototype,
+            TypedArrayKind::Uint16,
+            well_known::TO_STRING_TAG,
+        );
+        crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
+            self.int32_array_prototype,
+            TypedArrayKind::Int32,
+            well_known::TO_STRING_TAG,
+        );
+        crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
+            self.uint32_array_prototype,
+            TypedArrayKind::Uint32,
+            well_known::TO_STRING_TAG,
+        );
+        crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
+            self.float32_array_prototype,
+            TypedArrayKind::Float32,
+            well_known::TO_STRING_TAG,
+        );
+        crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
+            self.float64_array_prototype,
+            TypedArrayKind::Float64,
+            well_known::TO_STRING_TAG,
+        );
+        crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
+            self.bigint64_array_prototype,
+            TypedArrayKind::BigInt64,
+            well_known::TO_STRING_TAG,
+        );
+        crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
+            self.biguint64_array_prototype,
+            TypedArrayKind::BigUint64,
+            well_known::TO_STRING_TAG,
+        );
     }
 
     /// Install intrinsic constructors on the global object.

@@ -1,0 +1,735 @@
+//! TypedArray prototypes and methods (ES2026 §22.2)
+//!
+//! Implements %TypedArray%.prototype and all 11 typed array prototypes:
+//! - Int8Array, Uint8Array, Uint8ClampedArray
+//! - Int16Array, Uint16Array
+//! - Int32Array, Uint32Array
+//! - Float32Array, Float64Array
+//! - BigInt64Array, BigUint64Array
+//!
+//! ## Prototype Chain
+//!
+//! ```text
+//! instance → Int8Array.prototype → %TypedArray%.prototype → Object.prototype → null
+//! ```
+
+use std::sync::Arc;
+
+use crate::error::VmError;
+use crate::gc::GcRef;
+use crate::memory::MemoryManager;
+use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
+use crate::string::JsString;
+use crate::typed_array::{JsTypedArray, TypedArrayKind};
+use crate::value::Value;
+
+// ============================================================================
+// %TypedArray%.prototype initialization
+// ============================================================================
+
+/// Initialize %TypedArray%.prototype with common methods shared by all typed arrays.
+///
+/// This implements ES2026 §22.2.3 - Properties of the %TypedArray% Prototype Object.
+pub fn init_typed_array_prototype(
+    proto: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+    symbol_iterator_id: u64,
+    symbol_to_string_tag_id: u64,
+) {
+    // Getters (ES2026 §22.2.3.1-4)
+    init_typed_array_getters(proto, fn_proto, mm);
+
+    // Methods (ES2026 §22.2.3.5-32)
+    init_typed_array_methods(proto, fn_proto, mm);
+
+    // Iterators (ES2026 §22.2.3.6, 11, 29, 31)
+    init_typed_array_iterators(proto, fn_proto, mm, symbol_iterator_id);
+
+    // %TypedArray%.prototype[Symbol.toStringTag] = "TypedArray"
+    proto.define_property(
+        PropertyKey::Symbol(symbol_to_string_tag_id),
+        PropertyDescriptor::data_with_attrs(
+            Value::string(JsString::intern("TypedArray")),
+            PropertyAttributes {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        ),
+    );
+}
+
+/// Initialize individual typed array prototype (Int8Array.prototype, etc.)
+///
+/// Each specific prototype gets its own Symbol.toStringTag.
+pub fn init_specific_typed_array_prototype(
+    proto: GcRef<JsObject>,
+    kind: TypedArrayKind,
+    symbol_to_string_tag_id: u64,
+) {
+    // Int8Array.prototype[Symbol.toStringTag] = "Int8Array"
+    proto.define_property(
+        PropertyKey::Symbol(symbol_to_string_tag_id),
+        PropertyDescriptor::data_with_attrs(
+            Value::string(JsString::intern(kind.name())),
+            PropertyAttributes {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        ),
+    );
+}
+
+// ============================================================================
+// Getters
+// ============================================================================
+
+/// Helper to get TypedArray from this_val (handles both direct value and hidden property)
+fn get_typed_array(this_val: &Value) -> Result<Arc<JsTypedArray>, VmError> {
+    // Try to get TypedArray from the value directly first
+    if let Some(ta) = this_val.as_typed_array() {
+        return Ok(Arc::clone(ta));
+    }
+
+    // If this_val is an object, try to get the TypedArray from a hidden property
+    if let Some(obj) = this_val.as_object() {
+        if let Some(ta_val) = obj.get(&PropertyKey::string("__TypedArrayData__")) {
+            if let Some(ta) = ta_val.as_typed_array() {
+                return Ok(Arc::clone(ta));
+            }
+        }
+    }
+
+    Err(VmError::type_error("Method called on non-TypedArray"))
+}
+
+fn init_typed_array_getters(
+    proto: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+) {
+    // get %TypedArray%.prototype.buffer (ES2026 §22.2.3.1)
+    proto.define_property(
+        PropertyKey::string("buffer"),
+        PropertyDescriptor::getter(Value::native_function_with_proto(
+            |this_val, _args, _mm| {
+                let ta = get_typed_array(this_val)?;
+                Ok(Value::array_buffer(ta.buffer().clone()))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // get %TypedArray%.prototype.byteLength (ES2026 §22.2.3.2)
+    proto.define_property(
+        PropertyKey::string("byteLength"),
+        PropertyDescriptor::getter(Value::native_function_with_proto(
+            |this_val, _args, _mm| {
+                let ta = get_typed_array(this_val)?;
+                Ok(Value::int32(ta.byte_length() as i32))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // get %TypedArray%.prototype.byteOffset (ES2026 §22.2.3.3)
+    proto.define_property(
+        PropertyKey::string("byteOffset"),
+        PropertyDescriptor::getter(Value::native_function_with_proto(
+            |this_val, _args, _mm| {
+                let ta = get_typed_array(this_val)?;
+                Ok(Value::int32(ta.byte_offset() as i32))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // get %TypedArray%.prototype.length (ES2026 §22.2.3.4)
+    proto.define_property(
+        PropertyKey::string("length"),
+        PropertyDescriptor::getter(Value::native_function_with_proto(
+            |this_val, _args, _mm| {
+                let ta = get_typed_array(this_val)?;
+                Ok(Value::int32(ta.length() as i32))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+}
+
+// ============================================================================
+// Methods
+// ============================================================================
+
+fn init_typed_array_methods(
+    proto: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+) {
+    // %TypedArray%.prototype.at(index) — ES2022 §22.2.3.5
+    proto.define_property(
+        PropertyKey::string("at"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let ta = get_typed_array(this_val)?;
+
+                let index = args.first()
+                    .and_then(|v| v.as_int32())
+                    .unwrap_or(0);
+
+                let length = ta.length() as i32;
+                let actual_index = if index < 0 {
+                    (length + index) as usize
+                } else {
+                    index as usize
+                };
+
+                if actual_index >= ta.length() {
+                    return Ok(Value::undefined());
+                }
+
+                match ta.get(actual_index) {
+                    Some(val) => Ok(Value::number(val)),
+                    None => Ok(Value::undefined()),
+                }
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.copyWithin(target, start, end) — ES2026 §22.2.3.8
+    proto.define_property(
+        PropertyKey::string("copyWithin"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let ta = get_typed_array(this_val)?;
+
+                let target = args.get(0)
+                    .and_then(|v| v.as_int32())
+                    .unwrap_or(0) as i64;
+                let start = args.get(1)
+                    .and_then(|v| v.as_int32())
+                    .unwrap_or(0) as i64;
+                let end = args.get(2)
+                    .and_then(|v| v.as_int32())
+                    .map(|v| v as i64);
+
+                ta.copy_within(target, start, end);
+
+                Ok(this_val.clone())
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.fill(value, start, end) — ES2026 §22.2.3.11
+    proto.define_property(
+        PropertyKey::string("fill"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let ta = get_typed_array(this_val)?;
+
+                let value = args.first()
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0);
+
+                let start = args.get(1)
+                    .and_then(|v| v.as_int32())
+                    .map(|v| v as i64);
+
+                let end = args.get(2)
+                    .and_then(|v| v.as_int32())
+                    .map(|v| v as i64);
+
+                ta.fill(value, start, end);
+
+                Ok(this_val.clone())
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.includes(searchElement, fromIndex) — ES2026 §22.2.3.13
+    proto.define_property(
+        PropertyKey::string("includes"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let ta = get_typed_array(this_val)?;
+
+                let search = args.first()
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(f64::NAN);
+
+                let from_index = args.get(1)
+                    .and_then(|v| v.as_int32())
+                    .unwrap_or(0) as usize;
+
+                for i in from_index..ta.length() {
+                    if let Some(val) = ta.get(i) {
+                        if (val.is_nan() && search.is_nan()) || val == search {
+                            return Ok(Value::boolean(true));
+                        }
+                    }
+                }
+
+                Ok(Value::boolean(false))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.indexOf(searchElement, fromIndex) — ES2026 §22.2.3.14
+    proto.define_property(
+        PropertyKey::string("indexOf"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let ta = get_typed_array(this_val)?;
+
+                let search = args.first()
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(f64::NAN);
+
+                let from_index = args.get(1)
+                    .and_then(|v| v.as_int32())
+                    .unwrap_or(0) as usize;
+
+                for i in from_index..ta.length() {
+                    if let Some(val) = ta.get(i) {
+                        if val == search {
+                            return Ok(Value::int32(i as i32));
+                        }
+                    }
+                }
+
+                Ok(Value::int32(-1))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.join(separator) — ES2026 §22.2.3.15
+    proto.define_property(
+        PropertyKey::string("join"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let ta = get_typed_array(this_val)?;
+
+                let separator = args.first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.as_str().to_owned())
+                    .unwrap_or_else(|| ",".to_owned());
+
+                let mut result = String::new();
+                for i in 0..ta.length() {
+                    if i > 0 {
+                        result.push_str(&separator);
+                    }
+                    if let Some(val) = ta.get(i) {
+                        result.push_str(&val.to_string());
+                    }
+                }
+
+                Ok(Value::string(JsString::intern(&result)))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.lastIndexOf(searchElement, fromIndex) — ES2026 §22.2.3.16
+    proto.define_property(
+        PropertyKey::string("lastIndexOf"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let ta = get_typed_array(this_val)?;
+
+                let search = args.first()
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(f64::NAN);
+
+                let from_index = args.get(1)
+                    .and_then(|v| v.as_int32())
+                    .map(|v| v as usize)
+                    .unwrap_or(ta.length().saturating_sub(1));
+
+                for i in (0..=from_index.min(ta.length().saturating_sub(1))).rev() {
+                    if let Some(val) = ta.get(i) {
+                        if val == search {
+                            return Ok(Value::int32(i as i32));
+                        }
+                    }
+                }
+
+                Ok(Value::int32(-1))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.reverse() — ES2026 §22.2.3.22
+    proto.define_property(
+        PropertyKey::string("reverse"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, _mm| {
+                let ta = get_typed_array(this_val)?;
+
+                ta.reverse();
+
+                Ok(this_val.clone())
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.set(source, offset) — ES2026 §22.2.3.23
+    proto.define_property(
+        PropertyKey::string("set"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let ta = get_typed_array(this_val)?;
+
+                let offset = args.get(1)
+                    .and_then(|v| v.as_int32())
+                    .unwrap_or(0) as usize;
+
+                if let Some(source) = args.first() {
+                    // Check if source is a TypedArray
+                    if let Some(source_ta) = source.as_typed_array() {
+                        for i in 0..source_ta.length() {
+                            if let Some(val) = source_ta.get(i) {
+                                let _ = ta.set(offset + i, val);
+                            }
+                        }
+                    } else if let Some(source_obj) = source.as_object() {
+                        // Array-like object
+                        if let Some(length_val) = source_obj.get(&PropertyKey::string("length")) {
+                            if let Some(length) = length_val.as_int32() {
+                                for i in 0..(length as usize) {
+                                    if let Some(val) = source_obj.get(&PropertyKey::Index(i as u32)) {
+                                        if let Some(num) = val.as_number() {
+                                            let _ = ta.set(offset + i, num);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Ok(Value::undefined())
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.slice(start, end) — ES2026 §22.2.3.24
+    proto.define_property(
+        PropertyKey::string("slice"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let ta = get_typed_array(this_val)?;
+
+                let start = args.get(0)
+                    .and_then(|v| v.as_int32())
+                    .unwrap_or(0) as i64;
+
+                let end = args.get(1)
+                    .and_then(|v| v.as_int32())
+                    .map(|v| v as i64);
+
+                let new_ta = ta.slice(start, end)
+                    .map_err(|e| VmError::type_error(e))?;
+
+                Ok(Value::typed_array(Arc::new(new_ta)))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.subarray(begin, end) — ES2026 §22.2.3.27
+    proto.define_property(
+        PropertyKey::string("subarray"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _mm| {
+                let ta = get_typed_array(this_val)?;
+
+                let begin = args.get(0)
+                    .and_then(|v| v.as_int32())
+                    .unwrap_or(0) as i64;
+
+                let end = args.get(1)
+                    .and_then(|v| v.as_int32())
+                    .map(|v| v as i64);
+
+                let new_ta = ta.subarray(begin, end)
+                    .map_err(|e| VmError::type_error(e))?;
+
+                Ok(Value::typed_array(Arc::new(new_ta)))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.toString() — ES2026 §22.2.3.29
+    proto.define_property(
+        PropertyKey::string("toString"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, _mm| {
+                // Delegate to Array.prototype.toString which calls join()
+                let ta = get_typed_array(this_val)?;
+
+                let mut result = String::new();
+                for i in 0..ta.length() {
+                    if i > 0 {
+                        result.push(',');
+                    }
+                    if let Some(val) = ta.get(i) {
+                        result.push_str(&val.to_string());
+                    }
+                }
+
+                Ok(Value::string(JsString::intern(&result)))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.toLocaleString() — ES2026 §22.2.3.28
+    // For now, just delegate to toString
+    proto.define_property(
+        PropertyKey::string("toLocaleString"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, _mm| {
+                let ta = get_typed_array(this_val)?;
+
+                let mut result = String::new();
+                for i in 0..ta.length() {
+                    if i > 0 {
+                        result.push(',');
+                    }
+                    if let Some(val) = ta.get(i) {
+                        result.push_str(&val.to_string());
+                    }
+                }
+
+                Ok(Value::string(JsString::intern(&result)))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+}
+
+// ============================================================================
+// Iterators
+// ============================================================================
+
+fn init_typed_array_iterators(
+    proto: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+    symbol_iterator_id: u64,
+) {
+    let fn_proto_clone1 = fn_proto;
+    let fn_proto_clone2 = fn_proto;
+    let fn_proto_clone3 = fn_proto;
+
+    // %TypedArray%.prototype.values() — ES2026 §22.2.3.31
+    // This is the iterator method that returns an iterator
+    let values_method = Value::native_function_with_proto(
+        move |this_val, _args, mm| {
+            let ta = get_typed_array(this_val)?;
+
+            // Create an iterator object (simplified - would need proper iterator protocol)
+            let iter_obj = GcRef::new(JsObject::new(None, mm.clone()));
+
+            // Store the typed array reference and current index
+            iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
+            iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
+
+            // Add next method
+            iter_obj.set(
+                PropertyKey::string("next"),
+                Value::native_function_with_proto(
+                    move |iter_this, _args, mm_inner| {
+                        let iter_obj = iter_this
+                            .as_object()
+                            .ok_or_else(|| VmError::internal("iterator is not an object"))?;
+
+                        let ta_val = iter_obj.get(&PropertyKey::string("_typedArray"))
+                            .ok_or_else(|| VmError::internal("iterator missing _typedArray"))?;
+                        let ta = ta_val.as_typed_array()
+                            .ok_or_else(|| VmError::internal("_typedArray is not a TypedArray"))?;
+
+                        let index_val = iter_obj.get(&PropertyKey::string("_index"))
+                            .ok_or_else(|| VmError::internal("iterator missing _index"))?;
+                        let index = index_val.as_int32().unwrap_or(0) as usize;
+
+                        let result = GcRef::new(JsObject::new(None, mm_inner.clone()));
+
+                        if index >= ta.length() {
+                            result.set(PropertyKey::string("done"), Value::boolean(true));
+                            result.set(PropertyKey::string("value"), Value::undefined());
+                        } else {
+                            let val = ta.get(index)
+                                .map(Value::number)
+                                .unwrap_or(Value::undefined());
+                            result.set(PropertyKey::string("value"), val);
+                            result.set(PropertyKey::string("done"), Value::boolean(false));
+                            iter_obj.set(PropertyKey::string("_index"), Value::int32((index + 1) as i32));
+                        }
+
+                        Ok(Value::object(result))
+                    },
+                    mm.clone(),
+                    fn_proto_clone1,
+                ),
+            );
+
+            Ok(Value::object(iter_obj))
+        },
+        mm.clone(),
+        fn_proto_clone1,
+    );
+
+    proto.define_property(
+        PropertyKey::string("values"),
+        PropertyDescriptor::builtin_method(values_method.clone()),
+    );
+
+    // %TypedArray%.prototype[Symbol.iterator] = %TypedArray%.prototype.values
+    proto.define_property(
+        PropertyKey::Symbol(symbol_iterator_id),
+        PropertyDescriptor::builtin_method(values_method),
+    );
+
+    // %TypedArray%.prototype.keys() — ES2026 §22.2.3.16 (different from lastIndexOf!)
+    proto.define_property(
+        PropertyKey::string("keys"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            move |this_val, _args, mm| {
+                let ta = get_typed_array(this_val)?;
+
+                let iter_obj = GcRef::new(JsObject::new(None, mm.clone()));
+                iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
+                iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
+
+                iter_obj.set(
+                    PropertyKey::string("next"),
+                    Value::native_function_with_proto(
+                        move |iter_this, _args, mm_inner| {
+                            let iter_obj = iter_this.as_object()
+                                .ok_or_else(|| VmError::internal("iterator is not an object"))?;
+
+                            let ta_val = iter_obj.get(&PropertyKey::string("_typedArray"))
+                                .ok_or_else(|| VmError::internal("iterator missing _typedArray"))?;
+                            let ta = ta_val.as_typed_array()
+                                .ok_or_else(|| VmError::internal("_typedArray is not a TypedArray"))?;
+
+                            let index = iter_obj.get(&PropertyKey::string("_index"))
+                                .and_then(|v| v.as_int32())
+                                .unwrap_or(0) as usize;
+
+                            let result = GcRef::new(JsObject::new(None, mm_inner.clone()));
+
+                            if index >= ta.length() {
+                                result.set(PropertyKey::string("done"), Value::boolean(true));
+                                result.set(PropertyKey::string("value"), Value::undefined());
+                            } else {
+                                result.set(PropertyKey::string("value"), Value::int32(index as i32));
+                                result.set(PropertyKey::string("done"), Value::boolean(false));
+                                iter_obj.set(PropertyKey::string("_index"), Value::int32((index + 1) as i32));
+                            }
+
+                            Ok(Value::object(result))
+                        },
+                        mm.clone(),
+                        fn_proto_clone2,
+                    ),
+                );
+
+                Ok(Value::object(iter_obj))
+            },
+            mm.clone(),
+            fn_proto_clone2,
+        )),
+    );
+
+    // %TypedArray%.prototype.entries() — ES2026 §22.2.3.9
+    proto.define_property(
+        PropertyKey::string("entries"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            move |this_val, _args, mm| {
+                let ta = get_typed_array(this_val)?;
+
+                let iter_obj = GcRef::new(JsObject::new(None, mm.clone()));
+                iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
+                iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
+
+                iter_obj.set(
+                    PropertyKey::string("next"),
+                    Value::native_function_with_proto(
+                        move |iter_this, _args, mm_inner| {
+                            let iter_obj = iter_this.as_object()
+                                .ok_or_else(|| VmError::internal("iterator is not an object"))?;
+
+                            let ta_val = iter_obj.get(&PropertyKey::string("_typedArray"))
+                                .ok_or_else(|| VmError::internal("iterator missing _typedArray"))?;
+                            let ta = ta_val.as_typed_array()
+                                .ok_or_else(|| VmError::internal("_typedArray is not a TypedArray"))?;
+
+                            let index = iter_obj.get(&PropertyKey::string("_index"))
+                                .and_then(|v| v.as_int32())
+                                .unwrap_or(0) as usize;
+
+                            let result = GcRef::new(JsObject::new(None, mm_inner.clone()));
+
+                            if index >= ta.length() {
+                                result.set(PropertyKey::string("done"), Value::boolean(true));
+                                result.set(PropertyKey::string("value"), Value::undefined());
+                            } else {
+                                let val = ta.get(index)
+                                    .map(Value::number)
+                                    .unwrap_or(Value::undefined());
+
+                                // Create [index, value] array
+                                let entry = GcRef::new(JsObject::new(None, mm_inner.clone()));
+                                entry.set(PropertyKey::Index(0), Value::int32(index as i32));
+                                entry.set(PropertyKey::Index(1), val);
+
+                                result.set(PropertyKey::string("value"), Value::object(entry));
+                                result.set(PropertyKey::string("done"), Value::boolean(false));
+                                iter_obj.set(PropertyKey::string("_index"), Value::int32((index + 1) as i32));
+                            }
+
+                            Ok(Value::object(result))
+                        },
+                        mm.clone(),
+                        fn_proto_clone3,
+                    ),
+                );
+
+                Ok(Value::object(iter_obj))
+            },
+            mm.clone(),
+            fn_proto_clone3,
+        )),
+    );
+}

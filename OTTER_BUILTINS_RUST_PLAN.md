@@ -13,14 +13,16 @@ All builtins live in `crates/otter-vm-core/src/intrinsics.rs` + `intrinsics_impl
 | `boolean.rs` | ~140 | Boolean constructor + prototype |
 | `date.rs` | ~970 | ALL Date.prototype methods (ES2026) |
 | `function.rs` | ~260 | Function.prototype (call, apply, bind, toString) |
-| `map_set.rs` | ~1400 | Map/Set/WeakMap/WeakSet + ES2025 set algebra |
+| `map_set.rs` | ~1650 | Map/Set/WeakMap/WeakSet + ES2025 set algebra + iterators |
 | `math.rs` | ~470 | Math (8 constants + 37 methods, ES2026) |
 | `number.rs` | ~420 | Number.prototype methods |
 | `promise.rs` | ~550 | Promise constructor + statics + prototype |
 | `reflect.rs` | ~430 | Reflect (all 13 ES2015+ methods) |
 | `regexp.rs` | ~700 | RegExp constructor + all prototype methods |
-| `string.rs` | ~880 | String.prototype methods |
+| `string.rs` | ~990 | String.prototype methods + Symbol.iterator |
 | `temporal.rs` | ~150 | Temporal namespace |
+| `generator.rs` | ~280 | Generator.prototype + AsyncGenerator.prototype (ES2026) |
+| `typed_array.rs` | ~850 | TypedArray.prototype + all 11 typed array types (ES2026) |
 
 Intrinsics initialization: 4 stages in `intrinsics.rs`:
 1. `allocate()` — pre-allocate all prototype objects + well-known symbols
@@ -32,21 +34,30 @@ Callback dispatch uses `InterceptionSignal` enum: native function detects closur
 
 ## Remaining Work
 
+### Completed Recently
+
+✅ **TypedArray implementation** (2026-02-01) — Complete ES2026-compliant TypedArray implementation with all 11 types (Int8Array through BigUint64Array). Includes:
+  - Full intrinsics system integration with %TypedArray%.prototype and 11 specific prototypes
+  - All constructors supporting 5 forms: empty, length, typedArray, buffer view, arrayLike
+  - Static methods: BYTES_PER_ELEMENT, from(), of()
+  - All prototype methods: at, copyWithin, fill, includes, indexOf, join, lastIndexOf, reverse, set, slice, subarray, toString, toLocaleString
+  - Getters: buffer, byteLength, byteOffset, length
+  - Iterators: values, keys, entries, Symbol.iterator
+  - Proper object-based storage with hidden __TypedArrayData__ property for getter/method access
+
+✅ **Generator/AsyncGenerator prototypes** (2026-02-01) — `Generator.prototype` and `AsyncGenerator.prototype` fully implemented as proper intrinsics with ES2026-compliant prototype chains, all methods (next, return, throw), Symbol.iterator/asyncIterator, and Symbol.toStringTag.
+
+✅ **Iterator protocol completeness** (2026-02-01) — Map/Set/String iterators fully implemented with `%IteratorPrototype%` chain, Symbol.iterator support, UTF-16 surrogate pair handling for strings, and snapshot semantics for stable iteration.
+
 ### Medium Priority
 
-1. **Iterator protocol completeness** — Map/Set iterators need `%IteratorPrototype%` chain, `String.prototype[Symbol.iterator]` not wired yet.
-
-2. **Generator/AsyncGenerator prototypes** — Generator core (`generator.rs`) works, but `Generator.prototype` and `AsyncGenerator.prototype` objects are not wired as proper intrinsics with `[Symbol.toStringTag]` etc.
-
-3. **TypedArray constructors** — Prototypes exist in intrinsics, but constructors (Int8Array, Uint8Array, Float32Array, etc.) are not fully wired to the intrinsics system.
-
-4. **Proxy handler traps** — Proxy constructor exists but not all handler traps are fully validated.
+1. **Proxy handler traps** — Proxy constructor exists but not all handler traps are fully validated.
 
 ### Low Priority
 
-5. **Extract `intrinsics_impl/object.rs`** — Object.prototype and Object static methods currently inline in `intrinsics.rs`, could be extracted for maintainability.
+1. **Extract `intrinsics_impl/object.rs`** — Object.prototype and Object static methods currently inline in `intrinsics.rs`, could be extracted for maintainability.
 
-6. **Extract `intrinsics_impl/error.rs`** — Error hierarchy init is inline in `intrinsics.rs`.
+2. **Extract `intrinsics_impl/error.rs`** — Error hierarchy init is inline in `intrinsics.rs`.
 
 ## Task 2: Runtime Job/Microtask Drain Correctness
 

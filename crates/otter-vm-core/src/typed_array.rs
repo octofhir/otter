@@ -76,6 +76,8 @@ impl TypedArrayKind {
 /// It does not copy data - it references the underlying buffer.
 #[derive(Debug)]
 pub struct JsTypedArray {
+    /// Associated JavaScript object (for properties and prototype)
+    pub object: GcRef<JsObject>,
     /// The underlying ArrayBuffer
     buffer: Arc<JsArrayBuffer>,
     /// Byte offset into the buffer
@@ -89,6 +91,7 @@ pub struct JsTypedArray {
 impl JsTypedArray {
     /// Create a new TypedArray view over an ArrayBuffer
     pub fn new(
+        object: GcRef<JsObject>,
         buffer: Arc<JsArrayBuffer>,
         kind: TypedArrayKind,
         byte_offset: usize,
@@ -108,6 +111,7 @@ impl JsTypedArray {
         }
 
         Ok(Self {
+            object,
             buffer,
             byte_offset,
             length,
@@ -123,8 +127,10 @@ impl JsTypedArray {
         memory_manager: Arc<MemoryManager>,
     ) -> Self {
         let byte_length = length * kind.element_size();
-        let buffer = Arc::new(JsArrayBuffer::new(byte_length, prototype, memory_manager));
+        let buffer = Arc::new(JsArrayBuffer::new(byte_length, None, memory_manager.clone()));
+        let object = GcRef::new(JsObject::new(prototype, memory_manager));
         Self {
+            object,
             buffer,
             byte_offset: 0,
             length,
@@ -334,7 +340,13 @@ impl JsTypedArray {
         let new_length = end_pos.saturating_sub(start);
         let new_byte_offset = self.byte_offset + start * self.kind.element_size();
 
+        // Create new object with same prototype as original
+        let prototype = self.object.prototype();
+        let memory_manager = self.object.memory_manager().clone();
+        let object = GcRef::new(JsObject::new(prototype, memory_manager));
+
         Ok(JsTypedArray {
+            object,
             buffer: self.buffer.clone(),
             byte_offset: new_byte_offset,
             length: new_length,
@@ -381,7 +393,13 @@ impl JsTypedArray {
             new_buffer.write_bytes(0, &src[src_offset..src_offset + new_byte_length]);
         });
 
+        // Create new object with same prototype as original
+        let object_prototype = self.object.prototype();
+        let object_memory_manager = self.object.memory_manager().clone();
+        let object = GcRef::new(JsObject::new(object_prototype, object_memory_manager));
+
         Ok(JsTypedArray {
+            object,
             buffer: new_buffer,
             byte_offset: 0,
             length: new_length,
@@ -506,8 +524,10 @@ mod tests {
 
     #[test]
     fn test_create_int32_array() {
-        let buf = Arc::new(JsArrayBuffer::new(16, None, make_mm()));
-        let arr = JsTypedArray::new(buf, TypedArrayKind::Int32, 0, 4).unwrap();
+        let mm = make_mm();
+        let buf = Arc::new(JsArrayBuffer::new(16, None, mm.clone()));
+        let object = GcRef::new(JsObject::new(None, mm));
+        let arr = JsTypedArray::new(object, buf, TypedArrayKind::Int32, 0, 4).unwrap();
         assert_eq!(arr.length(), 4);
         assert_eq!(arr.byte_length(), 16);
         assert_eq!(arr.byte_offset(), 0);
@@ -608,8 +628,10 @@ mod tests {
 
     #[test]
     fn test_detached_buffer() {
-        let buf = Arc::new(JsArrayBuffer::new(16, None, make_mm()));
-        let arr = JsTypedArray::new(buf.clone(), TypedArrayKind::Int32, 0, 4).unwrap();
+        let mm = make_mm();
+        let buf = Arc::new(JsArrayBuffer::new(16, None, mm.clone()));
+        let object = GcRef::new(JsObject::new(None, mm));
+        let arr = JsTypedArray::new(object, buf.clone(), TypedArrayKind::Int32, 0, 4).unwrap();
 
         arr.set(0, 42.0);
         assert_eq!(arr.get(0), Some(42.0));
@@ -624,8 +646,10 @@ mod tests {
 
     #[test]
     fn test_alignment_error() {
-        let buf = Arc::new(JsArrayBuffer::new(16, None, make_mm()));
-        let result = JsTypedArray::new(buf, TypedArrayKind::Int32, 1, 3);
+        let mm = make_mm();
+        let buf = Arc::new(JsArrayBuffer::new(16, None, mm.clone()));
+        let object = GcRef::new(JsObject::new(None, mm));
+        let result = JsTypedArray::new(object, buf, TypedArrayKind::Int32, 1, 3);
         assert!(result.is_err());
     }
 }

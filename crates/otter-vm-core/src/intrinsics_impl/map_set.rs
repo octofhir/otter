@@ -9,6 +9,7 @@
 //! All methods use inline implementations for optimal performance.
 //! Internal storage uses the same pattern as `otter-vm-builtins/src/map.rs` and `set.rs`.
 
+use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
@@ -143,6 +144,155 @@ fn init_set_slots(obj: &GcRef<JsObject>, mm: &Arc<MemoryManager>) {
 // Map.prototype
 // ============================================================================
 
+// ============================================================================
+// Map Iterator
+// ============================================================================
+
+/// Create a Map iterator object following the array iterator pattern.
+/// Snapshots keys at creation for stable iteration.
+fn make_map_iterator(
+    this_val: &Value,
+    kind: &str,
+    mm: Arc<MemoryManager>,
+    fn_proto: GcRef<JsObject>,
+    iter_proto: GcRef<JsObject>,
+) -> Result<Value, VmError> {
+    let obj = this_val
+        .as_object()
+        .ok_or_else(|| VmError::type_error("Map iterator: this is not an object"))?;
+    if !is_map(&obj) {
+        return Err(VmError::type_error("Map iterator called on incompatible receiver"));
+    }
+
+    // Create iterator object with %IteratorPrototype% as prototype
+    let iter = GcRef::new(JsObject::new(Some(iter_proto), mm.clone()));
+
+    // Store the map reference, snapshot keys, current index, and kind
+    iter.set(PropertyKey::string("__map_ref__"), Value::object(obj));
+    iter.set(PropertyKey::string("__iter_index__"), Value::number(0.0));
+    iter.set(
+        PropertyKey::string("__iter_kind__"),
+        Value::string(JsString::intern(kind)),
+    );
+
+    // Snapshot keys at iterator creation (for stable iteration)
+    let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
+    let keys_snapshot = GcRef::new(JsObject::array(0, mm.clone()));
+    let props = entries.own_keys();
+    let mut index = 0u32;
+    for prop in props {
+        if let Some(entry) = entries.get(&prop) {
+            if let Some(entry_obj) = entry.as_object() {
+                let key = entry_obj.get(&pk("k")).unwrap_or(Value::undefined());
+                keys_snapshot.set(PropertyKey::Index(index), key);
+                index += 1;
+            }
+        }
+    }
+    keys_snapshot.set(pk("length"), Value::int32(index as i32));
+    iter.set(PropertyKey::string("__iter_keys__"), Value::array(keys_snapshot));
+
+    // Define next() method
+    let fn_proto_for_next = fn_proto;
+    iter.define_property(
+        PropertyKey::string("next"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, mm_inner| {
+                let iter_obj = this_val
+                    .as_object()
+                    .ok_or_else(|| "not an iterator object".to_string())?;
+                let map = iter_obj
+                    .get(&PropertyKey::string("__map_ref__"))
+                    .and_then(|v| v.as_object())
+                    .ok_or_else(|| "iterator: missing map ref".to_string())?;
+                let idx = iter_obj
+                    .get(&PropertyKey::string("__iter_index__"))
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as usize;
+                let keys_snapshot = iter_obj
+                    .get(&PropertyKey::string("__iter_keys__"))
+                    .and_then(|v| v.as_object())
+                    .ok_or_else(|| "iterator: missing keys snapshot".to_string())?;
+                let len = keys_snapshot
+                    .get(&PropertyKey::string("length"))
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as usize;
+                let kind = iter_obj
+                    .get(&PropertyKey::string("__iter_kind__"))
+                    .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
+                    .unwrap_or_else(|| "entry".to_string());
+
+                if idx >= len {
+                    // Done
+                    let result = GcRef::new(JsObject::new(None, mm_inner));
+                    result.set(PropertyKey::string("value"), Value::undefined());
+                    result.set(PropertyKey::string("done"), Value::boolean(true));
+                    return Ok(Value::object(result));
+                }
+
+                // Get key from snapshot
+                let key = keys_snapshot
+                    .get(&PropertyKey::Index(idx as u32))
+                    .unwrap_or(Value::undefined());
+
+                // Advance index
+                iter_obj.set(
+                    PropertyKey::string("__iter_index__"),
+                    Value::number((idx + 1) as f64),
+                );
+
+                // Look up current value in live map (handle deleted entries)
+                let entries = get_entries(&map).ok_or("Internal error: missing entries")?;
+                let hash_key = value_to_key(&key);
+                let entry_opt = entries.get(&pk(&hash_key));
+
+                // If entry was deleted, skip to next (recursive call)
+                if entry_opt.is_none() {
+                    // Entry deleted - skip to next
+                    return this_val
+                        .as_object()
+                        .and_then(|obj| obj.get(&PropertyKey::string("next")))
+                        .and_then(|next_fn| {
+                            if let Some(func) = next_fn.as_native_function() {
+                                func(this_val, &[], mm_inner.clone()).ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or_else(|| VmError::type_error("Failed to skip deleted entry"));
+                }
+
+                let entry_obj = entry_opt
+                    .and_then(|v| v.as_object())
+                    .ok_or_else(|| "invalid entry".to_string())?;
+                let value = entry_obj.get(&pk("v")).unwrap_or(Value::undefined());
+
+                let result = GcRef::new(JsObject::new(None, mm_inner.clone()));
+                match kind.as_str() {
+                    "key" => {
+                        result.set(PropertyKey::string("value"), key);
+                    }
+                    "entry" => {
+                        let entry = GcRef::new(JsObject::array(2, mm_inner));
+                        entry.set(PropertyKey::Index(0), key);
+                        entry.set(PropertyKey::Index(1), value);
+                        result.set(PropertyKey::string("value"), Value::array(entry));
+                    }
+                    _ => {
+                        // "value"
+                        result.set(PropertyKey::string("value"), value);
+                    }
+                }
+                result.set(PropertyKey::string("done"), Value::boolean(false));
+                Ok(Value::object(result))
+            },
+            mm,
+            fn_proto_for_next,
+        )),
+    );
+    Ok(Value::object(iter))
+}
+
 /// Initialize Map.prototype with all ES2026 methods.
 ///
 /// # Methods
@@ -153,6 +303,8 @@ pub fn init_map_prototype(
     map_proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
+    iterator_proto: GcRef<JsObject>,
+    symbol_iterator_id: u64,
 ) {
     // Map.prototype.get(key)
     map_proto.define_property(
@@ -311,103 +463,47 @@ pub fn init_map_prototype(
         },
     );
 
-    // Map.prototype.keys()
+    // Map.prototype.keys() - returns iterator
+    let iter_proto_for_keys = iterator_proto;
+    let mm_for_keys = mm.clone();
+    let fn_proto_for_keys = fn_proto;
     map_proto.define_property(
         PropertyKey::string("keys"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, mm| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.keys called on incompatible receiver"))?;
-                if !is_map(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Map.prototype.keys called on incompatible receiver"));
-                }
-                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
-                let keys_array = GcRef::new(JsObject::array(0, mm));
-                let props = entries.own_keys();
-                let mut index = 0i32;
-                for prop in props {
-                    if let Some(entry) = entries.get(&prop) {
-                        if let Some(entry_obj) = entry.as_object() {
-                            let key = entry_obj.get(&pk("k")).unwrap_or(Value::undefined());
-                            keys_array.set(pk(&index.to_string()), key);
-                            index += 1;
-                        }
-                    }
-                }
-                keys_array.set(pk("length"), Value::int32(index));
-                Ok(Value::array(keys_array))
+            move |this_val, _args, mm| {
+                make_map_iterator(this_val, "key", mm, fn_proto_for_keys, iter_proto_for_keys)
             },
-            mm.clone(),
+            mm_for_keys,
             fn_proto,
         )),
     );
 
-    // Map.prototype.values()
+    // Map.prototype.values() - returns iterator
+    let iter_proto_for_values = iterator_proto;
+    let mm_for_values = mm.clone();
+    let fn_proto_for_values = fn_proto;
     map_proto.define_property(
         PropertyKey::string("values"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, mm| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.values called on incompatible receiver"))?;
-                if !is_map(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Map.prototype.values called on incompatible receiver"));
-                }
-                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
-                let values_array = GcRef::new(JsObject::array(0, mm));
-                let props = entries.own_keys();
-                let mut index = 0i32;
-                for prop in props {
-                    if let Some(entry) = entries.get(&prop) {
-                        if let Some(entry_obj) = entry.as_object() {
-                            let value = entry_obj.get(&pk("v")).unwrap_or(Value::undefined());
-                            values_array.set(pk(&index.to_string()), value);
-                            index += 1;
-                        }
-                    }
-                }
-                values_array.set(pk("length"), Value::int32(index));
-                Ok(Value::array(values_array))
+            move |this_val, _args, mm| {
+                make_map_iterator(this_val, "value", mm, fn_proto_for_values, iter_proto_for_values)
             },
-            mm.clone(),
+            mm_for_values,
             fn_proto,
         )),
     );
 
-    // Map.prototype.entries()
+    // Map.prototype.entries() - returns iterator
+    let iter_proto_for_entries = iterator_proto;
+    let mm_for_entries = mm.clone();
+    let fn_proto_for_entries = fn_proto;
     map_proto.define_property(
         PropertyKey::string("entries"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, mm| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.entries called on incompatible receiver"))?;
-                if !is_map(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Map.prototype.entries called on incompatible receiver"));
-                }
-                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
-                let entries_array = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
-                let props = entries.own_keys();
-                let mut index = 0i32;
-                for prop in props {
-                    if let Some(entry) = entries.get(&prop) {
-                        if let Some(entry_obj) = entry.as_object() {
-                            let key = entry_obj.get(&pk("k")).unwrap_or(Value::undefined());
-                            let value = entry_obj.get(&pk("v")).unwrap_or(Value::undefined());
-                            let pair = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
-                            pair.set(pk("0"), key);
-                            pair.set(pk("1"), value);
-                            pair.set(pk("length"), Value::int32(2));
-                            entries_array.set(pk(&index.to_string()), Value::array(pair));
-                            index += 1;
-                        }
-                    }
-                }
-                entries_array.set(pk("length"), Value::int32(index));
-                Ok(Value::array(entries_array))
+            move |this_val, _args, mm| {
+                make_map_iterator(this_val, "entry", mm, fn_proto_for_entries, iter_proto_for_entries)
             },
-            mm.clone(),
+            mm_for_entries,
             fn_proto,
         )),
     );
@@ -450,6 +546,21 @@ pub fn init_map_prototype(
         )),
     );
 
+    // Map.prototype[Symbol.iterator] - same as entries per ES spec
+    let iter_proto_for_symbol = iterator_proto;
+    let mm_for_symbol = mm.clone();
+    let fn_proto_for_symbol = fn_proto;
+    map_proto.define_property(
+        PropertyKey::Symbol(symbol_iterator_id),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            move |this_val, _args, mm| {
+                make_map_iterator(this_val, "entry", mm, fn_proto_for_symbol, iter_proto_for_symbol)
+            },
+            mm_for_symbol,
+            fn_proto,
+        )),
+    );
+
     // Map.prototype[Symbol.toStringTag] = "Map"
     map_proto.define_property(
         PropertyKey::Symbol(crate::intrinsics::well_known::TO_STRING_TAG),
@@ -468,6 +579,145 @@ pub fn init_map_prototype(
 // Set.prototype
 // ============================================================================
 
+// ============================================================================
+// Set Iterator
+// ============================================================================
+
+/// Create a Set iterator object following the array iterator pattern.
+/// Snapshots values at creation for stable iteration.
+fn make_set_iterator(
+    this_val: &Value,
+    kind: &str,
+    mm: Arc<MemoryManager>,
+    fn_proto: GcRef<JsObject>,
+    iter_proto: GcRef<JsObject>,
+) -> Result<Value, VmError> {
+    let obj = this_val
+        .as_object()
+        .ok_or_else(|| VmError::type_error("Set iterator: this is not an object"))?;
+    if !is_set(&obj) {
+        return Err(VmError::type_error("Set iterator called on incompatible receiver"));
+    }
+
+    // Create iterator object with %IteratorPrototype% as prototype
+    let iter = GcRef::new(JsObject::new(Some(iter_proto), mm.clone()));
+
+    // Store the set reference, snapshot values, current index, and kind
+    iter.set(PropertyKey::string("__set_ref__"), Value::object(obj));
+    iter.set(PropertyKey::string("__iter_index__"), Value::number(0.0));
+    iter.set(
+        PropertyKey::string("__iter_kind__"),
+        Value::string(JsString::intern(kind)),
+    );
+
+    // Snapshot values at iterator creation (for stable iteration)
+    let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
+    let values_snapshot = GcRef::new(JsObject::array(0, mm.clone()));
+    let props = values.own_keys();
+    let mut index = 0u32;
+    for prop in props {
+        if let Some(value) = values.get(&prop) {
+            values_snapshot.set(PropertyKey::Index(index), value);
+            index += 1;
+        }
+    }
+    values_snapshot.set(pk("length"), Value::int32(index as i32));
+    iter.set(PropertyKey::string("__iter_values__"), Value::array(values_snapshot));
+
+    // Define next() method
+    let fn_proto_for_next = fn_proto;
+    iter.define_property(
+        PropertyKey::string("next"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, mm_inner| {
+                let iter_obj = this_val
+                    .as_object()
+                    .ok_or_else(|| "not an iterator object".to_string())?;
+                let set = iter_obj
+                    .get(&PropertyKey::string("__set_ref__"))
+                    .and_then(|v| v.as_object())
+                    .ok_or_else(|| "iterator: missing set ref".to_string())?;
+                let idx = iter_obj
+                    .get(&PropertyKey::string("__iter_index__"))
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as usize;
+                let values_snapshot = iter_obj
+                    .get(&PropertyKey::string("__iter_values__"))
+                    .and_then(|v| v.as_object())
+                    .ok_or_else(|| "iterator: missing values snapshot".to_string())?;
+                let len = values_snapshot
+                    .get(&PropertyKey::string("length"))
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as usize;
+                let kind = iter_obj
+                    .get(&PropertyKey::string("__iter_kind__"))
+                    .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
+                    .unwrap_or_else(|| "value".to_string());
+
+                if idx >= len {
+                    // Done
+                    let result = GcRef::new(JsObject::new(None, mm_inner));
+                    result.set(PropertyKey::string("value"), Value::undefined());
+                    result.set(PropertyKey::string("done"), Value::boolean(true));
+                    return Ok(Value::object(result));
+                }
+
+                // Get value from snapshot
+                let value = values_snapshot
+                    .get(&PropertyKey::Index(idx as u32))
+                    .unwrap_or(Value::undefined());
+
+                // Advance index
+                iter_obj.set(
+                    PropertyKey::string("__iter_index__"),
+                    Value::number((idx + 1) as f64),
+                );
+
+                // Check if value still exists in live set (handle deleted entries)
+                let values_obj = get_set_values_obj(&set).ok_or("Internal error: missing values")?;
+                let hash_key = value_to_key(&value);
+                let still_exists = values_obj.get(&pk(&hash_key)).is_some();
+
+                // If entry was deleted, skip to next (recursive call)
+                if !still_exists {
+                    // Entry deleted - skip to next
+                    return this_val
+                        .as_object()
+                        .and_then(|obj| obj.get(&PropertyKey::string("next")))
+                        .and_then(|next_fn| {
+                            if let Some(func) = next_fn.as_native_function() {
+                                func(this_val, &[], mm_inner.clone()).ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or_else(|| VmError::type_error("Failed to skip deleted entry"));
+                }
+
+                let result = GcRef::new(JsObject::new(None, mm_inner.clone()));
+                match kind.as_str() {
+                    "entry" => {
+                        // For Sets, entries are [value, value] per ES spec
+                        let entry = GcRef::new(JsObject::array(2, mm_inner));
+                        entry.set(PropertyKey::Index(0), value.clone());
+                        entry.set(PropertyKey::Index(1), value);
+                        result.set(PropertyKey::string("value"), Value::array(entry));
+                    }
+                    _ => {
+                        // "value" or "key" (both are the same for Sets)
+                        result.set(PropertyKey::string("value"), value);
+                    }
+                }
+                result.set(PropertyKey::string("done"), Value::boolean(false));
+                Ok(Value::object(result))
+            },
+            mm,
+            fn_proto_for_next,
+        )),
+    );
+    Ok(Value::object(iter))
+}
+
 /// Initialize Set.prototype with all ES2026 + ES2025 methods.
 ///
 /// # Methods
@@ -480,6 +730,8 @@ pub fn init_set_prototype(
     set_proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
+    iterator_proto: GcRef<JsObject>,
+    symbol_iterator_id: u64,
 ) {
     // Set.prototype.add(value)
     set_proto.define_property(
@@ -605,93 +857,47 @@ pub fn init_set_prototype(
         },
     );
 
-    // Set.prototype.values()
+    // Set.prototype.values() - returns iterator
+    let iter_proto_for_values = iterator_proto;
+    let mm_for_values = mm.clone();
+    let fn_proto_for_values = fn_proto;
     set_proto.define_property(
         PropertyKey::string("values"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, mm| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.values called on incompatible receiver"))?;
-                if !is_set(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Set.prototype.values called on incompatible receiver"));
-                }
-                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
-                let values_array = GcRef::new(JsObject::array(0, mm));
-                let props = values.own_keys();
-                let mut index = 0i32;
-                for prop in props {
-                    if let Some(value) = values.get(&prop) {
-                        values_array.set(pk(&index.to_string()), value);
-                        index += 1;
-                    }
-                }
-                values_array.set(pk("length"), Value::int32(index));
-                Ok(Value::array(values_array))
+            move |this_val, _args, mm| {
+                make_set_iterator(this_val, "value", mm, fn_proto_for_values, iter_proto_for_values)
             },
-            mm.clone(),
+            mm_for_values,
             fn_proto,
         )),
     );
 
-    // Set.prototype.keys() — same as values() per spec
+    // Set.prototype.keys() - same as values() per spec, returns iterator
+    let iter_proto_for_keys = iterator_proto;
+    let mm_for_keys = mm.clone();
+    let fn_proto_for_keys = fn_proto;
     set_proto.define_property(
         PropertyKey::string("keys"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, mm| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.keys called on incompatible receiver"))?;
-                if !is_set(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Set.prototype.keys called on incompatible receiver"));
-                }
-                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
-                let values_array = GcRef::new(JsObject::array(0, mm));
-                let props = values.own_keys();
-                let mut index = 0i32;
-                for prop in props {
-                    if let Some(value) = values.get(&prop) {
-                        values_array.set(pk(&index.to_string()), value);
-                        index += 1;
-                    }
-                }
-                values_array.set(pk("length"), Value::int32(index));
-                Ok(Value::array(values_array))
+            move |this_val, _args, mm| {
+                make_set_iterator(this_val, "value", mm, fn_proto_for_keys, iter_proto_for_keys)
             },
-            mm.clone(),
+            mm_for_keys,
             fn_proto,
         )),
     );
 
-    // Set.prototype.entries()
+    // Set.prototype.entries() - returns iterator
+    let iter_proto_for_entries = iterator_proto;
+    let mm_for_entries = mm.clone();
+    let fn_proto_for_entries = fn_proto;
     set_proto.define_property(
         PropertyKey::string("entries"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, mm| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.entries called on incompatible receiver"))?;
-                if !is_set(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Set.prototype.entries called on incompatible receiver"));
-                }
-                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
-                let entries_array = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
-                let props = values.own_keys();
-                let mut index = 0i32;
-                for prop in props {
-                    if let Some(value) = values.get(&prop) {
-                        let pair = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
-                        pair.set(pk("0"), value.clone());
-                        pair.set(pk("1"), value);
-                        pair.set(pk("length"), Value::int32(2));
-                        entries_array.set(pk(&index.to_string()), Value::array(pair));
-                        index += 1;
-                    }
-                }
-                entries_array.set(pk("length"), Value::int32(index));
-                Ok(Value::array(entries_array))
+            move |this_val, _args, mm| {
+                make_set_iterator(this_val, "entry", mm, fn_proto_for_entries, iter_proto_for_entries)
             },
-            mm.clone(),
+            mm_for_entries,
             fn_proto,
         )),
     );
@@ -1029,6 +1235,21 @@ pub fn init_set_prototype(
                 Ok(Value::boolean(true))
             },
             mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Set.prototype[Symbol.iterator] - same as values per ES spec
+    let iter_proto_for_symbol = iterator_proto;
+    let mm_for_symbol = mm.clone();
+    let fn_proto_for_symbol = fn_proto;
+    set_proto.define_property(
+        PropertyKey::Symbol(symbol_iterator_id),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            move |this_val, _args, mm| {
+                make_set_iterator(this_val, "value", mm, fn_proto_for_symbol, iter_proto_for_symbol)
+            },
+            mm_for_symbol,
             fn_proto,
         )),
     );

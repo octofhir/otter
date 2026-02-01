@@ -3525,29 +3525,21 @@ impl Interpreter {
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
 
                 // Generator property access
-                if object.is_generator() {
-                    // For generators, return the prototype method from GeneratorPrototype
-                    // or from the global generator prototype if available
-                    if Self::utf16_eq_ascii(name_str, "next")
-                        || Self::utf16_eq_ascii(name_str, "return")
-                        || Self::utf16_eq_ascii(name_str, "throw")
-                    {
-                        // Get the method from GeneratorPrototype global if available
-                        if let Some(gen_proto) = ctx.get_global("GeneratorPrototype") {
-                            if let Some(proto_obj) = gen_proto.as_object() {
-                                let key = Self::utf16_key(name_str);
-                                if let Some(method) = proto_obj.get(&key) {
-                                    ctx.set_register(dst.0, method);
-                                    return Ok(InstructionResult::Continue);
-                                }
-                            }
-                        }
-                        // If no prototype available, return a placeholder function
-                        // The CallMethod instruction will handle the actual generator operations
-                        ctx.set_register(dst.0, Value::undefined());
+                if let Some(generator) = object.as_generator() {
+                    let key = Self::utf16_key(name_str);
+
+                    // Check the generator's internal object first
+                    if let Some(val) = generator.object.get(&key) {
+                        ctx.set_register(dst.0, val);
                         return Ok(InstructionResult::Continue);
                     }
-                    // Other properties on generators return undefined
+                    // Check prototype chain (this gives us next, return, throw, Symbol.iterator, Symbol.toStringTag)
+                    if let Some(proto) = generator.object.prototype() {
+                        if let Some(val) = proto.get(&key) {
+                            ctx.set_register(dst.0, val);
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
                     ctx.set_register(dst.0, Value::undefined());
                     return Ok(InstructionResult::Continue);
                 }
@@ -4091,6 +4083,34 @@ impl Interpreter {
                     }
                     // Check prototype chain
                     if let Some(proto) = closure.object.prototype() {
+                        if let Some(val) = proto.get(&key) {
+                            ctx.set_register(dst.0, val);
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                    ctx.set_register(dst.0, Value::undefined());
+                    return Ok(InstructionResult::Continue);
+                }
+
+                // Generator property access
+                if let Some(generator) = object.as_generator() {
+                    // Convert key to property key
+                    let key = if let Some(s) = key_value.as_string() {
+                        PropertyKey::from_js_string(s)
+                    } else if let Some(sym) = key_value.as_symbol() {
+                        PropertyKey::Symbol(sym.id)
+                    } else {
+                        let key_str = self.to_string(&key_value);
+                        PropertyKey::string(&key_str)
+                    };
+
+                    // Check the generator's internal object first
+                    if let Some(val) = generator.object.get(&key) {
+                        ctx.set_register(dst.0, val);
+                        return Ok(InstructionResult::Continue);
+                    }
+                    // Check prototype chain (this gives us next, return, throw, Symbol.iterator, Symbol.toStringTag)
+                    if let Some(proto) = generator.object.prototype() {
                         if let Some(val) = proto.get(&key) {
                             ctx.set_register(dst.0, val);
                             return Ok(InstructionResult::Continue);
@@ -6605,11 +6625,12 @@ impl Interpreter {
         // 3. Handle closures
         if let Some(closure) = current_func.as_function() {
             if closure.is_generator {
-                // Get the .prototype from the generator function
-                let proto = closure
-                    .object
-                    .get(&PropertyKey::string("prototype"))
-                    .and_then(|v| v.as_object());
+                // Use intrinsic generator prototype for correct prototype chain
+                let proto = if closure.is_async {
+                    ctx.async_generator_prototype_intrinsic()
+                } else {
+                    ctx.generator_prototype_intrinsic()
+                };
 
                 // Create the generator's internal object
                 let gen_obj = GcRef::new(JsObject::new(proto, ctx.memory_manager().clone()));

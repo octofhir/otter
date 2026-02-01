@@ -50,7 +50,8 @@ fn define_global_fn<F>(
 ///
 /// `fn_proto` is the intrinsic `%Function.prototype%` created by VmRuntime.
 /// All native functions receive it as their `[[Prototype]]` per ES2023 §10.3.1.
-pub fn setup_global_object(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>) {
+/// `intrinsics_opt` is optional intrinsics for TypedArray prototypes.
+pub fn setup_global_object(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>, intrinsics_opt: Option<&crate::intrinsics::Intrinsics>) {
     let mm = global.memory_manager().clone();
 
     // globalThis - self-referencing
@@ -79,13 +80,14 @@ pub fn setup_global_object(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>) {
     define_global_fn(&global, &mm, fn_proto, global_decode_uri_component, "decodeURIComponent", 1);
 
     // Standard built-in objects
-    setup_builtin_constructors(global, fn_proto);
+    setup_builtin_constructors(global, fn_proto, intrinsics_opt);
 }
 
 /// Set up standard built-in constructors and their prototypes.
 /// `fn_proto` is the intrinsic `%Function.prototype%` — used as-is for `Function.prototype`
 /// and as `[[Prototype]]` for all native function objects.
-fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>) {
+/// `intrinsics_opt` is optional intrinsics for TypedArray prototypes.
+fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>, intrinsics_opt: Option<&crate::intrinsics::Intrinsics>) {
     let mm = global.memory_manager().clone();
     let builtins = [
         "Object",
@@ -135,8 +137,24 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
         // For the "Function" constructor, use the intrinsic fn_proto
         // instead of creating a fresh object. This is the BOA/V8 pattern:
         // Function.prototype is created once and shared.
+        // For TypedArrays, use intrinsic prototypes if available.
         let proto = if name == "Function" {
             fn_proto
+        } else if let Some(intrinsics) = intrinsics_opt {
+            match name {
+                "Int8Array" => intrinsics.int8_array_prototype,
+                "Uint8Array" => intrinsics.uint8_array_prototype,
+                "Uint8ClampedArray" => intrinsics.uint8_clamped_array_prototype,
+                "Int16Array" => intrinsics.int16_array_prototype,
+                "Uint16Array" => intrinsics.uint16_array_prototype,
+                "Int32Array" => intrinsics.int32_array_prototype,
+                "Uint32Array" => intrinsics.uint32_array_prototype,
+                "Float32Array" => intrinsics.float32_array_prototype,
+                "Float64Array" => intrinsics.float64_array_prototype,
+                "BigInt64Array" => intrinsics.bigint64_array_prototype,
+                "BigUint64Array" => intrinsics.biguint64_array_prototype,
+                _ => GcRef::new(JsObject::new(None, mm.clone())),
+            }
         } else {
             GcRef::new(JsObject::new(None, mm.clone()))
         };
@@ -206,6 +224,180 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
 
                     let ab = Arc::new(JsArrayBuffer::new(len, Some(fn_proto), mm_inner));
                     Ok(Value::array_buffer(ab))
+                },
+                mm_clone,
+                fn_proto,
+            )
+        } else if name.ends_with("Array") && (
+            name == "Int8Array" || name == "Uint8Array" || name == "Uint8ClampedArray" ||
+            name == "Int16Array" || name == "Uint16Array" ||
+            name == "Int32Array" || name == "Uint32Array" ||
+            name == "Float32Array" || name == "Float64Array" ||
+            name == "BigInt64Array" || name == "BigUint64Array"
+        ) {
+            // TypedArray constructors
+            use crate::typed_array::{JsTypedArray, TypedArrayKind};
+            use crate::array_buffer::JsArrayBuffer;
+
+            let kind = match name {
+                "Int8Array" => TypedArrayKind::Int8,
+                "Uint8Array" => TypedArrayKind::Uint8,
+                "Uint8ClampedArray" => TypedArrayKind::Uint8Clamped,
+                "Int16Array" => TypedArrayKind::Int16,
+                "Uint16Array" => TypedArrayKind::Uint16,
+                "Int32Array" => TypedArrayKind::Int32,
+                "Uint32Array" => TypedArrayKind::Uint32,
+                "Float32Array" => TypedArrayKind::Float32,
+                "Float64Array" => TypedArrayKind::Float64,
+                "BigInt64Array" => TypedArrayKind::BigInt64,
+                "BigUint64Array" => TypedArrayKind::BigUint64,
+                _ => unreachable!(),
+            };
+
+            let mm_clone = mm.clone();
+            let proto_clone = proto;
+            Value::native_function_with_proto(
+                move |_this, args: &[Value], mm_inner| {
+                    // Helper to create TypedArray with hidden property for getter access
+                    let make_typed_array = |ta: JsTypedArray| -> Value {
+                        let ta_arc = Arc::new(ta);
+                        let obj = ta_arc.object;
+                        // Store TypedArray as hidden property so getters can access it
+                        obj.define_property(
+                            PropertyKey::string("__TypedArrayData__"),
+                            PropertyDescriptor::data(Value::typed_array(ta_arc.clone())),
+                        );
+                        // Return the object directly, not the TypedArray value
+                        Value::object(obj)
+                    };
+
+                    // Handle 4 constructor forms:
+                    // new TypedArray() - create empty
+                    // new TypedArray(length)
+                    // new TypedArray(typedArray)
+                    // new TypedArray(buffer[, byteOffset[, length]])
+                    // new TypedArray(arrayLike)
+
+                    if args.is_empty() {
+                        // new TypedArray() - create empty with length 0
+                        let buffer = Arc::new(JsArrayBuffer::new(0, None, mm_inner.clone()));
+                        let object = GcRef::new(JsObject::new(Some(proto_clone), mm_inner.clone()));
+                        let ta = JsTypedArray::new(object, buffer, kind, 0, 0)
+                            .map_err(|e| VmError::type_error(e))?;
+                        return Ok(make_typed_array(ta));
+                    }
+
+                    let arg0 = &args[0];
+
+                    // Check if arg0 is ArrayBuffer
+                    if let Some(buffer) = arg0.as_array_buffer() {
+                        let byte_offset = args.get(1)
+                            .and_then(|v| v.as_int32())
+                            .unwrap_or(0) as usize;
+
+                        let length = if let Some(len_val) = args.get(2) {
+                            len_val.as_int32().unwrap_or(0) as usize
+                        } else {
+                            // Auto-calculate length from buffer
+                            let available = buffer.byte_length().saturating_sub(byte_offset);
+                            available / kind.element_size()
+                        };
+
+                        let object = GcRef::new(JsObject::new(Some(proto_clone), mm_inner.clone()));
+                        let ta = JsTypedArray::new(object, buffer.clone(), kind, byte_offset, length)
+                            .map_err(|e| VmError::type_error(e))?;
+                        return Ok(make_typed_array(ta));
+                    }
+
+                    // Check if arg0 is another TypedArray
+                    if let Some(other_ta) = arg0.as_typed_array() {
+                        let length = other_ta.length();
+                        let buffer = Arc::new(JsArrayBuffer::new(
+                            length * kind.element_size(),
+                            None,
+                            mm_inner.clone(),
+                        ));
+                        let object = GcRef::new(JsObject::new(Some(proto_clone), mm_inner.clone()));
+                        let ta = JsTypedArray::new(object, buffer, kind, 0, length)
+                            .map_err(|e| VmError::type_error(e))?;
+
+                        // Copy elements
+                        for i in 0..length {
+                            if let Some(val) = other_ta.get(i) {
+                                let _ = ta.set(i, val);
+                            }
+                        }
+
+                        return Ok(make_typed_array(ta));
+                    }
+
+                    // Check if arg0 is a number (length)
+                    if let Some(length_num) = arg0.as_number() {
+                        let length = if length_num < 0.0 {
+                            0
+                        } else {
+                            length_num as usize
+                        };
+                        let buffer = Arc::new(JsArrayBuffer::new(
+                            length * kind.element_size(),
+                            None,
+                            mm_inner.clone(),
+                        ));
+                        let object = GcRef::new(JsObject::new(Some(proto_clone), mm_inner.clone()));
+                        let ta = JsTypedArray::new(object, buffer, kind, 0, length)
+                            .map_err(|e| VmError::type_error(e))?;
+                        return Ok(make_typed_array(ta));
+                    }
+
+                    if let Some(length_int) = arg0.as_int32() {
+                        let length = length_int.max(0) as usize;
+                        let buffer = Arc::new(JsArrayBuffer::new(
+                            length * kind.element_size(),
+                            None,
+                            mm_inner.clone(),
+                        ));
+                        let object = GcRef::new(JsObject::new(Some(proto_clone), mm_inner.clone()));
+                        let ta = JsTypedArray::new(object, buffer, kind, 0, length)
+                            .map_err(|e| VmError::type_error(e))?;
+                        return Ok(make_typed_array(ta));
+                    }
+
+                    // Array-like object
+                    if let Some(obj) = arg0.as_object() {
+                        if let Some(length_val) = obj.get(&PropertyKey::string("length")) {
+                            if let Some(length) = length_val.as_int32() {
+                                let length = length.max(0) as usize;
+                                let buffer = Arc::new(JsArrayBuffer::new(
+                                    length * kind.element_size(),
+                                    None,
+                                    mm_inner.clone(),
+                                ));
+                                let object = GcRef::new(JsObject::new(Some(proto_clone), mm_inner.clone()));
+                                let ta = JsTypedArray::new(object, buffer, kind, 0, length)
+                                    .map_err(|e| VmError::type_error(e))?;
+
+                                // Copy elements from object
+                                for i in 0..length {
+                                    if let Some(val) = obj.get(&PropertyKey::Index(i as u32)) {
+                                        if let Some(num) = val.as_number() {
+                                            let _ = ta.set(i, num);
+                                        } else if let Some(num_int) = val.as_int32() {
+                                            let _ = ta.set(i, num_int as f64);
+                                        }
+                                    }
+                                }
+
+                                return Ok(make_typed_array(ta));
+                            }
+                        }
+                    }
+
+                    // Default: treat as length 0
+                    let buffer = Arc::new(JsArrayBuffer::new(0, None, mm_inner.clone()));
+                    let object = GcRef::new(JsObject::new(Some(proto_clone), mm_inner.clone()));
+                    let ta = JsTypedArray::new(object, buffer, kind, 0, 0)
+                        .map_err(|e| VmError::type_error(e))?;
+                    Ok(make_typed_array(ta))
                 },
                 mm_clone,
                 fn_proto,
@@ -326,6 +518,139 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                             }
                         },
                         mm.clone(),
+                        fn_proto,
+                    ),
+                );
+            } else if name.ends_with("Array") && (
+                name == "Int8Array" || name == "Uint8Array" || name == "Uint8ClampedArray" ||
+                name == "Int16Array" || name == "Uint16Array" ||
+                name == "Int32Array" || name == "Uint32Array" ||
+                name == "Float32Array" || name == "Float64Array" ||
+                name == "BigInt64Array" || name == "BigUint64Array"
+            ) {
+                // Add TypedArray static methods and properties
+                use crate::typed_array::{JsTypedArray, TypedArrayKind};
+                use crate::array_buffer::JsArrayBuffer;
+
+                let kind = match name {
+                    "Int8Array" => TypedArrayKind::Int8,
+                    "Uint8Array" => TypedArrayKind::Uint8,
+                    "Uint8ClampedArray" => TypedArrayKind::Uint8Clamped,
+                    "Int16Array" => TypedArrayKind::Int16,
+                    "Uint16Array" => TypedArrayKind::Uint16,
+                    "Int32Array" => TypedArrayKind::Int32,
+                    "Uint32Array" => TypedArrayKind::Uint32,
+                    "Float32Array" => TypedArrayKind::Float32,
+                    "Float64Array" => TypedArrayKind::Float64,
+                    "BigInt64Array" => TypedArrayKind::BigInt64,
+                    "BigUint64Array" => TypedArrayKind::BigUint64,
+                    _ => unreachable!(),
+                };
+
+                // BYTES_PER_ELEMENT - ES2026 §22.2.5.1
+                ctor_obj.set(
+                    PropertyKey::string("BYTES_PER_ELEMENT"),
+                    Value::int32(kind.element_size() as i32),
+                );
+
+                // TypedArray.from(source, mapFn?, thisArg?) - ES2026 §22.2.2.1
+                let mm_from = mm.clone();
+                let proto_from = proto.clone();
+                ctor_obj.set(
+                    PropertyKey::string("from"),
+                    Value::native_function_with_proto(
+                        move |_this, args, mm_inner| {
+                            let source = args.get(0).ok_or_else(|| VmError::type_error("TypedArray.from requires a source argument"))?;
+
+                            // Get length of source
+                            let length = if let Some(obj) = source.as_object() {
+                                obj.get(&PropertyKey::string("length"))
+                                    .and_then(|v| v.as_int32())
+                                    .unwrap_or(0)
+                                    .max(0) as usize
+                            } else {
+                                0
+                            };
+
+                            // Create new TypedArray
+                            let buffer = Arc::new(JsArrayBuffer::new(
+                                length * kind.element_size(),
+                                None,
+                                mm_inner.clone(),
+                            ));
+                            let object = GcRef::new(JsObject::new(Some(proto_from), mm_inner.clone()));
+                            let ta = JsTypedArray::new(object, buffer, kind, 0, length)
+                                .map_err(|e| VmError::type_error(e))?;
+
+                            // Copy elements (with optional mapping)
+                            let map_fn = args.get(1);
+                            if let Some(obj) = source.as_object() {
+                                for i in 0..length {
+                                    if let Some(val) = obj.get(&PropertyKey::Index(i as u32)) {
+                                        let final_val = if let Some(map_fn_val) = map_fn {
+                                            // TODO: Call mapFn(val, i)
+                                            val
+                                        } else {
+                                            val
+                                        };
+
+                                        if let Some(num) = final_val.as_number() {
+                                            let _ = ta.set(i, num);
+                                        } else if let Some(num_int) = final_val.as_int32() {
+                                            let _ = ta.set(i, num_int as f64);
+                                        }
+                                    }
+                                }
+                            }
+
+                            let ta_arc = Arc::new(ta);
+                            object.define_property(
+                                PropertyKey::string("__TypedArrayData__"),
+                                PropertyDescriptor::data(Value::typed_array(ta_arc.clone())),
+                            );
+                            Ok(Value::object(object))
+                        },
+                        mm_from,
+                        fn_proto,
+                    ),
+                );
+
+                // TypedArray.of(...items) - ES2026 §22.2.2.2
+                let mm_of = mm.clone();
+                let proto_of = proto.clone();
+                ctor_obj.set(
+                    PropertyKey::string("of"),
+                    Value::native_function_with_proto(
+                        move |_this, args, mm_inner| {
+                            let length = args.len();
+
+                            // Create new TypedArray
+                            let buffer = Arc::new(JsArrayBuffer::new(
+                                length * kind.element_size(),
+                                None,
+                                mm_inner.clone(),
+                            ));
+                            let object = GcRef::new(JsObject::new(Some(proto_of), mm_inner.clone()));
+                            let ta = JsTypedArray::new(object, buffer, kind, 0, length)
+                                .map_err(|e| VmError::type_error(e))?;
+
+                            // Set elements from arguments
+                            for (i, arg) in args.iter().enumerate() {
+                                if let Some(num) = arg.as_number() {
+                                    let _ = ta.set(i, num);
+                                } else if let Some(num_int) = arg.as_int32() {
+                                    let _ = ta.set(i, num_int as f64);
+                                }
+                            }
+
+                            let ta_arc = Arc::new(ta);
+                            object.define_property(
+                                PropertyKey::string("__TypedArrayData__"),
+                                PropertyDescriptor::data(Value::typed_array(ta_arc.clone())),
+                            );
+                            Ok(Value::object(object))
+                        },
+                        mm_of,
                         fn_proto,
                     ),
                 );

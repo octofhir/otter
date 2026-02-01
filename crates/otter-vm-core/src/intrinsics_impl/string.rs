@@ -61,11 +61,109 @@ fn this_string_value(this_val: &Value) -> Result<GcRef<JsString>, String> {
     Err("String.prototype method called on null or undefined".to_string())
 }
 
+// ============================================================================
+// String Iterator
+// ============================================================================
+
+/// Helper to check if a UTF-16 code unit is a high surrogate
+fn is_high_surrogate(unit: u16) -> bool {
+    unit >= 0xD800 && unit <= 0xDBFF
+}
+
+/// Helper to check if a UTF-16 code unit is a low surrogate
+fn is_low_surrogate(unit: u16) -> bool {
+    unit >= 0xDC00 && unit <= 0xDFFF
+}
+
+/// Create a String iterator object that handles UTF-16 surrogate pairs correctly.
+fn make_string_iterator(
+    this_val: &Value,
+    mm: Arc<MemoryManager>,
+    fn_proto: GcRef<JsObject>,
+    iter_proto: GcRef<JsObject>,
+) -> Result<Value, VmError> {
+    // Extract string value (handles both primitives and String objects)
+    let string = this_string_value(this_val)
+        .map_err(|e| VmError::type_error(&e))?;
+
+    // Create iterator object with %IteratorPrototype% as prototype
+    let iter = GcRef::new(JsObject::new(Some(iter_proto), mm.clone()));
+
+    // Store the string reference and current index
+    iter.set(PropertyKey::string("__string_ref__"), Value::string(string));
+    iter.set(PropertyKey::string("__string_index__"), Value::number(0.0));
+
+    // Define next() method
+    let fn_proto_for_next = fn_proto;
+    iter.define_property(
+        PropertyKey::string("next"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, mm_inner| {
+                let iter_obj = this_val
+                    .as_object()
+                    .ok_or_else(|| "not an iterator object".to_string())?;
+                let string = iter_obj
+                    .get(&PropertyKey::string("__string_ref__"))
+                    .and_then(|v| v.as_string())
+                    .ok_or_else(|| "iterator: missing string ref".to_string())?;
+                let idx = iter_obj
+                    .get(&PropertyKey::string("__string_index__"))
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as usize;
+
+                // Get UTF-16 code units
+                let units = string.as_utf16();
+                let len = units.len();
+
+                if idx >= len {
+                    // Done
+                    let result = GcRef::new(JsObject::new(None, mm_inner));
+                    result.set(PropertyKey::string("value"), Value::undefined());
+                    result.set(PropertyKey::string("done"), Value::boolean(true));
+                    return Ok(Value::object(result));
+                }
+
+                // Read code point(s), handling surrogate pairs
+                let first = units[idx];
+                let (char_string, next_idx) = if is_high_surrogate(first)
+                    && idx + 1 < len
+                    && is_low_surrogate(units[idx + 1]) {
+                    // Surrogate pair: combine into single code point
+                    let pair = vec![first, units[idx + 1]];
+                    let char_str = String::from_utf16_lossy(&pair);
+                    (JsString::intern(&char_str), idx + 2)
+                } else {
+                    // Single code unit (either BMP character or unpaired surrogate)
+                    let single = vec![first];
+                    let char_str = String::from_utf16_lossy(&single);
+                    (JsString::intern(&char_str), idx + 1)
+                };
+
+                // Advance index
+                iter_obj.set(
+                    PropertyKey::string("__string_index__"),
+                    Value::number(next_idx as f64),
+                );
+
+                let result = GcRef::new(JsObject::new(None, mm_inner));
+                result.set(PropertyKey::string("value"), Value::string(char_string));
+                result.set(PropertyKey::string("done"), Value::boolean(false));
+                Ok(Value::object(result))
+            },
+            mm,
+            fn_proto_for_next,
+        )),
+    );
+    Ok(Value::object(iter))
+}
+
 /// Wire all String.prototype methods to the prototype object
 pub fn init_string_prototype(
     string_proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
+    iterator_proto: GcRef<JsObject>,
+    symbol_iterator_id: u64,
 ) {
         string_proto.define_property(
             PropertyKey::string("toString"),
@@ -881,4 +979,19 @@ pub fn init_string_prototype(
                 fn_proto,
             )),
         );
+
+    // String.prototype[Symbol.iterator]
+    let iter_proto_for_symbol = iterator_proto;
+    let mm_for_symbol = mm.clone();
+    let fn_proto_for_symbol = fn_proto;
+    string_proto.define_property(
+        PropertyKey::Symbol(symbol_iterator_id),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            move |this_val, _args, mm| {
+                make_string_iterator(this_val, mm, fn_proto_for_symbol, iter_proto_for_symbol)
+            },
+            mm_for_symbol,
+            fn_proto,
+        )),
+    );
 }

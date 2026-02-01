@@ -5,7 +5,9 @@
 //! Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array
 
 use otter_vm_core::error::VmError;
+use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
+use otter_vm_core::object::JsObject;
 use otter_vm_core::string::JsString;
 use otter_vm_core::typed_array::{JsTypedArray, TypedArrayKind};
 use otter_vm_core::value::{BigInt, HeapRef, Value as VmValue};
@@ -145,7 +147,8 @@ fn native_typed_array_create(
         }
     };
 
-    let ta = JsTypedArray::new(ab, kind, byte_offset, actual_length)
+    let object = GcRef::new(JsObject::new(None, _mm.clone()));
+    let ta = JsTypedArray::new(object, ab, kind, byte_offset, actual_length)
         .map_err(|e| VmError::range_error(format!("{}", e)))?;
 
     Ok(VmValue::typed_array(Arc::new(ta)))

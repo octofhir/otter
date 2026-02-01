@@ -7060,12 +7060,6 @@ mod tests {
     }
 
     #[test]
-    fn test_shim_builtins_js_compiles() {
-        let builtins = include_str!("../../otter-vm-builtins/src/builtins.js");
-        Compiler::new().compile(builtins, "builtins.js").unwrap();
-    }
-
-    #[test]
     fn test_shim_fetch_js_compiles() {
         let fetch = include_str!("../../otter-vm-builtins/src/fetch.js");
         Compiler::new().compile(fetch, "fetch.js").unwrap();

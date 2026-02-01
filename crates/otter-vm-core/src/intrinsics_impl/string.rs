@@ -10,6 +10,57 @@ use crate::value::Value;
 use crate::memory::MemoryManager;
 use std::sync::Arc;
 
+/// thisStringValue(value) per ES2023 §22.1.3
+///
+/// Extracts the string value from `this`:
+/// - If `this` is a string primitive, returns it directly.
+/// - If `this` is a String wrapper object (`new String("...")`), reads its
+///   `[[PrimitiveValue]]` internal slot (stored as `toString()` result or via
+///   a `__primitiveValue__` property).
+/// - If `this` is any other object, calls `toString()` on it as a fallback.
+/// - Otherwise, returns an error (null/undefined).
+fn this_string_value(this_val: &Value) -> Result<GcRef<JsString>, String> {
+    // Fast path: string primitive
+    if let Some(s) = this_val.as_string() {
+        return Ok(s);
+    }
+    // Object path: String wrapper or generic object
+    if let Some(obj) = this_val.as_object() {
+        // Check for __primitiveValue__ (internal slot for String wrapper objects)
+        if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
+            if let Some(s) = prim.as_string() {
+                return Ok(s);
+            }
+        }
+        // Fallback: try valueOf then toString
+        if let Some(val) = obj.get(&PropertyKey::string("valueOf")) {
+            if let Some(s) = val.as_string() {
+                return Ok(s);
+            }
+        }
+        if let Some(val) = obj.get(&PropertyKey::string("toString")) {
+            if let Some(s) = val.as_string() {
+                return Ok(s);
+            }
+        }
+        // Last resort: coerce via number-like or use "[object Object]"
+        return Ok(JsString::intern("[object Object]"));
+    }
+    // Number/boolean coercion
+    if let Some(n) = this_val.as_number() {
+        let s = if n.fract() == 0.0 && n.abs() < 1e15 {
+            format!("{}", n as i64)
+        } else {
+            format!("{}", n)
+        };
+        return Ok(JsString::intern(&s));
+    }
+    if let Some(b) = this_val.as_boolean() {
+        return Ok(JsString::intern(if b { "true" } else { "false" }));
+    }
+    Err("String.prototype method called on null or undefined".to_string())
+}
+
 /// Wire all String.prototype methods to the prototype object
 pub fn init_string_prototype(
     string_proto: GcRef<JsObject>,
@@ -60,9 +111,7 @@ pub fn init_string_prototype(
             PropertyKey::string("charAt"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.charAt: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     let pos = args
                         .first()
                         .and_then(|v| v.as_number())
@@ -84,9 +133,7 @@ pub fn init_string_prototype(
             PropertyKey::string("charCodeAt"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.charCodeAt: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     let pos = args
                         .first()
                         .and_then(|v| v.as_number())
@@ -108,9 +155,7 @@ pub fn init_string_prototype(
             PropertyKey::string("slice"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.slice: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     let str_val = s.as_str();
                     let len = str_val.len() as i64;
                     let start = args
@@ -153,9 +198,7 @@ pub fn init_string_prototype(
             PropertyKey::string("substring"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.substring: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     let str_val = s.as_str();
                     let len = str_val.len();
                     let start = args
@@ -188,9 +231,7 @@ pub fn init_string_prototype(
             PropertyKey::string("toLowerCase"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, _args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.toLowerCase: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     Ok(Value::string(JsString::intern(&s.as_str().to_lowercase())))
                 },
                 mm.clone(),
@@ -203,9 +244,7 @@ pub fn init_string_prototype(
             PropertyKey::string("toUpperCase"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, _args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.toUpperCase: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     Ok(Value::string(JsString::intern(&s.as_str().to_uppercase())))
                 },
                 mm.clone(),
@@ -218,9 +257,7 @@ pub fn init_string_prototype(
             PropertyKey::string("trim"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, _args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.trim: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     Ok(Value::string(JsString::intern(s.as_str().trim())))
                 },
                 mm.clone(),
@@ -233,9 +270,7 @@ pub fn init_string_prototype(
             PropertyKey::string("trimStart"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, _args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.trimStart: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     Ok(Value::string(JsString::intern(s.as_str().trim_start())))
                 },
                 mm.clone(),
@@ -248,9 +283,7 @@ pub fn init_string_prototype(
             PropertyKey::string("trimEnd"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, _args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.trimEnd: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     Ok(Value::string(JsString::intern(s.as_str().trim_end())))
                 },
                 mm.clone(),
@@ -263,9 +296,7 @@ pub fn init_string_prototype(
             PropertyKey::string("startsWith"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.startsWith: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     let search = args
                         .first()
                         .and_then(|v| v.as_string())
@@ -291,9 +322,7 @@ pub fn init_string_prototype(
             PropertyKey::string("endsWith"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.endsWith: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     let search = args
                         .first()
                         .and_then(|v| v.as_string())
@@ -323,9 +352,7 @@ pub fn init_string_prototype(
             PropertyKey::string("includes"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.includes: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     let search = args
                         .first()
                         .and_then(|v| v.as_string())
@@ -351,9 +378,7 @@ pub fn init_string_prototype(
             PropertyKey::string("repeat"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.repeat: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     let count = args
                         .first()
                         .and_then(|v| v.as_number())
@@ -374,9 +399,7 @@ pub fn init_string_prototype(
             PropertyKey::string("padStart"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.padStart: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     let target_len = args
                         .first()
                         .and_then(|v| v.as_number())
@@ -414,9 +437,7 @@ pub fn init_string_prototype(
             PropertyKey::string("padEnd"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.padEnd: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     let target_len = args
                         .first()
                         .and_then(|v| v.as_number())
@@ -454,9 +475,7 @@ pub fn init_string_prototype(
             PropertyKey::string("at"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.at: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     let chars: Vec<char> = s.as_str().chars().collect();
                     let len = chars.len() as i64;
                     let idx = args
@@ -479,9 +498,7 @@ pub fn init_string_prototype(
             PropertyKey::string("indexOf"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.indexOf: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     let search = args
                         .first()
                         .and_then(|v| v.as_string())
@@ -510,9 +527,7 @@ pub fn init_string_prototype(
             PropertyKey::string("lastIndexOf"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.lastIndexOf: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     let search = args
                         .first()
                         .and_then(|v| v.as_string())
@@ -533,9 +548,7 @@ pub fn init_string_prototype(
             PropertyKey::string("concat"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, _mm| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.concat: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
                     let mut result = s.as_str().to_string();
                     for arg in args {
                         if let Some(s) = arg.as_string() {
@@ -562,9 +575,7 @@ pub fn init_string_prototype(
             PropertyKey::string("split"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, mm_inner| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.split: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
 
                     // If separator is a RegExp, delegate to Symbol.split
                     if let Some(sep) = args.first() {
@@ -632,9 +643,7 @@ pub fn init_string_prototype(
             PropertyKey::string("replace"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, mm_inner| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.replace: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
 
                     // If searchValue is a RegExp, delegate to Symbol.replace
                     if let Some(search_val) = args.first() {
@@ -688,9 +697,7 @@ pub fn init_string_prototype(
             PropertyKey::string("replaceAll"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, mm_inner| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.replaceAll: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
 
                     // If searchValue is a RegExp, it must have global flag
                     if let Some(search_val) = args.first() {
@@ -740,9 +747,7 @@ pub fn init_string_prototype(
             PropertyKey::string("search"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, mm_inner| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.search: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
 
                     // If regexp is a RegExp, delegate to Symbol.search
                     if let Some(search_val) = args.first() {
@@ -780,9 +785,7 @@ pub fn init_string_prototype(
             PropertyKey::string("match"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, mm_inner| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.match: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
 
                     // If regexp is a RegExp, delegate to Symbol.match
                     if let Some(search_val) = args.first() {
@@ -828,9 +831,7 @@ pub fn init_string_prototype(
             PropertyKey::string("matchAll"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, mm_inner| {
-                    let s = this_val
-                        .as_string()
-                        .ok_or_else(|| "String.prototype.matchAll: not a string".to_string())?;
+                    let s = this_string_value(this_val)?;
 
                     // If regexp is a RegExp, delegate to Symbol.matchAll
                     if let Some(search_val) = args.first() {

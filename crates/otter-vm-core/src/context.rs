@@ -501,14 +501,21 @@ impl VmContext {
     /// Get a register value
     #[inline]
     pub fn get_register(&self, index: u16) -> &Value {
-        let frame = self.current_frame().expect("no call frame");
+        static UNDEFINED: Value = Value::undefined();
+        let frame = match self.current_frame() {
+            Some(f) => f,
+            None => return &UNDEFINED,
+        };
         &self.registers[frame.register_base + index as usize]
     }
 
     /// Set a register value
     #[inline]
     pub fn set_register(&mut self, index: u16, value: Value) {
-        let base = self.current_frame().expect("no call frame").register_base;
+        let base = match self.current_frame() {
+            Some(f) => f.register_base,
+            None => return,
+        };
         self.registers[base + index as usize] = value;
     }
 
@@ -1198,10 +1205,7 @@ impl VmContext {
     /// Returns true if a collection was performed.
     pub fn maybe_collect_garbage(&self) -> bool {
         if self.memory_manager.should_collect_garbage() {
-            let before = self.heap_size();
-            let reclaimed = self.collect_garbage();
-            let after = self.heap_size();
-            eprintln!("[GC] Collected {} bytes (heap: {} -> {})", reclaimed, before, after);
+            self.collect_garbage();
             true
         } else {
             false

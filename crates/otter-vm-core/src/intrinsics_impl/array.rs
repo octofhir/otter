@@ -8,6 +8,7 @@
 //!   slice, concat, reverse, at, fill, splice, flat, forEach, map, filter,
 //!   reduce, reduceRight, find, findIndex, every, some, sort, entries, keys, values, copyWithin
 
+use crate::error::{InterceptionSignal, VmError};
 use crate::gc::GcRef;
 use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
@@ -16,11 +17,34 @@ use crate::value::Value;
 use crate::intrinsics_impl::helpers::{same_value_zero, strict_equal};
 use std::sync::Arc;
 
-/// Helper: get array length from an object
+/// Helper: get array length from an object (spec-compliant, no cap).
 fn get_len(obj: &GcRef<JsObject>) -> usize {
     obj.get(&PropertyKey::string("length"))
         .and_then(|v| v.as_number())
         .unwrap_or(0.0) as usize
+}
+
+/// Helper: convert value to string for default sort comparison
+fn value_to_sort_string(val: &Value) -> String {
+    if val.is_undefined() {
+        return String::new(); // undefined sorts last but we handle that
+    }
+    if let Some(s) = val.as_string() {
+        return s.as_str().to_string();
+    }
+    if let Some(n) = val.as_number() {
+        if n.fract() == 0.0 && n.abs() < 1e15 {
+            return format!("{}", n as i64);
+        }
+        return format!("{}", n);
+    }
+    if let Some(b) = val.as_boolean() {
+        return if b { "true" } else { "false" }.to_string();
+    }
+    if val.is_null() {
+        return "null".to_string();
+    }
+    "[object Object]".to_string()
 }
 
 /// Helper: set array length
@@ -28,11 +52,101 @@ fn set_len(obj: &GcRef<JsObject>, len: usize) {
     obj.set(PropertyKey::string("length"), Value::number(len as f64));
 }
 
+/// Create an array iterator object with the given kind ("value", "key", or "entry").
+fn make_array_iterator(
+    this_val: &Value,
+    kind: &str,
+    mm: Arc<MemoryManager>,
+    fn_proto: GcRef<JsObject>,
+    iter_proto: GcRef<JsObject>,
+) -> Result<Value, crate::error::VmError> {
+    let obj = this_val
+        .as_object()
+        .ok_or_else(|| "Array iterator: this is not an object".to_string())?;
+    let iter = GcRef::new(JsObject::new(Some(iter_proto), mm.clone()));
+    // Store the array reference, current index, length, and kind
+    iter.set(PropertyKey::string("__array_ref__"), Value::object(obj));
+    iter.set(PropertyKey::string("__array_index__"), Value::number(0.0));
+    iter.set(
+        PropertyKey::string("__iter_kind__"),
+        Value::string(JsString::intern(kind)),
+    );
+    // next() method
+    let fn_proto_for_next = fn_proto;
+    iter.define_property(
+        PropertyKey::string("next"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, _args, mm_inner| {
+                let iter_obj = this_val
+                    .as_object()
+                    .ok_or_else(|| "not an iterator object".to_string())?;
+                let arr = iter_obj
+                    .get(&PropertyKey::string("__array_ref__"))
+                    .and_then(|v| v.as_object())
+                    .ok_or_else(|| "iterator: missing array ref".to_string())?;
+                let idx = iter_obj
+                    .get(&PropertyKey::string("__array_index__"))
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as usize;
+                let len = get_len(&arr);
+                let kind = iter_obj
+                    .get(&PropertyKey::string("__iter_kind__"))
+                    .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
+                    .unwrap_or_else(|| "value".to_string());
+
+                if idx >= len {
+                    // Done
+                    let result = GcRef::new(JsObject::new(None, mm_inner));
+                    result.set(PropertyKey::string("value"), Value::undefined());
+                    result.set(PropertyKey::string("done"), Value::boolean(true));
+                    return Ok(Value::object(result));
+                }
+
+                // Advance index
+                iter_obj.set(
+                    PropertyKey::string("__array_index__"),
+                    Value::number((idx + 1) as f64),
+                );
+
+                let result = GcRef::new(JsObject::new(None, mm_inner.clone()));
+                match kind.as_str() {
+                    "key" => {
+                        result.set(PropertyKey::string("value"), Value::number(idx as f64));
+                    }
+                    "entry" => {
+                        let entry = GcRef::new(JsObject::array(2, mm_inner));
+                        entry.set(PropertyKey::Index(0), Value::number(idx as f64));
+                        let val = arr
+                            .get(&PropertyKey::Index(idx as u32))
+                            .unwrap_or(Value::undefined());
+                        entry.set(PropertyKey::Index(1), val);
+                        result.set(PropertyKey::string("value"), Value::array(entry));
+                    }
+                    _ => {
+                        // "value"
+                        let val = arr
+                            .get(&PropertyKey::Index(idx as u32))
+                            .unwrap_or(Value::undefined());
+                        result.set(PropertyKey::string("value"), val);
+                    }
+                }
+                result.set(PropertyKey::string("done"), Value::boolean(false));
+                Ok(Value::object(result))
+            },
+            mm,
+            fn_proto_for_next,
+        )),
+    );
+    Ok(Value::object(iter))
+}
+
 /// Wire all Array.prototype methods to the prototype object
 pub fn init_array_prototype(
     arr_proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
+    iterator_proto: GcRef<JsObject>,
+    symbol_iterator_id: u64,
 ) {
         // Array.prototype.push
         arr_proto.define_property(
@@ -259,7 +373,9 @@ pub fn init_array_prototype(
                             }
                         })
                         .unwrap_or_else(|| ",".to_string());
-                    let mut parts = Vec::with_capacity(len);
+                    // Don't pre-allocate with huge lengths (sparse arrays can have
+                    // length up to 2^32-1 but only a few actual elements).
+                    let mut parts = Vec::with_capacity(len.min(1024));
                     for i in 0..len {
                         let val = obj
                             .get(&PropertyKey::Index(i as u32))
@@ -297,7 +413,7 @@ pub fn init_array_prototype(
                         .as_object()
                         .ok_or_else(|| "Array.prototype.toString: not an object".to_string())?;
                     let len = get_len(&obj);
-                    let mut parts = Vec::with_capacity(len);
+                    let mut parts = Vec::with_capacity(len.min(1024));
                     for i in 0..len {
                         let val = obj
                             .get(&PropertyKey::Index(i as u32))
@@ -625,6 +741,603 @@ pub fn init_array_prototype(
                 fn_proto,
             )),
         );
+
+        // ================================================================
+        // Array callback methods: forEach, map, filter, find, findIndex,
+        // every, some, reduce, reduceRight, findLast, findLastIndex,
+        // flatMap, sort (with comparator)
+        // ================================================================
+
+        // Array.prototype.forEach(callback [, thisArg])
+        arr_proto.define_property(
+            PropertyKey::string("forEach"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("Array.prototype.forEach: this is not an object"))?;
+                    let callback = args.first().cloned().unwrap_or(Value::undefined());
+                    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+
+                    if callback.is_function() {
+                        return Err(VmError::interception(InterceptionSignal::ArrayForEach));
+                    }
+                    if let Some(native_fn) = callback.as_native_function() {
+                        let len = get_len(&obj);
+                        for i in 0..len {
+                            let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            native_fn(&this_arg, &[val, Value::number(i as f64), this_val.clone()], mm_inner.clone())?;
+                        }
+                        return Ok(Value::undefined());
+                    }
+                    Err(VmError::type_error("Array.prototype.forEach: callback is not a function"))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // Array.prototype.map(callback [, thisArg])
+        arr_proto.define_property(
+            PropertyKey::string("map"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("Array.prototype.map: this is not an object"))?;
+                    let callback = args.first().cloned().unwrap_or(Value::undefined());
+                    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+
+                    if callback.is_function() {
+                        return Err(VmError::interception(InterceptionSignal::ArrayMap));
+                    }
+                    if let Some(native_fn) = callback.as_native_function() {
+                        let len = get_len(&obj);
+                        let result = GcRef::new(JsObject::array(len, mm_inner.clone()));
+                        for i in 0..len {
+                            let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            let mapped = native_fn(&this_arg, &[val, Value::number(i as f64), this_val.clone()], mm_inner.clone())?;
+                            result.set(PropertyKey::Index(i as u32), mapped);
+                        }
+                        return Ok(Value::array(result));
+                    }
+                    Err(VmError::type_error("Array.prototype.map: callback is not a function"))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // Array.prototype.filter(callback [, thisArg])
+        arr_proto.define_property(
+            PropertyKey::string("filter"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("Array.prototype.filter: this is not an object"))?;
+                    let callback = args.first().cloned().unwrap_or(Value::undefined());
+                    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+
+                    if callback.is_function() {
+                        return Err(VmError::interception(InterceptionSignal::ArrayFilter));
+                    }
+                    if let Some(native_fn) = callback.as_native_function() {
+                        let len = get_len(&obj);
+                        let result = GcRef::new(JsObject::array(0, mm_inner.clone()));
+                        let mut out_idx = 0u32;
+                        for i in 0..len {
+                            let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            let keep = native_fn(&this_arg, &[val.clone(), Value::number(i as f64), this_val.clone()], mm_inner.clone())?;
+                            if keep.to_boolean() {
+                                result.set(PropertyKey::Index(out_idx), val);
+                                out_idx += 1;
+                            }
+                        }
+                        set_len(&result, out_idx as usize);
+                        return Ok(Value::array(result));
+                    }
+                    Err(VmError::type_error("Array.prototype.filter: callback is not a function"))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // Array.prototype.find(callback [, thisArg])
+        arr_proto.define_property(
+            PropertyKey::string("find"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("Array.prototype.find: this is not an object"))?;
+                    let callback = args.first().cloned().unwrap_or(Value::undefined());
+                    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+
+                    if callback.is_function() {
+                        return Err(VmError::interception(InterceptionSignal::ArrayFind));
+                    }
+                    if let Some(native_fn) = callback.as_native_function() {
+                        let len = get_len(&obj);
+                        for i in 0..len {
+                            let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            let test = native_fn(&this_arg, &[val.clone(), Value::number(i as f64), this_val.clone()], mm_inner.clone())?;
+                            if test.to_boolean() {
+                                return Ok(val);
+                            }
+                        }
+                        return Ok(Value::undefined());
+                    }
+                    Err(VmError::type_error("Array.prototype.find: callback is not a function"))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // Array.prototype.findIndex(callback [, thisArg])
+        arr_proto.define_property(
+            PropertyKey::string("findIndex"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("Array.prototype.findIndex: this is not an object"))?;
+                    let callback = args.first().cloned().unwrap_or(Value::undefined());
+                    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+
+                    if callback.is_function() {
+                        return Err(VmError::interception(InterceptionSignal::ArrayFindIndex));
+                    }
+                    if let Some(native_fn) = callback.as_native_function() {
+                        let len = get_len(&obj);
+                        for i in 0..len {
+                            let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            let test = native_fn(&this_arg, &[val, Value::number(i as f64), this_val.clone()], mm_inner.clone())?;
+                            if test.to_boolean() {
+                                return Ok(Value::number(i as f64));
+                            }
+                        }
+                        return Ok(Value::number(-1.0));
+                    }
+                    Err(VmError::type_error("Array.prototype.findIndex: callback is not a function"))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // Array.prototype.findLast(callback [, thisArg])
+        arr_proto.define_property(
+            PropertyKey::string("findLast"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("Array.prototype.findLast: this is not an object"))?;
+                    let callback = args.first().cloned().unwrap_or(Value::undefined());
+                    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+
+                    if callback.is_function() {
+                        return Err(VmError::interception(InterceptionSignal::ArrayFindLast));
+                    }
+                    if let Some(native_fn) = callback.as_native_function() {
+                        let len = get_len(&obj);
+                        for i in (0..len).rev() {
+                            let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            let test = native_fn(&this_arg, &[val.clone(), Value::number(i as f64), this_val.clone()], mm_inner.clone())?;
+                            if test.to_boolean() {
+                                return Ok(val);
+                            }
+                        }
+                        return Ok(Value::undefined());
+                    }
+                    Err(VmError::type_error("Array.prototype.findLast: callback is not a function"))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // Array.prototype.findLastIndex(callback [, thisArg])
+        arr_proto.define_property(
+            PropertyKey::string("findLastIndex"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("Array.prototype.findLastIndex: this is not an object"))?;
+                    let callback = args.first().cloned().unwrap_or(Value::undefined());
+                    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+
+                    if callback.is_function() {
+                        return Err(VmError::interception(InterceptionSignal::ArrayFindLastIndex));
+                    }
+                    if let Some(native_fn) = callback.as_native_function() {
+                        let len = get_len(&obj);
+                        for i in (0..len).rev() {
+                            let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            let test = native_fn(&this_arg, &[val, Value::number(i as f64), this_val.clone()], mm_inner.clone())?;
+                            if test.to_boolean() {
+                                return Ok(Value::number(i as f64));
+                            }
+                        }
+                        return Ok(Value::number(-1.0));
+                    }
+                    Err(VmError::type_error("Array.prototype.findLastIndex: callback is not a function"))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // Array.prototype.every(callback [, thisArg])
+        arr_proto.define_property(
+            PropertyKey::string("every"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("Array.prototype.every: this is not an object"))?;
+                    let callback = args.first().cloned().unwrap_or(Value::undefined());
+                    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+
+                    if callback.is_function() {
+                        return Err(VmError::interception(InterceptionSignal::ArrayEvery));
+                    }
+                    if let Some(native_fn) = callback.as_native_function() {
+                        let len = get_len(&obj);
+                        for i in 0..len {
+                            let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            let test = native_fn(&this_arg, &[val, Value::number(i as f64), this_val.clone()], mm_inner.clone())?;
+                            if !test.to_boolean() {
+                                return Ok(Value::boolean(false));
+                            }
+                        }
+                        return Ok(Value::boolean(true));
+                    }
+                    Err(VmError::type_error("Array.prototype.every: callback is not a function"))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // Array.prototype.some(callback [, thisArg])
+        arr_proto.define_property(
+            PropertyKey::string("some"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("Array.prototype.some: this is not an object"))?;
+                    let callback = args.first().cloned().unwrap_or(Value::undefined());
+                    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+
+                    if callback.is_function() {
+                        return Err(VmError::interception(InterceptionSignal::ArraySome));
+                    }
+                    if let Some(native_fn) = callback.as_native_function() {
+                        let len = get_len(&obj);
+                        for i in 0..len {
+                            let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            let test = native_fn(&this_arg, &[val, Value::number(i as f64), this_val.clone()], mm_inner.clone())?;
+                            if test.to_boolean() {
+                                return Ok(Value::boolean(true));
+                            }
+                        }
+                        return Ok(Value::boolean(false));
+                    }
+                    Err(VmError::type_error("Array.prototype.some: callback is not a function"))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // Array.prototype.reduce(callback [, initialValue])
+        arr_proto.define_property(
+            PropertyKey::string("reduce"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("Array.prototype.reduce: this is not an object"))?;
+                    let callback = args.first().cloned().unwrap_or(Value::undefined());
+
+                    if callback.is_function() {
+                        return Err(VmError::interception(InterceptionSignal::ArrayReduce));
+                    }
+                    if let Some(native_fn) = callback.as_native_function() {
+                        let len = get_len(&obj);
+                        let has_initial = args.len() > 1;
+                        let mut accumulator = if has_initial {
+                            args[1].clone()
+                        } else {
+                            if len == 0 {
+                                return Err(VmError::type_error("Reduce of empty array with no initial value"));
+                            }
+                            obj.get(&PropertyKey::Index(0)).unwrap_or(Value::undefined())
+                        };
+                        let start = if has_initial { 0 } else { 1 };
+                        for i in start..len {
+                            let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            accumulator = native_fn(
+                                &Value::undefined(),
+                                &[accumulator, val, Value::number(i as f64), this_val.clone()],
+                                mm_inner.clone(),
+                            )?;
+                        }
+                        return Ok(accumulator);
+                    }
+                    Err(VmError::type_error("Array.prototype.reduce: callback is not a function"))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // Array.prototype.reduceRight(callback [, initialValue])
+        arr_proto.define_property(
+            PropertyKey::string("reduceRight"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("Array.prototype.reduceRight: this is not an object"))?;
+                    let callback = args.first().cloned().unwrap_or(Value::undefined());
+
+                    if callback.is_function() {
+                        return Err(VmError::interception(InterceptionSignal::ArrayReduceRight));
+                    }
+                    if let Some(native_fn) = callback.as_native_function() {
+                        let len = get_len(&obj);
+                        let has_initial = args.len() > 1;
+                        let mut accumulator = if has_initial {
+                            args[1].clone()
+                        } else {
+                            if len == 0 {
+                                return Err(VmError::type_error("Reduce of empty array with no initial value"));
+                            }
+                            obj.get(&PropertyKey::Index((len - 1) as u32)).unwrap_or(Value::undefined())
+                        };
+                        let end = if has_initial { len } else { len.saturating_sub(1) };
+                        for i in (0..end).rev() {
+                            let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            accumulator = native_fn(
+                                &Value::undefined(),
+                                &[accumulator, val, Value::number(i as f64), this_val.clone()],
+                                mm_inner.clone(),
+                            )?;
+                        }
+                        return Ok(accumulator);
+                    }
+                    Err(VmError::type_error("Array.prototype.reduceRight: callback is not a function"))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // Array.prototype.flatMap(callback [, thisArg])
+        arr_proto.define_property(
+            PropertyKey::string("flatMap"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("Array.prototype.flatMap: this is not an object"))?;
+                    let callback = args.first().cloned().unwrap_or(Value::undefined());
+                    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+
+                    if callback.is_function() {
+                        return Err(VmError::interception(InterceptionSignal::ArrayFlatMap));
+                    }
+                    if let Some(native_fn) = callback.as_native_function() {
+                        let len = get_len(&obj);
+                        let result = GcRef::new(JsObject::array(0, mm_inner.clone()));
+                        let mut out_idx = 0u32;
+                        for i in 0..len {
+                            let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            let mapped = native_fn(&this_arg, &[val, Value::number(i as f64), this_val.clone()], mm_inner.clone())?;
+                            // Flatten one level
+                            if let Some(inner) = mapped.as_object() {
+                                if inner.get(&PropertyKey::string("length")).is_some() {
+                                    let inner_len = get_len(&inner);
+                                    for j in 0..inner_len {
+                                        let item = inner.get(&PropertyKey::Index(j as u32)).unwrap_or(Value::undefined());
+                                        result.set(PropertyKey::Index(out_idx), item);
+                                        out_idx += 1;
+                                    }
+                                    continue;
+                                }
+                            }
+                            result.set(PropertyKey::Index(out_idx), mapped);
+                            out_idx += 1;
+                        }
+                        set_len(&result, out_idx as usize);
+                        return Ok(Value::array(result));
+                    }
+                    Err(VmError::type_error("Array.prototype.flatMap: callback is not a function"))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // Array.prototype.sort([compareFn])
+        arr_proto.define_property(
+            PropertyKey::string("sort"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, mm_inner| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("Array.prototype.sort: this is not an object"))?;
+                    let compare_fn = args.first().cloned().unwrap_or(Value::undefined());
+                    let len = get_len(&obj);
+
+                    // Collect elements
+                    let mut elements: Vec<Value> = Vec::with_capacity(len.min(1024));
+                    for i in 0..len {
+                        elements.push(obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined()));
+                    }
+
+                    if compare_fn.is_undefined() {
+                        // Default: sort by toString
+                        elements.sort_by(|a, b| {
+                            let sa = value_to_sort_string(a);
+                            let sb = value_to_sort_string(b);
+                            sa.cmp(&sb)
+                        });
+                    } else if compare_fn.is_function() {
+                        // Closure comparator — need interpreter context
+                        return Err(VmError::interception(InterceptionSignal::ArraySort));
+                    } else if let Some(native_fn) = compare_fn.as_native_function() {
+                        // Native comparator — fast path
+                        let mut err: Option<VmError> = None;
+                        elements.sort_by(|a, b| {
+                            if err.is_some() {
+                                return std::cmp::Ordering::Equal;
+                            }
+                            match native_fn(&Value::undefined(), &[a.clone(), b.clone()], mm_inner.clone()) {
+                                Ok(result) => {
+                                    let n = result.as_number().unwrap_or(0.0);
+                                    if n < 0.0 {
+                                        std::cmp::Ordering::Less
+                                    } else if n > 0.0 {
+                                        std::cmp::Ordering::Greater
+                                    } else {
+                                        std::cmp::Ordering::Equal
+                                    }
+                                }
+                                Err(e) => {
+                                    err = Some(e);
+                                    std::cmp::Ordering::Equal
+                                }
+                            }
+                        });
+                        if let Some(e) = err {
+                            return Err(e);
+                        }
+                    } else {
+                        return Err(VmError::type_error("Array.prototype.sort: comparator is not a function"));
+                    }
+
+                    // Write sorted elements back
+                    for (i, val) in elements.into_iter().enumerate() {
+                        obj.set(PropertyKey::Index(i as u32), val);
+                    }
+                    Ok(this_val.clone())
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // Array.prototype.copyWithin(target, start [, end])
+        arr_proto.define_property(
+            PropertyKey::string("copyWithin"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |this_val, args, _mm| {
+                    let obj = this_val
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("Array.prototype.copyWithin: this is not an object"))?;
+                    let len = get_len(&obj) as i64;
+                    let target = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i64;
+                    let start = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i64;
+                    let end = args.get(2).and_then(|v| {
+                        if v.is_undefined() { None } else { v.as_number() }
+                    }).unwrap_or(len as f64) as i64;
+
+                    let to = if target < 0 { (len + target).max(0) } else { target.min(len) } as usize;
+                    let from = if start < 0 { (len + start).max(0) } else { start.min(len) } as usize;
+                    let fin = if end < 0 { (len + end).max(0) } else { end.min(len) } as usize;
+                    let count = (fin.saturating_sub(from)).min((len as usize).saturating_sub(to));
+
+                    // Copy in correct direction to handle overlapping
+                    if from < to && to < from + count {
+                        for i in (0..count).rev() {
+                            let val = obj.get(&PropertyKey::Index((from + i) as u32)).unwrap_or(Value::undefined());
+                            obj.set(PropertyKey::Index((to + i) as u32), val);
+                        }
+                    } else {
+                        for i in 0..count {
+                            let val = obj.get(&PropertyKey::Index((from + i) as u32)).unwrap_or(Value::undefined());
+                            obj.set(PropertyKey::Index((to + i) as u32), val);
+                        }
+                    }
+                    Ok(this_val.clone())
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
+        // ================================================================
+        // Array.prototype.values / keys / entries / [Symbol.iterator]
+        // ================================================================
+        {
+            let iter_proto = iterator_proto;
+            let sym_id = symbol_iterator_id;
+
+            // Array.prototype.values()
+            let mm_c = mm.clone();
+            let fn_p = fn_proto;
+            let ip = iter_proto;
+            arr_proto.define_property(
+                PropertyKey::string("values"),
+                PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                    move |this_val, _args, mm_inner| {
+                        make_array_iterator(this_val, "value", mm_inner, fn_p, ip)
+                    },
+                    mm.clone(),
+                    fn_proto,
+                )),
+            );
+
+            // Array.prototype.keys()
+            let fn_p = fn_proto;
+            let ip = iter_proto;
+            arr_proto.define_property(
+                PropertyKey::string("keys"),
+                PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                    move |this_val, _args, mm_inner| {
+                        make_array_iterator(this_val, "key", mm_inner, fn_p, ip)
+                    },
+                    mm.clone(),
+                    fn_proto,
+                )),
+            );
+
+            // Array.prototype.entries()
+            let fn_p = fn_proto;
+            let ip = iter_proto;
+            arr_proto.define_property(
+                PropertyKey::string("entries"),
+                PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                    move |this_val, _args, mm_inner| {
+                        make_array_iterator(this_val, "entry", mm_inner, fn_p, ip)
+                    },
+                    mm.clone(),
+                    fn_proto,
+                )),
+            );
+
+            // Array.prototype[Symbol.iterator] = Array.prototype.values
+            let fn_p = fn_proto;
+            let ip = iter_proto;
+            arr_proto.define_property(
+                PropertyKey::Symbol(sym_id),
+                PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                    move |this_val, _args, mm_inner| {
+                        make_array_iterator(this_val, "value", mm_inner, fn_p, ip)
+                    },
+                    mm.clone(),
+                    fn_proto,
+                )),
+            );
+        }
 }
 
 /// Install static methods on the Array constructor.

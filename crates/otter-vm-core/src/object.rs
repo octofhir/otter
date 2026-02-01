@@ -66,12 +66,16 @@ pub enum PropertyKey {
 }
 
 impl PropertyKey {
+    /// Maximum valid array index per ECMA-262: 0 .. 2^32 - 2.
+    /// The value 2^32 - 1 (4294967295) is NOT a valid array index.
+    pub const MAX_ARRAY_INDEX: u32 = u32::MAX - 1; // 4294967294
+
     /// Create a string property key (canonicalizes numeric strings to Index)
     pub fn string(s: &str) -> Self {
-        // Canonicalize numeric strings to Index for consistent lookup
+        // Canonicalize numeric strings to Index for consistent lookup.
+        // Only values 0..=MAX_ARRAY_INDEX are valid array indices per spec.
         if let Ok(n) = s.parse::<u32>() {
-            // Verify it's canonical (no leading zeros except for "0")
-            if n.to_string() == s {
+            if n <= Self::MAX_ARRAY_INDEX && n.to_string() == s {
                 return Self::Index(n);
             }
         }
@@ -384,6 +388,9 @@ pub struct ObjectFlags {
     pub is_dictionary: bool,
     /// Is an intrinsic/shared object (protected from teardown clearing)
     pub is_intrinsic: bool,
+    /// Explicit array length, used when the array is sparse and elements.len()
+    /// doesn't represent the true JS `.length`. `None` means use elements.len().
+    pub sparse_array_length: Option<u32>,
 }
 
 impl JsObject {
@@ -418,8 +425,17 @@ impl JsObject {
     /// Create a new array
     pub fn array(length: usize, memory_manager: Arc<crate::memory::MemoryManager>) -> Self {
         let obj = Self::new(None, memory_manager); // TODO: Array.prototype
-        obj.flags.write().is_array = true;
-        obj.elements.write().resize(length, Value::undefined());
+        // Cap dense element pre-allocation to avoid OOM on large sparse arrays.
+        const MAX_DENSE_PREALLOC: usize = 1 << 24; // 16M elements
+        let mut flags = obj.flags.write();
+        flags.is_array = true;
+        if length <= MAX_DENSE_PREALLOC {
+            drop(flags);
+            obj.elements.write().resize(length, Value::undefined());
+        } else {
+            flags.sparse_array_length = Some(length as u32);
+            drop(flags);
+        }
         obj
     }
 
@@ -605,6 +621,11 @@ impl JsObject {
             && let PropertyKey::String(s) = key
             && s.as_str() == "length"
         {
+            let flags = self.flags.read();
+            if let Some(sparse_len) = flags.sparse_array_length {
+                return Some(Value::number(sparse_len as f64));
+            }
+            drop(flags);
             return Some(Value::int32(self.elements.read().len() as i32));
         }
 
@@ -659,8 +680,18 @@ impl JsObject {
                 break;
             }
 
-            // Check proto via shape lookup and inline storage
-            {
+            // Check proto: dictionary mode first, then shape lookup
+            if proto.is_dictionary_mode() {
+                if let Some(dict) = proto.dictionary_properties.read().as_ref() {
+                    if let Some(entry) = dict.get(key) {
+                        match &entry.desc {
+                            PropertyDescriptor::Data { value, .. } => return Some(value.clone()),
+                            PropertyDescriptor::Accessor { .. } => return None,
+                            PropertyDescriptor::Deleted => {}
+                        }
+                    }
+                }
+            } else {
                 let shape = proto.shape.read();
                 if let Some(offset) = shape.get_offset(key) {
                     if let Some(desc) = proto.get_property_entry_by_offset(offset) {
@@ -808,10 +839,15 @@ impl JsObject {
                 elements[idx] = value;
                 return true;
             } else if flags.is_array && flags.extensible && !flags.sealed {
-                // Extend array (only if extensible and not sealed)
-                elements.resize(idx + 1, Value::undefined());
-                elements[idx] = value;
-                return true;
+                // Cap dense element storage to avoid OOM on sparse arrays.
+                // Indices beyond this limit are stored as dictionary properties.
+                const MAX_DENSE_LENGTH: usize = 1 << 24; // 16M elements
+                if idx < MAX_DENSE_LENGTH {
+                    elements.resize(idx + 1, Value::undefined());
+                    elements[idx] = value;
+                    return true;
+                }
+                // Large sparse index — fall through to dictionary/string storage
             }
             drop(elements);
             drop(flags);
@@ -1277,6 +1313,9 @@ impl JsObject {
 
     /// Get array length (for arrays)
     pub fn array_length(&self) -> usize {
+        if let Some(sparse_len) = self.flags.read().sparse_array_length {
+            return sparse_len as usize;
+        }
         self.elements.read().len()
     }
 

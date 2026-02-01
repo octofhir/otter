@@ -20,6 +20,33 @@ pub enum InterceptionSignal {
     ReflectConstruct,
     /// eval() called indirectly — requires VM context to compile and execute code
     EvalCall,
+    // ---- Array callback methods (require VM context to call closure callbacks) ----
+    /// Array.prototype.forEach
+    ArrayForEach,
+    /// Array.prototype.map
+    ArrayMap,
+    /// Array.prototype.filter
+    ArrayFilter,
+    /// Array.prototype.find
+    ArrayFind,
+    /// Array.prototype.findIndex
+    ArrayFindIndex,
+    /// Array.prototype.findLast
+    ArrayFindLast,
+    /// Array.prototype.findLastIndex
+    ArrayFindLastIndex,
+    /// Array.prototype.every
+    ArrayEvery,
+    /// Array.prototype.some
+    ArraySome,
+    /// Array.prototype.reduce
+    ArrayReduce,
+    /// Array.prototype.reduceRight
+    ArrayReduceRight,
+    /// Array.prototype.flatMap
+    ArrayFlatMap,
+    /// Array.prototype.sort with comparator
+    ArraySort,
 }
 
 /// VM execution errors

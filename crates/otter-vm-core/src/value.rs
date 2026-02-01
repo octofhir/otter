@@ -453,6 +453,18 @@ impl Value {
     {
         let func: NativeFn = Arc::new(f);
         let object = GcRef::new(JsObject::new(Some(prototype), memory_manager));
+        // Per ES2023 §10.2.8, built-in function objects have `length` and `name`
+        // properties: { writable: false, enumerable: false, configurable: true }.
+        object.define_property(
+            crate::object::PropertyKey::string("length"),
+            crate::object::PropertyDescriptor::function_length(Value::int32(0)),
+        );
+        object.define_property(
+            crate::object::PropertyKey::string("name"),
+            crate::object::PropertyDescriptor::function_length(Value::string(
+                crate::string::JsString::intern(""),
+            )),
+        );
         let native = Arc::new(NativeFunctionObject { func, object });
         Self {
             bits: TAG_POINTER,

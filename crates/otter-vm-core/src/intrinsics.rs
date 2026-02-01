@@ -1485,7 +1485,13 @@ impl Intrinsics {
         // ===================================================================
         // Array.prototype methods (extracted to intrinsics_impl/array.rs)
         // ===================================================================
-        crate::intrinsics_impl::array::init_array_prototype(self.array_prototype, fn_proto, mm);
+        crate::intrinsics_impl::array::init_array_prototype(
+            self.array_prototype,
+            fn_proto,
+            mm,
+            self.iterator_prototype,
+            well_known::ITERATOR,
+        );
 
         // ===================================================================
         // Map/Set/WeakMap/WeakSet prototype methods (extracted to intrinsics_impl/map_set.rs)
@@ -1627,13 +1633,22 @@ impl Intrinsics {
         let string_ctor = alloc_ctor();
         let string_ctor_fn: Box<
             dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync,
-        > = Box::new(|_this, args, _mm| {
+        > = Box::new(|this, args, _mm| {
             let s = if let Some(arg) = args.first() {
                 crate::globals::to_string(arg)
             } else {
                 String::new()
             };
-            Ok(Value::string(JsString::intern(&s)))
+            let str_val = Value::string(JsString::intern(&s));
+            // When called as constructor (new String("...")), `this` is an object.
+            // Store the primitive value so String.prototype methods can retrieve it.
+            if let Some(obj) = this.as_object() {
+                obj.set(
+                    PropertyKey::string("__primitiveValue__"),
+                    str_val.clone(),
+                );
+            }
+            Ok(str_val)
         });
         install("String", string_ctor, self.string_prototype, Some(string_ctor_fn));
 
@@ -2041,6 +2056,7 @@ impl Intrinsics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::{PropertyDescriptor, PropertyKey};
 
     #[test]
     fn test_intrinsics_allocate() {
@@ -2070,13 +2086,66 @@ mod tests {
         // Function.prototype.__proto__ === Object.prototype
         let fp_proto = intrinsics.function_prototype.prototype();
         assert!(fp_proto.is_some());
+        assert_eq!(fp_proto.unwrap().as_ptr(), intrinsics.object_prototype.as_ptr());
 
         // Array.prototype.__proto__ === Object.prototype
         let ap_proto = intrinsics.array_prototype.prototype();
         assert!(ap_proto.is_some());
+        assert_eq!(ap_proto.unwrap().as_ptr(), intrinsics.object_prototype.as_ptr());
 
         // TypeError.prototype.__proto__ === Error.prototype
         let tep_proto = intrinsics.type_error_prototype.prototype();
         assert!(tep_proto.is_some());
+        assert_eq!(tep_proto.unwrap().as_ptr(), intrinsics.error_prototype.as_ptr());
+
+        // RangeError.prototype.__proto__ === Error.prototype
+        let rep_proto = intrinsics.range_error_prototype.prototype();
+        assert!(rep_proto.is_some());
+        assert_eq!(rep_proto.unwrap().as_ptr(), intrinsics.error_prototype.as_ptr());
+
+        // Error.prototype.__proto__ === Object.prototype
+        let ep_proto = intrinsics.error_prototype.prototype();
+        assert!(ep_proto.is_some());
+        assert_eq!(ep_proto.unwrap().as_ptr(), intrinsics.object_prototype.as_ptr());
+    }
+
+    #[test]
+    fn test_init_core_builtin_methods() {
+        let mm = Arc::new(MemoryManager::test());
+        let fn_proto = GcRef::new(JsObject::new(None, mm.clone()));
+        let intrinsics = Intrinsics::allocate(&mm, fn_proto);
+        intrinsics.wire_prototype_chains();
+        intrinsics.init_core(&mm);
+
+        // Array.prototype should have map, filter, forEach, etc.
+        assert!(intrinsics.array_prototype.has(&PropertyKey::string("map")));
+        assert!(intrinsics.array_prototype.has(&PropertyKey::string("filter")));
+        assert!(intrinsics.array_prototype.has(&PropertyKey::string("forEach")));
+        assert!(intrinsics.array_prototype.has(&PropertyKey::string("find")));
+        assert!(intrinsics.array_prototype.has(&PropertyKey::string("reduce")));
+        assert!(intrinsics.array_prototype.has(&PropertyKey::string("values")));
+        assert!(intrinsics.array_prototype.has(&PropertyKey::string("keys")));
+        assert!(intrinsics.array_prototype.has(&PropertyKey::string("entries")));
+        assert!(intrinsics.array_prototype.has(&PropertyKey::string("sort")));
+
+        // Array.prototype[Symbol.iterator] should exist
+        assert!(intrinsics.array_prototype.has(&PropertyKey::Symbol(well_known::ITERATOR)));
+
+        // Builtin methods should be non-enumerable
+        let map_desc = intrinsics.array_prototype.get_own_property_descriptor(&PropertyKey::string("map"));
+        assert!(map_desc.is_some(), "Array.prototype.map descriptor should exist");
+        if let Some(PropertyDescriptor::Data { attributes, .. }) = map_desc {
+            assert!(!attributes.enumerable, "Array.prototype.map should be non-enumerable");
+            assert!(attributes.writable, "Array.prototype.map should be writable");
+            assert!(attributes.configurable, "Array.prototype.map should be configurable");
+        }
+
+        // String.prototype should have methods
+        assert!(intrinsics.string_prototype.has(&PropertyKey::string("charAt")));
+        assert!(intrinsics.string_prototype.has(&PropertyKey::string("slice")));
+
+        // Number.prototype should have methods
+        assert!(intrinsics.number_prototype.has(&PropertyKey::string("toFixed")));
+        assert!(intrinsics.number_prototype.has(&PropertyKey::string("toString")));
     }
 }

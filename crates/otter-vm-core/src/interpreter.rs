@@ -6290,6 +6290,312 @@ impl Interpreter {
                             ctx.set_register(return_reg, result);
                             return Ok(InstructionResult::Continue);
                         }
+
+                        // ============================================================
+                        // Array callback methods — use call_function for sync closure calls
+                        // ============================================================
+
+                        InterceptionSignal::ArrayForEach => {
+                            // current_this = the array, current_args[0] = callback, [1] = thisArg
+                            let obj = current_this.as_object()
+                                .ok_or_else(|| VmError::type_error("forEach: not an object"))?;
+                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
+                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
+                            let len = obj.get(&PropertyKey::string("length"))
+                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                            for i in 0..len {
+                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                                self.call_function(ctx, &callback, this_arg.clone(),
+                                    &[val, Value::number(i as f64), current_this.clone()])?;
+                            }
+                            ctx.set_register(return_reg, Value::undefined());
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ArrayMap => {
+                            let obj = current_this.as_object()
+                                .ok_or_else(|| VmError::type_error("map: not an object"))?;
+                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
+                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
+                            let len = obj.get(&PropertyKey::string("length"))
+                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                            let result = GcRef::new(JsObject::array(len, ctx.memory_manager().clone()));
+                            for i in 0..len {
+                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                                let mapped = self.call_function(ctx, &callback, this_arg.clone(),
+                                    &[val, Value::number(i as f64), current_this.clone()])?;
+                                result.set(PropertyKey::Index(i as u32), mapped);
+                            }
+                            ctx.set_register(return_reg, Value::array(result));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ArrayFilter => {
+                            let obj = current_this.as_object()
+                                .ok_or_else(|| VmError::type_error("filter: not an object"))?;
+                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
+                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
+                            let len = obj.get(&PropertyKey::string("length"))
+                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                            let result = GcRef::new(JsObject::array(0, ctx.memory_manager().clone()));
+                            let mut out_idx = 0u32;
+                            for i in 0..len {
+                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                                let keep = self.call_function(ctx, &callback, this_arg.clone(),
+                                    &[val.clone(), Value::number(i as f64), current_this.clone()])?;
+                                if keep.to_boolean() {
+                                    result.set(PropertyKey::Index(out_idx), val);
+                                    out_idx += 1;
+                                }
+                            }
+                            result.set(PropertyKey::string("length"), Value::number(out_idx as f64));
+                            ctx.set_register(return_reg, Value::array(result));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ArrayFind => {
+                            let obj = current_this.as_object()
+                                .ok_or_else(|| VmError::type_error("find: not an object"))?;
+                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
+                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
+                            let len = obj.get(&PropertyKey::string("length"))
+                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                            for i in 0..len {
+                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                                let test = self.call_function(ctx, &callback, this_arg.clone(),
+                                    &[val.clone(), Value::number(i as f64), current_this.clone()])?;
+                                if test.to_boolean() {
+                                    ctx.set_register(return_reg, val);
+                                    return Ok(InstructionResult::Continue);
+                                }
+                            }
+                            ctx.set_register(return_reg, Value::undefined());
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ArrayFindIndex => {
+                            let obj = current_this.as_object()
+                                .ok_or_else(|| VmError::type_error("findIndex: not an object"))?;
+                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
+                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
+                            let len = obj.get(&PropertyKey::string("length"))
+                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                            for i in 0..len {
+                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                                let test = self.call_function(ctx, &callback, this_arg.clone(),
+                                    &[val, Value::number(i as f64), current_this.clone()])?;
+                                if test.to_boolean() {
+                                    ctx.set_register(return_reg, Value::number(i as f64));
+                                    return Ok(InstructionResult::Continue);
+                                }
+                            }
+                            ctx.set_register(return_reg, Value::number(-1.0));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ArrayFindLast => {
+                            let obj = current_this.as_object()
+                                .ok_or_else(|| VmError::type_error("findLast: not an object"))?;
+                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
+                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
+                            let len = obj.get(&PropertyKey::string("length"))
+                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                            for i in (0..len).rev() {
+                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                                let test = self.call_function(ctx, &callback, this_arg.clone(),
+                                    &[val.clone(), Value::number(i as f64), current_this.clone()])?;
+                                if test.to_boolean() {
+                                    ctx.set_register(return_reg, val);
+                                    return Ok(InstructionResult::Continue);
+                                }
+                            }
+                            ctx.set_register(return_reg, Value::undefined());
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ArrayFindLastIndex => {
+                            let obj = current_this.as_object()
+                                .ok_or_else(|| VmError::type_error("findLastIndex: not an object"))?;
+                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
+                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
+                            let len = obj.get(&PropertyKey::string("length"))
+                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                            for i in (0..len).rev() {
+                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                                let test = self.call_function(ctx, &callback, this_arg.clone(),
+                                    &[val, Value::number(i as f64), current_this.clone()])?;
+                                if test.to_boolean() {
+                                    ctx.set_register(return_reg, Value::number(i as f64));
+                                    return Ok(InstructionResult::Continue);
+                                }
+                            }
+                            ctx.set_register(return_reg, Value::number(-1.0));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ArrayEvery => {
+                            let obj = current_this.as_object()
+                                .ok_or_else(|| VmError::type_error("every: not an object"))?;
+                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
+                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
+                            let len = obj.get(&PropertyKey::string("length"))
+                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                            for i in 0..len {
+                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                                let test = self.call_function(ctx, &callback, this_arg.clone(),
+                                    &[val, Value::number(i as f64), current_this.clone()])?;
+                                if !test.to_boolean() {
+                                    ctx.set_register(return_reg, Value::boolean(false));
+                                    return Ok(InstructionResult::Continue);
+                                }
+                            }
+                            ctx.set_register(return_reg, Value::boolean(true));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ArraySome => {
+                            let obj = current_this.as_object()
+                                .ok_or_else(|| VmError::type_error("some: not an object"))?;
+                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
+                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
+                            let len = obj.get(&PropertyKey::string("length"))
+                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                            for i in 0..len {
+                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                                let test = self.call_function(ctx, &callback, this_arg.clone(),
+                                    &[val, Value::number(i as f64), current_this.clone()])?;
+                                if test.to_boolean() {
+                                    ctx.set_register(return_reg, Value::boolean(true));
+                                    return Ok(InstructionResult::Continue);
+                                }
+                            }
+                            ctx.set_register(return_reg, Value::boolean(false));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ArrayReduce => {
+                            let obj = current_this.as_object()
+                                .ok_or_else(|| VmError::type_error("reduce: not an object"))?;
+                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
+                            let len = obj.get(&PropertyKey::string("length"))
+                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                            let has_initial = current_args.len() > 1;
+                            let mut accumulator = if has_initial {
+                                current_args[1].clone()
+                            } else {
+                                if len == 0 {
+                                    return Err(VmError::type_error("Reduce of empty array with no initial value"));
+                                }
+                                obj.get(&PropertyKey::Index(0)).unwrap_or(Value::undefined())
+                            };
+                            let start = if has_initial { 0 } else { 1 };
+                            for i in start..len {
+                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                                accumulator = self.call_function(ctx, &callback, Value::undefined(),
+                                    &[accumulator, val, Value::number(i as f64), current_this.clone()])?;
+                            }
+                            ctx.set_register(return_reg, accumulator);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ArrayReduceRight => {
+                            let obj = current_this.as_object()
+                                .ok_or_else(|| VmError::type_error("reduceRight: not an object"))?;
+                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
+                            let len = obj.get(&PropertyKey::string("length"))
+                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                            let has_initial = current_args.len() > 1;
+                            let mut accumulator = if has_initial {
+                                current_args[1].clone()
+                            } else {
+                                if len == 0 {
+                                    return Err(VmError::type_error("Reduce of empty array with no initial value"));
+                                }
+                                obj.get(&PropertyKey::Index((len - 1) as u32)).unwrap_or(Value::undefined())
+                            };
+                            let end = if has_initial { len } else { len.saturating_sub(1) };
+                            for i in (0..end).rev() {
+                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                                accumulator = self.call_function(ctx, &callback, Value::undefined(),
+                                    &[accumulator, val, Value::number(i as f64), current_this.clone()])?;
+                            }
+                            ctx.set_register(return_reg, accumulator);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ArrayFlatMap => {
+                            let obj = current_this.as_object()
+                                .ok_or_else(|| VmError::type_error("flatMap: not an object"))?;
+                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
+                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
+                            let len = obj.get(&PropertyKey::string("length"))
+                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                            let result = GcRef::new(JsObject::array(0, ctx.memory_manager().clone()));
+                            let mut out_idx = 0u32;
+                            for i in 0..len {
+                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                                let mapped = self.call_function(ctx, &callback, this_arg.clone(),
+                                    &[val, Value::number(i as f64), current_this.clone()])?;
+                                // Flatten one level
+                                if let Some(inner) = mapped.as_object() {
+                                    if inner.get(&PropertyKey::string("length")).is_some() {
+                                        let inner_len = inner.get(&PropertyKey::string("length"))
+                                            .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                                        for j in 0..inner_len {
+                                            let item = inner.get(&PropertyKey::Index(j as u32)).unwrap_or(Value::undefined());
+                                            result.set(PropertyKey::Index(out_idx), item);
+                                            out_idx += 1;
+                                        }
+                                        continue;
+                                    }
+                                }
+                                result.set(PropertyKey::Index(out_idx), mapped);
+                                out_idx += 1;
+                            }
+                            result.set(PropertyKey::string("length"), Value::number(out_idx as f64));
+                            ctx.set_register(return_reg, Value::array(result));
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::ArraySort => {
+                            let obj = current_this.as_object()
+                                .ok_or_else(|| VmError::type_error("sort: not an object"))?;
+                            let compare_fn = current_args.first().cloned().unwrap_or(Value::undefined());
+                            let len = obj.get(&PropertyKey::string("length"))
+                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+
+                            // Collect elements
+                            let mut elements: Vec<Value> = Vec::with_capacity(len.min(1024));
+                            for i in 0..len {
+                                elements.push(obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined()));
+                            }
+
+                            // Sort using closure comparator via call_function
+                            // We use a simple insertion sort to avoid the FnMut issue with sort_by
+                            let mut i = 1;
+                            while i < elements.len() {
+                                let mut j = i;
+                                while j > 0 {
+                                    let cmp_result = self.call_function(ctx, &compare_fn, Value::undefined(),
+                                        &[elements[j - 1].clone(), elements[j].clone()])?;
+                                    let n = cmp_result.as_number().unwrap_or(0.0);
+                                    if n > 0.0 {
+                                        elements.swap(j - 1, j);
+                                        j -= 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                i += 1;
+                            }
+
+                            // Write sorted elements back
+                            for (i, val) in elements.into_iter().enumerate() {
+                                obj.set(PropertyKey::Index(i as u32), val);
+                            }
+                            ctx.set_register(return_reg, current_this);
+                            return Ok(InstructionResult::Continue);
+                        }
                     }
                 }
                 Err(e) => return Err(e),
@@ -6502,19 +6808,13 @@ impl Interpreter {
                         (Some(n), Some(m)) => format!("{}: {}", n, m),
                         (Some(n), None) => n,
                         (None, Some(m)) => m,
-                        (None, None) => {
-                            let keys = obj.own_keys();
-                            if keys.is_empty() {
-                                "[object Object]".to_string()
-                            } else {
-                                let key_strings: Vec<String> =
-                                    keys.iter().map(|k| format!("{:?}", k)).collect();
-                                format!("[object Object {{ {} }}]", key_strings.join(", "))
-                            }
-                        }
+                        (None, None) => "[object Object]".to_string(),
                     }
+                } else if value.is_function() || value.is_native_function() {
+                    // Functions: toString should return source or "function X() { [native code] }"
+                    "function () { [native code] }".to_string()
                 } else {
-                    format!("{:?}", value)
+                    "[object Object]".to_string()
                 }
             }
         }

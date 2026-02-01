@@ -284,20 +284,38 @@ impl RunSummary {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Suppress default panic output — panics are caught by catch_unwind
+    // in the runner and reported as Crash/Fail outcomes.
+    std::panic::set_hook(Box::new(|_| {}));
+
     const STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MB
     let builder = std::thread::Builder::new()
         .name("test262-main".into())
         .stack_size(STACK_SIZE);
     let handler = builder
         .spawn(|| {
-            tokio::runtime::Builder::new_current_thread()
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .unwrap()
                 .block_on(async_main())
         })
         .expect("failed to spawn main thread");
-    handler.join().unwrap();
+    match handler.join() {
+        Ok(()) => {}
+        Err(e) => {
+            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = e.downcast_ref::<&str>() {
+                s.to_string()
+            } else {
+                "unknown panic".to_string()
+            };
+            eprintln!("Test runner thread panicked: {}", msg);
+            std::process::exit(2);
+        }
+    }
 }
 
 async fn async_main() {

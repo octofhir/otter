@@ -1,16 +1,14 @@
 use std::fs;
-use std::io::Write;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::thread;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use otter_engine::{EngineBuilder, Otter, OtterError, Value, VmContextSnapshot};
+use otter_engine::{EngineBuilder, Otter, OtterError, Value};
 
 use crate::harness::TestHarnessState;
 use crate::metadata::{ExecutionMode, TestMetadata};
@@ -26,10 +24,10 @@ pub struct Test262Runner {
     filter: Option<String>,
     /// Features to skip
     skip_features: Vec<String>,
-    /// Shared engine instance
-    engine: Arc<Mutex<Otter>>,
     /// Shared harness state for capturing async test results
     harness_state: TestHarnessState,
+    /// Reusable engine (created once, used for all tests)
+    engine: Otter,
 }
 
 /// Result of running a single test (in one execution mode)
@@ -79,25 +77,18 @@ pub enum TestOutcome {
 impl Test262Runner {
     /// Create a new test runner
     pub fn new(test_dir: impl AsRef<Path>) -> Self {
-        eprintln!("Initializing Otter Engine...");
-        let start = Instant::now();
-
-        // Create harness extension with shared state for async output capture
         let (harness_ext, harness_state) =
             crate::harness::create_harness_extension_with_state();
-
-        // Initialize engine once with all standard builtins and harness extensions
         let engine = EngineBuilder::new()
             .extension(harness_ext)
             .build();
-        eprintln!("Engine initialized in {:.2?}", start.elapsed());
 
         Self {
             test_dir: test_dir.as_ref().to_path_buf(),
             filter: None,
             skip_features: Vec::new(),
-            engine: Arc::new(Mutex::new(engine)),
             harness_state,
+            engine,
         }
     }
 
@@ -168,7 +159,7 @@ impl Test262Runner {
     }
 
     /// Run all tests
-    pub async fn run_all(&self) -> Vec<TestResult> {
+    pub async fn run_all(&mut self) -> Vec<TestResult> {
         let tests = self.list_tests();
         let mut results = Vec::with_capacity(tests.len() * 2);
         for path in tests {
@@ -182,7 +173,7 @@ impl Test262Runner {
     /// Returns one `TestResult` per mode (strict / non-strict / module).
     /// Most tests will produce two results (strict + non-strict).
     pub async fn run_test_all_modes(
-        &self,
+        &mut self,
         path: &Path,
         timeout: Option<Duration>,
     ) -> Vec<TestResult> {
@@ -269,7 +260,7 @@ impl Test262Runner {
     /// Run a single test in a single execution mode.
     ///
     /// Legacy API — runs only in non-strict mode (or strict if onlyStrict).
-    pub async fn run_test(&self, path: &Path, timeout: Option<Duration>) -> TestResult {
+    pub async fn run_test(&mut self, path: &Path, timeout: Option<Duration>) -> TestResult {
         let results = self.run_test_all_modes(path, timeout).await;
         // Return the first result for backward compatibility
         results.into_iter().next().unwrap_or(TestResult {
@@ -284,7 +275,7 @@ impl Test262Runner {
 
     /// Run a single test file in a specific execution mode.
     async fn run_single_mode(
-        &self,
+        &mut self,
         path: &Path,
         content: &str,
         metadata: &TestMetadata,
@@ -352,24 +343,16 @@ impl Test262Runner {
 
     /// Execute a test and return (outcome, error_message)
     async fn execute_test(
-        &self,
+        &mut self,
         source: &str,
         metadata: &TestMetadata,
         test_name: &str,
         timeout: Option<Duration>,
     ) -> (TestOutcome, Option<String>) {
-        // Create a fresh engine for each test to avoid cross-test contamination
-        // (shared intrinsic objects like Object.prototype get modified by tests)
-        let (harness_ext, _harness_state) =
-            crate::harness::create_harness_extension_with_state();
-        let mut engine = EngineBuilder::new()
-            .extension(harness_ext)
-            .build();
         let is_async = metadata.is_async();
 
-        
         match self
-            .run_with_timeout(&mut engine, source, timeout, test_name)
+            .run_with_timeout(source, timeout, test_name)
             .await
         {
             Ok(value) => {
@@ -477,106 +460,54 @@ impl Test262Runner {
     }
 
     async fn run_with_timeout(
-        &self,
-        engine: &mut Otter,
+        &mut self,
         source: &str,
         timeout: Option<Duration>,
-        test_name: &str,
+        _test_name: &str,
     ) -> Result<Value, OtterError> {
         if let Some(duration) = timeout {
-            let interrupt_flag = engine.interrupt_flag();
-            let snapshot_handle = engine.debug_snapshot_handle();
-            let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-            let timed_out_thread = Arc::clone(&timed_out);
-            let done_thread = Arc::clone(&done);
-            let test_name = test_name.to_string();
-            thread::spawn(move || {
-                thread::sleep(duration);
-                if done_thread.load(Ordering::Relaxed) {
-                    return;
-                }
-                timed_out_thread.store(true, Ordering::Relaxed);
-                interrupt_flag.store(true, Ordering::Relaxed);
-                let snapshot = snapshot_handle.lock().clone();
-                eprintln!(
-                    "WATCHDOG: timeout after {:?} in {}. VM snapshot: {}",
-                    duration,
-                    test_name,
-                    format_snapshot(&snapshot)
-                );
-                let _ = std::io::stderr().flush();
+            // Cooperative timeout: spawn a tokio task as watchdog on a separate
+            // worker thread (runtime is multi-threaded). It sets the interrupt
+            // flag after the deadline; the VM checks it every ~10K instructions.
+            let flag = self.engine.interrupt_flag();
+            let watchdog = tokio::spawn(async move {
+                tokio::time::sleep(duration).await;
+                flag.store(true, Ordering::Relaxed);
             });
 
-            // Use eval_sync to avoid async wrapper (globalThis, async function)
-            // which breaks simple test262 tests
-            let result = engine.eval_sync(source);
-            done.store(true, Ordering::Relaxed);
+            let result = AssertUnwindSafe(self.engine.eval(source))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|panic| {
+                    let msg = extract_panic_message(&panic);
+                    Err(OtterError::Runtime(format!("VM panic: {}", msg)))
+                });
 
-            if timed_out.load(Ordering::Relaxed) {
-                Err(OtterError::Runtime("Test timed out".to_string()))
-            } else {
-                result
-            }
+            // Cancel watchdog if test finished before timeout
+            watchdog.abort();
+
+            result
         } else {
-            engine.eval_sync(source)
+            AssertUnwindSafe(self.engine.eval(source))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|panic| {
+                    let msg = extract_panic_message(&panic);
+                    Err(OtterError::Runtime(format!("VM panic: {}", msg)))
+                })
         }
     }
 }
 
-fn format_snapshot(snapshot: &VmContextSnapshot) -> String {
-    let mut parts = Vec::new();
-    parts.push(format!("stack_depth={}", snapshot.stack_depth));
-    parts.push(format!("try_stack_depth={}", snapshot.try_stack_depth));
-    parts.push(format!("instruction_count={}", snapshot.instruction_count));
-    parts.push(format!("native_call_depth={}", snapshot.native_call_depth));
-    if let Some(pc) = snapshot.pc {
-        parts.push(format!("pc={}", pc));
+/// Extract a human-readable message from a caught panic payload.
+fn extract_panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
     }
-    if let Some(ref instruction) = snapshot.instruction {
-        parts.push(format!("instruction={}", instruction));
-    }
-    if let Some(function_index) = snapshot.function_index {
-        parts.push(format!("function_index={}", function_index));
-    }
-    if let Some(ref name) = snapshot.function_name {
-        parts.push(format!("function_name={}", name));
-    }
-    if let Some(ref module_url) = snapshot.module_url {
-        parts.push(format!("module_url={}", module_url));
-    }
-    if let Some(is_async) = snapshot.is_async {
-        parts.push(format!("is_async={}", is_async));
-    }
-    if let Some(is_generator) = snapshot.is_generator {
-        parts.push(format!("is_generator={}", is_generator));
-    }
-    if let Some(is_construct) = snapshot.is_construct {
-        parts.push(format!("is_construct={}", is_construct));
-    }
-    if !snapshot.frames.is_empty() {
-        let frames = snapshot
-            .frames
-            .iter()
-            .map(|frame| {
-                format!(
-                    "[fn={} name={} pc={} instr={} module={} async={} gen={} construct={}]",
-                    frame.function_index,
-                    frame.function_name.clone().unwrap_or_default(),
-                    frame.pc,
-                    frame.instruction.clone().unwrap_or_default(),
-                    frame.module_url,
-                    frame.is_async,
-                    frame.is_generator,
-                    frame.is_construct
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        parts.push(format!("frames={}", frames));
-    }
-    parts.join(", ")
 }
 
 #[cfg(test)]

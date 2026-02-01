@@ -1902,6 +1902,7 @@ dependencies = [
  "chrono",
  "clap",
  "colored",
+ "futures",
  "indicatif",
  "otter-engine",
  "otter-kv",

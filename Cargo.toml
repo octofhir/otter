@@ -29,6 +29,11 @@ debug = true           # Include debug info for flamegraph
 panic = "abort"        # No unwinding (smaller binary)
 opt-level = 3          # Maximum optimization
 
+# Release profile for test262 runner — needs panic=unwind for catch_unwind
+[profile.test262]
+inherits = "release"
+panic = "unwind"
+
 # Fast release for development iteration
 [profile.release-fast]
 inherits = "release"

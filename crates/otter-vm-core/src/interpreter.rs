@@ -662,7 +662,7 @@ impl Interpreter {
                                 error
                             ));
                         }
-                        PromiseState::Pending => {
+                        PromiseState::Pending | PromiseState::PendingThenable(_) => {
                             // Promise is pending - suspend execution
                             let async_ctx = self.capture_async_context(
                                 ctx,
@@ -978,7 +978,7 @@ impl Interpreter {
                                 error
                             )));
                         }
-                        PromiseState::Pending => {
+                        PromiseState::Pending | PromiseState::PendingThenable(_) => {
                             // Promise is pending - need to wait for async operation
                             // Return the promise to caller for async handling
                             // The runtime's event loop should poll and resume
@@ -2842,6 +2842,95 @@ impl Interpreter {
                     // Call native constructor with depth tracking
                     let result = match self.call_native_fn(ctx, native_fn, &new_obj_value, &args) {
                         Ok(v) => v,
+                        Err(VmError::Interception(crate::error::InterceptionSignal::PromiseConstructor)) => {
+                            let executor = args.get(0).cloned().unwrap_or(Value::undefined());
+                            if !executor.is_callable() {
+                                return Err(VmError::type_error("Promise resolver is not a function"));
+                            }
+
+                            let promise = JsPromise::new();
+                            let js_queue = ctx.js_job_queue();
+                            let enqueue_js_job = {
+                                let js_queue = js_queue.clone();
+                                move |job, args| {
+                                    if let Some(queue) = &js_queue {
+                                        queue.enqueue(job, args);
+                                    }
+                                }
+                            };
+
+                            let fn_proto = ctx
+                                .function_prototype()
+                                .ok_or_else(|| VmError::internal("Function.prototype is not defined"))?;
+
+                            let resolve_promise = promise.clone();
+                            let enqueue_resolve = enqueue_js_job.clone();
+                            let resolve_fn = Value::native_function_with_proto(
+                                move |_this, args, _mm| {
+                                    let value = args.first().cloned().unwrap_or(Value::undefined());
+                                    resolve_promise.resolve_with_js_jobs(value, enqueue_resolve.clone());
+                                    Ok(Value::undefined())
+                                },
+                                ctx.memory_manager().clone(),
+                                fn_proto,
+                            );
+                            if let Some(obj) = resolve_fn.as_object() {
+                                obj.set(
+                                    PropertyKey::string("__non_constructor"),
+                                    Value::boolean(true),
+                                );
+                            }
+
+                            let reject_promise = promise.clone();
+                            let enqueue_reject = enqueue_js_job.clone();
+                            let reject_fn = Value::native_function_with_proto(
+                                move |_this, args, _mm| {
+                                    let reason = args.first().cloned().unwrap_or(Value::undefined());
+                                    reject_promise.reject_with_js_jobs(reason, enqueue_reject.clone());
+                                    Ok(Value::undefined())
+                                },
+                                ctx.memory_manager().clone(),
+                                fn_proto,
+                            );
+                            if let Some(obj) = reject_fn.as_object() {
+                                obj.set(
+                                    PropertyKey::string("__non_constructor"),
+                                    Value::boolean(true),
+                                );
+                            }
+
+                            if let Err(err) = self.call_function(
+                                ctx,
+                                &executor,
+                                Value::undefined(),
+                                &[resolve_fn.clone(), reject_fn.clone()],
+                            ) {
+                                let error_val = match err {
+                                    VmError::Exception(thrown) => thrown.value,
+                                    VmError::TypeError(message) => {
+                                        self.make_error(ctx, "TypeError", &message)
+                                    }
+                                    VmError::RangeError(message) => {
+                                        self.make_error(ctx, "RangeError", &message)
+                                    }
+                                    VmError::ReferenceError(message) => {
+                                        self.make_error(ctx, "ReferenceError", &message)
+                                    }
+                                    VmError::SyntaxError(message) => {
+                                        self.make_error(ctx, "SyntaxError", &message)
+                                    }
+                                    other => {
+                                        let message = other.to_string();
+                                        Value::string(JsString::intern(&message))
+                                    }
+                                };
+                                promise.reject_with_js_jobs(error_val, enqueue_js_job.clone());
+                            }
+
+                            let js_promise = self.create_js_promise(ctx, promise);
+                            ctx.set_register(dst.0, js_promise);
+                            return Ok(InstructionResult::Continue);
+                        }
                         // eval (and similar non-constructors) throw Interception when called
                         // with string args — treat as "not a constructor" in Construct context
                         Err(VmError::Interception(_)) => {
@@ -3093,6 +3182,7 @@ impl Interpreter {
                         // For async generators, wrap result in a Promise
                         if generator.is_async() {
                             let promise = JsPromise::new();
+                            let js_queue = ctx.js_job_queue();
                             match gen_result {
                                 GeneratorResult::Yielded(v) => {
                                     let iter_result = GcRef::new(JsObject::new(
@@ -3102,7 +3192,15 @@ impl Interpreter {
                                     iter_result.set(PropertyKey::string("value"), v);
                                     iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(false));
-                                    promise.resolve(Value::object(iter_result));
+                                    let js_queue = js_queue.clone();
+                                    promise.resolve_with_js_jobs(
+                                        Value::object(iter_result),
+                                        move |job, args| {
+                                            if let Some(queue) = &js_queue {
+                                                queue.enqueue(job, args);
+                                            }
+                                        },
+                                    );
                                 }
                                 GeneratorResult::Returned(v) => {
                                     let iter_result = GcRef::new(JsObject::new(
@@ -3112,11 +3210,27 @@ impl Interpreter {
                                     iter_result.set(PropertyKey::string("value"), v);
                                     iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(true));
-                                    promise.resolve(Value::object(iter_result));
+                                    let js_queue = js_queue.clone();
+                                    promise.resolve_with_js_jobs(
+                                        Value::object(iter_result),
+                                        move |job, args| {
+                                            if let Some(queue) = &js_queue {
+                                                queue.enqueue(job, args);
+                                            }
+                                        },
+                                    );
                                 }
                                 GeneratorResult::Error(e) => {
                                     let error_msg = e.to_string();
-                                    promise.reject(Value::string(JsString::intern(&error_msg)));
+                                    let js_queue = js_queue.clone();
+                                    promise.reject_with_js_jobs(
+                                        Value::string(JsString::intern(&error_msg)),
+                                        move |job, args| {
+                                            if let Some(queue) = &js_queue {
+                                                queue.enqueue(job, args);
+                                            }
+                                        },
+                                    );
                                 }
                                 GeneratorResult::Suspended {
                                     promise: awaited_promise,
@@ -3127,6 +3241,7 @@ impl Interpreter {
                                     // Chain onto the awaited promise and resume when it settles
                                     let result_promise = promise.clone();
                                     let mm = ctx.memory_manager().clone();
+                                    let js_queue = js_queue.clone();
                                     awaited_promise.then(move |resolved_value| {
                                         // When the awaited promise resolves, we would resume the generator
                                         // For now, just resolve with the awaited value wrapped in an iterator result
@@ -3139,7 +3254,15 @@ impl Interpreter {
                                             PropertyKey::string("done"),
                                             Value::boolean(false),
                                         );
-                                        result_promise.resolve(Value::object(iter_result));
+                                        let js_queue = js_queue.clone();
+                                        result_promise.resolve_with_js_jobs(
+                                            Value::object(iter_result),
+                                            move |job, args| {
+                                                if let Some(queue) = &js_queue {
+                                                    queue.enqueue(job, args);
+                                                }
+                                            },
+                                        );
                                     });
                                     // Store the resume_reg and generator for later use
                                     let _ = (resume_reg, suspended_gen);
@@ -3468,7 +3591,7 @@ impl Interpreter {
                                 error
                             )))
                         }
-                        PromiseState::Pending => {
+                        PromiseState::Pending | PromiseState::PendingThenable(_) => {
                             // Promise is pending, suspend execution
                             Ok(InstructionResult::Suspend {
                                 promise: Arc::clone(&promise),
@@ -5112,6 +5235,7 @@ impl Interpreter {
                         // For async generators, wrap result in a Promise
                         if generator.is_async() {
                             let promise = JsPromise::new();
+                            let js_queue = ctx.js_job_queue();
                             match gen_result {
                                 GeneratorResult::Yielded(v) => {
                                     let iter_result = GcRef::new(JsObject::new(
@@ -5121,7 +5245,15 @@ impl Interpreter {
                                     iter_result.set(PropertyKey::string("value"), v);
                                     iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(false));
-                                    promise.resolve(Value::object(iter_result));
+                                    let js_queue = js_queue.clone();
+                                    promise.resolve_with_js_jobs(
+                                        Value::object(iter_result),
+                                        move |job, args| {
+                                            if let Some(queue) = &js_queue {
+                                                queue.enqueue(job, args);
+                                            }
+                                        },
+                                    );
                                 }
                                 GeneratorResult::Returned(v) => {
                                     let iter_result = GcRef::new(JsObject::new(
@@ -5131,11 +5263,27 @@ impl Interpreter {
                                     iter_result.set(PropertyKey::string("value"), v);
                                     iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(true));
-                                    promise.resolve(Value::object(iter_result));
+                                    let js_queue = js_queue.clone();
+                                    promise.resolve_with_js_jobs(
+                                        Value::object(iter_result),
+                                        move |job, args| {
+                                            if let Some(queue) = &js_queue {
+                                                queue.enqueue(job, args);
+                                            }
+                                        },
+                                    );
                                 }
                                 GeneratorResult::Error(e) => {
                                     let error_msg = e.to_string();
-                                    promise.reject(Value::string(JsString::intern(&error_msg)));
+                                    let js_queue = js_queue.clone();
+                                    promise.reject_with_js_jobs(
+                                        Value::string(JsString::intern(&error_msg)),
+                                        move |job, args| {
+                                            if let Some(queue) = &js_queue {
+                                                queue.enqueue(job, args);
+                                            }
+                                        },
+                                    );
                                 }
                                 GeneratorResult::Suspended {
                                     promise: awaited_promise,
@@ -5144,6 +5292,7 @@ impl Interpreter {
                                     // Generator is awaiting a promise
                                     let result_promise = promise.clone();
                                     let mm = ctx.memory_manager().clone();
+                                    let js_queue = js_queue.clone();
                                     awaited_promise.then(move |resolved_value| {
                                         let iter_result =
                                             GcRef::new(JsObject::new(None, mm.clone()));
@@ -5153,7 +5302,15 @@ impl Interpreter {
                                             PropertyKey::string("done"),
                                             Value::boolean(false),
                                         );
-                                        result_promise.resolve(Value::object(iter_result));
+                                        let js_queue = js_queue.clone();
+                                        result_promise.resolve_with_js_jobs(
+                                            Value::object(iter_result),
+                                            move |job, args| {
+                                                if let Some(queue) = &js_queue {
+                                                    queue.enqueue(job, args);
+                                                }
+                                            },
+                                        );
                                     });
                                 }
                             }
@@ -6247,24 +6404,49 @@ impl Interpreter {
 
                 if generator.is_async() {
                     let promise = JsPromise::new();
+                    let js_queue = ctx.js_job_queue();
                     match gen_result {
                         GeneratorResult::Yielded(v) => {
                             let iter_result =
                                 GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
                             iter_result.set(PropertyKey::string("value"), v);
                             iter_result.set(PropertyKey::string("done"), Value::boolean(false));
-                            promise.resolve(Value::object(iter_result));
+                            let js_queue = js_queue.clone();
+                            promise.resolve_with_js_jobs(
+                                Value::object(iter_result),
+                                move |job, args| {
+                                    if let Some(queue) = &js_queue {
+                                        queue.enqueue(job, args);
+                                    }
+                                },
+                            );
                         }
                         GeneratorResult::Returned(v) => {
                             let iter_result =
                                 GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
                             iter_result.set(PropertyKey::string("value"), v);
                             iter_result.set(PropertyKey::string("done"), Value::boolean(true));
-                            promise.resolve(Value::object(iter_result));
+                            let js_queue = js_queue.clone();
+                            promise.resolve_with_js_jobs(
+                                Value::object(iter_result),
+                                move |job, args| {
+                                    if let Some(queue) = &js_queue {
+                                        queue.enqueue(job, args);
+                                    }
+                                },
+                            );
                         }
                         GeneratorResult::Error(e) => {
                             let error_msg = e.to_string();
-                            promise.reject(Value::string(JsString::intern(&error_msg)));
+                            let js_queue = js_queue.clone();
+                            promise.reject_with_js_jobs(
+                                Value::string(JsString::intern(&error_msg)),
+                                move |job, args| {
+                                    if let Some(queue) = &js_queue {
+                                        queue.enqueue(job, args);
+                                    }
+                                },
+                            );
                         }
                         GeneratorResult::Suspended {
                             promise: awaited_promise,
@@ -6272,11 +6454,20 @@ impl Interpreter {
                         } => {
                             let result_promise = promise.clone();
                             let mm = ctx.memory_manager().clone();
+                            let js_queue = js_queue.clone();
                             awaited_promise.then(move |resolved_value| {
                                 let iter_result = GcRef::new(JsObject::new(None, mm.clone()));
                                 iter_result.set(PropertyKey::string("value"), resolved_value);
                                 iter_result.set(PropertyKey::string("done"), Value::boolean(false));
-                                result_promise.resolve(Value::object(iter_result));
+                                let js_queue = js_queue.clone();
+                                result_promise.resolve_with_js_jobs(
+                                    Value::object(iter_result),
+                                    move |job, args| {
+                                        if let Some(queue) = &js_queue {
+                                            queue.enqueue(job, args);
+                                        }
+                                    },
+                                );
                             });
                         }
                     }
@@ -6309,6 +6500,57 @@ impl Interpreter {
                 Err(VmError::Interception(signal)) => {
                     // Handle interception signals for Function.prototype.call/apply
                     use crate::error::InterceptionSignal;
+
+                    let js_queue = ctx.js_job_queue();
+                    let enqueue_js_job = {
+                        let js_queue = js_queue.clone();
+                        move |job, args| {
+                            if let Some(queue) = &js_queue {
+                                queue.enqueue(job, args);
+                            }
+                        }
+                    };
+
+                    let extract_array_items = |value: Option<&Value>| -> Result<Vec<Value>, VmError> {
+                        let value = value.ok_or_else(|| VmError::type_error("Expected an iterable"))?;
+                        if let Some(obj) = value.as_object() {
+                            if obj.is_array() {
+                                let len = obj.array_length();
+                                let mut items = Vec::with_capacity(len);
+                                for i in 0..len {
+                                    items.push(
+                                        obj.get(&PropertyKey::Index(i as u32))
+                                            .unwrap_or(Value::undefined()),
+                                    );
+                                }
+                                return Ok(items);
+                            }
+                        }
+                        Ok(vec![value.clone()])
+                    };
+
+                    let internal_key = PropertyKey::string("_internal");
+                    let extract_internal_promise = |value: &Value| -> Option<Arc<JsPromise>> {
+                        if let Some(promise) = value.as_promise() {
+                            return Some(promise.clone());
+                        }
+                        if let Some(obj) = value.as_object() {
+                            if let Some(internal) = obj.get(&internal_key) {
+                                if let Some(promise) = internal.as_promise() {
+                                    return Some(promise.clone());
+                                }
+                            }
+                        }
+                        None
+                    };
+                    let is_wrapped_promise = |value: &Value| -> bool {
+                        if let Some(obj) = value.as_object() {
+                            if let Some(internal) = obj.get(&internal_key) {
+                                return internal.is_promise();
+                            }
+                        }
+                        false
+                    };
 
                     match signal {
                         InterceptionSignal::FunctionCall => {
@@ -7359,6 +7601,621 @@ impl Interpreter {
                             )?;
 
                             ctx.set_register(return_reg, result);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        // ============================================================
+                        // Promise methods — register JS callbacks via job queue
+                        // ============================================================
+
+                        InterceptionSignal::PromiseConstructor => {
+                            return Err(VmError::type_error("Constructor Promise requires 'new'"));
+                        }
+
+                        InterceptionSignal::PromiseThen => {
+                            // Promise.prototype.then(onFulfilled, onRejected)
+                            // current_this = source promise
+                            // current_args[0] = onFulfilled
+                            // current_args[1] = onRejected
+
+                            let source = extract_internal_promise(&current_this)
+                                .ok_or_else(|| VmError::type_error("then: not a promise"))?;
+
+                            let on_fulfilled = current_args.get(0).cloned().unwrap_or(Value::undefined());
+                            let on_rejected = current_args.get(1).cloned().unwrap_or(Value::undefined());
+
+                            // Create result promise for chaining
+                            let result_promise = crate::promise::JsPromise::new();
+
+                            let fulfill_job = crate::promise::JsPromiseJob {
+                                kind: if on_fulfilled.is_function() {
+                                    crate::promise::JsPromiseJobKind::Fulfill
+                                } else {
+                                    crate::promise::JsPromiseJobKind::PassthroughFulfill
+                                },
+                                callback: on_fulfilled,
+                                this_arg: Value::undefined(),
+                                result_promise: Some(result_promise.clone()),
+                            };
+
+                            let reject_job = crate::promise::JsPromiseJob {
+                                kind: if on_rejected.is_function() {
+                                    crate::promise::JsPromiseJobKind::Reject
+                                } else {
+                                    crate::promise::JsPromiseJobKind::PassthroughReject
+                                },
+                                callback: on_rejected,
+                                this_arg: Value::undefined(),
+                                result_promise: Some(result_promise.clone()),
+                            };
+
+                            source.then_js(fulfill_job, |job, args| {
+                                let _ = ctx.enqueue_js_job(job, args);
+                            });
+                            source.catch_js(reject_job, |job, args| {
+                                let _ = ctx.enqueue_js_job(job, args);
+                            });
+
+                            let js_promise = self.create_js_promise(ctx, result_promise);
+                            ctx.set_register(return_reg, js_promise);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::PromiseCatch => {
+                            // Promise.prototype.catch(onRejected)
+                            // current_this = source promise
+                            // current_args[0] = onRejected
+
+                            let source = extract_internal_promise(&current_this)
+                                .ok_or_else(|| VmError::type_error("catch: not a promise"))?;
+
+                            let on_rejected = current_args.get(0).cloned().unwrap_or(Value::undefined());
+
+                            // Create result promise for chaining
+                            let result_promise = crate::promise::JsPromise::new();
+
+                            let fulfill_job = crate::promise::JsPromiseJob {
+                                kind: crate::promise::JsPromiseJobKind::PassthroughFulfill,
+                                callback: Value::undefined(),
+                                this_arg: Value::undefined(),
+                                result_promise: Some(result_promise.clone()),
+                            };
+
+                            let reject_job = crate::promise::JsPromiseJob {
+                                kind: if on_rejected.is_function() {
+                                    crate::promise::JsPromiseJobKind::Reject
+                                } else {
+                                    crate::promise::JsPromiseJobKind::PassthroughReject
+                                },
+                                callback: on_rejected,
+                                this_arg: Value::undefined(),
+                                result_promise: Some(result_promise.clone()),
+                            };
+
+                            source.then_js(fulfill_job, |job, args| {
+                                let _ = ctx.enqueue_js_job(job, args);
+                            });
+                            source.catch_js(reject_job, |job, args| {
+                                let _ = ctx.enqueue_js_job(job, args);
+                            });
+
+                            let js_promise = self.create_js_promise(ctx, result_promise);
+                            ctx.set_register(return_reg, js_promise);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::PromiseFinally => {
+                            // Promise.prototype.finally(onFinally)
+                            // current_this = source promise
+                            // current_args[0] = onFinally
+                            //
+                            // Note: finally runs the callback on both fulfill and reject,
+                            // then passes through the original value/error
+
+                            let source = extract_internal_promise(&current_this)
+                                .ok_or_else(|| VmError::type_error("finally: not a promise"))?;
+
+                            let on_finally = current_args.get(0).cloned().unwrap_or(Value::undefined());
+
+                            // Create result promise for chaining
+                            let result_promise = crate::promise::JsPromise::new();
+
+                            let (fulfill_kind, reject_kind, fulfill_callback, reject_callback) =
+                                if on_finally.is_function() {
+                                    (
+                                        crate::promise::JsPromiseJobKind::FinallyFulfill,
+                                        crate::promise::JsPromiseJobKind::FinallyReject,
+                                        on_finally.clone(),
+                                        on_finally,
+                                    )
+                                } else {
+                                    (
+                                        crate::promise::JsPromiseJobKind::PassthroughFulfill,
+                                        crate::promise::JsPromiseJobKind::PassthroughReject,
+                                        Value::undefined(),
+                                        Value::undefined(),
+                                    )
+                                };
+
+                            let fulfill_job = crate::promise::JsPromiseJob {
+                                kind: fulfill_kind,
+                                callback: fulfill_callback,
+                                this_arg: Value::undefined(),
+                                result_promise: Some(result_promise.clone()),
+                            };
+
+                            let reject_job = crate::promise::JsPromiseJob {
+                                kind: reject_kind,
+                                callback: reject_callback,
+                                this_arg: Value::undefined(),
+                                result_promise: Some(result_promise.clone()),
+                            };
+
+                            source.then_js(fulfill_job, |job, args| {
+                                let _ = ctx.enqueue_js_job(job, args);
+                            });
+                            source.catch_js(reject_job, |job, args| {
+                                let _ = ctx.enqueue_js_job(job, args);
+                            });
+
+                            let js_promise = self.create_js_promise(ctx, result_promise);
+                            ctx.set_register(return_reg, js_promise);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::PromiseAll => {
+                            // Promise.all(iterable)
+                            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+                            use std::sync::Mutex;
+
+                            let items = extract_array_items(current_args.first())?;
+                            let result_promise = crate::promise::JsPromise::new();
+                            let mm = ctx.memory_manager().clone();
+
+                            if items.is_empty() {
+                                let arr = GcRef::new(JsObject::array(0, mm));
+                                result_promise.resolve_with_js_jobs(Value::array(arr), enqueue_js_job.clone());
+                                let js_promise = self.create_js_promise(ctx, result_promise);
+                                ctx.set_register(return_reg, js_promise);
+                                return Ok(InstructionResult::Continue);
+                            }
+
+                            let count = items.len();
+                            let remaining = Arc::new(AtomicUsize::new(count));
+                            let results: Arc<Mutex<Vec<Option<Value>>>> =
+                                Arc::new(Mutex::new(vec![None; count]));
+                            let rejected = Arc::new(AtomicBool::new(false));
+
+                            for (index, item) in items.into_iter().enumerate() {
+                                let result_p = result_promise.clone();
+                                let remaining = remaining.clone();
+                                let results = results.clone();
+                                let rejected = rejected.clone();
+                                let mm_inner = mm.clone();
+                                let enqueue = enqueue_js_job.clone();
+
+                                let source_promise = if let Some(promise) = extract_internal_promise(&item) {
+                                    promise
+                                } else {
+                                    let p = crate::promise::JsPromise::new();
+                                    let enqueue_resolve = enqueue_js_job.clone();
+                                    p.resolve_with_js_jobs(item, enqueue_resolve);
+                                    p
+                                };
+
+                                let result_p_reject = result_p.clone();
+                                let rejected_check = rejected.clone();
+                                let enqueue_reject = enqueue_js_job.clone();
+                                source_promise.then(move |value| {
+                                    if rejected.load(Ordering::Acquire) {
+                                        return;
+                                    }
+                                    if let Ok(mut locked) = results.lock() {
+                                        locked[index] = Some(value);
+                                    }
+                                    if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                        let arr =
+                                            GcRef::new(JsObject::array(count, mm_inner.clone()));
+                                        if let Ok(locked) = results.lock() {
+                                            for (i, v) in locked.iter().enumerate() {
+                                                if let Some(val) = v {
+                                                    arr.set(PropertyKey::Index(i as u32), val.clone());
+                                                }
+                                            }
+                                        }
+                                        result_p.resolve_with_js_jobs(Value::array(arr), enqueue.clone());
+                                    }
+                                });
+                                source_promise.catch(move |error| {
+                                    if !rejected_check.swap(true, Ordering::AcqRel) {
+                                        result_p_reject
+                                            .reject_with_js_jobs(error, enqueue_reject.clone());
+                                    }
+                                });
+                            }
+
+                            let js_promise = self.create_js_promise(ctx, result_promise);
+                            ctx.set_register(return_reg, js_promise);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::PromiseRace => {
+                            // Promise.race(iterable)
+                            use std::sync::atomic::{AtomicBool, Ordering};
+
+                            let items = extract_array_items(current_args.first())?;
+                            let result_promise = crate::promise::JsPromise::new();
+                            let settled = Arc::new(AtomicBool::new(false));
+
+                            for item in items {
+                                let result_p = result_promise.clone();
+                                let result_p_reject = result_promise.clone();
+                                let settled1 = settled.clone();
+                                let settled2 = settled.clone();
+                                let enqueue = enqueue_js_job.clone();
+                                let enqueue_reject = enqueue_js_job.clone();
+                                let source_promise = if let Some(promise) = extract_internal_promise(&item) {
+                                    promise
+                                } else {
+                                    let p = crate::promise::JsPromise::new();
+                                    let enqueue_resolve = enqueue_js_job.clone();
+                                    p.resolve_with_js_jobs(item, enqueue_resolve);
+                                    p
+                                };
+
+                                source_promise.then(move |value| {
+                                    if !settled1.swap(true, Ordering::AcqRel) {
+                                        result_p.resolve_with_js_jobs(value, enqueue.clone());
+                                    }
+                                });
+                                source_promise.catch(move |error| {
+                                    if !settled2.swap(true, Ordering::AcqRel) {
+                                        result_p_reject
+                                            .reject_with_js_jobs(error, enqueue_reject.clone());
+                                    }
+                                });
+                            }
+
+                            let js_promise = self.create_js_promise(ctx, result_promise);
+                            ctx.set_register(return_reg, js_promise);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::PromiseAllSettled => {
+                            // Promise.allSettled(iterable)
+                            use std::sync::atomic::{AtomicUsize, Ordering};
+                            use std::sync::Mutex;
+
+                            let items = extract_array_items(current_args.first())?;
+                            let result_promise = crate::promise::JsPromise::new();
+                            let mm = ctx.memory_manager().clone();
+
+                            if items.is_empty() {
+                                let arr = GcRef::new(JsObject::array(0, mm));
+                                result_promise.resolve_with_js_jobs(Value::array(arr), enqueue_js_job.clone());
+                                let js_promise = self.create_js_promise(ctx, result_promise);
+                                ctx.set_register(return_reg, js_promise);
+                                return Ok(InstructionResult::Continue);
+                            }
+
+                            let count = items.len();
+                            let remaining = Arc::new(AtomicUsize::new(count));
+                            let results: Arc<Mutex<Vec<Option<Value>>>> =
+                                Arc::new(Mutex::new(vec![None; count]));
+                            for (index, item) in items.into_iter().enumerate() {
+                                let result_p = result_promise.clone();
+                                let remaining = remaining.clone();
+                                let results = results.clone();
+                                let result_p2 = result_promise.clone();
+                                let remaining2 = remaining.clone();
+                                let results2 = results.clone();
+                                let mm_t = mm.clone();
+                                let mm_c = mm.clone();
+                                let enqueue = enqueue_js_job.clone();
+                                let enqueue2 = enqueue_js_job.clone();
+                                let source_promise = if let Some(promise) = extract_internal_promise(&item) {
+                                    promise
+                                } else {
+                                    let p = crate::promise::JsPromise::new();
+                                    let enqueue_resolve = enqueue_js_job.clone();
+                                    p.resolve_with_js_jobs(item, enqueue_resolve);
+                                    p
+                                };
+
+                                source_promise.then(move |value| {
+                                    let obj = GcRef::new(JsObject::new(None, mm_t.clone()));
+                                    obj.set(
+                                        "status".into(),
+                                        Value::string(JsString::intern("fulfilled")),
+                                    );
+                                    obj.set("value".into(), value);
+                                    if let Ok(mut locked) = results.lock() {
+                                        locked[index] = Some(Value::object(obj));
+                                    }
+                                    if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                        let arr = GcRef::new(JsObject::array(count, mm_t.clone()));
+                                        if let Ok(locked) = results.lock() {
+                                            for (i, v) in locked.iter().enumerate() {
+                                                if let Some(val) = v {
+                                                    arr.set(PropertyKey::Index(i as u32), val.clone());
+                                                }
+                                            }
+                                        }
+                                        result_p
+                                            .resolve_with_js_jobs(Value::array(arr), enqueue.clone());
+                                    }
+                                });
+                                source_promise.catch(move |error| {
+                                    let obj = GcRef::new(JsObject::new(None, mm_c.clone()));
+                                    obj.set(
+                                        "status".into(),
+                                        Value::string(JsString::intern("rejected")),
+                                    );
+                                    obj.set("reason".into(), error);
+                                    if let Ok(mut locked) = results2.lock() {
+                                        locked[index] = Some(Value::object(obj));
+                                    }
+                                    if remaining2.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                        let arr = GcRef::new(JsObject::array(count, mm_c.clone()));
+                                        if let Ok(locked) = results2.lock() {
+                                            for (i, v) in locked.iter().enumerate() {
+                                                if let Some(val) = v {
+                                                    arr.set(PropertyKey::Index(i as u32), val.clone());
+                                                }
+                                            }
+                                        }
+                                        result_p2
+                                            .resolve_with_js_jobs(Value::array(arr), enqueue2.clone());
+                                    }
+                                });
+                            }
+
+                            let js_promise = self.create_js_promise(ctx, result_promise);
+                            ctx.set_register(return_reg, js_promise);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::PromiseAny => {
+                            // Promise.any(iterable)
+                            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+                            use std::sync::Mutex;
+
+                            let items = extract_array_items(current_args.first())?;
+                            let result_promise = crate::promise::JsPromise::new();
+                            let mm = ctx.memory_manager().clone();
+
+                            if items.is_empty() {
+                                let err =
+                                    Value::string(JsString::intern("All promises were rejected"));
+                                result_promise.reject_with_js_jobs(err, enqueue_js_job.clone());
+                                let js_promise = self.create_js_promise(ctx, result_promise);
+                                ctx.set_register(return_reg, js_promise);
+                                return Ok(InstructionResult::Continue);
+                            }
+
+                            let count = items.len();
+                            let fulfilled = Arc::new(AtomicBool::new(false));
+                            let remaining = Arc::new(AtomicUsize::new(count));
+                            let errors: Arc<Mutex<Vec<Option<Value>>>> =
+                                Arc::new(Mutex::new(vec![None; count]));
+
+                            for (index, item) in items.into_iter().enumerate() {
+                                let result_p = result_promise.clone();
+                                let fulfilled1 = fulfilled.clone();
+                                let remaining = remaining.clone();
+                                let errors = errors.clone();
+                                let result_p2 = result_promise.clone();
+                                let fulfilled2 = fulfilled.clone();
+                                let mm_err = mm.clone();
+                                let enqueue = enqueue_js_job.clone();
+                                let enqueue_reject = enqueue_js_job.clone();
+                                let source_promise = if let Some(promise) = extract_internal_promise(&item) {
+                                    promise
+                                } else {
+                                    let p = crate::promise::JsPromise::new();
+                                    let enqueue_resolve = enqueue_js_job.clone();
+                                    p.resolve_with_js_jobs(item, enqueue_resolve);
+                                    p
+                                };
+
+                                source_promise.then(move |value| {
+                                    if !fulfilled1.swap(true, Ordering::AcqRel) {
+                                        result_p.resolve_with_js_jobs(value, enqueue.clone());
+                                    }
+                                });
+                                source_promise.catch(move |error| {
+                                    if fulfilled2.load(Ordering::Acquire) {
+                                        return;
+                                    }
+                                    if let Ok(mut locked) = errors.lock() {
+                                        locked[index] = Some(error);
+                                    }
+                                    if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                        let errs: Vec<Value> = if let Ok(locked) = errors.lock() {
+                                            locked.iter().filter_map(|e| e.clone()).collect()
+                                        } else {
+                                            vec![]
+                                        };
+                                        let arr = GcRef::new(JsObject::array(
+                                            errs.len(),
+                                            mm_err.clone(),
+                                        ));
+                                        for (i, e) in errs.iter().enumerate() {
+                                            arr.set(PropertyKey::Index(i as u32), e.clone());
+                                        }
+                                        let agg = GcRef::new(JsObject::new(None, mm_err.clone()));
+                                        agg.set(
+                                            "message".into(),
+                                            Value::string(JsString::intern(
+                                                "All promises were rejected",
+                                            )),
+                                        );
+                                        agg.set("errors".into(), Value::array(arr));
+                                        result_p2.reject_with_js_jobs(
+                                            Value::object(agg),
+                                            enqueue_reject.clone(),
+                                        );
+                                    }
+                                });
+                            }
+
+                            let js_promise = self.create_js_promise(ctx, result_promise);
+                            ctx.set_register(return_reg, js_promise);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::PromiseReject => {
+                            // Promise.reject(reason)
+                            let reason = current_args
+                                .first()
+                                .cloned()
+                                .unwrap_or(Value::undefined());
+                            let result_promise = crate::promise::JsPromise::new();
+                            result_promise.reject_with_js_jobs(reason, enqueue_js_job.clone());
+                            let js_promise = self.create_js_promise(ctx, result_promise);
+                            ctx.set_register(return_reg, js_promise);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::PromiseResolve => {
+                            // Promise.resolve(value)
+                            let value = current_args
+                                .first()
+                                .cloned()
+                                .unwrap_or(Value::undefined());
+
+                            if is_wrapped_promise(&value) {
+                                ctx.set_register(return_reg, value);
+                                return Ok(InstructionResult::Continue);
+                            }
+
+                            if let Some(promise) = value.as_promise() {
+                                let js_promise = self.create_js_promise(ctx, promise.clone());
+                                ctx.set_register(return_reg, js_promise);
+                                return Ok(InstructionResult::Continue);
+                            }
+
+                            let result_promise = crate::promise::JsPromise::new();
+
+                            if value.is_object() {
+                                let key = PropertyKey::string("then");
+                                let then_val = if let Some(proxy) = value.as_proxy() {
+                                    let key_value = Value::string(JsString::intern("then"));
+                                    crate::proxy_operations::proxy_get(
+                                        self,
+                                        ctx,
+                                        proxy,
+                                        &key,
+                                        key_value,
+                                        value.clone(),
+                                    )
+                                } else if let Some(obj) = value.as_object() {
+                                    match obj.lookup_property_descriptor(&key) {
+                                        Some(crate::object::PropertyDescriptor::Accessor { get, .. }) => {
+                                            if let Some(getter) = get {
+                                                self.call_function(ctx, &getter, value.clone(), &[])
+                                            } else {
+                                                Ok(Value::undefined())
+                                            }
+                                        }
+                                        Some(crate::object::PropertyDescriptor::Data { value, .. }) => {
+                                            Ok(value)
+                                        }
+                                        _ => Ok(Value::undefined()),
+                                    }
+                                } else {
+                                    Ok(Value::undefined())
+                                };
+
+                                match then_val {
+                                    Ok(then_callable) if then_callable.is_callable() => {
+                                        let job = crate::promise::JsPromiseJob {
+                                            kind: crate::promise::JsPromiseJobKind::ResolveThenable,
+                                            callback: then_callable,
+                                            this_arg: value,
+                                            result_promise: Some(result_promise.clone()),
+                                        };
+                                        let _ = ctx.enqueue_js_job(job, Vec::new());
+                                        let js_promise = self.create_js_promise(ctx, result_promise);
+                                        ctx.set_register(return_reg, js_promise);
+                                        return Ok(InstructionResult::Continue);
+                                    }
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        let error_val = match err {
+                                            VmError::Exception(thrown) => thrown.value,
+                                            VmError::TypeError(message) => {
+                                                self.make_error(ctx, "TypeError", &message)
+                                            }
+                                            VmError::RangeError(message) => {
+                                                self.make_error(ctx, "RangeError", &message)
+                                            }
+                                            VmError::ReferenceError(message) => {
+                                                self.make_error(ctx, "ReferenceError", &message)
+                                            }
+                                            VmError::SyntaxError(message) => {
+                                                self.make_error(ctx, "SyntaxError", &message)
+                                            }
+                                            other => {
+                                                let message = other.to_string();
+                                                Value::string(JsString::intern(&message))
+                                            }
+                                        };
+                                        result_promise.reject_with_js_jobs(error_val, |job, args| {
+                                            let _ = ctx.enqueue_js_job(job, args);
+                                        });
+                                        let js_promise = self.create_js_promise(ctx, result_promise);
+                                        ctx.set_register(return_reg, js_promise);
+                                        return Ok(InstructionResult::Continue);
+                                    }
+                                }
+                            }
+
+                            result_promise.resolve_with_js_jobs(value, |job, args| {
+                                let _ = ctx.enqueue_js_job(job, args);
+                            });
+                            let js_promise = self.create_js_promise(ctx, result_promise);
+                            ctx.set_register(return_reg, js_promise);
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::PromiseResolveFunction => {
+                            // Promise.withResolvers().resolve(value)
+                            let promise = current_func
+                                .as_object()
+                                .and_then(|obj| obj.get(&PropertyKey::string("__promise__")))
+                                .and_then(|v| v.as_promise().cloned())
+                                .ok_or_else(|| VmError::type_error("Invalid promise resolver"))?;
+
+                            let value = current_args
+                                .first()
+                                .cloned()
+                                .unwrap_or(Value::undefined());
+
+                            promise.resolve_with_js_jobs(value, |job, args| {
+                                let _ = ctx.enqueue_js_job(job, args);
+                            });
+                            ctx.set_register(return_reg, Value::undefined());
+                            return Ok(InstructionResult::Continue);
+                        }
+
+                        InterceptionSignal::PromiseRejectFunction => {
+                            // Promise.withResolvers().reject(reason)
+                            let promise = current_func
+                                .as_object()
+                                .and_then(|obj| obj.get(&PropertyKey::string("__promise__")))
+                                .and_then(|v| v.as_promise().cloned())
+                                .ok_or_else(|| VmError::type_error("Invalid promise resolver"))?;
+
+                            let reason = current_args
+                                .first()
+                                .cloned()
+                                .unwrap_or(Value::undefined());
+
+                            promise.reject_with_js_jobs(reason, |job, args| {
+                                let _ = ctx.enqueue_js_job(job, args);
+                            });
+                            ctx.set_register(return_reg, Value::undefined());
                             return Ok(InstructionResult::Continue);
                         }
                     }

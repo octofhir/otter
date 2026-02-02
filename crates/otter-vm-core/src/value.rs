@@ -1061,7 +1061,7 @@ mod tests {
 
 impl Value {
     /// Trace GC references in this value
-    pub(crate) fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+    pub fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         if let Some(heap_ref) = &self.heap_ref {
             match heap_ref {
                 HeapRef::String(s) => {
@@ -1090,6 +1090,13 @@ impl Value {
                 }
                 HeapRef::DataView(dv) => {
                     tracer(dv.buffer().object.header() as *const _);
+                }
+                HeapRef::Promise(p) => {
+                    p.trace_roots(tracer);
+                }
+                HeapRef::Proxy(p) => {
+                    tracer(p.target.header() as *const _);
+                    tracer(p.handler.header() as *const _);
                 }
                 // Other types use Arc, not GcRef, so no GC tracing needed
                 _ => {}

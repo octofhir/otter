@@ -227,7 +227,8 @@ fn native_promise_state(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Res
     let result = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
 
     match promise.state() {
-        otter_vm_core::promise::PromiseState::Pending => {
+        otter_vm_core::promise::PromiseState::Pending
+        | otter_vm_core::promise::PromiseState::PendingThenable(_) => {
             result.set("state".into(), VmValue::string(JsString::intern("pending")));
         }
         otter_vm_core::promise::PromiseState::Fulfilled(v) => {
@@ -547,7 +548,7 @@ fn native_promise_with_resolvers(
     _args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
 ) -> Result<VmValue, VmError> {
-    let resolvers = JsPromise::with_resolvers(Arc::clone(&mm));
+    let resolvers = JsPromise::with_resolvers(Arc::clone(&mm), |_, _| {});
 
     let result = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
     result.set("promise".into(), VmValue::promise(resolvers.promise));

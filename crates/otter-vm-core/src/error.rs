@@ -74,6 +74,31 @@ pub enum InterceptionSignal {
     ReflectApplyProxy,
     /// Reflect.construct on a proxy
     ReflectConstructProxy,
+    // ---- Promise methods (require VM context to register JS callbacks) ----
+    /// Promise.prototype.then
+    PromiseThen,
+    /// Promise.prototype.catch
+    PromiseCatch,
+    /// Promise.prototype.finally
+    PromiseFinally,
+    /// Promise constructor (new Promise)
+    PromiseConstructor,
+    /// Promise.resolve
+    PromiseResolve,
+    /// Promise.reject
+    PromiseReject,
+    /// Promise.all
+    PromiseAll,
+    /// Promise.race
+    PromiseRace,
+    /// Promise.allSettled
+    PromiseAllSettled,
+    /// Promise.any
+    PromiseAny,
+    /// Promise resolver function (from Promise.withResolvers)
+    PromiseResolveFunction,
+    /// Promise reject function (from Promise.withResolvers)
+    PromiseRejectFunction,
 }
 
 /// VM execution errors

@@ -2,7 +2,7 @@
 //!
 //! Async-only event loop with tokio integration for HTTP server support.
 
-use crate::microtask::MicrotaskQueue;
+use crate::microtask::{JsJobQueue, MicrotaskQueue, MicrotaskSequencer};
 use crate::timer::{Immediate, ImmediateId, Timer, TimerCallback, TimerHeapEntry, TimerId};
 use parking_lot::Mutex;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -66,8 +66,10 @@ pub struct EventLoop {
     timer_heap: Mutex<BinaryHeap<TimerHeapEntry>>,
     /// Immediate queue (FIFO)
     immediates: Mutex<VecDeque<Immediate>>,
-    /// Microtask queue
+    /// Microtask queue (Rust closures)
     microtasks: MicrotaskQueue,
+    /// JS callback job queue (JavaScript functions)
+    js_jobs: Arc<JsJobQueue>,
     /// Next timer ID
     next_timer_id: AtomicU64,
     /// Next immediate ID
@@ -101,11 +103,13 @@ pub struct EventLoop {
 impl EventLoop {
     /// Create a new event loop
     pub fn new() -> Arc<Self> {
+        let sequencer = MicrotaskSequencer::new();
         Arc::new(Self {
             timers: Mutex::new(HashMap::new()),
             timer_heap: Mutex::new(BinaryHeap::new()),
             immediates: Mutex::new(VecDeque::new()),
-            microtasks: MicrotaskQueue::new(),
+            microtasks: MicrotaskQueue::with_sequencer(sequencer.clone()),
+            js_jobs: Arc::new(JsJobQueue::with_sequencer(sequencer)),
             next_timer_id: AtomicU64::new(1),
             next_immediate_id: AtomicU64::new(1),
             running: AtomicBool::new(false),
@@ -368,11 +372,18 @@ impl EventLoop {
         &self.microtasks
     }
 
+    /// Get access to the JS job queue
+    ///
+    /// This allows Promise callbacks to enqueue JavaScript function calls.
+    pub fn js_job_queue(&self) -> &Arc<JsJobQueue> {
+        &self.js_jobs
+    }
+
 
 
     /// Check if there are pending tasks that keep the loop alive
     pub fn has_pending_tasks(&self) -> bool {
-        if !self.microtasks.is_empty() {
+        if !self.microtasks.is_empty() || !self.js_jobs.is_empty() {
             return true;
         }
 
@@ -799,6 +810,7 @@ impl EventLoop {
 
             // 7. Small sleep if nothing is immediately ready to prevent busy-loop
             if self.microtasks.is_empty()
+                && self.js_jobs.is_empty()
                 && self.immediates.lock().is_empty()
                 && !has_servers
                 && let Some(wait) = self.time_until_next_timer()
@@ -815,11 +827,13 @@ impl EventLoop {
 impl Default for EventLoop {
     fn default() -> Self {
         // Note: new() returns Arc<Self>, but Default needs Self
+        let sequencer = MicrotaskSequencer::new();
         Self {
             timers: Mutex::new(HashMap::new()),
             timer_heap: Mutex::new(BinaryHeap::new()),
             immediates: Mutex::new(VecDeque::new()),
-            microtasks: MicrotaskQueue::new(),
+            microtasks: MicrotaskQueue::with_sequencer(sequencer.clone()),
+            js_jobs: Arc::new(JsJobQueue::with_sequencer(sequencer)),
             next_timer_id: AtomicU64::new(1),
             next_immediate_id: AtomicU64::new(1),
             running: AtomicBool::new(false),

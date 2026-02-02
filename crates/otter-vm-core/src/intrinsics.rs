@@ -983,7 +983,12 @@ impl Intrinsics {
         // Other builtins
         // ====================================================================
         let promise_ctor = alloc_ctor();
-        install("Promise", promise_ctor, self.promise_prototype, None);
+        install(
+            "Promise",
+            promise_ctor,
+            self.promise_prototype,
+            Some(crate::intrinsics_impl::promise::create_promise_constructor()),
+        );
         crate::intrinsics_impl::promise::install_promise_statics(promise_ctor, fn_proto, mm);
 
         let regexp_ctor = alloc_ctor();

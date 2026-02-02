@@ -844,15 +844,7 @@ impl Trace for crate::proxy::JsProxy {
 // Implement Trace for JsPromise
 impl Trace for crate::promise::JsPromise {
     fn trace(&self, tracer: &mut dyn Tracer) {
-        // Trace state
-        let state = self.state.lock();
-        match &*state {
-            crate::promise::PromiseState::Pending => {}
-            crate::promise::PromiseState::Fulfilled(value) => tracer.mark_value(value),
-            crate::promise::PromiseState::Rejected(value) => tracer.mark_value(value),
-        }
-        // Note: we cannot trace callbacks in Box<dyn Fn> as they are opaque.
-        // This is a known limitation.
+        self.trace_roots(&mut |header| tracer.mark_header(header));
     }
 }
 

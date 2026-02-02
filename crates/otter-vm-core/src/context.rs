@@ -152,6 +152,27 @@ pub struct VmContext {
     /// Set by otter-vm-runtime to bridge the compiler (which otter-vm-core
     /// cannot depend on directly). The interpreter handles execution.
     eval_fn: Option<Arc<dyn Fn(&str) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync>>,
+    /// Microtask enqueue function for Promise callbacks.
+    /// Set by otter-vm-runtime to enable proper microtask queuing from intrinsics.
+    microtask_enqueue: Option<Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>>,
+    /// JS job queue for JavaScript function callbacks (Promise.then/catch/finally).
+    /// Set by otter-vm-runtime to enable Promise callbacks to be executed via interpreter.
+    js_job_queue: Option<Arc<dyn JsJobQueueTrait + Send + Sync>>,
+    /// External root sets registered by the runtime (e.g., job queues).
+    /// These are traced during GC root collection.
+    external_root_sets: Vec<Arc<dyn ExternalRootSet + Send + Sync>>,
+}
+
+/// Trait for JS job queue access (allows runtime to inject the queue)
+pub trait JsJobQueueTrait {
+    /// Enqueue a JS callback job
+    fn enqueue(&self, job: crate::promise::JsPromiseJob, args: Vec<Value>);
+}
+
+/// Trait for external root sets (allows runtime to expose GC roots)
+pub trait ExternalRootSet {
+    /// Trace all GC roots in this external set
+    fn trace_roots(&self, tracer: &mut dyn FnMut(*const crate::gc::GcHeader));
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +273,9 @@ impl VmContext {
             generator_prototype_intrinsic: None,
             async_generator_prototype_intrinsic: None,
             eval_fn: None,
+            microtask_enqueue: None,
+            js_job_queue: None,
+            external_root_sets: Vec::new(),
         }
     }
 
@@ -696,6 +720,61 @@ impl VmContext {
             .as_ref()
             .ok_or_else(|| VmError::type_error("eval() is not available in this context"))?;
         eval_fn(code)
+    }
+
+    /// Set the microtask enqueue callback used by Promise intrinsics.
+    /// Called by otter-vm-runtime during context setup to enable proper
+    /// microtask queuing for Promise.prototype.then/catch/finally.
+    pub fn set_microtask_enqueue(
+        &mut self,
+        f: Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>,
+    ) {
+        self.microtask_enqueue = Some(f);
+    }
+
+    /// Enqueue a microtask if a microtask queue is configured.
+    /// Returns true if the task was enqueued, false if no queue is available.
+    pub fn enqueue_microtask(&self, task: Box<dyn FnOnce() + Send>) -> bool {
+        if let Some(enqueue) = &self.microtask_enqueue {
+            enqueue(task);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set the JS job queue for Promise callbacks
+    pub fn set_js_job_queue(&mut self, queue: Arc<dyn JsJobQueueTrait + Send + Sync>) {
+        self.js_job_queue = Some(queue);
+    }
+
+    /// Register an external root set for GC (e.g., job queues)
+    pub fn register_external_root_set(
+        &mut self,
+        roots: Arc<dyn ExternalRootSet + Send + Sync>,
+    ) {
+        self.external_root_sets.push(roots);
+    }
+
+    /// Enqueue a JS callback job if a queue is configured.
+    /// Returns true if the job was enqueued, false if no queue is available.
+    pub fn enqueue_js_job(&self, job: crate::promise::JsPromiseJob, args: Vec<Value>) -> bool {
+        if let Some(queue) = &self.js_job_queue {
+            queue.enqueue(job, args);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get the JS job queue, if configured.
+    pub fn js_job_queue(&self) -> Option<Arc<dyn JsJobQueueTrait + Send + Sync>> {
+        self.js_job_queue.clone()
+    }
+
+    /// Check if a JS job queue is available
+    pub fn has_js_job_queue(&self) -> bool {
+        self.js_job_queue.is_some()
     }
 
     /// Get global variable
@@ -1277,64 +1356,51 @@ impl VmContext {
 
         // Add values from registers
         for value in self.registers.iter() {
-            if let Some(header) = value.gc_header() {
-                roots.push(header);
-            }
+            value.trace(&mut |header| roots.push(header));
         }
 
         // Add values from call stack
         for frame in self.call_stack.iter() {
             // Locals
             for value in frame.locals.iter() {
-                if let Some(header) = value.gc_header() {
-                    roots.push(header);
-                }
+                value.trace(&mut |header| roots.push(header));
             }
             // Upvalues
             for cell in frame.upvalues.iter() {
-                if let Some(header) = cell.get().gc_header() {
-                    roots.push(header);
-                }
+                cell.get().trace(&mut |header| roots.push(header));
             }
             // This value
-            if let Some(header) = frame.this_value.gc_header() {
-                roots.push(header);
-            }
+            frame.this_value.trace(&mut |header| roots.push(header));
         }
 
         // Add root slots (HandleScope roots)
         for value in self.root_slots.iter() {
-            if let Some(header) = value.gc_header() {
-                roots.push(header);
-            }
+            value.trace(&mut |header| roots.push(header));
         }
 
         // Add exception if any
         if let Some(exc) = &self.exception {
-            if let Some(header) = exc.gc_header() {
-                roots.push(header);
-            }
+            exc.trace(&mut |header| roots.push(header));
         }
 
         // Add pending args
         for value in self.pending_args.iter() {
-            if let Some(header) = value.gc_header() {
-                roots.push(header);
-            }
+            value.trace(&mut |header| roots.push(header));
         }
 
         // Add pending this
         if let Some(this) = &self.pending_this {
-            if let Some(header) = this.gc_header() {
-                roots.push(header);
-            }
+            this.trace(&mut |header| roots.push(header));
         }
 
         // Add open upvalues
         for cell in self.open_upvalues.values() {
-            if let Some(header) = cell.get().gc_header() {
-                roots.push(header);
-            }
+            cell.get().trace(&mut |header| roots.push(header));
+        }
+
+        // Add external root sets (runtime-managed queues, etc.)
+        for root_set in &self.external_root_sets {
+            root_set.trace_roots(&mut |header| roots.push(header));
         }
 
         roots

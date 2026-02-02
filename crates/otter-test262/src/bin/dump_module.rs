@@ -42,7 +42,7 @@ fn main() {
     };
 
     let compiler = Compiler::new();
-    let module = match compiler.compile(&source, &file) {
+    let module = match compiler.compile(&source, &file, false) {
         Ok(m) => m,
         Err(err) => {
             eprintln!("Compile error: {}", err);

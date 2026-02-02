@@ -151,7 +151,8 @@ pub struct VmContext {
     /// Eval compiler callback: compiles eval source code into a Module.
     /// Set by otter-vm-runtime to bridge the compiler (which otter-vm-core
     /// cannot depend on directly). The interpreter handles execution.
-    eval_fn: Option<Arc<dyn Fn(&str) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync>>,
+    /// The boolean parameter indicates whether the caller is in strict mode context.
+    eval_fn: Option<Arc<dyn Fn(&str, bool) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync>>,
     /// Microtask enqueue function for Promise callbacks.
     /// Set by otter-vm-runtime to enable proper microtask queuing from intrinsics.
     microtask_enqueue: Option<Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>>,
@@ -702,24 +703,26 @@ impl VmContext {
 
     /// Set the eval compiler callback used by the interpreter to compile
     /// eval code at runtime. Called by otter-vm-runtime during context setup.
-    /// The callback takes source code and returns a compiled Module.
+    /// The callback takes source code and a boolean indicating strict mode context,
+    /// and returns a compiled Module.
     pub fn set_eval_fn(
         &mut self,
         f: Arc<
-            dyn Fn(&str) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync,
+            dyn Fn(&str, bool) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync,
         >,
     ) {
         self.eval_fn = Some(f);
     }
 
     /// Compile eval code into a Module using the registered eval compiler.
+    /// The strict_context parameter indicates whether the caller is in strict mode.
     /// Returns `VmError::TypeError` if the eval callback is not configured.
-    pub fn compile_eval(&self, code: &str) -> Result<otter_vm_bytecode::Module, VmError> {
+    pub fn compile_eval(&self, code: &str, strict_context: bool) -> Result<otter_vm_bytecode::Module, VmError> {
         let eval_fn = self
             .eval_fn
             .as_ref()
             .ok_or_else(|| VmError::type_error("eval() is not available in this context"))?;
-        eval_fn(code)
+        eval_fn(code, strict_context)
     }
 
     /// Set the microtask enqueue callback used by Promise intrinsics.
@@ -868,7 +871,11 @@ impl VmContext {
         }
 
         // Take pending this value (defaults to undefined)
-        let this_value = self.take_pending_this();
+        // ES2023 §10.2.1.1: In non-strict mode, undefined/null this becomes globalThis
+        let mut this_value = self.take_pending_this();
+        if this_value.is_undefined() && !func.flags.is_strict && !is_construct {
+            this_value = Value::object(self.global());
+        }
 
         // Take pending upvalues (captured closure cells)
         let upvalues = self.take_pending_upvalues();

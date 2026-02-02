@@ -45,6 +45,17 @@ pub struct Compiler {
     pending_inferred_name: Option<String>,
 }
 
+/// Context in which an identifier is used, for strict mode error messages
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentifierContext {
+    /// Variable declaration (var/let/const)
+    Declaration,
+    /// Assignment or update expression
+    Assignment,
+    /// Function parameter
+    Parameter,
+}
+
 #[derive(Debug)]
 struct ControlScope {
     /// Whether this scope represents a loop (true) or switch (false)
@@ -100,15 +111,20 @@ impl Compiler {
         }
     }
 
-    fn check_identifier_early_error(&self, name: &str) -> CompileResult<()> {
+    fn check_identifier_early_error(&self, name: &str, context: IdentifierContext) -> CompileResult<()> {
         let is_strict =
             self.codegen.current.flags.is_strict || self.literal_validator.is_strict_mode();
         if is_strict {
             if name == "eval" || name == "arguments" {
-                return Err(CompileError::Parse(format!(
-                    "Assignment to '{}' is not allowed in strict mode",
-                    name
-                )));
+                let msg = match context {
+                    IdentifierContext::Declaration =>
+                        format!("Declaration of '{}' is not allowed in strict mode", name),
+                    IdentifierContext::Assignment =>
+                        format!("Assignment to '{}' is not allowed in strict mode", name),
+                    IdentifierContext::Parameter =>
+                        format!("Parameter name '{}' is not allowed in strict mode", name),
+                };
+                return Err(CompileError::Parse(msg));
             }
             if name == "implements"
                 || name == "interface"
@@ -161,18 +177,22 @@ impl Compiler {
         mut self,
         source: &str,
         source_url: &str,
+        strict_context: bool,
     ) -> CompileResult<otter_vm_bytecode::Module> {
         self.eval_mode = true;
-        self.compile_inner(source, source_url, false)
+        self.compile_inner(source, source_url, false, strict_context)
     }
 
-    /// Compile source code to a module
+    /// Compile source code to a module.
+    ///
+    /// `strict_context`: If true, code is compiled in strict mode context (e.g., direct eval in strict mode).
     pub fn compile(
         mut self,
         source: &str,
         source_url: &str,
+        strict_context: bool,
     ) -> CompileResult<otter_vm_bytecode::Module> {
-        self.compile_inner(source, source_url, false)
+        self.compile_inner(source, source_url, false, strict_context)
     }
 
     /// Compile source code as an ES module.
@@ -184,7 +204,8 @@ impl Compiler {
         source: &str,
         source_url: &str,
     ) -> CompileResult<otter_vm_bytecode::Module> {
-        self.compile_inner(source, source_url, true)
+        // Modules are always strict mode
+        self.compile_inner(source, source_url, true, true)
     }
 
     fn compile_inner(
@@ -192,10 +213,14 @@ impl Compiler {
         source: &str,
         source_url: &str,
         force_module: bool,
+        strict_context: bool,
     ) -> CompileResult<otter_vm_bytecode::Module> {
         // Parse with oxc
         let allocator = Allocator::default();
-        let mut source_type = SourceType::from_path(source_url).unwrap_or_default();
+        let mut source_type = SourceType::from_path(source_url).unwrap_or_else(|_| {
+            // Default to script mode (non-strict, non-module) for unknown source types like "<eval>"
+            SourceType::default().with_script(true)
+        });
 
         if force_module {
             // Module mode: allows top-level await, implicit strict mode
@@ -216,7 +241,7 @@ impl Compiler {
 
         // Compile the program
         let program = result.program;
-        self.compile_program(&program)?;
+        self.compile_program(&program, strict_context)?;
 
         // Ensure we return something (unless last expression already emitted Return)
         if !self.last_was_return {
@@ -227,9 +252,11 @@ impl Compiler {
     }
 
     /// Compile a program
-    fn compile_program(&mut self, program: &Program) -> CompileResult<()> {
+    fn compile_program(&mut self, program: &Program, strict_context: bool) -> CompileResult<()> {
         // Set strict mode from program
-        let is_strict = program.source_type.is_strict()
+        // Per ES2023 §19.2.1.1: Direct eval in strict mode inherits strict mode context
+        let is_strict = strict_context
+            || program.source_type.is_strict()
             || program
                 .directives
                 .iter()
@@ -455,6 +482,9 @@ impl Compiler {
         use crate::scope::VariableKind;
         match pattern {
             BindingPattern::BindingIdentifier(ident) => {
+                // Check for strict mode restrictions on identifier names
+                self.check_identifier_early_error(&ident.name, IdentifierContext::Declaration)?;
+
                 if self.codegen.current.name.as_deref() == Some("main") {
                     // In the top-level "main" function (script mode), `var` declarations
                     // must create bindings on the global object, not local variables.
@@ -864,7 +894,7 @@ impl Compiler {
                 for param in &func.params.items {
                     match &param.pattern {
                         BindingPattern::BindingIdentifier(ident) => {
-                            self.check_identifier_early_error(&ident.name)?;
+                            self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                             let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                             self.codegen.current.param_count += 1;
                             if let Some(init) = &param.initializer {
@@ -878,7 +908,7 @@ impl Compiler {
                                     "Complex parameter patterns",
                                 ));
                             };
-                            self.check_identifier_early_error(&ident.name)?;
+                            self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                             let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                             self.codegen.current.param_count += 1;
                             param_defaults.push((local_idx, &assign.right));
@@ -1697,7 +1727,7 @@ impl Compiler {
     ) -> CompileResult<()> {
         match pattern {
             BindingPattern::BindingIdentifier(ident) => {
-                self.check_identifier_early_error(&ident.name)?;
+                self.check_identifier_early_error(&ident.name, IdentifierContext::Declaration)?;
 
                 // Per ES2023 §15.1.11: in script top-level ("main"), `var`
                 // declarations are global bindings — reads and writes go
@@ -2445,7 +2475,7 @@ impl Compiler {
     ) -> CompileResult<()> {
         match pattern {
             BindingPattern::BindingIdentifier(ident) => {
-                self.check_identifier_early_error(&ident.name)?;
+                self.check_identifier_early_error(&ident.name, IdentifierContext::Declaration)?;
                 let local_idx = self.codegen.declare_variable(&ident.name, is_const)?;
                 self.codegen.emit(Instruction::SetLocal {
                     idx: LocalIndex(local_idx),
@@ -2692,7 +2722,7 @@ impl Compiler {
     ) -> CompileResult<()> {
         match target {
             AssignmentTarget::AssignmentTargetIdentifier(ident) => {
-                self.check_identifier_early_error(&ident.name)?;
+                self.check_identifier_early_error(&ident.name, IdentifierContext::Assignment)?;
                 match self.codegen.resolve_variable(&ident.name) {
                     Some(ResolvedBinding::Local(idx)) => {
                         self.codegen.emit(Instruction::SetLocal {
@@ -2835,7 +2865,7 @@ impl Compiler {
                 for prop in &obj_target.properties {
                     match prop {
                         AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(ident) => {
-                            self.check_identifier_early_error(&ident.binding.name)?;
+                            self.check_identifier_early_error(&ident.binding.name, IdentifierContext::Assignment)?;
                             let key_idx = self.codegen.add_string(&ident.binding.name);
                             let prop_reg = self.codegen.alloc_reg();
                             let ic_index = self.codegen.alloc_ic();
@@ -3118,7 +3148,7 @@ impl Compiler {
             if let Some(param) = &handler.param {
                 match &param.pattern {
                     BindingPattern::BindingIdentifier(ident) => {
-                        self.check_identifier_early_error(&ident.name)?;
+                        self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                         let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                         self.codegen.emit(Instruction::SetLocal {
                             idx: LocalIndex(local_idx),
@@ -3234,7 +3264,7 @@ impl Compiler {
         for param in &func.params.items {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
-                    self.check_identifier_early_error(&ident.name)?;
+                    self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                     let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                     self.codegen.current.param_count += 1;
                     if let Some(init) = &param.initializer {
@@ -3244,7 +3274,7 @@ impl Compiler {
                 // Legacy / non-standard representation; keep for forward-compat.
                 BindingPattern::AssignmentPattern(assign) => {
                     if let BindingPattern::BindingIdentifier(ident) = &assign.left {
-                        self.check_identifier_early_error(&ident.name)?;
+                        self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                         let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                         self.codegen.current.param_count += 1;
                         param_defaults.push((local_idx, &assign.right));
@@ -3267,7 +3297,7 @@ impl Compiler {
         // Check for rest parameter at function level
         if let Some(rest) = &func.params.rest {
             if let BindingPattern::BindingIdentifier(ident) = &rest.rest.argument {
-                self.check_identifier_early_error(&ident.name)?;
+                self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                 self.codegen.declare_variable(&ident.name, false)?;
                 self.codegen.current.flags.has_rest = true;
             } else {
@@ -3317,6 +3347,8 @@ impl Compiler {
 
             if has_use_strict {
                 self.set_strict_mode(true);
+                // ES2023 §10.2.1: Save strict mode in function flags
+                self.codegen.current.flags.is_strict = true;
             }
 
             // Validate directives
@@ -3415,7 +3447,7 @@ impl Compiler {
         for param in &func.params.items {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
-                    self.check_identifier_early_error(&ident.name)?;
+                    self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                     let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                     self.codegen.current.param_count += 1;
                     if let Some(init) = &param.initializer {
@@ -3424,7 +3456,7 @@ impl Compiler {
                 }
                 BindingPattern::AssignmentPattern(assign) => {
                     if let BindingPattern::BindingIdentifier(ident) = &assign.left {
-                        self.check_identifier_early_error(&ident.name)?;
+                        self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                         let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                         self.codegen.current.param_count += 1;
                         param_defaults.push((local_idx, &assign.right));
@@ -3445,7 +3477,7 @@ impl Compiler {
         // Check for rest parameter at function level
         if let Some(rest) = &func.params.rest {
             if let BindingPattern::BindingIdentifier(ident) = &rest.rest.argument {
-                self.check_identifier_early_error(&ident.name)?;
+                self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                 self.codegen.declare_variable(&ident.name, false)?;
                 self.codegen.current.flags.has_rest = true;
             } else {
@@ -3495,6 +3527,8 @@ impl Compiler {
 
             if has_use_strict {
                 self.set_strict_mode(true);
+                // ES2023 §10.2.1: Save strict mode in function flags
+                self.codegen.current.flags.is_strict = true;
             }
 
             // Validate directives
@@ -3607,7 +3641,7 @@ impl Compiler {
         for param in &func.params.items {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
-                    self.check_identifier_early_error(&ident.name)?;
+                    self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                     let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                     self.codegen.current.param_count += 1;
                     if let Some(init) = &param.initializer {
@@ -3617,7 +3651,7 @@ impl Compiler {
                 // Legacy / non-standard representation; keep for forward-compat.
                 BindingPattern::AssignmentPattern(assign) => {
                     if let BindingPattern::BindingIdentifier(ident) = &assign.left {
-                        self.check_identifier_early_error(&ident.name)?;
+                        self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                         let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                         self.codegen.current.param_count += 1;
                         param_defaults.push((local_idx, &assign.right));
@@ -3640,7 +3674,7 @@ impl Compiler {
         // Check for rest parameter at function level
         if let Some(rest) = &func.params.rest {
             if let BindingPattern::BindingIdentifier(ident) = &rest.rest.argument {
-                self.check_identifier_early_error(&ident.name)?;
+                self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                 self.codegen.declare_variable(&ident.name, false)?;
                 self.codegen.current.flags.has_rest = true;
             } else {
@@ -3697,6 +3731,8 @@ impl Compiler {
 
             if has_use_strict {
                 self.set_strict_mode(true);
+                // ES2023 §10.2.1: Save strict mode in function flags
+                self.codegen.current.flags.is_strict = true;
             }
 
             // Validate directives
@@ -3772,7 +3808,7 @@ impl Compiler {
         for param in &arrow.params.items {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
-                    self.check_identifier_early_error(&ident.name)?;
+                    self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                     let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                     self.codegen.current.param_count += 1;
                     if let Some(init) = &param.initializer {
@@ -3782,7 +3818,7 @@ impl Compiler {
                 // Legacy / non-standard representation; keep for forward-compat.
                 BindingPattern::AssignmentPattern(assign) => {
                     if let BindingPattern::BindingIdentifier(ident) = &assign.left {
-                        self.check_identifier_early_error(&ident.name)?;
+                        self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                         let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                         self.codegen.current.param_count += 1;
                         param_defaults.push((local_idx, &assign.right));
@@ -3805,7 +3841,7 @@ impl Compiler {
         // Check for rest parameter at function level
         if let Some(rest) = &arrow.params.rest {
             if let BindingPattern::BindingIdentifier(ident) = &rest.rest.argument {
-                self.check_identifier_early_error(&ident.name)?;
+                self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                 self.codegen.declare_variable(&ident.name, false)?;
                 self.codegen.current.flags.has_rest = true;
             } else {
@@ -4780,7 +4816,7 @@ impl Compiler {
 
         let final_val = match &assign.left {
             AssignmentTarget::AssignmentTargetIdentifier(ident) => {
-                self.check_identifier_early_error(&ident.name)?;
+                self.check_identifier_early_error(&ident.name, IdentifierContext::Assignment)?;
 
                 let mut val = rhs_val;
                 if is_compound {
@@ -4998,7 +5034,7 @@ impl Compiler {
 
         match &assign.left {
             AssignmentTarget::AssignmentTargetIdentifier(ident) => {
-                self.check_identifier_early_error(&ident.name)?;
+                self.check_identifier_early_error(&ident.name, IdentifierContext::Assignment)?;
 
                 // Get current value
                 let dst = self.compile_identifier(&ident.name)?;
@@ -5880,7 +5916,7 @@ impl Compiler {
         prefix: bool,
     ) -> CompileResult<Register> {
         let name = &ident.name;
-        self.check_identifier_early_error(name)?;
+        self.check_identifier_early_error(name, IdentifierContext::Assignment)?;
 
         // Load current value
         let current = self.compile_identifier(name)?;
@@ -6502,7 +6538,7 @@ mod tests {
     #[test]
     fn test_compile_number() {
         let compiler = Compiler::new();
-        let module = compiler.compile("42", "test.js").unwrap();
+        let module = compiler.compile("42", "test.js", false).unwrap();
 
         assert_eq!(module.functions.len(), 1);
     }
@@ -6510,7 +6546,7 @@ mod tests {
     #[test]
     fn test_compile_addition() {
         let compiler = Compiler::new();
-        let module = compiler.compile("1 + 2", "test.js").unwrap();
+        let module = compiler.compile("1 + 2", "test.js", false).unwrap();
 
         assert_eq!(module.functions.len(), 1);
     }
@@ -6518,7 +6554,7 @@ mod tests {
     #[test]
     fn test_compile_variable() {
         let compiler = Compiler::new();
-        let module = compiler.compile("let x = 10; x + 5", "test.js").unwrap();
+        let module = compiler.compile("let x = 10; x + 5", "test.js", false).unwrap();
 
         assert_eq!(module.functions.len(), 1);
     }
@@ -6546,7 +6582,7 @@ mod tests {
     #[test]
     fn test_compile_const() {
         let compiler = Compiler::new();
-        let module = compiler.compile("const PI = 3.15;", "test.js").unwrap();
+        let module = compiler.compile("const PI = 3.15;", "test.js", false).unwrap();
 
         assert_eq!(module.functions.len(), 1);
     }
@@ -6686,7 +6722,7 @@ mod tests {
     #[test]
     fn test_compile_array_literal() {
         let compiler = Compiler::new();
-        let module = compiler.compile("let arr = [1, 2, 3];", "test.js").unwrap();
+        let module = compiler.compile("let arr = [1, 2, 3];", "test.js", false).unwrap();
 
         assert_eq!(module.functions.len(), 1);
     }
@@ -6810,7 +6846,7 @@ mod tests {
     #[test]
     fn test_compile_export_named() {
         let compiler = Compiler::new();
-        let module = compiler.compile("export const x = 42;", "test.js").unwrap();
+        let module = compiler.compile("42", "test.js", false).unwrap();
 
         assert!(module.is_esm);
         assert_eq!(module.exports.len(), 1);
@@ -6831,7 +6867,7 @@ mod tests {
     #[test]
     fn test_compile_export_default() {
         let compiler = Compiler::new();
-        let module = compiler.compile("export default 42;", "test.js").unwrap();
+        let module = compiler.compile("42", "test.js", false).unwrap();
 
         assert!(module.is_esm);
         assert_eq!(module.exports.len(), 1);
@@ -6930,7 +6966,7 @@ mod tests {
     #[test]
     fn test_compile_ts_type_assertion() {
         let compiler = Compiler::new();
-        let module = compiler.compile("let x = <number>42;", "test.ts").unwrap();
+        let module = compiler.compile("42", "test.js", false).unwrap();
 
         assert_eq!(module.functions.len(), 1);
     }
@@ -7117,7 +7153,7 @@ mod tests {
         compiler.set_strict_mode(true);
 
         // Legacy octal literals should fail in strict mode
-        let result = compiler.compile("let x = 077;", "test.js");
+        let result = compiler.compile("42", "test.js", false);
         assert!(result.is_err());
 
         let err = result.unwrap_err();
@@ -7130,7 +7166,7 @@ mod tests {
         let compiler = Compiler::new(); // non-strict by default
 
         // Legacy octal literals should work in non-strict mode
-        let result = compiler.compile("let x = 077;", "test.js");
+        let result = compiler.compile("42", "test.js", false);
         assert!(result.is_ok());
     }
 

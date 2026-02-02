@@ -3697,8 +3697,16 @@ impl Interpreter {
                     .ok_or_else(|| VmError::type_error("eval argument is not a string"))?;
                 let source = js_str.as_str().to_string();
 
+                // Per ES2023 §19.2.1.1: Direct eval inherits strict mode from calling context
+                let is_strict_context = ctx.current_frame()
+                    .and_then(|frame| {
+                        frame.module.functions.get(frame.function_index as usize)
+                    })
+                    .map(|func| func.flags.is_strict)
+                    .unwrap_or(false);
+
                 // Compile eval code into a module
-                let eval_module = ctx.compile_eval(&source)?;
+                let eval_module = ctx.compile_eval(&source, is_strict_context)?;
                 let result = self.execute_eval_module(ctx, &eval_module)?;
                 ctx.set_register(dst.0, result);
                 Ok(InstructionResult::Continue)
@@ -6695,7 +6703,8 @@ impl Interpreter {
                                     VmError::type_error("eval argument is not a string")
                                 })?;
                             let source = js_str.as_str().to_string();
-                            let eval_module = ctx.compile_eval(&source)?;
+                            // Indirect eval does NOT inherit strict mode
+                            let eval_module = ctx.compile_eval(&source, false)?;
                             let result =
                                 self.execute_eval_module(ctx, &eval_module)?;
                             ctx.set_register(return_reg, result);

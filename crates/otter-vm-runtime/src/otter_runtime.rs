@@ -439,8 +439,9 @@ impl Otter {
 
     /// Execute JS code with suspension support.
     ///
-    /// Compiles as an ES module to allow top-level await, then executes with
-    /// the interpreter's suspension machinery for async operations.
+    /// Compiles as a script (NOT a module) to preserve non-strict mode semantics,
+    /// while still supporting top-level await through the interpreter's suspension machinery.
+    /// ES2023 §16.1.6: Scripts are not automatically strict unless they have "use strict" directive.
     fn execute_with_suspension(
         &self,
         ctx: &mut VmContext,
@@ -450,7 +451,7 @@ impl Otter {
     ) -> Result<VmExecutionResult, OtterError> {
         let compiler = Compiler::new();
         let module = compiler
-            .compile_as_module(code, source_url)
+            .compile(code, source_url, false)  // Non-strict context for top-level code
             .map_err(|e| OtterError::Compile(e.to_string()))?;
 
         let module_arc = Arc::new(module);
@@ -596,8 +597,18 @@ impl Otter {
                     unsafe {
                         let ctx = &mut *(ctx_ptr as *mut VmContext);
                         let vm = &*(vm_ptr as *const VmRuntime);
+
+                        // Determine if we're in strict mode context (for direct eval)
+                        // Per ES2023 §19.2.1.1: Direct eval inherits strict mode from calling context
+                        let is_strict_context = ctx.current_frame()
+                            .and_then(|frame| {
+                                frame.module.functions.get(frame.function_index as usize)
+                            })
+                            .map(|func| func.flags.is_strict)
+                            .unwrap_or(false);
+
                         let compiler = Compiler::new();
-                        let module = match compiler.compile(&code, "eval.js") {
+                        let module = match compiler.compile(&code, "<eval>", is_strict_context) {
                             Ok(module) => module,
                             Err(err) => {
                                 return Ok(result_err("SyntaxError", &err.to_string()));
@@ -844,7 +855,7 @@ impl Otter {
     ) -> Result<Value, OtterError> {
         let compiler = Compiler::new();
         let module = compiler
-            .compile(code, source_url)
+            .compile(code, source_url, false)  // Non-strict context for top-level code
             .map_err(|e| OtterError::Compile(e.to_string()))?;
 
         self.vm
@@ -884,7 +895,7 @@ impl Otter {
         self.clear_interrupt();
         let compiler = Compiler::new();
         let module = compiler
-            .compile_eval(code, "eval.js")
+            .compile_eval(code, "eval.js", false)
             .map_err(|e| OtterError::Compile(e.to_string()))?;
 
         // Execute in provided context
@@ -1520,10 +1531,10 @@ impl Otter {
     /// and `CallEval` bytecode can compile code at runtime.
     /// The interpreter handles execution with proper stack depth tracking.
     fn configure_eval(ctx: &mut VmContext) {
-        ctx.set_eval_fn(Arc::new(|code: &str| {
+        ctx.set_eval_fn(Arc::new(|code: &str, strict_context: bool| {
             let compiler = Compiler::new();
             compiler
-                .compile_eval(code, "<eval>")
+                .compile_eval(code, "<eval>", strict_context)
                 .map_err(|e| VmError::SyntaxError(e.to_string()))
         }));
     }
@@ -1546,7 +1557,7 @@ impl Otter {
     ) -> Result<Value, OtterError> {
         let compiler = Compiler::new();
         let module = compiler
-            .compile_eval(code, source_url)
+            .compile_eval(code, source_url, false)
             .map_err(|e| OtterError::Compile(e.to_string()))?;
 
         self.vm

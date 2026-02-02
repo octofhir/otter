@@ -354,7 +354,7 @@ impl ModuleLoader {
         // Compile
         let compiler = Compiler::new();
         let bytecode = compiler
-            .compile(&source, url)
+            .compile(&source, url, false)
             .map_err(|e| ModuleError::CompileError(e.to_string()))?;
 
         // Create loaded module

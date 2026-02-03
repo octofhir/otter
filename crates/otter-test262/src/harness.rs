@@ -40,8 +40,11 @@ var $262 = {
         }
     },
     createRealm: function() {
+        // NOTE: Real realms are not implemented yet.
+        // For now, return the current global object so cross-realm tests
+        // can at least access eval and builtins.
         return {
-            global: {},
+            global: this.global,
             evalScript: function(code) {
                 return $262.evalScript(code);
             }

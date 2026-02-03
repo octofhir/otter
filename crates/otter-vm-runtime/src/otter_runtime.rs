@@ -955,9 +955,9 @@ impl Otter {
 
             if let Some(proxy) = value.as_proxy() {
                 let key_value = Value::string(JsString::intern("then"));
+                let mut ncx = otter_vm_core::context::NativeContext::new(ctx, interpreter);
                 return otter_vm_core::proxy_operations::proxy_get(
-                    interpreter,
-                    ctx,
+                    &mut ncx,
                     proxy,
                     &key,
                     key_value,

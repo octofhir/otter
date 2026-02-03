@@ -4,10 +4,12 @@
 
 use crate::error::VmError;
 use crate::gc::GcRef;
+use crate::intrinsics::well_known;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
 use crate::memory::MemoryManager;
+use crate::value::Symbol;
 use std::sync::Arc;
 
 /// Initialize Object.prototype methods
@@ -20,7 +22,87 @@ pub fn init_object_prototype(
     object_proto.define_property(
         PropertyKey::string("toString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, _args, _ncx| Ok(Value::string(JsString::intern("[object Object]"))),
+            |this_val, _args, ncx| {
+                if this_val.is_undefined() {
+                    return Ok(Value::string(JsString::intern("[object Undefined]")));
+                }
+                if this_val.is_null() {
+                    return Ok(Value::string(JsString::intern("[object Null]")));
+                }
+
+                if this_val.is_boolean() {
+                    return Ok(Value::string(JsString::intern("[object Boolean]")));
+                }
+                if this_val.is_number() {
+                    return Ok(Value::string(JsString::intern("[object Number]")));
+                }
+                if this_val.is_string() {
+                    return Ok(Value::string(JsString::intern("[object String]")));
+                }
+                if this_val.is_symbol() {
+                    return Ok(Value::string(JsString::intern("[object Symbol]")));
+                }
+                if this_val.is_bigint() {
+                    return Ok(Value::string(JsString::intern("[object BigInt]")));
+                }
+
+                fn is_array_value(value: &Value) -> Result<bool, VmError> {
+                    if let Some(proxy) = value.as_proxy() {
+                        let target = proxy
+                            .target()
+                            .ok_or_else(|| VmError::type_error("Cannot perform 'get' on a proxy that has been revoked"))?;
+                        return is_array_value(&target);
+                    }
+                    if let Some(obj) = value.as_object() {
+                        return Ok(obj.is_array());
+                    }
+                    Ok(false)
+                }
+
+                let is_array = is_array_value(this_val)?;
+                let builtin_tag = if is_array {
+                    "Array"
+                } else if this_val.is_callable() {
+                    "Function"
+                } else if this_val.is_promise() {
+                    "Promise"
+                } else if this_val.is_generator() {
+                    "Generator"
+                } else if this_val.is_array_buffer() {
+                    "ArrayBuffer"
+                } else if this_val.is_shared_array_buffer() {
+                    "SharedArrayBuffer"
+                } else if this_val.is_typed_array() {
+                    "TypedArray"
+                } else if this_val.is_data_view() {
+                    "DataView"
+                } else if this_val.as_regex().is_some() {
+                    "RegExp"
+                } else {
+                    "Object"
+                };
+
+                let tag_value = if let Some(proxy) = this_val.as_proxy() {
+                    let key = PropertyKey::Symbol(well_known::TO_STRING_TAG);
+                    let key_value = Value::symbol(Arc::new(Symbol {
+                        description: None,
+                        id: well_known::TO_STRING_TAG,
+                    }));
+                    crate::proxy_operations::proxy_get(ncx, proxy, &key, key_value, this_val.clone())?
+                } else if let Some(obj) = this_val.as_object() {
+                    obj.get(&PropertyKey::Symbol(well_known::TO_STRING_TAG))
+                        .unwrap_or(Value::undefined())
+                } else {
+                    Value::undefined()
+                };
+
+                let tag = tag_value
+                    .as_string()
+                    .map(|s| s.as_str().to_string())
+                    .unwrap_or_else(|| builtin_tag.to_string());
+
+                Ok(Value::string(JsString::intern(&format!("[object {}]", tag))))
+            },
             mm.clone(),
             fn_proto.clone(),
         )),
@@ -766,9 +848,18 @@ pub fn init_object_constructor(
                 let obj = match args.first().and_then(|v| v.as_object()) {
                     Some(o) => o,
                     None => {
-                        return Ok(Value::array(GcRef::new(JsObject::array(
-                            0, ncx_inner.memory_manager().clone(),
-                        ))));
+                        let arr =
+                            GcRef::new(JsObject::array(0, ncx_inner.memory_manager().clone()));
+                        if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array")) {
+                            if let Some(array_obj) = array_ctor.as_object() {
+                                if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
+                                    if let Some(proto_obj) = proto_val.as_object() {
+                                        arr.set_prototype(Some(proto_obj));
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(Value::array(arr));
                     }
                 };
                 let keys = obj.own_keys();
@@ -786,6 +877,15 @@ pub fn init_object_constructor(
                 }
                 let result =
                     GcRef::new(JsObject::array(names.len(), ncx_inner.memory_manager().clone()));
+                if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array")) {
+                    if let Some(array_obj) = array_ctor.as_object() {
+                        if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
+                            if let Some(proto_obj) = proto_val.as_object() {
+                                result.set_prototype(Some(proto_obj));
+                            }
+                        }
+                    }
+                }
                 for (i, name) in names.into_iter().enumerate() {
                     result.set(PropertyKey::Index(i as u32), name);
                 }

@@ -617,7 +617,16 @@ impl Value {
     /// Check if value is callable (function or native function)
     #[inline]
     pub fn is_callable(&self) -> bool {
-        self.is_function() || self.is_native_function()
+        if self.is_function() || self.is_native_function() {
+            return true;
+        }
+        if let Some(proxy) = self.as_proxy() {
+            if let Some(target) = proxy.target() {
+                return target.is_callable();
+            }
+            return proxy.target_raw().is_callable();
+        }
+        false
     }
 
     /// Check if value is a symbol
@@ -884,13 +893,19 @@ impl Value {
                 Some(
                     HeapRef::Array(_)
                     | HeapRef::Promise(_)
-                    | HeapRef::Proxy(_)
                     | HeapRef::Generator(_)
                     | HeapRef::ArrayBuffer(_)
                     | HeapRef::TypedArray(_)
                     | HeapRef::DataView(_)
                     | HeapRef::SharedArrayBuffer(_),
                 ) => "object",
+                Some(HeapRef::Proxy(_)) => {
+                    if self.is_callable() {
+                        "function"
+                    } else {
+                        "object"
+                    }
+                }
                 None => "undefined", // Should not happen
             },
         }
@@ -1100,8 +1115,8 @@ impl Value {
                     p.trace_roots(tracer);
                 }
                 HeapRef::Proxy(p) => {
-                    tracer(p.target.header() as *const _);
-                    tracer(p.handler.header() as *const _);
+                    p.target.trace(tracer);
+                    p.handler.trace(tracer);
                 }
                 // Other types use Arc, not GcRef, so no GC tracing needed
                 _ => {}

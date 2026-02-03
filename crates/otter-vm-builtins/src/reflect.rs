@@ -82,12 +82,19 @@ fn to_property_key(value: &VmValue) -> PropertyKey {
 }
 
 /// Get object from value, checking for proxy first
-fn get_target_object(value: &VmValue) -> Result<GcRef<JsObject>, VmError> {
+fn get_target_object(value: &VmValue) -> Result<otter_vm_core::gc::GcRef<JsObject>, VmError> {
     // Check if it's a proxy first
     if let Some(proxy) = value.as_proxy() {
-        return proxy
+        let target = proxy
             .target()
-            .ok_or_else(|| VmError::type_error("Cannot perform operation on a revoked proxy"));
+            .ok_or_else(|| VmError::type_error("Cannot perform operation on a revoked proxy"))?;
+        return target.as_object().ok_or_else(|| {
+            VmError::type_error(format!(
+                "Reflect method requires an object target (got {}: {:?})",
+                target.type_of(),
+                target
+            ))
+        });
     }
 
     value.as_object().ok_or_else(|| {

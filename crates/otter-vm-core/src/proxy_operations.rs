@@ -5,12 +5,247 @@
 
 use crate::error::{VmError, VmResult};
 use crate::gc::GcRef;
-use crate::interpreter::Interpreter;
+use crate::context::NativeContext;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::proxy::JsProxy;
+use crate::string::JsString;
 use crate::value::Value;
-use crate::VmContext;
 use std::sync::Arc;
+
+fn create_args_array(ncx: &mut NativeContext, args: &[Value]) -> GcRef<JsObject> {
+    let arr = GcRef::new(JsObject::array(args.len(), ncx.memory_manager().clone()));
+    if let Some(array_ctor) = ncx.global().get(&PropertyKey::string("Array")) {
+        if let Some(array_obj) = array_ctor.as_object() {
+            if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
+                if let Some(proto_obj) = proto_val.as_object() {
+                    arr.set_prototype(Some(proto_obj));
+                }
+            }
+        }
+    }
+    for (i, arg) in args.iter().enumerate() {
+        arr.set(PropertyKey::Index(i as u32), arg.clone());
+    }
+    arr
+}
+
+fn proxy_target_value(proxy: &Arc<JsProxy>) -> VmResult<Value> {
+    proxy
+        .target()
+        .ok_or_else(|| VmError::type_error("Proxy target is not available"))
+}
+
+fn proxy_handler_value(proxy: &Arc<JsProxy>) -> VmResult<Value> {
+    proxy
+        .handler()
+        .ok_or_else(|| VmError::type_error("Proxy handler is not available"))
+}
+
+fn property_key_to_value(key: &PropertyKey) -> Value {
+    match key {
+        PropertyKey::String(s) => Value::string(*s),
+        PropertyKey::Index(n) => Value::string(JsString::intern(&n.to_string())),
+        PropertyKey::Symbol(sym) => Value::symbol(Arc::new(crate::value::Symbol {
+            description: None,
+            id: *sym,
+        })),
+    }
+}
+
+fn get_property_value(
+    ncx: &mut NativeContext,
+    receiver: &Value,
+    key: &PropertyKey,
+    key_value: Value,
+) -> VmResult<Value> {
+    if let Some(proxy) = receiver.as_proxy() {
+        return proxy_get(ncx, proxy, key, key_value, receiver.clone());
+    }
+
+    let obj = receiver
+        .as_object()
+        .ok_or_else(|| VmError::type_error("Proxy handler must be an object"))?;
+
+    if let Some(desc) = obj.lookup_property_descriptor(key) {
+        match desc {
+            PropertyDescriptor::Data { value, .. } => Ok(value),
+            PropertyDescriptor::Accessor { get, .. } => {
+                if let Some(getter) = get {
+                    ncx.call_function(&getter, receiver.clone(), &[])
+                } else {
+                    Ok(Value::undefined())
+                }
+            }
+            PropertyDescriptor::Deleted => Ok(Value::undefined()),
+        }
+    } else {
+        Ok(Value::undefined())
+    }
+}
+
+fn target_get_own_property_descriptor(
+    ncx: &mut NativeContext,
+    target: &Value,
+    key: &PropertyKey,
+    key_value: Value,
+) -> VmResult<Option<PropertyDescriptor>> {
+    if let Some(proxy) = target.as_proxy() {
+        return proxy_get_own_property_descriptor(ncx, proxy, key, key_value);
+    }
+    let obj = target
+        .as_object()
+        .ok_or_else(|| VmError::type_error("Proxy target must be an object"))?;
+    Ok(obj.get_own_property_descriptor(key))
+}
+
+fn target_has_own(
+    ncx: &mut NativeContext,
+    target: &Value,
+    key: &PropertyKey,
+    key_value: Value,
+) -> VmResult<bool> {
+    Ok(target_get_own_property_descriptor(ncx, target, key, key_value)?.is_some())
+}
+
+fn target_has(
+    ncx: &mut NativeContext,
+    target: &Value,
+    key: &PropertyKey,
+    key_value: Value,
+) -> VmResult<bool> {
+    if let Some(proxy) = target.as_proxy() {
+        return proxy_has(ncx, proxy, key, key_value);
+    }
+    let obj = target
+        .as_object()
+        .ok_or_else(|| VmError::type_error("Proxy target must be an object"))?;
+    Ok(obj.has(key))
+}
+
+fn target_is_extensible(ncx: &mut NativeContext, target: &Value) -> VmResult<bool> {
+    if let Some(proxy) = target.as_proxy() {
+        return proxy_is_extensible(ncx, proxy);
+    }
+    let obj = target
+        .as_object()
+        .ok_or_else(|| VmError::type_error("Proxy target must be an object"))?;
+    Ok(obj.is_extensible())
+}
+
+fn target_get(
+    ncx: &mut NativeContext,
+    target: &Value,
+    key: &PropertyKey,
+    key_value: Value,
+    receiver: Value,
+) -> VmResult<Value> {
+    if let Some(proxy) = target.as_proxy() {
+        return proxy_get(ncx, proxy, key, key_value, receiver);
+    }
+    let obj = target
+        .as_object()
+        .ok_or_else(|| VmError::type_error("Proxy target must be an object"))?;
+    Ok(obj.get(key).unwrap_or(Value::undefined()))
+}
+
+fn target_set(
+    ncx: &mut NativeContext,
+    target: &Value,
+    key: &PropertyKey,
+    key_value: Value,
+    value: Value,
+    receiver: Value,
+) -> VmResult<bool> {
+    if let Some(proxy) = target.as_proxy() {
+        return proxy_set(ncx, proxy, key, key_value, value, receiver);
+    }
+    let obj = target
+        .as_object()
+        .ok_or_else(|| VmError::type_error("Proxy target must be an object"))?;
+    obj.set(*key, value);
+    Ok(true)
+}
+
+fn target_delete_property(
+    ncx: &mut NativeContext,
+    target: &Value,
+    key: &PropertyKey,
+    key_value: Value,
+) -> VmResult<bool> {
+    if let Some(proxy) = target.as_proxy() {
+        return proxy_delete_property(ncx, proxy, key, key_value);
+    }
+    let obj = target
+        .as_object()
+        .ok_or_else(|| VmError::type_error("Proxy target must be an object"))?;
+    Ok(obj.delete(key))
+}
+
+fn target_own_keys(ncx: &mut NativeContext, target: &Value) -> VmResult<Vec<PropertyKey>> {
+    if let Some(proxy) = target.as_proxy() {
+        return proxy_own_keys(ncx, proxy);
+    }
+    let obj = target
+        .as_object()
+        .ok_or_else(|| VmError::type_error("Proxy target must be an object"))?;
+    Ok(obj.own_keys())
+}
+
+fn target_define_property(
+    ncx: &mut NativeContext,
+    target: &Value,
+    key: &PropertyKey,
+    key_value: Value,
+    desc: &PropertyDescriptor,
+) -> VmResult<bool> {
+    if let Some(proxy) = target.as_proxy() {
+        return proxy_define_property(ncx, proxy, key, key_value, desc);
+    }
+    let obj = target
+        .as_object()
+        .ok_or_else(|| VmError::type_error("Proxy target must be an object"))?;
+    obj.define_property(*key, desc.clone());
+    Ok(true)
+}
+
+fn target_get_prototype_of(
+    ncx: &mut NativeContext,
+    target: &Value,
+) -> VmResult<Option<GcRef<JsObject>>> {
+    if let Some(proxy) = target.as_proxy() {
+        return proxy_get_prototype_of(ncx, proxy);
+    }
+    let obj = target
+        .as_object()
+        .ok_or_else(|| VmError::type_error("Proxy target must be an object"))?;
+    Ok(obj.prototype())
+}
+
+fn target_set_prototype_of(
+    ncx: &mut NativeContext,
+    target: &Value,
+    proto: Option<GcRef<JsObject>>,
+) -> VmResult<bool> {
+    if let Some(proxy) = target.as_proxy() {
+        return proxy_set_prototype_of(ncx, proxy, proto);
+    }
+    let obj = target
+        .as_object()
+        .ok_or_else(|| VmError::type_error("Proxy target must be an object"))?;
+    obj.set_prototype(proto);
+    Ok(true)
+}
+
+fn target_prevent_extensions(ncx: &mut NativeContext, target: &Value) -> VmResult<bool> {
+    if let Some(proxy) = target.as_proxy() {
+        return proxy_prevent_extensions(ncx, proxy);
+    }
+    let obj = target
+        .as_object()
+        .ok_or_else(|| VmError::type_error("Proxy target must be an object"))?;
+    obj.prevent_extensions();
+    Ok(true)
+}
 
 /// Invoke a trap on a proxy handler
 ///
@@ -19,8 +254,7 @@ use std::sync::Arc;
 /// - `Ok(None)` if the trap doesn't exist (caller should use default behavior)
 /// - `Err(...)` if the trap exists but threw an error or isn't callable
 fn invoke_trap(
-    interpreter: &Interpreter,
-    ctx: &mut VmContext,
+    ncx: &mut NativeContext,
     proxy: &Arc<JsProxy>,
     trap_name: &str,
     args: &[Value],
@@ -33,11 +267,14 @@ fn invoke_trap(
         )));
     }
 
-    // Get the trap from handler
-    let trap = match proxy.get_trap(trap_name) {
-        Some(t) => t,
-        None => return Ok(None), // No trap, use default behavior
-    };
+    let handler = proxy_handler_value(proxy)?;
+    let trap_key = PropertyKey::string(trap_name);
+    let trap_key_value = Value::string(JsString::intern(trap_name));
+    let trap = get_property_value(ncx, &handler, &trap_key, trap_key_value)?;
+
+    if trap.is_undefined() || trap.is_null() {
+        return Ok(None);
+    }
 
     // Verify trap is callable
     if !trap.is_callable() {
@@ -48,12 +285,7 @@ fn invoke_trap(
     }
 
     // Call the trap with the handler as 'this'
-    let handler = proxy
-        .handler()
-        .ok_or_else(|| VmError::type_error("Proxy handler is not available"))?;
-    let this_value = Value::object(handler);
-
-    let result = interpreter.call_function(ctx, &trap, this_value, args)?;
+    let result = ncx.call_function(&trap, handler, args)?;
     Ok(Some(result))
 }
 
@@ -61,45 +293,42 @@ fn invoke_trap(
 ///
 /// Implements the `get` trap with proper invariant validation.
 pub fn proxy_get(
-    interpreter: &Interpreter,
-    ctx: &mut VmContext,
+    ncx: &mut NativeContext,
     proxy: &Arc<JsProxy>,
     key: &PropertyKey,
     key_value: Value,
     receiver: Value,
 ) -> VmResult<Value> {
     // Get target
-    let target = proxy
-        .target()
-        .ok_or_else(|| VmError::type_error("Proxy target is not available"))?;
+    let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.get(target, key, receiver)
-    let trap_args = &[Value::object(target), key_value, receiver];
-    let trap_result = invoke_trap(interpreter, ctx, proxy, "get", trap_args)?;
+    let trap_args = &[target.clone(), key_value.clone(), receiver.clone()];
+    let trap_result = invoke_trap(ncx, proxy, "get", trap_args)?;
 
     // If no trap, perform default [[Get]] on target
     let result = match trap_result {
         Some(r) => r,
         None => {
-            // Default behavior: get property from target
-            return Ok(target.get(key).unwrap_or(Value::undefined()));
+            return target_get(ncx, &target, key, key_value, receiver);
         }
     };
 
     // Validate invariants (ES §9.5.8 step 11-12)
-    validate_get_trap_invariants(&target, key, &result)?;
+    validate_get_trap_invariants(ncx, &target, key, key_value, &result)?;
 
     Ok(result)
 }
 
 /// Validate invariants for the `get` trap (ES §9.5.8)
 fn validate_get_trap_invariants(
-    target: &GcRef<JsObject>,
+    ncx: &mut NativeContext,
+    target: &Value,
     key: &PropertyKey,
+    key_value: Value,
     trap_result: &Value,
 ) -> VmResult<()> {
-    // Get target's own property descriptor
-    let target_desc = target.get_own_property_descriptor(key);
+    let target_desc = target_get_own_property_descriptor(ncx, target, key, key_value)?;
 
     if let Some(desc) = target_desc {
         match desc {
@@ -141,8 +370,7 @@ fn validate_get_trap_invariants(
 ///
 /// Implements the `set` trap with proper invariant validation.
 pub fn proxy_set(
-    interpreter: &Interpreter,
-    ctx: &mut VmContext,
+    ncx: &mut NativeContext,
     proxy: &Arc<JsProxy>,
     key: &PropertyKey,
     key_value: Value,
@@ -150,18 +378,11 @@ pub fn proxy_set(
     receiver: Value,
 ) -> VmResult<bool> {
     // Get target
-    let target = proxy
-        .target()
-        .ok_or_else(|| VmError::type_error("Proxy target is not available"))?;
+    let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.set(target, key, value, receiver)
-    let trap_args = &[
-        Value::object(target),
-        key_value,
-        value.clone(),
-        receiver,
-    ];
-    let trap_result = invoke_trap(interpreter, ctx, proxy, "set", trap_args)?;
+    let trap_args = &[target.clone(), key_value.clone(), value.clone(), receiver.clone()];
+    let trap_result = invoke_trap(ncx, proxy, "set", trap_args)?;
 
     // If no trap, perform default [[Set]] on target
     let success = match trap_result {
@@ -170,15 +391,13 @@ pub fn proxy_set(
             r.to_boolean()
         }
         None => {
-            // Default behavior: set property on target
-            target.set(*key, value);
-            return Ok(true);
+            return target_set(ncx, &target, key, key_value, value, receiver);
         }
     };
 
     // Validate invariants (ES §9.5.9 step 12-13)
     if success {
-        validate_set_trap_invariants(&target, key, &value)?;
+        validate_set_trap_invariants(ncx, &target, key, key_value, &value)?;
     }
 
     Ok(success)
@@ -186,12 +405,13 @@ pub fn proxy_set(
 
 /// Validate invariants for the `set` trap (ES §9.5.9)
 fn validate_set_trap_invariants(
-    target: &GcRef<JsObject>,
+    ncx: &mut NativeContext,
+    target: &Value,
     key: &PropertyKey,
+    key_value: Value,
     value: &Value,
 ) -> VmResult<()> {
-    // Get target's own property descriptor
-    let target_desc = target.get_own_property_descriptor(key);
+    let target_desc = target_get_own_property_descriptor(ncx, target, key, key_value)?;
 
     if let Some(desc) = target_desc {
         match desc {
@@ -231,44 +451,41 @@ fn validate_set_trap_invariants(
 ///
 /// Implements the `has` trap with proper invariant validation.
 pub fn proxy_has(
-    interpreter: &Interpreter,
-    ctx: &mut VmContext,
+    ncx: &mut NativeContext,
     proxy: &Arc<JsProxy>,
     key: &PropertyKey,
     key_value: Value,
 ) -> VmResult<bool> {
     // Get target
-    let target = proxy
-        .target()
-        .ok_or_else(|| VmError::type_error("Proxy target is not available"))?;
+    let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.has(target, key)
-    let trap_args = &[Value::object(target), key_value];
-    let trap_result = invoke_trap(interpreter, ctx, proxy, "has", trap_args)?;
+    let trap_args = &[target.clone(), key_value.clone()];
+    let trap_result = invoke_trap(ncx, proxy, "has", trap_args)?;
 
     // If no trap, perform default [[HasProperty]] on target
     let result = match trap_result {
         Some(r) => r.to_boolean(),
         None => {
-            // Default behavior: has property on target
-            return Ok(target.has(key));
+            return target_has(ncx, &target, key, key_value);
         }
     };
 
     // Validate invariants (ES §9.5.7 step 9-10)
-    validate_has_trap_invariants(&target, key, result)?;
+    validate_has_trap_invariants(ncx, &target, key, key_value, result)?;
 
     Ok(result)
 }
 
 /// Validate invariants for the `has` trap (ES §9.5.7)
 fn validate_has_trap_invariants(
-    target: &GcRef<JsObject>,
+    ncx: &mut NativeContext,
+    target: &Value,
     key: &PropertyKey,
+    key_value: Value,
     trap_result: bool,
 ) -> VmResult<()> {
-    // Get target's own property descriptor
-    let target_desc = target.get_own_property_descriptor(key);
+    let target_desc = target_get_own_property_descriptor(ncx, target, key, key_value.clone())?;
 
     if let Some(desc) = target_desc {
         // If property exists on target and is non-configurable,
@@ -282,8 +499,8 @@ fn validate_has_trap_invariants(
 
     // If target is non-extensible and property exists,
     // trap must return true
-    if !target.is_extensible() {
-        if target.has_own(key) && !trap_result {
+    if !target_is_extensible(ncx, target)? {
+        if target_has_own(ncx, target, key, key_value)? && !trap_result {
             return Err(VmError::type_error(
                 "Proxy 'has' trap returned false for property of non-extensible target",
             ));
@@ -297,33 +514,29 @@ fn validate_has_trap_invariants(
 ///
 /// Implements the `deleteProperty` trap with proper invariant validation.
 pub fn proxy_delete_property(
-    interpreter: &Interpreter,
-    ctx: &mut VmContext,
+    ncx: &mut NativeContext,
     proxy: &Arc<JsProxy>,
     key: &PropertyKey,
     key_value: Value,
 ) -> VmResult<bool> {
     // Get target
-    let target = proxy
-        .target()
-        .ok_or_else(|| VmError::type_error("Proxy target is not available"))?;
+    let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.deleteProperty(target, key)
-    let trap_args = &[Value::object(target), key_value];
-    let trap_result = invoke_trap(interpreter, ctx, proxy, "deleteProperty", trap_args)?;
+    let trap_args = &[target.clone(), key_value.clone()];
+    let trap_result = invoke_trap(ncx, proxy, "deleteProperty", trap_args)?;
 
     // If no trap, perform default [[Delete]] on target
     let result = match trap_result {
         Some(r) => r.to_boolean(),
         None => {
-            // Default behavior: delete property from target
-            return Ok(target.delete(key));
+            return target_delete_property(ncx, &target, key, key_value);
         }
     };
 
     // Validate invariants (ES §9.5.10 step 11-12)
     if result {
-        validate_delete_trap_invariants(&target, key)?;
+        validate_delete_trap_invariants(ncx, &target, key, key_value)?;
     }
 
     Ok(result)
@@ -331,11 +544,12 @@ pub fn proxy_delete_property(
 
 /// Validate invariants for the `deleteProperty` trap (ES §9.5.10)
 fn validate_delete_trap_invariants(
-    target: &GcRef<JsObject>,
+    ncx: &mut NativeContext,
+    target: &Value,
     key: &PropertyKey,
+    key_value: Value,
 ) -> VmResult<()> {
-    // Get target's own property descriptor
-    let target_desc = target.get_own_property_descriptor(key);
+    let target_desc = target_get_own_property_descriptor(ncx, target, key, key_value)?;
 
     if let Some(desc) = target_desc {
         // If property is non-configurable, trap cannot return true
@@ -353,26 +567,21 @@ fn validate_delete_trap_invariants(
 ///
 /// Implements the `ownKeys` trap with proper invariant validation.
 pub fn proxy_own_keys(
-    interpreter: &Interpreter,
-    ctx: &mut VmContext,
+    ncx: &mut NativeContext,
     proxy: &Arc<JsProxy>,
 ) -> VmResult<Vec<PropertyKey>> {
     // Get target
-    let target = proxy
-        .target()
-        .ok_or_else(|| VmError::type_error("Proxy target is not available"))?;
+    let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.ownKeys(target)
-    let trap_args = &[Value::object(target.clone())];
-    let trap_result = invoke_trap(interpreter, ctx, proxy, "ownKeys", trap_args)?;
+    let trap_args = &[target.clone()];
+    let trap_result = invoke_trap(ncx, proxy, "ownKeys", trap_args)?;
 
     // If no trap, perform default [[OwnPropertyKeys]] on target
     let keys_array = match trap_result {
         Some(r) => r,
         None => {
-            // Default behavior: get own property keys from target
-            let keys = target.own_keys();
-            return Ok(keys);
+            return target_own_keys(ncx, &target);
         }
     };
 
@@ -406,22 +615,27 @@ pub fn proxy_own_keys(
     }
 
     // Validate invariants (ES §9.5.11 step 10-23)
-    validate_own_keys_trap_invariants(&target, &trap_keys)?;
+    validate_own_keys_trap_invariants(ncx, &target, &trap_keys)?;
 
     Ok(trap_keys)
 }
 
 /// Validate invariants for the `ownKeys` trap (ES §9.5.11)
 fn validate_own_keys_trap_invariants(
-    target: &GcRef<JsObject>,
+    ncx: &mut NativeContext,
+    target: &Value,
     trap_keys: &[PropertyKey],
 ) -> VmResult<()> {
-    // Get target's own keys
-    let target_keys = target.own_keys();
+    let target_keys = target_own_keys(ncx, target)?;
 
     // Check that all non-configurable keys are present
     for target_key in &target_keys {
-        if let Some(desc) = target.get_own_property_descriptor(target_key) {
+        if let Some(desc) = target_get_own_property_descriptor(
+            ncx,
+            target,
+            target_key,
+            property_key_to_value(target_key),
+        )? {
             if !desc.is_configurable() {
                 // Non-configurable property must be in trap result
                 if !trap_keys.contains(target_key) {
@@ -434,7 +648,7 @@ fn validate_own_keys_trap_invariants(
     }
 
     // If target is non-extensible, trap result must contain exactly target's keys
-    if !target.is_extensible() {
+    if !target_is_extensible(ncx, target)? {
         // All target keys must be in trap result
         for target_key in &target_keys {
             if !trap_keys.contains(target_key) {
@@ -461,34 +675,32 @@ fn validate_own_keys_trap_invariants(
 ///
 /// Implements the `getOwnPropertyDescriptor` trap with proper invariant validation.
 pub fn proxy_get_own_property_descriptor(
-    interpreter: &Interpreter,
-    ctx: &mut VmContext,
+    ncx: &mut NativeContext,
     proxy: &Arc<JsProxy>,
     key: &PropertyKey,
     key_value: Value,
 ) -> VmResult<Option<PropertyDescriptor>> {
     // Get target
-    let target = proxy
-        .target()
-        .ok_or_else(|| VmError::type_error("Proxy target is not available"))?;
+    let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.getOwnPropertyDescriptor(target, key)
-    let trap_args = &[Value::object(target.clone()), key_value];
-    let trap_result = invoke_trap(interpreter, ctx, proxy, "getOwnPropertyDescriptor", trap_args)?;
+    let trap_args = &[target.clone(), key_value.clone()];
+    let trap_result = invoke_trap(ncx, proxy, "getOwnPropertyDescriptor", trap_args)?;
 
     // If no trap, perform default [[GetOwnProperty]] on target
     let result_value = match trap_result {
         Some(r) => r,
         None => {
-            // Default behavior: get own property descriptor from target
-            return Ok(target.get_own_property_descriptor(key));
+            return target_get_own_property_descriptor(ncx, &target, key, key_value);
         }
     };
 
     // Trap result must be undefined or an object
     if result_value.is_undefined() {
         // Validate: if target property is non-configurable, trap cannot return undefined
-        if let Some(target_desc) = target.get_own_property_descriptor(key) {
+        if let Some(target_desc) =
+            target_get_own_property_descriptor(ncx, &target, key, key_value.clone())?
+        {
             if !target_desc.is_configurable() {
                 return Err(VmError::type_error(
                     "Proxy 'getOwnPropertyDescriptor' trap cannot return undefined for non-configurable property",
@@ -497,7 +709,9 @@ pub fn proxy_get_own_property_descriptor(
         }
 
         // If target is non-extensible and property exists, trap cannot return undefined
-        if !target.is_extensible() && target.has_own(key) {
+        if !target_is_extensible(ncx, &target)?
+            && target_has_own(ncx, &target, key, key_value)?
+        {
             return Err(VmError::type_error(
                 "Proxy 'getOwnPropertyDescriptor' trap cannot return undefined for property of non-extensible target",
             ));
@@ -514,18 +728,20 @@ pub fn proxy_get_own_property_descriptor(
     let trap_desc = descriptor_from_object(&desc_obj)?;
 
     // Validate invariants (ES §9.5.5 step 19-21)
-    validate_get_own_property_descriptor_invariants(&target, key, &trap_desc)?;
+    validate_get_own_property_descriptor_invariants(ncx, &target, key, key_value, &trap_desc)?;
 
     Ok(Some(trap_desc))
 }
 
 /// Validate invariants for `getOwnPropertyDescriptor` trap (ES §9.5.5)
 fn validate_get_own_property_descriptor_invariants(
-    target: &GcRef<JsObject>,
+    ncx: &mut NativeContext,
+    target: &Value,
     key: &PropertyKey,
+    key_value: Value,
     trap_desc: &PropertyDescriptor,
 ) -> VmResult<()> {
-    let target_desc = target.get_own_property_descriptor(key);
+    let target_desc = target_get_own_property_descriptor(ncx, target, key, key_value.clone())?;
 
     if let Some(target_desc) = target_desc {
         // If target property is non-configurable, trap result must match
@@ -556,7 +772,7 @@ fn validate_get_own_property_descriptor_invariants(
     } else {
         // Property doesn't exist on target
         // If target is non-extensible, trap cannot report a new property
-        if !target.is_extensible() && !trap_desc.is_configurable() {
+        if !target_is_extensible(ncx, target)? && !trap_desc.is_configurable() {
             return Err(VmError::type_error(
                 "Proxy 'getOwnPropertyDescriptor' trap cannot report non-configurable property on non-extensible target",
             ));
@@ -570,38 +786,33 @@ fn validate_get_own_property_descriptor_invariants(
 ///
 /// Implements the `defineProperty` trap with proper invariant validation.
 pub fn proxy_define_property(
-    interpreter: &Interpreter,
-    ctx: &mut VmContext,
+    ncx: &mut NativeContext,
     proxy: &Arc<JsProxy>,
     key: &PropertyKey,
     key_value: Value,
     desc: &PropertyDescriptor,
 ) -> VmResult<bool> {
     // Get target
-    let target = proxy
-        .target()
-        .ok_or_else(|| VmError::type_error("Proxy target is not available"))?;
+    let target = proxy_target_value(proxy)?;
 
     // Convert descriptor to object for trap call
-    let desc_obj = descriptor_to_object(desc, ctx);
+    let desc_obj = descriptor_to_object(desc, ncx);
 
     // Invoke trap: handler.defineProperty(target, key, descriptor)
-    let trap_args = &[Value::object(target.clone()), key_value, desc_obj];
-    let trap_result = invoke_trap(interpreter, ctx, proxy, "defineProperty", trap_args)?;
+    let trap_args = &[target.clone(), key_value.clone(), desc_obj];
+    let trap_result = invoke_trap(ncx, proxy, "defineProperty", trap_args)?;
 
     // If no trap, perform default [[DefineOwnProperty]] on target
     let success = match trap_result {
         Some(r) => r.to_boolean(),
         None => {
-            // Default behavior: define property on target
-            target.define_property(*key, desc.clone());
-            return Ok(true);
+            return target_define_property(ncx, &target, key, key_value, desc);
         }
     };
 
     // Validate invariants (ES §9.5.6 step 17-20)
     if success {
-        validate_define_property_invariants(&target, key, desc)?;
+        validate_define_property_invariants(ncx, &target, key, key_value, desc)?;
     }
 
     Ok(success)
@@ -609,14 +820,16 @@ pub fn proxy_define_property(
 
 /// Validate invariants for `defineProperty` trap (ES §9.5.6)
 fn validate_define_property_invariants(
-    target: &GcRef<JsObject>,
+    ncx: &mut NativeContext,
+    target: &Value,
     key: &PropertyKey,
+    key_value: Value,
     desc: &PropertyDescriptor,
 ) -> VmResult<()> {
-    let target_desc = target.get_own_property_descriptor(key);
+    let target_desc = target_get_own_property_descriptor(ncx, target, key, key_value)?;
 
     // If target is non-extensible, cannot add new properties
-    if !target.is_extensible() && target_desc.is_none() {
+    if !target_is_extensible(ncx, target)? && target_desc.is_none() {
         return Err(VmError::type_error(
             "Cannot define property on non-extensible target via proxy",
         ));
@@ -635,8 +848,8 @@ fn validate_define_property_invariants(
 }
 
 /// Convert a PropertyDescriptor to a descriptor object Value
-fn descriptor_to_object(desc: &PropertyDescriptor, ctx: &VmContext) -> Value {
-    let obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+fn descriptor_to_object(desc: &PropertyDescriptor, ncx: &NativeContext) -> Value {
+    let obj = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
 
     match desc {
         PropertyDescriptor::Data { value, attributes } => {
@@ -727,25 +940,21 @@ fn descriptor_from_object(obj: &GcRef<JsObject>) -> VmResult<PropertyDescriptor>
 ///
 /// Implements the `getPrototypeOf` trap with proper invariant validation.
 pub fn proxy_get_prototype_of(
-    interpreter: &Interpreter,
-    ctx: &mut VmContext,
+    ncx: &mut NativeContext,
     proxy: &Arc<JsProxy>,
 ) -> VmResult<Option<GcRef<JsObject>>> {
     // Get target
-    let target = proxy
-        .target()
-        .ok_or_else(|| VmError::type_error("Proxy target is not available"))?;
+    let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.getPrototypeOf(target)
-    let trap_args = &[Value::object(target.clone())];
-    let trap_result = invoke_trap(interpreter, ctx, proxy, "getPrototypeOf", trap_args)?;
+    let trap_args = &[target.clone()];
+    let trap_result = invoke_trap(ncx, proxy, "getPrototypeOf", trap_args)?;
 
     // If no trap, perform default [[GetPrototypeOf]] on target
     let proto_value = match trap_result {
         Some(r) => r,
         None => {
-            // Default behavior: get prototype from target
-            return Ok(target.prototype());
+            return target_get_prototype_of(ncx, &target);
         }
     };
 
@@ -761,19 +970,19 @@ pub fn proxy_get_prototype_of(
     };
 
     // Validate invariants (ES §9.5.1 step 8)
-    validate_get_prototype_of_invariants(&target, &trap_proto)?;
+    validate_get_prototype_of_invariants(ncx, &target, &trap_proto)?;
 
     Ok(trap_proto)
 }
 
 /// Validate invariants for `getPrototypeOf` trap (ES §9.5.1)
 fn validate_get_prototype_of_invariants(
-    target: &GcRef<JsObject>,
+    ncx: &mut NativeContext,
+    target: &Value,
     trap_proto: &Option<GcRef<JsObject>>,
 ) -> VmResult<()> {
-    // If target is non-extensible, trap result must match target's prototype
-    if !target.is_extensible() {
-        let target_proto = target.prototype();
+    if !target_is_extensible(ncx, target)? {
+        let target_proto = target_get_prototype_of(ncx, target)?;
 
         // Both must be None or both must be Some with same reference
         let proto_matches = match (trap_proto, &target_proto) {
@@ -796,15 +1005,12 @@ fn validate_get_prototype_of_invariants(
 ///
 /// Implements the `setPrototypeOf` trap with proper invariant validation.
 pub fn proxy_set_prototype_of(
-    interpreter: &Interpreter,
-    ctx: &mut VmContext,
+    ncx: &mut NativeContext,
     proxy: &Arc<JsProxy>,
     proto: Option<GcRef<JsObject>>,
 ) -> VmResult<bool> {
     // Get target
-    let target = proxy
-        .target()
-        .ok_or_else(|| VmError::type_error("Proxy target is not available"))?;
+    let target = proxy_target_value(proxy)?;
 
     // Convert prototype to Value
     let proto_value = match &proto {
@@ -813,22 +1019,20 @@ pub fn proxy_set_prototype_of(
     };
 
     // Invoke trap: handler.setPrototypeOf(target, proto)
-    let trap_args = &[Value::object(target.clone()), proto_value];
-    let trap_result = invoke_trap(interpreter, ctx, proxy, "setPrototypeOf", trap_args)?;
+    let trap_args = &[target.clone(), proto_value];
+    let trap_result = invoke_trap(ncx, proxy, "setPrototypeOf", trap_args)?;
 
     // If no trap, perform default [[SetPrototypeOf]] on target
     let success = match trap_result {
         Some(r) => r.to_boolean(),
         None => {
-            // Default behavior: set prototype on target
-            target.set_prototype(proto.clone());
-            return Ok(true);
+            return target_set_prototype_of(ncx, &target, proto);
         }
     };
 
     // Validate invariants (ES §9.5.2 step 8)
     if success {
-        validate_set_prototype_of_invariants(&target, &proto)?;
+        validate_set_prototype_of_invariants(ncx, &target, &proto)?;
     }
 
     Ok(success)
@@ -836,12 +1040,12 @@ pub fn proxy_set_prototype_of(
 
 /// Validate invariants for `setPrototypeOf` trap (ES §9.5.2)
 fn validate_set_prototype_of_invariants(
-    target: &GcRef<JsObject>,
+    ncx: &mut NativeContext,
+    target: &Value,
     proto: &Option<GcRef<JsObject>>,
 ) -> VmResult<()> {
-    // If target is non-extensible, cannot change prototype
-    if !target.is_extensible() {
-        let target_proto = target.prototype();
+    if !target_is_extensible(ncx, target)? {
+        let target_proto = target_get_prototype_of(ncx, target)?;
 
         // Prototype must match target's current prototype
         let proto_matches = match (proto, &target_proto) {
@@ -864,30 +1068,26 @@ fn validate_set_prototype_of_invariants(
 ///
 /// Implements the `isExtensible` trap with proper invariant validation.
 pub fn proxy_is_extensible(
-    interpreter: &Interpreter,
-    ctx: &mut VmContext,
+    ncx: &mut NativeContext,
     proxy: &Arc<JsProxy>,
 ) -> VmResult<bool> {
     // Get target
-    let target = proxy
-        .target()
-        .ok_or_else(|| VmError::type_error("Proxy target is not available"))?;
+    let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.isExtensible(target)
-    let trap_args = &[Value::object(target.clone())];
-    let trap_result = invoke_trap(interpreter, ctx, proxy, "isExtensible", trap_args)?;
+    let trap_args = &[target.clone()];
+    let trap_result = invoke_trap(ncx, proxy, "isExtensible", trap_args)?;
 
     // If no trap, perform default [[IsExtensible]] on target
     let trap_extensible = match trap_result {
         Some(r) => r.to_boolean(),
         None => {
-            // Default behavior: check if target is extensible
-            return Ok(target.is_extensible());
+            return target_is_extensible(ncx, &target);
         }
     };
 
     // Validate invariants (ES §9.5.3 step 7)
-    let target_extensible = target.is_extensible();
+    let target_extensible = target_is_extensible(ncx, &target)?;
     if trap_extensible != target_extensible {
         return Err(VmError::type_error(
             "Proxy 'isExtensible' trap result must match target's extensibility",
@@ -901,31 +1101,26 @@ pub fn proxy_is_extensible(
 ///
 /// Implements the `preventExtensions` trap with proper invariant validation.
 pub fn proxy_prevent_extensions(
-    interpreter: &Interpreter,
-    ctx: &mut VmContext,
+    ncx: &mut NativeContext,
     proxy: &Arc<JsProxy>,
 ) -> VmResult<bool> {
     // Get target
-    let target = proxy
-        .target()
-        .ok_or_else(|| VmError::type_error("Proxy target is not available"))?;
+    let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.preventExtensions(target)
-    let trap_args = &[Value::object(target.clone())];
-    let trap_result = invoke_trap(interpreter, ctx, proxy, "preventExtensions", trap_args)?;
+    let trap_args = &[target.clone()];
+    let trap_result = invoke_trap(ncx, proxy, "preventExtensions", trap_args)?;
 
     // If no trap, perform default [[PreventExtensions]] on target
     let success = match trap_result {
         Some(r) => r.to_boolean(),
         None => {
-            // Default behavior: prevent extensions on target
-            target.prevent_extensions();
-            return Ok(true);
+            return target_prevent_extensions(ncx, &target);
         }
     };
 
     // Validate invariants (ES §9.5.4 step 7)
-    if success && target.is_extensible() {
+    if success && target_is_extensible(ncx, &target)? {
         return Err(VmError::type_error(
             "Proxy 'preventExtensions' trap returned true but target is still extensible",
         ));
@@ -938,41 +1133,33 @@ pub fn proxy_prevent_extensions(
 ///
 /// Implements the `apply` trap for function calls.
 pub fn proxy_apply(
-    interpreter: &Interpreter,
-    ctx: &mut VmContext,
+    ncx: &mut NativeContext,
     proxy: &Arc<JsProxy>,
     this_value: Value,
     args: &[Value],
 ) -> VmResult<Value> {
     // Get target
-    let target = proxy
-        .target()
-        .ok_or_else(|| VmError::type_error("Proxy target is not available"))?;
+    let target = proxy_target_value(proxy)?;
 
     // Note: ES spec requires target to be callable, but we let the trap handle it
     // The trap can validate and throw if needed
 
     // Create arguments array for trap
-    let args_array = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
-    for (i, arg) in args.iter().enumerate() {
-        args_array.set(PropertyKey::Index(i as u32), arg.clone());
-    }
-    args_array.set(PropertyKey::from("length"), Value::int32(args.len() as i32));
+    let args_array = create_args_array(ncx, args);
 
     // Invoke trap: handler.apply(target, thisValue, args)
-    let trap_args = &[
-        Value::object(target.clone()),
-        this_value.clone(),
-        Value::object(args_array),
-    ];
-    let trap_result = invoke_trap(interpreter, ctx, proxy, "apply", trap_args)?;
+    let trap_args = &[target.clone(), this_value.clone(), Value::object(args_array)];
+    let trap_result = invoke_trap(ncx, proxy, "apply", trap_args)?;
 
     // If no trap, perform default [[Call]] on target
     match trap_result {
         Some(result) => Ok(result),
         None => {
             // Default behavior: call target function
-            interpreter.call_function(ctx, &Value::object(target), this_value, args)
+            if let Some(proxy) = target.as_proxy() {
+                return proxy_apply(ncx, proxy, this_value, args);
+            }
+            ncx.call_function(&target, this_value, args)
         }
     }
 }
@@ -981,34 +1168,23 @@ pub fn proxy_apply(
 ///
 /// Implements the `construct` trap for constructor calls.
 pub fn proxy_construct(
-    interpreter: &Interpreter,
-    ctx: &mut VmContext,
+    ncx: &mut NativeContext,
     proxy: &Arc<JsProxy>,
     args: &[Value],
     new_target: Value,
 ) -> VmResult<Value> {
     // Get target
-    let target = proxy
-        .target()
-        .ok_or_else(|| VmError::type_error("Proxy target is not available"))?;
+    let target = proxy_target_value(proxy)?;
 
     // Note: ES spec requires target to be a constructor, but we let the trap handle it
     // The trap can validate and throw if needed
 
     // Create arguments array for trap
-    let args_array = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
-    for (i, arg) in args.iter().enumerate() {
-        args_array.set(PropertyKey::Index(i as u32), arg.clone());
-    }
-    args_array.set(PropertyKey::from("length"), Value::int32(args.len() as i32));
+    let args_array = create_args_array(ncx, args);
 
     // Invoke trap: handler.construct(target, args, newTarget)
-    let trap_args = &[
-        Value::object(target.clone()),
-        Value::object(args_array),
-        new_target.clone(),
-    ];
-    let trap_result = invoke_trap(interpreter, ctx, proxy, "construct", trap_args)?;
+    let trap_args = &[target.clone(), Value::object(args_array), new_target.clone()];
+    let trap_result = invoke_trap(ncx, proxy, "construct", trap_args)?;
 
     // If no trap, perform default [[Construct]] on target
     let result = match trap_result {

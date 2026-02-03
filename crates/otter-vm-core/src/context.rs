@@ -31,12 +31,24 @@ pub struct NativeContext<'a> {
     pub ctx: &'a mut VmContext,
     /// Reference to the interpreter for executing closures
     interpreter: &'a crate::interpreter::Interpreter,
+    /// Whether this native function is being called as a constructor (via `new`).
+    is_construct: bool,
 }
 
 impl<'a> NativeContext<'a> {
-    /// Create a new `NativeContext`.
+    /// Create a new `NativeContext` for a regular function call.
     pub fn new(ctx: &'a mut VmContext, interpreter: &'a crate::interpreter::Interpreter) -> Self {
-        Self { ctx, interpreter }
+        Self { ctx, interpreter, is_construct: false }
+    }
+
+    /// Create a new `NativeContext` for a constructor call (via `new`).
+    pub fn new_construct(ctx: &'a mut VmContext, interpreter: &'a crate::interpreter::Interpreter) -> Self {
+        Self { ctx, interpreter, is_construct: true }
+    }
+
+    /// Returns true if this function is being called as a constructor (via `new`).
+    pub fn is_construct(&self) -> bool {
+        self.is_construct
     }
 
     /// Call a JavaScript function (closure or native) with full VM context.
@@ -49,7 +61,52 @@ impl<'a> NativeContext<'a> {
         this_value: crate::value::Value,
         args: &[crate::value::Value],
     ) -> crate::error::VmResult<crate::value::Value> {
-        self.interpreter.call_function(self.ctx, func, this_value, args)
+        let mut current_func = func.clone();
+        let mut current_this = this_value;
+        let mut current_args: Vec<crate::value::Value> = args.to_vec();
+
+        // Unwrap bound functions (stored as objects)
+        while let Some(obj) = current_func.as_object() {
+            if let Some(bound_fn) = obj.get(&crate::object::PropertyKey::string("__boundFunction__")) {
+                let raw_this_arg = obj
+                    .get(&crate::object::PropertyKey::string("__boundThis__"))
+                    .unwrap_or_else(crate::value::Value::undefined);
+                if raw_this_arg.is_null() || raw_this_arg.is_undefined() {
+                    current_this = crate::value::Value::object(self.ctx.global());
+                } else {
+                    current_this = raw_this_arg;
+                }
+
+                if let Some(bound_args_val) = obj.get(&crate::object::PropertyKey::string("__boundArgs__")) {
+                    if let Some(args_obj) = bound_args_val.as_object() {
+                        let len = args_obj
+                            .get(&crate::object::PropertyKey::string("length"))
+                            .and_then(|v| v.as_int32())
+                            .unwrap_or(0) as usize;
+                        let mut new_args = Vec::with_capacity(len + current_args.len());
+                        for i in 0..len {
+                            new_args.push(
+                                args_obj
+                                    .get(&crate::object::PropertyKey::Index(i as u32))
+                                    .unwrap_or_else(crate::value::Value::undefined),
+                            );
+                        }
+                        new_args.extend(current_args);
+                        current_args = new_args;
+                    }
+                }
+                current_func = bound_fn;
+            } else {
+                break;
+            }
+        }
+
+        if let Some(proxy) = current_func.as_proxy() {
+            return crate::proxy_operations::proxy_apply(self, proxy, current_this, &current_args);
+        }
+
+        self.interpreter
+            .call_function(self.ctx, &current_func, current_this, &current_args)
     }
 
     /// Access the memory manager.

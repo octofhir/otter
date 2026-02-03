@@ -276,6 +276,9 @@ impl Test262Runner {
         mode: ExecutionMode,
         timeout: Option<Duration>,
     ) -> (TestOutcome, Option<String>) {
+        // Ensure a clean realm per mode to avoid cross-mode contamination.
+        self.rebuild_engine();
+
         let relative_path = path.strip_prefix(&self.test_dir).unwrap_or(path);
         let test_name = format!("{} ({})", relative_path.to_string_lossy(), mode);
 

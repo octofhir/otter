@@ -501,38 +501,37 @@ pub fn init_map_prototype(
         )),
     );
 
-    // Map.prototype.forEach(callback) — returns entries for JS-side iteration
+    // Map.prototype.forEach(callback [, thisArg])
     map_proto.define_property(
         PropertyKey::string("forEach"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, ncx| {
+            |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.forEach called on incompatible receiver"))?;
                 if !is_map(&obj) {
                     return Err(crate::error::VmError::type_error("Method Map.prototype.forEach called on incompatible receiver"));
                 }
-                // Return entries array for JS-side iteration (same pattern as builtins)
+                let callback = args.first().cloned().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+
+                if !callback.is_callable() {
+                    return Err(crate::error::VmError::type_error("Map.prototype.forEach: callback is not a function"));
+                }
+
                 let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
-                let entries_array = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
                 let props = entries.own_keys();
-                let mut index = 0i32;
                 for prop in props {
                     if let Some(entry) = entries.get(&prop) {
                         if let Some(entry_obj) = entry.as_object() {
                             let key = entry_obj.get(&pk("k")).unwrap_or(Value::undefined());
                             let value = entry_obj.get(&pk("v")).unwrap_or(Value::undefined());
-                            let pair = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
-                            pair.set(pk("0"), key);
-                            pair.set(pk("1"), value);
-                            pair.set(pk("length"), Value::int32(2));
-                            entries_array.set(pk(&index.to_string()), Value::array(pair));
-                            index += 1;
+                            // Call callback(value, key, map)
+                            ncx.call_function(&callback, this_arg.clone(), &[value, key, this_val.clone()])?;
                         }
                     }
                 }
-                entries_array.set(pk("length"), Value::int32(index));
-                Ok(Value::array(entries_array))
+                Ok(Value::undefined())
             },
             mm.clone(),
             fn_proto,
@@ -888,29 +887,33 @@ pub fn init_set_prototype(
         )),
     );
 
-    // Set.prototype.forEach(callback) — returns values for JS-side iteration
+    // Set.prototype.forEach(callback [, thisArg])
     set_proto.define_property(
         PropertyKey::string("forEach"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, ncx| {
+            |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.forEach called on incompatible receiver"))?;
                 if !is_set(&obj) {
                     return Err(crate::error::VmError::type_error("Method Set.prototype.forEach called on incompatible receiver"));
                 }
+                let callback = args.first().cloned().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+
+                if !callback.is_callable() {
+                    return Err(crate::error::VmError::type_error("Set.prototype.forEach: callback is not a function"));
+                }
+
                 let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
-                let values_array = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
                 let props = values.own_keys();
-                let mut index = 0i32;
                 for prop in props {
                     if let Some(value) = values.get(&prop) {
-                        values_array.set(pk(&index.to_string()), value);
-                        index += 1;
+                        // Call callback(value, value, set) - Set passes value as both args
+                        ncx.call_function(&callback, this_arg.clone(), &[value.clone(), value, this_val.clone()])?;
                     }
                 }
-                values_array.set(pk("length"), Value::int32(index));
-                Ok(Value::array(values_array))
+                Ok(Value::undefined())
             },
             mm.clone(),
             fn_proto,

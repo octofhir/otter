@@ -836,8 +836,8 @@ impl Trace for otter_vm_bytecode::function::Function {
 // Implement Trace for JsProxy
 impl Trace for crate::proxy::JsProxy {
     fn trace(&self, tracer: &mut dyn Tracer) {
-        tracer.mark(self.target.as_ref());
-        tracer.mark(self.handler.as_ref());
+        tracer.mark_value(&self.target);
+        tracer.mark_value(&self.handler);
     }
 }
 

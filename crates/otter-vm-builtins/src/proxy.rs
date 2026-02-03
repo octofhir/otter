@@ -40,14 +40,16 @@ fn native_proxy_create(
     let handler = args.get(1).ok_or("Proxy requires a handler argument")?;
 
     // Validate target is an object (not null/undefined/primitive)
-    let target_obj = target.as_object().ok_or("Proxy target must be an object")?;
+    if !target.is_object() {
+        return Err(VmError::type_error("Proxy target must be an object"));
+    }
 
     // Validate handler is an object (not null/undefined/primitive)
-    let handler_obj = handler
-        .as_object()
-        .ok_or("Proxy handler must be an object")?;
+    if !handler.is_object() {
+        return Err(VmError::type_error("Proxy handler must be an object"));
+    }
 
-    let proxy = JsProxy::new(target_obj, handler_obj);
+    let proxy = JsProxy::new(target.clone(), handler.clone());
     Ok(VmValue::proxy(proxy))
 }
 
@@ -65,13 +67,14 @@ fn native_proxy_revocable(
         .get(1)
         .ok_or("Proxy.revocable requires a handler argument")?;
 
-    let target_obj = target.as_object().ok_or("Proxy target must be an object")?;
+    if !target.is_object() {
+        return Err(VmError::type_error("Proxy target must be an object"));
+    }
+    if !handler.is_object() {
+        return Err(VmError::type_error("Proxy handler must be an object"));
+    }
 
-    let handler_obj = handler
-        .as_object()
-        .ok_or("Proxy handler must be an object")?;
-
-    let revocable = JsProxy::revocable(target_obj, handler_obj);
+    let revocable = JsProxy::revocable(target.clone(), handler.clone());
 
     let result = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
     result.set("proxy".into(), VmValue::proxy(revocable.proxy));
@@ -104,7 +107,7 @@ fn native_proxy_get_target(
     let proxy = proxy_val.as_proxy().ok_or("Argument must be a proxy")?;
 
     match proxy.target() {
-        Some(target) => Ok(VmValue::object(target)),
+        Some(target) => Ok(target),
         None => Err(VmError::type_error("Cannot perform operation on a revoked proxy")),
     }
 }
@@ -121,7 +124,7 @@ fn native_proxy_get_handler(
     let proxy = proxy_val.as_proxy().ok_or("Argument must be a proxy")?;
 
     match proxy.handler() {
-        Some(handler) => Ok(VmValue::object(handler)),
+        Some(handler) => Ok(handler),
         None => Err(VmError::type_error("Cannot perform operation on a revoked proxy")),
     }
 }

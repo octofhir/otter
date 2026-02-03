@@ -58,6 +58,9 @@ impl Interpreter {
         // Record the function call for hot function detection
         let _ = entry_func.record_call();
 
+        // Top-level scripts should have globalThis as `this`.
+        ctx.set_pending_this(Value::object(ctx.global()));
+
         // Push initial frame with module reference
         ctx.push_frame(
             module.entry_point,
@@ -100,6 +103,9 @@ impl Interpreter {
 
         // Record the function call for hot function detection
         let _ = entry_func.record_call();
+
+        // Top-level scripts should have globalThis as `this`.
+        ctx.set_pending_this(Value::object(ctx.global()));
 
         // Push initial frame with module reference
         if let Err(e) = ctx.push_frame(
@@ -228,18 +234,36 @@ impl Interpreter {
                     ctx.jump(offset);
                 }
                 Ok(InstructionResult::Return(value)) => {
+                    let (return_reg, is_construct, construct_this, is_async) = {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        (
+                            frame.return_register,
+                            frame.is_construct,
+                            frame.this_value.clone(),
+                            frame.is_async,
+                        )
+                    };
+                    let value = if is_construct && !value.is_object() {
+                        construct_this
+                    } else if is_async {
+                        self.create_js_promise(ctx, JsPromise::resolved(value))
+                    } else {
+                        value
+                    };
                     // Check if we've returned to the original depth
                     if ctx.stack_depth() <= prev_stack_depth + 1 {
                         ctx.pop_frame();
                         break value;
                     }
                     // Handle return from nested call
-                    let return_reg = ctx
-                        .current_frame()
-                        .and_then(|f| f.return_register)
-                        .unwrap_or(0);
                     ctx.pop_frame();
-                    ctx.set_register(return_reg, value);
+                    if let Some(reg) = return_reg {
+                        ctx.set_register(reg, value);
+                    } else {
+                        ctx.set_register(0, value);
+                    }
                 }
                 Ok(InstructionResult::Call {
                     func_index,
@@ -314,10 +338,7 @@ impl Interpreter {
                 }
                 Ok(InstructionResult::Throw(error)) => {
                     ctx.set_running(was_running);
-                    return Err(VmError::internal(format!(
-                        "Uncaught exception: {}",
-                        self.to_string(&error)
-                    )));
+                    return Err(VmError::exception(error));
                 }
                 Err(e) => {
                     ctx.set_running(was_running);
@@ -2083,13 +2104,10 @@ impl Interpreter {
                         let idx_str = self.to_string(&left);
                         PropertyKey::string(&idx_str)
                     };
-                    let result = crate::proxy_operations::proxy_has(
-                        self,
-                        ctx,
-                        proxy,
-                        &key,
-                        left.clone(),
-                    )?;
+                    let result = {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        crate::proxy_operations::proxy_has(&mut ncx, proxy, &key, left.clone())?
+                    };
                     ctx.set_register(dst.0, Value::boolean(result));
                     return Ok(InstructionResult::Continue);
                 }
@@ -2607,13 +2625,15 @@ impl Interpreter {
 
                 // Check if it's a proxy with apply trap
                 if let Some(proxy) = func_value.as_proxy() {
-                    let result = crate::proxy_operations::proxy_apply(
-                        self,
-                        ctx,
-                        proxy,
-                        Value::undefined(),
-                        &args,
-                    )?;
+                    let result = {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        crate::proxy_operations::proxy_apply(
+                            &mut ncx,
+                            proxy,
+                            Value::undefined(),
+                            &args,
+                        )?
+                    };
                     ctx.set_register(dst.0, result);
                     return Ok(InstructionResult::Continue);
                 }
@@ -2804,13 +2824,15 @@ impl Interpreter {
                         let arg = ctx.get_register(func.0 + 1 + i).clone();
                         args.push(arg);
                     }
-                    let result = crate::proxy_operations::proxy_construct(
-                        self,
-                        ctx,
-                        proxy,
-                        &args,
-                        func_value.clone(), // new.target
-                    )?;
+                    let result = {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        crate::proxy_operations::proxy_construct(
+                            &mut ncx,
+                            proxy,
+                            &args,
+                            func_value.clone(), // new.target
+                        )?
+                    };
                     ctx.set_register(dst.0, result);
                     return Ok(InstructionResult::Continue);
                 }
@@ -2854,6 +2876,7 @@ impl Interpreter {
                     let result = match self.call_native_fn(ctx, native_fn, &new_obj_value, &args) {
                         Ok(v) => v,
                         Err(VmError::Interception(crate::error::InterceptionSignal::PromiseConstructor)) => {
+                            // Handle new Promise(executor)
                             let executor = args.get(0).cloned().unwrap_or(Value::undefined());
                             if !executor.is_callable() {
                                 return Err(VmError::type_error("Promise resolver is not a function"));
@@ -3095,7 +3118,18 @@ impl Interpreter {
                 // Get the method from the receiver.
                 // For primitives/functions, emulate `ToObject` lookup by consulting the corresponding
                 // prototype object (e.g. `String.prototype`) but keep `this` as the primitive.
-                let method_value = if receiver.is_function() || receiver.is_native_function() {
+                let method_value = if let Some(proxy) = receiver.as_proxy() {
+                    let key = Self::utf16_key(method_name);
+                    let key_value = Value::string(JsString::intern_utf16(method_name));
+                    let mut ncx = crate::context::NativeContext::new(ctx, self);
+                    crate::proxy_operations::proxy_get(
+                        &mut ncx,
+                        proxy,
+                        &key,
+                        key_value,
+                        receiver.clone(),
+                    )?
+                } else if receiver.is_function() || receiver.is_native_function() {
                     let function_global = ctx.get_global("Function");
                     let function_obj = function_global
                         .as_ref()
@@ -3743,7 +3777,10 @@ impl Interpreter {
                     let key = Self::utf16_key(name_str);
                     let key_value = Value::string(JsString::intern_utf16(name_str));
                     let receiver = object.clone();
-                    let result = crate::proxy_operations::proxy_get(self, ctx, proxy, &key, key_value, receiver)?;
+                    let result = {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        crate::proxy_operations::proxy_get(&mut ncx, proxy, &key, key_value, receiver)?
+                    };
                     ctx.set_register(dst.0, result);
                     return Ok(InstructionResult::Continue);
                 }
@@ -4053,7 +4090,17 @@ impl Interpreter {
                     let key = Self::utf16_key(name_str);
                     let key_value = Value::string(JsString::intern_utf16(name_str));
                     let receiver = object.clone();
-                    crate::proxy_operations::proxy_set(self, ctx, proxy, &key, key_value, val_val, receiver)?;
+                    {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        crate::proxy_operations::proxy_set(
+                            &mut ncx,
+                            proxy,
+                            &key,
+                            key_value,
+                            val_val,
+                            receiver,
+                        )?;
+                    }
                     return Ok(InstructionResult::Continue);
                 }
 
@@ -4225,13 +4272,15 @@ impl Interpreter {
                         let key_str = self.to_string(&key_value);
                         PropertyKey::string(&key_str)
                     };
-                    let result = crate::proxy_operations::proxy_delete_property(
-                        self,
-                        ctx,
-                        proxy,
-                        &prop_key,
-                        key_value,
-                    )?;
+                    let result = {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        crate::proxy_operations::proxy_delete_property(
+                            &mut ncx,
+                            proxy,
+                            &prop_key,
+                            key_value,
+                        )?
+                    };
                     ctx.set_register(dst.0, Value::boolean(result));
                     return Ok(InstructionResult::Continue);
                 }
@@ -4291,7 +4340,16 @@ impl Interpreter {
                         PropertyKey::string(&key_str)
                     };
                     let receiver = object.clone();
-                    let result = crate::proxy_operations::proxy_get(self, ctx, proxy, &prop_key, key_value.clone(), receiver)?;
+                    let result = {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        crate::proxy_operations::proxy_get(
+                            &mut ncx,
+                            proxy,
+                            &prop_key,
+                            key_value.clone(),
+                            receiver,
+                        )?
+                    };
                     ctx.set_register(dst.0, result);
                     return Ok(InstructionResult::Continue);
                 }
@@ -4619,7 +4677,17 @@ impl Interpreter {
                         PropertyKey::string(&key_str)
                     };
                     let receiver = object.clone();
-                    crate::proxy_operations::proxy_set(self, ctx, proxy, &prop_key, key_value.clone(), val_val, receiver)?;
+                    {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        crate::proxy_operations::proxy_set(
+                            &mut ncx,
+                            proxy,
+                            &prop_key,
+                            key_value.clone(),
+                            val_val,
+                            receiver,
+                        )?;
+                    }
                     return Ok(InstructionResult::Continue);
                 }
 
@@ -5205,6 +5273,25 @@ impl Interpreter {
                     return self.handle_call_value(ctx, &method_value, receiver, args, dst.0);
                 }
 
+                if let Some(proxy) = receiver.as_proxy() {
+                    let prop_key = self.value_to_property_key(&key_value);
+                    let method_value = {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        crate::proxy_operations::proxy_get(
+                            &mut ncx,
+                            proxy,
+                            &prop_key,
+                            key_value.clone(),
+                            receiver.clone(),
+                        )?
+                    };
+                    let mut args = Vec::with_capacity(*argc as usize);
+                    for i in 0..(*argc as u16) {
+                        args.push(ctx.get_register(obj.0 + 2 + i).clone());
+                    }
+                    return self.handle_call_value(ctx, &method_value, receiver, args, dst.0);
+                }
+
                 // Special handling for generator methods
                 if receiver.is_generator() {
                     let method_str = self.to_string(&key_value);
@@ -5449,6 +5536,21 @@ impl Interpreter {
                     );
                 }
 
+                if let Some(proxy) = receiver.as_proxy() {
+                    let prop_key = self.value_to_property_key(&key_value);
+                    let method_value = {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        crate::proxy_operations::proxy_get(
+                            &mut ncx,
+                            proxy,
+                            &prop_key,
+                            key_value.clone(),
+                            receiver.clone(),
+                        )?
+                    };
+                    return self.dispatch_method_spread(ctx, &method_value, receiver, &spread_arr, dst.0);
+                }
+
                 let key = self.value_to_property_key(&key_value);
                 let method_value = if let Some(obj_ref) = receiver.as_object() {
                     obj_ref.get(&key).unwrap_or_else(Value::undefined)
@@ -5542,11 +5644,27 @@ impl Interpreter {
 
                 // Get Symbol.iterator method using well-known symbol ID (1)
                 const SYMBOL_ITERATOR_ID: u64 = 1;
-                let iterator_method = match obj.heap_ref() {
-                    Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
-                        o.get(&PropertyKey::Symbol(SYMBOL_ITERATOR_ID))
+                let iterator_method = if let Some(proxy) = obj.as_proxy() {
+                    let key = PropertyKey::Symbol(SYMBOL_ITERATOR_ID);
+                    let key_value = Value::symbol(Arc::new(crate::value::Symbol {
+                        description: None,
+                        id: SYMBOL_ITERATOR_ID,
+                    }));
+                    let mut ncx = crate::context::NativeContext::new(ctx, self);
+                    Some(crate::proxy_operations::proxy_get(
+                        &mut ncx,
+                        proxy,
+                        &key,
+                        key_value,
+                        obj.clone(),
+                    )?)
+                } else {
+                    match obj.heap_ref() {
+                        Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
+                            o.get(&PropertyKey::Symbol(SYMBOL_ITERATOR_ID))
+                        }
+                        _ => None,
                     }
-                    _ => None,
                 };
 
                 let iterator_fn =
@@ -5585,21 +5703,53 @@ impl Interpreter {
                 const SYMBOL_ASYNC_ITERATOR_ID: u64 = 2;
                 const SYMBOL_ITERATOR_ID: u64 = 1;
 
-                let mut iterator_method = match obj.heap_ref() {
-                    Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
-                        o.get(&PropertyKey::Symbol(SYMBOL_ASYNC_ITERATOR_ID))
+                let mut iterator_method = if let Some(proxy) = obj.as_proxy() {
+                    let key = PropertyKey::Symbol(SYMBOL_ASYNC_ITERATOR_ID);
+                    let key_value = Value::symbol(Arc::new(crate::value::Symbol {
+                        description: None,
+                        id: SYMBOL_ASYNC_ITERATOR_ID,
+                    }));
+                    let mut ncx = crate::context::NativeContext::new(ctx, self);
+                    Some(crate::proxy_operations::proxy_get(
+                        &mut ncx,
+                        proxy,
+                        &key,
+                        key_value,
+                        obj.clone(),
+                    )?)
+                } else {
+                    match obj.heap_ref() {
+                        Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
+                            o.get(&PropertyKey::Symbol(SYMBOL_ASYNC_ITERATOR_ID))
+                        }
+                        _ => None,
                     }
-                    _ => None,
                 };
 
                 // 2. Fallback to Symbol.iterator (ID 1)
                 if iterator_method.is_none() {
-                    iterator_method = match obj.heap_ref() {
-                        Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
-                            o.get(&PropertyKey::Symbol(SYMBOL_ITERATOR_ID))
-                        }
-                        _ => None,
-                    };
+                    if let Some(proxy) = obj.as_proxy() {
+                        let key = PropertyKey::Symbol(SYMBOL_ITERATOR_ID);
+                        let key_value = Value::symbol(Arc::new(crate::value::Symbol {
+                            description: None,
+                            id: SYMBOL_ITERATOR_ID,
+                        }));
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        iterator_method = Some(crate::proxy_operations::proxy_get(
+                            &mut ncx,
+                            proxy,
+                            &key,
+                            key_value,
+                            obj.clone(),
+                        )?);
+                    } else {
+                        iterator_method = match obj.heap_ref() {
+                            Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
+                                o.get(&PropertyKey::Symbol(SYMBOL_ITERATOR_ID))
+                            }
+                            _ => None,
+                        };
+                    }
                 }
 
                 let iterator_fn = iterator_method
@@ -6297,6 +6447,24 @@ impl Interpreter {
             native_fn(this_value, args, &mut ncx)
         };
         // ncx dropped here — ctx borrow released
+        ctx.exit_native_call();
+        result
+    }
+
+    /// Call a native function as a constructor (via `new`).
+    /// Sets `NativeContext::is_construct()` to true.
+    fn call_native_fn_construct(
+        &self,
+        ctx: &mut VmContext,
+        native_fn: &crate::value::NativeFn,
+        this_value: &Value,
+        args: &[Value],
+    ) -> VmResult<Value> {
+        ctx.enter_native_call()?;
+        let result = {
+            let mut ncx = crate::context::NativeContext::new_construct(ctx, self);
+            native_fn(this_value, args, &mut ncx)
+        };
         ctx.exit_native_call();
         result
     }
@@ -7066,14 +7234,16 @@ impl Interpreter {
                             };
 
                             // Call proxy_get
-                            let result = crate::proxy_operations::proxy_get(
-                                self,
-                                ctx,
-                                proxy,
-                                &key,
-                                property_key.clone(),
-                                receiver,
-                            )?;
+                            let result = {
+                                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                crate::proxy_operations::proxy_get(
+                                    &mut ncx,
+                                    proxy,
+                                    &key,
+                                    property_key.clone(),
+                                    receiver,
+                                )?
+                            };
 
                             ctx.set_register(return_reg, result);
                             return Ok(InstructionResult::Continue);
@@ -7115,15 +7285,17 @@ impl Interpreter {
                             };
 
                             // Call proxy_set
-                            let success = crate::proxy_operations::proxy_set(
-                                self,
-                                ctx,
-                                proxy,
-                                &key,
-                                property_key.clone(),
-                                value,
-                                receiver,
-                            )?;
+                            let success = {
+                                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                crate::proxy_operations::proxy_set(
+                                    &mut ncx,
+                                    proxy,
+                                    &key,
+                                    property_key.clone(),
+                                    value,
+                                    receiver,
+                                )?
+                            };
 
                             ctx.set_register(return_reg, Value::boolean(success));
                             return Ok(InstructionResult::Continue);
@@ -7157,13 +7329,15 @@ impl Interpreter {
                             };
 
                             // Call proxy_has
-                            let result = crate::proxy_operations::proxy_has(
-                                self,
-                                ctx,
-                                proxy,
-                                &key,
-                                property_key.clone(),
-                            )?;
+                            let result = {
+                                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                crate::proxy_operations::proxy_has(
+                                    &mut ncx,
+                                    proxy,
+                                    &key,
+                                    property_key.clone(),
+                                )?
+                            };
 
                             ctx.set_register(return_reg, Value::boolean(result));
                             return Ok(InstructionResult::Continue);
@@ -7197,13 +7371,15 @@ impl Interpreter {
                             };
 
                             // Call proxy_delete_property
-                            let result = crate::proxy_operations::proxy_delete_property(
-                                self,
-                                ctx,
-                                proxy,
-                                &key,
-                                property_key.clone(),
-                            )?;
+                            let result = {
+                                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                crate::proxy_operations::proxy_delete_property(
+                                    &mut ncx,
+                                    proxy,
+                                    &key,
+                                    property_key.clone(),
+                                )?
+                            };
 
                             ctx.set_register(return_reg, Value::boolean(result));
                             return Ok(InstructionResult::Continue);
@@ -7223,11 +7399,10 @@ impl Interpreter {
                                 .ok_or_else(|| VmError::type_error("Reflect.ownKeys: target is not a proxy"))?;
 
                             // Call proxy_own_keys
-                            let keys = crate::proxy_operations::proxy_own_keys(
-                                self,
-                                ctx,
-                                proxy,
-                            )?;
+                            let keys = {
+                                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                crate::proxy_operations::proxy_own_keys(&mut ncx, proxy)?
+                            };
 
                             // Convert keys to array
                             let result = GcRef::new(crate::object::JsObject::new(None, ctx.memory_manager().clone()));
@@ -7279,13 +7454,15 @@ impl Interpreter {
                             };
 
                             // Call proxy_get_own_property_descriptor
-                            let result_desc = crate::proxy_operations::proxy_get_own_property_descriptor(
-                                self,
-                                ctx,
-                                proxy,
-                                &key,
-                                property_key.clone(),
-                            )?;
+                            let result_desc = {
+                                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                crate::proxy_operations::proxy_get_own_property_descriptor(
+                                    &mut ncx,
+                                    proxy,
+                                    &key,
+                                    property_key.clone(),
+                                )?
+                            };
 
                             // Convert descriptor to object or undefined
                             let result = if let Some(desc) = result_desc {
@@ -7411,14 +7588,16 @@ impl Interpreter {
                             };
 
                             // Call proxy_define_property
-                            let result = crate::proxy_operations::proxy_define_property(
-                                self,
-                                ctx,
-                                proxy,
-                                &key,
-                                property_key.clone(),
-                                &desc,
-                            )?;
+                            let result = {
+                                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                crate::proxy_operations::proxy_define_property(
+                                    &mut ncx,
+                                    proxy,
+                                    &key,
+                                    property_key.clone(),
+                                    &desc,
+                                )?
+                            };
 
                             ctx.set_register(return_reg, Value::boolean(result));
                             return Ok(InstructionResult::Continue);
@@ -7438,11 +7617,10 @@ impl Interpreter {
                                 .ok_or_else(|| VmError::type_error("Reflect.getPrototypeOf: target is not a proxy"))?;
 
                             // Call proxy_get_prototype_of
-                            let result_proto = crate::proxy_operations::proxy_get_prototype_of(
-                                self,
-                                ctx,
-                                proxy,
-                            )?;
+                            let result_proto = {
+                                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                crate::proxy_operations::proxy_get_prototype_of(&mut ncx, proxy)?
+                            };
 
                             // Convert to Value
                             let result = match result_proto {
@@ -7479,12 +7657,10 @@ impl Interpreter {
                             };
 
                             // Call proxy_set_prototype_of
-                            let result = crate::proxy_operations::proxy_set_prototype_of(
-                                self,
-                                ctx,
-                                proxy,
-                                proto,
-                            )?;
+                            let result = {
+                                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                crate::proxy_operations::proxy_set_prototype_of(&mut ncx, proxy, proto)?
+                            };
 
                             ctx.set_register(return_reg, Value::boolean(result));
                             return Ok(InstructionResult::Continue);
@@ -7504,11 +7680,10 @@ impl Interpreter {
                                 .ok_or_else(|| VmError::type_error("Reflect.isExtensible: target is not a proxy"))?;
 
                             // Call proxy_is_extensible
-                            let result = crate::proxy_operations::proxy_is_extensible(
-                                self,
-                                ctx,
-                                proxy,
-                            )?;
+                            let result = {
+                                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                crate::proxy_operations::proxy_is_extensible(&mut ncx, proxy)?
+                            };
 
                             ctx.set_register(return_reg, Value::boolean(result));
                             return Ok(InstructionResult::Continue);
@@ -7528,11 +7703,10 @@ impl Interpreter {
                                 .ok_or_else(|| VmError::type_error("Reflect.preventExtensions: target is not a proxy"))?;
 
                             // Call proxy_prevent_extensions
-                            let result = crate::proxy_operations::proxy_prevent_extensions(
-                                self,
-                                ctx,
-                                proxy,
-                            )?;
+                            let result = {
+                                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                crate::proxy_operations::proxy_prevent_extensions(&mut ncx, proxy)?
+                            };
 
                             ctx.set_register(return_reg, Value::boolean(result));
                             return Ok(InstructionResult::Continue);
@@ -7571,13 +7745,15 @@ impl Interpreter {
                             };
 
                             // Call proxy_apply
-                            let result = crate::proxy_operations::proxy_apply(
-                                self,
-                                ctx,
-                                proxy,
-                                this_arg,
-                                &args_array,
-                            )?;
+                            let result = {
+                                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                crate::proxy_operations::proxy_apply(
+                                    &mut ncx,
+                                    proxy,
+                                    this_arg,
+                                    &args_array,
+                                )?
+                            };
 
                             ctx.set_register(return_reg, result);
                             return Ok(InstructionResult::Continue);
@@ -7616,13 +7792,15 @@ impl Interpreter {
                             };
 
                             // Call proxy_construct
-                            let result = crate::proxy_operations::proxy_construct(
-                                self,
-                                ctx,
-                                proxy,
-                                &args_array,
-                                new_target,
-                            )?;
+                            let result = {
+                                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                crate::proxy_operations::proxy_construct(
+                                    &mut ncx,
+                                    proxy,
+                                    &args_array,
+                                    new_target,
+                                )?
+                            };
 
                             ctx.set_register(return_reg, result);
                             return Ok(InstructionResult::Continue);
@@ -8125,14 +8303,16 @@ impl Interpreter {
                                 let key = PropertyKey::string("then");
                                 let then_val = if let Some(proxy) = value.as_proxy() {
                                     let key_value = Value::string(JsString::intern("then"));
-                                    crate::proxy_operations::proxy_get(
-                                        self,
-                                        ctx,
-                                        proxy,
-                                        &key,
-                                        key_value,
-                                        value.clone(),
-                                    )
+                                    {
+                                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                        crate::proxy_operations::proxy_get(
+                                            &mut ncx,
+                                            proxy,
+                                            &key,
+                                            key_value,
+                                            value.clone(),
+                                        )
+                                    }
                                 } else if let Some(obj) = value.as_object() {
                                     match obj.lookup_property_descriptor(&key) {
                                         Some(crate::object::PropertyDescriptor::Accessor { get, .. }) => {

@@ -25,7 +25,7 @@ use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
 use crate::memory::MemoryManager;
-use crate::error::{InterceptionSignal, VmError};
+use crate::error::VmError;
 use std::sync::Arc;
 
 /// Initialize Function.prototype with all ES2026 methods
@@ -108,26 +108,17 @@ pub fn init_function_prototype(
                     vec![]
                 };
 
+                if let Some(proxy) = this_val.as_proxy() {
+                    return crate::proxy_operations::proxy_apply(ncx, proxy, this_arg, &call_args);
+                }
+
                 // Check if target is callable
-                if !this_val.is_function() && !this_val.is_native_function() {
+                if !this_val.is_callable() {
                     return Err(VmError::type_error("Function.prototype.call requires a callable target"));
                 }
 
-                // For closures, use interception signal
-                if let Some(_closure) = this_val.as_function() {
-                    // ⚡ Closure path: Signal interpreter to handle with VM context
-                    // This is not a real error - it's a signal for interception
-                    return Err(VmError::interception(InterceptionSignal::FunctionCall));
-                }
-
-                // For native functions, try direct call
-                if let Some(native_fn) = this_val.as_native_function() {
-                    // ✅ FAST PATH: Native function - direct call
-                    return native_fn(&this_arg, &call_args, ncx);
-                }
-
-                // Shouldn't reach here
-                Err(VmError::type_error("Function.prototype.call: unknown function type"))
+                // Call the function (handles both closures and native functions)
+                ncx.call_function(&this_val, this_arg, &call_args)
             },
             mm.clone(),
             fn_proto,
@@ -146,11 +137,6 @@ pub fn init_function_prototype(
                 // args[1] is argsArray
                 let this_arg = args.first().cloned().unwrap_or(Value::undefined());
                 let args_array_val = args.get(1).cloned().unwrap_or(Value::undefined());
-
-                // Check if target is callable
-                if !this_val.is_function() && !this_val.is_native_function() {
-                    return Err(VmError::type_error("Function.prototype.apply requires a callable target"));
-                }
 
                 // Convert argsArray to Vec<Value>
                 let call_args = if args_array_val.is_undefined() || args_array_val.is_null() {
@@ -173,20 +159,17 @@ pub fn init_function_prototype(
                     return Err(VmError::type_error("Function.prototype.apply: argumentsList must be an object"));
                 };
 
-                // For closures, use interception signal
-                if let Some(_closure) = this_val.as_function() {
-                    // ⚡ Closure path: Signal interpreter to handle with VM context
-                    return Err(VmError::interception(InterceptionSignal::FunctionApply));
+                if let Some(proxy) = this_val.as_proxy() {
+                    return crate::proxy_operations::proxy_apply(ncx, proxy, this_arg, &call_args);
                 }
 
-                // For native functions, try direct call
-                if let Some(native_fn) = this_val.as_native_function() {
-                    // ✅ FAST PATH: Native function - direct call
-                    return native_fn(&this_arg, &call_args, ncx);
+                // Check if target is callable
+                if !this_val.is_callable() {
+                    return Err(VmError::type_error("Function.prototype.apply requires a callable target"));
                 }
 
-                // Shouldn't reach here
-                Err(VmError::type_error("Function.prototype.apply: unknown function type"))
+                // Call the function (handles both closures and native functions)
+                ncx.call_function(&this_val, this_arg, &call_args)
             },
             mm.clone(),
             fn_proto,

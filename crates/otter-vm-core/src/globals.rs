@@ -465,11 +465,13 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
         }
 
         if let Some(ctor_obj) = ctor.as_object() {
-            ctor_obj.set(
-                PropertyKey::string("prototype"),
-                Value::object(proto.clone()),
-            );
-            proto.set(PropertyKey::string("constructor"), ctor.clone());
+            if name != "Proxy" {
+                ctor_obj.set(
+                    PropertyKey::string("prototype"),
+                    Value::object(proto.clone()),
+                );
+                proto.set(PropertyKey::string("constructor"), ctor.clone());
+            }
 
             // Add static methods to constructors
             if name == "String" {

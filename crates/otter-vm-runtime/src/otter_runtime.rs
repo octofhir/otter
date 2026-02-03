@@ -90,6 +90,8 @@ pub struct Otter {
     interrupt_flag: Arc<AtomicBool>,
     /// Debug snapshot for watchdogs
     debug_snapshot: Arc<parking_lot::Mutex<VmContextSnapshot>>,
+    /// Trace configuration (if tracing is enabled)
+    trace_config: Option<otter_vm_core::TraceConfig>,
 }
 
 impl Otter {
@@ -113,6 +115,7 @@ impl Otter {
             capabilities: Capabilities::none(),
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             debug_snapshot: Arc::new(parking_lot::Mutex::new(VmContextSnapshot::default())),
+            trace_config: None,
         }
     }
 
@@ -148,6 +151,32 @@ impl Otter {
     /// Clear the interrupt flag (call before re-using the engine)
     pub fn clear_interrupt(&self) {
         self.interrupt_flag.store(false, Ordering::Relaxed);
+    }
+
+    /// Set trace configuration for instruction-level tracing
+    pub fn set_trace_config(&mut self, config: otter_vm_core::TraceConfig) {
+        self.trace_config = Some(config);
+    }
+
+    /// Dump formatted snapshot to writer (useful for debugging timeouts)
+    pub fn dump_snapshot(&self, writer: &mut dyn std::io::Write) -> std::io::Result<()> {
+        let snapshot = self.debug_snapshot();
+
+        // Create a temporary ring buffer from the snapshot entries if present
+        let trace_buffer = if !snapshot.recent_instructions.is_empty() {
+            let mut buffer = otter_vm_core::TraceRingBuffer::new(snapshot.recent_instructions.len().max(1));
+            for entry in &snapshot.recent_instructions {
+                buffer.push(entry.clone());
+            }
+            Some(buffer)
+        } else {
+            None
+        };
+
+        // Use format module to create human-readable output
+        let formatted = otter_vm_core::format::format_snapshot(&snapshot, trace_buffer.as_ref());
+
+        write!(writer, "{}", formatted)
     }
 
     /// Register an extension
@@ -228,6 +257,12 @@ impl Otter {
         let mut ctx = self.vm.create_context();
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
         ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
+
+        // Apply trace configuration if enabled
+        if let Some(ref trace_config) = self.trace_config {
+            ctx.set_trace_config(trace_config.clone());
+        }
+
         Self::configure_eval(&mut ctx);
         Self::configure_js_job_queue(&mut ctx, &self.event_loop);
 
@@ -502,6 +537,12 @@ impl Otter {
         let mut ctx = self.vm.create_context();
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
         ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
+
+        // Apply trace configuration if enabled
+        if let Some(ref trace_config) = self.trace_config {
+            ctx.set_trace_config(trace_config.clone());
+        }
+
         Self::configure_eval(&mut ctx);
         Self::configure_js_job_queue(&mut ctx, &self.event_loop);
 

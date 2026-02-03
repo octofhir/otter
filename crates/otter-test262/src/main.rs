@@ -71,6 +71,38 @@ struct Cli {
     /// Specific test files to run
     #[arg(value_name = "FILES", global = true)]
     files: Vec<String>,
+
+    /// Dump debug snapshot on timeout (default: true)
+    #[arg(long, global = true, default_value = "true")]
+    dump_on_timeout: bool,
+
+    /// File path for timeout dumps (default: stderr)
+    #[arg(long, global = true)]
+    dump_file: Option<PathBuf>,
+
+    /// Number of instructions to keep in ring buffer (default: 100)
+    #[arg(long, global = true, default_value = "100")]
+    dump_buffer_size: usize,
+
+    /// Enable full execution trace for tests
+    #[arg(long, global = true)]
+    trace: bool,
+
+    /// File path for trace output (default: test262-trace.txt)
+    #[arg(long, global = true)]
+    trace_file: Option<PathBuf>,
+
+    /// Filter trace by module/function pattern (regex)
+    #[arg(long, global = true)]
+    trace_filter: Option<String>,
+
+    /// Trace only failing tests
+    #[arg(long, global = true)]
+    trace_failures_only: bool,
+
+    /// Trace only timeout tests
+    #[arg(long, global = true)]
+    trace_timeouts_only: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -383,7 +415,17 @@ async fn run_tests(cli: Cli) {
     };
 
     // Create runner with config
-    let mut runner = Test262Runner::new(&cli.test_dir);
+    let mut runner = Test262Runner::new(
+        &cli.test_dir,
+        cli.dump_on_timeout,
+        cli.dump_file.clone(),
+        cli.dump_buffer_size,
+        cli.trace,
+        cli.trace_file.clone(),
+        cli.trace_filter.clone(),
+        cli.trace_failures_only,
+        cli.trace_timeouts_only,
+    );
 
     // Apply skip features from config
     if !config.skip_features.is_empty() {

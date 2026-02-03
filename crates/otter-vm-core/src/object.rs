@@ -781,6 +781,16 @@ impl JsObject {
 
     /// Get own property descriptor (does not walk prototype chain).
     pub fn get_own_property_descriptor(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        // Handle array indexed elements as own data properties.
+        if self.is_array() {
+            if let PropertyKey::Index(i) = key {
+                let elements = self.elements.read();
+                if (*i as usize) < elements.len() {
+                    return Some(PropertyDescriptor::data(elements[*i as usize].clone()));
+                }
+            }
+        }
+
         // Dictionary mode: lookup in HashMap
         if self.is_dictionary_mode() {
             if let Some(dict) = self.dictionary_properties.read().as_ref() {

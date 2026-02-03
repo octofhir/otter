@@ -3104,15 +3104,155 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_for_in_statement(&mut self, _for_in_stmt: &ForInStatement) -> CompileResult<()> {
-        // Stub: Treat as runtime error for now, but allow compilation to succeed
-        let msg = self
-            .codegen
-            .add_string("ForInStatement not yet implemented in runtime");
-        let reg = self.codegen.alloc_reg();
-        self.codegen
-            .emit(Instruction::LoadConst { dst: reg, idx: msg });
-        self.codegen.free_reg(reg);
+    fn compile_for_in_statement(&mut self, for_in_stmt: &ForInStatement) -> CompileResult<()> {
+        self.codegen.enter_scope();
+
+        // Compile the target expression.
+        let target = self.compile_expression(&for_in_stmt.right)?;
+
+        // Call Object.keys(target) to get enumerable own string keys.
+        let object_name = self.codegen.add_string("Object");
+        let object_ctor = self.codegen.alloc_reg();
+        let ic_index = self.codegen.alloc_ic();
+        self.codegen.emit(Instruction::GetGlobal {
+            dst: object_ctor,
+            name: object_name,
+            ic_index,
+        });
+
+        let keys_name = self.codegen.add_string("keys");
+        let frame = self.codegen.alloc_fresh_block(2);
+        self.codegen.emit(Instruction::Move {
+            dst: frame,
+            src: object_ctor,
+        });
+        self.codegen.emit(Instruction::Move {
+            dst: Register(frame.0 + 1),
+            src: target,
+        });
+
+        let keys_reg = self.codegen.alloc_reg();
+        let ic_index = self.codegen.alloc_ic();
+        self.codegen.emit(Instruction::CallMethod {
+            dst: keys_reg,
+            obj: frame,
+            method: keys_name,
+            argc: 1,
+            ic_index,
+        });
+
+        self.codegen.free_reg(object_ctor);
+        self.codegen.free_reg(target);
+        self.codegen.free_reg(frame);
+        self.codegen.free_reg(Register(frame.0 + 1));
+
+        // Iterate over keys using for-of lowering.
+        let iterator = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::GetIterator {
+            dst: iterator,
+            src: keys_reg,
+        });
+        self.codegen.free_reg(keys_reg);
+
+        let value_reg = self.codegen.alloc_reg();
+        let done_reg = self.codegen.alloc_reg();
+        let result_reg = self.codegen.alloc_reg();
+
+        let next_name = self.codegen.add_string("next");
+        let done_name = self.codegen.add_string("done");
+        let value_name = self.codegen.add_string("value");
+
+        let loop_start = self.codegen.current_index();
+        self.loop_stack.push(ControlScope {
+            is_loop: true,
+            is_switch: false,
+            labels: std::mem::take(&mut self.pending_labels),
+            break_jumps: Vec::new(),
+            continue_jumps: Vec::new(),
+            continue_target: Some(loop_start),
+        });
+
+        let iter_frame = self.codegen.alloc_fresh_block(1);
+        self.codegen.emit(Instruction::Move {
+            dst: iter_frame,
+            src: iterator,
+        });
+        let ic_index_next = self.codegen.alloc_ic();
+        self.codegen.emit(Instruction::CallMethod {
+            dst: result_reg,
+            obj: iter_frame,
+            method: next_name,
+            argc: 0,
+            ic_index: ic_index_next,
+        });
+        self.codegen.free_reg(iter_frame);
+
+        let ic_index_done = self.codegen.alloc_ic();
+        self.codegen.emit(Instruction::GetPropConst {
+            dst: done_reg,
+            obj: result_reg,
+            name: done_name,
+            ic_index: ic_index_done,
+        });
+        let ic_index_value = self.codegen.alloc_ic();
+        self.codegen.emit(Instruction::GetPropConst {
+            dst: value_reg,
+            obj: result_reg,
+            name: value_name,
+            ic_index: ic_index_value,
+        });
+
+        let jump_end = self.codegen.emit_jump_if_true(done_reg);
+
+        match &for_in_stmt.left {
+            ForStatementLeft::VariableDeclaration(decl) => {
+                let is_const = decl.kind == VariableDeclarationKind::Const;
+                if let Some(declarator) = decl.declarations.first() {
+                    if declarator.init.is_some() {
+                        return Err(CompileError::Parse(
+                            "for-in loop variable declaration may not have an initializer".to_string(),
+                        ));
+                    }
+                    self.compile_binding_init(&declarator.id, value_reg, is_const)?;
+                }
+            }
+            left => {
+                if let Some(target) = left.as_assignment_target() {
+                    self.compile_assignment_target_init(target, value_reg)?;
+                } else {
+                    return Err(CompileError::unsupported("Unsupported for-in left-hand side"));
+                }
+            }
+        }
+
+        self.compile_statement(&for_in_stmt.body)?;
+
+        let back_offset = loop_start as i32 - self.codegen.current_index() as i32;
+        self.codegen.emit(Instruction::Jump {
+            offset: JumpOffset(back_offset),
+        });
+
+        let end_offset = self.codegen.current_index() as i32 - jump_end as i32;
+        self.codegen.patch_jump(jump_end, end_offset);
+
+        let break_target = self.codegen.current_index();
+        let loop_ctl = self.loop_stack.pop().expect("loop stack underflow");
+        for jump in loop_ctl.break_jumps {
+            let offset = break_target as i32 - jump as i32;
+            self.codegen.patch_jump(jump, offset);
+        }
+        if let Some(continue_target) = loop_ctl.continue_target {
+            for jump in loop_ctl.continue_jumps {
+                let offset = continue_target as i32 - jump as i32;
+                self.codegen.patch_jump(jump, offset);
+            }
+        }
+
+        self.codegen.free_reg(iterator);
+        self.codegen.free_reg(value_reg);
+        self.codegen.free_reg(done_reg);
+        self.codegen.free_reg(result_reg);
+        self.codegen.exit_scope();
         Ok(())
     }
 
@@ -3381,6 +3521,16 @@ impl Compiler {
 
         // Exit function and get index
         let func_idx = self.codegen.exit_function();
+
+        if std::env::var("OTTER_DUMP_ASSERT").is_ok() && name.as_deref() == Some("assert") {
+            if let Some(func) = self.codegen.functions.get(func_idx as usize) {
+                eprintln!("== OTTER_DUMP_ASSERT function assert ==");
+                for (i, instr) in func.instructions.iter().enumerate() {
+                    eprintln!("{:04}: {:?}", i, instr);
+                }
+                eprintln!("== OTTER_DUMP_ASSERT end ==");
+            }
+        }
 
         // Create closure and store in variable
         if let Some(n) = name

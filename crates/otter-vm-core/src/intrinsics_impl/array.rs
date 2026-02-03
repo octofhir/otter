@@ -830,6 +830,15 @@ pub fn init_array_prototype(
                     }
                     let len = get_len(&obj);
                     let result = GcRef::new(JsObject::array(len, ncx.memory_manager().clone()));
+                    if let Some(array_ctor) = ncx.global().get(&PropertyKey::string("Array")) {
+                        if let Some(array_obj) = array_ctor.as_object() {
+                            if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
+                                if let Some(proto_obj) = proto_val.as_object() {
+                                    result.set_prototype(Some(proto_obj));
+                                }
+                            }
+                        }
+                    }
                     for i in 0..len {
                         let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
                         let mapped = ncx.call_function(&callback, this_arg.clone(), &[val, Value::number(i as f64), this_val.clone()])?;

@@ -601,16 +601,17 @@ pub fn proxy_own_keys(
             .get(&PropertyKey::Index(i as u32))
             .unwrap_or(Value::undefined());
 
-        // Convert element to PropertyKey
+        // ES §9.5.11 step 8: CreateListFromArrayLike(trapResultArray, « String, Symbol »)
+        // Only String and Symbol types are allowed
         if let Some(s) = element.as_string() {
             trap_keys.push(PropertyKey::String(s.clone()));
         } else if let Some(sym) = element.as_symbol() {
             trap_keys.push(PropertyKey::Symbol(sym.id));
         } else {
-            // Convert to string (use string representation)
-            // For now, skip non-string/symbol keys
-            // TODO: proper ToString conversion
-            continue;
+            // Per spec, throw TypeError for any other type
+            return Err(VmError::type_error(
+                "Proxy 'ownKeys' trap result must only contain String or Symbol values"
+            ));
         }
     }
 
@@ -756,11 +757,19 @@ fn validate_get_own_property_descriptor_invariants(
             // For data properties, check value and writable
             if let PropertyDescriptor::Data { value: target_value, attributes: target_attrs } = &target_desc {
                 if let PropertyDescriptor::Data { value: trap_value, attributes: trap_attrs } = trap_desc {
+                    // ES §9.5.5 step 17.b.i: If trap reports writable: false but target has writable: true, throw TypeError
+                    if target_attrs.writable && !trap_attrs.writable && !trap_desc.is_configurable() {
+                        return Err(VmError::type_error(
+                            "Proxy 'getOwnPropertyDescriptor' trap cannot report writable property as non-writable when non-configurable",
+                        ));
+                    }
+                    // Trap cannot report non-writable as writable
                     if !target_attrs.writable && trap_attrs.writable {
                         return Err(VmError::type_error(
                             "Proxy 'getOwnPropertyDescriptor' trap cannot report non-writable property as writable",
                         ));
                     }
+                    // For non-configurable, non-writable properties, value must match
                     if !target_attrs.writable && !same_value(trap_value, target_value) {
                         return Err(VmError::type_error(
                             "Proxy 'getOwnPropertyDescriptor' trap must report same value for non-configurable, non-writable property",
@@ -770,11 +779,18 @@ fn validate_get_own_property_descriptor_invariants(
             }
         }
     } else {
-        // Property doesn't exist on target
-        // If target is non-extensible, trap cannot report a new property
-        if !target_is_extensible(ncx, target)? && !trap_desc.is_configurable() {
+        // Property doesn't exist on target (targetDesc is undefined)
+        // ES §9.5.5 step 22.a: If resultDesc.[[Configurable]] is false and targetDesc is undefined, throw TypeError
+        if !trap_desc.is_configurable() {
             return Err(VmError::type_error(
-                "Proxy 'getOwnPropertyDescriptor' trap cannot report non-configurable property on non-extensible target",
+                "Proxy 'getOwnPropertyDescriptor' trap cannot report non-configurable descriptor for non-existent property",
+            ));
+        }
+
+        // If target is non-extensible, trap cannot report a new property
+        if !target_is_extensible(ncx, target)? {
+            return Err(VmError::type_error(
+                "Proxy 'getOwnPropertyDescriptor' trap cannot report property on non-extensible target",
             ));
         }
     }

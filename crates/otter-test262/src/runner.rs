@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -28,6 +29,22 @@ pub struct Test262Runner {
     harness_state: TestHarnessState,
     /// Reusable engine (created once, used for all tests)
     engine: Otter,
+    /// Whether to dump on timeout
+    dump_on_timeout: bool,
+    /// Dump output path (None = stderr)
+    dump_file: Option<PathBuf>,
+    /// Ring buffer size for trace
+    dump_buffer_size: usize,
+    /// Enable full trace
+    trace_enabled: bool,
+    /// Trace output file
+    trace_file: Option<PathBuf>,
+    /// Trace filter pattern
+    trace_filter: Option<String>,
+    /// Trace only failures
+    trace_failures_only: bool,
+    /// Trace only timeouts
+    trace_timeouts_only: bool,
 }
 
 /// Result of running a single test (in one execution mode)
@@ -76,12 +93,34 @@ pub enum TestOutcome {
 
 impl Test262Runner {
     /// Create a new test runner
-    pub fn new(test_dir: impl AsRef<Path>) -> Self {
+    pub fn new(
+        test_dir: impl AsRef<Path>,
+        dump_on_timeout: bool,
+        dump_file: Option<PathBuf>,
+        dump_buffer_size: usize,
+        trace_enabled: bool,
+        trace_file: Option<PathBuf>,
+        trace_filter: Option<String>,
+        trace_failures_only: bool,
+        trace_timeouts_only: bool,
+    ) -> Self {
         let (harness_ext, harness_state) =
             crate::harness::create_harness_extension_with_state();
-        let engine = EngineBuilder::new()
+        let mut engine = EngineBuilder::new()
             .extension(harness_ext)
             .build();
+
+        // Configure trace if dump_on_timeout is enabled
+        if dump_on_timeout {
+            engine.set_trace_config(otter_vm_core::TraceConfig {
+                enabled: true,
+                mode: otter_vm_core::TraceMode::RingBuffer,
+                ring_buffer_size: dump_buffer_size,
+                output_path: dump_file.clone(),
+                filter: None,
+                capture_timing: false,
+            });
+        }
 
         Self {
             test_dir: test_dir.as_ref().to_path_buf(),
@@ -89,6 +128,14 @@ impl Test262Runner {
             skip_features: Vec::new(),
             harness_state,
             engine,
+            dump_on_timeout,
+            dump_file,
+            dump_buffer_size,
+            trace_enabled,
+            trace_file,
+            trace_filter,
+            trace_failures_only,
+            trace_timeouts_only,
         }
     }
 
@@ -96,15 +143,29 @@ impl Test262Runner {
     fn rebuild_engine(&mut self) {
         let (harness_ext, harness_state) =
             crate::harness::create_harness_extension_with_state();
-        self.engine = EngineBuilder::new()
+        let mut engine = EngineBuilder::new()
             .extension(harness_ext)
             .build();
+
+        // Re-apply trace configuration if enabled
+        if self.dump_on_timeout {
+            engine.set_trace_config(otter_vm_core::TraceConfig {
+                enabled: true,
+                mode: otter_vm_core::TraceMode::RingBuffer,
+                ring_buffer_size: self.dump_buffer_size,
+                output_path: self.dump_file.clone(),
+                filter: None,
+                capture_timing: false,
+            });
+        }
+
+        self.engine = engine;
         self.harness_state = harness_state;
     }
 
     /// Create a new test runner that skips no features (runs everything).
     pub fn new_no_skip(test_dir: impl AsRef<Path>) -> Self {
-        let mut runner = Self::new(test_dir);
+        let mut runner = Self::new(test_dir, false, None, 100, false, None, None, false, false);
         runner.skip_features.clear();
         runner
     }
@@ -282,6 +343,9 @@ impl Test262Runner {
         let relative_path = path.strip_prefix(&self.test_dir).unwrap_or(path);
         let test_name = format!("{} ({})", relative_path.to_string_lossy(), mode);
 
+        // Configure trace for this test
+        self.configure_test_trace(&test_name);
+
         // Build test source with harness
         let mut test_source = String::new();
 
@@ -353,7 +417,7 @@ impl Test262Runner {
     ) -> (TestOutcome, Option<String>) {
         let is_async = metadata.is_async();
 
-        match self
+        let outcome = match self
             .run_with_timeout(source, timeout, test_name)
             .await
         {
@@ -424,6 +488,10 @@ impl Test262Runner {
                     if metadata.expects_runtime_error() {
                         self.validate_negative_error(metadata, &msg, ErrorPhase::Runtime)
                     } else if msg == "Test timed out" || msg.contains("Execution interrupted") {
+                        // Dump snapshot on timeout if enabled
+                        if self.dump_on_timeout {
+                            self.dump_timeout_info(&test_name, &msg);
+                        }
                         (TestOutcome::Timeout, None)
                     } else {
                         (TestOutcome::Fail, Some(msg))
@@ -431,6 +499,117 @@ impl Test262Runner {
                 }
                 OtterError::PermissionDenied(msg) => (TestOutcome::Fail, Some(msg)),
             },
+        };
+
+        // Save trace if configured for failures/timeouts
+        self.save_conditional_trace(&test_name, outcome.0);
+
+        outcome
+    }
+
+    /// Configure trace for a test based on runner settings
+    fn configure_test_trace(&mut self, test_name: &str) {
+        if !self.trace_enabled {
+            return;
+        }
+
+        // Determine trace mode based on settings
+        let mode = if self.trace_failures_only || self.trace_timeouts_only {
+            // Use ring buffer mode, will dump to file conditionally after test
+            otter_vm_core::TraceMode::RingBuffer
+        } else {
+            // Full trace mode - record everything
+            otter_vm_core::TraceMode::FullTrace
+        };
+
+        // Generate trace file path if not specified
+        let trace_path = if let Some(ref path) = self.trace_file {
+            path.clone()
+        } else {
+            let sanitized_name = test_name.replace(['/', '\\', ' ', '(', ')'], "_");
+            PathBuf::from(format!("test262-trace-{}.txt", sanitized_name))
+        };
+
+        self.engine.set_trace_config(otter_vm_core::TraceConfig {
+            enabled: true,
+            mode,
+            ring_buffer_size: self.dump_buffer_size,
+            output_path: Some(trace_path),
+            filter: self.trace_filter.clone(),
+            capture_timing: false,
+        });
+    }
+
+    /// Save trace for a test that failed/timed out (if configured)
+    fn save_conditional_trace(&self, test_name: &str, outcome: TestOutcome) {
+        // Only save if we're in conditional mode and the condition matches
+        let should_save = (self.trace_failures_only && outcome == TestOutcome::Fail)
+            || (self.trace_timeouts_only && outcome == TestOutcome::Timeout);
+
+        if !should_save {
+            return;
+        }
+
+        // Get snapshot and write to file
+        let snapshot = self.engine.debug_snapshot();
+        if snapshot.recent_instructions.is_empty() {
+            return;
+        }
+
+        let trace_path = if let Some(ref path) = self.trace_file {
+            path.clone()
+        } else {
+            let sanitized_name = test_name.replace(['/', '\\', ' ', '(', ')'], "_");
+            PathBuf::from(format!("test262-trace-{}.txt", sanitized_name))
+        };
+
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&trace_path)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "\n═══════════════════════════════════════════");
+            let _ = writeln!(file, "Test: {}", test_name);
+            let _ = writeln!(file, "Outcome: {:?}", outcome);
+            let _ = writeln!(file, "═══════════════════════════════════════════\n");
+
+            // Create temporary ring buffer from snapshot
+            let mut buffer = otter_vm_core::TraceRingBuffer::new(snapshot.recent_instructions.len().max(1));
+            for entry in &snapshot.recent_instructions {
+                buffer.push(entry.clone());
+            }
+
+            let formatted = otter_vm_core::format::format_trace_buffer(&buffer);
+            let _ = write!(file, "{}", formatted);
+        }
+    }
+
+    /// Dump debug information when a test times out
+    fn dump_timeout_info(&self, test_path: &str, _msg: &str) {
+        let header = format!(
+            "\n═══════════════════════════════════════════════════════════════\n\
+             TIMEOUT DETECTED: {}\n\
+             ═══════════════════════════════════════════════════════════════\n",
+            test_path
+        );
+
+        if let Some(ref dump_file) = self.dump_file {
+            // Write to file
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dump_file)
+            {
+                let _ = write!(file, "{}", header);
+                let _ = self.engine.dump_snapshot(&mut file);
+            } else {
+                eprintln!("Failed to open dump file: {:?}", dump_file);
+            }
+        } else {
+            // Write to stderr
+            eprintln!("{}", header);
+            let _ = self.engine.dump_snapshot(&mut std::io::stderr());
         }
     }
 
@@ -586,8 +765,19 @@ mod tests {
 
     #[test]
     fn test_runner_creation() {
-        let runner = Test262Runner::new("tests/test262");
-        assert!(!runner.skip_features.is_empty());
+        let runner = Test262Runner::new(
+            "tests/test262",
+            false, // dump_on_timeout
+            None,  // dump_file
+            100,   // dump_buffer_size
+            false, // trace_enabled
+            None,  // trace_file
+            None,  // trace_filter
+            false, // trace_failures_only
+            false, // trace_timeouts_only
+        );
+        // Skip features are now config-driven only; default is empty
+        assert!(runner.skip_features.is_empty());
     }
 
     #[test]
@@ -599,7 +789,17 @@ mod tests {
     #[test]
     fn test_default_skip_features_empty() {
         // Skip features are now config-driven only; default is empty
-        let runner = Test262Runner::new("tests/test262");
+        let runner = Test262Runner::new(
+            "tests/test262",
+            false, // dump_on_timeout
+            None,  // dump_file
+            100,   // dump_buffer_size
+            false, // trace_enabled
+            None,  // trace_file
+            None,  // trace_filter
+            false, // trace_failures_only
+            false, // trace_timeouts_only
+        );
         assert!(runner.skip_features.is_empty());
     }
 }

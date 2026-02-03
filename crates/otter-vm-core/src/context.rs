@@ -282,6 +282,8 @@ pub struct VmContext {
     /// External root sets registered by the runtime (e.g., job queues).
     /// These are traced during GC root collection.
     external_root_sets: Vec<Arc<dyn ExternalRootSet + Send + Sync>>,
+    /// Trace state (if tracing is enabled)
+    pub(crate) trace_state: Option<crate::trace::TraceState>,
 }
 
 /// Trait for JS job queue access (allows runtime to inject the queue)
@@ -344,6 +346,12 @@ pub struct VmContextSnapshot {
     pub is_construct: Option<bool>,
     /// Top stack frames (most recent first) for debugging
     pub frames: Vec<FrameSnapshot>,
+    /// Recent instructions (if trace is enabled)
+    pub recent_instructions: Vec<crate::trace::TraceEntry>,
+    /// Current frame snapshot (if available)
+    pub current_frame: Option<FrameSnapshot>,
+    /// Full call stack for detailed debugging
+    pub call_stack: Vec<FrameSnapshot>,
 }
 
 impl VmContext {
@@ -397,6 +405,7 @@ impl VmContext {
             microtask_enqueue: None,
             js_job_queue: None,
             external_root_sets: Vec::new(),
+            trace_state: None,
         }
     }
 
@@ -417,6 +426,73 @@ impl VmContext {
     /// Get the current debug snapshot (if enabled).
     pub fn debug_snapshot(&self) -> Option<VmContextSnapshot> {
         self.debug_snapshot.as_ref().map(|snapshot| snapshot.lock().clone())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Trace management
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// Set trace configuration and enable tracing.
+    pub fn set_trace_config(&mut self, config: crate::trace::TraceConfig) {
+        if config.enabled {
+            self.trace_state = Some(crate::trace::TraceState::new(config));
+        } else {
+            self.trace_state = None;
+        }
+    }
+
+    /// Get the trace buffer (if tracing is enabled).
+    pub fn get_trace_buffer(&self) -> Option<&crate::trace::TraceRingBuffer> {
+        self.trace_state.as_ref().map(|s| &s.ring_buffer)
+    }
+
+    /// Record a trace entry (called at interrupt check points or every instruction in FullTrace mode).
+    pub fn record_trace_entry(
+        &mut self,
+        instruction: &otter_vm_bytecode::Instruction,
+        pc: usize,
+        function_index: u32,
+        module: &std::sync::Arc<otter_vm_bytecode::Module>,
+    ) {
+        let Some(trace_state) = &mut self.trace_state else {
+            return;
+        };
+
+        let func = module.function(function_index);
+        let function_name = func.and_then(|f| f.name.clone());
+
+        // Format instruction operands (simplified for MVP)
+        let operands = format!("{:?}", instruction);
+
+        let entry = crate::trace::TraceEntry {
+            instruction_number: trace_state.instruction_counter,
+            pc,
+            function_index,
+            function_name,
+            module_url: module.source_url.clone(),
+            opcode: format!("{:?}", instruction).split(' ').next().unwrap_or("Unknown").to_string(),
+            operands,
+            modified_registers: vec![], // TODO: Track register modifications
+            execution_time_ns: None, // TODO: Add timing support
+        };
+
+        // Check filter
+        if !trace_state.matches_filter(&entry) {
+            trace_state.instruction_counter += 1;
+            return;
+        }
+
+        // Always add to ring buffer (for timeout dumps)
+        trace_state.ring_buffer.push(entry.clone());
+
+        // Write to trace file if in FullTrace mode
+        if trace_state.config.mode == crate::trace::TraceMode::FullTrace {
+            if let Some(ref mut writer) = trace_state.trace_writer {
+                let _ = writer.write_entry(&entry);
+            }
+        }
+
+        trace_state.instruction_counter += 1;
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -565,7 +641,7 @@ impl VmContext {
         self.interrupt_flag.store(false, Ordering::Relaxed);
     }
 
-    fn update_debug_snapshot(&self) {
+    pub(crate) fn update_debug_snapshot(&self) {
         let Some(target) = &self.debug_snapshot else {
             return;
         };
@@ -589,6 +665,25 @@ impl VmContext {
                     snapshot.instruction = Some(format!("{:?}", func.instructions[frame.pc]));
                 }
             }
+
+            // Add current frame snapshot
+            if let Some(func) = frame.module.function(frame.function_index) {
+                let instruction = if frame.pc < func.instructions.len() {
+                    Some(format!("{:?}", func.instructions[frame.pc]))
+                } else {
+                    None
+                };
+                snapshot.current_frame = Some(FrameSnapshot {
+                    function_index: frame.function_index,
+                    function_name: func.name.clone(),
+                    pc: frame.pc,
+                    instruction,
+                    module_url: frame.module.source_url.clone(),
+                    is_async: frame.is_async,
+                    is_generator: func.flags.is_generator,
+                    is_construct: frame.is_construct,
+                });
+            }
         }
 
         // Capture a few top frames for better watchdog debugging.
@@ -610,6 +705,34 @@ impl VmContext {
                     is_construct: frame.is_construct,
                 });
             }
+        }
+
+        // Capture ALL frames for full call stack
+        for frame in self.call_stack.iter().rev() {
+            if let Some(func) = frame.module.function(frame.function_index) {
+                let instruction = if frame.pc < func.instructions.len() {
+                    Some(format!("{:?}", func.instructions[frame.pc]))
+                } else {
+                    None
+                };
+                snapshot.call_stack.push(FrameSnapshot {
+                    function_index: frame.function_index,
+                    function_name: func.name.clone(),
+                    pc: frame.pc,
+                    instruction,
+                    module_url: frame.module.source_url.clone(),
+                    is_async: frame.is_async,
+                    is_generator: func.flags.is_generator,
+                    is_construct: frame.is_construct,
+                });
+            }
+        }
+
+        // Add trace buffer entries if available
+        if let Some(trace_state) = &self.trace_state {
+            snapshot.recent_instructions = trace_state.ring_buffer.iter()
+                .cloned()
+                .collect();
         }
 
         *target.lock() = snapshot;
@@ -986,6 +1109,23 @@ impl VmContext {
                 let target_idx = local_count as usize + (i - effective_param_count);
                 if target_idx < locals.len() {
                     locals[target_idx] = arg;
+                }
+            }
+        }
+
+        if std::env::var("OTTER_TRACE_ASSERT_ARGS").is_ok() {
+            if let Some(func) = module.functions.get(function_index as usize) {
+                if func.name.as_deref() == Some("assert") {
+                    let arg_types: Vec<_> = locals
+                        .iter()
+                        .take(param_count)
+                        .map(|v| v.type_of())
+                        .collect();
+                    eprintln!(
+                        "[OTTER_TRACE_ASSERT_ARGS] params={} types={:?}",
+                        param_count,
+                        arg_types
+                    );
                 }
             }
         }

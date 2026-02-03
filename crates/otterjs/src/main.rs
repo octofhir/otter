@@ -71,6 +71,34 @@ struct Cli {
     /// Show profiling information (memory usage)
     #[arg(long, global = true)]
     profile: bool,
+
+    /// Dump debug snapshot on timeout (default: true)
+    #[arg(long, global = true, default_value = "true")]
+    dump_on_timeout: bool,
+
+    /// File path for timeout dumps (default: stderr)
+    #[arg(long, global = true)]
+    dump_file: Option<PathBuf>,
+
+    /// Number of instructions to keep in ring buffer (default: 100)
+    #[arg(long, global = true, default_value = "100")]
+    dump_buffer_size: usize,
+
+    /// Enable full execution trace (logs every instruction to file)
+    #[arg(long, global = true)]
+    trace: bool,
+
+    /// File path for full trace output (required if --trace is enabled)
+    #[arg(long, global = true)]
+    trace_file: Option<PathBuf>,
+
+    /// Filter trace by module/function pattern (regex)
+    #[arg(long, global = true)]
+    trace_filter: Option<String>,
+
+    /// Capture timing information in trace (adds overhead)
+    #[arg(long, global = true)]
+    trace_timing: bool,
 }
 
 #[derive(Subcommand)]
@@ -246,7 +274,7 @@ async fn run_file(path: &PathBuf, cli: &Cli) -> Result<()> {
 }
 
 /// Run JavaScript code using EngineBuilder
-async fn run_code(source: &str, _source_url: &str, cli: &Cli) -> Result<()> {
+async fn run_code(source: &str, source_url: &str, cli: &Cli) -> Result<()> {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
@@ -279,6 +307,33 @@ async fn run_code(source: &str, _source_url: &str, cli: &Cli) -> Result<()> {
         .capabilities(caps)
         .with_http() // Enable Otter.serve()
         .build();
+
+    // Configure trace (either for full trace or timeout dumps)
+    if cli.trace {
+        // Full execution trace mode
+        if cli.trace_file.is_none() {
+            eprintln!("Error: --trace requires --trace-file to be specified");
+            return Err(anyhow::anyhow!("--trace requires --trace-file"));
+        }
+        engine.set_trace_config(otter_vm_core::TraceConfig {
+            enabled: true,
+            mode: otter_vm_core::TraceMode::FullTrace,
+            ring_buffer_size: cli.dump_buffer_size,
+            output_path: cli.trace_file.clone(),
+            filter: cli.trace_filter.clone(),
+            capture_timing: cli.trace_timing,
+        });
+    } else if cli.dump_on_timeout {
+        // Ring buffer mode for timeout dumps only
+        engine.set_trace_config(otter_vm_core::TraceConfig {
+            enabled: true,
+            mode: otter_vm_core::TraceMode::RingBuffer,
+            ring_buffer_size: cli.dump_buffer_size,
+            output_path: cli.dump_file.clone(),
+            filter: None,
+            capture_timing: false,
+        });
+    }
 
     // Set up timeout if specified (0 = no timeout)
     let timeout_handle = if cli.timeout > 0 {
@@ -360,6 +415,10 @@ async fn run_code(source: &str, _source_url: &str, cli: &Cli) -> Result<()> {
         Err(e) => {
             let err_str = e.to_string();
             if err_str.contains("interrupted") || err_str.contains("Interrupted") {
+                // Dump debug snapshot on timeout if enabled
+                if cli.dump_on_timeout {
+                    dump_timeout_info(&engine, &cli, Some(source_url));
+                }
                 Err(anyhow::anyhow!(
                     "Execution timed out after {} seconds",
                     cli.timeout
@@ -380,6 +439,33 @@ async fn run_repl(cli: &Cli) -> Result<()> {
 
     let caps = build_capabilities(cli);
     let mut engine = EngineBuilder::new().capabilities(caps).with_http().build();
+
+    // Configure trace (though REPL usually doesn't timeout or use full trace)
+    if cli.trace {
+        // Full execution trace mode
+        if cli.trace_file.is_none() {
+            eprintln!("Error: --trace requires --trace-file to be specified");
+            return Err(anyhow::anyhow!("--trace requires --trace-file"));
+        }
+        engine.set_trace_config(otter_vm_core::TraceConfig {
+            enabled: true,
+            mode: otter_vm_core::TraceMode::FullTrace,
+            ring_buffer_size: cli.dump_buffer_size,
+            output_path: cli.trace_file.clone(),
+            filter: cli.trace_filter.clone(),
+            capture_timing: cli.trace_timing,
+        });
+    } else if cli.dump_on_timeout {
+        // Ring buffer mode for timeout dumps only
+        engine.set_trace_config(otter_vm_core::TraceConfig {
+            enabled: true,
+            mode: otter_vm_core::TraceMode::RingBuffer,
+            ring_buffer_size: cli.dump_buffer_size,
+            output_path: cli.dump_file.clone(),
+            filter: None,
+            capture_timing: false,
+        });
+    }
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -597,6 +683,33 @@ async fn run_test_file(
 
     let mut engine = EngineBuilder::new().capabilities(caps).with_http().build();
 
+    // Configure trace (either for full trace or timeout dumps)
+    if cli.trace {
+        // Full execution trace mode
+        if cli.trace_file.is_none() {
+            eprintln!("Error: --trace requires --trace-file to be specified");
+            return Err(anyhow::anyhow!("--trace requires --trace-file"));
+        }
+        engine.set_trace_config(otter_vm_core::TraceConfig {
+            enabled: true,
+            mode: otter_vm_core::TraceMode::FullTrace,
+            ring_buffer_size: cli.dump_buffer_size,
+            output_path: cli.trace_file.clone(),
+            filter: cli.trace_filter.clone(),
+            capture_timing: cli.trace_timing,
+        });
+    } else if cli.dump_on_timeout {
+        // Ring buffer mode for timeout dumps only
+        engine.set_trace_config(otter_vm_core::TraceConfig {
+            enabled: true,
+            mode: otter_vm_core::TraceMode::RingBuffer,
+            ring_buffer_size: cli.dump_buffer_size,
+            output_path: cli.dump_file.clone(),
+            filter: None,
+            capture_timing: false,
+        });
+    }
+
     // Inject test framework
     let filter_json = match filter {
         Some(f) => format!("\"{}\"", f),
@@ -773,4 +886,43 @@ fn format_value(value: &Value) -> String {
     }
 
     "[unknown]".to_string()
+}
+
+/// Dump debug information when execution times out
+fn dump_timeout_info(engine: &otter_engine::Otter, cli: &Cli, source_path: Option<&str>) {
+    use std::io::Write;
+
+    let source_desc = source_path
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "<eval>".to_string());
+
+    let header = format!(
+        "\n═══════════════════════════════════════════════════════════════\n\
+         TIMEOUT DETECTED: {}\n\
+         Timeout: {} seconds\n\
+         ═══════════════════════════════════════════════════════════════\n",
+        source_desc, cli.timeout
+    );
+
+    if let Some(ref dump_file) = cli.dump_file {
+        // Write to file
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dump_file)
+        {
+            let _ = write!(file, "{}", header);
+            let _ = engine.dump_snapshot(&mut file);
+            eprintln!("Debug snapshot written to: {}", dump_file.display());
+        } else {
+            eprintln!("Failed to open dump file: {:?}", dump_file);
+            // Fallback to stderr
+            eprint!("{}", header);
+            let _ = engine.dump_snapshot(&mut std::io::stderr());
+        }
+    } else {
+        // Write to stderr
+        eprint!("{}", header);
+        let _ = engine.dump_snapshot(&mut std::io::stderr());
+    }
 }

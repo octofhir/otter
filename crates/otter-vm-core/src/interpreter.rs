@@ -2,7 +2,7 @@
 //!
 //! Executes bytecode instructions.
 
-use otter_vm_bytecode::{Instruction, Module, TypeFlags, UpvalueCapture};
+use otter_vm_bytecode::{Instruction, Module, Register, TypeFlags, UpvalueCapture};
 
 use crate::async_context::{AsyncContext, VmExecutionResult};
 use crate::context::VmContext;
@@ -20,6 +20,9 @@ use crate::value::{Closure, HeapRef, UpvalueCell, Value};
 use num_bigint::BigInt as NumBigInt;
 use num_traits::{One, ToPrimitive, Zero};
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+static DUMPED_ASSERT_RT: AtomicBool = AtomicBool::new(false);
 use std::sync::Arc;
 
 /// The bytecode interpreter
@@ -387,6 +390,8 @@ impl Interpreter {
                 }
                 // Check for GC trigger at safepoint
                 ctx.maybe_collect_garbage();
+                // Update debug snapshot
+                ctx.update_debug_snapshot();
             }
 
             let frame = match ctx.current_frame() {
@@ -425,6 +430,13 @@ impl Interpreter {
             // Record instruction execution for profiling
             ctx.record_instruction();
 
+            // Capture trace data while frame is borrowed (record after execution)
+            let trace_data = if ctx.trace_state.is_some() {
+                Some((frame.pc, frame.function_index, Arc::clone(&frame.module), instruction.clone()))
+            } else {
+                None
+            };
+
             // Execute the instruction
             let instruction_result = match self.execute_instruction(instruction, module_ref, ctx) {
                 Ok(result) => result,
@@ -446,11 +458,32 @@ impl Interpreter {
                 },
             };
 
+            // Record trace entry now that ctx is free (after execution, before state update)
+            if let Some((pc, function_index, module, instruction)) = trace_data {
+                ctx.record_trace_entry(&instruction, pc, function_index, &module);
+            }
+
             match instruction_result {
                 InstructionResult::Continue => {
                     ctx.advance_pc();
                 }
                 InstructionResult::Jump(offset) => {
+                    if std::env::var("OTTER_TRACE_ASSERT_JUMP_APPLY").is_ok() {
+                        if let Some(frame) = ctx.current_frame() {
+                            if let Some(func) = frame.module.function(frame.function_index) {
+                                if func.name.as_deref() == Some("assert") {
+                                    let old_pc = frame.pc;
+                                    let new_pc = (old_pc as i64 + offset as i64) as usize;
+                                    eprintln!(
+                                        "[OTTER_TRACE_ASSERT_JUMP_APPLY] pc={} offset={} new_pc={}",
+                                        old_pc,
+                                        offset,
+                                        new_pc
+                                    );
+                                }
+                            }
+                        }
+                    }
                     ctx.jump(offset);
                 }
                 InstructionResult::Return(value) => {
@@ -721,6 +754,8 @@ impl Interpreter {
                 }
                 // Check for GC trigger at safepoint
                 ctx.maybe_collect_garbage();
+                // Update debug snapshot
+                ctx.update_debug_snapshot();
             }
 
             let frame = ctx
@@ -739,6 +774,29 @@ impl Interpreter {
                 .function(frame.function_index)
                 .ok_or_else(|| VmError::internal("function not found"))?;
 
+            if std::env::var("OTTER_TRACE_ASSERT_PC").is_ok()
+                && func.name.as_deref() == Some("assert")
+            {
+                eprintln!(
+                    "[OTTER_TRACE_ASSERT_PC] frame_id={} pc={}",
+                    frame.frame_id, frame.pc
+                );
+            }
+
+            if std::env::var("OTTER_DUMP_ASSERT_RT").is_ok()
+                && func.name.as_deref() == Some("assert")
+                && !DUMPED_ASSERT_RT.swap(true, AtomicOrdering::SeqCst)
+            {
+                eprintln!(
+                    "[OTTER_DUMP_ASSERT_RT] function=assert instructions={} registers={}",
+                    func.instructions.len(),
+                    func.register_count
+                );
+                for (idx, instr) in func.instructions.iter().enumerate() {
+                    eprintln!("  {:04} {:?}", idx, instr);
+                }
+            }
+
             // Check if we've reached the end of the function
             if frame.pc >= func.instructions.len() {
                 // Implicit return undefined
@@ -755,6 +813,13 @@ impl Interpreter {
 
             // Record instruction execution for profiling
             ctx.record_instruction();
+
+            // Capture trace data while frame is borrowed (record after execution)
+            let trace_data = if ctx.trace_state.is_some() {
+                Some((frame.pc, frame.function_index, Arc::clone(&frame.module), instruction.clone()))
+            } else {
+                None
+            };
 
             // Execute the instruction
             let instruction_result = match self.execute_instruction(instruction, module_ref, ctx) {
@@ -776,6 +841,11 @@ impl Interpreter {
                     other => return Err(other),
                 },
             };
+
+            // Record trace entry now that ctx is free (after execution, before state update)
+            if let Some((pc, function_index, module, instruction)) = trace_data {
+                ctx.record_trace_entry(&instruction, pc, function_index, &module);
+            }
 
             match instruction_result {
                 InstructionResult::Continue => {
@@ -1073,12 +1143,45 @@ impl Interpreter {
             // ==================== Variables ====================
             Instruction::GetLocal { dst, idx } => {
                 let value = ctx.get_local(idx.0)?;
+                if std::env::var("OTTER_TRACE_ASSERT_GETLOCAL").is_ok() {
+                    if let Some(frame) = ctx.current_frame() {
+                        if let Some(func) = frame.module.function(frame.function_index) {
+                            if func.name.as_deref() == Some("assert") {
+                                eprintln!(
+                                    "[OTTER_TRACE_ASSERT_GETLOCAL] idx={} dst_reg={} type={}",
+                                    idx.0,
+                                    dst.0,
+                                    value.type_of()
+                                );
+                            }
+                        }
+                    }
+                }
                 ctx.set_register(dst.0, value);
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::SetLocal { idx, src } => {
                 let value = ctx.get_register(src.0).clone();
+                if std::env::var("OTTER_TRACE_ASSERT_SETLOCAL").is_ok()
+                    && idx.0 == 2
+                    && ctx
+                        .current_frame()
+                        .and_then(|frame| frame.module.function(frame.function_index))
+                        .and_then(|func| func.name.as_deref())
+                        == Some("main")
+                {
+                    let has_open = ctx
+                        .open_upvalues_to_trace()
+                        .contains_key(&(ctx.current_frame().unwrap().frame_id, idx.0));
+                    eprintln!(
+                        "[OTTER_TRACE_ASSERT_SETLOCAL] func=main idx={} type={} open_upvalue={}",
+                        idx.0,
+                        value.type_of()
+                        ,
+                        has_open
+                    );
+                }
                 ctx.set_local(idx.0, value)?;
                 Ok(InstructionResult::Continue)
             }
@@ -1086,6 +1189,55 @@ impl Interpreter {
             Instruction::GetUpvalue { dst, idx } => {
                 // Get value from upvalue cell
                 let value = ctx.get_upvalue(idx.0)?;
+                if std::env::var("OTTER_TRACE_ASSERT_UPVALUE").is_ok() {
+                    if let Some(frame) = ctx.current_frame() {
+                        if let Some(func) = frame.module.function(frame.function_index) {
+                            if func.name.as_deref() == Some("assert") {
+                                eprintln!(
+                                    "[OTTER_TRACE_ASSERT_UPVALUE] func=assert idx={} dst_reg={} type={}",
+                                    idx.0,
+                                    dst.0,
+                                    value.type_of()
+                                );
+                            }
+                        }
+                    }
+                }
+                if std::env::var("OTTER_TRACE_ASSERT_UPVALUE0").is_ok() && idx.0 == 0 {
+                    eprintln!(
+                        "[OTTER_TRACE_ASSERT_UPVALUE0] idx=0 dst_reg={} type={}",
+                        dst.0,
+                        value.type_of()
+                    );
+                }
+                if std::env::var("OTTER_TRACE_ASSERT_UPVALUE0_ASSERT").is_ok() && idx.0 == 0 {
+                    if let Some(frame) = ctx.current_frame() {
+                        if let Some(func) = frame.module.function(frame.function_index) {
+                            if func.name.as_deref() == Some("assert") {
+                                eprintln!(
+                                    "[OTTER_TRACE_ASSERT_UPVALUE0_ASSERT] pc={} dst_reg={} type={}",
+                                    frame.pc,
+                                    dst.0,
+                                    value.type_of()
+                                );
+                            }
+                        }
+                    }
+                }
+                if std::env::var("OTTER_TRACE_ASSERT_UPVALUE_WRITE").is_ok() && idx.0 == 0 {
+                    if let Some(frame) = ctx.current_frame() {
+                        if let Some(func) = frame.module.function(frame.function_index) {
+                            if func.name.as_deref() == Some("assert") {
+                                eprintln!(
+                                    "[OTTER_TRACE_ASSERT_UPVALUE_WRITE] pc={} dst_reg={} type={}",
+                                    frame.pc,
+                                    dst.0,
+                                    value.type_of()
+                                );
+                            }
+                        }
+                    }
+                }
                 ctx.set_register(dst.0, value);
                 Ok(InstructionResult::Continue)
             }
@@ -1117,37 +1269,81 @@ impl Interpreter {
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
 
-                // IC Fast Path
-                let cached_value = {
-                    let global_obj = ctx.global();
+                let trace_assert_globals =
+                    std::env::var("OTTER_TRACE_ASSERT_GLOBALS").is_ok();
+                let is_assert_func = if trace_assert_globals {
                     let frame = ctx
                         .current_frame()
                         .ok_or_else(|| VmError::internal("no frame"))?;
-                    let func = frame
+                    frame
                         .module
                         .function(frame.function_index)
-                        .ok_or_else(|| VmError::internal("no function"))?;
-                    let feedback = func.feedback_vector.read();
-                    if let Some(ic) = feedback.get(*ic_index as usize) {
-                        if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                            shape_id: shape_addr,
-                            offset,
-                        } = &ic.ic_state
-                        {
-                            if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr {
-                                global_obj.get_by_offset(*offset as usize)
+                        .ok_or_else(|| VmError::internal("no function"))?
+                        .name
+                        .as_deref()
+                        == Some("assert")
+                } else {
+                    false
+                };
+
+                // IC Fast Path
+                let cached_value = {
+                    let global_obj = ctx.global();
+                    if global_obj.is_dictionary_mode() {
+                        None
+                    } else {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        let func = frame
+                            .module
+                            .function(frame.function_index)
+                            .ok_or_else(|| VmError::internal("no function"))?;
+                        let feedback = func.feedback_vector.read();
+                        if let Some(ic) = feedback.get(*ic_index as usize) {
+                            if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                shape_id: shape_addr,
+                                offset,
+                            } = &ic.ic_state
+                            {
+                                if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr {
+                                    global_obj.get_by_offset(*offset as usize)
+                                } else {
+                                    None
+                                }
                             } else {
                                 None
                             }
                         } else {
                             None
                         }
-                    } else {
-                        None
                     }
                 };
 
                 if let Some(value) = cached_value {
+                    if is_assert_func {
+                        eprintln!(
+                            "[OTTER_TRACE_ASSERT_GLOBALS] GetGlobal(ic) name={} type={}",
+                            String::from_utf16_lossy(name_str),
+                            value.type_of()
+                        );
+                    }
+                    let trace_array = std::env::var("OTTER_TRACE_ARRAY").is_ok();
+                    if trace_array && Self::utf16_eq_ascii(name_str, "Array") {
+                        eprintln!(
+                            "[OTTER_TRACE_ARRAY] GetGlobal(ic) name=Array result_type={} obj_ptr={:?}",
+                            value.type_of(),
+                            value.as_object().map(|o| o.as_ptr())
+                        );
+                    }
+                    if std::env::var("OTTER_TRACE_GLOBAL_ASSERT").is_ok()
+                        && Self::utf16_eq_ascii(name_str, "assert")
+                    {
+                        eprintln!(
+                            "[OTTER_TRACE_GLOBAL_ASSERT] GetGlobal(ic) assert type={}",
+                            value.type_of()
+                        );
+                    }
                     ctx.set_register(dst.0, value);
                     return Ok(InstructionResult::Continue);
                 }
@@ -1165,32 +1361,57 @@ impl Interpreter {
                 // Update IC
                 {
                     let global_obj = ctx.global().clone();
-                    let key = Self::utf16_key(name_str);
-                    if let Some(offset) = global_obj.shape().get_offset(&key) {
-                        let frame = ctx
-                            .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let func = frame
-                            .module
-                            .function(frame.function_index)
-                            .ok_or_else(|| VmError::internal("no function"))?;
-                        let mut feedback = func.feedback_vector.write();
-                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if matches!(
-                                ic.ic_state,
-                                otter_vm_bytecode::function::InlineCacheState::Uninitialized
-                            ) {
-                                ic.ic_state =
-                                    otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                                        shape_id: std::sync::Arc::as_ptr(&global_obj.shape())
-                                            as u64,
-                                        offset: offset as u32,
-                                    };
+                    if !global_obj.is_dictionary_mode() {
+                        let key = Self::utf16_key(name_str);
+                        if let Some(offset) = global_obj.shape().get_offset(&key) {
+                            let frame = ctx
+                                .current_frame()
+                                .ok_or_else(|| VmError::internal("no frame"))?;
+                            let func = frame
+                                .module
+                                .function(frame.function_index)
+                                .ok_or_else(|| VmError::internal("no function"))?;
+                            let mut feedback = func.feedback_vector.write();
+                            if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                if matches!(
+                                    ic.ic_state,
+                                    otter_vm_bytecode::function::InlineCacheState::Uninitialized
+                                ) {
+                                    ic.ic_state =
+                                        otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                            shape_id: std::sync::Arc::as_ptr(&global_obj.shape())
+                                                as u64,
+                                            offset: offset as u32,
+                                        };
+                                }
                             }
                         }
                     }
                 }
 
+                let trace_array = std::env::var("OTTER_TRACE_ARRAY").is_ok();
+                if trace_array && Self::utf16_eq_ascii(name_str, "Array") {
+                    eprintln!(
+                        "[OTTER_TRACE_ARRAY] GetGlobal(slow) name=Array result_type={} obj_ptr={:?}",
+                        value.type_of(),
+                        value.as_object().map(|o| o.as_ptr())
+                    );
+                }
+                if std::env::var("OTTER_TRACE_GLOBAL_ASSERT").is_ok()
+                    && Self::utf16_eq_ascii(name_str, "assert")
+                {
+                    eprintln!(
+                        "[OTTER_TRACE_GLOBAL_ASSERT] GetGlobal(slow) assert type={}",
+                        value.type_of()
+                    );
+                }
+                if is_assert_func {
+                    eprintln!(
+                        "[OTTER_TRACE_ASSERT_GLOBALS] GetGlobal(slow) name={} type={}",
+                        String::from_utf16_lossy(name_str),
+                        value.type_of()
+                    );
+                }
                 ctx.set_register(dst.0, value);
                 Ok(InstructionResult::Continue)
             }
@@ -1209,27 +1430,39 @@ impl Interpreter {
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
                 let val_val = ctx.get_register(src.0).clone();
+                if std::env::var("OTTER_TRACE_GLOBAL_ASSERT").is_ok()
+                    && Self::utf16_eq_ascii(name_str, "assert")
+                {
+                    eprintln!(
+                        "[OTTER_TRACE_GLOBAL_ASSERT] SetGlobal assert type={}",
+                        val_val.type_of()
+                    );
+                }
 
                 // IC Fast Path
                 {
                     let global_obj = ctx.global().clone();
-                    let frame = ctx
-                        .current_frame()
-                        .ok_or_else(|| VmError::internal("no frame"))?;
-                    let func = frame
-                        .module
-                        .function(frame.function_index)
-                        .ok_or_else(|| VmError::internal("no function"))?;
-                    let feedback = func.feedback_vector.read();
-                    if let Some(ic) = feedback.get(*ic_index as usize) {
-                        if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                            shape_id: shape_addr,
-                            offset,
-                        } = &ic.ic_state
-                        {
-                            if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr {
-                                if global_obj.set_by_offset(*offset as usize, val_val.clone()) {
-                                    return Ok(InstructionResult::Continue);
+                    if !global_obj.is_dictionary_mode() {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        let func = frame
+                            .module
+                            .function(frame.function_index)
+                            .ok_or_else(|| VmError::internal("no function"))?;
+                        let feedback = func.feedback_vector.read();
+                        if let Some(ic) = feedback.get(*ic_index as usize) {
+                            if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                shape_id: shape_addr,
+                                offset,
+                            } = &ic.ic_state
+                            {
+                                if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr
+                                {
+                                    if global_obj.set_by_offset(*offset as usize, val_val.clone())
+                                    {
+                                        return Ok(InstructionResult::Continue);
+                                    }
                                 }
                             }
                         }
@@ -1241,27 +1474,29 @@ impl Interpreter {
                 // Update IC
                 {
                     let global_obj = ctx.global().clone();
-                    let key = Self::utf16_key(name_str);
-                    if let Some(offset) = global_obj.shape().get_offset(&key) {
-                        let frame = ctx
-                            .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let func = frame
-                            .module
-                            .function(frame.function_index)
-                            .ok_or_else(|| VmError::internal("no function"))?;
-                        let mut feedback = func.feedback_vector.write();
-                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if matches!(
-                                ic.ic_state,
-                                otter_vm_bytecode::function::InlineCacheState::Uninitialized
-                            ) {
-                                ic.ic_state =
-                                    otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                                        shape_id: std::sync::Arc::as_ptr(&global_obj.shape())
-                                            as u64,
-                                        offset: offset as u32,
-                                    };
+                    if !global_obj.is_dictionary_mode() {
+                        let key = Self::utf16_key(name_str);
+                        if let Some(offset) = global_obj.shape().get_offset(&key) {
+                            let frame = ctx
+                                .current_frame()
+                                .ok_or_else(|| VmError::internal("no frame"))?;
+                            let func = frame
+                                .module
+                                .function(frame.function_index)
+                                .ok_or_else(|| VmError::internal("no function"))?;
+                            let mut feedback = func.feedback_vector.write();
+                            if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                if matches!(
+                                    ic.ic_state,
+                                    otter_vm_bytecode::function::InlineCacheState::Uninitialized
+                                ) {
+                                    ic.ic_state =
+                                        otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                            shape_id: std::sync::Arc::as_ptr(&global_obj.shape())
+                                                as u64,
+                                            offset: offset as u32,
+                                        };
+                                }
                             }
                         }
                     }
@@ -1839,6 +2074,21 @@ impl Interpreter {
                 let right = ctx.get_register(rhs.0);
 
                 let result = self.strict_equal(left, right);
+                if std::env::var("OTTER_TRACE_ASSERT_STREQ").is_ok() {
+                    if let Some(frame) = ctx.current_frame() {
+                        if let Some(func) = frame.module.function(frame.function_index) {
+                            if func.name.as_deref() == Some("assert") && frame.pc == 7 {
+                                eprintln!(
+                                    "[OTTER_TRACE_ASSERT_STREQ] pc={} lhs_type={} rhs_type={} result={}",
+                                    frame.pc,
+                                    left.type_of(),
+                                    right.type_of(),
+                                    result
+                                );
+                            }
+                        }
+                    }
+                }
                 ctx.set_register(dst.0, Value::boolean(result));
                 Ok(InstructionResult::Continue)
             }
@@ -2262,7 +2512,25 @@ impl Interpreter {
             }
 
             Instruction::JumpIfFalse { cond, offset } => {
-                if !ctx.get_register(cond.0).to_boolean() {
+                let cond_val = ctx.get_register(cond.0);
+                if std::env::var("OTTER_TRACE_ASSERT_JIF").is_ok() {
+                    if let Some(frame) = ctx.current_frame() {
+                        if let Some(func) = frame.module.function(frame.function_index) {
+                            if func.name.as_deref() == Some("assert") && frame.pc == 8 {
+                                eprintln!(
+                                    "[OTTER_TRACE_ASSERT_JIF] frame_id={} reg_base={} pc={} cond_type={} cond_bool={} offset={}",
+                                    frame.frame_id,
+                                    frame.register_base,
+                                    frame.pc,
+                                    cond_val.type_of(),
+                                    cond_val.to_boolean(),
+                                    offset.0
+                                );
+                            }
+                        }
+                    }
+                }
+                if !cond_val.to_boolean() {
                     Ok(InstructionResult::Jump(offset.0))
                 } else {
                     Ok(InstructionResult::Continue)
@@ -3075,6 +3343,92 @@ impl Interpreter {
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
 
+                if std::env::var("OTTER_DUMP_CALLMETHOD_FUNC").is_ok()
+                    && receiver.is_undefined()
+                    && !DUMPED_ASSERT_RT.load(AtomicOrdering::SeqCst)
+                {
+                    if let Some(frame) = ctx.current_frame() {
+                        if let Some(func) = module.function(frame.function_index) {
+                            eprintln!(
+                                "[OTTER_DUMP_CALLMETHOD_FUNC] frame_id={} reg_base={} function_index={} name={:?} pc={}",
+                                frame.frame_id,
+                                frame.register_base,
+                                frame.function_index,
+                                func.name,
+                                frame.pc
+                            );
+                            eprintln!("  upvalues: {:?}", func.upvalues);
+                            for (idx, cell) in frame.upvalues.iter().enumerate() {
+                                eprintln!(
+                                    "  upvalue_cell[{}] type={}",
+                                    idx,
+                                    cell.get().type_of()
+                                );
+                            }
+                            let argc_usize = *argc as usize;
+                            for i in 0..=argc_usize {
+                                let reg = Register(obj.0 + i as u16);
+                                let val = ctx.get_register(reg.0);
+                                eprintln!(
+                                    "  call_reg[{}]=r{} type={}",
+                                    i,
+                                    reg.0,
+                                    val.type_of()
+                                );
+                            }
+                            for (idx, local) in frame.locals.iter().enumerate().take(4) {
+                                eprintln!("  local[{}] type={}", idx, local.type_of());
+                            }
+                            for (idx, instr) in func.instructions.iter().enumerate() {
+                                eprintln!("  {:04} {:?}", idx, instr);
+                            }
+                            let stack = ctx.call_stack();
+                            if stack.len() >= 2 {
+                                let parent = &stack[stack.len() - 2];
+                                if let Some(parent_func) =
+                                    parent.module.function(parent.function_index)
+                                {
+                                    eprintln!(
+                                        "  parent_function_index={} name={:?}",
+                                        parent.function_index, parent_func.name
+                                    );
+                                    eprintln!("  parent_local_names={:?}", parent_func.local_names);
+                                    for (idx, capture) in func.upvalues.iter().enumerate() {
+                                        match capture {
+                                            otter_vm_bytecode::UpvalueCapture::Local(local_idx) => {
+                                                let local_i = local_idx.0 as usize;
+                                                let name = parent_func
+                                                    .local_names
+                                                    .get(local_i)
+                                                    .cloned()
+                                                    .unwrap_or_else(|| "<unknown>".to_string());
+                                                let value_type = parent
+                                                    .locals
+                                                    .get(local_i)
+                                                    .map(|v| v.type_of())
+                                                    .unwrap_or("<out-of-range>");
+                                                eprintln!(
+                                                    "  upvalue[{}]=Local({}) name={} type={}",
+                                                    idx, local_i, name, value_type
+                                                );
+                                            }
+                                            otter_vm_bytecode::UpvalueCapture::Upvalue(
+                                                up_idx,
+                                            ) => {
+                                                eprintln!(
+                                                    "  upvalue[{}]=Upvalue({})",
+                                                    idx, up_idx.0
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            DUMPED_ASSERT_RT.store(true, AtomicOrdering::SeqCst);
+                        }
+                    }
+                }
+
                 // IC Fast Path
                 let cached_method = if let Some(obj_ref) = receiver.as_object() {
                     let frame = ctx
@@ -3389,6 +3743,29 @@ impl Interpreter {
                         .get(&Self::utf16_key(method_name))
                         .unwrap_or_else(Value::undefined)
                 } else {
+                    if std::env::var("OTTER_TRACE_CALLMETHOD").is_ok() {
+                        let (func_name, source_url, pc) = ctx
+                            .current_frame()
+                            .and_then(|frame| {
+                                let func = frame.module.function(frame.function_index);
+                                Some((
+                                    func.and_then(|f| f.name.clone())
+                                        .unwrap_or_else(|| "(anonymous)".to_string()),
+                                    frame.module.source_url.clone(),
+                                    frame.pc,
+                                ))
+                            })
+                            .unwrap_or_else(|| ("(no-frame)".to_string(), "(unknown)".to_string(), 0));
+                        eprintln!(
+                            "[OTTER_TRACE_CALLMETHOD] receiver_type={} method={} func={} pc={} source={} obj_reg={}",
+                            receiver.type_of(),
+                            String::from_utf16_lossy(method_name),
+                            func_name,
+                            pc,
+                            source_url,
+                            obj.0
+                        );
+                    }
                     return Err(VmError::type_error("Cannot read property of non-object"));
                 };
 
@@ -3771,6 +4148,29 @@ impl Interpreter {
                 let name_str = name_const
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
+                let trace_array = std::env::var("OTTER_TRACE_ARRAY").is_ok();
+                let is_global = object
+                    .as_object()
+                    .map(|o| o.as_ptr() == ctx.global().as_ptr())
+                    .unwrap_or(false);
+                let array_ctor_obj = ctx
+                    .global()
+                    .get(&PropertyKey::string("Array"))
+                    .and_then(|v| v.as_object());
+                let array_proto_obj = array_ctor_obj.and_then(|array_obj| {
+                    array_obj
+                        .get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object())
+                });
+                let array_proto_ptr = array_proto_obj.map(|proto| proto.as_ptr());
+                let is_array_proto = object
+                    .as_object()
+                    .map(|o| Some(o.as_ptr()) == array_proto_ptr)
+                    .unwrap_or(false);
+                let is_array_ctor = object
+                    .as_object()
+                    .map(|o| Some(o.as_ptr()) == array_ctor_obj.map(|a| a.as_ptr()))
+                    .unwrap_or(false);
 
                 // Proxy check - must be first
                 if let Some(proxy) = object.as_proxy() {
@@ -3781,6 +4181,19 @@ impl Interpreter {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
                         crate::proxy_operations::proxy_get(&mut ncx, proxy, &key, key_value, receiver)?
                     };
+                    if trace_array
+                        && (Self::utf16_eq_ascii(name_str, "Array")
+                            || Self::utf16_eq_ascii(name_str, "prototype")
+                            || Self::utf16_eq_ascii(name_str, "map"))
+                    {
+                        eprintln!(
+                            "[OTTER_TRACE_ARRAY] GetPropConst(proxy) name={} is_global={} is_array_proto={} result_type={}",
+                            String::from_utf16_lossy(name_str),
+                            is_global,
+                            is_array_proto,
+                            result.type_of()
+                        );
+                    }
                     ctx.set_register(dst.0, result);
                     return Ok(InstructionResult::Continue);
                 }
@@ -3829,6 +4242,19 @@ impl Interpreter {
                         {
                             let key = Self::utf16_key(name_str);
                             let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                            if trace_array
+                                && (Self::utf16_eq_ascii(name_str, "Array")
+                                    || Self::utf16_eq_ascii(name_str, "prototype")
+                                    || Self::utf16_eq_ascii(name_str, "map"))
+                            {
+                                eprintln!(
+                                    "[OTTER_TRACE_ARRAY] GetPropConst(string-proto) name={} is_global={} is_array_proto={} result_type={}",
+                                    String::from_utf16_lossy(name_str),
+                                    is_global,
+                                    is_array_proto,
+                                    value.type_of()
+                                );
+                            }
                             ctx.set_register(dst.0, value);
                             return Ok(InstructionResult::Continue);
                         }
@@ -3840,12 +4266,50 @@ impl Interpreter {
                     let key = Self::utf16_key(name_str);
                     // Check the function's internal object first (for properties like .prototype, .length, .name)
                     if let Some(val) = closure.object.get(&key) {
+                        if trace_array
+                            && (Self::utf16_eq_ascii(name_str, "Array")
+                                || Self::utf16_eq_ascii(name_str, "prototype")
+                                || Self::utf16_eq_ascii(name_str, "map"))
+                        {
+                            eprintln!(
+                                "[OTTER_TRACE_ARRAY] GetPropConst(function-obj) name={} is_global={} is_array_proto={} result_type={}",
+                                String::from_utf16_lossy(name_str),
+                                is_global,
+                                is_array_proto,
+                                val.type_of()
+                            );
+                            if Self::utf16_eq_ascii(name_str, "prototype") && is_array_ctor {
+                                let proto_match = val
+                                    .as_object()
+                                    .map(|p| Some(p.as_ptr()) == array_proto_ptr)
+                                    .unwrap_or(false);
+                                eprintln!(
+                                    "[OTTER_TRACE_ARRAY] Array.prototype from ctor match={} proto_ptr={:?} val_ptr={:?}",
+                                    proto_match,
+                                    array_proto_ptr,
+                                    val.as_object().map(|p| p.as_ptr())
+                                );
+                            }
+                        }
                         ctx.set_register(dst.0, val);
                         return Ok(InstructionResult::Continue);
                     }
                     // Check prototype chain
                     if let Some(proto) = closure.object.prototype() {
                         if let Some(val) = proto.get(&key) {
+                            if trace_array
+                                && (Self::utf16_eq_ascii(name_str, "Array")
+                                    || Self::utf16_eq_ascii(name_str, "prototype")
+                                    || Self::utf16_eq_ascii(name_str, "map"))
+                            {
+                                eprintln!(
+                                    "[OTTER_TRACE_ARRAY] GetPropConst(function-proto) name={} is_global={} is_array_proto={} result_type={}",
+                                    String::from_utf16_lossy(name_str),
+                                    is_global,
+                                    is_array_proto,
+                                    val.type_of()
+                                );
+                            }
                             ctx.set_register(dst.0, val);
                             return Ok(InstructionResult::Continue);
                         }
@@ -3863,7 +4327,7 @@ impl Interpreter {
                     }
 
                     let mut cached_val = None;
-                    {
+                    if !obj_ref.is_dictionary_mode() {
                         let frame = ctx
                             .current_frame()
                             .ok_or_else(|| VmError::internal("no frame"))?;
@@ -3899,6 +4363,19 @@ impl Interpreter {
                     }
 
                     if let Some(val) = cached_val {
+                        if trace_array
+                            && (Self::utf16_eq_ascii(name_str, "Array")
+                                || Self::utf16_eq_ascii(name_str, "prototype")
+                                || Self::utf16_eq_ascii(name_str, "map"))
+                        {
+                            eprintln!(
+                                "[OTTER_TRACE_ARRAY] GetPropConst(ic) name={} is_global={} is_array_proto={} result_type={}",
+                                String::from_utf16_lossy(name_str),
+                                is_global,
+                                is_array_proto,
+                                val.type_of()
+                            );
+                        }
                         ctx.set_register(dst.0, val);
                         return Ok(InstructionResult::Continue);
                     }
@@ -4029,6 +4506,19 @@ impl Interpreter {
                             }
 
                             let value = obj.get(&key).unwrap_or_else(Value::undefined);
+                            if trace_array
+                                && (Self::utf16_eq_ascii(name_str, "Array")
+                                    || Self::utf16_eq_ascii(name_str, "prototype")
+                                    || Self::utf16_eq_ascii(name_str, "map"))
+                            {
+                                eprintln!(
+                                    "[OTTER_TRACE_ARRAY] GetPropConst(slow) name={} is_global={} is_array_proto={} result_type={}",
+                                    String::from_utf16_lossy(name_str),
+                                    is_global,
+                                    is_array_proto,
+                                    value.type_of()
+                                );
+                            }
                             ctx.set_register(dst.0, value);
                             Ok(InstructionResult::Continue)
                         }
@@ -5625,6 +6115,20 @@ impl Interpreter {
             // ==================== Misc ====================
             Instruction::Move { dst, src } => {
                 let value = ctx.get_register(src.0).clone();
+                if std::env::var("OTTER_TRACE_ASSERT_MOVE").is_ok() {
+                    if let Some(frame) = ctx.current_frame() {
+                        if let Some(func) = frame.module.function(frame.function_index) {
+                            if func.name.as_deref() == Some("assert") {
+                                eprintln!(
+                                    "[OTTER_TRACE_ASSERT_MOVE] func=assert src_reg={} dst_reg={} src_type={}",
+                                    src.0,
+                                    dst.0,
+                                    value.type_of()
+                                );
+                            }
+                        }
+                    }
+                }
                 ctx.set_register(dst.0, value);
                 Ok(InstructionResult::Continue)
             }
@@ -9479,6 +9983,13 @@ impl Interpreter {
             let instruction = &func.instructions[frame.pc];
             ctx.record_instruction();
 
+            // Capture trace data while frame is borrowed (record after execution)
+            let trace_data = if ctx.trace_state.is_some() {
+                Some((frame.pc, frame.function_index, Arc::clone(&frame.module), instruction.clone()))
+            } else {
+                None
+            };
+
             // Execute instruction
             let instruction_result = match self.execute_instruction(instruction, module_ref, ctx) {
                 Ok(result) => result,
@@ -9501,6 +10012,11 @@ impl Interpreter {
                     }
                 },
             };
+
+            // Record trace entry now that ctx is free (after execution, before state update)
+            if let Some((pc, function_index, module, instruction)) = trace_data {
+                ctx.record_trace_entry(&instruction, pc, function_index, &module);
+            }
 
             match instruction_result {
                 InstructionResult::Continue => {

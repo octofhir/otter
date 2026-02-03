@@ -32,7 +32,7 @@ use crate::string::JsString;
 use std::sync::Arc;
 
 /// Helper to convert Value to PropertyKey
-fn to_property_key(value: &Value) -> PropertyKey {
+pub fn to_property_key(value: &Value) -> PropertyKey {
     if let Some(n) = value.as_number() {
         if n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64 {
             return PropertyKey::Index(n as u32);

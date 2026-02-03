@@ -18,6 +18,7 @@ parking_lot = "0.12"
 dashmap = "6"
 rustc-hash = "2"
 regress = { version = "0.10.5", features = ["utf16"] }
+regex = "1"
 num-bigint = "0.4"
 num-traits = "0.2"
 chrono = "0.4"

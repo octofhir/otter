@@ -767,7 +767,8 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
             }
         }
 
-        global.define_property(PropertyKey::string(name), PropertyDescriptor::data(ctor));
+        // Per ES2023 §18: Global constructors are { writable: true, enumerable: false, configurable: true }
+        global.define_property(PropertyKey::string(name), PropertyDescriptor::builtin_method(ctor));
     }
 }
 

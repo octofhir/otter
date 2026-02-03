@@ -59,7 +59,7 @@ pub fn init_function_prototype(
     fn_proto.define_property(
         PropertyKey::string("toString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 // Check if this is a closure
                 if this_val.is_function() {
                     if let Some(closure) = this_val.as_function() {
@@ -97,7 +97,7 @@ pub fn init_function_prototype(
     fn_proto.define_property(
         PropertyKey::string("call"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, mm| {
+            |this_val, args, ncx| {
                 // this_val is the function to call
                 // args[0] is thisArg
                 // args[1..] are the arguments
@@ -123,7 +123,7 @@ pub fn init_function_prototype(
                 // For native functions, try direct call
                 if let Some(native_fn) = this_val.as_native_function() {
                     // ✅ FAST PATH: Native function - direct call
-                    return native_fn(&this_arg, &call_args, mm.clone());
+                    return native_fn(&this_arg, &call_args, ncx);
                 }
 
                 // Shouldn't reach here
@@ -140,7 +140,7 @@ pub fn init_function_prototype(
     fn_proto.define_property(
         PropertyKey::string("apply"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, mm| {
+            |this_val, args, ncx| {
                 // this_val is the function to call
                 // args[0] is thisArg
                 // args[1] is argsArray
@@ -182,7 +182,7 @@ pub fn init_function_prototype(
                 // For native functions, try direct call
                 if let Some(native_fn) = this_val.as_native_function() {
                     // ✅ FAST PATH: Native function - direct call
-                    return native_fn(&this_arg, &call_args, mm.clone());
+                    return native_fn(&this_arg, &call_args, ncx);
                 }
 
                 // Shouldn't reach here
@@ -200,12 +200,12 @@ pub fn init_function_prototype(
     fn_proto.define_property(
         PropertyKey::string("bind"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            move |this_val, args, mm| {
+            move |this_val, args, ncx| {
                 // this_val is the function being bound
                 let this_arg = args.first().cloned().unwrap_or(Value::undefined());
 
                 // Create bound function object with Function.prototype as prototype
-                let bound = GcRef::new(JsObject::new(Some(fn_proto_for_bind.clone()), mm.clone()));
+                let bound = GcRef::new(JsObject::new(Some(fn_proto_for_bind.clone()), ncx.memory_manager().clone()));
 
                 // Store the original function
                 bound.set(
@@ -218,7 +218,7 @@ pub fn init_function_prototype(
 
                 // Store bound arguments (if any)
                 if args.len() > 1 {
-                    let arr = GcRef::new(JsObject::new(None, mm.clone()));
+                    let arr = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
                     for (i, arg) in args[1..].iter().enumerate() {
                         arr.set(PropertyKey::Index(i as u32), arg.clone());
                     }

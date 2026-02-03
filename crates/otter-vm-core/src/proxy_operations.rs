@@ -19,7 +19,7 @@ use std::sync::Arc;
 /// - `Ok(None)` if the trap doesn't exist (caller should use default behavior)
 /// - `Err(...)` if the trap exists but threw an error or isn't callable
 fn invoke_trap(
-    interpreter: &mut Interpreter,
+    interpreter: &Interpreter,
     ctx: &mut VmContext,
     proxy: &Arc<JsProxy>,
     trap_name: &str,
@@ -61,7 +61,7 @@ fn invoke_trap(
 ///
 /// Implements the `get` trap with proper invariant validation.
 pub fn proxy_get(
-    interpreter: &mut Interpreter,
+    interpreter: &Interpreter,
     ctx: &mut VmContext,
     proxy: &Arc<JsProxy>,
     key: &PropertyKey,
@@ -141,7 +141,7 @@ fn validate_get_trap_invariants(
 ///
 /// Implements the `set` trap with proper invariant validation.
 pub fn proxy_set(
-    interpreter: &mut Interpreter,
+    interpreter: &Interpreter,
     ctx: &mut VmContext,
     proxy: &Arc<JsProxy>,
     key: &PropertyKey,
@@ -231,7 +231,7 @@ fn validate_set_trap_invariants(
 ///
 /// Implements the `has` trap with proper invariant validation.
 pub fn proxy_has(
-    interpreter: &mut Interpreter,
+    interpreter: &Interpreter,
     ctx: &mut VmContext,
     proxy: &Arc<JsProxy>,
     key: &PropertyKey,
@@ -297,7 +297,7 @@ fn validate_has_trap_invariants(
 ///
 /// Implements the `deleteProperty` trap with proper invariant validation.
 pub fn proxy_delete_property(
-    interpreter: &mut Interpreter,
+    interpreter: &Interpreter,
     ctx: &mut VmContext,
     proxy: &Arc<JsProxy>,
     key: &PropertyKey,
@@ -353,7 +353,7 @@ fn validate_delete_trap_invariants(
 ///
 /// Implements the `ownKeys` trap with proper invariant validation.
 pub fn proxy_own_keys(
-    interpreter: &mut Interpreter,
+    interpreter: &Interpreter,
     ctx: &mut VmContext,
     proxy: &Arc<JsProxy>,
 ) -> VmResult<Vec<PropertyKey>> {
@@ -461,7 +461,7 @@ fn validate_own_keys_trap_invariants(
 ///
 /// Implements the `getOwnPropertyDescriptor` trap with proper invariant validation.
 pub fn proxy_get_own_property_descriptor(
-    interpreter: &mut Interpreter,
+    interpreter: &Interpreter,
     ctx: &mut VmContext,
     proxy: &Arc<JsProxy>,
     key: &PropertyKey,
@@ -570,7 +570,7 @@ fn validate_get_own_property_descriptor_invariants(
 ///
 /// Implements the `defineProperty` trap with proper invariant validation.
 pub fn proxy_define_property(
-    interpreter: &mut Interpreter,
+    interpreter: &Interpreter,
     ctx: &mut VmContext,
     proxy: &Arc<JsProxy>,
     key: &PropertyKey,
@@ -727,7 +727,7 @@ fn descriptor_from_object(obj: &GcRef<JsObject>) -> VmResult<PropertyDescriptor>
 ///
 /// Implements the `getPrototypeOf` trap with proper invariant validation.
 pub fn proxy_get_prototype_of(
-    interpreter: &mut Interpreter,
+    interpreter: &Interpreter,
     ctx: &mut VmContext,
     proxy: &Arc<JsProxy>,
 ) -> VmResult<Option<GcRef<JsObject>>> {
@@ -796,7 +796,7 @@ fn validate_get_prototype_of_invariants(
 ///
 /// Implements the `setPrototypeOf` trap with proper invariant validation.
 pub fn proxy_set_prototype_of(
-    interpreter: &mut Interpreter,
+    interpreter: &Interpreter,
     ctx: &mut VmContext,
     proxy: &Arc<JsProxy>,
     proto: Option<GcRef<JsObject>>,
@@ -864,7 +864,7 @@ fn validate_set_prototype_of_invariants(
 ///
 /// Implements the `isExtensible` trap with proper invariant validation.
 pub fn proxy_is_extensible(
-    interpreter: &mut Interpreter,
+    interpreter: &Interpreter,
     ctx: &mut VmContext,
     proxy: &Arc<JsProxy>,
 ) -> VmResult<bool> {
@@ -901,7 +901,7 @@ pub fn proxy_is_extensible(
 ///
 /// Implements the `preventExtensions` trap with proper invariant validation.
 pub fn proxy_prevent_extensions(
-    interpreter: &mut Interpreter,
+    interpreter: &Interpreter,
     ctx: &mut VmContext,
     proxy: &Arc<JsProxy>,
 ) -> VmResult<bool> {
@@ -938,7 +938,7 @@ pub fn proxy_prevent_extensions(
 ///
 /// Implements the `apply` trap for function calls.
 pub fn proxy_apply(
-    interpreter: &mut Interpreter,
+    interpreter: &Interpreter,
     ctx: &mut VmContext,
     proxy: &Arc<JsProxy>,
     this_value: Value,
@@ -981,7 +981,7 @@ pub fn proxy_apply(
 ///
 /// Implements the `construct` trap for constructor calls.
 pub fn proxy_construct(
-    interpreter: &mut Interpreter,
+    interpreter: &Interpreter,
     ctx: &mut VmContext,
     proxy: &Arc<JsProxy>,
     args: &[Value],

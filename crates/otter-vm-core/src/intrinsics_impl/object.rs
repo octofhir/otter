@@ -20,7 +20,7 @@ pub fn init_object_prototype(
     object_proto.define_property(
         PropertyKey::string("toString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, _args, _mm| Ok(Value::string(JsString::intern("[object Object]"))),
+            |_this, _args, _ncx| Ok(Value::string(JsString::intern("[object Object]"))),
             mm.clone(),
             fn_proto.clone(),
         )),
@@ -30,7 +30,7 @@ pub fn init_object_prototype(
     object_proto.define_property(
         PropertyKey::string("valueOf"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| Ok(this_val.clone()),
+            |this_val, _args, _ncx| Ok(this_val.clone()),
             mm.clone(),
             fn_proto.clone(),
         )),
@@ -40,7 +40,7 @@ pub fn init_object_prototype(
     object_proto.define_property(
         PropertyKey::string("hasOwnProperty"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 if let Some(obj) = this_val.as_object() {
                     if let Some(key) = args.first() {
                         if let Some(s) = key.as_string() {
@@ -61,7 +61,7 @@ pub fn init_object_prototype(
     object_proto.define_property(
         PropertyKey::string("isPrototypeOf"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 if let Some(target) = args.first().and_then(|v| v.as_object()) {
                     if let Some(this_obj) = this_val.as_object() {
                         let mut current = target.prototype();
@@ -87,7 +87,7 @@ pub fn init_object_prototype(
     object_proto.define_property(
         PropertyKey::string("propertyIsEnumerable"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 if let Some(obj) = this_val.as_object() {
                     if let Some(key) = args.first() {
                         if let Some(s) = key.as_string() {
@@ -116,7 +116,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("getPrototypeOf"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 if let Some(obj) = args.first().and_then(|v| v.as_object()) {
                     match obj.prototype() {
                         Some(proto) => Ok(Value::object(proto)),
@@ -135,7 +135,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("setPrototypeOf"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let target = args.first().cloned().unwrap_or(Value::undefined());
                 if let Some(obj) = target.as_object() {
                     let proto_val = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -161,7 +161,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("getOwnPropertyDescriptor"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, mm_inner| {
+            |_this, args, ncx_inner| {
                 let target = args.first().and_then(|v| v.as_object());
                 let key = args.get(1).and_then(|v| v.as_string());
                 if let (Some(obj), Some(key_str)) = (target, key) {
@@ -169,7 +169,7 @@ pub fn init_object_constructor(
                     if let Some(desc) = obj.get_own_property_descriptor(&pk) {
                         // Build descriptor object
                         let desc_obj =
-                            GcRef::new(JsObject::new(None, mm_inner));
+                            GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
                         match &desc {
                             PropertyDescriptor::Data { value, attributes } => {
                                 desc_obj.set(
@@ -227,7 +227,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("keys"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let obj = args
                     .first()
                     .and_then(|v| v.as_object())
@@ -255,7 +255,7 @@ pub fn init_object_constructor(
                         _ => {}
                     }
                 }
-                let result = GcRef::new(JsObject::array(names.len(), _mm));
+                let result = GcRef::new(JsObject::array(names.len(), _ncx.memory_manager().clone()));
                 for (i, name) in names.into_iter().enumerate() {
                     result.set(PropertyKey::Index(i as u32), name);
                 }
@@ -270,7 +270,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("values"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let obj = args
                     .first()
                     .and_then(|v| v.as_object())
@@ -286,7 +286,7 @@ pub fn init_object_constructor(
                         }
                     }
                 }
-                let result = GcRef::new(JsObject::array(values.len(), _mm));
+                let result = GcRef::new(JsObject::array(values.len(), _ncx.memory_manager().clone()));
                 for (i, value) in values.into_iter().enumerate() {
                     result.set(PropertyKey::Index(i as u32), value);
                 }
@@ -301,7 +301,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("entries"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, mm_inner| {
+            |_this, args, ncx_inner| {
                 let obj = args
                     .first()
                     .and_then(|v| v.as_object())
@@ -321,7 +321,7 @@ pub fn init_object_constructor(
                                 };
                                 let entry = GcRef::new(JsObject::array(
                                     2,
-                                    mm_inner.clone(),
+                                    ncx_inner.memory_manager().clone(),
                                 ));
                                 entry.set(PropertyKey::Index(0), key_str);
                                 entry.set(PropertyKey::Index(1), value);
@@ -331,7 +331,7 @@ pub fn init_object_constructor(
                     }
                 }
                 let result =
-                    GcRef::new(JsObject::array(entries.len(), mm_inner));
+                    GcRef::new(JsObject::array(entries.len(), ncx_inner.memory_manager().clone()));
                 for (i, entry) in entries.into_iter().enumerate() {
                     result.set(PropertyKey::Index(i as u32), entry);
                 }
@@ -346,7 +346,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("assign"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let target_val = args
                     .first()
                     .ok_or_else(|| {
@@ -382,7 +382,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("hasOwn"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let obj = args
                     .first()
                     .and_then(|v| v.as_object())
@@ -414,7 +414,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("freeze"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let obj_val = args.first().cloned().unwrap_or(Value::undefined());
                 if let Some(obj) = obj_val.as_object() {
                     obj.freeze();
@@ -430,7 +430,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("isFrozen"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let is_frozen = args
                     .first()
                     .and_then(|v| v.as_object())
@@ -447,7 +447,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("seal"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let obj_val = args.first().cloned().unwrap_or(Value::undefined());
                 if let Some(obj) = obj_val.as_object() {
                     obj.seal();
@@ -463,7 +463,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("isSealed"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let is_sealed = args
                     .first()
                     .and_then(|v| v.as_object())
@@ -480,7 +480,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("preventExtensions"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let obj_val = args.first().cloned().unwrap_or(Value::undefined());
                 if let Some(obj) = obj_val.as_object() {
                     obj.prevent_extensions();
@@ -496,7 +496,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("isExtensible"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let is_extensible = args
                     .first()
                     .and_then(|v| v.as_object())
@@ -513,7 +513,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("defineProperty"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let obj_val = args
                     .first()
                     .ok_or_else(|| "Object.defineProperty requires an object".to_string())?;
@@ -621,7 +621,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("create"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, mm_inner| {
+            |_this, args, ncx_inner| {
                 let proto_val = args.first().ok_or_else(|| {
                     "Object.create requires a prototype argument".to_string()
                 })?;
@@ -634,7 +634,7 @@ pub fn init_object_constructor(
                         VmError::type_error("Object prototype may only be an Object or null")
                     );
                 };
-                let new_obj = GcRef::new(JsObject::new(prototype, mm_inner.clone()));
+                let new_obj = GcRef::new(JsObject::new(prototype, ncx_inner.memory_manager().clone()));
 
                 // Handle optional properties object (second argument)
                 if let Some(props_val) = args.get(1) {
@@ -715,7 +715,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("is"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let v1 = args.first().cloned().unwrap_or(Value::undefined());
                 let v2 = args.get(1).cloned().unwrap_or(Value::undefined());
                 let result =
@@ -762,12 +762,12 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("getOwnPropertyNames"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, mm_inner| {
+            |_this, args, ncx_inner| {
                 let obj = match args.first().and_then(|v| v.as_object()) {
                     Some(o) => o,
                     None => {
                         return Ok(Value::array(GcRef::new(JsObject::array(
-                            0, mm_inner,
+                            0, ncx_inner.memory_manager().clone(),
                         ))));
                     }
                 };
@@ -785,7 +785,7 @@ pub fn init_object_constructor(
                     }
                 }
                 let result =
-                    GcRef::new(JsObject::array(names.len(), mm_inner));
+                    GcRef::new(JsObject::array(names.len(), ncx_inner.memory_manager().clone()));
                 for (i, name) in names.into_iter().enumerate() {
                     result.set(PropertyKey::Index(i as u32), name);
                 }
@@ -800,20 +800,20 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("getOwnPropertyDescriptors"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, mm_inner| {
+            |_this, args, ncx_inner| {
                 let obj = match args.first().and_then(|v| v.as_object()) {
                     Some(o) => o,
                     None => {
                         return Ok(Value::object(GcRef::new(JsObject::new(
-                            None, mm_inner,
+                            None, ncx_inner.memory_manager().clone(),
                         ))));
                     }
                 };
-                let result = GcRef::new(JsObject::new(None, mm_inner.clone()));
+                let result = GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
                 for key in obj.own_keys() {
                     if let Some(desc) = obj.get_own_property_descriptor(&key) {
                         let desc_obj =
-                            GcRef::new(JsObject::new(None, mm_inner.clone()));
+                            GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
                         match &desc {
                             PropertyDescriptor::Data { value, attributes } => {
                                 desc_obj.set(
@@ -873,7 +873,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("defineProperties"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let obj_val = args
                     .first()
                     .ok_or_else(|| {
@@ -957,14 +957,14 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("fromEntries"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, mm_inner| {
+            |_this, args, ncx_inner| {
                 let iterable = args.first().ok_or_else(|| {
                     "Object.fromEntries requires an iterable".to_string()
                 })?;
                 let iter_obj = iterable.as_object().ok_or_else(|| {
                     "Object.fromEntries argument must be iterable".to_string()
                 })?;
-                let result = GcRef::new(JsObject::new(None, mm_inner));
+                let result = GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
 
                 // Support array-like iterables (check length property)
                 if let Some(len_val) =
@@ -1009,9 +1009,9 @@ pub fn init_object_constructor(
 
 /// Create Object constructor function
 pub fn create_object_constructor() -> Box<
-    dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync
+    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync
 > {
-    Box::new(|_this, args, _mm_inner| {
+    Box::new(|_this, args, _ncx_inner| {
         // When called with an object argument, return it directly
         if let Some(arg) = args.first() {
             if arg.is_object() {

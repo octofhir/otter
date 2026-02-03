@@ -65,7 +65,7 @@ pub fn init_promise_prototype(
     proto.define_property(
         PropertyKey::string("then"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this_val, _args, _mm| {
+            |_this_val, _args, _ncx| {
                 // Delegate to interpreter via interception signal
                 Err(VmError::interception(InterceptionSignal::PromiseThen))
             },
@@ -78,7 +78,7 @@ pub fn init_promise_prototype(
     proto.define_property(
         PropertyKey::string("catch"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this_val, _args, _mm| {
+            |_this_val, _args, _ncx| {
                 // Delegate to interpreter via interception signal
                 Err(VmError::interception(InterceptionSignal::PromiseCatch))
             },
@@ -91,7 +91,7 @@ pub fn init_promise_prototype(
     proto.define_property(
         PropertyKey::string("finally"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this_val, _args, _mm| {
+            |_this_val, _args, _ncx| {
                 // Delegate to interpreter via interception signal
                 Err(VmError::interception(InterceptionSignal::PromiseFinally))
             },
@@ -108,9 +108,9 @@ pub fn init_promise_prototype(
 /// Create Promise constructor function (intercepts in interpreter).
 pub fn create_promise_constructor(
 ) -> Box<
-    dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync,
+    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
 > {
-    Box::new(|_this, _args, _mm| Err(VmError::interception(InterceptionSignal::PromiseConstructor)))
+    Box::new(|_this, _args, _ncx| Err(VmError::interception(InterceptionSignal::PromiseConstructor)))
 }
 
 /// Install static methods on the Promise constructor object.
@@ -123,7 +123,7 @@ pub fn install_promise_statics(
     ctor.define_property(
         PropertyKey::string("resolve"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let _ = args;
                 Err(VmError::interception(InterceptionSignal::PromiseResolve))
             },
@@ -136,7 +136,7 @@ pub fn install_promise_statics(
     ctor.define_property(
         PropertyKey::string("reject"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, _args, _mm| Err(VmError::interception(InterceptionSignal::PromiseReject)),
+            |_this, _args, _ncx| Err(VmError::interception(InterceptionSignal::PromiseReject)),
             mm.clone(),
             fn_proto,
         )),
@@ -146,7 +146,7 @@ pub fn install_promise_statics(
     ctor.define_property(
         PropertyKey::string("all"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, _args, _mm| Err(VmError::interception(InterceptionSignal::PromiseAll)),
+            |_this, _args, _ncx| Err(VmError::interception(InterceptionSignal::PromiseAll)),
             mm.clone(),
             fn_proto,
         )),
@@ -156,7 +156,7 @@ pub fn install_promise_statics(
     ctor.define_property(
         PropertyKey::string("race"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, _args, _mm| Err(VmError::interception(InterceptionSignal::PromiseRace)),
+            |_this, _args, _ncx| Err(VmError::interception(InterceptionSignal::PromiseRace)),
             mm.clone(),
             fn_proto,
         )),
@@ -166,7 +166,7 @@ pub fn install_promise_statics(
     ctor.define_property(
         PropertyKey::string("allSettled"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, _args, _mm| Err(VmError::interception(InterceptionSignal::PromiseAllSettled)),
+            |_this, _args, _ncx| Err(VmError::interception(InterceptionSignal::PromiseAllSettled)),
             mm.clone(),
             fn_proto,
         )),
@@ -176,7 +176,7 @@ pub fn install_promise_statics(
     ctor.define_property(
         PropertyKey::string("any"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, _args, _mm| Err(VmError::interception(InterceptionSignal::PromiseAny)),
+            |_this, _args, _ncx| Err(VmError::interception(InterceptionSignal::PromiseAny)),
             mm.clone(),
             fn_proto,
         )),
@@ -188,13 +188,13 @@ pub fn install_promise_statics(
         ctor.define_property(
             PropertyKey::string("withResolvers"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                move |_this, _args, _mm| {
+                move |_this, _args, _ncx| {
                     let promise = JsPromise::new();
                     let result = GcRef::new(JsObject::new(None, mm_wr.clone()));
                     result.set("promise".into(), Value::promise(promise.clone()));
 
                     let resolve_fn = Value::native_function_with_proto(
-                        |_this: &Value, _args: &[Value], _mm: Arc<MemoryManager>| {
+                        |_this: &Value, _args: &[Value], _ncx: &mut crate::context::NativeContext<'_>| {
                             Err(VmError::interception(InterceptionSignal::PromiseResolveFunction))
                         },
                         mm_wr.clone(),
@@ -209,7 +209,7 @@ pub fn install_promise_statics(
                     result.set("resolve".into(), resolve_fn);
 
                     let reject_fn = Value::native_function_with_proto(
-                        |_this: &Value, _args: &[Value], _mm: Arc<MemoryManager>| {
+                        |_this: &Value, _args: &[Value], _ncx: &mut crate::context::NativeContext<'_>| {
                             Err(VmError::interception(InterceptionSignal::PromiseRejectFunction))
                         },
                         mm_wr.clone(),

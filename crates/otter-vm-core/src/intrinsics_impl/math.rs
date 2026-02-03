@@ -174,34 +174,34 @@ pub fn install_math_namespace(
     }
 
     // === Basic Arithmetic ===
-    math_method!("abs", |_, args: &[Value], _mm| {
+    math_method!("abs", |_, args: &[Value], _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.abs()))
     });
 
-    math_method!("ceil", |_, args, _mm| {
+    math_method!("ceil", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.ceil()))
     });
 
-    math_method!("floor", |_, args, _mm| {
+    math_method!("floor", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.floor()))
     });
 
-    math_method!("round", |_, args, _mm| {
+    math_method!("round", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         // JavaScript Math.round: rounds towards +infinity for .5 cases
         // -4.5 rounds to -4, 4.5 rounds to 5
         Ok(Value::number((x + 0.5).floor()))
     });
 
-    math_method!("trunc", |_, args, _mm| {
+    math_method!("trunc", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.trunc()))
     });
 
-    math_method!("sign", |_, args, _mm| {
+    math_method!("sign", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         let result = if x.is_nan() {
             f64::NAN
@@ -215,7 +215,7 @@ pub fn install_math_namespace(
         Ok(Value::number(result))
     });
 
-    math_method!("max", |_, args, _mm| {
+    math_method!("max", |_, args, _ncx| {
         let mut max = f64::NEG_INFINITY;
         for arg in args {
             let n = to_number(arg);
@@ -229,7 +229,7 @@ pub fn install_math_namespace(
         Ok(Value::number(max))
     });
 
-    math_method!("min", |_, args, _mm| {
+    math_method!("min", |_, args, _ncx| {
         let mut min = f64::INFINITY;
         for arg in args {
             let n = to_number(arg);
@@ -244,23 +244,23 @@ pub fn install_math_namespace(
     });
 
     // === Roots and Powers ===
-    math_method!("sqrt", |_, args, _mm| {
+    math_method!("sqrt", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.sqrt()))
     });
 
-    math_method!("cbrt", |_, args, _mm| {
+    math_method!("cbrt", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.cbrt()))
     });
 
-    math_method!("pow", |_, args, _mm| {
+    math_method!("pow", |_, args, _ncx| {
         let base = to_number(args.get(0).unwrap_or(&Value::undefined()));
         let exp = to_number(args.get(1).unwrap_or(&Value::undefined()));
         Ok(Value::number(base.powf(exp)))
     });
 
-    math_method!("hypot", |_, args, _mm| {
+    math_method!("hypot", |_, args, _ncx| {
         let mut sum = 0.0;
         for arg in args {
             let n = to_number(arg);
@@ -273,123 +273,123 @@ pub fn install_math_namespace(
     });
 
     // === Exponentials and Logarithms ===
-    math_method!("exp", |_, args, _mm| {
+    math_method!("exp", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.exp()))
     });
 
-    math_method!("expm1", |_, args, _mm| {
+    math_method!("expm1", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.exp_m1()))
     });
 
-    math_method!("log", |_, args, _mm| {
+    math_method!("log", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.ln()))
     });
 
-    math_method!("log1p", |_, args, _mm| {
+    math_method!("log1p", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.ln_1p()))
     });
 
-    math_method!("log2", |_, args, _mm| {
+    math_method!("log2", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.log2()))
     });
 
-    math_method!("log10", |_, args, _mm| {
+    math_method!("log10", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.log10()))
     });
 
     // === Trigonometry ===
-    math_method!("sin", |_, args, _mm| {
+    math_method!("sin", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.sin()))
     });
 
-    math_method!("cos", |_, args, _mm| {
+    math_method!("cos", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.cos()))
     });
 
-    math_method!("tan", |_, args, _mm| {
+    math_method!("tan", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.tan()))
     });
 
-    math_method!("asin", |_, args, _mm| {
+    math_method!("asin", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.asin()))
     });
 
-    math_method!("acos", |_, args, _mm| {
+    math_method!("acos", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.acos()))
     });
 
-    math_method!("atan", |_, args, _mm| {
+    math_method!("atan", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.atan()))
     });
 
-    math_method!("atan2", |_, args, _mm| {
+    math_method!("atan2", |_, args, _ncx| {
         let y = to_number(args.get(0).unwrap_or(&Value::undefined()));
         let x = to_number(args.get(1).unwrap_or(&Value::undefined()));
         Ok(Value::number(y.atan2(x)))
     });
 
     // === Hyperbolic Functions ===
-    math_method!("sinh", |_, args, _mm| {
+    math_method!("sinh", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.sinh()))
     });
 
-    math_method!("cosh", |_, args, _mm| {
+    math_method!("cosh", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.cosh()))
     });
 
-    math_method!("tanh", |_, args, _mm| {
+    math_method!("tanh", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.tanh()))
     });
 
-    math_method!("asinh", |_, args, _mm| {
+    math_method!("asinh", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.asinh()))
     });
 
-    math_method!("acosh", |_, args, _mm| {
+    math_method!("acosh", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.acosh()))
     });
 
-    math_method!("atanh", |_, args, _mm| {
+    math_method!("atanh", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number(x.atanh()))
     });
 
     // === Special Functions ===
-    math_method!("clz32", |_, args, _mm| {
+    math_method!("clz32", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         let val = (x as i32) as u32;
         Ok(Value::number(val.leading_zeros() as f64))
     });
 
-    math_method!("imul", |_, args, _mm| {
+    math_method!("imul", |_, args, _ncx| {
         let a = to_number(args.get(0).unwrap_or(&Value::undefined())) as i32;
         let b = to_number(args.get(1).unwrap_or(&Value::undefined())) as i32;
         Ok(Value::number(a.wrapping_mul(b) as f64))
     });
 
-    math_method!("fround", |_, args, _mm| {
+    math_method!("fround", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
         Ok(Value::number((x as f32) as f64))
     });
 
-    math_method!("random", |_, _args, _mm| {
+    math_method!("random", |_, _args, _ncx| {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hasher};
         let mut hasher = RandomState::new().build_hasher();
@@ -405,7 +405,7 @@ pub fn install_math_namespace(
     // Math.f16round (ES2026) - round to half-precision (16-bit) float
     // Uses IEEE 754 binary16 format via the 'half' crate
     // Range: ±65504, overflow becomes infinity, proper subnormal handling
-    math_method!("f16round", |_, args, _mm| {
+    math_method!("f16round", |_, args, _ncx| {
         let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
 
         // IEEE 754 binary16 (half-precision) conversion
@@ -417,7 +417,7 @@ pub fn install_math_namespace(
     });
 
     // Math.sumPrecise (ES2026) - sum with enhanced floating-point precision
-    math_method!("sumPrecise", |_, args, _mm| {
+    math_method!("sumPrecise", |_, args, _ncx| {
         // Get the iterable (first argument)
         let undefined = Value::undefined();
         let iterable = args.get(0).unwrap_or(&undefined);

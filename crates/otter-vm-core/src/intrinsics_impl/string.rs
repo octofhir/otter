@@ -98,7 +98,7 @@ fn make_string_iterator(
     iter.define_property(
         PropertyKey::string("next"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, mm_inner| {
+            |this_val, _args, ncx| {
                 let iter_obj = this_val
                     .as_object()
                     .ok_or_else(|| "not an iterator object".to_string())?;
@@ -117,7 +117,7 @@ fn make_string_iterator(
 
                 if idx >= len {
                     // Done
-                    let result = GcRef::new(JsObject::new(None, mm_inner));
+                    let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
                     result.set(PropertyKey::string("value"), Value::undefined());
                     result.set(PropertyKey::string("done"), Value::boolean(true));
                     return Ok(Value::object(result));
@@ -145,7 +145,7 @@ fn make_string_iterator(
                     Value::number(next_idx as f64),
                 );
 
-                let result = GcRef::new(JsObject::new(None, mm_inner));
+                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
                 result.set(PropertyKey::string("value"), Value::string(char_string));
                 result.set(PropertyKey::string("done"), Value::boolean(false));
                 Ok(Value::object(result))
@@ -168,7 +168,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("toString"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, _args, _mm| {
+                |this_val, _args, _ncx| {
                     if let Some(s) = this_val.as_string() {
                         Ok(Value::string(s))
                     } else {
@@ -182,7 +182,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("valueOf"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, _args, _mm| Ok(this_val.clone()),
+                |this_val, _args, _ncx| Ok(this_val.clone()),
                 mm.clone(),
                 fn_proto,
             )),
@@ -192,7 +192,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("length"),
             PropertyDescriptor::getter(Value::native_function_with_proto(
-                |this_val, _args, _mm| {
+                |this_val, _args, _ncx| {
                     if let Some(s) = this_val.as_string() {
                         Ok(Value::number(s.as_str().len() as f64))
                     } else {
@@ -208,7 +208,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("charAt"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let s = this_string_value(this_val)?;
                     let pos = args
                         .first()
@@ -230,7 +230,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("charCodeAt"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let s = this_string_value(this_val)?;
                     let pos = args
                         .first()
@@ -252,7 +252,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("slice"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let s = this_string_value(this_val)?;
                     let str_val = s.as_str();
                     let len = str_val.len() as i64;
@@ -295,7 +295,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("substring"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let s = this_string_value(this_val)?;
                     let str_val = s.as_str();
                     let len = str_val.len();
@@ -328,7 +328,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("toLowerCase"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, _args, _mm| {
+                |this_val, _args, _ncx| {
                     let s = this_string_value(this_val)?;
                     Ok(Value::string(JsString::intern(&s.as_str().to_lowercase())))
                 },
@@ -341,7 +341,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("toUpperCase"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, _args, _mm| {
+                |this_val, _args, _ncx| {
                     let s = this_string_value(this_val)?;
                     Ok(Value::string(JsString::intern(&s.as_str().to_uppercase())))
                 },
@@ -354,7 +354,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("trim"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, _args, _mm| {
+                |this_val, _args, _ncx| {
                     let s = this_string_value(this_val)?;
                     Ok(Value::string(JsString::intern(s.as_str().trim())))
                 },
@@ -367,7 +367,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("trimStart"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, _args, _mm| {
+                |this_val, _args, _ncx| {
                     let s = this_string_value(this_val)?;
                     Ok(Value::string(JsString::intern(s.as_str().trim_start())))
                 },
@@ -380,7 +380,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("trimEnd"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, _args, _mm| {
+                |this_val, _args, _ncx| {
                     let s = this_string_value(this_val)?;
                     Ok(Value::string(JsString::intern(s.as_str().trim_end())))
                 },
@@ -393,7 +393,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("startsWith"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let s = this_string_value(this_val)?;
                     let search = args
                         .first()
@@ -419,7 +419,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("endsWith"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let s = this_string_value(this_val)?;
                     let search = args
                         .first()
@@ -449,7 +449,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("includes"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let s = this_string_value(this_val)?;
                     let search = args
                         .first()
@@ -475,7 +475,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("repeat"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let s = this_string_value(this_val)?;
                     let count = args
                         .first()
@@ -496,7 +496,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("padStart"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let s = this_string_value(this_val)?;
                     let target_len = args
                         .first()
@@ -534,7 +534,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("padEnd"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let s = this_string_value(this_val)?;
                     let target_len = args
                         .first()
@@ -572,7 +572,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("at"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let s = this_string_value(this_val)?;
                     let chars: Vec<char> = s.as_str().chars().collect();
                     let len = chars.len() as i64;
@@ -595,7 +595,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("indexOf"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let s = this_string_value(this_val)?;
                     let search = args
                         .first()
@@ -624,7 +624,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("lastIndexOf"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let s = this_string_value(this_val)?;
                     let search = args
                         .first()
@@ -645,7 +645,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("concat"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let s = this_string_value(this_val)?;
                     let mut result = s.as_str().to_string();
                     for arg in args {
@@ -672,7 +672,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("split"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, mm_inner| {
+                |this_val, args, ncx| {
                     let s = this_string_value(this_val)?;
 
                     // If separator is a RegExp, delegate to Symbol.split
@@ -687,7 +687,7 @@ pub fn init_string_prototype(
                                 if let Some(limit) = args.get(1) {
                                     sym_args.push(limit.clone());
                                 }
-                                return func(sep, &sym_args, mm_inner);
+                                return func(sep, &sym_args, ncx);
                             }
                         }
                     }
@@ -722,7 +722,7 @@ pub fn init_string_prototype(
                     };
 
                     let result_len = limit.unwrap_or(parts.len()).min(parts.len());
-                    let result = GcRef::new(JsObject::array(result_len, mm_inner));
+                    let result = GcRef::new(JsObject::array(result_len, ncx.memory_manager().clone()));
                     for (i, part) in parts.iter().take(result_len).enumerate() {
                         result.set(
                             PropertyKey::Index(i as u32),
@@ -740,7 +740,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("replace"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, mm_inner| {
+                |this_val, args, ncx| {
                     let s = this_string_value(this_val)?;
 
                     // If searchValue is a RegExp, delegate to Symbol.replace
@@ -755,7 +755,7 @@ pub fn init_string_prototype(
                                 if let Some(replacement) = args.get(1) {
                                     sym_args.push(replacement.clone());
                                 }
-                                return func(search_val, &sym_args, mm_inner);
+                                return func(search_val, &sym_args, ncx);
                             }
                         }
                     }
@@ -794,7 +794,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("replaceAll"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, mm_inner| {
+                |this_val, args, ncx| {
                     let s = this_string_value(this_val)?;
 
                     // If searchValue is a RegExp, it must have global flag
@@ -814,7 +814,7 @@ pub fn init_string_prototype(
                                 if let Some(replacement) = args.get(1) {
                                     sym_args.push(replacement.clone());
                                 }
-                                return func(search_val, &sym_args, mm_inner);
+                                return func(search_val, &sym_args, ncx);
                             }
                         }
                     }
@@ -844,7 +844,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("search"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, mm_inner| {
+                |this_val, args, ncx| {
                     let s = this_string_value(this_val)?;
 
                     // If regexp is a RegExp, delegate to Symbol.search
@@ -856,7 +856,7 @@ pub fn init_string_prototype(
                                 .unwrap_or_else(Value::undefined);
                             if let Some(func) = method.as_native_function() {
                                 let sym_args = vec![Value::string(s.clone())];
-                                return func(search_val, &sym_args, mm_inner);
+                                return func(search_val, &sym_args, ncx);
                             }
                         }
                     }
@@ -882,7 +882,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("match"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, mm_inner| {
+                |this_val, args, ncx| {
                     let s = this_string_value(this_val)?;
 
                     // If regexp is a RegExp, delegate to Symbol.match
@@ -894,7 +894,7 @@ pub fn init_string_prototype(
                                 .unwrap_or_else(Value::undefined);
                             if let Some(func) = method.as_native_function() {
                                 let sym_args = vec![Value::string(s.clone())];
-                                return func(search_val, &sym_args, mm_inner);
+                                return func(search_val, &sym_args, ncx);
                             }
                         }
                     }
@@ -909,7 +909,7 @@ pub fn init_string_prototype(
                         .unwrap_or_default();
                     match str_val.find(&search) {
                         Some(pos) => {
-                            let arr = GcRef::new(JsObject::array(1, mm_inner));
+                            let arr = GcRef::new(JsObject::array(1, ncx.memory_manager().clone()));
                             arr.set(PropertyKey::Index(0), Value::string(JsString::intern(&search)));
                             arr.set(PropertyKey::string("index"), Value::number(pos as f64));
                             arr.set(PropertyKey::string("input"), Value::string(s.clone()));
@@ -928,7 +928,7 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("matchAll"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, mm_inner| {
+                |this_val, args, ncx| {
                     let s = this_string_value(this_val)?;
 
                     // If regexp is a RegExp, delegate to Symbol.matchAll
@@ -945,7 +945,7 @@ pub fn init_string_prototype(
                                 .unwrap_or_else(Value::undefined);
                             if let Some(func) = method.as_native_function() {
                                 let sym_args = vec![Value::string(s.clone())];
-                                return func(search_val, &sym_args, mm_inner);
+                                return func(search_val, &sym_args, ncx);
                             }
                         }
                     }
@@ -961,7 +961,7 @@ pub fn init_string_prototype(
                     let mut start = 0;
                     while let Some(pos) = str_val[start..].find(&search) {
                         let abs_pos = start + pos;
-                        let match_arr = GcRef::new(JsObject::array(1, mm_inner.clone()));
+                        let match_arr = GcRef::new(JsObject::array(1, ncx.memory_manager().clone()));
                         match_arr.set(PropertyKey::Index(0), Value::string(JsString::intern(&search)));
                         match_arr.set(PropertyKey::string("index"), Value::number(abs_pos as f64));
                         match_arr.set(PropertyKey::string("input"), Value::string(s.clone()));
@@ -969,7 +969,7 @@ pub fn init_string_prototype(
                         results.push(Value::array(match_arr));
                         start = abs_pos + search.len().max(1);
                     }
-                    let arr = GcRef::new(JsObject::array(results.len(), mm_inner));
+                    let arr = GcRef::new(JsObject::array(results.len(), ncx.memory_manager().clone()));
                     for (i, val) in results.into_iter().enumerate() {
                         arr.set(PropertyKey::Index(i as u32), val);
                     }
@@ -987,8 +987,8 @@ pub fn init_string_prototype(
     string_proto.define_property(
         PropertyKey::Symbol(symbol_iterator_id),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            move |this_val, _args, mm| {
-                make_string_iterator(this_val, mm, fn_proto_for_symbol, iter_proto_for_symbol)
+            move |this_val, _args, ncx| {
+                make_string_iterator(this_val, ncx.memory_manager().clone(), fn_proto_for_symbol, iter_proto_for_symbol)
             },
             mm_for_symbol,
             fn_proto,

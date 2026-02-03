@@ -539,7 +539,7 @@ impl Intrinsics {
             self.iterator_prototype.define_property(
                 PropertyKey::Symbol(sym.id),
                 PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                    |this_val, _args, _mm| Ok(this_val.clone()),
+                    |this_val, _args, _ncx| Ok(this_val.clone()),
                     mm.clone(),
                     fn_proto,
                 )),
@@ -694,7 +694,7 @@ impl Intrinsics {
                        proto: GcRef<JsObject>,
                        ctor_fn: Option<
             Box<
-                dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError>
+                dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
                     + Send
                     + Sync,
             >,
@@ -785,8 +785,8 @@ impl Intrinsics {
         // String
         let string_ctor = alloc_ctor();
         let string_ctor_fn: Box<
-            dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync,
-        > = Box::new(|this, args, _mm| {
+            dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+        > = Box::new(|this, args, _ncx| {
             let s = if let Some(arg) = args.first() {
                 crate::globals::to_string(arg)
             } else {
@@ -809,7 +809,7 @@ impl Intrinsics {
         string_ctor.define_property(
             PropertyKey::string("fromCharCode"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, _mm| {
+                |_this, args, _ncx| {
                     let mut result = String::new();
                     for arg in args {
                         // Per ES2023 §22.1.2.1: ToUint16(ToNumber(arg))
@@ -851,7 +851,7 @@ impl Intrinsics {
         string_ctor.define_property(
             PropertyKey::string("fromCodePoint"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, _mm| {
+                |_this, args, _ncx| {
                     let mut result = String::new();
                     for arg in args {
                         let code = if let Some(n) = arg.as_number() {
@@ -880,8 +880,8 @@ impl Intrinsics {
         // Number
         let number_ctor = alloc_ctor();
         let number_ctor_fn: Box<
-            dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync,
-        > = Box::new(|_this, args, _mm| {
+            dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+        > = Box::new(|_this, args, _ncx| {
             let n = if let Some(arg) = args.first() {
                 crate::globals::to_number(arg)
             } else {
@@ -910,20 +910,20 @@ impl Intrinsics {
         // ====================================================================
         let array_ctor = alloc_ctor();
         let array_ctor_fn: Box<
-            dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync,
-        > = Box::new(|_this, args, mm_inner| {
+            dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+        > = Box::new(|_this, args, ncx| {
             if args.len() == 1 {
                 if let Some(n) = args[0].as_number() {
                     let len = n as u32;
                     if (len as f64) != n || n < 0.0 {
                         return Err(VmError::type_error("Invalid array length"));
                     }
-                    let arr = GcRef::new(JsObject::array(len as usize, mm_inner));
+                    let arr = GcRef::new(JsObject::array(len as usize, ncx.memory_manager().clone()));
                     return Ok(Value::object(arr));
                 }
             }
             // Array(...items) — populate the array
-            let arr = GcRef::new(JsObject::array(args.len(), mm_inner));
+            let arr = GcRef::new(JsObject::array(args.len(), ncx.memory_manager().clone()));
             for (i, arg) in args.iter().enumerate() {
                 arr.set(PropertyKey::index(i as u32), arg.clone());
             }
@@ -999,7 +999,7 @@ impl Intrinsics {
         regexp_ctor.define_property(
             PropertyKey::string("escape"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, _mm| {
+                |_this, args, _ncx| {
                     let s = args
                         .first()
                         .and_then(|v| v.as_string())
@@ -1013,8 +1013,8 @@ impl Intrinsics {
 
         let date_ctor = alloc_ctor();
         let date_ctor_fn: Box<
-            dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync,
-        > = Box::new(|this, args, _mm_inner| {
+            dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+        > = Box::new(|this, args, _ncx| {
             use std::time::{SystemTime, UNIX_EPOCH};
             let timestamp = if args.is_empty() {
                 SystemTime::now()
@@ -1043,7 +1043,7 @@ impl Intrinsics {
         date_ctor.define_property(
             PropertyKey::string("now"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, _args, _mm| {
+                |_this, _args, _ncx| {
                     use std::time::{SystemTime, UNIX_EPOCH};
                     let timestamp = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -1060,7 +1060,7 @@ impl Intrinsics {
         date_ctor.define_property(
             PropertyKey::string("parse"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, _mm| {
+                |_this, args, _ncx| {
                     use chrono::{DateTime, NaiveDate, NaiveDateTime};
 
                     let date_str = args
@@ -1099,7 +1099,7 @@ impl Intrinsics {
         date_ctor.define_property(
             PropertyKey::string("UTC"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, _mm| {
+                |_this, args, _ncx| {
                     use chrono::NaiveDate;
 
                     if args.is_empty() {

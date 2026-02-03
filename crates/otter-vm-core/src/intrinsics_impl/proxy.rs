@@ -44,7 +44,7 @@ pub fn init_proxy_constructor(
     proxy_ctor.define_property(
         PropertyKey::string("revocable"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            move |_this_val, args, mm| {
+            move |_this_val, args, ncx| {
                 let target = args
                     .first()
                     .ok_or_else(|| VmError::type_error("Proxy.revocable requires a target argument"))?;
@@ -65,7 +65,7 @@ pub fn init_proxy_constructor(
                 let revocable = JsProxy::revocable(target_obj, handler_obj);
 
                 // Create result object { proxy, revoke }
-                let result = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
                 result.set("proxy".into(), Value::proxy(revocable.proxy));
 
                 // Create revoke function
@@ -73,11 +73,11 @@ pub fn init_proxy_constructor(
                 result.set(
                     "revoke".into(),
                     Value::native_function(
-                        move |_this: &Value, _args: &[Value], _mm: Arc<MemoryManager>| {
+                        move |_this: &Value, _args: &[Value], _ncx: &mut crate::context::NativeContext<'_>| {
                             revoke_fn();
                             Ok(Value::undefined())
                         },
-                        Arc::clone(&mm),
+                        ncx.memory_manager().clone(),
                     ),
                 );
 
@@ -96,7 +96,7 @@ pub fn init_proxy_constructor(
 pub fn proxy_constructor(
     _this_val: &Value,
     args: &[Value],
-    _mm: Arc<MemoryManager>,
+    _ncx: &mut crate::context::NativeContext<'_>,
 ) -> Result<Value, VmError> {
     let target = args
         .first()

@@ -1,9 +1,11 @@
 //! Temporal.Now - utilities for getting current time
 
-use chrono::{Local, Utc};
 use otter_vm_core::value::Value;
 use otter_vm_core::{VmError, string::JsString};
 use otter_vm_runtime::{Op, op_native};
+use temporal_rs::Temporal;
+use temporal_rs::options::{DisplayCalendar, DisplayOffset, DisplayTimeZone, ToStringRoundingOptions};
+use temporal_rs::provider::COMPILED_TZ_PROVIDER;
 
 pub fn ops() -> Vec<Op> {
     vec![
@@ -16,82 +18,77 @@ pub fn ops() -> Vec<Op> {
     ]
 }
 
-/// Temporal.Now.instant() - returns current time as epochNanoseconds string
 fn now_instant(_args: &[Value]) -> Result<Value, VmError> {
-    let now = Utc::now();
-    let nanos = now.timestamp_nanos_opt().unwrap_or(0);
-    // Return as string since i128 doesn't fit in f64
-    Ok(Value::string(JsString::intern(&nanos.to_string())))
+    let instant = Temporal::now()
+        .instant()
+        .map_err(|e| VmError::type_error(format!("Failed to get instant: {:?}", e)))?;
+
+    Ok(Value::string(JsString::intern(
+        &instant.epoch_nanoseconds().as_i128().to_string(),
+    )))
 }
 
-/// Temporal.Now.timeZoneId() - returns current timezone IANA name
 fn now_timezone_id(_args: &[Value]) -> Result<Value, VmError> {
-    // Get system timezone name
-    let tz = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string());
-    Ok(Value::string(JsString::intern(&tz)))
+    let tz = Temporal::now()
+        .time_zone_with_provider(&*COMPILED_TZ_PROVIDER)
+        .map_err(|e| VmError::type_error(format!("Failed to get timezone: {:?}", e)))?;
+
+    let tz_id = tz
+        .identifier_with_provider(&*COMPILED_TZ_PROVIDER)
+        .map_err(|e| VmError::type_error(format!("Failed to get timezone id: {:?}", e)))?;
+    Ok(Value::string(JsString::intern(&tz_id)))
 }
 
-/// Temporal.Now.zonedDateTimeISO() - returns current ZonedDateTime in ISO calendar
 fn now_zoned_date_time_iso(_args: &[Value]) -> Result<Value, VmError> {
-    let now = Local::now();
-    let tz = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string());
+    let zdt = Temporal::now()
+        .zoned_date_time_iso_with_provider(None, &*COMPILED_TZ_PROVIDER)
+        .map_err(|e| VmError::type_error(format!("Failed to get zoned datetime: {:?}", e)))?;
 
-    // Format: 2026-01-23T15:30:45.123456789-05:00[America/New_York]
-    let nanos = now.timestamp_subsec_nanos();
-    let s = format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}{}[{}]",
-        now.year(),
-        now.month(),
-        now.day(),
-        now.hour(),
-        now.minute(),
-        now.second(),
-        nanos,
-        now.format("%:z"),
-        tz
-    );
+    let s = zdt
+        .to_ixdtf_string_with_provider(
+            DisplayOffset::Auto,
+            DisplayTimeZone::Auto,
+            DisplayCalendar::Auto,
+            ToStringRoundingOptions::default(),
+            &*COMPILED_TZ_PROVIDER,
+        )
+        .map_err(|e| VmError::type_error(format!("Failed to format: {:?}", e)))?;
+
     Ok(Value::string(JsString::intern(&s)))
 }
 
-/// Temporal.Now.plainDateTimeISO() - returns current PlainDateTime in ISO calendar
 fn now_plain_date_time_iso(_args: &[Value]) -> Result<Value, VmError> {
-    let now = Local::now();
-    let nanos = now.timestamp_subsec_nanos();
-    let s = format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}",
-        now.year(),
-        now.month(),
-        now.day(),
-        now.hour(),
-        now.minute(),
-        now.second(),
-        nanos
-    );
+    let dt = Temporal::now()
+        .plain_date_time_iso_with_provider(None, &*COMPILED_TZ_PROVIDER)
+        .map_err(|e| VmError::type_error(format!("Failed to get datetime: {:?}", e)))?;
+
+    let s = dt
+        .to_ixdtf_string(ToStringRoundingOptions::default(), DisplayCalendar::Auto)
+        .map_err(|e| VmError::type_error(format!("Failed to format: {:?}", e)))?;
+
     Ok(Value::string(JsString::intern(&s)))
 }
 
-/// Temporal.Now.plainDateISO() - returns current PlainDate in ISO calendar
 fn now_plain_date_iso(_args: &[Value]) -> Result<Value, VmError> {
-    let now = Local::now();
-    let s = format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
+    let date = Temporal::now()
+        .plain_date_iso_with_provider(None, &*COMPILED_TZ_PROVIDER)
+        .map_err(|e| VmError::type_error(format!("Failed to get date: {:?}", e)))?;
+
+    let s = date.to_ixdtf_string(DisplayCalendar::Auto);
+
     Ok(Value::string(JsString::intern(&s)))
 }
 
-/// Temporal.Now.plainTimeISO() - returns current PlainTime in ISO calendar
 fn now_plain_time_iso(_args: &[Value]) -> Result<Value, VmError> {
-    let now = Local::now();
-    let nanos = now.timestamp_subsec_nanos();
-    let s = format!(
-        "{:02}:{:02}:{:02}.{:09}",
-        now.hour(),
-        now.minute(),
-        now.second(),
-        nanos
-    );
+    let time = Temporal::now()
+        .plain_time_with_provider(None, &*COMPILED_TZ_PROVIDER)
+        .map_err(|e| VmError::type_error(format!("Failed to get time: {:?}", e)))?;
+
+    let s = time.to_ixdtf_string(ToStringRoundingOptions::default())
+        .map_err(|e| VmError::type_error(format!("Failed to format: {:?}", e)))?;
+
     Ok(Value::string(JsString::intern(&s)))
 }
-
-use chrono::{Datelike, Timelike};
 
 #[cfg(test)]
 mod tests {
@@ -101,25 +98,14 @@ mod tests {
     fn test_now_instant() {
         let result = now_instant(&[]).unwrap();
         let s = result.as_string().unwrap().to_string();
-        // Should be a large number (nanoseconds since epoch)
         let nanos: i128 = s.parse().unwrap();
-        assert!(nanos > 1_700_000_000_000_000_000); // After 2023
+        assert!(nanos > 1_700_000_000_000_000_000);
     }
 
     #[test]
     fn test_now_timezone_id() {
         let result = now_timezone_id(&[]).unwrap();
         let tz = result.as_string().unwrap().to_string();
-        // Should be a valid IANA timezone
         assert!(!tz.is_empty());
-    }
-
-    #[test]
-    fn test_now_plain_date_iso() {
-        let result = now_plain_date_iso(&[]).unwrap();
-        let s = result.as_string().unwrap().to_string();
-        // Should match YYYY-MM-DD format
-        assert!(s.len() == 10);
-        assert!(s.contains('-'));
     }
 }

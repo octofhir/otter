@@ -53,7 +53,7 @@ pub fn init_boolean_prototype(
     boolean_proto.define_property(
         PropertyKey::string("valueOf"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 // Return primitive boolean value
                 if let Some(b) = this_val.as_boolean() {
                     Ok(Value::boolean(b))
@@ -82,7 +82,7 @@ pub fn init_boolean_prototype(
     boolean_proto.define_property(
         PropertyKey::string("toString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 let b = if let Some(b) = this_val.as_boolean() {
                     b
                 } else if let Some(obj) = this_val.as_object() {
@@ -121,8 +121,8 @@ pub fn init_boolean_prototype(
 /// The constructor checks the `this` value to determine call vs construct form:
 /// - If `this` is undefined (call form), return primitive boolean
 /// - If `this` is object (construct form), set internal [[BooleanData]] and return object
-pub fn create_boolean_constructor() -> Box<dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, crate::error::VmError> + Send + Sync> {
-    Box::new(|this_val, args, _mm| {
+pub fn create_boolean_constructor() -> Box<dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, crate::error::VmError> + Send + Sync> {
+    Box::new(|this_val, args, _ncx| {
         let value = args.first().cloned().unwrap_or(Value::undefined());
         let bool_val = Value::boolean(to_boolean(&value));
 

@@ -26,7 +26,7 @@ pub fn init_number_prototype(
         number_proto.define_property(
             PropertyKey::string("valueOf"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, _args, _mm| Ok(this_val.clone()),
+                |this_val, _args, _ncx| Ok(this_val.clone()),
                 mm.clone(),
                 fn_proto,
             )),
@@ -36,7 +36,7 @@ pub fn init_number_prototype(
         number_proto.define_property(
             PropertyKey::string("toString"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let n = if let Some(num) = this_val.as_number() {
                         num
                     } else if let Some(i) = this_val.as_int32() {
@@ -104,7 +104,7 @@ pub fn init_number_prototype(
         number_proto.define_property(
             PropertyKey::string("toFixed"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let n = if let Some(num) = this_val.as_number() {
                         num
                     } else if let Some(i) = this_val.as_int32() {
@@ -145,7 +145,7 @@ pub fn init_number_prototype(
         number_proto.define_property(
             PropertyKey::string("toExponential"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let n = if let Some(num) = this_val.as_number() {
                         num
                     } else if let Some(i) = this_val.as_int32() {
@@ -188,7 +188,7 @@ pub fn init_number_prototype(
         number_proto.define_property(
             PropertyKey::string("toPrecision"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _mm| {
+                |this_val, args, _ncx| {
                     let n = if let Some(num) = this_val.as_number() {
                         num
                     } else if let Some(i) = this_val.as_int32() {
@@ -235,7 +235,7 @@ pub fn init_number_prototype(
         number_proto.define_property(
             PropertyKey::string("toLocaleString"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, _args, _mm| {
+                |this_val, _args, _ncx| {
                     let n = if let Some(num) = this_val.as_number() {
                         num
                     } else if let Some(i) = this_val.as_int32() {
@@ -289,7 +289,7 @@ pub fn install_number_statics(
     ctor.define_property(
         PropertyKey::string("isFinite"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let val = args.first();
                 match val {
                     Some(v) if v.is_number() => {
@@ -309,7 +309,7 @@ pub fn install_number_statics(
     ctor.define_property(
         PropertyKey::string("isInteger"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let val = args.first();
                 match val {
                     Some(v) if v.is_int32() => Ok(Value::boolean(true)),
@@ -329,7 +329,7 @@ pub fn install_number_statics(
     ctor.define_property(
         PropertyKey::string("isNaN"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let val = args.first();
                 match val {
                     Some(v) if v.is_number() => {
@@ -348,7 +348,7 @@ pub fn install_number_statics(
     ctor.define_property(
         PropertyKey::string("isSafeInteger"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let val = args.first();
                 match val {
                     Some(v) if v.is_int32() => Ok(Value::boolean(true)),
@@ -371,7 +371,7 @@ pub fn install_number_statics(
     ctor.define_property(
         PropertyKey::string("parseFloat"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let val = args.first().ok_or("parseFloat requires an argument")?;
                 if let Some(s) = val.as_string() {
                     let trimmed = s.as_str().trim_start();
@@ -393,7 +393,7 @@ pub fn install_number_statics(
     ctor.define_property(
         PropertyKey::string("parseInt"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _mm| {
+            |_this, args, _ncx| {
                 let val = args.first().ok_or("parseInt requires an argument")?;
                 let radix = args.get(1).and_then(|v| v.as_int32()).unwrap_or(10);
 

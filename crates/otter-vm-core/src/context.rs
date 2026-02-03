@@ -20,6 +20,69 @@ use otter_profiler::RuntimeStats;
 /// Default maximum call stack depth (matches RuntimeConfig default)
 pub const DEFAULT_MAX_STACK_DEPTH: usize = 10000;
 
+/// Context passed to native functions, enabling VM re-entry.
+///
+/// This replaces the old `Arc<MemoryManager>` parameter in `NativeFn`.
+/// Native functions can now call JavaScript functions (closures or other
+/// natives) through `call_function`, access the memory manager, global
+/// object, and enqueue microtask jobs — all without interception signals.
+pub struct NativeContext<'a> {
+    /// The VM execution context (registers, call stack, etc.)
+    pub ctx: &'a mut VmContext,
+    /// Reference to the interpreter for executing closures
+    interpreter: &'a crate::interpreter::Interpreter,
+}
+
+impl<'a> NativeContext<'a> {
+    /// Create a new `NativeContext`.
+    pub fn new(ctx: &'a mut VmContext, interpreter: &'a crate::interpreter::Interpreter) -> Self {
+        Self { ctx, interpreter }
+    }
+
+    /// Call a JavaScript function (closure or native) with full VM context.
+    ///
+    /// This is the key method that eliminates the need for interception signals.
+    /// Native builtins can now call user-provided callbacks directly.
+    pub fn call_function(
+        &mut self,
+        func: &crate::value::Value,
+        this_value: crate::value::Value,
+        args: &[crate::value::Value],
+    ) -> crate::error::VmResult<crate::value::Value> {
+        self.interpreter.call_function(self.ctx, func, this_value, args)
+    }
+
+    /// Access the memory manager.
+    pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
+        self.ctx.memory_manager()
+    }
+
+    /// Access the global object.
+    pub fn global(&self) -> GcRef<JsObject> {
+        self.ctx.global()
+    }
+
+    /// Enqueue a JS microtask job (for Promise callbacks).
+    pub fn enqueue_js_job(&self, job: crate::promise::JsPromiseJob, args: Vec<crate::value::Value>) -> bool {
+        self.ctx.enqueue_js_job(job, args)
+    }
+
+    /// Get the JS job queue, if configured.
+    pub fn js_job_queue(&self) -> Option<Arc<dyn JsJobQueueTrait + Send + Sync>> {
+        self.ctx.js_job_queue()
+    }
+
+    /// Check if a JS job queue is available.
+    pub fn has_js_job_queue(&self) -> bool {
+        self.ctx.has_js_job_queue()
+    }
+
+    /// Get the interpreter reference (for advanced operations).
+    pub fn interpreter(&self) -> &crate::interpreter::Interpreter {
+        self.interpreter
+    }
+}
+
 /// Default maximum native call depth to prevent Rust stack overflow
 pub const DEFAULT_MAX_NATIVE_DEPTH: usize = 100;
 

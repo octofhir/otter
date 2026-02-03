@@ -43,13 +43,13 @@ impl Interpreter {
     }
 
     /// Execute a module
-    pub fn execute(&mut self, module: &Module, ctx: &mut VmContext) -> VmResult<Value> {
+    pub fn execute(&self, module: &Module, ctx: &mut VmContext) -> VmResult<Value> {
         // Wrap in Arc for closure capture
         self.execute_arc(Arc::new(module.clone()), ctx)
     }
 
     /// Execute a module with Arc (for internal use and pre-created Arcs)
-    pub fn execute_arc(&mut self, module: Arc<Module>, ctx: &mut VmContext) -> VmResult<Value> {
+    pub fn execute_arc(&self, module: Arc<Module>, ctx: &mut VmContext) -> VmResult<Value> {
         // Get entry function
         let entry_func = module
             .entry_function()
@@ -87,7 +87,7 @@ impl Interpreter {
     /// Unlike `execute`, this method returns a `VmExecutionResult` that
     /// can indicate that execution was suspended waiting for a Promise.
     pub fn execute_with_suspension(
-        &mut self,
+        &self,
         module: Arc<Module>,
         ctx: &mut VmContext,
         result_promise: Arc<JsPromise>,
@@ -125,7 +125,7 @@ impl Interpreter {
     /// This is called when a Promise that was awaited resolves.
     /// It restores the VM state and continues execution.
     pub fn resume_async(
-        &mut self,
+        &self,
         ctx: &mut VmContext,
         async_ctx: AsyncContext,
         resolved_value: Value,
@@ -148,7 +148,7 @@ impl Interpreter {
     /// This method allows calling JavaScript functions from Rust code.
     /// It handles both native functions (direct call) and closures (push frame and execute).
     pub fn call_function(
-        &mut self,
+        &self,
         ctx: &mut VmContext,
         func: &Value,
         this_value: Value,
@@ -349,7 +349,7 @@ impl Interpreter {
 
     /// Main execution loop with suspension support
     fn run_loop_with_suspension(
-        &mut self,
+        &self,
         ctx: &mut VmContext,
         result_promise: Arc<JsPromise>,
     ) -> VmExecutionResult {
@@ -687,7 +687,7 @@ impl Interpreter {
     }
 
     /// Main execution loop
-    fn run_loop(&mut self, ctx: &mut VmContext) -> VmResult<Value> {
+    fn run_loop(&self, ctx: &mut VmContext) -> VmResult<Value> {
         // Cache module Arc - only refresh when frame changes
         let mut cached_module: Option<Arc<Module>> = None;
         let mut cached_frame_id: usize = usize::MAX;
@@ -1001,7 +1001,7 @@ impl Interpreter {
 
     /// Execute a single instruction
     fn execute_instruction(
-        &mut self,
+        &self,
         instruction: &Instruction,
         module: &Arc<Module>,
         ctx: &mut VmContext,
@@ -1267,6 +1267,17 @@ impl Interpreter {
                 let value = ctx.get_register(src.0);
                 let number = self.coerce_number(value)?;
                 ctx.set_register(dst.0, Value::number(number));
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::RequireCoercible { src } => {
+                let value = ctx.get_register(src.0);
+                if value.is_null() {
+                    return Err(VmError::type_error("Cannot destructure 'null' value"));
+                }
+                if value.is_undefined() {
+                    return Err(VmError::type_error("Cannot destructure 'undefined' value"));
+                }
                 Ok(InstructionResult::Continue)
             }
 
@@ -2866,7 +2877,7 @@ impl Interpreter {
                             let resolve_promise = promise.clone();
                             let enqueue_resolve = enqueue_js_job.clone();
                             let resolve_fn = Value::native_function_with_proto(
-                                move |_this, args, _mm| {
+                                move |_this, args, _ncx| {
                                     let value = args.first().cloned().unwrap_or(Value::undefined());
                                     resolve_promise.resolve_with_js_jobs(value, enqueue_resolve.clone());
                                     Ok(Value::undefined())
@@ -2884,7 +2895,7 @@ impl Interpreter {
                             let reject_promise = promise.clone();
                             let enqueue_reject = enqueue_js_job.clone();
                             let reject_fn = Value::native_function_with_proto(
-                                move |_this, args, _mm| {
+                                move |_this, args, _ncx| {
                                     let reason = args.first().cloned().unwrap_or(Value::undefined());
                                     reject_promise.reject_with_js_jobs(reason, enqueue_reject.clone());
                                     Ok(Value::undefined())
@@ -6086,7 +6097,7 @@ impl Interpreter {
     /// consuming outer call frames. This is the same pattern used by
     /// `call_function`.
     fn execute_eval_module(
-        &mut self,
+        &self,
         ctx: &mut VmContext,
         module: &Module,
     ) -> VmResult<Value> {
@@ -6275,20 +6286,24 @@ impl Interpreter {
     #[inline]
     fn call_native_fn(
         &self,
-        ctx: &VmContext,
+        ctx: &mut VmContext,
         native_fn: &crate::value::NativeFn,
         this_value: &Value,
         args: &[Value],
     ) -> VmResult<Value> {
         ctx.enter_native_call()?;
-        let result = native_fn(this_value, args, ctx.memory_manager().clone());
+        let result = {
+            let mut ncx = crate::context::NativeContext::new(ctx, self);
+            native_fn(this_value, args, &mut ncx)
+        };
+        // ncx dropped here — ctx borrow released
         ctx.exit_native_call();
         result
     }
 
     /// Handle a function call value (native or closure)
     fn handle_call_value(
-        &mut self,
+        &self,
         ctx: &mut VmContext,
         func_value: &Value,
         this_value: Value,
@@ -8940,7 +8955,7 @@ impl Interpreter {
     /// * `GeneratorResult::Returned(value)` - Generator completed
     /// * `GeneratorResult::Error(err)` - Generator threw an error
     pub fn execute_generator(
-        &mut self,
+        &self,
         generator: &Arc<JsGenerator>,
         ctx: &mut VmContext,
         sent_value: Option<Value>,
@@ -8971,7 +8986,7 @@ impl Interpreter {
 
     /// Start generator execution from the beginning
     fn start_generator_execution(
-        &mut self,
+        &self,
         generator: &Arc<JsGenerator>,
         ctx: &mut VmContext,
         _sent_value: Option<Value>,
@@ -9028,7 +9043,7 @@ impl Interpreter {
 
     /// Resume generator execution from saved frame
     fn resume_generator_execution(
-        &mut self,
+        &self,
         generator: &Arc<JsGenerator>,
         ctx: &mut VmContext,
         sent_value: Option<Value>,
@@ -9120,7 +9135,7 @@ impl Interpreter {
 
     /// Restore a generator frame to the context
     fn restore_generator_frame(
-        &mut self,
+        &self,
         ctx: &mut VmContext,
         frame: &GeneratorFrame,
     ) -> VmResult<()> {
@@ -9218,7 +9233,7 @@ impl Interpreter {
     /// `initial_depth` is the stack depth before the generator frame was pushed.
     /// This is used to correctly identify when the generator has returned.
     fn run_generator_loop(
-        &mut self,
+        &self,
         generator: &Arc<JsGenerator>,
         ctx: &mut VmContext,
         initial_depth: usize,

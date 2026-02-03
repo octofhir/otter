@@ -46,7 +46,7 @@ pub fn init_generator_prototype(
     proto.define_property(
         PropertyKey::string("next"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, mm| {
+            |this_val, args, ncx| {
                 // Extract the generator from `this`
                 let generator = this_val
                     .as_generator()
@@ -66,7 +66,7 @@ pub fn init_generator_prototype(
 
                 // For now, return a placeholder iterator result
                 // In production, this would delegate to the interpreter
-                let result = GcRef::new(JsObject::new(None, mm.clone()));
+                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
                 result.set(PropertyKey::string("value"), Value::undefined());
                 result.set(PropertyKey::string("done"), Value::boolean(false));
                 Ok(Value::object(result))
@@ -80,7 +80,7 @@ pub fn init_generator_prototype(
     proto.define_property(
         PropertyKey::string("return"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, mm| {
+            |this_val, args, ncx| {
                 let generator = this_val
                     .as_generator()
                     .ok_or_else(|| VmError::type_error("Generator.prototype.return called on non-generator"))?;
@@ -92,7 +92,7 @@ pub fn init_generator_prototype(
                 }
 
                 // Placeholder - actual execution handled by interpreter
-                let result = GcRef::new(JsObject::new(None, mm.clone()));
+                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
                 let return_value = args.first().cloned().unwrap_or_else(Value::undefined);
                 result.set(PropertyKey::string("value"), return_value);
                 result.set(PropertyKey::string("done"), Value::boolean(true));
@@ -107,7 +107,7 @@ pub fn init_generator_prototype(
     proto.define_property(
         PropertyKey::string("throw"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, mm| {
+            |this_val, args, ncx| {
                 let generator = this_val
                     .as_generator()
                     .ok_or_else(|| VmError::type_error("Generator.prototype.throw called on non-generator"))?;
@@ -131,7 +131,7 @@ pub fn init_generator_prototype(
     proto.define_property(
         PropertyKey::Symbol(symbol_iterator_id),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 // Generators are iterable - Symbol.iterator returns the generator itself
                 Ok(this_val.clone())
             },
@@ -177,7 +177,7 @@ pub fn init_async_generator_prototype(
     proto.define_property(
         PropertyKey::string("next"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, mm| {
+            |this_val, args, ncx| {
                 let generator = this_val
                     .as_generator()
                     .ok_or_else(|| {
@@ -193,7 +193,7 @@ pub fn init_async_generator_prototype(
 
                 // Placeholder - actual execution handled by interpreter
                 // Async generators return promises
-                let result = GcRef::new(JsObject::new(None, mm.clone()));
+                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
                 result.set(PropertyKey::string("value"), Value::undefined());
                 result.set(PropertyKey::string("done"), Value::boolean(false));
                 Ok(Value::object(result))
@@ -207,7 +207,7 @@ pub fn init_async_generator_prototype(
     proto.define_property(
         PropertyKey::string("return"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, mm| {
+            |this_val, args, ncx| {
                 let generator = this_val.as_generator().ok_or_else(|| {
                     VmError::type_error("AsyncGenerator.prototype.return called on non-generator")
                 })?;
@@ -219,7 +219,7 @@ pub fn init_async_generator_prototype(
                 }
 
                 // Placeholder - actual execution handled by interpreter
-                let result = GcRef::new(JsObject::new(None, mm.clone()));
+                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
                 let return_value = args.first().cloned().unwrap_or_else(Value::undefined);
                 result.set(PropertyKey::string("value"), return_value);
                 result.set(PropertyKey::string("done"), Value::boolean(true));
@@ -234,7 +234,7 @@ pub fn init_async_generator_prototype(
     proto.define_property(
         PropertyKey::string("throw"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, mm| {
+            |this_val, args, ncx| {
                 let generator = this_val.as_generator().ok_or_else(|| {
                     VmError::type_error("AsyncGenerator.prototype.throw called on non-generator")
                 })?;
@@ -258,7 +258,7 @@ pub fn init_async_generator_prototype(
     proto.define_property(
         PropertyKey::Symbol(symbol_async_iterator_id),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 // Async generators are async-iterable - Symbol.asyncIterator returns the generator itself
                 Ok(this_val.clone())
             },

@@ -558,7 +558,7 @@ fn native_promise_with_resolvers(
     result.set(
         "resolve".into(),
         VmValue::native_function(
-            move |_this: &VmValue, args: &[VmValue], _mm: Arc<memory::MemoryManager>| {
+            move |_this: &VmValue, args: &[VmValue], _ncx: &mut otter_vm_core::context::NativeContext<'_>| {
                 let value = args.first().cloned().unwrap_or(VmValue::undefined());
                 resolve_fn(value);
                 Ok(VmValue::undefined())
@@ -571,7 +571,7 @@ fn native_promise_with_resolvers(
     result.set(
         "reject".into(),
         VmValue::native_function(
-            move |_this: &VmValue, args: &[VmValue], _mm: Arc<memory::MemoryManager>| {
+            move |_this: &VmValue, args: &[VmValue], _ncx: &mut otter_vm_core::context::NativeContext<'_>| {
                 let reason = args.first().cloned().unwrap_or(VmValue::undefined());
                 reject_fn(reason);
                 Ok(VmValue::undefined())

@@ -108,9 +108,14 @@ pub struct Value {
 unsafe impl Send for Value {}
 unsafe impl Sync for Value {}
 
-/// Native function handler type
+/// Native function handler type.
+///
+/// Receives `(this, args, &mut NativeContext)`. The `NativeContext` provides
+/// access to the memory manager, global object, and — critically — the ability
+/// to call JavaScript functions (closures or other natives) via
+/// `ncx.call_function()`.
 pub type NativeFn = Arc<
-    dyn Fn(&Value, &[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, crate::error::VmError>
+    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, crate::error::VmError>
         + Send
         + Sync,
 >;
@@ -420,7 +425,7 @@ impl Value {
     /// Create native function value
     pub fn native_function<F>(f: F, memory_manager: Arc<crate::memory::MemoryManager>) -> Self
     where
-        F: Fn(&Value, &[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, crate::error::VmError>
+        F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, crate::error::VmError>
             + Send
             + Sync
             + 'static,
@@ -446,7 +451,7 @@ impl Value {
         prototype: GcRef<JsObject>,
     ) -> Self
     where
-        F: Fn(&Value, &[Value], Arc<crate::memory::MemoryManager>) -> Result<Value, crate::error::VmError>
+        F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, crate::error::VmError>
             + Send
             + Sync
             + 'static,

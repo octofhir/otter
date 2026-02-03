@@ -12,8 +12,7 @@ otter-macros = { path = "../otter-macros" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.10"
-iana-time-zone = "0.1"
+temporal_rs = { version = "0.1", features = ["sys"] }
 regress = { version = "0.10.5", features = ["utf16"] }
 
 # HTTP client and server

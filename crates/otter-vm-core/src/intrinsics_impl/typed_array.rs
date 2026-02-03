@@ -114,7 +114,7 @@ fn init_typed_array_getters(
     proto.define_property(
         PropertyKey::string("buffer"),
         PropertyDescriptor::getter(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 let ta = get_typed_array(this_val)?;
                 Ok(Value::array_buffer(ta.buffer().clone()))
             },
@@ -127,7 +127,7 @@ fn init_typed_array_getters(
     proto.define_property(
         PropertyKey::string("byteLength"),
         PropertyDescriptor::getter(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 let ta = get_typed_array(this_val)?;
                 Ok(Value::int32(ta.byte_length() as i32))
             },
@@ -140,7 +140,7 @@ fn init_typed_array_getters(
     proto.define_property(
         PropertyKey::string("byteOffset"),
         PropertyDescriptor::getter(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 let ta = get_typed_array(this_val)?;
                 Ok(Value::int32(ta.byte_offset() as i32))
             },
@@ -153,7 +153,7 @@ fn init_typed_array_getters(
     proto.define_property(
         PropertyKey::string("length"),
         PropertyDescriptor::getter(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 let ta = get_typed_array(this_val)?;
                 Ok(Value::int32(ta.length() as i32))
             },
@@ -176,7 +176,7 @@ fn init_typed_array_methods(
     proto.define_property(
         PropertyKey::string("at"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
                 let index = args.first()
@@ -208,7 +208,7 @@ fn init_typed_array_methods(
     proto.define_property(
         PropertyKey::string("copyWithin"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
                 let target = args.get(0)
@@ -234,7 +234,7 @@ fn init_typed_array_methods(
     proto.define_property(
         PropertyKey::string("fill"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
                 let value = args.first()
@@ -262,7 +262,7 @@ fn init_typed_array_methods(
     proto.define_property(
         PropertyKey::string("includes"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
                 let search = args.first()
@@ -292,7 +292,7 @@ fn init_typed_array_methods(
     proto.define_property(
         PropertyKey::string("indexOf"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
                 let search = args.first()
@@ -322,7 +322,7 @@ fn init_typed_array_methods(
     proto.define_property(
         PropertyKey::string("join"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
                 let separator = args.first()
@@ -351,7 +351,7 @@ fn init_typed_array_methods(
     proto.define_property(
         PropertyKey::string("lastIndexOf"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
                 let search = args.first()
@@ -382,7 +382,7 @@ fn init_typed_array_methods(
     proto.define_property(
         PropertyKey::string("reverse"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
                 ta.reverse();
@@ -398,7 +398,7 @@ fn init_typed_array_methods(
     proto.define_property(
         PropertyKey::string("set"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
                 let offset = args.get(1)
@@ -440,7 +440,7 @@ fn init_typed_array_methods(
     proto.define_property(
         PropertyKey::string("slice"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
                 let start = args.get(0)
@@ -465,7 +465,7 @@ fn init_typed_array_methods(
     proto.define_property(
         PropertyKey::string("subarray"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
                 let begin = args.get(0)
@@ -490,7 +490,7 @@ fn init_typed_array_methods(
     proto.define_property(
         PropertyKey::string("toString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 // Delegate to Array.prototype.toString which calls join()
                 let ta = get_typed_array(this_val)?;
 
@@ -516,7 +516,7 @@ fn init_typed_array_methods(
     proto.define_property(
         PropertyKey::string("toLocaleString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
                 let mut result = String::new();
@@ -554,11 +554,11 @@ fn init_typed_array_iterators(
     // %TypedArray%.prototype.values() — ES2026 §22.2.3.31
     // This is the iterator method that returns an iterator
     let values_method = Value::native_function_with_proto(
-        move |this_val, _args, mm| {
+        move |this_val, _args, ncx| {
             let ta = get_typed_array(this_val)?;
 
             // Create an iterator object (simplified - would need proper iterator protocol)
-            let iter_obj = GcRef::new(JsObject::new(None, mm.clone()));
+            let iter_obj = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
 
             // Store the typed array reference and current index
             iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
@@ -568,7 +568,7 @@ fn init_typed_array_iterators(
             iter_obj.set(
                 PropertyKey::string("next"),
                 Value::native_function_with_proto(
-                    move |iter_this, _args, mm_inner| {
+                    move |iter_this, _args, ncx_inner| {
                         let iter_obj = iter_this
                             .as_object()
                             .ok_or_else(|| VmError::internal("iterator is not an object"))?;
@@ -582,7 +582,7 @@ fn init_typed_array_iterators(
                             .ok_or_else(|| VmError::internal("iterator missing _index"))?;
                         let index = index_val.as_int32().unwrap_or(0) as usize;
 
-                        let result = GcRef::new(JsObject::new(None, mm_inner.clone()));
+                        let result = GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
 
                         if index >= ta.length() {
                             result.set(PropertyKey::string("done"), Value::boolean(true));
@@ -598,7 +598,7 @@ fn init_typed_array_iterators(
 
                         Ok(Value::object(result))
                     },
-                    mm.clone(),
+                    ncx.memory_manager().clone(),
                     fn_proto_clone1,
                 ),
             );
@@ -624,17 +624,17 @@ fn init_typed_array_iterators(
     proto.define_property(
         PropertyKey::string("keys"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            move |this_val, _args, mm| {
+            move |this_val, _args, ncx| {
                 let ta = get_typed_array(this_val)?;
 
-                let iter_obj = GcRef::new(JsObject::new(None, mm.clone()));
+                let iter_obj = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
                 iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
                 iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
 
                 iter_obj.set(
                     PropertyKey::string("next"),
                     Value::native_function_with_proto(
-                        move |iter_this, _args, mm_inner| {
+                        move |iter_this, _args, ncx_inner| {
                             let iter_obj = iter_this.as_object()
                                 .ok_or_else(|| VmError::internal("iterator is not an object"))?;
 
@@ -647,7 +647,7 @@ fn init_typed_array_iterators(
                                 .and_then(|v| v.as_int32())
                                 .unwrap_or(0) as usize;
 
-                            let result = GcRef::new(JsObject::new(None, mm_inner.clone()));
+                            let result = GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
 
                             if index >= ta.length() {
                                 result.set(PropertyKey::string("done"), Value::boolean(true));
@@ -660,7 +660,7 @@ fn init_typed_array_iterators(
 
                             Ok(Value::object(result))
                         },
-                        mm.clone(),
+                        ncx.memory_manager().clone(),
                         fn_proto_clone2,
                     ),
                 );
@@ -676,17 +676,17 @@ fn init_typed_array_iterators(
     proto.define_property(
         PropertyKey::string("entries"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            move |this_val, _args, mm| {
+            move |this_val, _args, ncx| {
                 let ta = get_typed_array(this_val)?;
 
-                let iter_obj = GcRef::new(JsObject::new(None, mm.clone()));
+                let iter_obj = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
                 iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
                 iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
 
                 iter_obj.set(
                     PropertyKey::string("next"),
                     Value::native_function_with_proto(
-                        move |iter_this, _args, mm_inner| {
+                        move |iter_this, _args, ncx_inner| {
                             let iter_obj = iter_this.as_object()
                                 .ok_or_else(|| VmError::internal("iterator is not an object"))?;
 
@@ -699,7 +699,7 @@ fn init_typed_array_iterators(
                                 .and_then(|v| v.as_int32())
                                 .unwrap_or(0) as usize;
 
-                            let result = GcRef::new(JsObject::new(None, mm_inner.clone()));
+                            let result = GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
 
                             if index >= ta.length() {
                                 result.set(PropertyKey::string("done"), Value::boolean(true));
@@ -710,7 +710,7 @@ fn init_typed_array_iterators(
                                     .unwrap_or(Value::undefined());
 
                                 // Create [index, value] array
-                                let entry = GcRef::new(JsObject::new(None, mm_inner.clone()));
+                                let entry = GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
                                 entry.set(PropertyKey::Index(0), Value::int32(index as i32));
                                 entry.set(PropertyKey::Index(1), val);
 
@@ -721,7 +721,7 @@ fn init_typed_array_iterators(
 
                             Ok(Value::object(result))
                         },
-                        mm.clone(),
+                        ncx.memory_manager().clone(),
                         fn_proto_clone3,
                     ),
                 );

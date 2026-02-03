@@ -230,7 +230,7 @@ pub trait SqlAdapter: Send + Sync {
     async fn close(&self) -> SqlResult<()>;
 
     /// Start a COPY FROM operation (PostgreSQL only)
-    async fn copy_from(&self, options: CopyFromOptions) -> SqlResult<Box<dyn CopySink>> {
+    async fn copy_from(&self, _options: CopyFromOptions) -> SqlResult<Box<dyn CopySink>> {
         Err(crate::error::SqlError::Unsupported(format!(
             "COPY FROM not supported for {}",
             self.adapter_type()
@@ -238,7 +238,7 @@ pub trait SqlAdapter: Send + Sync {
     }
 
     /// Start a COPY TO operation (PostgreSQL only)
-    async fn copy_to(&self, options: CopyToOptions) -> SqlResult<Box<dyn CopyStream>> {
+    async fn copy_to(&self, _options: CopyToOptions) -> SqlResult<Box<dyn CopyStream>> {
         Err(crate::error::SqlError::Unsupported(format!(
             "COPY TO not supported for {}",
             self.adapter_type()

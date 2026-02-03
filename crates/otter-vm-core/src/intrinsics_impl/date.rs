@@ -34,7 +34,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getTime"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 let ts = get_timestamp(this_val)?;
                 Ok(Value::number(ts as f64))
             },
@@ -47,7 +47,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("valueOf"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 let ts = get_timestamp(this_val)?;
                 Ok(Value::number(ts as f64))
             },
@@ -60,7 +60,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("toISOString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::DateTime;
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -76,7 +76,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("toString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Local};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -94,7 +94,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("toDateString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Local};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -112,7 +112,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("toTimeString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Local};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -130,7 +130,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getFullYear"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Datelike, Local};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -147,7 +147,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getMonth"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Datelike, Local};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -164,7 +164,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getDate"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Datelike, Local};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -181,7 +181,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getDay"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Datelike, Local};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -200,7 +200,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getHours"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Local, Timelike};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -217,7 +217,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getMinutes"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Local, Timelike};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -234,7 +234,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getSeconds"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Local, Timelike};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -251,7 +251,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getMilliseconds"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 let ts = get_timestamp(this_val)?;
                 Ok(Value::int32((ts % 1000) as i32))
             },
@@ -264,7 +264,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getTimezoneOffset"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Local};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -284,7 +284,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("toJSON"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::DateTime;
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -300,7 +300,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("toUTCString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::DateTime;
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -317,7 +317,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("toLocaleDateString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Datelike, Local};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -335,7 +335,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("toLocaleTimeString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Local, Timelike};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -355,7 +355,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("toLocaleString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Datelike, Local, Timelike};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -381,7 +381,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getUTCFullYear"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Datelike, Utc};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -398,7 +398,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getUTCMonth"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Datelike, Utc};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -415,7 +415,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getUTCDate"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Datelike, Utc};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -432,7 +432,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getUTCDay"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Datelike, Utc};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -450,7 +450,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getUTCHours"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Timelike, Utc};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -467,7 +467,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getUTCMinutes"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Timelike, Utc};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -484,7 +484,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getUTCSeconds"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 use chrono::{DateTime, Timelike, Utc};
                 let ts = get_timestamp(this_val)?;
                 let dt = DateTime::from_timestamp(ts / 1000, ((ts % 1000) * 1_000_000) as u32)
@@ -501,7 +501,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("getUTCMilliseconds"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 let ts = get_timestamp(this_val)?;
                 Ok(Value::int32((ts % 1000) as i32))
             },
@@ -518,7 +518,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("setTime"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let new_time = args.first()
                     .and_then(|v| v.as_number())
@@ -535,7 +535,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("setMilliseconds"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 use chrono::{DateTime, Local};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
@@ -557,7 +557,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("setSeconds"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 use chrono::{DateTime, Datelike, Local, Timelike};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
@@ -587,7 +587,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("setMinutes"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 use chrono::{DateTime, Datelike, Local, Timelike};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
@@ -622,7 +622,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("setHours"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 use chrono::{DateTime, Datelike, Local, Timelike};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
@@ -661,7 +661,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("setDate"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 use chrono::{DateTime, Datelike, Local, NaiveDate};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
@@ -686,7 +686,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("setMonth"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 use chrono::{DateTime, Datelike, Local};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
@@ -716,7 +716,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("setFullYear"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 use chrono::{DateTime, Datelike, Local};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
@@ -754,7 +754,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("setUTCMilliseconds"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 use chrono::{DateTime, Utc};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
@@ -776,7 +776,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("setUTCSeconds"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 use chrono::{DateTime, Timelike, Utc};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
@@ -806,7 +806,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("setUTCMinutes"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 use chrono::{DateTime, Timelike, Utc};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
@@ -841,7 +841,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("setUTCHours"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 use chrono::{DateTime, Timelike, Utc};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
@@ -880,7 +880,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("setUTCDate"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 use chrono::{DateTime, Datelike, Utc};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
@@ -905,7 +905,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("setUTCMonth"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 use chrono::{DateTime, Datelike, Utc};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
@@ -935,7 +935,7 @@ pub fn init_date_prototype(
     date_proto.define_property(
         PropertyKey::string("setUTCFullYear"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 use chrono::{DateTime, Datelike, Utc};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;

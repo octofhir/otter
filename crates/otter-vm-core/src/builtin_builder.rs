@@ -156,7 +156,7 @@ impl BuiltInBuilder {
     /// Set the constructor function implementation and its arity.
     pub fn constructor_fn<F>(mut self, f: F, length: u32) -> Self
     where
-        F: Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError>
+        F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
             + Send
             + Sync
             + 'static,
@@ -172,7 +172,7 @@ impl BuiltInBuilder {
     /// The function object will have `length` and `name` properties set correctly.
     pub fn method<F>(mut self, name: &str, f: F, length: u32) -> Self
     where
-        F: Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError>
+        F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
             + Send
             + Sync
             + 'static,
@@ -198,7 +198,7 @@ impl BuiltInBuilder {
     /// Add a static method to the constructor.
     pub fn static_method<F>(mut self, name: &str, f: F, length: u32) -> Self
     where
-        F: Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError>
+        F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
             + Send
             + Sync
             + 'static,
@@ -285,7 +285,7 @@ impl BuiltInBuilder {
         length: u32,
     ) -> Self
     where
-        F: Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError>
+        F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
             + Send
             + Sync
             + 'static,
@@ -515,7 +515,7 @@ impl NamespaceBuilder {
     /// Add a method to the namespace object.
     pub fn method<F>(mut self, name: &str, f: F, length: u32) -> Self
     where
-        F: Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError>
+        F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
             + Send
             + Sync
             + 'static,

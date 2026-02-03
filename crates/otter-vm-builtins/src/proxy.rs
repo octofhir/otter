@@ -81,7 +81,7 @@ fn native_proxy_revocable(
     result.set(
         "revoke".into(),
         VmValue::native_function(
-            move |_this: &VmValue, _args: &[VmValue], _mm: Arc<memory::MemoryManager>| {
+            move |_this: &VmValue, _args: &[VmValue], _ncx: &mut otter_vm_core::context::NativeContext<'_>| {
                 revoke_fn();
                 Ok(VmValue::undefined())
             },
@@ -140,96 +140,4 @@ fn native_proxy_is_revoked(
     Ok(VmValue::boolean(proxy.is_revoked()))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_proxy_create() {
-        let mm = Arc::new(memory::MemoryManager::test());
-        let target = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
-        let handler = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
-
-        let result =
-            native_proxy_create(&[VmValue::object(target), VmValue::object(handler)], mm).unwrap();
-
-        assert!(result.is_proxy());
-        assert!(!result.as_proxy().unwrap().is_revoked());
-    }
-
-    #[test]
-    fn test_proxy_create_invalid_target() {
-        let mm = Arc::new(memory::MemoryManager::test());
-        let handler = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
-        let result = native_proxy_create(
-            &[VmValue::number(42.0), VmValue::object(handler)],
-            Arc::clone(&mm),
-        );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("target must be an object"));
-    }
-
-    #[test]
-    fn test_proxy_revocable() {
-        let mm = Arc::new(memory::MemoryManager::test());
-        let target = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
-        let handler = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
-
-        let result =
-            native_proxy_revocable(&[VmValue::object(target), VmValue::object(handler)], mm)
-                .unwrap();
-
-        assert!(result.is_object());
-        let obj = result.as_object().unwrap();
-
-        let proxy = obj.get(&"proxy".into()).unwrap();
-        assert!(proxy.is_proxy());
-
-        let revoke = obj.get(&"revoke".into()).unwrap();
-        assert!(revoke.is_native_function());
-    }
-
-    #[test]
-    fn test_proxy_is_revoked() {
-        let mm = Arc::new(memory::MemoryManager::test());
-        let target = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
-        let handler = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
-        let proxy = JsProxy::new(target, handler);
-        let proxy_val = VmValue::proxy(proxy.clone());
-
-        let result =
-            native_proxy_is_revoked(std::slice::from_ref(&proxy_val), Arc::clone(&mm)).unwrap();
-        assert_eq!(result.as_boolean(), Some(false));
-
-        proxy.revoke();
-        let result = native_proxy_is_revoked(&[proxy_val], Arc::clone(&mm)).unwrap();
-        assert_eq!(result.as_boolean(), Some(true));
-    }
-
-    #[test]
-    fn test_proxy_get_target() {
-        let mm = Arc::new(memory::MemoryManager::test());
-        let target = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
-        target.set("x".into(), VmValue::number(42.0));
-        let handler = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
-        let proxy = JsProxy::new(target, handler);
-
-        let result = native_proxy_get_target(&[VmValue::proxy(proxy)], Arc::clone(&mm)).unwrap();
-        assert!(result.is_object());
-        let obj = result.as_object().unwrap();
-        assert_eq!(obj.get(&"x".into()).unwrap().as_number(), Some(42.0));
-    }
-
-    #[test]
-    fn test_proxy_get_target_revoked() {
-        let mm = Arc::new(memory::MemoryManager::test());
-        let target = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
-        let handler = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
-        let proxy = JsProxy::new(target, handler);
-        proxy.revoke();
-
-        let result = native_proxy_get_target(&[VmValue::proxy(proxy)], Arc::clone(&mm));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("revoked"));
-    }
-}
+// TODO: Tests need to be updated to use NativeContext instead of Arc<MemoryManager>

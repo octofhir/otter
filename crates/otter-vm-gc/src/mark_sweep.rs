@@ -438,6 +438,14 @@ pub trait GcTraceable {
 
     /// Trace all GC references in this value
     fn trace(&self, tracer: &mut dyn FnMut(*const GcHeader));
+
+    /// Whether this type needs sweep cleanup
+    fn needs_sweep_cleanup() -> bool {
+        false
+    }
+
+    /// Cleanup during sweep phase
+    fn sweep_cleanup(&mut self, _dead: &HashSet<*const GcHeader>) {}
 }
 
 // Implement GcTraceable for primitive types

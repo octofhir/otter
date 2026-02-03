@@ -116,7 +116,7 @@ pub fn install_reflect_namespace(
     // === Property Access ===
 
     // Reflect.get(target, propertyKey, receiver?)
-    reflect_method!("get", |_, args: &[Value], _mm| {
+    reflect_method!("get", |_, args: &[Value], _ncx| {
         let target = args.first().ok_or("Reflect.get requires a target argument")?;
         let property_key = args.get(1).ok_or("Reflect.get requires a propertyKey argument")?;
 
@@ -134,7 +134,7 @@ pub fn install_reflect_namespace(
     });
 
     // Reflect.set(target, propertyKey, value, receiver?)
-    reflect_method!("set", |_, args, _mm| {
+    reflect_method!("set", |_, args, _ncx| {
         let target = args.first().ok_or("Reflect.set requires a target argument")?;
         let property_key = args.get(1).ok_or("Reflect.set requires a propertyKey argument")?;
         let value = args.get(2).cloned().unwrap_or(Value::undefined());
@@ -154,7 +154,7 @@ pub fn install_reflect_namespace(
     });
 
     // Reflect.has(target, propertyKey)
-    reflect_method!("has", |_, args, _mm| {
+    reflect_method!("has", |_, args, _ncx| {
         let target = args.first().ok_or("Reflect.has requires a target argument")?;
         let property_key = args.get(1).ok_or("Reflect.has requires a propertyKey argument")?;
 
@@ -172,7 +172,7 @@ pub fn install_reflect_namespace(
     });
 
     // Reflect.deleteProperty(target, propertyKey)
-    reflect_method!("deleteProperty", |_, args, _mm| {
+    reflect_method!("deleteProperty", |_, args, _ncx| {
         let target = args.first().ok_or("Reflect.deleteProperty requires a target argument")?;
         let property_key = args.get(1).ok_or("Reflect.deleteProperty requires a propertyKey argument")?;
 
@@ -193,7 +193,7 @@ pub fn install_reflect_namespace(
     // === Property Enumeration and Inspection ===
 
     // Reflect.ownKeys(target)
-    reflect_method!("ownKeys", |_, args, mm| {
+    reflect_method!("ownKeys", |_, args, ncx| {
         let target = args.first().ok_or("Reflect.ownKeys requires a target argument")?;
 
         // Check if target is a proxy
@@ -204,7 +204,7 @@ pub fn install_reflect_namespace(
         let obj = get_target_object(target)?;
         let keys = obj.own_keys();
 
-        let result = GcRef::new(JsObject::array(keys.len(), mm.clone()));
+        let result = GcRef::new(JsObject::array(keys.len(), ncx.memory_manager().clone()));
         for (i, key) in keys.into_iter().enumerate() {
             let key_val = match key {
                 PropertyKey::String(s) => Value::string(s),
@@ -218,7 +218,7 @@ pub fn install_reflect_namespace(
     });
 
     // Reflect.getOwnPropertyDescriptor(target, propertyKey)
-    reflect_method!("getOwnPropertyDescriptor", |_, args, mm| {
+    reflect_method!("getOwnPropertyDescriptor", |_, args, ncx| {
         let target = args.first().ok_or("Reflect.getOwnPropertyDescriptor requires a target argument")?;
         let property_key = args.get(1).ok_or("Reflect.getOwnPropertyDescriptor requires a propertyKey argument")?;
 
@@ -233,7 +233,7 @@ pub fn install_reflect_namespace(
         if let Some(prop_desc) = obj.lookup_property_descriptor(&key) {
             match prop_desc {
                 PropertyDescriptor::Data { value, attributes } => {
-                    let desc = GcRef::new(JsObject::new(None, mm.clone()));
+                    let desc = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
                     desc.set("value".into(), value);
                     desc.set("writable".into(), Value::boolean(attributes.writable));
                     desc.set("enumerable".into(), Value::boolean(attributes.enumerable));
@@ -241,7 +241,7 @@ pub fn install_reflect_namespace(
                     Ok(Value::object(desc))
                 }
                 PropertyDescriptor::Accessor { get, set, attributes } => {
-                    let desc = GcRef::new(JsObject::new(None, mm.clone()));
+                    let desc = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
                     desc.set("get".into(), get.unwrap_or(Value::undefined()));
                     desc.set("set".into(), set.unwrap_or(Value::undefined()));
                     desc.set("enumerable".into(), Value::boolean(attributes.enumerable));
@@ -251,7 +251,7 @@ pub fn install_reflect_namespace(
                 PropertyDescriptor::Deleted => Ok(Value::undefined()),
             }
         } else if let Some(value) = obj.get(&key) {
-            let desc = GcRef::new(JsObject::new(None, mm.clone()));
+            let desc = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
             desc.set("value".into(), value);
             desc.set("writable".into(), Value::boolean(true));
             desc.set("enumerable".into(), Value::boolean(true));
@@ -263,7 +263,7 @@ pub fn install_reflect_namespace(
     });
 
     // Reflect.defineProperty(target, propertyKey, attributes)
-    reflect_method!("defineProperty", |_, args, _mm| {
+    reflect_method!("defineProperty", |_, args, _ncx| {
         let target = args.first().ok_or("Reflect.defineProperty requires a target argument")?;
         let property_key = args.get(1).ok_or("Reflect.defineProperty requires a propertyKey argument")?;
         let attributes = args.get(2).ok_or("Reflect.defineProperty requires an attributes argument")?;
@@ -325,7 +325,7 @@ pub fn install_reflect_namespace(
     // === Prototype Chain ===
 
     // Reflect.getPrototypeOf(target)
-    reflect_method!("getPrototypeOf", |_, args, _mm| {
+    reflect_method!("getPrototypeOf", |_, args, _ncx| {
         let target = args.first().ok_or("Reflect.getPrototypeOf requires a target argument")?;
 
         // Check if target is a proxy
@@ -342,7 +342,7 @@ pub fn install_reflect_namespace(
     });
 
     // Reflect.setPrototypeOf(target, prototype)
-    reflect_method!("setPrototypeOf", |_, args, _mm| {
+    reflect_method!("setPrototypeOf", |_, args, _ncx| {
         let target = args.first().ok_or("Reflect.setPrototypeOf requires a target argument")?;
         let prototype = args.get(1).ok_or("Reflect.setPrototypeOf requires a prototype argument")?;
 
@@ -368,7 +368,7 @@ pub fn install_reflect_namespace(
     // === Extensibility ===
 
     // Reflect.isExtensible(target)
-    reflect_method!("isExtensible", |_, args, _mm| {
+    reflect_method!("isExtensible", |_, args, _ncx| {
         let target = args.first().ok_or("Reflect.isExtensible requires a target argument")?;
 
         // Check if target is a proxy
@@ -381,7 +381,7 @@ pub fn install_reflect_namespace(
     });
 
     // Reflect.preventExtensions(target)
-    reflect_method!("preventExtensions", |_, args, _mm| {
+    reflect_method!("preventExtensions", |_, args, _ncx| {
         let target = args.first().ok_or("Reflect.preventExtensions requires a target argument")?;
 
         // Check if target is a proxy
@@ -397,7 +397,7 @@ pub fn install_reflect_namespace(
     // === Function Invocation ===
 
     // Reflect.apply(target, thisArgument, argumentsList)
-    reflect_method!("apply", |_, args, mm| {
+    reflect_method!("apply", |_, args, ncx| {
         let target = args.first().ok_or("Reflect.apply requires a target argument")?;
         let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
         let args_list = args.get(2).ok_or("Reflect.apply requires an argumentsList argument")?;
@@ -432,7 +432,7 @@ pub fn install_reflect_namespace(
         // Call the function
         if let Some(native_fn) = target.as_native_function() {
             // Native function call
-            native_fn(&this_arg, &args_array, mm.clone())
+            native_fn(&this_arg, &args_array, ncx)
         } else if let Some(_closure) = target.as_function() {
             // Closure call - not fully supported yet in intrinsics
             // Would require VmContext to execute bytecode
@@ -443,7 +443,7 @@ pub fn install_reflect_namespace(
     });
 
     // Reflect.construct(target, argumentsList, newTarget?)
-    reflect_method!("construct", |_, args, mm| {
+    reflect_method!("construct", |_, args, ncx| {
         let target = args.first().ok_or("Reflect.construct requires a target argument")?;
         let args_list = args.get(1).ok_or("Reflect.construct requires an argumentsList argument")?;
         let _new_target = args.get(2); // Optional, for advanced use
@@ -476,13 +476,13 @@ pub fn install_reflect_namespace(
         };
 
         // Create new instance
-        let new_obj = GcRef::new(JsObject::new(None, mm.clone()));
+        let new_obj = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
         let this_val = Value::object(new_obj);
 
         // Call constructor
         if let Some(native_fn) = target.as_native_function() {
             // Call native constructor
-            let result = native_fn(&this_val, &args_array, mm.clone())?;
+            let result = native_fn(&this_val, &args_array, ncx)?;
 
             // If constructor returns an object, use it; otherwise use this_val
             if result.is_object() {

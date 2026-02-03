@@ -54,17 +54,8 @@ skip_features = [
     "json-modules",
     # Iterator helpers
     "iterator-helpers",
-    # Array grouping
-    "array-grouping",
     # Symbols as WeakMap keys
     "symbols-as-weakmap-keys",
-    # RegExp features not yet implemented
-    "regexp-duplicate-named-groups",
-    "regexp-lookbehind",
-    "regexp-named-groups",
-    "regexp-unicode-property-escapes",
-    "regexp-v-flag",
-    "regexp-match-indices",
     # Hashbang
     "hashbang",
     # Class features

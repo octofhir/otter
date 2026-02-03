@@ -237,7 +237,7 @@ pub fn init_regexp_prototype(
     regexp_proto.define_property(
         PropertyKey::string("test"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 let regex = get_regex(this_val)?;
                 let input = args
                     .first()
@@ -256,14 +256,14 @@ pub fn init_regexp_prototype(
     regexp_proto.define_property(
         PropertyKey::string("exec"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, mm| {
+            |this_val, args, ncx| {
                 let regex = get_regex(this_val)?;
                 let input = args
                     .first()
                     .map(val_to_js_string)
                     .unwrap_or_else(|| JsString::intern("undefined"));
                 match find_first(regex, &input, 0) {
-                    Some(mat) => Ok(build_exec_result(&input, &mat, &mm)),
+                    Some(mat) => Ok(build_exec_result(&input, &mat, ncx.memory_manager())),
                     None => Ok(Value::null()),
                 }
             },
@@ -278,7 +278,7 @@ pub fn init_regexp_prototype(
     regexp_proto.define_property(
         PropertyKey::string("toString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 let regex = get_regex(this_val)?;
                 let source = if regex.pattern.is_empty() {
                     "(?:)"
@@ -301,7 +301,7 @@ pub fn init_regexp_prototype(
     regexp_proto.define_property(
         PropertyKey::Symbol(crate::intrinsics::well_known::MATCH),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, mm| {
+            |this_val, args, ncx| {
                 let regex = get_regex(this_val)?;
                 let input = args
                     .first()
@@ -316,7 +316,7 @@ pub fn init_regexp_prototype(
                     if matches.is_empty() {
                         return Ok(Value::null());
                     }
-                    let arr = JsObject::array(matches.len(), mm);
+                    let arr = JsObject::array(matches.len(), ncx.memory_manager().clone());
                     for (i, mat) in matches.iter().enumerate() {
                         let range = mat.range();
                         let slice = &input.as_utf16()[range.start..range.end];
@@ -329,7 +329,7 @@ pub fn init_regexp_prototype(
                 } else {
                     // Non-global: same as exec
                     match find_first(regex, &input, 0) {
-                        Some(mat) => Ok(build_exec_result(&input, &mat, &mm)),
+                        Some(mat) => Ok(build_exec_result(&input, &mat, ncx.memory_manager())),
                         None => Ok(Value::null()),
                     }
                 }
@@ -345,7 +345,7 @@ pub fn init_regexp_prototype(
     regexp_proto.define_property(
         PropertyKey::Symbol(crate::intrinsics::well_known::MATCH_ALL),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, mm| {
+            |this_val, args, ncx| {
                 let regex = get_regex(this_val)?;
                 let input = args
                     .first()
@@ -359,9 +359,9 @@ pub fn init_regexp_prototype(
                 }
 
                 let matches = find_all(regex, &input);
-                let arr = JsObject::array(matches.len(), mm.clone());
+                let arr = JsObject::array(matches.len(), ncx.memory_manager().clone());
                 for (i, mat) in matches.iter().enumerate() {
-                    let exec_result = build_exec_result(&input, mat, &mm);
+                    let exec_result = build_exec_result(&input, mat, ncx.memory_manager());
                     arr.set(PropertyKey::Index(i as u32), exec_result);
                 }
                 Ok(Value::array(GcRef::new(arr)))
@@ -377,7 +377,7 @@ pub fn init_regexp_prototype(
     regexp_proto.define_property(
         PropertyKey::Symbol(crate::intrinsics::well_known::REPLACE),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 let regex = get_regex(this_val)?;
                 let input = args
                     .first()
@@ -434,7 +434,7 @@ pub fn init_regexp_prototype(
     regexp_proto.define_property(
         PropertyKey::Symbol(crate::intrinsics::well_known::SEARCH),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _mm| {
+            |this_val, args, _ncx| {
                 let regex = get_regex(this_val)?;
                 let input = args
                     .first()
@@ -456,7 +456,7 @@ pub fn init_regexp_prototype(
     regexp_proto.define_property(
         PropertyKey::Symbol(crate::intrinsics::well_known::SPLIT),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, mm| {
+            |this_val, args, ncx| {
                 let regex = get_regex(this_val)?;
                 let input = args
                     .first()
@@ -515,7 +515,7 @@ pub fn init_regexp_prototype(
                     parts.push(Value::string(seg));
                 }
 
-                let arr = JsObject::array(parts.len(), mm);
+                let arr = JsObject::array(parts.len(), ncx.memory_manager().clone());
                 for (i, part) in parts.into_iter().enumerate() {
                     arr.set(PropertyKey::Index(i as u32), part);
                 }
@@ -543,7 +543,7 @@ pub fn init_regexp_prototype(
         PropertyKey::string("flags"),
         PropertyDescriptor::Accessor {
             get: Some(Value::native_function_with_proto(
-                |this_val, _args, _mm| {
+                |this_val, _args, _ncx| {
                     let regex = get_regex(this_val)?;
                     Ok(Value::string(intern(&regex.flags)))
                 },
@@ -560,7 +560,7 @@ pub fn init_regexp_prototype(
         PropertyKey::string("source"),
         PropertyDescriptor::Accessor {
             get: Some(Value::native_function_with_proto(
-                |this_val, _args, _mm| {
+                |this_val, _args, _ncx| {
                     let regex = get_regex(this_val)?;
                     let source = if regex.pattern.is_empty() {
                         "(?:)"
@@ -584,7 +584,7 @@ pub fn init_regexp_prototype(
                 PropertyKey::string(name),
                 PropertyDescriptor::Accessor {
                     get: Some(Value::native_function_with_proto(
-                        move |this_val, _args, _mm| {
+                        move |this_val, _args, _ncx| {
                             let regex = get_regex(this_val)?;
                             Ok(Value::boolean(regex.flags.contains(flag_char)))
                         },
@@ -624,9 +624,9 @@ pub fn init_regexp_prototype(
 pub fn create_regexp_constructor(
     regexp_proto: GcRef<JsObject>,
 ) -> Box<
-    dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync,
+    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
 > {
-    Box::new(move |_this_val, args, mm| {
+    Box::new(move |_this_val, args, ncx| {
         let pattern_arg = args.first().cloned().unwrap_or(Value::undefined());
         let flags_arg = args.get(1).cloned();
 
@@ -675,7 +675,7 @@ pub fn create_regexp_constructor(
             (p, f)
         };
 
-        let regex = Arc::new(JsRegExp::new(pattern, flags, Some(regexp_proto), mm));
+        let regex = Arc::new(JsRegExp::new(pattern, flags, Some(regexp_proto), ncx.memory_manager().clone()));
         Ok(Value::regex(regex))
     })
 }

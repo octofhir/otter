@@ -691,7 +691,7 @@ impl Otter {
             OpHandler::Native(native_fn) => {
                 // Native ops work directly with Value
                 Value::native_function_with_proto(
-                    move |_this, args, mm_inner| native_fn(args, mm_inner),
+                    move |_this, args, ncx| native_fn(args, ncx.memory_manager().clone()),
                     mm,
                     fn_proto,
                 )

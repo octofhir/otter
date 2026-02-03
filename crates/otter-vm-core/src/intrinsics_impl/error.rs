@@ -48,7 +48,7 @@ pub fn init_error_prototypes(
     error_proto.define_property(
         PropertyKey::string("toString"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _mm| {
+            |this_val, _args, _ncx| {
                 if let Some(obj) = this_val.as_object() {
                     let name = obj
                         .get(&PropertyKey::string("name"))
@@ -84,7 +84,7 @@ pub fn init_error_prototypes(
         PropertyKey::string("stack"),
         PropertyDescriptor::Accessor {
             get: Some(Value::native_function_with_proto(
-                |this_val, _args, _mm| {
+                |this_val, _args, _ncx| {
                     if let Some(obj) = this_val.as_object() {
                         // Get error name and message
                         let name = obj
@@ -209,8 +209,8 @@ pub fn init_error_prototypes(
 /// Create Error constructor function
 pub fn create_error_constructor(
     error_name: &'static str,
-) -> Box<dyn Fn(&Value, &[Value], Arc<MemoryManager>) -> Result<Value, VmError> + Send + Sync> {
-    Box::new(move |this, args, _mm_inner| {
+) -> Box<dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync> {
+    Box::new(move |this, args, _ncx_inner| {
         // Set properties on `this` (the new object created by Construct
         // which already has the correct ErrorType.prototype)
         if let Some(obj) = this.as_object() {

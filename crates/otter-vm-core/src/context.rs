@@ -1854,7 +1854,7 @@ mod tests {
     #[test]
     fn test_context_registers() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024));
-        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         let mut ctx = VmContext::new(global, memory_manager);
 
         ctx.push_frame(0, dummy_module(), 0, None, false, false, 0)
@@ -1867,7 +1867,7 @@ mod tests {
     #[test]
     fn test_context_locals() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024));
-        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         let mut ctx = VmContext::new(global, memory_manager);
 
         ctx.push_frame(0, dummy_module(), 3, None, false, false, 0)
@@ -1884,7 +1884,7 @@ mod tests {
     #[test]
     fn test_stack_overflow() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024));
-        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         // Use a small max_stack_depth for testing
         let test_max_depth = 100;
         let mut ctx = VmContext::with_config(
@@ -1909,7 +1909,7 @@ mod tests {
     #[test]
     fn test_native_call_depth() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024));
-        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         let ctx = VmContext::with_config(global, DEFAULT_MAX_STACK_DEPTH, 3, memory_manager);
 
         // Should be able to enter 3 native calls
@@ -1928,7 +1928,7 @@ mod tests {
     #[test]
     fn test_program_counter() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(1024 * 1024));
-        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         let mut ctx = VmContext::new(global, memory_manager);
 
         ctx.push_frame(0, dummy_module(), 0, None, false, false, 0)

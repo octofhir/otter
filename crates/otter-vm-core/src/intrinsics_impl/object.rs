@@ -157,7 +157,7 @@ pub fn init_object_prototype(
             |this_val, args, _ncx| {
                 if let Some(target) = args.first().and_then(|v| v.as_object()) {
                     if let Some(this_obj) = this_val.as_object() {
-                        let mut current = target.prototype();
+                        let mut current = target.prototype().as_object();
                         while let Some(proto) = current {
                             if std::ptr::eq(
                                 proto.as_ptr() as *const _,
@@ -165,7 +165,7 @@ pub fn init_object_prototype(
                             ) {
                                 return Ok(Value::boolean(true));
                             }
-                            current = proto.prototype();
+                            current = proto.prototype().as_object();
                         }
                     }
                 }
@@ -211,10 +211,7 @@ pub fn init_object_constructor(
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |_this, args, _ncx| {
                 if let Some(obj) = args.first().and_then(|v| v.as_object()) {
-                    match obj.prototype() {
-                        Some(proto) => Ok(Value::object(proto)),
-                        None => Ok(Value::null()),
-                    }
+                    Ok(obj.prototype())
                 } else {
                     Ok(Value::null())
                 }
@@ -237,7 +234,8 @@ pub fn init_object_constructor(
                     } else {
                         proto_val.as_object()
                     };
-                    if !obj.set_prototype(proto) {
+                    let proto_value = proto.map(Value::object).unwrap_or_else(Value::null);
+                    if !obj.set_prototype(proto_value) {
                         return Err(
                             VmError::type_error("Object.setPrototypeOf failed")
                         );
@@ -270,7 +268,7 @@ pub fn init_object_constructor(
                         )?;
 
                         if let Some(desc) = result_desc {
-                            let desc_obj = GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
+                            let desc_obj = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
                             match &desc {
                                 PropertyDescriptor::Data { value, attributes } => {
                                     desc_obj.set(PropertyKey::string("value"), value.clone());
@@ -300,7 +298,7 @@ pub fn init_object_constructor(
                     if let Some(desc) = obj.get_own_property_descriptor(&pk) {
                         // Build descriptor object
                         let desc_obj =
-                            GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
+                            GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
                         match &desc {
                             PropertyDescriptor::Data { value, attributes } => {
                                 desc_obj.set(
@@ -418,7 +416,7 @@ pub fn init_object_constructor(
                     if let Some(array_obj) = array_ctor.as_object() {
                         if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
                             if let Some(proto_obj) = proto_val.as_object() {
-                                result.set_prototype(Some(proto_obj));
+                                result.set_prototype(Value::object(proto_obj));
                             }
                         }
                     }
@@ -491,7 +489,7 @@ pub fn init_object_constructor(
                     if let Some(array_obj) = array_ctor.as_object() {
                         if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
                             if let Some(proto_obj) = proto_val.as_object() {
-                                result.set_prototype(Some(proto_obj));
+                                result.set_prototype(Value::object(proto_obj));
                             }
                         }
                     }
@@ -575,7 +573,7 @@ pub fn init_object_constructor(
                                     array_obj.get(&PropertyKey::string("prototype"))
                                 {
                                     if let Some(proto_obj) = proto_val.as_object() {
-                                        entry.set_prototype(Some(proto_obj));
+                                        entry.set_prototype(Value::object(proto_obj));
                                     }
                                 }
                             }
@@ -593,7 +591,7 @@ pub fn init_object_constructor(
                     if let Some(array_obj) = array_ctor.as_object() {
                         if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
                             if let Some(proto_obj) = proto_val.as_object() {
-                                result.set_prototype(Some(proto_obj));
+                                result.set_prototype(Value::object(proto_obj));
                             }
                         }
                     }
@@ -891,15 +889,18 @@ pub fn init_object_constructor(
                 let proto_val = args.first().ok_or_else(|| {
                     "Object.create requires a prototype argument".to_string()
                 })?;
+
+                // Prototype can be null, object, or proxy
                 let prototype = if proto_val.is_null() {
-                    None
-                } else if let Some(proto_obj) = proto_val.as_object() {
-                    Some(proto_obj)
+                    Value::null()
+                } else if proto_val.as_object().is_some() || proto_val.as_proxy().is_some() {
+                    proto_val.clone()
                 } else {
                     return Err(
                         VmError::type_error("Object prototype may only be an Object or null")
                     );
                 };
+
                 let new_obj = GcRef::new(JsObject::new(prototype, ncx_inner.memory_manager().clone()));
 
                 // Handle optional properties object (second argument)
@@ -1038,7 +1039,7 @@ pub fn init_object_constructor(
                             if let Some(array_obj) = array_ctor.as_object() {
                                 if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
                                     if let Some(proto_obj) = proto_val.as_object() {
-                                        arr.set_prototype(Some(proto_obj));
+                                        arr.set_prototype(Value::object(proto_obj));
                                     }
                                 }
                             }
@@ -1065,7 +1066,7 @@ pub fn init_object_constructor(
                     if let Some(array_obj) = array_ctor.as_object() {
                         if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
                             if let Some(proto_obj) = proto_val.as_object() {
-                                result.set_prototype(Some(proto_obj));
+                                result.set_prototype(Value::object(proto_obj));
                             }
                         }
                     }
@@ -1089,15 +1090,15 @@ pub fn init_object_constructor(
                     Some(o) => o,
                     None => {
                         return Ok(Value::object(GcRef::new(JsObject::new(
-                            None, ncx_inner.memory_manager().clone(),
+                            Value::null(), ncx_inner.memory_manager().clone(),
                         ))));
                     }
                 };
-                let result = GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
                 for key in obj.own_keys() {
                     if let Some(desc) = obj.get_own_property_descriptor(&key) {
                         let desc_obj =
-                            GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
+                            GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
                         match &desc {
                             PropertyDescriptor::Data { value, attributes } => {
                                 desc_obj.set(
@@ -1248,7 +1249,7 @@ pub fn init_object_constructor(
                 let iter_obj = iterable.as_object().ok_or_else(|| {
                     "Object.fromEntries argument must be iterable".to_string()
                 })?;
-                let result = GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
 
                 // Support array-like iterables (check length property)
                 if let Some(len_val) =

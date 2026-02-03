@@ -66,7 +66,7 @@ pub fn init_generator_prototype(
 
                 // For now, return a placeholder iterator result
                 // In production, this would delegate to the interpreter
-                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 result.set(PropertyKey::string("value"), Value::undefined());
                 result.set(PropertyKey::string("done"), Value::boolean(false));
                 Ok(Value::object(result))
@@ -92,7 +92,7 @@ pub fn init_generator_prototype(
                 }
 
                 // Placeholder - actual execution handled by interpreter
-                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 let return_value = args.first().cloned().unwrap_or_else(Value::undefined);
                 result.set(PropertyKey::string("value"), return_value);
                 result.set(PropertyKey::string("done"), Value::boolean(true));
@@ -193,7 +193,7 @@ pub fn init_async_generator_prototype(
 
                 // Placeholder - actual execution handled by interpreter
                 // Async generators return promises
-                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 result.set(PropertyKey::string("value"), Value::undefined());
                 result.set(PropertyKey::string("done"), Value::boolean(false));
                 Ok(Value::object(result))
@@ -219,7 +219,7 @@ pub fn init_async_generator_prototype(
                 }
 
                 // Placeholder - actual execution handled by interpreter
-                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 let return_value = args.first().cloned().unwrap_or_else(Value::undefined);
                 result.set(PropertyKey::string("value"), return_value);
                 result.set(PropertyKey::string("done"), Value::boolean(true));

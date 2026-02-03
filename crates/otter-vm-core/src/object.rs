@@ -363,8 +363,9 @@ pub struct JsObject {
     /// Dictionary mode property storage (used when is_dictionary flag is set)
     /// When in dictionary mode, shape/inline/overflow are ignored for property access.
     dictionary_properties: RwLock<Option<FxHashMap<PropertyKey, PropertyEntry>>>,
-    /// Prototype (null for Object.prototype, mutable via Reflect.setPrototypeOf) - GC-managed
-    prototype: RwLock<Option<GcRef<JsObject>>>,
+    /// Prototype (null for Object.prototype, mutable via Reflect.setPrototypeOf)
+    /// Can be Value::object, Value::proxy, or Value::null
+    prototype: RwLock<Value>,
     /// Array elements (for array-like objects)
     elements: RwLock<Vec<Value>>,
     /// Object flags (mutable for freeze/seal/preventExtensions)
@@ -394,9 +395,9 @@ pub struct ObjectFlags {
 }
 
 impl JsObject {
-    /// Create a new empty object (GC-managed prototype)
+    /// Create a new empty object (prototype can be object, proxy, or null)
     pub fn new(
-        prototype: Option<GcRef<JsObject>>,
+        prototype: Value,
         memory_manager: Arc<crate::memory::MemoryManager>,
     ) -> Self {
         // Assume basic object size for now
@@ -424,7 +425,7 @@ impl JsObject {
 
     /// Create a new array
     pub fn array(length: usize, memory_manager: Arc<crate::memory::MemoryManager>) -> Self {
-        let obj = Self::new(None, memory_manager); // TODO: Array.prototype
+        let obj = Self::new(Value::null(), memory_manager);
         // Cap dense element pre-allocation to avoid OOM on large sparse arrays.
         const MAX_DENSE_PREALLOC: usize = 1 << 24; // 16M elements
         let mut flags = obj.flags.write();
@@ -670,41 +671,62 @@ impl JsObject {
         }
 
         // Check prototype chain iteratively to avoid stack overflow
-        let mut current: Option<GcRef<JsObject>> = self.prototype.read().clone();
+        let mut current_proto: Value = self.prototype.read().clone();
         let mut depth = 0;
 
-        while let Some(proto) = current {
-            depth += 1;
-            // Optimization/Safety: limit prototype chain depth
-            if depth > MAX_PROTOTYPE_CHAIN_DEPTH {
-                break;
-            }
+        loop {
+            // Handle different prototype types
+            if let Some(proto_obj) = current_proto.as_object() {
+                depth += 1;
+                // Optimization/Safety: limit prototype chain depth
+                if depth > MAX_PROTOTYPE_CHAIN_DEPTH {
+                    break;
+                }
 
-            // Check proto: dictionary mode first, then shape lookup
-            if proto.is_dictionary_mode() {
-                if let Some(dict) = proto.dictionary_properties.read().as_ref() {
-                    if let Some(entry) = dict.get(key) {
-                        match &entry.desc {
-                            PropertyDescriptor::Data { value, .. } => return Some(value.clone()),
-                            PropertyDescriptor::Accessor { .. } => return None,
-                            PropertyDescriptor::Deleted => {}
+                // Check proto: dictionary mode first, then shape lookup
+                if proto_obj.is_dictionary_mode() {
+                    if let Some(dict) = proto_obj.dictionary_properties.read().as_ref() {
+                        if let Some(entry) = dict.get(key) {
+                            match &entry.desc {
+                                PropertyDescriptor::Data { value, .. } => return Some(value.clone()),
+                                PropertyDescriptor::Accessor { .. } => return None,
+                                PropertyDescriptor::Deleted => {}
+                            }
                         }
                     }
+                } else {
+                    let shape = proto_obj.shape.read();
+                    if let Some(offset) = shape.get_offset(key) {
+                        if let Some(desc) = proto_obj.get_property_entry_by_offset(offset) {
+                            match desc {
+                                PropertyDescriptor::Data { value, .. } => return Some(value),
+                                PropertyDescriptor::Accessor { .. } => return None,
+                                PropertyDescriptor::Deleted => {}
+                            }
+                        }
+                    }
+                }
+
+                current_proto = proto_obj.prototype.read().clone();
+            } else if let Some(proxy) = current_proto.as_proxy() {
+                // Proxy in prototype chain - look at target transparently
+                // Note: This bypasses proxy traps, which is incorrect per spec, but
+                // JsObject::get() is a low-level helper without interpreter access.
+                // Proper proxy handling should happen at higher levels (interpreter/intrinsics).
+                depth += 1;
+                if depth > MAX_PROTOTYPE_CHAIN_DEPTH {
+                    break;
+                }
+                if let Some(target) = proxy.target() {
+                    current_proto = target;
+                } else {
+                    // Revoked proxy - end chain
+                    break;
                 }
             } else {
-                let shape = proto.shape.read();
-                if let Some(offset) = shape.get_offset(key) {
-                    if let Some(desc) = proto.get_property_entry_by_offset(offset) {
-                        match desc {
-                            PropertyDescriptor::Data { value, .. } => return Some(value),
-                            PropertyDescriptor::Accessor { .. } => return None,
-                            PropertyDescriptor::Deleted => {}
-                        }
-                    }
-                }
+                // null, undefined, or other non-object - end of chain
+                break;
             }
-
-            current = proto.prototype.read().clone();
         }
 
         None
@@ -771,8 +793,9 @@ impl JsObject {
         // Clear prototype
         {
             let mut proto = self.prototype.write();
-            if let Some(p) = proto.take() {
-                values.push(Value::object(p));
+            let proto_val = std::mem::replace(&mut *proto, Value::null());
+            if !proto_val.is_null() && !proto_val.is_undefined() {
+                values.push(proto_val);
             }
         }
 
@@ -813,20 +836,37 @@ impl JsObject {
         }
 
         // Walk prototype chain iteratively to avoid stack overflow
-        let mut current: Option<GcRef<JsObject>> = self.prototype.read().clone();
+        let mut current_proto: Value = self.prototype.read().clone();
         let mut depth = 0;
 
-        while let Some(proto) = current {
-            depth += 1;
-            if depth > MAX_PROTOTYPE_CHAIN_DEPTH {
-                return None; // Limit reached
-            }
+        loop {
+            if let Some(proto_obj) = current_proto.as_object() {
+                depth += 1;
+                if depth > MAX_PROTOTYPE_CHAIN_DEPTH {
+                    return None; // Limit reached
+                }
 
-            if let Some(desc) = proto.get_own_property_descriptor(key) {
-                return Some(desc);
-            }
+                if let Some(desc) = proto_obj.get_own_property_descriptor(key) {
+                    return Some(desc);
+                }
 
-            current = proto.prototype.read().clone();
+                current_proto = proto_obj.prototype.read().clone();
+            } else if let Some(proxy) = current_proto.as_proxy() {
+                // Proxy in prototype chain - look at target transparently
+                depth += 1;
+                if depth > MAX_PROTOTYPE_CHAIN_DEPTH {
+                    return None;
+                }
+                if let Some(target) = proxy.target() {
+                    current_proto = target;
+                } else {
+                    // Revoked proxy - end chain
+                    break;
+                }
+            } else {
+                // null, undefined, or other - end of chain
+                break;
+            }
         }
 
         None
@@ -1044,20 +1084,37 @@ impl JsObject {
         }
 
         // Walk prototype chain iteratively to avoid stack overflow
-        let mut current: Option<GcRef<JsObject>> = self.prototype.read().clone();
+        let mut current_proto: Value = self.prototype.read().clone();
         let mut depth = 0;
 
-        while let Some(proto) = current {
-            depth += 1;
-            if depth > MAX_PROTOTYPE_CHAIN_DEPTH {
-                return false; // Limit reached
-            }
+        loop {
+            if let Some(proto_obj) = current_proto.as_object() {
+                depth += 1;
+                if depth > MAX_PROTOTYPE_CHAIN_DEPTH {
+                    return false; // Limit reached
+                }
 
-            if proto.has_own(key) {
-                return true;
-            }
+                if proto_obj.has_own(key) {
+                    return true;
+                }
 
-            current = proto.prototype.read().clone();
+                current_proto = proto_obj.prototype.read().clone();
+            } else if let Some(proxy) = current_proto.as_proxy() {
+                // Proxy in prototype chain - look at target transparently
+                depth += 1;
+                if depth > MAX_PROTOTYPE_CHAIN_DEPTH {
+                    return false;
+                }
+                if let Some(target) = proxy.target() {
+                    current_proto = target;
+                } else {
+                    // Revoked proxy - end chain
+                    break;
+                }
+            } else {
+                // null, undefined, or other - end of chain
+                break;
+            }
         }
 
         false
@@ -1193,33 +1250,49 @@ impl JsObject {
     }
 
     /// Get prototype
-    pub fn prototype(&self) -> Option<GcRef<JsObject>> {
+    pub fn prototype(&self) -> Value {
         self.prototype.read().clone()
     }
 
     /// Set prototype
     /// Returns false if object is not extensible, if it would create a cycle,
     /// or if the chain would be too deep
-    pub fn set_prototype(&self, prototype: Option<GcRef<JsObject>>) -> bool {
+    pub fn set_prototype(&self, prototype: Value) -> bool {
         if !self.flags.read().extensible {
             return false;
         }
 
         // Check for cycles and excessive depth
-        if let Some(proto) = prototype {
-            let self_ptr = self as *const JsObject;
-            let mut current = Some(proto);
-            let mut depth = 0;
+        let self_ptr = self as *const JsObject;
+        let mut current_proto = prototype.clone();
+        let mut depth = 0;
 
-            while let Some(p) = current {
+        loop {
+            if let Some(proto_obj) = current_proto.as_object() {
                 depth += 1;
                 if depth > MAX_PROTOTYPE_CHAIN_DEPTH {
                     return false; // Chain would be too deep
                 }
-                if p.as_ptr() == self_ptr {
+                if proto_obj.as_ptr() == self_ptr {
                     return false; // Would create cycle
                 }
-                current = p.prototype.read().clone();
+                current_proto = proto_obj.prototype.read().clone();
+            } else if let Some(proxy) = current_proto.as_proxy() {
+                // Proxy in prototype chain - check its target for cycles
+                depth += 1;
+                if depth > MAX_PROTOTYPE_CHAIN_DEPTH {
+                    return false;
+                }
+                // Get proxy target and continue checking
+                if let Some(target) = proxy.target() {
+                    current_proto = target;
+                } else {
+                    // Revoked proxy - end chain
+                    break;
+                }
+            } else {
+                // null, undefined, or other - end of chain
+                break;
             }
         }
 
@@ -1355,7 +1428,7 @@ impl JsObject {
         &self.elements
     }
 
-    pub(crate) fn get_prototype_storage(&self) -> &RwLock<Option<GcRef<JsObject>>> {
+    pub(crate) fn get_prototype_storage(&self) -> &RwLock<Value> {
         &self.prototype
     }
 }
@@ -1385,7 +1458,7 @@ mod tests {
     #[test]
     fn test_object_get_set() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let obj = JsObject::new(None, memory_manager);
+        let obj = JsObject::new(Value::null(), memory_manager);
 
         obj.set(PropertyKey::string("foo"), Value::int32(42));
         assert_eq!(obj.get(&PropertyKey::string("foo")), Some(Value::int32(42)));
@@ -1394,7 +1467,7 @@ mod tests {
     #[test]
     fn test_object_has() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let obj = JsObject::new(None, memory_manager);
+        let obj = JsObject::new(Value::null(), memory_manager);
         obj.set(PropertyKey::string("foo"), Value::int32(42));
 
         assert!(obj.has(&PropertyKey::string("foo")));
@@ -1426,7 +1499,7 @@ mod tests {
     #[test]
     fn test_object_freeze() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let obj = JsObject::new(None, memory_manager);
+        let obj = JsObject::new(Value::null(), memory_manager);
         obj.set(PropertyKey::string("foo"), Value::int32(42));
 
         assert!(!obj.is_frozen());
@@ -1454,7 +1527,7 @@ mod tests {
     #[test]
     fn test_object_seal() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let obj = JsObject::new(None, memory_manager);
+        let obj = JsObject::new(Value::null(), memory_manager);
         obj.set(PropertyKey::string("foo"), Value::int32(42));
 
         assert!(!obj.is_sealed());
@@ -1483,7 +1556,7 @@ mod tests {
     #[test]
     fn test_object_prevent_extensions() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let obj = JsObject::new(None, memory_manager);
+        let obj = JsObject::new(Value::null(), memory_manager);
         obj.set(PropertyKey::string("foo"), Value::int32(42));
 
         assert!(obj.is_extensible());
@@ -1509,17 +1582,17 @@ mod tests {
     fn test_deep_prototype_chain() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // Build a prototype chain of depth 100
-        let mut proto: Option<GcRef<JsObject>> = None;
+        let mut proto_val = Value::null();
         for i in 0..100 {
-            let obj = GcRef::new(JsObject::new(proto, Arc::clone(&memory_manager)));
+            let obj = GcRef::new(JsObject::new(proto_val, Arc::clone(&memory_manager)));
             obj.set(
                 PropertyKey::string(&format!("prop{}", i)),
                 Value::int32(i as i32),
             );
-            proto = Some(obj);
+            proto_val = Value::object(obj);
         }
 
-        let child = JsObject::new(proto, memory_manager);
+        let child = JsObject::new(proto_val, memory_manager);
 
         // Should be able to access properties at depth 100
         assert_eq!(
@@ -1537,16 +1610,16 @@ mod tests {
     fn test_prototype_chain_depth_limit() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // Build a prototype chain that exceeds the limit (100)
-        let mut proto: Option<GcRef<JsObject>> = None;
+        let mut proto_val = Value::null();
         for i in 0..110 {
-            let obj = GcRef::new(JsObject::new(proto, Arc::clone(&memory_manager)));
+            let obj = GcRef::new(JsObject::new(proto_val, Arc::clone(&memory_manager)));
             if i == 0 {
                 obj.set(PropertyKey::string("deep_prop"), Value::int32(42));
             }
-            proto = Some(obj);
+            proto_val = Value::object(obj);
         }
 
-        let child = JsObject::new(proto, memory_manager);
+        let child = JsObject::new(proto_val, memory_manager);
 
         // Property at depth > 100 should not be found (returns None gracefully)
         assert_eq!(child.get(&PropertyKey::string("deep_prop")), None);
@@ -1556,20 +1629,20 @@ mod tests {
     #[test]
     fn test_prototype_cycle_prevention() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let obj1 = GcRef::new(JsObject::new(None, Arc::clone(&memory_manager)));
-        let obj2 = GcRef::new(JsObject::new(Some(obj1), Arc::clone(&memory_manager)));
-        let obj3 = GcRef::new(JsObject::new(Some(obj2), Arc::clone(&memory_manager)));
+        let obj1 = GcRef::new(JsObject::new(Value::null(), Arc::clone(&memory_manager)));
+        let obj2 = GcRef::new(JsObject::new(Value::object(obj1), Arc::clone(&memory_manager)));
+        let obj3 = GcRef::new(JsObject::new(Value::object(obj2), Arc::clone(&memory_manager)));
 
         // Attempting to create a cycle should fail
         // obj1 -> obj2 -> obj3 -> obj1 would be a cycle
-        assert!(!obj1.set_prototype(Some(obj3)));
+        assert!(!obj1.set_prototype(Value::object(obj3)));
 
-        // Setting to None should work
-        assert!(obj1.set_prototype(None));
+        // Setting to null should work
+        assert!(obj1.set_prototype(Value::null()));
 
         // Setting to an unrelated object should work
-        let unrelated = GcRef::new(JsObject::new(None, memory_manager));
-        assert!(obj1.set_prototype(Some(unrelated)));
+        let unrelated = GcRef::new(JsObject::new(Value::null(), memory_manager));
+        assert!(obj1.set_prototype(Value::object(unrelated)));
     }
 }
 
@@ -1581,10 +1654,8 @@ impl otter_vm_gc::GcTraceable for JsObject {
     const NEEDS_TRACE: bool = true;
 
     fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
-        // Trace prototype
-        if let Some(proto) = self.prototype.read().as_ref() {
-            tracer(proto.header() as *const _);
-        }
+        // Trace prototype (now a Value)
+        self.prototype.read().trace(tracer);
 
         // Trace values in inline properties
         for entry_opt in self.inline_properties.read().iter() {

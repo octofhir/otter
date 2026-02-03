@@ -7,6 +7,7 @@ use crate::array_buffer::JsArrayBuffer;
 use crate::gc::GcRef;
 use crate::memory::MemoryManager;
 use crate::object::JsObject;
+use crate::value::Value;
 use std::sync::Arc;
 
 /// The kind of TypedArray - determines element size and interpretation
@@ -128,7 +129,8 @@ impl JsTypedArray {
     ) -> Self {
         let byte_length = length * kind.element_size();
         let buffer = Arc::new(JsArrayBuffer::new(byte_length, None, memory_manager.clone()));
-        let object = GcRef::new(JsObject::new(prototype, memory_manager));
+        let proto_value = prototype.map(Value::object).unwrap_or_else(Value::null);
+        let object = GcRef::new(JsObject::new(proto_value, memory_manager));
         Self {
             object,
             buffer,
@@ -379,7 +381,7 @@ impl JsTypedArray {
         let new_byte_length = new_length * elem_size;
 
         // Get prototype and memory_manager from existing buffer
-        let prototype = self.buffer.object.prototype();
+        let prototype = self.buffer.object.prototype().as_object();
         let memory_manager = self.buffer.object.memory_manager().clone();
         let new_buffer = Arc::new(JsArrayBuffer::new(
             new_byte_length,
@@ -526,7 +528,7 @@ mod tests {
     fn test_create_int32_array() {
         let mm = make_mm();
         let buf = Arc::new(JsArrayBuffer::new(16, None, mm.clone()));
-        let object = GcRef::new(JsObject::new(None, mm));
+        let object = GcRef::new(JsObject::new(Value::null(), mm));
         let arr = JsTypedArray::new(object, buf, TypedArrayKind::Int32, 0, 4).unwrap();
         assert_eq!(arr.length(), 4);
         assert_eq!(arr.byte_length(), 16);
@@ -630,7 +632,7 @@ mod tests {
     fn test_detached_buffer() {
         let mm = make_mm();
         let buf = Arc::new(JsArrayBuffer::new(16, None, mm.clone()));
-        let object = GcRef::new(JsObject::new(None, mm));
+        let object = GcRef::new(JsObject::new(Value::null(), mm));
         let arr = JsTypedArray::new(object, buf.clone(), TypedArrayKind::Int32, 0, 4).unwrap();
 
         arr.set(0, 42.0);
@@ -648,7 +650,7 @@ mod tests {
     fn test_alignment_error() {
         let mm = make_mm();
         let buf = Arc::new(JsArrayBuffer::new(16, None, mm.clone()));
-        let object = GcRef::new(JsObject::new(None, mm));
+        let object = GcRef::new(JsObject::new(Value::null(), mm));
         let result = JsTypedArray::new(object, buf, TypedArrayKind::Int32, 1, 3);
         assert!(result.is_err());
     }

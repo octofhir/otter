@@ -126,7 +126,7 @@ fn is_valid_weak_key(value: &Value) -> bool {
 
 /// Initialize Map internal slots on an object.
 fn init_map_slots(obj: &GcRef<JsObject>, mm: &Arc<MemoryManager>) {
-    let entries = GcRef::new(JsObject::new(None, mm.clone()));
+    let entries = GcRef::new(JsObject::new(Value::null(), mm.clone()));
     obj.set(pk(MAP_ENTRIES_KEY), Value::object(entries));
     obj.set(pk(MAP_SIZE_KEY), Value::int32(0));
     obj.set(pk(IS_MAP_KEY), Value::boolean(true));
@@ -134,7 +134,7 @@ fn init_map_slots(obj: &GcRef<JsObject>, mm: &Arc<MemoryManager>) {
 
 /// Initialize Set internal slots on an object.
 fn init_set_slots(obj: &GcRef<JsObject>, mm: &Arc<MemoryManager>) {
-    let values = GcRef::new(JsObject::new(None, mm.clone()));
+    let values = GcRef::new(JsObject::new(Value::null(), mm.clone()));
     obj.set(pk(SET_VALUES_KEY), Value::object(values));
     obj.set(pk(SET_SIZE_KEY), Value::int32(0));
     obj.set(pk(IS_SET_KEY), Value::boolean(true));
@@ -165,7 +165,7 @@ fn make_map_iterator(
     }
 
     // Create iterator object with %IteratorPrototype% as prototype
-    let iter = GcRef::new(JsObject::new(Some(iter_proto), mm.clone()));
+    let iter = GcRef::new(JsObject::new(Value::object(iter_proto), mm.clone()));
 
     // Store the map reference, snapshot keys, current index, and kind
     iter.set(PropertyKey::string("__map_ref__"), Value::object(obj));
@@ -227,7 +227,7 @@ fn make_map_iterator(
 
                     if idx >= len {
                         // Done
-                        let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                        let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                         result.set(PropertyKey::string("value"), Value::undefined());
                         result.set(PropertyKey::string("done"), Value::boolean(true));
                         return Ok(Value::object(result));
@@ -259,7 +259,7 @@ fn make_map_iterator(
                         .ok_or_else(|| "invalid entry".to_string())?;
                     let value = entry_obj.get(&pk("v")).unwrap_or(Value::undefined());
 
-                    let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                    let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                     match kind.as_str() {
                         "key" => {
                             result.set(PropertyKey::string("value"), key);
@@ -343,7 +343,7 @@ pub fn init_map_prototype(
                 let is_new = entries.get(&pk(&hash_key)).is_none();
 
                 // Create entry object with k/v
-                let entry = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let entry = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 entry.set(pk("k"), key);
                 entry.set(pk("v"), value);
                 entries.set(pk(&hash_key), Value::object(entry));
@@ -420,7 +420,7 @@ pub fn init_map_prototype(
                 if !is_map(&obj) {
                     return Err(crate::error::VmError::type_error("Method Map.prototype.clear called on incompatible receiver"));
                 }
-                let new_entries = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let new_entries = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 obj.set(pk(MAP_ENTRIES_KEY), Value::object(new_entries));
                 obj.set(pk(MAP_SIZE_KEY), Value::int32(0));
                 Ok(Value::undefined())
@@ -592,7 +592,7 @@ fn make_set_iterator(
     }
 
     // Create iterator object with %IteratorPrototype% as prototype
-    let iter = GcRef::new(JsObject::new(Some(iter_proto), mm.clone()));
+    let iter = GcRef::new(JsObject::new(Value::object(iter_proto), mm.clone()));
 
     // Store the set reference, snapshot values, current index, and kind
     iter.set(PropertyKey::string("__set_ref__"), Value::object(obj));
@@ -651,7 +651,7 @@ fn make_set_iterator(
 
                     if idx >= len {
                         // Done
-                        let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                        let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                         result.set(PropertyKey::string("value"), Value::undefined());
                         result.set(PropertyKey::string("done"), Value::boolean(true));
                         return Ok(Value::object(result));
@@ -678,7 +678,7 @@ fn make_set_iterator(
                         continue;
                     }
 
-                    let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                    let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                     match kind.as_str() {
                         "entry" => {
                             // For Sets, entries are [value, value] per ES spec
@@ -806,7 +806,7 @@ pub fn init_set_prototype(
                 if !is_set(&obj) {
                     return Err(crate::error::VmError::type_error("Method Set.prototype.clear called on incompatible receiver"));
                 }
-                let new_values = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let new_values = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 obj.set(pk(SET_VALUES_KEY), Value::object(new_values));
                 obj.set(pk(SET_SIZE_KEY), Value::int32(0));
                 Ok(Value::undefined())
@@ -944,7 +944,7 @@ pub fn init_set_prototype(
                 }
 
                 // Create new set
-                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 init_set_slots(&result, ncx.memory_manager());
                 let result_values = get_set_values_obj(&result).unwrap();
                 let mut count = 0i32;
@@ -998,7 +998,7 @@ pub fn init_set_prototype(
                     return Err(crate::error::VmError::type_error("Set.prototype.intersection requires a Set-like argument"));
                 }
 
-                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 init_set_slots(&result, ncx.memory_manager());
                 let result_values = get_set_values_obj(&result).unwrap();
                 let mut count = 0i32;
@@ -1041,7 +1041,7 @@ pub fn init_set_prototype(
                     return Err(crate::error::VmError::type_error("Set.prototype.difference requires a Set-like argument"));
                 }
 
-                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 init_set_slots(&result, ncx.memory_manager());
                 let result_values = get_set_values_obj(&result).unwrap();
                 let mut count = 0i32;
@@ -1084,7 +1084,7 @@ pub fn init_set_prototype(
                     return Err(crate::error::VmError::type_error("Set.prototype.symmetricDifference requires a Set-like argument"));
                 }
 
-                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 init_set_slots(&result, ncx.memory_manager());
                 let result_values = get_set_values_obj(&result).unwrap();
                 let mut count = 0i32;
@@ -1319,7 +1319,7 @@ pub fn init_weak_map_prototype(
                 let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
                 let hash_key = value_to_key(&key);
 
-                let entry = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let entry = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 entry.set(pk("k"), key);
                 entry.set(pk("v"), value);
                 entries.set(pk(&hash_key), Value::object(entry));
@@ -1574,7 +1574,7 @@ pub fn create_weak_map_constructor() -> Box<
             ));
         }
         if let Some(obj) = this_val.as_object() {
-            let entries = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+            let entries = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
             obj.set(pk(MAP_ENTRIES_KEY), Value::object(entries));
             obj.set(pk(IS_WEAKMAP_KEY), Value::boolean(true));
             Ok(this_val.clone())
@@ -1602,7 +1602,7 @@ pub fn create_weak_set_constructor() -> Box<
             ));
         }
         if let Some(obj) = this_val.as_object() {
-            let values = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+            let values = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
             obj.set(pk(SET_VALUES_KEY), Value::object(values));
             obj.set(pk(IS_WEAKSET_KEY), Value::boolean(true));
             Ok(this_val.clone())

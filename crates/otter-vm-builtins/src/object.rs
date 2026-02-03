@@ -264,10 +264,8 @@ fn native_object_create(
         .ok_or("Object.create requires a prototype argument")?;
 
     // Prototype must be object or null
-    let prototype = if proto_val.is_null() {
-        None
-    } else if let Some(proto_obj) = proto_val.as_object() {
-        Some(proto_obj)
+    let prototype = if proto_val.is_null() || proto_val.as_object().is_some() {
+        proto_val.clone()
     } else {
         return Err(VmError::type_error("Object prototype may only be an Object or null"));
     };
@@ -399,7 +397,7 @@ mod tests {
         use std::sync::Arc;
 
         let memory_manager = Arc::new(memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(VmValue::null(), memory_manager.clone()));
         obj.set("a".into(), VmValue::int32(1));
 
         let value = VmValue::object(obj.clone());
@@ -413,7 +411,7 @@ mod tests {
     #[test]
     fn test_native_object_is_frozen() {
         let memory_manager = Arc::new(memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(VmValue::null(), memory_manager.clone()));
         let value = VmValue::object(obj.clone());
 
         // Initially not frozen
@@ -433,7 +431,7 @@ mod tests {
         use std::sync::Arc;
 
         let memory_manager = Arc::new(memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(VmValue::null(), memory_manager.clone()));
         obj.set("a".into(), VmValue::int32(1));
 
         let value = VmValue::object(obj.clone());
@@ -448,7 +446,7 @@ mod tests {
         use std::sync::Arc;
 
         let memory_manager = Arc::new(memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(VmValue::null(), memory_manager.clone()));
         let value = VmValue::object(obj.clone());
 
         // Initially extensible
@@ -464,7 +462,7 @@ mod tests {
     #[test]
     fn test_native_object_rest() {
         let memory_manager = Arc::new(memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(VmValue::null(), memory_manager.clone()));
         obj.set("a".into(), VmValue::int32(1));
         obj.set("b".into(), VmValue::int32(2));
         obj.set("c".into(), VmValue::int32(3));
@@ -530,7 +528,7 @@ fn native_object_rest(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
     }
 
     let new_obj = GcRef::new(JsObject::new(
-        Some(GcRef::new(JsObject::new(None, mm.clone()))),
+        VmValue::object(GcRef::new(JsObject::new(VmValue::null(), mm.clone()))),
         mm,
     )); // Should probably use Object.prototype
 
@@ -770,7 +768,7 @@ fn descriptor_to_object(
     desc: PropertyDescriptor,
     mm: &Arc<memory::MemoryManager>,
 ) -> GcRef<JsObject> {
-    let desc_obj = GcRef::new(JsObject::new(None, Arc::clone(mm)));
+    let desc_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(mm)));
     match desc {
         PropertyDescriptor::Data { value, attributes } => {
             desc_obj.set("value".into(), value);
@@ -811,12 +809,12 @@ fn native_object_get_own_property_descriptors(
     // If not an object, return empty object (shams/wrappers should handle this)
     let Some(obj) = obj_val.as_object() else {
         return Ok(VmValue::object(GcRef::new(JsObject::new(
-            None,
+            VmValue::null(),
             Arc::clone(&mm),
         ))));
     };
 
-    let result = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let result = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
     let keys = obj.own_keys();
 
     for key in keys {

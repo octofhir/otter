@@ -65,7 +65,7 @@ fn error_create(
     });
 
     // Create error object
-    let obj = GcRef::new(JsObject::new(None, mm));
+    let obj = GcRef::new(JsObject::new(Value::null(), mm));
 
     // Set name property
     obj.set(

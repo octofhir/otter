@@ -224,7 +224,7 @@ fn native_promise_state(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Res
         .as_promise()
         .ok_or("Argument must be a promise")?;
 
-    let result = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let result = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
 
     match promise.state() {
         otter_vm_core::promise::PromiseState::Pending
@@ -403,7 +403,7 @@ fn native_promise_all_settled(args: &[VmValue], mm: Arc<memory::MemoryManager>) 
 
         if let Some(promise) = item.as_promise() {
             promise.then(move |value| {
-                let obj = GcRef::new(JsObject::new(None, Arc::clone(&mm_for_then)));
+                let obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm_for_then)));
                 obj.set(
                     "status".into(),
                     VmValue::string(JsString::intern("fulfilled")),
@@ -427,7 +427,7 @@ fn native_promise_all_settled(args: &[VmValue], mm: Arc<memory::MemoryManager>) 
             });
 
             promise.catch(move |error| {
-                let obj = GcRef::new(JsObject::new(None, Arc::clone(&mm_for_catch)));
+                let obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm_for_catch)));
                 obj.set(
                     "status".into(),
                     VmValue::string(JsString::intern("rejected")),
@@ -451,7 +451,7 @@ fn native_promise_all_settled(args: &[VmValue], mm: Arc<memory::MemoryManager>) 
             });
         } else {
             // Non-promise is treated as fulfilled
-            let obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+            let obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
             obj.set(
                 "status".into(),
                 VmValue::string(JsString::intern("fulfilled")),
@@ -550,7 +550,7 @@ fn native_promise_with_resolvers(
 ) -> Result<VmValue, VmError> {
     let resolvers = JsPromise::with_resolvers(Arc::clone(&mm), |_, _| {});
 
-    let result = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let result = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
     result.set("promise".into(), VmValue::promise(resolvers.promise));
 
     // Create native functions for resolve/reject
@@ -628,7 +628,7 @@ fn create_aggregate_error(
     message: &str,
     mm: Arc<memory::MemoryManager>,
 ) -> VmValue {
-    let obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
     obj.set(
         "name".into(),
         VmValue::string(JsString::intern("AggregateError")),

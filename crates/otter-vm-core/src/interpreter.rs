@@ -340,10 +340,18 @@ impl Interpreter {
                     break Value::undefined();
                 }
                 Ok(InstructionResult::Throw(error)) => {
+                    // Pop the frame we pushed and unwind to original depth
+                    while ctx.stack_depth() > prev_stack_depth {
+                        ctx.pop_frame();
+                    }
                     ctx.set_running(was_running);
                     return Err(VmError::exception(error));
                 }
                 Err(e) => {
+                    // Pop the frame we pushed and unwind to original depth
+                    while ctx.stack_depth() > prev_stack_depth {
+                        ctx.pop_frame();
+                    }
                     ctx.set_running(was_running);
                     return Err(e);
                 }
@@ -432,7 +440,12 @@ impl Interpreter {
 
             // Capture trace data while frame is borrowed (record after execution)
             let trace_data = if ctx.trace_state.is_some() {
-                Some((frame.pc, frame.function_index, Arc::clone(&frame.module), instruction.clone()))
+                Some((
+                    frame.pc,
+                    frame.function_index,
+                    Arc::clone(&frame.module),
+                    instruction.clone(),
+                ))
             } else {
                 None
             };
@@ -476,9 +489,7 @@ impl Interpreter {
                                     let new_pc = (old_pc as i64 + offset as i64) as usize;
                                     eprintln!(
                                         "[OTTER_TRACE_ASSERT_JUMP_APPLY] pc={} offset={} new_pc={}",
-                                        old_pc,
-                                        offset,
-                                        new_pc
+                                        old_pc, offset, new_pc
                                     );
                                 }
                             }
@@ -600,7 +611,7 @@ impl Interpreter {
                                 .get(&PropertyKey::string("prototype"))
                                 .and_then(|v| v.as_object())
                         {
-                            rest_arr.set_prototype(Some(array_proto));
+                            rest_arr.set_prototype(Value::object(array_proto));
                         }
                         for (i, arg) in rest_args.into_iter().enumerate() {
                             rest_arr.set(PropertyKey::Index(i as u32), arg);
@@ -672,7 +683,7 @@ impl Interpreter {
                                 .get(&PropertyKey::string("prototype"))
                                 .and_then(|v| v.as_object())
                         {
-                            rest_arr.set_prototype(Some(array_proto));
+                            rest_arr.set_prototype(Value::object(array_proto));
                         }
                         for (i, arg) in rest_args.into_iter().enumerate() {
                             rest_arr.set(PropertyKey::Index(i as u32), arg);
@@ -730,7 +741,8 @@ impl Interpreter {
                 }
                 InstructionResult::Yield { value, .. } => {
                     // Generator yielded a value
-                    let result = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                    let result =
+                        GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
                     result.set(PropertyKey::string("value"), value);
                     result.set(PropertyKey::string("done"), Value::boolean(false));
                     ctx.advance_pc();
@@ -745,6 +757,8 @@ impl Interpreter {
         // Cache module Arc - only refresh when frame changes
         let mut cached_module: Option<Arc<Module>> = None;
         let mut cached_frame_id: usize = usize::MAX;
+        let mut last_pc_by_frame_id: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
 
         loop {
             // Periodic interrupt check for responsive timeouts
@@ -773,6 +787,20 @@ impl Interpreter {
             let func = module_ref
                 .function(frame.function_index)
                 .ok_or_else(|| VmError::internal("function not found"))?;
+
+            if std::env::var("OTTER_TRACE_ASSERT_PC_BACKTRACK").is_ok()
+                && func.name.as_deref() == Some("assert")
+            {
+                if let Some(prev_pc) = last_pc_by_frame_id.get(&frame.frame_id).copied()
+                    && frame.pc < prev_pc
+                {
+                    eprintln!(
+                        "[OTTER_TRACE_ASSERT_PC_BACKTRACK] frame_id={} reg_base={} pc={} prev_pc={}",
+                        frame.frame_id, frame.register_base, frame.pc, prev_pc
+                    );
+                }
+                last_pc_by_frame_id.insert(frame.frame_id, frame.pc);
+            }
 
             if std::env::var("OTTER_TRACE_ASSERT_PC").is_ok()
                 && func.name.as_deref() == Some("assert")
@@ -816,7 +844,12 @@ impl Interpreter {
 
             // Capture trace data while frame is borrowed (record after execution)
             let trace_data = if ctx.trace_state.is_some() {
-                Some((frame.pc, frame.function_index, Arc::clone(&frame.module), instruction.clone()))
+                Some((
+                    frame.pc,
+                    frame.function_index,
+                    Arc::clone(&frame.module),
+                    instruction.clone(),
+                ))
             } else {
                 None
             };
@@ -963,7 +996,7 @@ impl Interpreter {
                                 .get(&PropertyKey::string("prototype"))
                                 .and_then(|v| v.as_object())
                         {
-                            rest_arr.set_prototype(Some(array_proto));
+                            rest_arr.set_prototype(Value::object(array_proto));
                         }
                         for (i, arg) in rest_args.into_iter().enumerate() {
                             rest_arr.set(PropertyKey::Index(i as u32), arg);
@@ -1030,7 +1063,7 @@ impl Interpreter {
                                 .get(&PropertyKey::string("prototype"))
                                 .and_then(|v| v.as_object())
                         {
-                            rest_arr.set_prototype(Some(array_proto));
+                            rest_arr.set_prototype(Value::object(array_proto));
                         }
                         for (i, arg) in rest_args.into_iter().enumerate() {
                             rest_arr.set(PropertyKey::Index(i as u32), arg);
@@ -1080,7 +1113,8 @@ impl Interpreter {
                 InstructionResult::Yield { value, .. } => {
                     // Generator yielded a value
                     // Create an iterator result object { value, done: false }
-                    let result = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                    let result =
+                        GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
                     result.set(PropertyKey::string("value"), value);
                     result.set(PropertyKey::string("done"), Value::boolean(false));
                     ctx.advance_pc();
@@ -1177,8 +1211,7 @@ impl Interpreter {
                     eprintln!(
                         "[OTTER_TRACE_ASSERT_SETLOCAL] func=main idx={} type={} open_upvalue={}",
                         idx.0,
-                        value.type_of()
-                        ,
+                        value.type_of(),
                         has_open
                     );
                 }
@@ -1269,8 +1302,7 @@ impl Interpreter {
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
 
-                let trace_assert_globals =
-                    std::env::var("OTTER_TRACE_ASSERT_GLOBALS").is_ok();
+                let trace_assert_globals = std::env::var("OTTER_TRACE_ASSERT_GLOBALS").is_ok();
                 let is_assert_func = if trace_assert_globals {
                     let frame = ctx
                         .current_frame()
@@ -1306,7 +1338,8 @@ impl Interpreter {
                                 offset,
                             } = &ic.ic_state
                             {
-                                if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr {
+                                if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr
+                                {
                                     global_obj.get_by_offset(*offset as usize)
                                 } else {
                                     None
@@ -1459,8 +1492,7 @@ impl Interpreter {
                             {
                                 if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr
                                 {
-                                    if global_obj.set_by_offset(*offset as usize, val_val.clone())
-                                    {
+                                    if global_obj.set_by_offset(*offset as usize, val_val.clone()) {
                                         return Ok(InstructionResult::Continue);
                                     }
                                 }
@@ -2326,7 +2358,7 @@ impl Interpreter {
                     if depth > MAX_PROTO_DEPTH {
                         break;
                     }
-                    current = obj.prototype();
+                    current = obj.prototype().as_object();
                 }
 
                 ctx.set_register(dst.0, Value::boolean(false));
@@ -2582,7 +2614,8 @@ impl Interpreter {
                 // Capture upvalues from parent frame
                 let captured_upvalues = self.capture_upvalues(ctx, &func_def.upvalues)?;
 
-                let func_obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                let func_obj =
+                    GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
 
                 // Get Object.prototype so function's .prototype object has correct chain
                 let obj_proto = ctx
@@ -2595,12 +2628,15 @@ impl Interpreter {
                     })
                     .and_then(|proto_val| proto_val.as_object());
 
-                let proto = GcRef::new(JsObject::new(obj_proto, ctx.memory_manager().clone()));
+                let proto = GcRef::new(JsObject::new(
+                    obj_proto.map(Value::object).unwrap_or_else(Value::null),
+                    ctx.memory_manager().clone(),
+                ));
 
                 // Set [[Prototype]] to Function.prototype so methods like
                 // .bind(), .call(), .apply() are inherited per ES2023 §10.2.4.
                 if let Some(fn_proto) = ctx.function_prototype() {
-                    func_obj.set_prototype(Some(fn_proto));
+                    func_obj.set_prototype(Value::object(fn_proto));
                 }
 
                 // Set function length and name properties with correct attributes
@@ -2664,7 +2700,8 @@ impl Interpreter {
                 // Capture upvalues from parent frame
                 let captured_upvalues = self.capture_upvalues(ctx, &func_def.upvalues)?;
 
-                let func_obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                let func_obj =
+                    GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
 
                 // Get Object.prototype for function's .prototype object
                 let obj_proto = ctx
@@ -2677,11 +2714,14 @@ impl Interpreter {
                     })
                     .and_then(|proto_val| proto_val.as_object());
 
-                let proto = GcRef::new(JsObject::new(obj_proto, ctx.memory_manager().clone()));
+                let proto = GcRef::new(JsObject::new(
+                    obj_proto.map(Value::object).unwrap_or_else(Value::null),
+                    ctx.memory_manager().clone(),
+                ));
 
                 // Set [[Prototype]] to Function.prototype
                 if let Some(fn_proto) = ctx.function_prototype() {
-                    func_obj.set_prototype(Some(fn_proto));
+                    func_obj.set_prototype(Value::object(fn_proto));
                 }
 
                 // Set function length and name properties
@@ -2748,8 +2788,12 @@ impl Interpreter {
                     .and_then(|v| v.as_object());
 
                 // Create a generator function closure - when called, it creates a generator object
-                let func_obj =
-                    GcRef::new(JsObject::new(gen_func_proto, ctx.memory_manager().clone()));
+                let func_obj = GcRef::new(JsObject::new(
+                    gen_func_proto
+                        .map(Value::object)
+                        .unwrap_or_else(Value::null),
+                    ctx.memory_manager().clone(),
+                ));
 
                 // Set function length and name properties
                 let fn_attrs = crate::object::PropertyAttributes {
@@ -2777,7 +2821,10 @@ impl Interpreter {
                 let gen_proto = ctx
                     .get_global("GeneratorPrototype")
                     .and_then(|v| v.as_object());
-                let proto = GcRef::new(JsObject::new(gen_proto, ctx.memory_manager().clone()));
+                let proto = GcRef::new(JsObject::new(
+                    gen_proto.map(Value::object).unwrap_or_else(Value::null),
+                    ctx.memory_manager().clone(),
+                ));
 
                 let closure = Arc::new(Closure {
                     function_index: func.0,
@@ -2822,7 +2869,9 @@ impl Interpreter {
 
                 // Create an async generator function closure
                 let func_obj = GcRef::new(JsObject::new(
-                    async_gen_func_proto,
+                    async_gen_func_proto
+                        .map(Value::object)
+                        .unwrap_or_else(Value::null),
                     ctx.memory_manager().clone(),
                 ));
 
@@ -2852,7 +2901,10 @@ impl Interpreter {
                 let gen_proto = ctx
                     .get_global("GeneratorPrototype")
                     .and_then(|v| v.as_object());
-                let proto = GcRef::new(JsObject::new(gen_proto, ctx.memory_manager().clone()));
+                let proto = GcRef::new(JsObject::new(
+                    gen_proto.map(Value::object).unwrap_or_else(Value::null),
+                    ctx.memory_manager().clone(),
+                ));
 
                 let closure = Arc::new(Closure {
                     function_index: func.0,
@@ -3127,117 +3179,34 @@ impl Interpreter {
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
                         .and_then(|v| v.as_object());
-                    let new_obj =
-                        GcRef::new(JsObject::new(ctor_proto.clone(), ctx.memory_manager().clone()));
+                    let new_obj = GcRef::new(JsObject::new(
+                        ctor_proto
+                            .clone()
+                            .map(Value::object)
+                            .unwrap_or_else(Value::null),
+                        ctx.memory_manager().clone(),
+                    ));
                     let new_obj_value = Value::object(new_obj.clone());
 
                     // Capture stack trace for Error objects
                     if let Some(proto) = ctor_proto {
-                        if proto.get(&PropertyKey::string("__is_error__"))
-                            .and_then(|v| v.as_boolean()) == Some(true)
+                        if proto
+                            .get(&PropertyKey::string("__is_error__"))
+                            .and_then(|v| v.as_boolean())
+                            == Some(true)
                         {
                             Self::capture_error_stack_trace(new_obj.clone(), ctx);
                         }
                     }
 
                     // Call native constructor with depth tracking
-                    let result = match self.call_native_fn(ctx, native_fn, &new_obj_value, &args) {
+                    let result = match self.call_native_fn_construct(
+                        ctx,
+                        native_fn,
+                        &new_obj_value,
+                        &args,
+                    ) {
                         Ok(v) => v,
-                        Err(VmError::Interception(crate::error::InterceptionSignal::PromiseConstructor)) => {
-                            // Handle new Promise(executor)
-                            let executor = args.get(0).cloned().unwrap_or(Value::undefined());
-                            if !executor.is_callable() {
-                                return Err(VmError::type_error("Promise resolver is not a function"));
-                            }
-
-                            let promise = JsPromise::new();
-                            let js_queue = ctx.js_job_queue();
-                            let enqueue_js_job = {
-                                let js_queue = js_queue.clone();
-                                move |job, args| {
-                                    if let Some(queue) = &js_queue {
-                                        queue.enqueue(job, args);
-                                    }
-                                }
-                            };
-
-                            let fn_proto = ctx
-                                .function_prototype()
-                                .ok_or_else(|| VmError::internal("Function.prototype is not defined"))?;
-
-                            let resolve_promise = promise.clone();
-                            let enqueue_resolve = enqueue_js_job.clone();
-                            let resolve_fn = Value::native_function_with_proto(
-                                move |_this, args, _ncx| {
-                                    let value = args.first().cloned().unwrap_or(Value::undefined());
-                                    resolve_promise.resolve_with_js_jobs(value, enqueue_resolve.clone());
-                                    Ok(Value::undefined())
-                                },
-                                ctx.memory_manager().clone(),
-                                fn_proto,
-                            );
-                            if let Some(obj) = resolve_fn.as_object() {
-                                obj.set(
-                                    PropertyKey::string("__non_constructor"),
-                                    Value::boolean(true),
-                                );
-                            }
-
-                            let reject_promise = promise.clone();
-                            let enqueue_reject = enqueue_js_job.clone();
-                            let reject_fn = Value::native_function_with_proto(
-                                move |_this, args, _ncx| {
-                                    let reason = args.first().cloned().unwrap_or(Value::undefined());
-                                    reject_promise.reject_with_js_jobs(reason, enqueue_reject.clone());
-                                    Ok(Value::undefined())
-                                },
-                                ctx.memory_manager().clone(),
-                                fn_proto,
-                            );
-                            if let Some(obj) = reject_fn.as_object() {
-                                obj.set(
-                                    PropertyKey::string("__non_constructor"),
-                                    Value::boolean(true),
-                                );
-                            }
-
-                            if let Err(err) = self.call_function(
-                                ctx,
-                                &executor,
-                                Value::undefined(),
-                                &[resolve_fn.clone(), reject_fn.clone()],
-                            ) {
-                                let error_val = match err {
-                                    VmError::Exception(thrown) => thrown.value,
-                                    VmError::TypeError(message) => {
-                                        self.make_error(ctx, "TypeError", &message)
-                                    }
-                                    VmError::RangeError(message) => {
-                                        self.make_error(ctx, "RangeError", &message)
-                                    }
-                                    VmError::ReferenceError(message) => {
-                                        self.make_error(ctx, "ReferenceError", &message)
-                                    }
-                                    VmError::SyntaxError(message) => {
-                                        self.make_error(ctx, "SyntaxError", &message)
-                                    }
-                                    other => {
-                                        let message = other.to_string();
-                                        Value::string(JsString::intern(&message))
-                                    }
-                                };
-                                promise.reject_with_js_jobs(error_val, enqueue_js_job.clone());
-                            }
-
-                            let js_promise = self.create_js_promise(ctx, promise);
-                            ctx.set_register(dst.0, js_promise);
-                            return Ok(InstructionResult::Continue);
-                        }
-                        // eval (and similar non-constructors) throw Interception when called
-                        // with string args — treat as "not a constructor" in Construct context
-                        Err(VmError::Interception(_)) => {
-                            return Err(VmError::type_error("not a constructor"));
-                        }
                         Err(e) => return Err(e),
                     };
                     let final_value = if result.is_object() {
@@ -3292,14 +3261,21 @@ impl Interpreter {
                             .as_object()
                             .and_then(|o| o.get(&PropertyKey::string("prototype")))
                             .and_then(|v| v.as_object());
-                        let new_obj =
-                            GcRef::new(JsObject::new(ctor_proto.clone(), ctx.memory_manager().clone()));
+                        let new_obj = GcRef::new(JsObject::new(
+                            ctor_proto
+                                .clone()
+                                .map(Value::object)
+                                .unwrap_or_else(Value::null),
+                            ctx.memory_manager().clone(),
+                        ));
                         let new_obj_value = Value::object(new_obj.clone());
 
                         // Capture stack trace for Error objects
                         if let Some(proto) = ctor_proto {
-                            if proto.get(&PropertyKey::string("__is_error__"))
-                                .and_then(|v| v.as_boolean()) == Some(true)
+                            if proto
+                                .get(&PropertyKey::string("__is_error__"))
+                                .and_then(|v| v.as_boolean())
+                                == Some(true)
                             {
                                 Self::capture_error_stack_trace(new_obj.clone(), ctx);
                             }
@@ -3359,22 +3335,13 @@ impl Interpreter {
                             );
                             eprintln!("  upvalues: {:?}", func.upvalues);
                             for (idx, cell) in frame.upvalues.iter().enumerate() {
-                                eprintln!(
-                                    "  upvalue_cell[{}] type={}",
-                                    idx,
-                                    cell.get().type_of()
-                                );
+                                eprintln!("  upvalue_cell[{}] type={}", idx, cell.get().type_of());
                             }
                             let argc_usize = *argc as usize;
                             for i in 0..=argc_usize {
                                 let reg = Register(obj.0 + i as u16);
                                 let val = ctx.get_register(reg.0);
-                                eprintln!(
-                                    "  call_reg[{}]=r{} type={}",
-                                    i,
-                                    reg.0,
-                                    val.type_of()
-                                );
+                                eprintln!("  call_reg[{}]=r{} type={}", i, reg.0, val.type_of());
                             }
                             for (idx, local) in frame.locals.iter().enumerate().take(4) {
                                 eprintln!("  local[{}] type={}", idx, local.type_of());
@@ -3412,9 +3379,7 @@ impl Interpreter {
                                                     idx, local_i, name, value_type
                                                 );
                                             }
-                                            otter_vm_bytecode::UpvalueCapture::Upvalue(
-                                                up_idx,
-                                            ) => {
+                                            otter_vm_bytecode::UpvalueCapture::Upvalue(up_idx) => {
                                                 eprintln!(
                                                     "  upvalue[{}]=Upvalue({})",
                                                     idx, up_idx.0
@@ -3488,16 +3453,12 @@ impl Interpreter {
                     let function_obj = function_global
                         .as_ref()
                         .and_then(|v| v.as_object())
-                        .ok_or_else(|| {
-                            VmError::type_error("Function is not defined")
-                        })?;
+                        .ok_or_else(|| VmError::type_error("Function is not defined"))?;
                     let proto_val = function_obj.get(&PropertyKey::string("prototype"));
                     let proto = proto_val
                         .as_ref()
                         .and_then(|v| v.as_object())
-                        .ok_or_else(|| {
-                            VmError::type_error("Function.prototype is not defined")
-                        })?;
+                        .ok_or_else(|| VmError::type_error("Function.prototype is not defined"))?;
                     if let Some(obj_ref) = receiver.as_object() {
                         obj_ref
                             .get(&Self::utf16_key(method_name))
@@ -3585,7 +3546,7 @@ impl Interpreter {
                             match gen_result {
                                 GeneratorResult::Yielded(v) => {
                                     let iter_result = GcRef::new(JsObject::new(
-                                        None,
+                                        Value::null(),
                                         ctx.memory_manager().clone(),
                                     ));
                                     iter_result.set(PropertyKey::string("value"), v);
@@ -3603,7 +3564,7 @@ impl Interpreter {
                                 }
                                 GeneratorResult::Returned(v) => {
                                     let iter_result = GcRef::new(JsObject::new(
-                                        None,
+                                        Value::null(),
                                         ctx.memory_manager().clone(),
                                     ));
                                     iter_result.set(PropertyKey::string("value"), v);
@@ -3646,7 +3607,7 @@ impl Interpreter {
                                         // For now, just resolve with the awaited value wrapped in an iterator result
                                         // TODO: Properly resume async generator execution
                                         let iter_result =
-                                            GcRef::new(JsObject::new(None, mm.clone()));
+                                            GcRef::new(JsObject::new(Value::null(), mm.clone()));
                                         iter_result
                                             .set(PropertyKey::string("value"), resolved_value);
                                         iter_result.set(
@@ -3682,7 +3643,8 @@ impl Interpreter {
                         };
 
                         // Create iterator result object { value, done }
-                        let result = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                        let result =
+                            GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
                         result.set(PropertyKey::string("value"), result_value);
                         result.set(PropertyKey::string("done"), Value::boolean(is_done));
                         ctx.set_register(dst.0, Value::object(result));
@@ -3742,6 +3704,25 @@ impl Interpreter {
                         .object
                         .get(&Self::utf16_key(method_name))
                         .unwrap_or_else(Value::undefined)
+                } else if let Some(proxy) = receiver.as_proxy() {
+                    // Proxy: look up method via proxy get trap
+                    let key = Self::utf16_key(method_name);
+                    let key_str = String::from_utf16_lossy(method_name);
+                    let key_val = Value::string(crate::string::JsString::intern(&key_str));
+                    let result = {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        crate::proxy_operations::proxy_get(
+                            &mut ncx,
+                            proxy,
+                            &key,
+                            key_val,
+                            receiver.clone(),
+                        )
+                    };
+                    match result {
+                        Ok(val) => val,
+                        Err(_) => Value::undefined(),
+                    }
                 } else {
                     if std::env::var("OTTER_TRACE_CALLMETHOD").is_ok() {
                         let (func_name, source_url, pc) = ctx
@@ -3755,7 +3736,9 @@ impl Interpreter {
                                     frame.pc,
                                 ))
                             })
-                            .unwrap_or_else(|| ("(no-frame)".to_string(), "(unknown)".to_string(), 0));
+                            .unwrap_or_else(|| {
+                                ("(no-frame)".to_string(), "(unknown)".to_string(), 0)
+                            });
                         eprintln!(
                             "[OTTER_TRACE_CALLMETHOD] receiver_type={} method={} func={} pc={} source={} obj_reg={}",
                             receiver.type_of(),
@@ -3940,11 +3923,14 @@ impl Interpreter {
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
                         .and_then(|v| v.as_object());
-                    let new_obj =
-                        GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
+                    let new_obj = GcRef::new(JsObject::new(
+                        ctor_proto.map(Value::object).unwrap_or_else(Value::null),
+                        ctx.memory_manager().clone(),
+                    ));
                     let new_obj_value = Value::object(new_obj);
 
-                    let result = self.call_native_fn(ctx, native_fn, &Value::undefined(), &args)?;
+                    let result =
+                        self.call_native_fn_construct(ctx, native_fn, &new_obj_value, &args)?;
                     let final_value = if result.is_object() {
                         result
                     } else {
@@ -3963,7 +3949,10 @@ impl Interpreter {
                     .as_object()
                     .and_then(|o| o.get(&PropertyKey::string("prototype")))
                     .and_then(|v| v.as_object());
-                let new_obj = GcRef::new(JsObject::new(ctor_proto, ctx.memory_manager().clone()));
+                let new_obj = GcRef::new(JsObject::new(
+                    ctor_proto.map(Value::object).unwrap_or_else(Value::null),
+                    ctx.memory_manager().clone(),
+                ));
                 let new_obj_value = Value::object(new_obj);
 
                 let argc_u8 = args.len() as u8;
@@ -4056,7 +4045,10 @@ impl Interpreter {
                     })
                     .and_then(|proto_val| proto_val.as_object());
 
-                let obj = GcRef::new(JsObject::new(proto, ctx.memory_manager().clone()));
+                let obj = GcRef::new(JsObject::new(
+                    proto.map(Value::object).unwrap_or_else(Value::null),
+                    ctx.memory_manager().clone(),
+                ));
                 ctx.set_register(dst.0, Value::object(obj));
                 Ok(InstructionResult::Continue)
             }
@@ -4077,7 +4069,7 @@ impl Interpreter {
 
                 let args_obj = GcRef::new(JsObject::array(argc, mm));
                 if let Some(proto) = array_proto {
-                    args_obj.set_prototype(Some(proto));
+                    args_obj.set_prototype(Value::object(proto));
                 }
 
                 // Populate arguments from locals
@@ -4120,10 +4112,9 @@ impl Interpreter {
                 let source = js_str.as_str().to_string();
 
                 // Per ES2023 §19.2.1.1: Direct eval inherits strict mode from calling context
-                let is_strict_context = ctx.current_frame()
-                    .and_then(|frame| {
-                        frame.module.functions.get(frame.function_index as usize)
-                    })
+                let is_strict_context = ctx
+                    .current_frame()
+                    .and_then(|frame| frame.module.functions.get(frame.function_index as usize))
                     .map(|func| func.flags.is_strict)
                     .unwrap_or(false);
 
@@ -4179,7 +4170,9 @@ impl Interpreter {
                     let receiver = object.clone();
                     let result = {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
-                        crate::proxy_operations::proxy_get(&mut ncx, proxy, &key, key_value, receiver)?
+                        crate::proxy_operations::proxy_get(
+                            &mut ncx, proxy, &key, key_value, receiver,
+                        )?
                     };
                     if trace_array
                         && (Self::utf16_eq_ascii(name_str, "Array")
@@ -4208,7 +4201,7 @@ impl Interpreter {
                         return Ok(InstructionResult::Continue);
                     }
                     // Check prototype chain (this gives us next, return, throw, Symbol.iterator, Symbol.toStringTag)
-                    if let Some(proto) = generator.object.prototype() {
+                    if let Some(proto) = generator.object.prototype().as_object() {
                         if let Some(val) = proto.get(&key) {
                             ctx.set_register(dst.0, val);
                             return Ok(InstructionResult::Continue);
@@ -4295,7 +4288,7 @@ impl Interpreter {
                         return Ok(InstructionResult::Continue);
                     }
                     // Check prototype chain
-                    if let Some(proto) = closure.object.prototype() {
+                    if let Some(proto) = closure.object.prototype().as_object() {
                         if let Some(val) = proto.get(&key) {
                             if trace_array
                                 && (Self::utf16_eq_ascii(name_str, "Array")
@@ -4541,7 +4534,8 @@ impl Interpreter {
                 } else if object.is_boolean() {
                     // Autobox boolean -> Boolean.prototype
                     let key = Self::utf16_key(name_str);
-                    if let Some(boolean_obj) = ctx.get_global("Boolean").and_then(|v| v.as_object()) {
+                    if let Some(boolean_obj) = ctx.get_global("Boolean").and_then(|v| v.as_object())
+                    {
                         if let Some(proto) = boolean_obj
                             .get(&PropertyKey::string("prototype"))
                             .and_then(|v| v.as_object())
@@ -4583,12 +4577,7 @@ impl Interpreter {
                     {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
                         crate::proxy_operations::proxy_set(
-                            &mut ncx,
-                            proxy,
-                            &key,
-                            key_value,
-                            val_val,
-                            receiver,
+                            &mut ncx, proxy, &key, key_value, val_val, receiver,
                         )?;
                     }
                     return Ok(InstructionResult::Continue);
@@ -4765,10 +4754,7 @@ impl Interpreter {
                     let result = {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
                         crate::proxy_operations::proxy_delete_property(
-                            &mut ncx,
-                            proxy,
-                            &prop_key,
-                            key_value,
+                            &mut ncx, proxy, &prop_key, key_value,
                         )?
                     };
                     ctx.set_register(dst.0, Value::boolean(result));
@@ -4904,7 +4890,7 @@ impl Interpreter {
                         return Ok(InstructionResult::Continue);
                     }
                     // Check prototype chain
-                    if let Some(proto) = closure.object.prototype() {
+                    if let Some(proto) = closure.object.prototype().as_object() {
                         if let Some(val) = proto.get(&key) {
                             ctx.set_register(dst.0, val);
                             return Ok(InstructionResult::Continue);
@@ -4932,7 +4918,7 @@ impl Interpreter {
                         return Ok(InstructionResult::Continue);
                     }
                     // Check prototype chain (this gives us next, return, throw, Symbol.iterator, Symbol.toStringTag)
-                    if let Some(proto) = generator.object.prototype() {
+                    if let Some(proto) = generator.object.prototype().as_object() {
                         if let Some(val) = proto.get(&key) {
                             ctx.set_register(dst.0, val);
                             return Ok(InstructionResult::Continue);
@@ -5126,7 +5112,8 @@ impl Interpreter {
                         let key_str = self.to_string(&key_value);
                         PropertyKey::string(&key_str)
                     };
-                    if let Some(boolean_obj) = ctx.get_global("Boolean").and_then(|v| v.as_object()) {
+                    if let Some(boolean_obj) = ctx.get_global("Boolean").and_then(|v| v.as_object())
+                    {
                         if let Some(proto) = boolean_obj
                             .get(&PropertyKey::string("prototype"))
                             .and_then(|v| v.as_object())
@@ -5402,7 +5389,7 @@ impl Interpreter {
                         .get(&PropertyKey::string("prototype"))
                         .and_then(|v| v.as_object())
                 {
-                    arr.set_prototype(Some(array_proto));
+                    arr.set_prototype(Value::object(array_proto));
                 }
                 ctx.set_register(dst.0, Value::object(arr));
                 Ok(InstructionResult::Continue)
@@ -5835,7 +5822,7 @@ impl Interpreter {
                             match gen_result {
                                 GeneratorResult::Yielded(v) => {
                                     let iter_result = GcRef::new(JsObject::new(
-                                        None,
+                                        Value::null(),
                                         ctx.memory_manager().clone(),
                                     ));
                                     iter_result.set(PropertyKey::string("value"), v);
@@ -5853,7 +5840,7 @@ impl Interpreter {
                                 }
                                 GeneratorResult::Returned(v) => {
                                     let iter_result = GcRef::new(JsObject::new(
-                                        None,
+                                        Value::null(),
                                         ctx.memory_manager().clone(),
                                     ));
                                     iter_result.set(PropertyKey::string("value"), v);
@@ -5891,7 +5878,7 @@ impl Interpreter {
                                     let js_queue = js_queue.clone();
                                     awaited_promise.then(move |resolved_value| {
                                         let iter_result =
-                                            GcRef::new(JsObject::new(None, mm.clone()));
+                                            GcRef::new(JsObject::new(Value::null(), mm.clone()));
                                         iter_result
                                             .set(PropertyKey::string("value"), resolved_value);
                                         iter_result.set(
@@ -5925,7 +5912,8 @@ impl Interpreter {
                         };
 
                         // Create iterator result object { value, done }
-                        let result = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                        let result =
+                            GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
                         result.set(PropertyKey::string("value"), result_value);
                         result.set(PropertyKey::string("done"), Value::boolean(is_done));
                         ctx.set_register(dst.0, Value::object(result));
@@ -6038,7 +6026,13 @@ impl Interpreter {
                             receiver.clone(),
                         )?
                     };
-                    return self.dispatch_method_spread(ctx, &method_value, receiver, &spread_arr, dst.0);
+                    return self.dispatch_method_spread(
+                        ctx,
+                        &method_value,
+                        receiver,
+                        &spread_arr,
+                        dst.0,
+                    );
                 }
 
                 let key = self.value_to_property_key(&key_value);
@@ -6369,7 +6363,7 @@ impl Interpreter {
                     // Validate superclass is callable (or null for extends null)
                     if super_value.is_null() {
                         // extends null: create prototype with null __proto__
-                        let derived_proto = GcRef::new(JsObject::new(None, mm.clone()));
+                        let derived_proto = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
                         // Set ctor.prototype = derived_proto
                         let proto_key = PropertyKey::string("prototype");
@@ -6401,7 +6395,10 @@ impl Interpreter {
                         };
 
                         // Create derived prototype: Object.create(super.prototype)
-                        let derived_proto = GcRef::new(JsObject::new(super_proto, mm.clone()));
+                        let derived_proto = GcRef::new(JsObject::new(
+                            super_proto.map(Value::object).unwrap_or_else(Value::null),
+                            mm.clone(),
+                        ));
 
                         // Set ctor.prototype = derived_proto
                         if let Some(ctor_obj) = ctor_value.as_object() {
@@ -6413,13 +6410,13 @@ impl Interpreter {
                             derived_proto
                                 .set(PropertyKey::string("constructor"), ctor_value.clone());
                             // Static inheritance: ctor.__proto__ = super
-                            ctor_obj.set_prototype(Some(super_obj));
+                            ctor_obj.set_prototype(Value::object(super_obj));
                         }
                     } else if super_value.is_function() || super_value.is_native_function() {
                         // Superclass is a function (but not an object with .prototype on HeapRef::Object)
                         // This handles NativeFunction or Function HeapRef variants
                         // For now, create a basic prototype chain
-                        let derived_proto = GcRef::new(JsObject::new(None, mm.clone()));
+                        let derived_proto = GcRef::new(JsObject::new(Value::null(), mm.clone()));
                         if let Some(ctor_obj) = ctor_value.as_object() {
                             ctor_obj.set(
                                 PropertyKey::string("prototype"),
@@ -6474,7 +6471,7 @@ impl Interpreter {
                     .unwrap_or_else(|| home_object.clone());
 
                 // Get the superclass constructor: Object.getPrototypeOf(home_object)
-                let super_proto = home_object.prototype().ok_or_else(|| {
+                let super_proto = home_object.prototype().as_object().ok_or_else(|| {
                     VmError::TypeError("Super constructor is not a constructor".to_string())
                 })?;
 
@@ -6526,7 +6523,8 @@ impl Interpreter {
                 } else {
                     // Base case: super constructor is NOT derived.
                     // Create the object with new_target_proto as [[Prototype]].
-                    let new_obj = GcRef::new(JsObject::new(Some(new_target_proto), mm.clone()));
+                    let new_obj =
+                        GcRef::new(JsObject::new(Value::object(new_target_proto), mm.clone()));
                     let new_obj_value = Value::object(new_obj);
 
                     let result =
@@ -6559,10 +6557,7 @@ impl Interpreter {
                 })?;
 
                 // super = Object.getPrototypeOf(home_object)
-                let result = match home_object.prototype() {
-                    Some(proto) => Value::object(proto),
-                    None => Value::null(),
-                };
+                let result = home_object.prototype();
 
                 ctx.set_register(dst.0, result);
                 Ok(InstructionResult::Continue)
@@ -6596,7 +6591,7 @@ impl Interpreter {
                     .map(|f| f.this_value.clone())
                     .unwrap_or_else(Value::undefined);
 
-                let value = if let Some(proto) = super_proto {
+                let value = if let Some(proto) = super_proto.as_object() {
                     // Use lookup_property_descriptor to find accessor properties
                     match proto.lookup_property_descriptor(&key) {
                         Some(crate::object::PropertyDescriptor::Data { value, .. }) => value,
@@ -6750,11 +6745,7 @@ impl Interpreter {
     /// stack depth and returns when the eval frame finishes, without
     /// consuming outer call frames. This is the same pattern used by
     /// `call_function`.
-    fn execute_eval_module(
-        &self,
-        ctx: &mut VmContext,
-        module: &Module,
-    ) -> VmResult<Value> {
+    fn execute_eval_module(&self, ctx: &mut VmContext, module: &Module) -> VmResult<Value> {
         let module = Arc::new(module.clone());
         let entry_func = module
             .entry_function()
@@ -7102,8 +7093,10 @@ impl Interpreter {
                     let js_queue = ctx.js_job_queue();
                     match gen_result {
                         GeneratorResult::Yielded(v) => {
-                            let iter_result =
-                                GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                            let iter_result = GcRef::new(JsObject::new(
+                                Value::null(),
+                                ctx.memory_manager().clone(),
+                            ));
                             iter_result.set(PropertyKey::string("value"), v);
                             iter_result.set(PropertyKey::string("done"), Value::boolean(false));
                             let js_queue = js_queue.clone();
@@ -7117,8 +7110,10 @@ impl Interpreter {
                             );
                         }
                         GeneratorResult::Returned(v) => {
-                            let iter_result =
-                                GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                            let iter_result = GcRef::new(JsObject::new(
+                                Value::null(),
+                                ctx.memory_manager().clone(),
+                            ));
                             iter_result.set(PropertyKey::string("value"), v);
                             iter_result.set(PropertyKey::string("done"), Value::boolean(true));
                             let js_queue = js_queue.clone();
@@ -7151,7 +7146,8 @@ impl Interpreter {
                             let mm = ctx.memory_manager().clone();
                             let js_queue = js_queue.clone();
                             awaited_promise.then(move |resolved_value| {
-                                let iter_result = GcRef::new(JsObject::new(None, mm.clone()));
+                                let iter_result =
+                                    GcRef::new(JsObject::new(Value::null(), mm.clone()));
                                 iter_result.set(PropertyKey::string("value"), resolved_value);
                                 iter_result.set(PropertyKey::string("done"), Value::boolean(false));
                                 let js_queue = js_queue.clone();
@@ -7179,1754 +7175,18 @@ impl Interpreter {
                     }
                 };
 
-                let result = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
                 result.set(PropertyKey::string("value"), result_value);
                 result.set(PropertyKey::string("done"), Value::boolean(is_done));
                 ctx.set_register(return_reg, Value::object(result));
                 return Ok(InstructionResult::Continue);
             }
 
-            // Normal native function execution with interception support
+            // Normal native function execution
             match self.call_native_fn(ctx, native_fn, &current_this, &current_args) {
                 Ok(result) => {
                     ctx.set_register(return_reg, result);
                     return Ok(InstructionResult::Continue);
-                }
-                Err(VmError::Interception(signal)) => {
-                    // Handle interception signals for Function.prototype.call/apply
-                    use crate::error::InterceptionSignal;
-
-                    let js_queue = ctx.js_job_queue();
-                    let enqueue_js_job = {
-                        let js_queue = js_queue.clone();
-                        move |job, args| {
-                            if let Some(queue) = &js_queue {
-                                queue.enqueue(job, args);
-                            }
-                        }
-                    };
-
-                    let extract_array_items = |value: Option<&Value>| -> Result<Vec<Value>, VmError> {
-                        let value = value.ok_or_else(|| VmError::type_error("Expected an iterable"))?;
-                        if let Some(obj) = value.as_object() {
-                            if obj.is_array() {
-                                let len = obj.array_length();
-                                let mut items = Vec::with_capacity(len);
-                                for i in 0..len {
-                                    items.push(
-                                        obj.get(&PropertyKey::Index(i as u32))
-                                            .unwrap_or(Value::undefined()),
-                                    );
-                                }
-                                return Ok(items);
-                            }
-                        }
-                        Ok(vec![value.clone()])
-                    };
-
-                    let internal_key = PropertyKey::string("_internal");
-                    let extract_internal_promise = |value: &Value| -> Option<Arc<JsPromise>> {
-                        if let Some(promise) = value.as_promise() {
-                            return Some(promise.clone());
-                        }
-                        if let Some(obj) = value.as_object() {
-                            if let Some(internal) = obj.get(&internal_key) {
-                                if let Some(promise) = internal.as_promise() {
-                                    return Some(promise.clone());
-                                }
-                            }
-                        }
-                        None
-                    };
-                    let is_wrapped_promise = |value: &Value| -> bool {
-                        if let Some(obj) = value.as_object() {
-                            if let Some(internal) = obj.get(&internal_key) {
-                                return internal.is_promise();
-                            }
-                        }
-                        false
-                    };
-
-                    match signal {
-                        InterceptionSignal::FunctionCall => {
-                            // Function.prototype.call(thisArg, ...args)
-                            // current_this = the function to call
-                            // current_args[0] = thisArg
-                            // current_args[1..] = the arguments
-                            let target = current_this;
-                            let this_arg = current_args.first().cloned().unwrap_or(Value::undefined());
-                            let call_args = if current_args.len() > 1 {
-                                current_args[1..].to_vec()
-                            } else {
-                                vec![]
-                            };
-
-                            return self.handle_call_value(ctx, &target, this_arg, call_args, return_reg);
-                        }
-                        InterceptionSignal::FunctionApply => {
-                            // Function.prototype.apply(thisArg, argsArray)
-                            // current_this = the function to call
-                            // current_args[0] = thisArg
-                            // current_args[1] = argsArray
-                            let target = current_this;
-                            let this_arg = current_args.first().cloned().unwrap_or(Value::undefined());
-                            let args_array = current_args.get(1).cloned().unwrap_or(Value::undefined());
-
-                            // Extract arguments from array
-                            let call_args = if args_array.is_undefined() || args_array.is_null() {
-                                vec![]
-                            } else if let Some(arr_obj) = args_array.as_object() {
-                                if arr_obj.is_array() {
-                                    let len = arr_obj.array_length();
-                                    let mut extracted = Vec::with_capacity(len);
-                                    for i in 0..len {
-                                        extracted.push(
-                                            arr_obj.get(&PropertyKey::Index(i as u32))
-                                                .unwrap_or(Value::undefined())
-                                        );
-                                    }
-                                    extracted
-                                } else {
-                                    return Err(VmError::type_error("Function.prototype.apply: argumentsList must be an array"));
-                                }
-                            } else {
-                                return Err(VmError::type_error("Function.prototype.apply: argumentsList must be an object"));
-                            };
-
-                            return self.handle_call_value(ctx, &target, this_arg, call_args, return_reg);
-                        }
-                        InterceptionSignal::ReflectApply => {
-                            // Reflect.apply(target, thisArg, argsArray)
-                            // current_args[0] = target
-                            // current_args[1] = thisArg
-                            // current_args[2] = argsArray
-                            if current_args.len() < 3 {
-                                return Err(VmError::type_error("Reflect.apply requires 3 arguments"));
-                            }
-
-                            let target = &current_args[0];
-                            let this_arg = current_args[1].clone();
-                            let args_array = &current_args[2];
-
-                            // Extract arguments from array
-                            let call_args = if let Some(arr_obj) = args_array.as_object() {
-                                if arr_obj.is_array() {
-                                    let len = arr_obj.array_length();
-                                    let mut extracted = Vec::with_capacity(len);
-                                    for i in 0..len {
-                                        extracted.push(
-                                            arr_obj.get(&PropertyKey::Index(i as u32))
-                                                .unwrap_or(Value::undefined())
-                                        );
-                                    }
-                                    extracted
-                                } else {
-                                    return Err(VmError::type_error("Reflect.apply: argumentsList must be an array"));
-                                }
-                            } else {
-                                return Err(VmError::type_error("Reflect.apply: argumentsList must be an object"));
-                            };
-
-                            return self.handle_call_value(ctx, target, this_arg, call_args, return_reg);
-                        }
-                        InterceptionSignal::ReflectConstruct => {
-                            // Reflect.construct(target, argsArray [, newTarget])
-                            // current_args[0] = target
-                            // current_args[1] = argsArray
-                            // current_args[2] = newTarget (optional, not implemented yet)
-                            if current_args.len() < 2 {
-                                return Err(VmError::type_error("Reflect.construct requires at least 2 arguments"));
-                            }
-
-                            let target = &current_args[0];
-                            let args_array = &current_args[1];
-
-                            // Extract arguments from array
-                            let call_args = if let Some(arr_obj) = args_array.as_object() {
-                                if arr_obj.is_array() {
-                                    let len = arr_obj.array_length();
-                                    let mut extracted = Vec::with_capacity(len);
-                                    for i in 0..len {
-                                        extracted.push(
-                                            arr_obj.get(&PropertyKey::Index(i as u32))
-                                                .unwrap_or(Value::undefined())
-                                        );
-                                    }
-                                    extracted
-                                } else {
-                                    return Err(VmError::type_error("Reflect.construct: argumentsList must be an array"));
-                                }
-                            } else {
-                                return Err(VmError::type_error("Reflect.construct: argumentsList must be an object"));
-                            };
-
-                            // Create new object for this
-                            let new_obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
-                            let this_value = Value::object(new_obj.clone());
-
-                            // Call constructor
-                            self.handle_call_value(ctx, target, this_value.clone(), call_args, return_reg)?;
-
-                            // Get result from register
-                            let ctor_result = ctx.get_register(return_reg);
-
-                            // Return object or this
-                            if ctor_result.is_object() {
-                                ctx.set_register(return_reg, ctor_result.clone());
-                            } else {
-                                ctx.set_register(return_reg, this_value);
-                            }
-                            return Ok(InstructionResult::Continue);
-                        }
-                        InterceptionSignal::EvalCall => {
-                            // Indirect eval: compile and execute in global scope
-                            let code_value = current_args
-                                .first()
-                                .cloned()
-                                .unwrap_or(Value::undefined());
-                            let js_str = code_value
-                                .as_string()
-                                .ok_or_else(|| {
-                                    VmError::type_error("eval argument is not a string")
-                                })?;
-                            let source = js_str.as_str().to_string();
-                            // Indirect eval does NOT inherit strict mode
-                            let eval_module = ctx.compile_eval(&source, false)?;
-                            let result =
-                                self.execute_eval_module(ctx, &eval_module)?;
-                            ctx.set_register(return_reg, result);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        // ============================================================
-                        // Array callback methods — use call_function for sync closure calls
-                        // ============================================================
-
-                        InterceptionSignal::ArrayForEach => {
-                            // current_this = the array, current_args[0] = callback, [1] = thisArg
-                            let obj = current_this.as_object()
-                                .ok_or_else(|| VmError::type_error("forEach: not an object"))?;
-                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
-                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
-                            let len = obj.get(&PropertyKey::string("length"))
-                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                            for i in 0..len {
-                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                                self.call_function(ctx, &callback, this_arg.clone(),
-                                    &[val, Value::number(i as f64), current_this.clone()])?;
-                            }
-                            ctx.set_register(return_reg, Value::undefined());
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ArrayMap => {
-                            let obj = current_this.as_object()
-                                .ok_or_else(|| VmError::type_error("map: not an object"))?;
-                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
-                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
-                            let len = obj.get(&PropertyKey::string("length"))
-                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                            let result = GcRef::new(JsObject::array(len, ctx.memory_manager().clone()));
-                            for i in 0..len {
-                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                                let mapped = self.call_function(ctx, &callback, this_arg.clone(),
-                                    &[val, Value::number(i as f64), current_this.clone()])?;
-                                result.set(PropertyKey::Index(i as u32), mapped);
-                            }
-                            ctx.set_register(return_reg, Value::array(result));
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ArrayFilter => {
-                            let obj = current_this.as_object()
-                                .ok_or_else(|| VmError::type_error("filter: not an object"))?;
-                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
-                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
-                            let len = obj.get(&PropertyKey::string("length"))
-                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                            let result = GcRef::new(JsObject::array(0, ctx.memory_manager().clone()));
-                            let mut out_idx = 0u32;
-                            for i in 0..len {
-                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                                let keep = self.call_function(ctx, &callback, this_arg.clone(),
-                                    &[val.clone(), Value::number(i as f64), current_this.clone()])?;
-                                if keep.to_boolean() {
-                                    result.set(PropertyKey::Index(out_idx), val);
-                                    out_idx += 1;
-                                }
-                            }
-                            result.set(PropertyKey::string("length"), Value::number(out_idx as f64));
-                            ctx.set_register(return_reg, Value::array(result));
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ArrayFind => {
-                            let obj = current_this.as_object()
-                                .ok_or_else(|| VmError::type_error("find: not an object"))?;
-                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
-                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
-                            let len = obj.get(&PropertyKey::string("length"))
-                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                            for i in 0..len {
-                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                                let test = self.call_function(ctx, &callback, this_arg.clone(),
-                                    &[val.clone(), Value::number(i as f64), current_this.clone()])?;
-                                if test.to_boolean() {
-                                    ctx.set_register(return_reg, val);
-                                    return Ok(InstructionResult::Continue);
-                                }
-                            }
-                            ctx.set_register(return_reg, Value::undefined());
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ArrayFindIndex => {
-                            let obj = current_this.as_object()
-                                .ok_or_else(|| VmError::type_error("findIndex: not an object"))?;
-                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
-                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
-                            let len = obj.get(&PropertyKey::string("length"))
-                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                            for i in 0..len {
-                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                                let test = self.call_function(ctx, &callback, this_arg.clone(),
-                                    &[val, Value::number(i as f64), current_this.clone()])?;
-                                if test.to_boolean() {
-                                    ctx.set_register(return_reg, Value::number(i as f64));
-                                    return Ok(InstructionResult::Continue);
-                                }
-                            }
-                            ctx.set_register(return_reg, Value::number(-1.0));
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ArrayFindLast => {
-                            let obj = current_this.as_object()
-                                .ok_or_else(|| VmError::type_error("findLast: not an object"))?;
-                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
-                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
-                            let len = obj.get(&PropertyKey::string("length"))
-                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                            for i in (0..len).rev() {
-                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                                let test = self.call_function(ctx, &callback, this_arg.clone(),
-                                    &[val.clone(), Value::number(i as f64), current_this.clone()])?;
-                                if test.to_boolean() {
-                                    ctx.set_register(return_reg, val);
-                                    return Ok(InstructionResult::Continue);
-                                }
-                            }
-                            ctx.set_register(return_reg, Value::undefined());
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ArrayFindLastIndex => {
-                            let obj = current_this.as_object()
-                                .ok_or_else(|| VmError::type_error("findLastIndex: not an object"))?;
-                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
-                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
-                            let len = obj.get(&PropertyKey::string("length"))
-                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                            for i in (0..len).rev() {
-                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                                let test = self.call_function(ctx, &callback, this_arg.clone(),
-                                    &[val, Value::number(i as f64), current_this.clone()])?;
-                                if test.to_boolean() {
-                                    ctx.set_register(return_reg, Value::number(i as f64));
-                                    return Ok(InstructionResult::Continue);
-                                }
-                            }
-                            ctx.set_register(return_reg, Value::number(-1.0));
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ArrayEvery => {
-                            let obj = current_this.as_object()
-                                .ok_or_else(|| VmError::type_error("every: not an object"))?;
-                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
-                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
-                            let len = obj.get(&PropertyKey::string("length"))
-                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                            for i in 0..len {
-                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                                let test = self.call_function(ctx, &callback, this_arg.clone(),
-                                    &[val, Value::number(i as f64), current_this.clone()])?;
-                                if !test.to_boolean() {
-                                    ctx.set_register(return_reg, Value::boolean(false));
-                                    return Ok(InstructionResult::Continue);
-                                }
-                            }
-                            ctx.set_register(return_reg, Value::boolean(true));
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ArraySome => {
-                            let obj = current_this.as_object()
-                                .ok_or_else(|| VmError::type_error("some: not an object"))?;
-                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
-                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
-                            let len = obj.get(&PropertyKey::string("length"))
-                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                            for i in 0..len {
-                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                                let test = self.call_function(ctx, &callback, this_arg.clone(),
-                                    &[val, Value::number(i as f64), current_this.clone()])?;
-                                if test.to_boolean() {
-                                    ctx.set_register(return_reg, Value::boolean(true));
-                                    return Ok(InstructionResult::Continue);
-                                }
-                            }
-                            ctx.set_register(return_reg, Value::boolean(false));
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ArrayReduce => {
-                            let obj = current_this.as_object()
-                                .ok_or_else(|| VmError::type_error("reduce: not an object"))?;
-                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
-                            let len = obj.get(&PropertyKey::string("length"))
-                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                            let has_initial = current_args.len() > 1;
-                            let mut accumulator = if has_initial {
-                                current_args[1].clone()
-                            } else {
-                                if len == 0 {
-                                    return Err(VmError::type_error("Reduce of empty array with no initial value"));
-                                }
-                                obj.get(&PropertyKey::Index(0)).unwrap_or(Value::undefined())
-                            };
-                            let start = if has_initial { 0 } else { 1 };
-                            for i in start..len {
-                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                                accumulator = self.call_function(ctx, &callback, Value::undefined(),
-                                    &[accumulator, val, Value::number(i as f64), current_this.clone()])?;
-                            }
-                            ctx.set_register(return_reg, accumulator);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ArrayReduceRight => {
-                            let obj = current_this.as_object()
-                                .ok_or_else(|| VmError::type_error("reduceRight: not an object"))?;
-                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
-                            let len = obj.get(&PropertyKey::string("length"))
-                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                            let has_initial = current_args.len() > 1;
-                            let mut accumulator = if has_initial {
-                                current_args[1].clone()
-                            } else {
-                                if len == 0 {
-                                    return Err(VmError::type_error("Reduce of empty array with no initial value"));
-                                }
-                                obj.get(&PropertyKey::Index((len - 1) as u32)).unwrap_or(Value::undefined())
-                            };
-                            let end = if has_initial { len } else { len.saturating_sub(1) };
-                            for i in (0..end).rev() {
-                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                                accumulator = self.call_function(ctx, &callback, Value::undefined(),
-                                    &[accumulator, val, Value::number(i as f64), current_this.clone()])?;
-                            }
-                            ctx.set_register(return_reg, accumulator);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ArrayFlatMap => {
-                            let obj = current_this.as_object()
-                                .ok_or_else(|| VmError::type_error("flatMap: not an object"))?;
-                            let callback = current_args.first().cloned().unwrap_or(Value::undefined());
-                            let this_arg = current_args.get(1).cloned().unwrap_or(Value::undefined());
-                            let len = obj.get(&PropertyKey::string("length"))
-                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                            let result = GcRef::new(JsObject::array(0, ctx.memory_manager().clone()));
-                            let mut out_idx = 0u32;
-                            for i in 0..len {
-                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                                let mapped = self.call_function(ctx, &callback, this_arg.clone(),
-                                    &[val, Value::number(i as f64), current_this.clone()])?;
-                                // Flatten one level
-                                if let Some(inner) = mapped.as_object() {
-                                    if inner.get(&PropertyKey::string("length")).is_some() {
-                                        let inner_len = inner.get(&PropertyKey::string("length"))
-                                            .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                                        for j in 0..inner_len {
-                                            let item = inner.get(&PropertyKey::Index(j as u32)).unwrap_or(Value::undefined());
-                                            result.set(PropertyKey::Index(out_idx), item);
-                                            out_idx += 1;
-                                        }
-                                        continue;
-                                    }
-                                }
-                                result.set(PropertyKey::Index(out_idx), mapped);
-                                out_idx += 1;
-                            }
-                            result.set(PropertyKey::string("length"), Value::number(out_idx as f64));
-                            ctx.set_register(return_reg, Value::array(result));
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ArraySort => {
-                            let obj = current_this.as_object()
-                                .ok_or_else(|| VmError::type_error("sort: not an object"))?;
-                            let compare_fn = current_args.first().cloned().unwrap_or(Value::undefined());
-                            let len = obj.get(&PropertyKey::string("length"))
-                                .and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-
-                            // Collect elements
-                            let mut elements: Vec<Value> = Vec::with_capacity(len.min(1024));
-                            for i in 0..len {
-                                elements.push(obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined()));
-                            }
-
-                            // Sort using closure comparator via call_function
-                            // We use a simple insertion sort to avoid the FnMut issue with sort_by
-                            let mut i = 1;
-                            while i < elements.len() {
-                                let mut j = i;
-                                while j > 0 {
-                                    let cmp_result = self.call_function(ctx, &compare_fn, Value::undefined(),
-                                        &[elements[j - 1].clone(), elements[j].clone()])?;
-                                    let n = cmp_result.as_number().unwrap_or(0.0);
-                                    if n > 0.0 {
-                                        elements.swap(j - 1, j);
-                                        j -= 1;
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                i += 1;
-                            }
-
-                            // Write sorted elements back
-                            for (i, val) in elements.into_iter().enumerate() {
-                                obj.set(PropertyKey::Index(i as u32), val);
-                            }
-                            ctx.set_register(return_reg, current_this);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ReflectGetProxy => {
-                            // Reflect.get(proxy, propertyKey, receiver?)
-                            // current_args[0] = proxy (target)
-                            // current_args[1] = propertyKey
-                            // current_args[2] = receiver (optional)
-                            if current_args.len() < 2 {
-                                return Err(VmError::type_error("Reflect.get requires at least 2 arguments"));
-                            }
-
-                            let target = &current_args[0];
-                            let property_key = &current_args[1];
-                            let receiver = if current_args.len() > 2 {
-                                current_args[2].clone()
-                            } else {
-                                target.clone()
-                            };
-
-                            // Get proxy from target
-                            let proxy = target.as_proxy()
-                                .ok_or_else(|| VmError::type_error("Reflect.get: target is not a proxy"))?;
-
-                            // Convert key to PropertyKey
-                            let key = if let Some(n) = property_key.as_int32() {
-                                PropertyKey::Index(n as u32)
-                            } else if let Some(s) = property_key.as_string() {
-                                PropertyKey::from_js_string(s)
-                            } else if let Some(sym) = property_key.as_symbol() {
-                                PropertyKey::Symbol(sym.id)
-                            } else {
-                                let key_str = self.to_string(property_key);
-                                PropertyKey::string(&key_str)
-                            };
-
-                            // Call proxy_get
-                            let result = {
-                                let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                crate::proxy_operations::proxy_get(
-                                    &mut ncx,
-                                    proxy,
-                                    &key,
-                                    property_key.clone(),
-                                    receiver,
-                                )?
-                            };
-
-                            ctx.set_register(return_reg, result);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ReflectSetProxy => {
-                            // Reflect.set(proxy, propertyKey, value, receiver?)
-                            // current_args[0] = proxy (target)
-                            // current_args[1] = propertyKey
-                            // current_args[2] = value
-                            // current_args[3] = receiver (optional)
-                            if current_args.len() < 3 {
-                                return Err(VmError::type_error("Reflect.set requires at least 3 arguments"));
-                            }
-
-                            let target = &current_args[0];
-                            let property_key = &current_args[1];
-                            let value = current_args[2].clone();
-                            let receiver = if current_args.len() > 3 {
-                                current_args[3].clone()
-                            } else {
-                                target.clone()
-                            };
-
-                            // Get proxy from target
-                            let proxy = target.as_proxy()
-                                .ok_or_else(|| VmError::type_error("Reflect.set: target is not a proxy"))?;
-
-                            // Convert key to PropertyKey
-                            let key = if let Some(n) = property_key.as_int32() {
-                                PropertyKey::Index(n as u32)
-                            } else if let Some(s) = property_key.as_string() {
-                                PropertyKey::from_js_string(s)
-                            } else if let Some(sym) = property_key.as_symbol() {
-                                PropertyKey::Symbol(sym.id)
-                            } else {
-                                let key_str = self.to_string(property_key);
-                                PropertyKey::string(&key_str)
-                            };
-
-                            // Call proxy_set
-                            let success = {
-                                let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                crate::proxy_operations::proxy_set(
-                                    &mut ncx,
-                                    proxy,
-                                    &key,
-                                    property_key.clone(),
-                                    value,
-                                    receiver,
-                                )?
-                            };
-
-                            ctx.set_register(return_reg, Value::boolean(success));
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ReflectHasProxy => {
-                            // Reflect.has(proxy, propertyKey)
-                            // current_args[0] = proxy (target)
-                            // current_args[1] = propertyKey
-                            if current_args.len() < 2 {
-                                return Err(VmError::type_error("Reflect.has requires at least 2 arguments"));
-                            }
-
-                            let target = &current_args[0];
-                            let property_key = &current_args[1];
-
-                            // Get proxy from target
-                            let proxy = target.as_proxy()
-                                .ok_or_else(|| VmError::type_error("Reflect.has: target is not a proxy"))?;
-
-                            // Convert key to PropertyKey
-                            let key = if let Some(n) = property_key.as_int32() {
-                                PropertyKey::Index(n as u32)
-                            } else if let Some(s) = property_key.as_string() {
-                                PropertyKey::from_js_string(s)
-                            } else if let Some(sym) = property_key.as_symbol() {
-                                PropertyKey::Symbol(sym.id)
-                            } else {
-                                let key_str = self.to_string(property_key);
-                                PropertyKey::string(&key_str)
-                            };
-
-                            // Call proxy_has
-                            let result = {
-                                let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                crate::proxy_operations::proxy_has(
-                                    &mut ncx,
-                                    proxy,
-                                    &key,
-                                    property_key.clone(),
-                                )?
-                            };
-
-                            ctx.set_register(return_reg, Value::boolean(result));
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ReflectDeletePropertyProxy => {
-                            // Reflect.deleteProperty(proxy, propertyKey)
-                            // current_args[0] = proxy (target)
-                            // current_args[1] = propertyKey
-                            if current_args.len() < 2 {
-                                return Err(VmError::type_error("Reflect.deleteProperty requires at least 2 arguments"));
-                            }
-
-                            let target = &current_args[0];
-                            let property_key = &current_args[1];
-
-                            // Get proxy from target
-                            let proxy = target.as_proxy()
-                                .ok_or_else(|| VmError::type_error("Reflect.deleteProperty: target is not a proxy"))?;
-
-                            // Convert key to PropertyKey
-                            let key = if let Some(n) = property_key.as_int32() {
-                                PropertyKey::Index(n as u32)
-                            } else if let Some(s) = property_key.as_string() {
-                                PropertyKey::from_js_string(s)
-                            } else if let Some(sym) = property_key.as_symbol() {
-                                PropertyKey::Symbol(sym.id)
-                            } else {
-                                let key_str = self.to_string(property_key);
-                                PropertyKey::string(&key_str)
-                            };
-
-                            // Call proxy_delete_property
-                            let result = {
-                                let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                crate::proxy_operations::proxy_delete_property(
-                                    &mut ncx,
-                                    proxy,
-                                    &key,
-                                    property_key.clone(),
-                                )?
-                            };
-
-                            ctx.set_register(return_reg, Value::boolean(result));
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ReflectOwnKeysProxy => {
-                            // Reflect.ownKeys(proxy)
-                            // current_args[0] = proxy (target)
-                            if current_args.is_empty() {
-                                return Err(VmError::type_error("Reflect.ownKeys requires at least 1 argument"));
-                            }
-
-                            let target = &current_args[0];
-
-                            // Get proxy from target
-                            let proxy = target.as_proxy()
-                                .ok_or_else(|| VmError::type_error("Reflect.ownKeys: target is not a proxy"))?;
-
-                            // Call proxy_own_keys
-                            let keys = {
-                                let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                crate::proxy_operations::proxy_own_keys(&mut ncx, proxy)?
-                            };
-
-                            // Convert keys to array
-                            let result = GcRef::new(crate::object::JsObject::new(None, ctx.memory_manager().clone()));
-                            for (i, key) in keys.into_iter().enumerate() {
-                                let key_val = match key {
-                                    PropertyKey::String(s) => Value::string(s),
-                                    PropertyKey::Index(n) => Value::string(crate::string::JsString::intern(&n.to_string())),
-                                    PropertyKey::Symbol(sym_id) => {
-                                        // Create symbol value
-                                        Value::symbol(Arc::new(crate::value::Symbol {
-                                            description: None,
-                                            id: sym_id,
-                                        }))
-                                    }
-                                };
-                                result.set(PropertyKey::Index(i as u32), key_val);
-                            }
-                            result.set(PropertyKey::from("length"), Value::int32(result.own_keys().len() as i32));
-
-                            ctx.set_register(return_reg, Value::object(result));
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ReflectGetOwnPropertyDescriptorProxy => {
-                            // Reflect.getOwnPropertyDescriptor(proxy, propertyKey)
-                            // current_args[0] = proxy (target)
-                            // current_args[1] = propertyKey
-                            if current_args.len() < 2 {
-                                return Err(VmError::type_error("Reflect.getOwnPropertyDescriptor requires at least 2 arguments"));
-                            }
-
-                            let target = &current_args[0];
-                            let property_key = &current_args[1];
-
-                            // Get proxy from target
-                            let proxy = target.as_proxy()
-                                .ok_or_else(|| VmError::type_error("Reflect.getOwnPropertyDescriptor: target is not a proxy"))?;
-
-                            // Convert key to PropertyKey
-                            let key = if let Some(n) = property_key.as_int32() {
-                                PropertyKey::Index(n as u32)
-                            } else if let Some(s) = property_key.as_string() {
-                                PropertyKey::from_js_string(s)
-                            } else if let Some(sym) = property_key.as_symbol() {
-                                PropertyKey::Symbol(sym.id)
-                            } else {
-                                let key_str = self.to_string(property_key);
-                                PropertyKey::string(&key_str)
-                            };
-
-                            // Call proxy_get_own_property_descriptor
-                            let result_desc = {
-                                let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                crate::proxy_operations::proxy_get_own_property_descriptor(
-                                    &mut ncx,
-                                    proxy,
-                                    &key,
-                                    property_key.clone(),
-                                )?
-                            };
-
-                            // Convert descriptor to object or undefined
-                            let result = if let Some(desc) = result_desc {
-                                match desc {
-                                    crate::object::PropertyDescriptor::Data { value, attributes } => {
-                                        let desc_obj = GcRef::new(crate::object::JsObject::new(None, ctx.memory_manager().clone()));
-                                        desc_obj.set(PropertyKey::from("value"), value);
-                                        desc_obj.set(PropertyKey::from("writable"), Value::boolean(attributes.writable));
-                                        desc_obj.set(PropertyKey::from("enumerable"), Value::boolean(attributes.enumerable));
-                                        desc_obj.set(PropertyKey::from("configurable"), Value::boolean(attributes.configurable));
-                                        Value::object(desc_obj)
-                                    }
-                                    crate::object::PropertyDescriptor::Accessor { get, set, attributes } => {
-                                        let desc_obj = GcRef::new(crate::object::JsObject::new(None, ctx.memory_manager().clone()));
-                                        if let Some(getter) = get {
-                                            desc_obj.set(PropertyKey::from("get"), getter);
-                                        }
-                                        if let Some(setter) = set {
-                                            desc_obj.set(PropertyKey::from("set"), setter);
-                                        }
-                                        desc_obj.set(PropertyKey::from("enumerable"), Value::boolean(attributes.enumerable));
-                                        desc_obj.set(PropertyKey::from("configurable"), Value::boolean(attributes.configurable));
-                                        Value::object(desc_obj)
-                                    }
-                                    crate::object::PropertyDescriptor::Deleted => {
-                                        // Return undefined
-                                        Value::undefined()
-                                    }
-                                }
-                            } else {
-                                Value::undefined()
-                            };
-
-                            ctx.set_register(return_reg, result);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ReflectDefinePropertyProxy => {
-                            // Reflect.defineProperty(proxy, propertyKey, attributes)
-                            // current_args[0] = proxy (target)
-                            // current_args[1] = propertyKey
-                            // current_args[2] = attributes
-                            if current_args.len() < 3 {
-                                return Err(VmError::type_error("Reflect.defineProperty requires at least 3 arguments"));
-                            }
-
-                            let target = &current_args[0];
-                            let property_key = &current_args[1];
-                            let attributes = &current_args[2];
-
-                            // Get proxy from target
-                            let proxy = target.as_proxy()
-                                .ok_or_else(|| VmError::type_error("Reflect.defineProperty: target is not a proxy"))?;
-
-                            // Convert key to PropertyKey
-                            let key = if let Some(n) = property_key.as_int32() {
-                                PropertyKey::Index(n as u32)
-                            } else if let Some(s) = property_key.as_string() {
-                                PropertyKey::from_js_string(s)
-                            } else if let Some(sym) = property_key.as_symbol() {
-                                PropertyKey::Symbol(sym.id)
-                            } else {
-                                let key_str = self.to_string(property_key);
-                                PropertyKey::string(&key_str)
-                            };
-
-                            // Convert attributes object to PropertyDescriptor
-                            let attr_obj = attributes.as_object()
-                                .ok_or_else(|| VmError::type_error("Reflect.defineProperty requires attributes to be an object"))?;
-
-                            let has_value = attr_obj.has(&PropertyKey::from("value"));
-                            let has_writable = attr_obj.has(&PropertyKey::from("writable"));
-                            let has_get = attr_obj.has(&PropertyKey::from("get"));
-                            let has_set = attr_obj.has(&PropertyKey::from("set"));
-
-                            let enumerable = attr_obj
-                                .get(&PropertyKey::from("enumerable"))
-                                .map(|v| v.to_boolean())
-                                .unwrap_or(false);
-                            let configurable = attr_obj
-                                .get(&PropertyKey::from("configurable"))
-                                .map(|v| v.to_boolean())
-                                .unwrap_or(false);
-
-                            let desc = if has_value || has_writable {
-                                // Data descriptor
-                                let value = attr_obj.get(&PropertyKey::from("value")).unwrap_or(Value::undefined());
-                                let writable = attr_obj
-                                    .get(&PropertyKey::from("writable"))
-                                    .map(|v| v.to_boolean())
-                                    .unwrap_or(false);
-                                crate::object::PropertyDescriptor::Data {
-                                    value,
-                                    attributes: crate::object::PropertyAttributes {
-                                        writable,
-                                        enumerable,
-                                        configurable,
-                                    },
-                                }
-                            } else if has_get || has_set {
-                                // Accessor descriptor
-                                let get = attr_obj.get(&PropertyKey::from("get")).filter(|v| !v.is_undefined());
-                                let set = attr_obj.get(&PropertyKey::from("set")).filter(|v| !v.is_undefined());
-                                crate::object::PropertyDescriptor::Accessor {
-                                    get,
-                                    set,
-                                    attributes: crate::object::PropertyAttributes {
-                                        writable: false,
-                                        enumerable,
-                                        configurable,
-                                    },
-                                }
-                            } else {
-                                // Generic descriptor
-                                crate::object::PropertyDescriptor::Data {
-                                    value: Value::undefined(),
-                                    attributes: crate::object::PropertyAttributes {
-                                        writable: false,
-                                        enumerable,
-                                        configurable,
-                                    },
-                                }
-                            };
-
-                            // Call proxy_define_property
-                            let result = {
-                                let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                crate::proxy_operations::proxy_define_property(
-                                    &mut ncx,
-                                    proxy,
-                                    &key,
-                                    property_key.clone(),
-                                    &desc,
-                                )?
-                            };
-
-                            ctx.set_register(return_reg, Value::boolean(result));
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ReflectGetPrototypeOfProxy => {
-                            // Reflect.getPrototypeOf(proxy)
-                            // current_args[0] = proxy (target)
-                            if current_args.is_empty() {
-                                return Err(VmError::type_error("Reflect.getPrototypeOf requires at least 1 argument"));
-                            }
-
-                            let target = &current_args[0];
-
-                            // Get proxy from target
-                            let proxy = target.as_proxy()
-                                .ok_or_else(|| VmError::type_error("Reflect.getPrototypeOf: target is not a proxy"))?;
-
-                            // Call proxy_get_prototype_of
-                            let result_proto = {
-                                let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                crate::proxy_operations::proxy_get_prototype_of(&mut ncx, proxy)?
-                            };
-
-                            // Convert to Value
-                            let result = match result_proto {
-                                Some(proto) => Value::object(proto),
-                                None => Value::null(),
-                            };
-
-                            ctx.set_register(return_reg, result);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ReflectSetPrototypeOfProxy => {
-                            // Reflect.setPrototypeOf(proxy, prototype)
-                            // current_args[0] = proxy (target)
-                            // current_args[1] = prototype
-                            if current_args.len() < 2 {
-                                return Err(VmError::type_error("Reflect.setPrototypeOf requires at least 2 arguments"));
-                            }
-
-                            let target = &current_args[0];
-                            let prototype = &current_args[1];
-
-                            // Get proxy from target
-                            let proxy = target.as_proxy()
-                                .ok_or_else(|| VmError::type_error("Reflect.setPrototypeOf: target is not a proxy"))?;
-
-                            // Convert prototype to Option<GcRef<JsObject>>
-                            let proto = if prototype.is_null() {
-                                None
-                            } else if let Some(proto_obj) = prototype.as_object() {
-                                Some(proto_obj)
-                            } else {
-                                return Err(VmError::type_error("Prototype must be an object or null"));
-                            };
-
-                            // Call proxy_set_prototype_of
-                            let result = {
-                                let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                crate::proxy_operations::proxy_set_prototype_of(&mut ncx, proxy, proto)?
-                            };
-
-                            ctx.set_register(return_reg, Value::boolean(result));
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ReflectIsExtensibleProxy => {
-                            // Reflect.isExtensible(proxy)
-                            // current_args[0] = proxy (target)
-                            if current_args.is_empty() {
-                                return Err(VmError::type_error("Reflect.isExtensible requires at least 1 argument"));
-                            }
-
-                            let target = &current_args[0];
-
-                            // Get proxy from target
-                            let proxy = target.as_proxy()
-                                .ok_or_else(|| VmError::type_error("Reflect.isExtensible: target is not a proxy"))?;
-
-                            // Call proxy_is_extensible
-                            let result = {
-                                let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                crate::proxy_operations::proxy_is_extensible(&mut ncx, proxy)?
-                            };
-
-                            ctx.set_register(return_reg, Value::boolean(result));
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ReflectPreventExtensionsProxy => {
-                            // Reflect.preventExtensions(proxy)
-                            // current_args[0] = proxy (target)
-                            if current_args.is_empty() {
-                                return Err(VmError::type_error("Reflect.preventExtensions requires at least 1 argument"));
-                            }
-
-                            let target = &current_args[0];
-
-                            // Get proxy from target
-                            let proxy = target.as_proxy()
-                                .ok_or_else(|| VmError::type_error("Reflect.preventExtensions: target is not a proxy"))?;
-
-                            // Call proxy_prevent_extensions
-                            let result = {
-                                let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                crate::proxy_operations::proxy_prevent_extensions(&mut ncx, proxy)?
-                            };
-
-                            ctx.set_register(return_reg, Value::boolean(result));
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ReflectApplyProxy => {
-                            // Reflect.apply(proxy, thisArgument, argumentsList)
-                            // current_args[0] = proxy (target)
-                            // current_args[1] = thisArgument
-                            // current_args[2] = argumentsList
-                            if current_args.len() < 3 {
-                                return Err(VmError::type_error("Reflect.apply requires at least 3 arguments"));
-                            }
-
-                            let target = &current_args[0];
-                            let this_arg = current_args[1].clone();
-                            let args_list = &current_args[2];
-
-                            // Get proxy from target
-                            let proxy = target.as_proxy()
-                                .ok_or_else(|| VmError::type_error("Reflect.apply: target is not a proxy"))?;
-
-                            // Convert argumentsList to Vec<Value>
-                            let args_array = if let Some(arr_obj) = args_list.as_object() {
-                                let len = arr_obj.get(&PropertyKey::from("length"))
-                                    .and_then(|v| v.as_int32())
-                                    .unwrap_or(0) as usize;
-                                let mut call_args = Vec::with_capacity(len);
-                                for i in 0..len {
-                                    let val = arr_obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                                    call_args.push(val);
-                                }
-                                call_args
-                            } else {
-                                return Err(VmError::type_error("Reflect.apply argumentsList must be an object"));
-                            };
-
-                            // Call proxy_apply
-                            let result = {
-                                let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                crate::proxy_operations::proxy_apply(
-                                    &mut ncx,
-                                    proxy,
-                                    this_arg,
-                                    &args_array,
-                                )?
-                            };
-
-                            ctx.set_register(return_reg, result);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::ReflectConstructProxy => {
-                            // Reflect.construct(proxy, argumentsList, newTarget?)
-                            // current_args[0] = proxy (target)
-                            // current_args[1] = argumentsList
-                            // current_args[2] = newTarget (optional)
-                            if current_args.len() < 2 {
-                                return Err(VmError::type_error("Reflect.construct requires at least 2 arguments"));
-                            }
-
-                            let target = &current_args[0];
-                            let args_list = &current_args[1];
-                            let new_target = current_args.get(2).cloned().unwrap_or_else(|| target.clone());
-
-                            // Get proxy from target
-                            let proxy = target.as_proxy()
-                                .ok_or_else(|| VmError::type_error("Reflect.construct: target is not a proxy"))?;
-
-                            // Convert argumentsList to Vec<Value>
-                            let args_array = if let Some(arr_obj) = args_list.as_object() {
-                                let len = arr_obj.get(&PropertyKey::from("length"))
-                                    .and_then(|v| v.as_int32())
-                                    .unwrap_or(0) as usize;
-                                let mut call_args = Vec::with_capacity(len);
-                                for i in 0..len {
-                                    let val = arr_obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                                    call_args.push(val);
-                                }
-                                call_args
-                            } else {
-                                return Err(VmError::type_error("Reflect.construct argumentsList must be an object"));
-                            };
-
-                            // Call proxy_construct
-                            let result = {
-                                let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                crate::proxy_operations::proxy_construct(
-                                    &mut ncx,
-                                    proxy,
-                                    &args_array,
-                                    new_target,
-                                )?
-                            };
-
-                            ctx.set_register(return_reg, result);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        // ============================================================
-                        // Promise methods — register JS callbacks via job queue
-                        // ============================================================
-
-                        InterceptionSignal::PromiseConstructor => {
-                            return Err(VmError::type_error("Constructor Promise requires 'new'"));
-                        }
-
-                        InterceptionSignal::PromiseThen => {
-                            // Promise.prototype.then(onFulfilled, onRejected)
-                            // current_this = source promise
-                            // current_args[0] = onFulfilled
-                            // current_args[1] = onRejected
-
-                            let source = extract_internal_promise(&current_this)
-                                .ok_or_else(|| VmError::type_error("then: not a promise"))?;
-
-                            let on_fulfilled = current_args.get(0).cloned().unwrap_or(Value::undefined());
-                            let on_rejected = current_args.get(1).cloned().unwrap_or(Value::undefined());
-
-                            // Create result promise for chaining
-                            let result_promise = crate::promise::JsPromise::new();
-
-                            let fulfill_job = crate::promise::JsPromiseJob {
-                                kind: if on_fulfilled.is_function() {
-                                    crate::promise::JsPromiseJobKind::Fulfill
-                                } else {
-                                    crate::promise::JsPromiseJobKind::PassthroughFulfill
-                                },
-                                callback: on_fulfilled,
-                                this_arg: Value::undefined(),
-                                result_promise: Some(result_promise.clone()),
-                            };
-
-                            let reject_job = crate::promise::JsPromiseJob {
-                                kind: if on_rejected.is_function() {
-                                    crate::promise::JsPromiseJobKind::Reject
-                                } else {
-                                    crate::promise::JsPromiseJobKind::PassthroughReject
-                                },
-                                callback: on_rejected,
-                                this_arg: Value::undefined(),
-                                result_promise: Some(result_promise.clone()),
-                            };
-
-                            source.then_js(fulfill_job, |job, args| {
-                                let _ = ctx.enqueue_js_job(job, args);
-                            });
-                            source.catch_js(reject_job, |job, args| {
-                                let _ = ctx.enqueue_js_job(job, args);
-                            });
-
-                            let js_promise = self.create_js_promise(ctx, result_promise);
-                            ctx.set_register(return_reg, js_promise);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::PromiseCatch => {
-                            // Promise.prototype.catch(onRejected)
-                            // current_this = source promise
-                            // current_args[0] = onRejected
-
-                            let source = extract_internal_promise(&current_this)
-                                .ok_or_else(|| VmError::type_error("catch: not a promise"))?;
-
-                            let on_rejected = current_args.get(0).cloned().unwrap_or(Value::undefined());
-
-                            // Create result promise for chaining
-                            let result_promise = crate::promise::JsPromise::new();
-
-                            let fulfill_job = crate::promise::JsPromiseJob {
-                                kind: crate::promise::JsPromiseJobKind::PassthroughFulfill,
-                                callback: Value::undefined(),
-                                this_arg: Value::undefined(),
-                                result_promise: Some(result_promise.clone()),
-                            };
-
-                            let reject_job = crate::promise::JsPromiseJob {
-                                kind: if on_rejected.is_function() {
-                                    crate::promise::JsPromiseJobKind::Reject
-                                } else {
-                                    crate::promise::JsPromiseJobKind::PassthroughReject
-                                },
-                                callback: on_rejected,
-                                this_arg: Value::undefined(),
-                                result_promise: Some(result_promise.clone()),
-                            };
-
-                            source.then_js(fulfill_job, |job, args| {
-                                let _ = ctx.enqueue_js_job(job, args);
-                            });
-                            source.catch_js(reject_job, |job, args| {
-                                let _ = ctx.enqueue_js_job(job, args);
-                            });
-
-                            let js_promise = self.create_js_promise(ctx, result_promise);
-                            ctx.set_register(return_reg, js_promise);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::PromiseFinally => {
-                            // Promise.prototype.finally(onFinally)
-                            // current_this = source promise
-                            // current_args[0] = onFinally
-                            //
-                            // Note: finally runs the callback on both fulfill and reject,
-                            // then passes through the original value/error
-
-                            let source = extract_internal_promise(&current_this)
-                                .ok_or_else(|| VmError::type_error("finally: not a promise"))?;
-
-                            let on_finally = current_args.get(0).cloned().unwrap_or(Value::undefined());
-
-                            // Create result promise for chaining
-                            let result_promise = crate::promise::JsPromise::new();
-
-                            let (fulfill_kind, reject_kind, fulfill_callback, reject_callback) =
-                                if on_finally.is_function() {
-                                    (
-                                        crate::promise::JsPromiseJobKind::FinallyFulfill,
-                                        crate::promise::JsPromiseJobKind::FinallyReject,
-                                        on_finally.clone(),
-                                        on_finally,
-                                    )
-                                } else {
-                                    (
-                                        crate::promise::JsPromiseJobKind::PassthroughFulfill,
-                                        crate::promise::JsPromiseJobKind::PassthroughReject,
-                                        Value::undefined(),
-                                        Value::undefined(),
-                                    )
-                                };
-
-                            let fulfill_job = crate::promise::JsPromiseJob {
-                                kind: fulfill_kind,
-                                callback: fulfill_callback,
-                                this_arg: Value::undefined(),
-                                result_promise: Some(result_promise.clone()),
-                            };
-
-                            let reject_job = crate::promise::JsPromiseJob {
-                                kind: reject_kind,
-                                callback: reject_callback,
-                                this_arg: Value::undefined(),
-                                result_promise: Some(result_promise.clone()),
-                            };
-
-                            source.then_js(fulfill_job, |job, args| {
-                                let _ = ctx.enqueue_js_job(job, args);
-                            });
-                            source.catch_js(reject_job, |job, args| {
-                                let _ = ctx.enqueue_js_job(job, args);
-                            });
-
-                            let js_promise = self.create_js_promise(ctx, result_promise);
-                            ctx.set_register(return_reg, js_promise);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::PromiseAll => {
-                            // Promise.all(iterable)
-                            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-                            use std::sync::Mutex;
-
-                            let items = extract_array_items(current_args.first())?;
-                            let result_promise = crate::promise::JsPromise::new();
-                            let mm = ctx.memory_manager().clone();
-
-                            if items.is_empty() {
-                                let arr = GcRef::new(JsObject::array(0, mm));
-                                result_promise.resolve_with_js_jobs(Value::array(arr), enqueue_js_job.clone());
-                                let js_promise = self.create_js_promise(ctx, result_promise);
-                                ctx.set_register(return_reg, js_promise);
-                                return Ok(InstructionResult::Continue);
-                            }
-
-                            let count = items.len();
-                            let remaining = Arc::new(AtomicUsize::new(count));
-                            let results: Arc<Mutex<Vec<Option<Value>>>> =
-                                Arc::new(Mutex::new(vec![None; count]));
-                            let rejected = Arc::new(AtomicBool::new(false));
-
-                            for (index, item) in items.into_iter().enumerate() {
-                                let result_p = result_promise.clone();
-                                let remaining = remaining.clone();
-                                let results = results.clone();
-                                let rejected = rejected.clone();
-                                let mm_inner = mm.clone();
-                                let enqueue = enqueue_js_job.clone();
-
-                                let source_promise = if let Some(promise) = extract_internal_promise(&item) {
-                                    promise
-                                } else {
-                                    let p = crate::promise::JsPromise::new();
-                                    let enqueue_resolve = enqueue_js_job.clone();
-                                    p.resolve_with_js_jobs(item, enqueue_resolve);
-                                    p
-                                };
-
-                                let result_p_reject = result_p.clone();
-                                let rejected_check = rejected.clone();
-                                let enqueue_reject = enqueue_js_job.clone();
-                                source_promise.then(move |value| {
-                                    if rejected.load(Ordering::Acquire) {
-                                        return;
-                                    }
-                                    if let Ok(mut locked) = results.lock() {
-                                        locked[index] = Some(value);
-                                    }
-                                    if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                                        let arr =
-                                            GcRef::new(JsObject::array(count, mm_inner.clone()));
-                                        if let Ok(locked) = results.lock() {
-                                            for (i, v) in locked.iter().enumerate() {
-                                                if let Some(val) = v {
-                                                    arr.set(PropertyKey::Index(i as u32), val.clone());
-                                                }
-                                            }
-                                        }
-                                        result_p.resolve_with_js_jobs(Value::array(arr), enqueue.clone());
-                                    }
-                                });
-                                source_promise.catch(move |error| {
-                                    if !rejected_check.swap(true, Ordering::AcqRel) {
-                                        result_p_reject
-                                            .reject_with_js_jobs(error, enqueue_reject.clone());
-                                    }
-                                });
-                            }
-
-                            let js_promise = self.create_js_promise(ctx, result_promise);
-                            ctx.set_register(return_reg, js_promise);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::PromiseRace => {
-                            // Promise.race(iterable)
-                            use std::sync::atomic::{AtomicBool, Ordering};
-
-                            let items = extract_array_items(current_args.first())?;
-                            let result_promise = crate::promise::JsPromise::new();
-                            let settled = Arc::new(AtomicBool::new(false));
-
-                            for item in items {
-                                let result_p = result_promise.clone();
-                                let result_p_reject = result_promise.clone();
-                                let settled1 = settled.clone();
-                                let settled2 = settled.clone();
-                                let enqueue = enqueue_js_job.clone();
-                                let enqueue_reject = enqueue_js_job.clone();
-                                let source_promise = if let Some(promise) = extract_internal_promise(&item) {
-                                    promise
-                                } else {
-                                    let p = crate::promise::JsPromise::new();
-                                    let enqueue_resolve = enqueue_js_job.clone();
-                                    p.resolve_with_js_jobs(item, enqueue_resolve);
-                                    p
-                                };
-
-                                source_promise.then(move |value| {
-                                    if !settled1.swap(true, Ordering::AcqRel) {
-                                        result_p.resolve_with_js_jobs(value, enqueue.clone());
-                                    }
-                                });
-                                source_promise.catch(move |error| {
-                                    if !settled2.swap(true, Ordering::AcqRel) {
-                                        result_p_reject
-                                            .reject_with_js_jobs(error, enqueue_reject.clone());
-                                    }
-                                });
-                            }
-
-                            let js_promise = self.create_js_promise(ctx, result_promise);
-                            ctx.set_register(return_reg, js_promise);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::PromiseAllSettled => {
-                            // Promise.allSettled(iterable)
-                            use std::sync::atomic::{AtomicUsize, Ordering};
-                            use std::sync::Mutex;
-
-                            let items = extract_array_items(current_args.first())?;
-                            let result_promise = crate::promise::JsPromise::new();
-                            let mm = ctx.memory_manager().clone();
-
-                            if items.is_empty() {
-                                let arr = GcRef::new(JsObject::array(0, mm));
-                                result_promise.resolve_with_js_jobs(Value::array(arr), enqueue_js_job.clone());
-                                let js_promise = self.create_js_promise(ctx, result_promise);
-                                ctx.set_register(return_reg, js_promise);
-                                return Ok(InstructionResult::Continue);
-                            }
-
-                            let count = items.len();
-                            let remaining = Arc::new(AtomicUsize::new(count));
-                            let results: Arc<Mutex<Vec<Option<Value>>>> =
-                                Arc::new(Mutex::new(vec![None; count]));
-                            for (index, item) in items.into_iter().enumerate() {
-                                let result_p = result_promise.clone();
-                                let remaining = remaining.clone();
-                                let results = results.clone();
-                                let result_p2 = result_promise.clone();
-                                let remaining2 = remaining.clone();
-                                let results2 = results.clone();
-                                let mm_t = mm.clone();
-                                let mm_c = mm.clone();
-                                let enqueue = enqueue_js_job.clone();
-                                let enqueue2 = enqueue_js_job.clone();
-                                let source_promise = if let Some(promise) = extract_internal_promise(&item) {
-                                    promise
-                                } else {
-                                    let p = crate::promise::JsPromise::new();
-                                    let enqueue_resolve = enqueue_js_job.clone();
-                                    p.resolve_with_js_jobs(item, enqueue_resolve);
-                                    p
-                                };
-
-                                source_promise.then(move |value| {
-                                    let obj = GcRef::new(JsObject::new(None, mm_t.clone()));
-                                    obj.set(
-                                        "status".into(),
-                                        Value::string(JsString::intern("fulfilled")),
-                                    );
-                                    obj.set("value".into(), value);
-                                    if let Ok(mut locked) = results.lock() {
-                                        locked[index] = Some(Value::object(obj));
-                                    }
-                                    if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                                        let arr = GcRef::new(JsObject::array(count, mm_t.clone()));
-                                        if let Ok(locked) = results.lock() {
-                                            for (i, v) in locked.iter().enumerate() {
-                                                if let Some(val) = v {
-                                                    arr.set(PropertyKey::Index(i as u32), val.clone());
-                                                }
-                                            }
-                                        }
-                                        result_p
-                                            .resolve_with_js_jobs(Value::array(arr), enqueue.clone());
-                                    }
-                                });
-                                source_promise.catch(move |error| {
-                                    let obj = GcRef::new(JsObject::new(None, mm_c.clone()));
-                                    obj.set(
-                                        "status".into(),
-                                        Value::string(JsString::intern("rejected")),
-                                    );
-                                    obj.set("reason".into(), error);
-                                    if let Ok(mut locked) = results2.lock() {
-                                        locked[index] = Some(Value::object(obj));
-                                    }
-                                    if remaining2.fetch_sub(1, Ordering::AcqRel) == 1 {
-                                        let arr = GcRef::new(JsObject::array(count, mm_c.clone()));
-                                        if let Ok(locked) = results2.lock() {
-                                            for (i, v) in locked.iter().enumerate() {
-                                                if let Some(val) = v {
-                                                    arr.set(PropertyKey::Index(i as u32), val.clone());
-                                                }
-                                            }
-                                        }
-                                        result_p2
-                                            .resolve_with_js_jobs(Value::array(arr), enqueue2.clone());
-                                    }
-                                });
-                            }
-
-                            let js_promise = self.create_js_promise(ctx, result_promise);
-                            ctx.set_register(return_reg, js_promise);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::PromiseAny => {
-                            // Promise.any(iterable)
-                            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-                            use std::sync::Mutex;
-
-                            let items = extract_array_items(current_args.first())?;
-                            let result_promise = crate::promise::JsPromise::new();
-                            let mm = ctx.memory_manager().clone();
-
-                            if items.is_empty() {
-                                let err =
-                                    Value::string(JsString::intern("All promises were rejected"));
-                                result_promise.reject_with_js_jobs(err, enqueue_js_job.clone());
-                                let js_promise = self.create_js_promise(ctx, result_promise);
-                                ctx.set_register(return_reg, js_promise);
-                                return Ok(InstructionResult::Continue);
-                            }
-
-                            let count = items.len();
-                            let fulfilled = Arc::new(AtomicBool::new(false));
-                            let remaining = Arc::new(AtomicUsize::new(count));
-                            let errors: Arc<Mutex<Vec<Option<Value>>>> =
-                                Arc::new(Mutex::new(vec![None; count]));
-
-                            for (index, item) in items.into_iter().enumerate() {
-                                let result_p = result_promise.clone();
-                                let fulfilled1 = fulfilled.clone();
-                                let remaining = remaining.clone();
-                                let errors = errors.clone();
-                                let result_p2 = result_promise.clone();
-                                let fulfilled2 = fulfilled.clone();
-                                let mm_err = mm.clone();
-                                let enqueue = enqueue_js_job.clone();
-                                let enqueue_reject = enqueue_js_job.clone();
-                                let source_promise = if let Some(promise) = extract_internal_promise(&item) {
-                                    promise
-                                } else {
-                                    let p = crate::promise::JsPromise::new();
-                                    let enqueue_resolve = enqueue_js_job.clone();
-                                    p.resolve_with_js_jobs(item, enqueue_resolve);
-                                    p
-                                };
-
-                                source_promise.then(move |value| {
-                                    if !fulfilled1.swap(true, Ordering::AcqRel) {
-                                        result_p.resolve_with_js_jobs(value, enqueue.clone());
-                                    }
-                                });
-                                source_promise.catch(move |error| {
-                                    if fulfilled2.load(Ordering::Acquire) {
-                                        return;
-                                    }
-                                    if let Ok(mut locked) = errors.lock() {
-                                        locked[index] = Some(error);
-                                    }
-                                    if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                                        let errs: Vec<Value> = if let Ok(locked) = errors.lock() {
-                                            locked.iter().filter_map(|e| e.clone()).collect()
-                                        } else {
-                                            vec![]
-                                        };
-                                        let arr = GcRef::new(JsObject::array(
-                                            errs.len(),
-                                            mm_err.clone(),
-                                        ));
-                                        for (i, e) in errs.iter().enumerate() {
-                                            arr.set(PropertyKey::Index(i as u32), e.clone());
-                                        }
-                                        let agg = GcRef::new(JsObject::new(None, mm_err.clone()));
-                                        agg.set(
-                                            "message".into(),
-                                            Value::string(JsString::intern(
-                                                "All promises were rejected",
-                                            )),
-                                        );
-                                        agg.set("errors".into(), Value::array(arr));
-                                        result_p2.reject_with_js_jobs(
-                                            Value::object(agg),
-                                            enqueue_reject.clone(),
-                                        );
-                                    }
-                                });
-                            }
-
-                            let js_promise = self.create_js_promise(ctx, result_promise);
-                            ctx.set_register(return_reg, js_promise);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::PromiseReject => {
-                            // Promise.reject(reason)
-                            let reason = current_args
-                                .first()
-                                .cloned()
-                                .unwrap_or(Value::undefined());
-                            let result_promise = crate::promise::JsPromise::new();
-                            result_promise.reject_with_js_jobs(reason, enqueue_js_job.clone());
-                            let js_promise = self.create_js_promise(ctx, result_promise);
-                            ctx.set_register(return_reg, js_promise);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::PromiseResolve => {
-                            // Promise.resolve(value)
-                            let value = current_args
-                                .first()
-                                .cloned()
-                                .unwrap_or(Value::undefined());
-
-                            if is_wrapped_promise(&value) {
-                                ctx.set_register(return_reg, value);
-                                return Ok(InstructionResult::Continue);
-                            }
-
-                            if let Some(promise) = value.as_promise() {
-                                let js_promise = self.create_js_promise(ctx, promise.clone());
-                                ctx.set_register(return_reg, js_promise);
-                                return Ok(InstructionResult::Continue);
-                            }
-
-                            let result_promise = crate::promise::JsPromise::new();
-
-                            if value.is_object() {
-                                let key = PropertyKey::string("then");
-                                let then_val = if let Some(proxy) = value.as_proxy() {
-                                    let key_value = Value::string(JsString::intern("then"));
-                                    {
-                                        let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                        crate::proxy_operations::proxy_get(
-                                            &mut ncx,
-                                            proxy,
-                                            &key,
-                                            key_value,
-                                            value.clone(),
-                                        )
-                                    }
-                                } else if let Some(obj) = value.as_object() {
-                                    match obj.lookup_property_descriptor(&key) {
-                                        Some(crate::object::PropertyDescriptor::Accessor { get, .. }) => {
-                                            if let Some(getter) = get {
-                                                self.call_function(ctx, &getter, value.clone(), &[])
-                                            } else {
-                                                Ok(Value::undefined())
-                                            }
-                                        }
-                                        Some(crate::object::PropertyDescriptor::Data { value, .. }) => {
-                                            Ok(value)
-                                        }
-                                        _ => Ok(Value::undefined()),
-                                    }
-                                } else {
-                                    Ok(Value::undefined())
-                                };
-
-                                match then_val {
-                                    Ok(then_callable) if then_callable.is_callable() => {
-                                        let job = crate::promise::JsPromiseJob {
-                                            kind: crate::promise::JsPromiseJobKind::ResolveThenable,
-                                            callback: then_callable,
-                                            this_arg: value,
-                                            result_promise: Some(result_promise.clone()),
-                                        };
-                                        let _ = ctx.enqueue_js_job(job, Vec::new());
-                                        let js_promise = self.create_js_promise(ctx, result_promise);
-                                        ctx.set_register(return_reg, js_promise);
-                                        return Ok(InstructionResult::Continue);
-                                    }
-                                    Ok(_) => {}
-                                    Err(err) => {
-                                        let error_val = match err {
-                                            VmError::Exception(thrown) => thrown.value,
-                                            VmError::TypeError(message) => {
-                                                self.make_error(ctx, "TypeError", &message)
-                                            }
-                                            VmError::RangeError(message) => {
-                                                self.make_error(ctx, "RangeError", &message)
-                                            }
-                                            VmError::ReferenceError(message) => {
-                                                self.make_error(ctx, "ReferenceError", &message)
-                                            }
-                                            VmError::SyntaxError(message) => {
-                                                self.make_error(ctx, "SyntaxError", &message)
-                                            }
-                                            other => {
-                                                let message = other.to_string();
-                                                Value::string(JsString::intern(&message))
-                                            }
-                                        };
-                                        result_promise.reject_with_js_jobs(error_val, |job, args| {
-                                            let _ = ctx.enqueue_js_job(job, args);
-                                        });
-                                        let js_promise = self.create_js_promise(ctx, result_promise);
-                                        ctx.set_register(return_reg, js_promise);
-                                        return Ok(InstructionResult::Continue);
-                                    }
-                                }
-                            }
-
-                            result_promise.resolve_with_js_jobs(value, |job, args| {
-                                let _ = ctx.enqueue_js_job(job, args);
-                            });
-                            let js_promise = self.create_js_promise(ctx, result_promise);
-                            ctx.set_register(return_reg, js_promise);
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::PromiseResolveFunction => {
-                            // Promise.withResolvers().resolve(value)
-                            let promise = current_func
-                                .as_object()
-                                .and_then(|obj| obj.get(&PropertyKey::string("__promise__")))
-                                .and_then(|v| v.as_promise().cloned())
-                                .ok_or_else(|| VmError::type_error("Invalid promise resolver"))?;
-
-                            let value = current_args
-                                .first()
-                                .cloned()
-                                .unwrap_or(Value::undefined());
-
-                            promise.resolve_with_js_jobs(value, |job, args| {
-                                let _ = ctx.enqueue_js_job(job, args);
-                            });
-                            ctx.set_register(return_reg, Value::undefined());
-                            return Ok(InstructionResult::Continue);
-                        }
-
-                        InterceptionSignal::PromiseRejectFunction => {
-                            // Promise.withResolvers().reject(reason)
-                            let promise = current_func
-                                .as_object()
-                                .and_then(|obj| obj.get(&PropertyKey::string("__promise__")))
-                                .and_then(|v| v.as_promise().cloned())
-                                .ok_or_else(|| VmError::type_error("Invalid promise resolver"))?;
-
-                            let reason = current_args
-                                .first()
-                                .cloned()
-                                .unwrap_or(Value::undefined());
-
-                            promise.reject_with_js_jobs(reason, |job, args| {
-                                let _ = ctx.enqueue_js_job(job, args);
-                            });
-                            ctx.set_register(return_reg, Value::undefined());
-                            return Ok(InstructionResult::Continue);
-                        }
-                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -8943,7 +7203,10 @@ impl Interpreter {
                 };
 
                 // Create the generator's internal object
-                let gen_obj = GcRef::new(JsObject::new(proto, ctx.memory_manager().clone()));
+                let gen_obj = GcRef::new(JsObject::new(
+                    proto.map(Value::object).unwrap_or_else(Value::null),
+                    ctx.memory_manager().clone(),
+                ));
 
                 let generator = JsGenerator::new(
                     closure.function_index,
@@ -9154,7 +7417,7 @@ impl Interpreter {
     /// Create a JavaScript Promise object from an internal promise
     /// This creates an object with _internal field and copies methods from Promise.prototype
     fn create_js_promise(&self, ctx: &VmContext, internal: Arc<JsPromise>) -> Value {
-        let obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+        let obj = GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
 
         // Set _internal to the raw promise
         obj.set(PropertyKey::string("_internal"), Value::promise(internal));
@@ -9177,7 +7440,7 @@ impl Interpreter {
                 }
 
                 // Set prototype for proper inheritance
-                obj.set_prototype(Some(proto));
+                obj.set_prototype(Value::object(proto));
             }
         }
 
@@ -9235,7 +7498,10 @@ impl Interpreter {
             .and_then(|obj| obj.get(&PropertyKey::string("prototype")))
             .and_then(|v| v.as_object());
 
-        let obj = GcRef::new(JsObject::new(proto, ctx.memory_manager().clone()));
+        let obj = GcRef::new(JsObject::new(
+            proto.map(Value::object).unwrap_or_else(Value::null),
+            ctx.memory_manager().clone(),
+        ));
         obj.set(
             PropertyKey::string("name"),
             Value::string(JsString::intern(name)),
@@ -9541,22 +7807,20 @@ impl Interpreter {
         use crate::string::JsString;
 
         // Get call stack frames (skip the Error constructor itself)
-        let frames: Vec<_> = ctx.call_stack()
-            .iter()
-            .rev()
-            .skip(1)
-            .take(10)
-            .collect();
+        let frames: Vec<_> = ctx.call_stack().iter().rev().skip(1).take(10).collect();
 
         // Create array to hold stack frame objects
         let frames_array = GcRef::new(JsObject::array(frames.len(), ctx.memory_manager().clone()));
 
         for (i, frame) in frames.iter().enumerate() {
-            let frame_obj = GcRef::new(JsObject::new(None, ctx.memory_manager().clone()));
+            let frame_obj = GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
 
             // Get function name
             if let Some(func_def) = frame.module.functions.get(frame.function_index as usize) {
-                let func_name = func_def.name.clone().unwrap_or_else(|| "<anonymous>".to_string());
+                let func_name = func_def
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "<anonymous>".to_string());
                 frame_obj.set(
                     PropertyKey::string("function"),
                     Value::string(JsString::intern(&func_name)),
@@ -9818,11 +8082,7 @@ impl Interpreter {
     }
 
     /// Restore a generator frame to the context
-    fn restore_generator_frame(
-        &self,
-        ctx: &mut VmContext,
-        frame: &GeneratorFrame,
-    ) -> VmResult<()> {
+    fn restore_generator_frame(&self, ctx: &mut VmContext, frame: &GeneratorFrame) -> VmResult<()> {
         // Push a new frame with the saved state
         ctx.set_pending_upvalues(frame.upvalues.clone());
         ctx.set_pending_this(frame.this_value.clone());
@@ -9985,7 +8245,12 @@ impl Interpreter {
 
             // Capture trace data while frame is borrowed (record after execution)
             let trace_data = if ctx.trace_state.is_some() {
-                Some((frame.pc, frame.function_index, Arc::clone(&frame.module), instruction.clone()))
+                Some((
+                    frame.pc,
+                    frame.function_index,
+                    Arc::clone(&frame.module),
+                    instruction.clone(),
+                ))
             } else {
                 None
             };
@@ -10146,7 +8411,7 @@ impl Interpreter {
                                 .get(&PropertyKey::string("prototype"))
                                 .and_then(|v| v.as_object())
                         {
-                            rest_arr.set_prototype(Some(array_proto));
+                            rest_arr.set_prototype(Value::object(array_proto));
                         }
                         for (i, arg) in rest_args.into_iter().enumerate() {
                             rest_arr.set(PropertyKey::Index(i as u32), arg);
@@ -10215,7 +8480,7 @@ impl Interpreter {
                                 .get(&PropertyKey::string("prototype"))
                                 .and_then(|v| v.as_object())
                         {
-                            rest_arr.set_prototype(Some(array_proto));
+                            rest_arr.set_prototype(Value::object(array_proto));
                         }
                         for (i, arg) in rest_args.into_iter().enumerate() {
                             rest_arr.set(PropertyKey::Index(i as u32), arg);
@@ -10329,7 +8594,7 @@ mod tests {
 
     fn create_test_context() -> VmContext {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         VmContext::new(global, memory_manager)
     }
 
@@ -11588,11 +9853,11 @@ mod tests {
         let initial_epoch = get_proto_epoch();
 
         // Create objects and set prototype
-        let obj1 = GcRef::new(JsObject::new(None, memory_manager.clone()));
-        let obj2 = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let obj1 = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let obj2 = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
 
         // Set prototype should bump epoch
-        obj1.set_prototype(Some(obj2.clone()));
+        obj1.set_prototype(Value::object(obj2.clone()));
 
         let after_first = get_proto_epoch();
         assert!(
@@ -11601,8 +9866,8 @@ mod tests {
         );
 
         // Another set_prototype should bump again
-        let obj3 = GcRef::new(JsObject::new(None, memory_manager.clone()));
-        obj2.set_prototype(Some(obj3));
+        let obj3 = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        obj2.set_prototype(Value::object(obj3));
 
         let after_second = get_proto_epoch();
         assert!(
@@ -11853,7 +10118,7 @@ mod tests {
         use crate::object::{DICTIONARY_THRESHOLD, JsObject, PropertyKey};
 
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, memory_manager));
+        let obj = GcRef::new(JsObject::new(Value::null(), memory_manager));
 
         // Initially not in dictionary mode
         assert!(
@@ -11897,7 +10162,7 @@ mod tests {
         use crate::object::{JsObject, PropertyKey};
 
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, memory_manager));
+        let obj = GcRef::new(JsObject::new(Value::null(), memory_manager));
 
         // Add a few properties
         let key_a = PropertyKey::String(crate::string::JsString::intern("a"));
@@ -11928,7 +10193,7 @@ mod tests {
         use crate::object::{JsObject, PropertyKey};
 
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, memory_manager));
+        let obj = GcRef::new(JsObject::new(Value::null(), memory_manager));
 
         // Add a property
         let key_a = PropertyKey::String(crate::string::JsString::intern("a"));
@@ -11963,7 +10228,7 @@ mod tests {
         use otter_vm_bytecode::function::InlineCacheState;
 
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, memory_manager));
+        let obj = GcRef::new(JsObject::new(Value::null(), memory_manager));
 
         // Add and delete a property to trigger dictionary mode
         let key_a = PropertyKey::String(crate::string::JsString::intern("a"));

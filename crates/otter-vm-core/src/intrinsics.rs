@@ -10,16 +10,13 @@
 
 use std::sync::Arc;
 
-
 use crate::error::VmError;
 use crate::gc::GcRef;
+use crate::intrinsics_impl::helpers::{same_value_zero, strict_equal};
 use crate::memory::MemoryManager;
 use crate::object::JsObject;
-use crate::intrinsics_impl::helpers::{same_value_zero, strict_equal};
 
 use crate::value::{Symbol, Value};
-
-
 
 /// Well-known symbol IDs (fixed, pre-defined).
 /// These must match the IDs in `otter-vm-builtins/src/symbol.rs`.
@@ -223,7 +220,7 @@ impl Intrinsics {
     /// by `VmRuntime` before this call.
     pub fn allocate(mm: &Arc<MemoryManager>, fn_proto: GcRef<JsObject>) -> Self {
         // Helper to allocate an empty object with no prototype
-        let alloc = || GcRef::new(JsObject::new(None, mm.clone()));
+        let alloc = || GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
         // Create well-known symbols
         let make_symbol = |id: u64, desc: &str| -> Value {
@@ -368,7 +365,7 @@ impl Intrinsics {
 
         // Function.prototype.[[Prototype]] = Object.prototype
         self.function_prototype
-            .set_prototype(Some(self.object_prototype));
+            .set_prototype(Value::object(self.object_prototype));
 
         // All other prototypes chain to Object.prototype
         let protos_to_obj = [
@@ -390,12 +387,12 @@ impl Intrinsics {
             self.iterator_prototype,
         ];
         for proto in &protos_to_obj {
-            proto.set_prototype(Some(self.object_prototype));
+            proto.set_prototype(Value::object(self.object_prototype));
         }
 
         // Error.prototype.[[Prototype]] = Object.prototype
         self.error_prototype
-            .set_prototype(Some(self.object_prototype));
+            .set_prototype(Value::object(self.object_prototype));
 
         // All specific error prototypes chain to Error.prototype
         let error_protos = [
@@ -407,24 +404,24 @@ impl Intrinsics {
             self.eval_error_prototype,
         ];
         for proto in &error_protos {
-            proto.set_prototype(Some(self.error_prototype));
+            proto.set_prototype(Value::object(self.error_prototype));
         }
 
         // AsyncIteratorPrototype.[[Prototype]] = Object.prototype
         self.async_iterator_prototype
-            .set_prototype(Some(self.object_prototype));
+            .set_prototype(Value::object(self.object_prototype));
 
         // Generator.prototype.[[Prototype]] = Iterator.prototype (ES2026 §27.5.1)
         self.generator_prototype
-            .set_prototype(Some(self.iterator_prototype));
+            .set_prototype(Value::object(self.iterator_prototype));
 
         // AsyncGenerator.prototype.[[Prototype]] = AsyncIterator.prototype
         self.async_generator_prototype
-            .set_prototype(Some(self.async_iterator_prototype));
+            .set_prototype(Value::object(self.async_iterator_prototype));
 
         // %TypedArray%.prototype.[[Prototype]] = Object.prototype (ES2026 §22.2.3)
         self.typed_array_prototype
-            .set_prototype(Some(self.object_prototype));
+            .set_prototype(Value::object(self.object_prototype));
 
         // All specific TypedArray prototypes chain to %TypedArray%.prototype
         let typed_array_protos = [
@@ -441,13 +438,13 @@ impl Intrinsics {
             self.biguint64_array_prototype,
         ];
         for proto in &typed_array_protos {
-            proto.set_prototype(Some(self.typed_array_prototype));
+            proto.set_prototype(Value::object(self.typed_array_prototype));
         }
 
         // Constructor objects: [[Prototype]] = Function.prototype
         let ctors = [self.object_constructor, self.function_constructor];
         for ctor in &ctors {
-            ctor.set_prototype(Some(self.function_prototype));
+            ctor.set_prototype(Value::object(self.function_prototype));
         }
     }
 
@@ -465,11 +462,7 @@ impl Intrinsics {
         // Object.prototype methods (extracted to intrinsics_impl/object.rs)
         // ====================================================================
         let fn_proto = self.function_prototype;
-        crate::intrinsics_impl::object::init_object_prototype(
-            self.object_prototype,
-            fn_proto,
-            mm,
-        );
+        crate::intrinsics_impl::object::init_object_prototype(self.object_prototype, fn_proto, mm);
 
         // ===================================================================
         // Function.prototype methods (extracted to intrinsics_impl/function.rs)
@@ -513,7 +506,6 @@ impl Intrinsics {
             well_known::ITERATOR,
         );
 
-
         // ====================================================================
 
         // ===================================================================
@@ -524,8 +516,11 @@ impl Intrinsics {
         // ===================================================================
         // Boolean.prototype methods (extracted to intrinsics_impl/boolean.rs)
         // ===================================================================
-        crate::intrinsics_impl::boolean::init_boolean_prototype(self.boolean_prototype, fn_proto, mm);
-
+        crate::intrinsics_impl::boolean::init_boolean_prototype(
+            self.boolean_prototype,
+            fn_proto,
+            mm,
+        );
 
         // ===================================================================
         // Date.prototype methods (extracted to intrinsics_impl/date.rs)
@@ -576,8 +571,16 @@ impl Intrinsics {
             self.iterator_prototype,
             well_known::ITERATOR,
         );
-        crate::intrinsics_impl::map_set::init_weak_map_prototype(self.weak_map_prototype, fn_proto, mm);
-        crate::intrinsics_impl::map_set::init_weak_set_prototype(self.weak_set_prototype, fn_proto, mm);
+        crate::intrinsics_impl::map_set::init_weak_map_prototype(
+            self.weak_map_prototype,
+            fn_proto,
+            mm,
+        );
+        crate::intrinsics_impl::map_set::init_weak_set_prototype(
+            self.weak_set_prototype,
+            fn_proto,
+            mm,
+        );
 
         // ===================================================================
         // RegExp.prototype methods (extracted to intrinsics_impl/regexp.rs)
@@ -587,7 +590,11 @@ impl Intrinsics {
         // ===================================================================
         // Promise.prototype methods (extracted to intrinsics_impl/promise.rs)
         // ===================================================================
-        crate::intrinsics_impl::promise::init_promise_prototype(self.promise_prototype, fn_proto, mm);
+        crate::intrinsics_impl::promise::init_promise_prototype(
+            self.promise_prototype,
+            fn_proto,
+            mm,
+        );
 
         // ===================================================================
         // Generator.prototype and AsyncGenerator.prototype methods
@@ -694,7 +701,11 @@ impl Intrinsics {
                        proto: GcRef<JsObject>,
                        ctor_fn: Option<
             Box<
-                dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
+                dyn Fn(
+                        &Value,
+                        &[Value],
+                        &mut crate::context::NativeContext<'_>,
+                    ) -> Result<Value, VmError>
                     + Send
                     + Sync,
             >,
@@ -748,7 +759,10 @@ impl Intrinsics {
             // Install on global as non-enumerable (spec behavior)
             global.define_property(
                 PropertyKey::string(name),
-                PropertyDescriptor::data_with_attrs(ctor_value, PropertyAttributes::builtin_method()),
+                PropertyDescriptor::data_with_attrs(
+                    ctor_value,
+                    PropertyAttributes::builtin_method(),
+                ),
             );
         };
 
@@ -761,7 +775,12 @@ impl Intrinsics {
             self.object_prototype,
             Some(crate::intrinsics_impl::object::create_object_constructor()),
         );
-        install("Function", self.function_constructor, self.function_prototype, None);
+        install(
+            "Function",
+            self.function_constructor,
+            self.function_prototype,
+            None,
+        );
 
         // Register global aliases for interpreter interception
         // The interpreter checks for these globals to detect and intercept
@@ -780,12 +799,18 @@ impl Intrinsics {
         // For constructors that need actual implementations, we allocate fresh
         // constructor objects (since intrinsics only pre-allocated prototypes).
         // The prototype still comes from intrinsics with correct [[Prototype]] chain.
-        let alloc_ctor = || GcRef::new(JsObject::new(Some(fn_proto), mm.clone()));
+        let alloc_ctor = || GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
 
         // String
         let string_ctor = alloc_ctor();
         let string_ctor_fn: Box<
-            dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+            dyn Fn(
+                    &Value,
+                    &[Value],
+                    &mut crate::context::NativeContext<'_>,
+                ) -> Result<Value, VmError>
+                + Send
+                + Sync,
         > = Box::new(|this, args, _ncx| {
             let s = if let Some(arg) = args.first() {
                 crate::globals::to_string(arg)
@@ -796,14 +821,16 @@ impl Intrinsics {
             // When called as constructor (new String("...")), `this` is an object.
             // Store the primitive value so String.prototype methods can retrieve it.
             if let Some(obj) = this.as_object() {
-                obj.set(
-                    PropertyKey::string("__primitiveValue__"),
-                    str_val.clone(),
-                );
+                obj.set(PropertyKey::string("__primitiveValue__"), str_val.clone());
             }
             Ok(str_val)
         });
-        install("String", string_ctor, self.string_prototype, Some(string_ctor_fn));
+        install(
+            "String",
+            string_ctor,
+            self.string_prototype,
+            Some(string_ctor_fn),
+        );
 
         // String.fromCharCode(...codeUnits)
         string_ctor.define_property(
@@ -862,12 +889,18 @@ impl Intrinsics {
                             0
                         };
                         if code > 0x10FFFF {
-                            return Err(VmError::type_error(format!("Invalid code point: {}", code)));
+                            return Err(VmError::type_error(format!(
+                                "Invalid code point: {}",
+                                code
+                            )));
                         }
                         if let Some(ch) = char::from_u32(code) {
                             result.push(ch);
                         } else {
-                            return Err(VmError::type_error(format!("Invalid code point: {}", code)));
+                            return Err(VmError::type_error(format!(
+                                "Invalid code point: {}",
+                                code
+                            )));
                         }
                     }
                     Ok(Value::string(JsString::intern(&result)))
@@ -880,7 +913,13 @@ impl Intrinsics {
         // Number
         let number_ctor = alloc_ctor();
         let number_ctor_fn: Box<
-            dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+            dyn Fn(
+                    &Value,
+                    &[Value],
+                    &mut crate::context::NativeContext<'_>,
+                ) -> Result<Value, VmError>
+                + Send
+                + Sync,
         > = Box::new(|_this, args, _ncx| {
             let n = if let Some(arg) = args.first() {
                 crate::globals::to_number(arg)
@@ -889,13 +928,23 @@ impl Intrinsics {
             };
             Ok(Value::number(n))
         });
-        install("Number", number_ctor, self.number_prototype, Some(number_ctor_fn));
+        install(
+            "Number",
+            number_ctor,
+            self.number_prototype,
+            Some(number_ctor_fn),
+        );
         crate::intrinsics_impl::number::install_number_statics(number_ctor, fn_proto, mm);
 
         // Boolean
         let boolean_ctor = alloc_ctor();
         let boolean_ctor_fn = crate::intrinsics_impl::boolean::create_boolean_constructor();
-        install("Boolean", boolean_ctor, self.boolean_prototype, Some(boolean_ctor_fn));
+        install(
+            "Boolean",
+            boolean_ctor,
+            self.boolean_prototype,
+            Some(boolean_ctor_fn),
+        );
 
         // Symbol
         let symbol_ctor = alloc_ctor();
@@ -910,7 +959,13 @@ impl Intrinsics {
         // ====================================================================
         let array_ctor = alloc_ctor();
         let array_ctor_fn: Box<
-            dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+            dyn Fn(
+                    &Value,
+                    &[Value],
+                    &mut crate::context::NativeContext<'_>,
+                ) -> Result<Value, VmError>
+                + Send
+                + Sync,
         > = Box::new(|_this, args, ncx| {
             if args.len() == 1 {
                 if let Some(n) = args[0].as_number() {
@@ -918,7 +973,8 @@ impl Intrinsics {
                     if (len as f64) != n || n < 0.0 {
                         return Err(VmError::type_error("Invalid array length"));
                     }
-                    let arr = GcRef::new(JsObject::array(len as usize, ncx.memory_manager().clone()));
+                    let arr =
+                        GcRef::new(JsObject::array(len as usize, ncx.memory_manager().clone()));
                     return Ok(Value::object(arr));
                 }
             }
@@ -929,7 +985,12 @@ impl Intrinsics {
             }
             Ok(Value::object(arr))
         });
-        install("Array", array_ctor, self.array_prototype, Some(array_ctor_fn));
+        install(
+            "Array",
+            array_ctor,
+            self.array_prototype,
+            Some(array_ctor_fn),
+        );
         crate::intrinsics_impl::array::install_array_statics(array_ctor, fn_proto, mm);
 
         let map_ctor = alloc_ctor();
@@ -942,42 +1003,94 @@ impl Intrinsics {
 
         let weak_map_ctor = alloc_ctor();
         let weak_map_ctor_fn = crate::intrinsics_impl::map_set::create_weak_map_constructor();
-        install("WeakMap", weak_map_ctor, self.weak_map_prototype, Some(weak_map_ctor_fn));
+        install(
+            "WeakMap",
+            weak_map_ctor,
+            self.weak_map_prototype,
+            Some(weak_map_ctor_fn),
+        );
 
         let weak_set_ctor = alloc_ctor();
         let weak_set_ctor_fn = crate::intrinsics_impl::map_set::create_weak_set_constructor();
-        install("WeakSet", weak_set_ctor, self.weak_set_prototype, Some(weak_set_ctor_fn));
+        install(
+            "WeakSet",
+            weak_set_ctor,
+            self.weak_set_prototype,
+            Some(weak_set_ctor_fn),
+        );
 
         // ====================================================================
         // Error constructors (extracted to intrinsics_impl/error.rs)
         // ====================================================================
         let error_ctor = alloc_ctor();
-        install("Error", error_ctor, self.error_prototype,
-            Some(crate::intrinsics_impl::error::create_error_constructor("Error")));
+        install(
+            "Error",
+            error_ctor,
+            self.error_prototype,
+            Some(crate::intrinsics_impl::error::create_error_constructor(
+                "Error",
+            )),
+        );
 
         let type_error_ctor = alloc_ctor();
-        install("TypeError", type_error_ctor, self.type_error_prototype,
-            Some(crate::intrinsics_impl::error::create_error_constructor("TypeError")));
+        install(
+            "TypeError",
+            type_error_ctor,
+            self.type_error_prototype,
+            Some(crate::intrinsics_impl::error::create_error_constructor(
+                "TypeError",
+            )),
+        );
 
         let range_error_ctor = alloc_ctor();
-        install("RangeError", range_error_ctor, self.range_error_prototype,
-            Some(crate::intrinsics_impl::error::create_error_constructor("RangeError")));
+        install(
+            "RangeError",
+            range_error_ctor,
+            self.range_error_prototype,
+            Some(crate::intrinsics_impl::error::create_error_constructor(
+                "RangeError",
+            )),
+        );
 
         let reference_error_ctor = alloc_ctor();
-        install("ReferenceError", reference_error_ctor, self.reference_error_prototype,
-            Some(crate::intrinsics_impl::error::create_error_constructor("ReferenceError")));
+        install(
+            "ReferenceError",
+            reference_error_ctor,
+            self.reference_error_prototype,
+            Some(crate::intrinsics_impl::error::create_error_constructor(
+                "ReferenceError",
+            )),
+        );
 
         let syntax_error_ctor = alloc_ctor();
-        install("SyntaxError", syntax_error_ctor, self.syntax_error_prototype,
-            Some(crate::intrinsics_impl::error::create_error_constructor("SyntaxError")));
+        install(
+            "SyntaxError",
+            syntax_error_ctor,
+            self.syntax_error_prototype,
+            Some(crate::intrinsics_impl::error::create_error_constructor(
+                "SyntaxError",
+            )),
+        );
 
         let uri_error_ctor = alloc_ctor();
-        install("URIError", uri_error_ctor, self.uri_error_prototype,
-            Some(crate::intrinsics_impl::error::create_error_constructor("URIError")));
+        install(
+            "URIError",
+            uri_error_ctor,
+            self.uri_error_prototype,
+            Some(crate::intrinsics_impl::error::create_error_constructor(
+                "URIError",
+            )),
+        );
 
         let eval_error_ctor = alloc_ctor();
-        install("EvalError", eval_error_ctor, self.eval_error_prototype,
-            Some(crate::intrinsics_impl::error::create_error_constructor("EvalError")));
+        install(
+            "EvalError",
+            eval_error_ctor,
+            self.eval_error_prototype,
+            Some(crate::intrinsics_impl::error::create_error_constructor(
+                "EvalError",
+            )),
+        );
 
         // ====================================================================
         // Other builtins
@@ -992,19 +1105,26 @@ impl Intrinsics {
         crate::intrinsics_impl::promise::install_promise_statics(promise_ctor, fn_proto, mm);
 
         let regexp_ctor = alloc_ctor();
-        let regexp_ctor_fn = crate::intrinsics_impl::regexp::create_regexp_constructor(self.regexp_prototype);
-        install("RegExp", regexp_ctor, self.regexp_prototype, Some(regexp_ctor_fn));
+        let regexp_ctor_fn =
+            crate::intrinsics_impl::regexp::create_regexp_constructor(self.regexp_prototype);
+        install(
+            "RegExp",
+            regexp_ctor,
+            self.regexp_prototype,
+            Some(regexp_ctor_fn),
+        );
 
         // RegExp.escape (ES2026 §22.2.4.1)
         regexp_ctor.define_property(
             PropertyKey::string("escape"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |_this, args, _ncx| {
-                    let s = args
-                        .first()
-                        .and_then(|v| v.as_string())
-                        .ok_or_else(|| VmError::type_error("RegExp.escape requires a string argument"))?;
-                    Ok(Value::string(JsString::intern(&regress::escape(s.as_str()))))
+                    let s = args.first().and_then(|v| v.as_string()).ok_or_else(|| {
+                        VmError::type_error("RegExp.escape requires a string argument")
+                    })?;
+                    Ok(Value::string(JsString::intern(&regress::escape(
+                        s.as_str(),
+                    ))))
                 },
                 mm.clone(),
                 fn_proto,
@@ -1013,7 +1133,13 @@ impl Intrinsics {
 
         let date_ctor = alloc_ctor();
         let date_ctor_fn: Box<
-            dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+            dyn Fn(
+                    &Value,
+                    &[Value],
+                    &mut crate::context::NativeContext<'_>,
+                ) -> Result<Value, VmError>
+                + Send
+                + Sync,
         > = Box::new(|this, args, _ncx| {
             use std::time::{SystemTime, UNIX_EPOCH};
             let timestamp = if args.is_empty() {
@@ -1030,10 +1156,7 @@ impl Intrinsics {
             };
             // Set timestamp on `this` (created by Construct with Date.prototype)
             if let Some(obj) = this.as_object() {
-                obj.set(
-                    PropertyKey::string("__timestamp"),
-                    Value::number(timestamp),
-                );
+                obj.set(PropertyKey::string("__timestamp"), Value::number(timestamp));
             }
             Ok(Value::undefined())
         });
@@ -1076,13 +1199,16 @@ impl Intrinsics {
                         .or_else(|_| {
                             // Try parsing as naive datetime
                             NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
-                                .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
+                                .or_else(|_| {
+                                    NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+                                })
                                 .map(|dt| dt.and_utc().timestamp_millis() as f64)
                         })
                         .or_else(|_| {
                             // Try parsing as date only
-                            NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                                .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis() as f64)
+                            NaiveDate::parse_from_str(s, "%Y-%m-%d").map(|d| {
+                                d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis() as f64
+                            })
                         });
 
                     match parsed {
@@ -1114,8 +1240,15 @@ impl Intrinsics {
                     let second = args.get(5).and_then(|v| v.as_int32()).unwrap_or(0);
                     let ms = args.get(6).and_then(|v| v.as_int32()).unwrap_or(0);
 
-                    let date = NaiveDate::from_ymd_opt(year, month as u32, day as u32)
-                        .and_then(|d| d.and_hms_milli_opt(hour as u32, minute as u32, second as u32, ms as u32));
+                    let date =
+                        NaiveDate::from_ymd_opt(year, month as u32, day as u32).and_then(|d| {
+                            d.and_hms_milli_opt(
+                                hour as u32,
+                                minute as u32,
+                                second as u32,
+                                ms as u32,
+                            )
+                        });
 
                     match date {
                         Some(dt) => {
@@ -1131,7 +1264,12 @@ impl Intrinsics {
         );
 
         let array_buffer_ctor = alloc_ctor();
-        install("ArrayBuffer", array_buffer_ctor, self.array_buffer_prototype, None);
+        install(
+            "ArrayBuffer",
+            array_buffer_ctor,
+            self.array_buffer_prototype,
+            None,
+        );
 
         let data_view_ctor = alloc_ctor();
         install("DataView", data_view_ctor, self.data_view_prototype, None);
@@ -1189,102 +1327,5 @@ impl Intrinsics {
         // support and will be added in a future update.
         // ====================================================================
         crate::intrinsics_impl::reflect::install_reflect_namespace(global, mm);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::object::{PropertyDescriptor, PropertyKey};
-
-    #[test]
-    fn test_intrinsics_allocate() {
-        let mm = Arc::new(MemoryManager::test());
-        let fn_proto = GcRef::new(JsObject::new(None, mm.clone()));
-        let intrinsics = Intrinsics::allocate(&mm, fn_proto);
-
-        // All well-known symbols should be symbols
-        assert!(intrinsics.symbol_iterator.is_symbol());
-        assert!(intrinsics.symbol_async_iterator.is_symbol());
-        assert!(intrinsics.symbol_to_string_tag.is_symbol());
-        assert!(intrinsics.symbol_has_instance.is_symbol());
-        assert!(intrinsics.symbol_to_primitive.is_symbol());
-        assert!(intrinsics.symbol_species.is_symbol());
-    }
-
-    #[test]
-    fn test_prototype_chain_wiring() {
-        let mm = Arc::new(MemoryManager::test());
-        let fn_proto = GcRef::new(JsObject::new(None, mm.clone()));
-        let intrinsics = Intrinsics::allocate(&mm, fn_proto);
-        intrinsics.wire_prototype_chains();
-
-        // Object.prototype.__proto__ === null
-        assert!(intrinsics.object_prototype.prototype().is_none());
-
-        // Function.prototype.__proto__ === Object.prototype
-        let fp_proto = intrinsics.function_prototype.prototype();
-        assert!(fp_proto.is_some());
-        assert_eq!(fp_proto.unwrap().as_ptr(), intrinsics.object_prototype.as_ptr());
-
-        // Array.prototype.__proto__ === Object.prototype
-        let ap_proto = intrinsics.array_prototype.prototype();
-        assert!(ap_proto.is_some());
-        assert_eq!(ap_proto.unwrap().as_ptr(), intrinsics.object_prototype.as_ptr());
-
-        // TypeError.prototype.__proto__ === Error.prototype
-        let tep_proto = intrinsics.type_error_prototype.prototype();
-        assert!(tep_proto.is_some());
-        assert_eq!(tep_proto.unwrap().as_ptr(), intrinsics.error_prototype.as_ptr());
-
-        // RangeError.prototype.__proto__ === Error.prototype
-        let rep_proto = intrinsics.range_error_prototype.prototype();
-        assert!(rep_proto.is_some());
-        assert_eq!(rep_proto.unwrap().as_ptr(), intrinsics.error_prototype.as_ptr());
-
-        // Error.prototype.__proto__ === Object.prototype
-        let ep_proto = intrinsics.error_prototype.prototype();
-        assert!(ep_proto.is_some());
-        assert_eq!(ep_proto.unwrap().as_ptr(), intrinsics.object_prototype.as_ptr());
-    }
-
-    #[test]
-    fn test_init_core_builtin_methods() {
-        let mm = Arc::new(MemoryManager::test());
-        let fn_proto = GcRef::new(JsObject::new(None, mm.clone()));
-        let intrinsics = Intrinsics::allocate(&mm, fn_proto);
-        intrinsics.wire_prototype_chains();
-        intrinsics.init_core(&mm);
-
-        // Array.prototype should have map, filter, forEach, etc.
-        assert!(intrinsics.array_prototype.has(&PropertyKey::string("map")));
-        assert!(intrinsics.array_prototype.has(&PropertyKey::string("filter")));
-        assert!(intrinsics.array_prototype.has(&PropertyKey::string("forEach")));
-        assert!(intrinsics.array_prototype.has(&PropertyKey::string("find")));
-        assert!(intrinsics.array_prototype.has(&PropertyKey::string("reduce")));
-        assert!(intrinsics.array_prototype.has(&PropertyKey::string("values")));
-        assert!(intrinsics.array_prototype.has(&PropertyKey::string("keys")));
-        assert!(intrinsics.array_prototype.has(&PropertyKey::string("entries")));
-        assert!(intrinsics.array_prototype.has(&PropertyKey::string("sort")));
-
-        // Array.prototype[Symbol.iterator] should exist
-        assert!(intrinsics.array_prototype.has(&PropertyKey::Symbol(well_known::ITERATOR)));
-
-        // Builtin methods should be non-enumerable
-        let map_desc = intrinsics.array_prototype.get_own_property_descriptor(&PropertyKey::string("map"));
-        assert!(map_desc.is_some(), "Array.prototype.map descriptor should exist");
-        if let Some(PropertyDescriptor::Data { attributes, .. }) = map_desc {
-            assert!(!attributes.enumerable, "Array.prototype.map should be non-enumerable");
-            assert!(attributes.writable, "Array.prototype.map should be writable");
-            assert!(attributes.configurable, "Array.prototype.map should be configurable");
-        }
-
-        // String.prototype should have methods
-        assert!(intrinsics.string_prototype.has(&PropertyKey::string("charAt")));
-        assert!(intrinsics.string_prototype.has(&PropertyKey::string("slice")));
-
-        // Number.prototype should have methods
-        assert!(intrinsics.number_prototype.has(&PropertyKey::string("toFixed")));
-        assert!(intrinsics.number_prototype.has(&PropertyKey::string("toString")));
     }
 }

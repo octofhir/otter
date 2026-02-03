@@ -132,8 +132,8 @@ impl BuiltInBuilder {
         obj_proto: GcRef<JsObject>,
         name: &str,
     ) -> Self {
-        let prototype = GcRef::new(JsObject::new(Some(obj_proto), mm.clone()));
-        let constructor = GcRef::new(JsObject::new(Some(fn_proto), mm.clone()));
+        let prototype = GcRef::new(JsObject::new(Value::object(obj_proto), mm.clone()));
+        let constructor = GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
         Self {
             mm,
             fn_proto,
@@ -324,7 +324,7 @@ impl BuiltInBuilder {
 
         // 1. Set prototype's [[Prototype]] if specified
         if let Some(parent) = &parent_proto {
-            prototype.set_prototype(Some(*parent));
+            prototype.set_prototype(Value::object(*parent));
         }
 
         // 2. Apply all deferred properties
@@ -472,7 +472,7 @@ fn make_native_fn(
     name: &str,
     length: u32,
 ) -> Value {
-    let fn_obj = GcRef::new(JsObject::new(Some(fn_proto), mm.clone()));
+    let fn_obj = GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
 
     fn_obj.define_property(
         PropertyKey::string("length"),

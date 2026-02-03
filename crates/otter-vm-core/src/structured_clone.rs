@@ -160,7 +160,7 @@ impl StructuredCloner {
         }
 
         // Create new object
-        let new_obj = GcRef::new(JsObject::new(None, self.memory_manager.clone()));
+        let new_obj = GcRef::new(JsObject::new(Value::null(), self.memory_manager.clone()));
         let new_value = Value::object(new_obj);
 
         // Register before cloning properties (to handle circular refs)
@@ -249,7 +249,7 @@ mod tests {
     fn test_clone_object() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         let mut cloner = StructuredCloner::new(memory_manager.clone());
-        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         obj.set(PropertyKey::string("x"), Value::int32(1));
         obj.set(PropertyKey::string("y"), Value::int32(2));
 
@@ -302,7 +302,7 @@ mod tests {
             upvalues: vec![],
             is_async: false,
             is_generator: false,
-            object: GcRef::new(JsObject::new(None, memory_manager.clone())),
+            object: GcRef::new(JsObject::new(Value::null(), memory_manager.clone())),
             home_object: None,
         }));
 

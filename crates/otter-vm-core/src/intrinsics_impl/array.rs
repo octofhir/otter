@@ -63,7 +63,7 @@ fn make_array_iterator(
     if this_val.as_object().is_none() && this_val.as_proxy().is_none() {
         return Err("Array iterator: this is not an object".to_string().into());
     }
-    let iter = GcRef::new(JsObject::new(Some(iter_proto), mm.clone()));
+    let iter = GcRef::new(JsObject::new(Value::object(iter_proto), mm.clone()));
     // Store the array reference, current index, length, and kind
     iter.set(PropertyKey::string("__array_ref__"), this_val.clone());
     iter.set(PropertyKey::string("__array_index__"), Value::number(0.0));
@@ -112,7 +112,7 @@ fn make_array_iterator(
 
                 if idx >= len {
                     // Done
-                    let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                    let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                     result.set(PropertyKey::string("value"), Value::undefined());
                     result.set(PropertyKey::string("done"), Value::boolean(true));
                     return Ok(Value::object(result));
@@ -124,7 +124,7 @@ fn make_array_iterator(
                     Value::number((idx + 1) as f64),
                 );
 
-                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 match kind.as_str() {
                     "key" => {
                         result.set(PropertyKey::string("value"), Value::number(idx as f64));
@@ -834,7 +834,7 @@ pub fn init_array_prototype(
                         if let Some(array_obj) = array_ctor.as_object() {
                             if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
                                 if let Some(proto_obj) = proto_val.as_object() {
-                                    result.set_prototype(Some(proto_obj));
+                                    result.set_prototype(Value::object(proto_obj));
                                 }
                             }
                         }

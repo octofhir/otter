@@ -32,7 +32,7 @@ pub fn ops() -> Vec<Op> {
 
 /// Create an iterator result object { value, done }
 fn create_iterator_result(value: VmValue, done: bool, mm: Arc<memory::MemoryManager>) -> VmValue {
-    let result = GcRef::new(JsObject::new(None, mm));
+    let result = GcRef::new(JsObject::new(VmValue::null(), mm));
     result.set(PropertyKey::string("value"), value);
     result.set(PropertyKey::string("done"), VmValue::boolean(done));
     VmValue::object(result)
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn test_generator_return() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, mm.clone()));
+        let obj = GcRef::new(JsObject::new(VmValue::null(), mm.clone()));
         let generator = JsGenerator::new_simple(0, vec![], obj);
         let result = native_generator_return(
             &[VmValue::generator(generator.clone()), VmValue::number(99.0)],
@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn test_is_generator() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, mm.clone()));
+        let obj = GcRef::new(JsObject::new(VmValue::null(), mm.clone()));
         let generator = JsGenerator::new_simple(0, vec![], obj);
         let result = native_is_generator(&[VmValue::generator(generator)], mm.clone()).unwrap();
         assert_eq!(result.as_boolean(), Some(true));
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn test_generator_next_on_completed() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, mm.clone()));
+        let obj = GcRef::new(JsObject::new(VmValue::null(), mm.clone()));
         let generator = JsGenerator::new_simple(0, vec![], obj);
         generator.complete();
 

@@ -87,7 +87,7 @@ fn make_string_iterator(
         .map_err(|e| VmError::type_error(&e))?;
 
     // Create iterator object with %IteratorPrototype% as prototype
-    let iter = GcRef::new(JsObject::new(Some(iter_proto), mm.clone()));
+    let iter = GcRef::new(JsObject::new(Value::object(iter_proto), mm.clone()));
 
     // Store the string reference and current index
     iter.set(PropertyKey::string("__string_ref__"), Value::string(string));
@@ -117,7 +117,7 @@ fn make_string_iterator(
 
                 if idx >= len {
                     // Done
-                    let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                    let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                     result.set(PropertyKey::string("value"), Value::undefined());
                     result.set(PropertyKey::string("done"), Value::boolean(true));
                     return Ok(Value::object(result));
@@ -145,7 +145,7 @@ fn make_string_iterator(
                     Value::number(next_idx as f64),
                 );
 
-                let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 result.set(PropertyKey::string("value"), Value::string(char_string));
                 result.set(PropertyKey::string("done"), Value::boolean(false));
                 Ok(Value::object(result))

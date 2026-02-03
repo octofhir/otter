@@ -563,7 +563,7 @@ mod tests {
     fn test_generator_creation() {
         let module = Arc::new(Module::builder("test").build());
         let mm = Arc::new(crate::memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
         let generator = JsGenerator::new(
             0,
             module,
@@ -584,7 +584,7 @@ mod tests {
     fn test_generator_state_transitions() {
         let module = Arc::new(Module::builder("test").build());
         let mm = Arc::new(crate::memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, mm));
+        let obj = GcRef::new(JsObject::new(Value::null(), mm));
         let generator = JsGenerator::new(
             0,
             Arc::clone(&module),
@@ -629,7 +629,7 @@ mod tests {
     fn test_sent_value() {
         let module = Arc::new(Module::builder("test").build());
         let mm = Arc::new(crate::memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, mm));
+        let obj = GcRef::new(JsObject::new(Value::null(), mm));
         let generator = JsGenerator::new(
             0,
             Arc::clone(&module),
@@ -718,7 +718,7 @@ mod tests {
     fn test_completion_type() {
         let module = Arc::new(Module::builder("test").build());
         let mm = Arc::new(crate::memory::MemoryManager::test());
-        let obj = GcRef::new(JsObject::new(None, mm));
+        let obj = GcRef::new(JsObject::new(Value::null(), mm));
         let generator = JsGenerator::new(
             0,
             Arc::clone(&module),

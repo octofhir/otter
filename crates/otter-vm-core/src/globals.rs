@@ -29,7 +29,7 @@ fn define_global_fn<F>(
 ) where
     F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync + 'static,
 {
-    let fn_obj = GcRef::new(JsObject::new(Some(fn_proto), mm.clone()));
+    let fn_obj = GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
     fn_obj.define_property(
         PropertyKey::string("length"),
         PropertyDescriptor::function_length(Value::number(length as f64)),
@@ -153,10 +153,10 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                 "Float64Array" => intrinsics.float64_array_prototype,
                 "BigInt64Array" => intrinsics.bigint64_array_prototype,
                 "BigUint64Array" => intrinsics.biguint64_array_prototype,
-                _ => GcRef::new(JsObject::new(None, mm.clone())),
+                _ => GcRef::new(JsObject::new(Value::null(), mm.clone())),
             }
         } else {
-            GcRef::new(JsObject::new(None, mm.clone()))
+            GcRef::new(JsObject::new(Value::null(), mm.clone()))
         };
 
         // Create constructor based on type — all get fn_proto as [[Prototype]]
@@ -281,7 +281,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                     if args.is_empty() {
                         // new TypedArray() - create empty with length 0
                         let buffer = Arc::new(JsArrayBuffer::new(0, None, ncx.memory_manager().clone()));
-                        let object = GcRef::new(JsObject::new(Some(proto_clone), ncx.memory_manager().clone()));
+                        let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
                         let ta = JsTypedArray::new(object, buffer, kind, 0, 0)
                             .map_err(|e| VmError::type_error(e))?;
                         return Ok(make_typed_array(ta));
@@ -303,7 +303,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                             available / kind.element_size()
                         };
 
-                        let object = GcRef::new(JsObject::new(Some(proto_clone), ncx.memory_manager().clone()));
+                        let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
                         let ta = JsTypedArray::new(object, buffer.clone(), kind, byte_offset, length)
                             .map_err(|e| VmError::type_error(e))?;
                         return Ok(make_typed_array(ta));
@@ -317,7 +317,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                             None,
                             ncx.memory_manager().clone(),
                         ));
-                        let object = GcRef::new(JsObject::new(Some(proto_clone), ncx.memory_manager().clone()));
+                        let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
                         let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                             .map_err(|e| VmError::type_error(e))?;
 
@@ -343,7 +343,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                             None,
                             ncx.memory_manager().clone(),
                         ));
-                        let object = GcRef::new(JsObject::new(Some(proto_clone), ncx.memory_manager().clone()));
+                        let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
                         let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                             .map_err(|e| VmError::type_error(e))?;
                         return Ok(make_typed_array(ta));
@@ -356,7 +356,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                             None,
                             ncx.memory_manager().clone(),
                         ));
-                        let object = GcRef::new(JsObject::new(Some(proto_clone), ncx.memory_manager().clone()));
+                        let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
                         let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                             .map_err(|e| VmError::type_error(e))?;
                         return Ok(make_typed_array(ta));
@@ -372,7 +372,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                                     None,
                                     ncx.memory_manager().clone(),
                                 ));
-                                let object = GcRef::new(JsObject::new(Some(proto_clone), ncx.memory_manager().clone()));
+                                let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
                                 let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                                     .map_err(|e| VmError::type_error(e))?;
 
@@ -394,7 +394,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
 
                     // Default: treat as length 0
                     let buffer = Arc::new(JsArrayBuffer::new(0, None, ncx.memory_manager().clone()));
-                    let object = GcRef::new(JsObject::new(Some(proto_clone), ncx.memory_manager().clone()));
+                    let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
                     let ta = JsTypedArray::new(object, buffer, kind, 0, 0)
                         .map_err(|e| VmError::type_error(e))?;
                     Ok(make_typed_array(ta))
@@ -417,7 +417,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                     // and arguments are present, we might want to set properties.
                     // For Error types, setting 'message' is crucial.
                     if let Some(msg) = args.get(0) {
-                        let obj = JsObject::new(None, ncx.memory_manager().clone());
+                        let obj = JsObject::new(Value::null(), ncx.memory_manager().clone());
                         obj.set(PropertyKey::string("message"), msg.clone());
                         return Ok(Value::object(GcRef::new(obj)));
                     }
@@ -587,7 +587,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                                 None,
                                 ncx.memory_manager().clone(),
                             ));
-                            let object = GcRef::new(JsObject::new(Some(proto_from), ncx.memory_manager().clone()));
+                            let object = GcRef::new(JsObject::new(Value::object(proto_from), ncx.memory_manager().clone()));
                             let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                                 .map_err(|e| VmError::type_error(e))?;
 
@@ -639,7 +639,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                                 None,
                                 ncx.memory_manager().clone(),
                             ));
-                            let object = GcRef::new(JsObject::new(Some(proto_of), ncx.memory_manager().clone()));
+                            let object = GcRef::new(JsObject::new(Value::object(proto_of), ncx.memory_manager().clone()));
                             let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                                 .map_err(|e| VmError::type_error(e))?;
 
@@ -784,17 +784,16 @@ fn get_arg(args: &[Value], index: usize) -> Value {
 
 /// `eval(x)` - Evaluates JavaScript code represented as a string.
 ///
-/// For indirect eval (`var e = eval; e("...")` or `(0, eval)("...")`),
-/// this native function is called. It signals the interpreter via
-/// `InterceptionSignal::EvalCall` so the VM can compile and execute
-/// the code with full context access.
+/// Currently, indirect eval is not fully supported. When called with a string,
+/// it returns an error. This is a limitation to be addressed in a future update.
 fn global_eval(_this: &Value, args: &[Value], _ncx: &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> {
     // Per spec: if argument is not a string, return it unchanged
     let arg = get_arg(args, 0);
 
     if arg.is_string() {
-        // Signal the interpreter to handle eval with full VM context
-        Err(VmError::interception(crate::error::InterceptionSignal::EvalCall))
+        // TODO: Implement indirect eval with NativeContext
+        // For now, return an error indicating eval is not supported
+        Err(VmError::type_error("eval() is not supported in this context"))
     } else {
         // Non-string argument: return it unchanged (per spec §19.2.1.1)
         Ok(arg)
@@ -1175,8 +1174,8 @@ mod tests {
     #[test]
     fn test_global_this_setup() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
-        let fn_proto = GcRef::new(JsObject::new(None, memory_manager));
+        let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let fn_proto = GcRef::new(JsObject::new(Value::null(), memory_manager));
         setup_global_object(global, fn_proto, None);
 
         // globalThis should reference the global object itself

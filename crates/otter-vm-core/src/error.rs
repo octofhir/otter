@@ -3,104 +3,6 @@
 use crate::value::Value;
 use thiserror::Error;
 
-/// Interception signals for internal VM operations
-///
-/// These are used to signal the interpreter that a special operation needs to be performed
-/// with full VM context (call stack, upvalues, etc.). Instead of using magic strings,
-/// we use a strongly-typed enum for type safety and performance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InterceptionSignal {
-    /// Function.prototype.call with a closure (requires VM context to execute)
-    FunctionCall,
-    /// Function.prototype.apply with a closure (requires VM context to execute)
-    FunctionApply,
-    /// Reflect.apply with a closure (requires VM context to execute)
-    ReflectApply,
-    /// Reflect.construct with a closure (requires VM context to execute)
-    ReflectConstruct,
-    /// eval() called indirectly — requires VM context to compile and execute code
-    EvalCall,
-    // ---- Array callback methods (require VM context to call closure callbacks) ----
-    /// Array.prototype.forEach
-    ArrayForEach,
-    /// Array.prototype.map
-    ArrayMap,
-    /// Array.prototype.filter
-    ArrayFilter,
-    /// Array.prototype.find
-    ArrayFind,
-    /// Array.prototype.findIndex
-    ArrayFindIndex,
-    /// Array.prototype.findLast
-    ArrayFindLast,
-    /// Array.prototype.findLastIndex
-    ArrayFindLastIndex,
-    /// Array.prototype.every
-    ArrayEvery,
-    /// Array.prototype.some
-    ArraySome,
-    /// Array.prototype.reduce
-    ArrayReduce,
-    /// Array.prototype.reduceRight
-    ArrayReduceRight,
-    /// Array.prototype.flatMap
-    ArrayFlatMap,
-    /// Array.prototype.sort with comparator
-    ArraySort,
-    // ---- Reflect methods on proxies (require VM context to invoke traps) ----
-    /// Reflect.get on a proxy
-    ReflectGetProxy,
-    /// Reflect.set on a proxy
-    ReflectSetProxy,
-    /// Reflect.has on a proxy
-    ReflectHasProxy,
-    /// Reflect.deleteProperty on a proxy
-    ReflectDeletePropertyProxy,
-    /// Reflect.ownKeys on a proxy
-    ReflectOwnKeysProxy,
-    /// Reflect.getOwnPropertyDescriptor on a proxy
-    ReflectGetOwnPropertyDescriptorProxy,
-    /// Reflect.defineProperty on a proxy
-    ReflectDefinePropertyProxy,
-    /// Reflect.getPrototypeOf on a proxy
-    ReflectGetPrototypeOfProxy,
-    /// Reflect.setPrototypeOf on a proxy
-    ReflectSetPrototypeOfProxy,
-    /// Reflect.isExtensible on a proxy
-    ReflectIsExtensibleProxy,
-    /// Reflect.preventExtensions on a proxy
-    ReflectPreventExtensionsProxy,
-    /// Reflect.apply on a proxy
-    ReflectApplyProxy,
-    /// Reflect.construct on a proxy
-    ReflectConstructProxy,
-    // ---- Promise methods (require VM context to register JS callbacks) ----
-    /// Promise.prototype.then
-    PromiseThen,
-    /// Promise.prototype.catch
-    PromiseCatch,
-    /// Promise.prototype.finally
-    PromiseFinally,
-    /// Promise constructor (new Promise)
-    PromiseConstructor,
-    /// Promise.resolve
-    PromiseResolve,
-    /// Promise.reject
-    PromiseReject,
-    /// Promise.all
-    PromiseAll,
-    /// Promise.race
-    PromiseRace,
-    /// Promise.allSettled
-    PromiseAllSettled,
-    /// Promise.any
-    PromiseAny,
-    /// Promise resolver function (from Promise.withResolvers)
-    PromiseResolveFunction,
-    /// Promise reject function (from Promise.withResolvers)
-    PromiseRejectFunction,
-}
-
 /// VM execution errors
 #[derive(Debug, Error)]
 pub enum VmError {
@@ -143,16 +45,6 @@ pub enum VmError {
     /// Execution was interrupted (timeout/cancellation)
     #[error("Execution interrupted")]
     Interrupted,
-
-    /// Internal interception signal (not a real error)
-    ///
-    /// This is used to signal the interpreter that a special operation needs VM context.
-    /// For example, calling Function.prototype.call with a closure requires access to
-    /// the call stack and upvalues, which native functions don't have.
-    ///
-    /// This is NOT displayed to users - it's caught and handled by the interpreter.
-    #[error("Internal interception: {0:?}")]
-    Interception(InterceptionSignal),
 }
 
 /// A thrown JavaScript value
@@ -223,11 +115,6 @@ impl VmError {
             value,
             stack: Vec::new(),
         }))
-    }
-
-    /// Create an interception signal for internal VM operations
-    pub fn interception(signal: InterceptionSignal) -> Self {
-        Self::Interception(signal)
     }
 }
 

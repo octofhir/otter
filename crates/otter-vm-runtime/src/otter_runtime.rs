@@ -601,14 +601,14 @@ impl Otter {
                 move |_this: &Value, args: &[Value], _mm| {
                     let mm_result = mm_eval_closure.clone();
                     let result_ok = |value: Value| {
-                        let obj = JsObject::new(None, mm_result.clone());
+                        let obj = JsObject::new(Value::null(), mm_result.clone());
                         obj.set(PropertyKey::string("ok"), Value::boolean(true));
                         obj.set(PropertyKey::string("value"), value);
                         Value::object(GcRef::new(obj))
                     };
 
                     let result_err = |error_type: &str, message: &str| {
-                        let obj = JsObject::new(None, mm_result.clone());
+                        let obj = JsObject::new(Value::null(), mm_result.clone());
                         obj.set(PropertyKey::string("ok"), Value::boolean(false));
                         obj.set(
                             PropertyKey::string("errorType"),
@@ -678,7 +678,7 @@ impl Otter {
         );
 
         // Create console object from __console_* ops
-        let console_obj = GcRef::new(JsObject::new(None, self.vm.memory_manager().clone()));
+        let console_obj = GcRef::new(JsObject::new(Value::null(), self.vm.memory_manager().clone()));
 
         // Helper to wire console methods from global __console_* functions
         let wire_console = |method_name: &str, global_name: &str| {
@@ -1762,7 +1762,7 @@ fn json_to_value(json: &serde_json::Value, mm: Arc<otter_vm_core::MemoryManager>
             Value::object(GcRef::new(js_arr))
         }
         serde_json::Value::Object(obj) => {
-            let js_obj = JsObject::new(None, mm.clone());
+            let js_obj = JsObject::new(Value::null(), mm.clone());
             for (key, val) in obj {
                 js_obj.set(PropertyKey::string(key), json_to_value(val, mm.clone()));
             }
@@ -1777,7 +1777,7 @@ fn make_error_value(ctx: &VmContext, name: &str, message: &str) -> Value {
         .as_ref()
         .and_then(|v| v.as_object())
         .and_then(|obj| obj.get(&PropertyKey::string("prototype")))
-        .and_then(|v| v.as_object());
+        .unwrap_or_else(Value::null);
 
     let obj = GcRef::new(JsObject::new(proto, ctx.memory_manager().clone()));
     obj.set(

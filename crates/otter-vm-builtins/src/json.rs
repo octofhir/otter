@@ -53,7 +53,7 @@ fn json_to_value(value: &JsonValue, mm: Arc<memory::MemoryManager>) -> Value {
             Value::array(GcRef::new(arr))
         }
         JsonValue::Object(map) => {
-            let obj = JsObject::new(None, mm.clone());
+            let obj = JsObject::new(Value::null(), mm.clone());
             for (key, value) in map {
                 obj.set(PropertyKey::string(key), json_to_value(value, mm.clone()));
             }

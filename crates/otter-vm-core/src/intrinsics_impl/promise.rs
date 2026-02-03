@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::context::JsJobQueueTrait;
-use crate::error::{InterceptionSignal, VmError};
+use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
@@ -103,7 +103,10 @@ fn extract_array_items(value: Option<&Value>) -> Result<Vec<Value>, VmError> {
 /// Create a JavaScript Promise wrapper object from an internal promise.
 ///
 /// Creates an object with `_internal` field and copies methods from Promise.prototype.
-fn create_js_promise_wrapper(ncx: &crate::context::NativeContext<'_>, internal: Arc<JsPromise>) -> Value {
+fn create_js_promise_wrapper(
+    ncx: &crate::context::NativeContext<'_>,
+    internal: Arc<JsPromise>,
+) -> Value {
     create_js_promise_wrapper_with_mm(ncx.memory_manager(), ncx.ctx, internal)
 }
 
@@ -113,7 +116,7 @@ fn create_js_promise_wrapper_with_mm(
     ctx: &crate::context::VmContext,
     internal: Arc<JsPromise>,
 ) -> Value {
-    let obj = GcRef::new(JsObject::new(None, mm.clone()));
+    let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
     // Set _internal to the raw promise
     obj.set(PropertyKey::string("_internal"), Value::promise(internal));
@@ -316,20 +319,141 @@ pub fn init_promise_prototype(
 
 /// Create Promise constructor function.
 ///
-/// Returns an interception signal so the interpreter can handle:
+/// Implements ES2023 §27.2.3.1 Promise(executor):
 /// - `new Promise(executor)` → creates promise and calls executor with resolve/reject
 /// - `Promise(executor)` → throws TypeError (requires 'new')
 ///
-/// NOTE: The Promise constructor still uses interception because calling the executor
-/// via `ncx.call_function()` from within a native constructor causes re-entry issues
-/// when the executor throws an error. This needs to be investigated separately.
-pub fn create_promise_constructor(
-) -> Box<
-    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+/// The executor is called synchronously with (resolve, reject) arguments.
+/// If the executor throws, the promise is rejected with the thrown value.
+pub fn create_promise_constructor() -> Box<
+    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
+        + Send
+        + Sync,
 > {
-    Box::new(|_this, _args, _ncx| {
-        Err(VmError::interception(InterceptionSignal::PromiseConstructor))
+    Box::new(|_this, args, ncx| {
+        // Check if called as constructor
+        if !ncx.is_construct() {
+            return Err(VmError::type_error("Promise constructor requires 'new'"));
+        }
+
+        // Get the executor function
+        let executor = args.first().cloned().unwrap_or(Value::undefined());
+        if !executor.is_callable() {
+            return Err(VmError::type_error("Promise resolver is not a function"));
+        }
+
+        // Create the internal promise
+        let promise = JsPromise::new();
+
+        // Get job queue for callbacks
+        let js_queue = ncx.js_job_queue();
+        let enqueue_js_job = {
+            let js_queue = js_queue.clone();
+            move |job: crate::promise::JsPromiseJob, args: Vec<Value>| {
+                if let Some(queue) = &js_queue {
+                    queue.enqueue(job, args);
+                }
+            }
+        };
+
+        // Get function prototype for creating resolve/reject functions
+        let fn_proto = ncx
+            .ctx
+            .function_prototype()
+            .ok_or_else(|| VmError::internal("Function.prototype is not defined"))?;
+
+        // Create resolve function
+        let resolve_promise = promise.clone();
+        let enqueue_resolve = enqueue_js_job.clone();
+        let resolve_fn = Value::native_function_with_proto(
+            move |_this, args, _ncx| {
+                let value = args.first().cloned().unwrap_or(Value::undefined());
+                resolve_promise.resolve_with_js_jobs(value, enqueue_resolve.clone());
+                Ok(Value::undefined())
+            },
+            ncx.memory_manager().clone(),
+            fn_proto,
+        );
+
+        // Create reject function
+        let reject_promise = promise.clone();
+        let enqueue_reject = enqueue_js_job.clone();
+        let reject_fn = Value::native_function_with_proto(
+            move |_this, args, _ncx| {
+                let reason = args.first().cloned().unwrap_or(Value::undefined());
+                reject_promise.reject_with_js_jobs(reason, enqueue_reject.clone());
+                Ok(Value::undefined())
+            },
+            ncx.memory_manager().clone(),
+            fn_proto,
+        );
+
+        // Call the executor with (resolve, reject)
+        // If it throws, we catch the error and reject the promise
+        let call_result =
+            ncx.call_function(&executor, Value::undefined(), &[resolve_fn, reject_fn]);
+
+        if let Err(err) = call_result {
+            // Convert error to value and reject the promise
+            // Convert error to value and reject the promise
+            let error_val = match err {
+                VmError::Exception(thrown) => thrown.value,
+                VmError::TypeError(message) => create_error_value(ncx, "TypeError", &message),
+                VmError::RangeError(message) => create_error_value(ncx, "RangeError", &message),
+                VmError::ReferenceError(message) => {
+                    create_error_value(ncx, "ReferenceError", &message)
+                }
+                VmError::SyntaxError(message) => create_error_value(ncx, "SyntaxError", &message),
+                other => {
+                    let message = other.to_string();
+                    Value::string(JsString::intern(&message))
+                }
+            };
+            promise.reject_with_js_jobs(error_val, enqueue_js_job);
+        }
+
+        // Create and return the JS promise wrapper
+        Ok(create_js_promise_wrapper(ncx, promise))
     })
+}
+
+/// Helper to create an error value from error name and message.
+fn create_error_value(ncx: &crate::context::NativeContext<'_>, name: &str, message: &str) -> Value {
+    use crate::object::{PropertyDescriptor, PropertyKey};
+
+    // Try to get the error constructor prototype
+    let proto = ncx
+        .ctx
+        .get_global(name)
+        .and_then(|v| v.as_object())
+        .and_then(|obj| obj.get(&PropertyKey::string("prototype")))
+        .and_then(|v| v.as_object());
+
+    let obj = GcRef::new(JsObject::new(
+        proto.map(Value::object).unwrap_or_else(Value::null),
+        ncx.memory_manager().clone(),
+    ));
+
+    obj.set(
+        PropertyKey::string("name"),
+        Value::string(JsString::intern(name)),
+    );
+    obj.set(
+        PropertyKey::string("message"),
+        Value::string(JsString::intern(message)),
+    );
+
+    let stack = if message.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}: {}", name, message)
+    };
+    obj.set(
+        PropertyKey::string("stack"),
+        Value::string(JsString::intern(&stack)),
+    );
+
+    Value::object(obj)
 }
 
 /// Install static methods on the Promise constructor object.
@@ -423,9 +547,9 @@ pub fn install_promise_statics(
                 }
 
                 // Get job queue for async callbacks
-                let queue = ncx.js_job_queue().ok_or_else(|| {
-                    VmError::type_error("Promise.all requires a job queue")
-                })?;
+                let queue = ncx
+                    .js_job_queue()
+                    .ok_or_else(|| VmError::type_error("Promise.all requires a job queue"))?;
                 let enqueue = make_enqueue_fn(queue);
 
                 let count = items.len();
@@ -470,7 +594,8 @@ pub fn install_promise_statics(
                                     }
                                 }
                             }
-                            result_p.resolve_with_js_jobs(Value::array(arr), enqueue_fulfill.clone());
+                            result_p
+                                .resolve_with_js_jobs(Value::array(arr), enqueue_fulfill.clone());
                         }
                     });
                     source_promise.catch(move |error| {
@@ -497,9 +622,9 @@ pub fn install_promise_statics(
                 let settled = Arc::new(AtomicBool::new(false));
 
                 // Get job queue for async callbacks
-                let queue = ncx.js_job_queue().ok_or_else(|| {
-                    VmError::type_error("Promise.race requires a job queue")
-                })?;
+                let queue = ncx
+                    .js_job_queue()
+                    .ok_or_else(|| VmError::type_error("Promise.race requires a job queue"))?;
                 let enqueue = make_enqueue_fn(queue);
 
                 for item in items {
@@ -587,8 +712,11 @@ pub fn install_promise_statics(
                     };
 
                     source_promise.then(move |value| {
-                        let obj = GcRef::new(JsObject::new(None, mm_t.clone()));
-                        obj.set("status".into(), Value::string(JsString::intern("fulfilled")));
+                        let obj = GcRef::new(JsObject::new(Value::null(), mm_t.clone()));
+                        obj.set(
+                            "status".into(),
+                            Value::string(JsString::intern("fulfilled")),
+                        );
                         obj.set("value".into(), value);
                         if let Ok(mut locked) = results.lock() {
                             locked[index] = Some(Value::object(obj));
@@ -602,11 +730,12 @@ pub fn install_promise_statics(
                                     }
                                 }
                             }
-                            result_p.resolve_with_js_jobs(Value::array(arr), enqueue_fulfill.clone());
+                            result_p
+                                .resolve_with_js_jobs(Value::array(arr), enqueue_fulfill.clone());
                         }
                     });
                     source_promise.catch(move |error| {
-                        let obj = GcRef::new(JsObject::new(None, mm_c.clone()));
+                        let obj = GcRef::new(JsObject::new(Value::null(), mm_c.clone()));
                         obj.set("status".into(), Value::string(JsString::intern("rejected")));
                         obj.set("reason".into(), error);
                         if let Ok(mut locked) = results2.lock() {
@@ -621,7 +750,8 @@ pub fn install_promise_statics(
                                     }
                                 }
                             }
-                            result_p2.resolve_with_js_jobs(Value::array(arr), enqueue_reject.clone());
+                            result_p2
+                                .resolve_with_js_jobs(Value::array(arr), enqueue_reject.clone());
                         }
                     });
                 }
@@ -652,9 +782,9 @@ pub fn install_promise_statics(
                 }
 
                 // Get job queue for async callbacks
-                let queue = ncx.js_job_queue().ok_or_else(|| {
-                    VmError::type_error("Promise.any requires a job queue")
-                })?;
+                let queue = ncx
+                    .js_job_queue()
+                    .ok_or_else(|| VmError::type_error("Promise.any requires a job queue"))?;
                 let enqueue = make_enqueue_fn(queue);
 
                 let count = items.len();
@@ -704,13 +834,14 @@ pub fn install_promise_statics(
                             for (i, e) in errs.iter().enumerate() {
                                 arr.set(PropertyKey::Index(i as u32), e.clone());
                             }
-                            let agg = GcRef::new(JsObject::new(None, mm_err.clone()));
+                            let agg = GcRef::new(JsObject::new(Value::null(), mm_err.clone()));
                             agg.set(
                                 "message".into(),
                                 Value::string(JsString::intern("All promises were rejected")),
                             );
                             agg.set("errors".into(), Value::array(arr));
-                            result_p2.reject_with_js_jobs(Value::object(agg), enqueue_reject.clone());
+                            result_p2
+                                .reject_with_js_jobs(Value::object(agg), enqueue_reject.clone());
                         }
                     });
                 }
@@ -730,7 +861,7 @@ pub fn install_promise_statics(
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 move |_this, _args, ncx| {
                     let promise = JsPromise::new();
-                    let result = GcRef::new(JsObject::new(None, mm_wr.clone()));
+                    let result = GcRef::new(JsObject::new(Value::null(), mm_wr.clone()));
 
                     // Get job queue for resolver/rejecter functions
                     let queue = ncx.js_job_queue();

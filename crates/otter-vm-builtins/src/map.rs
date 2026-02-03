@@ -85,10 +85,10 @@ fn str_to_key(s: &str) -> PropertyKey {
 
 /// Create a new Map
 fn native_map_new(_args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
-    let map_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let map_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
 
     // Create internal entries storage as a nested object
-    let entries_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let entries_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
     map_obj.set(str_to_key(MAP_ENTRIES_KEY), VmValue::object(entries_obj));
     map_obj.set(str_to_key(MAP_SIZE_KEY), VmValue::int32(0));
     map_obj.set(str_to_key(IS_MAP_KEY), VmValue::boolean(true));
@@ -165,7 +165,7 @@ fn native_map_set(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<Vm
     let is_new = existing.is_none();
 
     // Create entry object to store both key and value
-    let entry = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let entry = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
     entry.set(str_to_key("k"), key);
     entry.set(str_to_key("v"), value);
     entries_obj.set(str_to_key(&hash_key), VmValue::object(entry));
@@ -267,7 +267,7 @@ fn native_map_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<
     }
 
     // Replace entries with new empty object
-    let new_entries = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let new_entries = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
     map_obj.set(str_to_key(MAP_ENTRIES_KEY), VmValue::object(new_entries));
     map_obj.set(str_to_key(MAP_SIZE_KEY), VmValue::int32(0));
 
@@ -445,10 +445,10 @@ fn native_weakmap_new(
     _args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
 ) -> Result<VmValue, VmError> {
-    let map_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let map_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
 
     // WeakMap uses the same internal structure but only allows object keys
-    let entries_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let entries_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
     map_obj.set(str_to_key(MAP_ENTRIES_KEY), VmValue::object(entries_obj));
     map_obj.set(str_to_key(IS_WEAKMAP_KEY), VmValue::boolean(true));
 
@@ -539,7 +539,7 @@ fn native_weakmap_set(
     let hash_key = value_to_key(&key);
 
     // Create entry object to store both key (weakly) and value
-    let entry = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let entry = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
     entry.set(str_to_key("k"), key);
     entry.set(str_to_key("v"), value);
     entries_obj.set(str_to_key(&hash_key), VmValue::object(entry));
@@ -757,7 +757,7 @@ mod tests {
         let map = native_weakmap_new(&[], Arc::clone(&mm)).unwrap();
 
         // Object key should work
-        let key_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+        let key_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
         let key = VmValue::object(key_obj);
         let value = VmValue::int32(100);
 

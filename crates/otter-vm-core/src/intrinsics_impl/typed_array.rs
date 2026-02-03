@@ -558,7 +558,7 @@ fn init_typed_array_iterators(
             let ta = get_typed_array(this_val)?;
 
             // Create an iterator object (simplified - would need proper iterator protocol)
-            let iter_obj = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+            let iter_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
 
             // Store the typed array reference and current index
             iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
@@ -582,7 +582,7 @@ fn init_typed_array_iterators(
                             .ok_or_else(|| VmError::internal("iterator missing _index"))?;
                         let index = index_val.as_int32().unwrap_or(0) as usize;
 
-                        let result = GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
+                        let result = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
 
                         if index >= ta.length() {
                             result.set(PropertyKey::string("done"), Value::boolean(true));
@@ -627,7 +627,7 @@ fn init_typed_array_iterators(
             move |this_val, _args, ncx| {
                 let ta = get_typed_array(this_val)?;
 
-                let iter_obj = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let iter_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
                 iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
 
@@ -647,7 +647,7 @@ fn init_typed_array_iterators(
                                 .and_then(|v| v.as_int32())
                                 .unwrap_or(0) as usize;
 
-                            let result = GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
+                            let result = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
 
                             if index >= ta.length() {
                                 result.set(PropertyKey::string("done"), Value::boolean(true));
@@ -679,7 +679,7 @@ fn init_typed_array_iterators(
             move |this_val, _args, ncx| {
                 let ta = get_typed_array(this_val)?;
 
-                let iter_obj = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                let iter_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
                 iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
 
@@ -699,7 +699,7 @@ fn init_typed_array_iterators(
                                 .and_then(|v| v.as_int32())
                                 .unwrap_or(0) as usize;
 
-                            let result = GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
+                            let result = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
 
                             if index >= ta.length() {
                                 result.set(PropertyKey::string("done"), Value::boolean(true));
@@ -710,7 +710,7 @@ fn init_typed_array_iterators(
                                     .unwrap_or(Value::undefined());
 
                                 // Create [index, value] array
-                                let entry = GcRef::new(JsObject::new(None, ncx_inner.memory_manager().clone()));
+                                let entry = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
                                 entry.set(PropertyKey::Index(0), Value::int32(index as i32));
                                 entry.set(PropertyKey::Index(1), val);
 

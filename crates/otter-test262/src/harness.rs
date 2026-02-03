@@ -203,7 +203,7 @@ pub fn setup_harness(ctx: &mut VmContext) {
     let mm = Arc::clone(global.memory_manager());
 
     // Create $262 object
-    let obj_262 = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let obj_262 = GcRef::new(JsObject::new(Value::null(), Arc::clone(&mm)));
 
     // $262.global - Reference to the global object
     obj_262.set(PropertyKey::string("global"), Value::object(global));

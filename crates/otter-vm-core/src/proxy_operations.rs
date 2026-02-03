@@ -18,7 +18,7 @@ fn create_args_array(ncx: &mut NativeContext, args: &[Value]) -> GcRef<JsObject>
         if let Some(array_obj) = array_ctor.as_object() {
             if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
                 if let Some(proto_obj) = proto_val.as_object() {
-                    arr.set_prototype(Some(proto_obj));
+                    arr.set_prototype(Value::object(proto_obj));
                 }
             }
         }
@@ -218,7 +218,7 @@ fn target_get_prototype_of(
     let obj = target
         .as_object()
         .ok_or_else(|| VmError::type_error("Proxy target must be an object"))?;
-    Ok(obj.prototype())
+    Ok(obj.prototype().as_object())
 }
 
 fn target_set_prototype_of(
@@ -232,7 +232,8 @@ fn target_set_prototype_of(
     let obj = target
         .as_object()
         .ok_or_else(|| VmError::type_error("Proxy target must be an object"))?;
-    obj.set_prototype(proto);
+    let proto_value = proto.map(Value::object).unwrap_or_else(Value::null);
+    obj.set_prototype(proto_value);
     Ok(true)
 }
 
@@ -865,7 +866,7 @@ fn validate_define_property_invariants(
 
 /// Convert a PropertyDescriptor to a descriptor object Value
 fn descriptor_to_object(desc: &PropertyDescriptor, ncx: &NativeContext) -> Value {
-    let obj = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+    let obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
 
     match desc {
         PropertyDescriptor::Data { value, attributes } => {

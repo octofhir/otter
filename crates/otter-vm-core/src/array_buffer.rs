@@ -5,6 +5,7 @@
 
 use crate::gc::GcRef;
 use crate::object::JsObject;
+use crate::value::Value;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -29,7 +30,8 @@ impl JsArrayBuffer {
         prototype: Option<GcRef<JsObject>>,
         memory_manager: Arc<crate::memory::MemoryManager>,
     ) -> Self {
-        let object = GcRef::new(JsObject::new(prototype, memory_manager));
+        let proto_value = prototype.map(Value::object).unwrap_or_else(Value::null);
+        let object = GcRef::new(JsObject::new(proto_value, memory_manager));
         Self {
             object,
             data: Mutex::new(Some(vec![0; byte_length])),
@@ -44,7 +46,8 @@ impl JsArrayBuffer {
         prototype: Option<GcRef<JsObject>>,
         memory_manager: Arc<crate::memory::MemoryManager>,
     ) -> Self {
-        let object = GcRef::new(JsObject::new(prototype, memory_manager));
+        let proto_value = prototype.map(Value::object).unwrap_or_else(Value::null);
+        let object = GcRef::new(JsObject::new(proto_value, memory_manager));
         Self {
             object,
             data: Mutex::new(Some(vec![0; byte_length])),
@@ -84,7 +87,7 @@ impl JsArrayBuffer {
         // Create new object with same memory manager but fresh object identity/proto
         // Note: Callers might need to set correct proto if not default
         let mm = self.object.memory_manager().clone();
-        let object = GcRef::new(JsObject::new(None, mm));
+        let object = GcRef::new(JsObject::new(Value::null(), mm));
         Some(JsArrayBuffer {
             object,
             data: Mutex::new(Some(data)),
@@ -101,7 +104,7 @@ impl JsArrayBuffer {
         new_data[..copy_len].copy_from_slice(&old_data[..copy_len]);
 
         let mm = self.object.memory_manager().clone();
-        let object = GcRef::new(JsObject::new(None, mm));
+        let object = GcRef::new(JsObject::new(Value::null(), mm));
 
         Some(JsArrayBuffer {
             object,
@@ -136,7 +139,7 @@ impl JsArrayBuffer {
         }
 
         let mm = self.object.memory_manager().clone();
-        let object = GcRef::new(JsObject::new(None, mm));
+        let object = GcRef::new(JsObject::new(Value::null(), mm));
 
         Some(JsArrayBuffer {
             object,

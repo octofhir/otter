@@ -145,7 +145,7 @@ fn descriptor_from_attributes(attr_obj: &GcRef<JsObject>) -> PropertyDescriptor 
 fn descriptor_to_value(desc: PropertyDescriptor, ncx: &NativeContext) -> Value {
     match desc {
         PropertyDescriptor::Data { value, attributes } => {
-            let desc_obj = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+            let desc_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
             desc_obj.set("value".into(), value);
             desc_obj.set("writable".into(), Value::boolean(attributes.writable));
             desc_obj.set("enumerable".into(), Value::boolean(attributes.enumerable));
@@ -153,7 +153,7 @@ fn descriptor_to_value(desc: PropertyDescriptor, ncx: &NativeContext) -> Value {
             Value::object(desc_obj)
         }
         PropertyDescriptor::Accessor { get, set, attributes } => {
-            let desc_obj = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+            let desc_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
             desc_obj.set("get".into(), get.unwrap_or(Value::undefined()));
             desc_obj.set("set".into(), set.unwrap_or(Value::undefined()));
             desc_obj.set("enumerable".into(), Value::boolean(attributes.enumerable));
@@ -187,7 +187,7 @@ pub fn install_reflect_namespace(
     mm: &Arc<MemoryManager>,
 ) {
     // Create Reflect namespace object (plain object, not a constructor)
-    let reflect_obj = GcRef::new(JsObject::new(None, mm.clone()));
+    let reflect_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
     // ====================================================================
     // Reflect Methods (ES2015+ §26.1)
@@ -354,7 +354,7 @@ pub fn install_reflect_namespace(
         if let Some(prop_desc) = obj.lookup_property_descriptor(&key) {
             match prop_desc {
                 PropertyDescriptor::Data { value, attributes } => {
-                    let desc = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                    let desc = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                     desc.set("value".into(), value);
                     desc.set("writable".into(), Value::boolean(attributes.writable));
                     desc.set("enumerable".into(), Value::boolean(attributes.enumerable));
@@ -362,7 +362,7 @@ pub fn install_reflect_namespace(
                     Ok(Value::object(desc))
                 }
                 PropertyDescriptor::Accessor { get, set, attributes } => {
-                    let desc = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                    let desc = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                     desc.set("get".into(), get.unwrap_or(Value::undefined()));
                     desc.set("set".into(), set.unwrap_or(Value::undefined()));
                     desc.set("enumerable".into(), Value::boolean(attributes.enumerable));
@@ -372,7 +372,7 @@ pub fn install_reflect_namespace(
                 PropertyDescriptor::Deleted => Ok(Value::undefined()),
             }
         } else if let Some(value) = obj.get(&key) {
-            let desc = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+            let desc = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
             desc.set("value".into(), value);
             desc.set("writable".into(), Value::boolean(true));
             desc.set("enumerable".into(), Value::boolean(true));
@@ -465,10 +465,8 @@ pub fn install_reflect_namespace(
 
         let obj = get_target_object(target)?;
 
-        match obj.prototype() {
-            Some(proto) => Ok(Value::object(proto)),
-            None => Ok(Value::null()),
-        }
+        let proto_val = obj.prototype();
+        Ok(proto_val)
     });
 
     // Reflect.setPrototypeOf(target, prototype)
@@ -498,7 +496,8 @@ pub fn install_reflect_namespace(
             return Err(VmError::type_error("Prototype must be an object or null"));
         };
 
-        let success = obj.set_prototype(new_proto);
+        let proto_value = new_proto.map(Value::object).unwrap_or_else(Value::null);
+        let success = obj.set_prototype(proto_value);
         Ok(Value::boolean(success))
     });
 
@@ -648,7 +647,7 @@ pub fn install_reflect_namespace(
         };
 
         // Create new instance
-        let new_obj = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+        let new_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
         let this_val = Value::object(new_obj);
 
         // Call constructor (handles both closures and native functions)

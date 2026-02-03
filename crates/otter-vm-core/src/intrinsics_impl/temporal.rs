@@ -23,12 +23,12 @@ pub fn install_temporal_namespace(
     mm: &Arc<MemoryManager>,
 ) {
     // Create main Temporal namespace object
-    let temporal_obj = GcRef::new(JsObject::new(None, mm.clone()));
+    let temporal_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
     // ====================================================================
     // Temporal.Now
     // ====================================================================
-    let temporal_now = GcRef::new(JsObject::new(None, mm.clone()));
+    let temporal_now = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
     if let Some(instant_fn) = global.get(&PropertyKey::string("__Temporal_Now_instant")) {
         temporal_now.set(PropertyKey::string("instant"), instant_fn);
@@ -54,7 +54,7 @@ pub fn install_temporal_namespace(
     // ====================================================================
     // Temporal.Instant
     // ====================================================================
-    let temporal_instant = GcRef::new(JsObject::new(None, mm.clone()));
+    let temporal_instant = GcRef::new(JsObject::new(Value::null(), mm.clone()));
     if let Some(from_fn) = global.get(&PropertyKey::string("__Temporal_Instant_from")) {
         temporal_instant.set(PropertyKey::string("from"), from_fn);
     }
@@ -66,7 +66,7 @@ pub fn install_temporal_namespace(
     // ====================================================================
     // Temporal.PlainDate
     // ====================================================================
-    let temporal_plain_date = GcRef::new(JsObject::new(None, mm.clone()));
+    let temporal_plain_date = GcRef::new(JsObject::new(Value::null(), mm.clone()));
     if let Some(from_fn) = global.get(&PropertyKey::string("__Temporal_PlainDate_from")) {
         temporal_plain_date.set(PropertyKey::string("from"), from_fn);
     }
@@ -78,7 +78,7 @@ pub fn install_temporal_namespace(
     // ====================================================================
     // Temporal.PlainTime
     // ====================================================================
-    let temporal_plain_time = GcRef::new(JsObject::new(None, mm.clone()));
+    let temporal_plain_time = GcRef::new(JsObject::new(Value::null(), mm.clone()));
     if let Some(from_fn) = global.get(&PropertyKey::string("__Temporal_PlainTime_from")) {
         temporal_plain_time.set(PropertyKey::string("from"), from_fn);
     }
@@ -90,7 +90,7 @@ pub fn install_temporal_namespace(
     // ====================================================================
     // Temporal.PlainDateTime
     // ====================================================================
-    let temporal_plain_date_time = GcRef::new(JsObject::new(None, mm.clone()));
+    let temporal_plain_date_time = GcRef::new(JsObject::new(Value::null(), mm.clone()));
     if let Some(from_fn) = global.get(&PropertyKey::string("__Temporal_PlainDateTime_from")) {
         temporal_plain_date_time.set(PropertyKey::string("from"), from_fn);
     }
@@ -102,7 +102,7 @@ pub fn install_temporal_namespace(
     // ====================================================================
     // Temporal.PlainYearMonth
     // ====================================================================
-    let temporal_plain_year_month = GcRef::new(JsObject::new(None, mm.clone()));
+    let temporal_plain_year_month = GcRef::new(JsObject::new(Value::null(), mm.clone()));
     if let Some(from_fn) = global.get(&PropertyKey::string("__Temporal_PlainYearMonth_from")) {
         temporal_plain_year_month.set(PropertyKey::string("from"), from_fn);
     }
@@ -111,7 +111,7 @@ pub fn install_temporal_namespace(
     // ====================================================================
     // Temporal.PlainMonthDay
     // ====================================================================
-    let temporal_plain_month_day = GcRef::new(JsObject::new(None, mm.clone()));
+    let temporal_plain_month_day = GcRef::new(JsObject::new(Value::null(), mm.clone()));
     if let Some(from_fn) = global.get(&PropertyKey::string("__Temporal_PlainMonthDay_from")) {
         temporal_plain_month_day.set(PropertyKey::string("from"), from_fn);
     }
@@ -120,7 +120,7 @@ pub fn install_temporal_namespace(
     // ====================================================================
     // Temporal.ZonedDateTime
     // ====================================================================
-    let temporal_zoned_date_time = GcRef::new(JsObject::new(None, mm.clone()));
+    let temporal_zoned_date_time = GcRef::new(JsObject::new(Value::null(), mm.clone()));
     if let Some(from_fn) = global.get(&PropertyKey::string("__Temporal_ZonedDateTime_from")) {
         temporal_zoned_date_time.set(PropertyKey::string("from"), from_fn);
     }
@@ -132,7 +132,7 @@ pub fn install_temporal_namespace(
     // ====================================================================
     // Temporal.Duration
     // ====================================================================
-    let temporal_duration = GcRef::new(JsObject::new(None, mm.clone()));
+    let temporal_duration = GcRef::new(JsObject::new(Value::null(), mm.clone()));
     if let Some(from_fn) = global.get(&PropertyKey::string("__Temporal_Duration_from")) {
         temporal_duration.set(PropertyKey::string("from"), from_fn);
     }

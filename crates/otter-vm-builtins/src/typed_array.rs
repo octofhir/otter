@@ -147,7 +147,7 @@ fn native_typed_array_create(
         }
     };
 
-    let object = GcRef::new(JsObject::new(None, _mm.clone()));
+    let object = GcRef::new(JsObject::new(VmValue::null(), _mm.clone()));
     let ta = JsTypedArray::new(object, ab, kind, byte_offset, actual_length)
         .map_err(|e| VmError::range_error(format!("{}", e)))?;
 

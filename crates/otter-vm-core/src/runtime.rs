@@ -73,7 +73,7 @@ impl VmRuntime {
         // Per ES2023 §10.3.1, every built-in function object must have this
         // as its [[Prototype]]. By creating it up-front, all native functions
         // can receive it at construction time (BOA/V8/SpiderMonkey pattern).
-        let function_prototype = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let function_prototype = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         function_prototype.mark_as_intrinsic();
 
         // Stage 1: Allocate all intrinsic objects (empty, no properties yet)
@@ -83,7 +83,7 @@ impl VmRuntime {
         // Stage 3: Initialize core intrinsic properties (toString, valueOf, etc.)
         intrinsics.init_core(&memory_manager);
 
-        let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         globals::setup_global_object(global, function_prototype, Some(&intrinsics));
         // Install intrinsic constructors on global (Object, Function, etc.)
         intrinsics.install_on_global(global, &memory_manager);
@@ -115,7 +115,7 @@ impl VmRuntime {
     pub fn create_context(&self) -> VmContext {
         // Clone global object for isolation
         // TODO: Proper cloning with prototype chain
-        let global = GcRef::new(JsObject::new(None, self.memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(Value::null(), self.memory_manager.clone()));
         globals::setup_global_object(global, self.function_prototype, Some(&self.intrinsics));
 
         // Install intrinsic constructors on the new global

@@ -28,7 +28,8 @@ impl JsRegExp {
         proto: Option<GcRef<JsObject>>,
         memory_manager: Arc<crate::memory::MemoryManager>,
     ) -> Self {
-        let object = GcRef::new(JsObject::new(proto, memory_manager));
+        let proto_value = proto.map(Value::object).unwrap_or_else(Value::null);
+        let object = GcRef::new(JsObject::new(proto_value, memory_manager));
         let source = if pattern.is_empty() {
             "(?:)".to_string()
         } else {

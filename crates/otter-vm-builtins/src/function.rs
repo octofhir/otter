@@ -148,7 +148,7 @@ fn function_create_bound(args: &[Value], mm: Arc<memory::MemoryManager>) -> Resu
     let this_arg = args.get(1).cloned().unwrap_or_else(Value::undefined);
 
     // Create bound function as an object with special properties
-    let bound = GcRef::new(JsObject::new(None, mm.clone()));
+    let bound = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
     // Store the original function
     bound.set(PropertyKey::string("__boundFunction__"), original.clone());
@@ -160,7 +160,7 @@ fn function_create_bound(args: &[Value], mm: Arc<memory::MemoryManager>) -> Resu
     if args.len() > 2 {
         let bound_args: Vec<Value> = args[2..].to_vec();
         // Store as array
-        let arr = GcRef::new(JsObject::new(None, mm.clone()));
+        let arr = GcRef::new(JsObject::new(Value::null(), mm.clone()));
         for (i, arg) in bound_args.iter().enumerate() {
             arr.set(PropertyKey::Index(i as u32), arg.clone());
         }

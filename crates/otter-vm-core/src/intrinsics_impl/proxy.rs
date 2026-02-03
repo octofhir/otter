@@ -64,7 +64,7 @@ pub fn init_proxy_constructor(
             let revocable = JsProxy::revocable(target.clone(), handler.clone());
 
             // Create result object { proxy, revoke }
-            let result = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+            let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
             result.set("proxy".into(), Value::proxy(revocable.proxy));
 
             // Create revoke function

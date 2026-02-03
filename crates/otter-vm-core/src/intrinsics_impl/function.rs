@@ -188,7 +188,7 @@ pub fn init_function_prototype(
                 let this_arg = args.first().cloned().unwrap_or(Value::undefined());
 
                 // Create bound function object with Function.prototype as prototype
-                let bound = GcRef::new(JsObject::new(Some(fn_proto_for_bind.clone()), ncx.memory_manager().clone()));
+                let bound = GcRef::new(JsObject::new(Value::object(fn_proto_for_bind.clone()), ncx.memory_manager().clone()));
 
                 // Store the original function
                 bound.set(
@@ -201,7 +201,7 @@ pub fn init_function_prototype(
 
                 // Store bound arguments (if any)
                 if args.len() > 1 {
-                    let arr = GcRef::new(JsObject::new(None, ncx.memory_manager().clone()));
+                    let arr = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                     for (i, arg) in args[1..].iter().enumerate() {
                         arr.set(PropertyKey::Index(i as u32), arg.clone());
                     }

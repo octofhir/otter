@@ -67,7 +67,7 @@ pub fn install_math_namespace(
     mm: &Arc<MemoryManager>,
 ) {
     // Create Math namespace object (plain object, not a constructor)
-    let math_obj = GcRef::new(JsObject::new(None, mm.clone()));
+    let math_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
     // ====================================================================
     // Math Constants (ES2026 §21.3.1)

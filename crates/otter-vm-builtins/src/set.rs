@@ -90,10 +90,10 @@ fn str_to_key(s: &str) -> PropertyKey {
 
 /// Create a new Set
 fn native_set_new(_args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
-    let set_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let set_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
 
     // Create internal values storage
-    let values_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let values_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
     set_obj.set(str_to_key(SET_VALUES_KEY), VmValue::object(values_obj));
     set_obj.set(str_to_key(SET_SIZE_KEY), VmValue::int32(0));
     set_obj.set(str_to_key(IS_SET_KEY), VmValue::boolean(true));
@@ -229,7 +229,7 @@ fn native_set_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<
     }
 
     // Replace values with new empty object
-    let new_values = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let new_values = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
     set_obj.set(str_to_key(SET_VALUES_KEY), VmValue::object(new_values));
     set_obj.set(str_to_key(SET_SIZE_KEY), VmValue::int32(0));
 
@@ -535,9 +535,9 @@ fn native_weakset_new(
     _args: &[VmValue],
     mm: Arc<memory::MemoryManager>,
 ) -> Result<VmValue, VmError> {
-    let set_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let set_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
 
-    let values_obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+    let values_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
     set_obj.set(str_to_key(SET_VALUES_KEY), VmValue::object(values_obj));
     set_obj.set(str_to_key(IS_WEAKSET_KEY), VmValue::boolean(true));
 
@@ -794,7 +794,7 @@ mod tests {
         let mm = Arc::new(memory::MemoryManager::test());
         let set = native_weakset_new(&[], Arc::clone(&mm)).unwrap();
 
-        let obj = GcRef::new(JsObject::new(None, Arc::clone(&mm)));
+        let obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
         let value = VmValue::object(obj);
 
         let _ = native_weakset_add(&[set.clone(), value.clone()], Arc::clone(&mm)).unwrap();

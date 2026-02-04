@@ -296,7 +296,7 @@ mod tests {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         let mut cloner = StructuredCloner::new(memory_manager.clone());
         let dummy_module = Arc::new(Module::builder("test.js").build());
-        let func = Value::function(Arc::new(Closure {
+        let func = Value::function(GcRef::new(Closure {
             function_index: 0,
             module: dummy_module,
             upvalues: vec![],

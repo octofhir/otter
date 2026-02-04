@@ -2662,7 +2662,7 @@ impl Interpreter {
                     },
                 );
 
-                let closure = Arc::new(Closure {
+                let closure = GcRef::new(Closure {
                     function_index: func.0,
                     module: Arc::clone(module),
                     upvalues: captured_upvalues,
@@ -2746,7 +2746,7 @@ impl Interpreter {
                     },
                 );
 
-                let closure = Arc::new(Closure {
+                let closure = GcRef::new(Closure {
                     function_index: func.0,
                     module: Arc::clone(module),
                     upvalues: captured_upvalues,
@@ -2826,7 +2826,7 @@ impl Interpreter {
                     ctx.memory_manager().clone(),
                 ));
 
-                let closure = Arc::new(Closure {
+                let closure = GcRef::new(Closure {
                     function_index: func.0,
                     module: Arc::clone(module),
                     upvalues: captured_upvalues,
@@ -2906,7 +2906,7 @@ impl Interpreter {
                     ctx.memory_manager().clone(),
                 ));
 
-                let closure = Arc::new(Closure {
+                let closure = GcRef::new(Closure {
                     function_index: func.0,
                     module: Arc::clone(module),
                     upvalues: captured_upvalues,
@@ -2966,7 +2966,7 @@ impl Interpreter {
                             (
                                 Some(HeapRef::NativeFunction(a)),
                                 Some(HeapRef::NativeFunction(b)),
-                            ) => Arc::ptr_eq(a, b),
+                            ) => std::ptr::eq(a.as_ptr(), b.as_ptr()),
                             _ => false,
                         }
                     };
@@ -6630,7 +6630,7 @@ impl Interpreter {
                             object: closure.object.clone(),
                             home_object: Some(obj_ref),
                         };
-                        ctx.set_register(func.0, Value::function(Arc::new(new_closure)));
+                        ctx.set_register(func.0, Value::function(GcRef::new(new_closure)));
                     }
                 }
                 Ok(InstructionResult::Continue)
@@ -7033,7 +7033,7 @@ impl Interpreter {
             let is_same_native = |candidate: &Value| -> bool {
                 match (current_func.heap_ref(), candidate.heap_ref()) {
                     (Some(HeapRef::NativeFunction(a)), Some(HeapRef::NativeFunction(b))) => {
-                        Arc::ptr_eq(a, b)
+                        std::ptr::eq(a.as_ptr(), b.as_ptr())
                     }
                     _ => false,
                 }

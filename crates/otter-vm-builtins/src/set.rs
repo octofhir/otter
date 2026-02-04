@@ -74,7 +74,7 @@ fn value_to_key(value: &VmValue) -> String {
         return format!("__obj_{:p}__", obj.as_ptr());
     }
     if let Some(func) = value.as_function() {
-        return format!("__func_{:p}__", Arc::as_ptr(func));
+        return format!("__func_{:p}__", func.as_ptr());
     }
     format!("__unknown_{:?}__", value)
 }

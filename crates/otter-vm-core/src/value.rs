@@ -130,7 +130,7 @@ pub enum HeapRef {
     /// Array value (stored as Object internally, GC-managed)
     Array(GcRef<JsObject>),
     /// Function closure
-    Function(Arc<Closure>),
+    Function(GcRef<Closure>),
     /// Symbol
     Symbol(GcRef<Symbol>),
     /// BigInt
@@ -150,7 +150,7 @@ pub enum HeapRef {
     /// SharedArrayBuffer (can be shared between workers)
     SharedArrayBuffer(GcRef<SharedArrayBuffer>),
     /// Native function (implemented in Rust)
-    NativeFunction(Arc<NativeFunctionObject>),
+    NativeFunction(GcRef<NativeFunctionObject>),
     /// RegExp
     RegExp(GcRef<JsRegExp>),
 }
@@ -197,6 +197,27 @@ pub struct Closure {
     pub home_object: Option<GcRef<JsObject>>,
 }
 
+impl otter_vm_gc::GcTraceable for Closure {
+    const NEEDS_TRACE: bool = true;
+
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // Trace function object
+        tracer(self.object.header() as *const _);
+
+        // CRITICAL FIX: Trace home_object for super keyword support
+        if let Some(home) = &self.home_object {
+            tracer(home.header() as *const _);
+        }
+
+        // CRITICAL FIX: Trace upvalue values
+        // Each UpvalueCell contains Arc<Mutex<Value>>, trace the Value inside
+        for upvalue in &self.upvalues {
+            let value = upvalue.get(); // Locks and clones the Value
+            value.trace(tracer);
+        }
+    }
+}
+
 /// A native function with an attached object for properties.
 #[derive(Clone)]
 pub struct NativeFunctionObject {
@@ -204,6 +225,19 @@ pub struct NativeFunctionObject {
     pub func: NativeFn,
     /// Attached object for properties (GC-managed)
     pub object: GcRef<JsObject>,
+}
+
+impl otter_vm_gc::GcTraceable for NativeFunctionObject {
+    const NEEDS_TRACE: bool = true;
+
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // Trace the attached object
+        tracer(self.object.header() as *const _);
+
+        // NativeFn is Arc<dyn Fn>, which is opaque to GC
+        // Any Value references are passed through arguments, not captured in the closure
+        // Native functions are created by Rust code and don't capture GC-managed values
+    }
 }
 
 /// A JavaScript Symbol
@@ -329,8 +363,8 @@ impl Value {
     }
 
     /// Create function closure value
-    pub fn function(closure: Arc<Closure>) -> Self {
-        let ptr = Arc::as_ptr(&closure) as u64;
+    pub fn function(closure: GcRef<Closure>) -> Self {
+        let ptr = closure.as_ptr() as u64;
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::Function(closure)),
@@ -446,7 +480,7 @@ impl Value {
     {
         let func: NativeFn = Arc::new(f);
         let object = GcRef::new(JsObject::new(Value::null(), memory_manager));
-        let native = Arc::new(NativeFunctionObject { func, object });
+        let native = GcRef::new(NativeFunctionObject { func, object });
         // Use a dummy pointer for NaN-boxing (the actual function is in heap_ref)
         Self {
             bits: TAG_POINTER,
@@ -484,7 +518,7 @@ impl Value {
                 crate::string::JsString::intern(""),
             )),
         );
-        let native = Arc::new(NativeFunctionObject { func, object });
+        let native = GcRef::new(NativeFunctionObject { func, object });
         Self {
             bits: TAG_POINTER,
             heap_ref: Some(HeapRef::NativeFunction(native)),
@@ -500,7 +534,7 @@ impl Value {
         _prototype: GcRef<JsObject>,
         object: GcRef<JsObject>,
     ) -> Self {
-        let native = Arc::new(NativeFunctionObject { func, object });
+        let native = GcRef::new(NativeFunctionObject { func, object });
         Self {
             bits: TAG_POINTER,
             heap_ref: Some(HeapRef::NativeFunction(native)),
@@ -725,9 +759,9 @@ impl Value {
     }
 
     /// Get as function closure
-    pub fn as_function(&self) -> Option<&Arc<Closure>> {
+    pub fn as_function(&self) -> Option<GcRef<Closure>> {
         match &self.heap_ref {
-            Some(HeapRef::Function(f)) => Some(f),
+            Some(HeapRef::Function(f)) => Some(*f),
             _ => None,
         }
     }
@@ -1105,10 +1139,10 @@ impl Value {
                     tracer(o.header() as *const _);
                 }
                 HeapRef::Function(f) => {
-                    tracer(f.object.header() as *const _);
+                    tracer(f.header() as *const _);
                 }
                 HeapRef::NativeFunction(n) => {
-                    tracer(n.object.header() as *const _);
+                    tracer(n.header() as *const _);
                 }
                 HeapRef::RegExp(r) => {
                     tracer(r.object.header() as *const _);

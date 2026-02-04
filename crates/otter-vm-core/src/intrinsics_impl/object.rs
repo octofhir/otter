@@ -84,7 +84,7 @@ pub fn init_object_prototype(
 
                 let tag_value = if let Some(proxy) = this_val.as_proxy() {
                     let key = PropertyKey::Symbol(well_known::TO_STRING_TAG);
-                    let key_value = Value::symbol(Arc::new(Symbol {
+                    let key_value = Value::symbol(GcRef::new(Symbol {
                         description: None,
                         id: well_known::TO_STRING_TAG,
                     }));
@@ -450,7 +450,7 @@ pub fn init_object_constructor(
                         PropertyKey::String(s) => Value::string(*s),
                         PropertyKey::Index(i) => Value::string(JsString::intern(&i.to_string())),
                         PropertyKey::Symbol(sym_id) => {
-                            Value::symbol(Arc::new(crate::value::Symbol {
+                            Value::symbol(GcRef::new(crate::value::Symbol {
                                 description: None,
                                 id: *sym_id,
                             }))
@@ -523,7 +523,7 @@ pub fn init_object_constructor(
                         PropertyKey::String(s) => Value::string(*s),
                         PropertyKey::Index(i) => Value::string(JsString::intern(&i.to_string())),
                         PropertyKey::Symbol(sym_id) => {
-                            Value::symbol(Arc::new(crate::value::Symbol {
+                            Value::symbol(GcRef::new(crate::value::Symbol {
                                 description: None,
                                 id: *sym_id,
                             }))
@@ -1296,12 +1296,53 @@ pub fn init_object_constructor(
 pub fn create_object_constructor() -> Box<
     dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync
 > {
-    Box::new(|_this, args, _ncx_inner| {
+    Box::new(|_this, args, ncx| {
+        let global = ncx.ctx.global();
+        let mm = ncx.ctx.memory_manager().clone();
+        let get_proto = |name: &str| -> Option<GcRef<JsObject>> {
+            global
+                .get(&PropertyKey::string(name))
+                .and_then(|v| v.as_object())
+                .and_then(|ctor| ctor.get(&PropertyKey::string("prototype")))
+                .and_then(|v| v.as_object())
+        };
         // When called with an object argument, return it directly
         if let Some(arg) = args.first() {
             if arg.is_object() {
                 return Ok(arg.clone());
             }
+            if arg.is_null() || arg.is_undefined() {
+                let obj_proto = get_proto("Object");
+                let obj = GcRef::new(JsObject::new(
+                    obj_proto
+                        .map(Value::object)
+                        .unwrap_or_else(Value::null),
+                    mm,
+                ));
+                return Ok(Value::object(obj));
+            }
+
+            let (proto_name, slot_key, slot_value) = if let Some(s) = arg.as_string() {
+                ("String", "__primitiveValue__", Value::string(s))
+            } else if let Some(n) = arg.as_number() {
+                ("Number", "__value__", Value::number(n))
+            } else if let Some(i) = arg.as_int32() {
+                ("Number", "__value__", Value::number(i as f64))
+            } else if let Some(b) = arg.as_boolean() {
+                ("Boolean", "__value__", Value::boolean(b))
+            } else if arg.is_bigint() {
+                ("BigInt", "__value__", arg.clone())
+            } else {
+                ("Object", "__value__", arg.clone())
+            };
+
+            let proto = get_proto(proto_name).or_else(|| get_proto("Object"));
+            let obj = GcRef::new(JsObject::new(
+                proto.map(Value::object).unwrap_or_else(Value::null),
+                mm,
+            ));
+            obj.set(PropertyKey::string(slot_key), slot_value);
+            return Ok(Value::object(obj));
         }
         // Return undefined so Construct handler uses new_obj_value
         // (which has Object.prototype as [[Prototype]])

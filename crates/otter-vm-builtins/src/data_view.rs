@@ -5,6 +5,7 @@
 
 use otter_vm_core::error::VmError;
 use otter_vm_core::data_view::JsDataView;
+use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
 use otter_vm_core::value::{BigInt, HeapRef, Value as VmValue};
 use otter_vm_runtime::{Op, op_native_with_mm as op_native};
@@ -47,9 +48,9 @@ pub fn ops() -> Vec<Op> {
 }
 
 /// Helper to extract BigInt value from a Value
-fn get_bigint_value(value: &VmValue) -> Option<&Arc<BigInt>> {
+fn get_bigint_value(value: &VmValue) -> Option<otter_vm_core::gc::GcRef<BigInt>> {
     match value.heap_ref() {
-        Some(HeapRef::BigInt(bi)) => Some(bi),
+        Some(HeapRef::BigInt(bi)) => Some(*bi),
         _ => None,
     }
 }
@@ -83,7 +84,7 @@ fn native_data_view_create(
     let dv = JsDataView::new(ab, byte_offset, byte_length)
         .map_err(|e| format!("RangeError: {}", e))?;
 
-    Ok(VmValue::data_view(Arc::new(dv)))
+    Ok(VmValue::data_view(GcRef::new(dv)))
 }
 
 /// Get the underlying buffer

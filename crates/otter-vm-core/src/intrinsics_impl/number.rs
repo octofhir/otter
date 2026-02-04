@@ -26,7 +26,20 @@ pub fn init_number_prototype(
         number_proto.define_property(
             PropertyKey::string("valueOf"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, _args, _ncx| Ok(this_val.clone()),
+                |this_val, _args, _ncx| {
+                    if let Some(num) = this_val.as_number() {
+                        return Ok(Value::number(num));
+                    }
+                    if let Some(i) = this_val.as_int32() {
+                        return Ok(Value::number(i as f64));
+                    }
+                    if let Some(obj) = this_val.as_object() {
+                        if let Some(val) = obj.get(&PropertyKey::string("__value__")) {
+                            return Ok(val);
+                        }
+                    }
+                    Err(VmError::type_error("Number.prototype.valueOf requires a number"))
+                },
                 mm.clone(),
                 fn_proto,
             )),

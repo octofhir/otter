@@ -15,6 +15,13 @@ pub struct SharedArrayBuffer {
     data: Box<[AtomicU8]>,
 }
 
+impl otter_vm_gc::GcTraceable for SharedArrayBuffer {
+    const NEEDS_TRACE: bool = false;
+    fn trace(&self, _tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // SharedArrayBuffer contains only Box<[AtomicU8]>, no GC references
+    }
+}
+
 impl SharedArrayBuffer {
     /// Create a new SharedArrayBuffer with the specified byte length
     pub fn new(byte_length: usize) -> Self {
@@ -168,6 +175,7 @@ unsafe impl Sync for SharedArrayBuffer {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gc::GcRef;
     use std::sync::Arc;
     use std::thread;
 
@@ -212,8 +220,8 @@ mod tests {
 
     #[test]
     fn test_shared_between_threads() {
-        let sab = Arc::new(SharedArrayBuffer::new(1));
-        let sab_clone = Arc::clone(&sab);
+        let sab = GcRef::new(SharedArrayBuffer::new(1));
+        let sab_clone = sab; // GcRef is Copy
 
         let handle = thread::spawn(move || {
             sab_clone.set(0, 42);
@@ -225,12 +233,12 @@ mod tests {
 
     #[test]
     fn test_concurrent_atomics() {
-        let sab = Arc::new(SharedArrayBuffer::new(1));
+        let sab = GcRef::new(SharedArrayBuffer::new(1));
         let mut handles = vec![];
 
         // Spawn 10 threads that each add 1 to the counter
         for _ in 0..10 {
-            let sab_clone = Arc::clone(&sab);
+            let sab_clone = sab; // GcRef is Copy
             handles.push(thread::spawn(move || {
                 for _ in 0..100 {
                     sab_clone.atomic_add(0, 1);

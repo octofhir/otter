@@ -96,7 +96,7 @@ impl Interpreter {
         &self,
         module: Arc<Module>,
         ctx: &mut VmContext,
-        result_promise: Arc<JsPromise>,
+        result_promise: GcRef<JsPromise>,
     ) -> VmExecutionResult {
         // Get entry function
         let entry_func = match module.entry_function() {
@@ -367,8 +367,8 @@ impl Interpreter {
         &self,
         ctx: &VmContext,
         resume_register: u16,
-        awaited_promise: Arc<JsPromise>,
-        result_promise: Arc<JsPromise>,
+        awaited_promise: GcRef<JsPromise>,
+        result_promise: GcRef<JsPromise>,
     ) -> AsyncContext {
         AsyncContext::new(
             ctx.save_frames(),
@@ -383,7 +383,7 @@ impl Interpreter {
     fn run_loop_with_suspension(
         &self,
         ctx: &mut VmContext,
-        result_promise: Arc<JsPromise>,
+        result_promise: GcRef<JsPromise>,
     ) -> VmExecutionResult {
         // Cache module Arc - only refresh when frame changes
         let mut cached_module: Option<Arc<Module>> = None;
@@ -733,7 +733,7 @@ impl Interpreter {
                                 ctx,
                                 resume_reg,
                                 promise,
-                                Arc::clone(&result_promise),
+                                result_promise,
                             );
                             return VmExecutionResult::Suspended(async_ctx);
                         }
@@ -1552,14 +1552,14 @@ impl Interpreter {
             }
 
             Instruction::ToNumber { dst, src } => {
-                let value = ctx.get_register(src.0);
-                let number = self.coerce_number(value)?;
+                let value = ctx.get_register(src.0).clone();
+                let number = self.coerce_number(ctx, value)?;
                 ctx.set_register(dst.0, Value::number(number));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::RequireCoercible { src } => {
-                let value = ctx.get_register(src.0);
+                let value = ctx.get_register(src.0).clone();
                 if value.is_null() {
                     return Err(VmError::type_error("Cannot destructure 'null' value"));
                 }
@@ -1576,16 +1576,16 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                let left = ctx.get_register(lhs.0);
-                let right = ctx.get_register(rhs.0);
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
 
                 // Collect type feedback and check for quickening opportunity
                 let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
                         let mut feedback = func.feedback_vector.write();
                         if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
-                            Self::observe_value_type(&mut meta.type_observations, left);
-                            Self::observe_value_type(&mut meta.type_observations, right);
+                            Self::observe_value_type(&mut meta.type_observations, &left);
+                            Self::observe_value_type(&mut meta.type_observations, &right);
                             // Use fast path if only int32 types have been seen
                             meta.type_observations.is_int32_only()
                         } else {
@@ -1609,7 +1609,7 @@ impl Interpreter {
                 }
 
                 // Generic path
-                let result = self.op_add(left, right)?;
+                let result = self.op_add(ctx, &left, &right)?;
                 ctx.set_register(dst.0, result);
                 Ok(InstructionResult::Continue)
             }
@@ -1620,16 +1620,16 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                let left_value = ctx.get_register(lhs.0);
-                let right_value = ctx.get_register(rhs.0);
+                let left_value = ctx.get_register(lhs.0).clone();
+                let right_value = ctx.get_register(rhs.0).clone();
 
                 // Collect type feedback and check for quickening opportunity
                 let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
                         let mut feedback = func.feedback_vector.write();
                         if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
-                            Self::observe_value_type(&mut meta.type_observations, left_value);
-                            Self::observe_value_type(&mut meta.type_observations, right_value);
+                            Self::observe_value_type(&mut meta.type_observations, &left_value);
+                            Self::observe_value_type(&mut meta.type_observations, &right_value);
                             meta.type_observations.is_int32_only()
                         } else {
                             false
@@ -1652,8 +1652,8 @@ impl Interpreter {
                 }
 
                 // Generic path
-                let left_bigint = self.bigint_value(left_value)?;
-                let right_bigint = self.bigint_value(right_value)?;
+                let left_bigint = self.bigint_value(&left_value)?;
+                let right_bigint = self.bigint_value(&right_value)?;
 
                 if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
                     let result = left_bigint - right_bigint;
@@ -1665,35 +1665,35 @@ impl Interpreter {
                     return Err(VmError::type_error("Cannot mix BigInt and other types"));
                 }
 
-                let left = self.coerce_number(left_value)?;
-                let right = self.coerce_number(right_value)?;
+                let left = self.coerce_number(ctx, left_value)?;
+                let right = self.coerce_number(ctx, right_value)?;
 
                 ctx.set_register(dst.0, Value::number(left - right));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Inc { dst, src } => {
-                let value = ctx.get_register(src.0);
-                if let Some(bigint) = self.bigint_value(value)? {
+                let value = ctx.get_register(src.0).clone();
+                if let Some(bigint) = self.bigint_value(&value)? {
                     let result = bigint + NumBigInt::one();
                     ctx.set_register(dst.0, Value::bigint(result.to_string()));
                     return Ok(InstructionResult::Continue);
                 }
 
-                let val = self.coerce_number(value)?;
+                let val = self.coerce_number(ctx, value)?;
                 ctx.set_register(dst.0, Value::number(val + 1.0));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Dec { dst, src } => {
-                let value = ctx.get_register(src.0);
-                if let Some(bigint) = self.bigint_value(value)? {
+                let value = ctx.get_register(src.0).clone();
+                if let Some(bigint) = self.bigint_value(&value)? {
                     let result = bigint - NumBigInt::one();
                     ctx.set_register(dst.0, Value::bigint(result.to_string()));
                     return Ok(InstructionResult::Continue);
                 }
 
-                let val = self.coerce_number(value)?;
+                let val = self.coerce_number(ctx, value)?;
                 ctx.set_register(dst.0, Value::number(val - 1.0));
                 Ok(InstructionResult::Continue)
             }
@@ -1704,16 +1704,16 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                let left_value = ctx.get_register(lhs.0);
-                let right_value = ctx.get_register(rhs.0);
+                let left_value = ctx.get_register(lhs.0).clone();
+                let right_value = ctx.get_register(rhs.0).clone();
 
                 // Collect type feedback and check for quickening opportunity
                 let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
                         let mut feedback = func.feedback_vector.write();
                         if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
-                            Self::observe_value_type(&mut meta.type_observations, left_value);
-                            Self::observe_value_type(&mut meta.type_observations, right_value);
+                            Self::observe_value_type(&mut meta.type_observations, &left_value);
+                            Self::observe_value_type(&mut meta.type_observations, &right_value);
                             meta.type_observations.is_int32_only()
                         } else {
                             false
@@ -1736,8 +1736,8 @@ impl Interpreter {
                 }
 
                 // Generic path
-                let left_bigint = self.bigint_value(left_value)?;
-                let right_bigint = self.bigint_value(right_value)?;
+                let left_bigint = self.bigint_value(&left_value)?;
+                let right_bigint = self.bigint_value(&right_value)?;
 
                 if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
                     let result = left_bigint * right_bigint;
@@ -1749,8 +1749,8 @@ impl Interpreter {
                     return Err(VmError::type_error("Cannot mix BigInt and other types"));
                 }
 
-                let left = self.coerce_number(left_value)?;
-                let right = self.coerce_number(right_value)?;
+                let left = self.coerce_number(ctx, left_value)?;
+                let right = self.coerce_number(ctx, right_value)?;
 
                 ctx.set_register(dst.0, Value::number(left * right));
                 Ok(InstructionResult::Continue)
@@ -1762,16 +1762,16 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                let left_value = ctx.get_register(lhs.0);
-                let right_value = ctx.get_register(rhs.0);
+                let left_value = ctx.get_register(lhs.0).clone();
+                let right_value = ctx.get_register(rhs.0).clone();
 
                 // Collect type feedback and check for quickening opportunity
                 let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
                         let mut feedback = func.feedback_vector.write();
                         if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
-                            Self::observe_value_type(&mut meta.type_observations, left_value);
-                            Self::observe_value_type(&mut meta.type_observations, right_value);
+                            Self::observe_value_type(&mut meta.type_observations, &left_value);
+                            Self::observe_value_type(&mut meta.type_observations, &right_value);
                             meta.type_observations.is_int32_only()
                         } else {
                             false
@@ -1795,8 +1795,8 @@ impl Interpreter {
                 }
 
                 // Generic path
-                let left_bigint = self.bigint_value(left_value)?;
-                let right_bigint = self.bigint_value(right_value)?;
+                let left_bigint = self.bigint_value(&left_value)?;
+                let right_bigint = self.bigint_value(&right_value)?;
 
                 if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
                     if right_bigint.is_zero() {
@@ -1811,8 +1811,8 @@ impl Interpreter {
                     return Err(VmError::type_error("Cannot mix BigInt and other types"));
                 }
 
-                let left = self.coerce_number(left_value)?;
-                let right = self.coerce_number(right_value)?;
+                let left = self.coerce_number(ctx, left_value)?;
+                let right = self.coerce_number(ctx, right_value)?;
 
                 ctx.set_register(dst.0, Value::number(left / right));
                 Ok(InstructionResult::Continue)
@@ -1825,8 +1825,8 @@ impl Interpreter {
                 rhs,
                 feedback_index: _,
             } => {
-                let left = ctx.get_register(lhs.0);
-                let right = ctx.get_register(rhs.0);
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
 
                 // Fast path: both operands are int32
                 if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
@@ -1838,7 +1838,7 @@ impl Interpreter {
                 }
 
                 // Fallback to generic add
-                let result = self.op_add(left, right)?;
+                let result = self.op_add(ctx, &left, &right)?;
                 ctx.set_register(dst.0, result);
                 Ok(InstructionResult::Continue)
             }
@@ -1849,8 +1849,8 @@ impl Interpreter {
                 rhs,
                 feedback_index: _,
             } => {
-                let left = ctx.get_register(lhs.0);
-                let right = ctx.get_register(rhs.0);
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
 
                 // Fast path: both operands are int32
                 if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
@@ -1861,8 +1861,8 @@ impl Interpreter {
                 }
 
                 // Fallback to generic sub
-                let left_num = self.coerce_number(left)?;
-                let right_num = self.coerce_number(right)?;
+                let left_num = self.coerce_number(ctx, left)?;
+                let right_num = self.coerce_number(ctx, right)?;
                 ctx.set_register(dst.0, Value::number(left_num - right_num));
                 Ok(InstructionResult::Continue)
             }
@@ -1873,8 +1873,8 @@ impl Interpreter {
                 rhs,
                 feedback_index: _,
             } => {
-                let left = ctx.get_register(lhs.0);
-                let right = ctx.get_register(rhs.0);
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
 
                 // Fast path: both operands are int32
                 if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
@@ -1885,8 +1885,8 @@ impl Interpreter {
                 }
 
                 // Fallback to generic mul
-                let left_num = self.coerce_number(left)?;
-                let right_num = self.coerce_number(right)?;
+                let left_num = self.coerce_number(ctx, left)?;
+                let right_num = self.coerce_number(ctx, right)?;
                 ctx.set_register(dst.0, Value::number(left_num * right_num));
                 Ok(InstructionResult::Continue)
             }
@@ -1897,8 +1897,8 @@ impl Interpreter {
                 rhs,
                 feedback_index: _,
             } => {
-                let left = ctx.get_register(lhs.0);
-                let right = ctx.get_register(rhs.0);
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
 
                 // Fast path: both operands are int32 and divide evenly
                 if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
@@ -1911,8 +1911,8 @@ impl Interpreter {
                 }
 
                 // Fallback to generic div (produces f64)
-                let left_num = self.coerce_number(left)?;
-                let right_num = self.coerce_number(right)?;
+                let left_num = self.coerce_number(ctx, left)?;
+                let right_num = self.coerce_number(ctx, right)?;
                 ctx.set_register(dst.0, Value::number(left_num / right_num));
                 Ok(InstructionResult::Continue)
             }
@@ -1923,8 +1923,8 @@ impl Interpreter {
                 rhs,
                 feedback_index: _,
             } => {
-                let left = ctx.get_register(lhs.0);
-                let right = ctx.get_register(rhs.0);
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
 
                 // Fast path: both operands are numbers
                 if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
@@ -1933,7 +1933,7 @@ impl Interpreter {
                 }
 
                 // Fallback to generic add
-                let result = self.op_add(left, right)?;
+                let result = self.op_add(ctx, &left, &right)?;
                 ctx.set_register(dst.0, result);
                 Ok(InstructionResult::Continue)
             }
@@ -1944,8 +1944,8 @@ impl Interpreter {
                 rhs,
                 feedback_index: _,
             } => {
-                let left = ctx.get_register(lhs.0);
-                let right = ctx.get_register(rhs.0);
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
 
                 // Fast path: both operands are numbers
                 if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
@@ -1954,8 +1954,8 @@ impl Interpreter {
                 }
 
                 // Fallback to generic sub
-                let left_num = self.coerce_number(left)?;
-                let right_num = self.coerce_number(right)?;
+                let left_num = self.coerce_number(ctx, left)?;
+                let right_num = self.coerce_number(ctx, right)?;
                 ctx.set_register(dst.0, Value::number(left_num - right_num));
                 Ok(InstructionResult::Continue)
             }
@@ -1966,8 +1966,8 @@ impl Interpreter {
                 rhs,
                 feedback_index: _,
             } => {
-                let left = ctx.get_register(lhs.0);
-                let right = ctx.get_register(rhs.0);
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
 
                 // Fast path: both operands are numbers
                 if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
@@ -1976,8 +1976,8 @@ impl Interpreter {
                 }
 
                 // Fallback to generic mul
-                let left_num = self.coerce_number(left)?;
-                let right_num = self.coerce_number(right)?;
+                let left_num = self.coerce_number(ctx, left)?;
+                let right_num = self.coerce_number(ctx, right)?;
                 ctx.set_register(dst.0, Value::number(left_num * right_num));
                 Ok(InstructionResult::Continue)
             }
@@ -1988,8 +1988,8 @@ impl Interpreter {
                 rhs,
                 feedback_index: _,
             } => {
-                let left = ctx.get_register(lhs.0);
-                let right = ctx.get_register(rhs.0);
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
 
                 // Fast path: both operands are numbers
                 if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
@@ -1998,17 +1998,17 @@ impl Interpreter {
                 }
 
                 // Fallback to generic div
-                let left_num = self.coerce_number(left)?;
-                let right_num = self.coerce_number(right)?;
+                let left_num = self.coerce_number(ctx, left)?;
+                let right_num = self.coerce_number(ctx, right)?;
                 ctx.set_register(dst.0, Value::number(left_num / right_num));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Mod { dst, lhs, rhs } => {
-                let left_value = ctx.get_register(lhs.0);
-                let right_value = ctx.get_register(rhs.0);
-                let left_bigint = self.bigint_value(left_value)?;
-                let right_bigint = self.bigint_value(right_value)?;
+                let left_value = ctx.get_register(lhs.0).clone();
+                let right_value = ctx.get_register(rhs.0).clone();
+                let left_bigint = self.bigint_value(&left_value)?;
+                let right_bigint = self.bigint_value(&right_value)?;
 
                 if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
                     if right_bigint.is_zero() {
@@ -2023,18 +2023,18 @@ impl Interpreter {
                     return Err(VmError::type_error("Cannot mix BigInt and other types"));
                 }
 
-                let left = self.coerce_number(left_value)?;
-                let right = self.coerce_number(right_value)?;
+                let left = self.coerce_number(ctx, left_value)?;
+                let right = self.coerce_number(ctx, right_value)?;
 
                 ctx.set_register(dst.0, Value::number(left % right));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Pow { dst, lhs, rhs } => {
-                let left_value = ctx.get_register(lhs.0);
-                let right_value = ctx.get_register(rhs.0);
-                let left_bigint = self.bigint_value(left_value)?;
-                let right_bigint = self.bigint_value(right_value)?;
+                let left_value = ctx.get_register(lhs.0).clone();
+                let right_value = ctx.get_register(rhs.0).clone();
+                let left_bigint = self.bigint_value(&left_value)?;
+                let right_bigint = self.bigint_value(&right_value)?;
 
                 if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
                     if right_bigint < NumBigInt::zero() {
@@ -2054,15 +2054,15 @@ impl Interpreter {
                     return Err(VmError::type_error("Cannot mix BigInt and other types"));
                 }
 
-                let left = self.coerce_number(left_value)?;
-                let right = self.coerce_number(right_value)?;
+                let left = self.coerce_number(ctx, left_value)?;
+                let right = self.coerce_number(ctx, right_value)?;
 
                 ctx.set_register(dst.0, Value::number(left.powf(right)));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Neg { dst, src } => {
-                let val = ctx.get_register(src.0);
+                let val = ctx.get_register(src.0).clone();
                 if let Some(crate::value::HeapRef::BigInt(b)) = val.heap_ref() {
                     let s = &b.value;
                     let result_s = if s.starts_with('-') {
@@ -2076,7 +2076,7 @@ impl Interpreter {
                     return Ok(InstructionResult::Continue);
                 }
 
-                let value = self.coerce_number(val)?;
+                let value = self.coerce_number(ctx, val)?;
 
                 ctx.set_register(dst.0, Value::number(-value));
                 Ok(InstructionResult::Continue)
@@ -2084,28 +2084,28 @@ impl Interpreter {
 
             // ==================== Comparison ====================
             Instruction::Eq { dst, lhs, rhs } => {
-                let left = ctx.get_register(lhs.0);
-                let right = ctx.get_register(rhs.0);
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
 
-                let result = self.abstract_equal(left, right);
+                let result = self.abstract_equal(&left, &right);
                 ctx.set_register(dst.0, Value::boolean(result));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Ne { dst, lhs, rhs } => {
-                let left = ctx.get_register(lhs.0);
-                let right = ctx.get_register(rhs.0);
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
 
-                let result = !self.abstract_equal(left, right);
+                let result = !self.abstract_equal(&left, &right);
                 ctx.set_register(dst.0, Value::boolean(result));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::StrictEq { dst, lhs, rhs } => {
-                let left = ctx.get_register(lhs.0);
-                let right = ctx.get_register(rhs.0);
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
 
-                let result = self.strict_equal(left, right);
+                let result = self.strict_equal(&left, &right);
                 if std::env::var("OTTER_TRACE_ASSERT_STREQ").is_ok() {
                     if let Some(frame) = ctx.current_frame() {
                         if let Some(func) = frame.module.function(frame.function_index) {
@@ -2126,10 +2126,10 @@ impl Interpreter {
             }
 
             Instruction::StrictNe { dst, lhs, rhs } => {
-                let left = ctx.get_register(lhs.0);
-                let right = ctx.get_register(rhs.0);
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
 
-                let result = !self.strict_equal(left, right);
+                let result = !self.strict_equal(&left, &right);
                 ctx.set_register(dst.0, Value::boolean(result));
                 Ok(InstructionResult::Continue)
             }
@@ -2544,7 +2544,7 @@ impl Interpreter {
             }
 
             Instruction::JumpIfFalse { cond, offset } => {
-                let cond_val = ctx.get_register(cond.0);
+                let cond_val = ctx.get_register(cond.0).clone();
                 if std::env::var("OTTER_TRACE_ASSERT_JIF").is_ok() {
                     if let Some(frame) = ctx.current_frame() {
                         if let Some(func) = frame.module.function(frame.function_index) {
@@ -3340,7 +3340,7 @@ impl Interpreter {
                             let argc_usize = *argc as usize;
                             for i in 0..=argc_usize {
                                 let reg = Register(obj.0 + i as u16);
-                                let val = ctx.get_register(reg.0);
+                                let val = ctx.get_register(reg.0).clone();
                                 eprintln!("  call_reg[{}]=r{} type={}", i, reg.0, val.type_of());
                             }
                             for (idx, local) in frame.locals.iter().enumerate().take(4) {
@@ -3553,7 +3553,7 @@ impl Interpreter {
                                     iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(false));
                                     let js_queue = js_queue.clone();
-                                    promise.resolve_with_js_jobs(
+                                    JsPromise::resolve_with_js_jobs(promise, 
                                         Value::object(iter_result),
                                         move |job, args| {
                                             if let Some(queue) = &js_queue {
@@ -3571,7 +3571,7 @@ impl Interpreter {
                                     iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(true));
                                     let js_queue = js_queue.clone();
-                                    promise.resolve_with_js_jobs(
+                                    JsPromise::resolve_with_js_jobs(promise, 
                                         Value::object(iter_result),
                                         move |job, args| {
                                             if let Some(queue) = &js_queue {
@@ -3583,7 +3583,7 @@ impl Interpreter {
                                 GeneratorResult::Error(e) => {
                                     let error_msg = e.to_string();
                                     let js_queue = js_queue.clone();
-                                    promise.reject_with_js_jobs(
+                                    JsPromise::reject_with_js_jobs(promise, 
                                         Value::string(JsString::intern(&error_msg)),
                                         move |job, args| {
                                             if let Some(queue) = &js_queue {
@@ -3615,7 +3615,7 @@ impl Interpreter {
                                             Value::boolean(false),
                                         );
                                         let js_queue = js_queue.clone();
-                                        result_promise.resolve_with_js_jobs(
+                                        JsPromise::resolve_with_js_jobs(result_promise, 
                                             Value::object(iter_result),
                                             move |job, args| {
                                                 if let Some(queue) = &js_queue {
@@ -3979,11 +3979,11 @@ impl Interpreter {
                 // 1. Check if it's a raw VM promise
                 // 2. Check if it's a JS Promise wrapper with _internal property
                 let promise_opt = if value.as_promise().is_some() {
-                    value.as_promise().cloned()
+                    value.as_promise()
                 } else if let Some(obj) = value.as_object() {
                     // Check for JS Promise wrapper: { _internal: <vm_promise> }
                     obj.get(&PropertyKey::string("_internal"))
-                        .and_then(|v| v.as_promise().cloned())
+                        .and_then(|v| v.as_promise())
                 } else {
                     None
                 };
@@ -4005,7 +4005,7 @@ impl Interpreter {
                         PromiseState::Pending | PromiseState::PendingThenable(_) => {
                             // Promise is pending, suspend execution
                             Ok(InstructionResult::Suspend {
-                                promise: Arc::clone(&promise),
+                                promise,
                                 resume_reg: dst.0,
                             })
                         }
@@ -5327,12 +5327,12 @@ impl Interpreter {
             }
 
             Instruction::DefineGetter { obj, key, func } => {
-                let object = ctx.get_register(obj.0);
-                let key_value = ctx.get_register(key.0);
+                let object = ctx.get_register(obj.0).clone();
+                let key_value = ctx.get_register(key.0).clone();
                 let getter_fn = ctx.get_register(func.0).clone();
 
                 if let Some(obj) = object.as_object() {
-                    let prop_key = self.value_to_property_key(key_value);
+                    let prop_key = self.value_to_property_key(&key_value);
 
                     // Check if there's already an accessor with a setter
                     let existing_setter =
@@ -5354,12 +5354,12 @@ impl Interpreter {
             }
 
             Instruction::DefineSetter { obj, key, func } => {
-                let object = ctx.get_register(obj.0);
-                let key_value = ctx.get_register(key.0);
+                let object = ctx.get_register(obj.0).clone();
+                let key_value = ctx.get_register(key.0).clone();
                 let setter_fn = ctx.get_register(func.0).clone();
 
                 if let Some(obj) = object.as_object() {
-                    let prop_key = self.value_to_property_key(key_value);
+                    let prop_key = self.value_to_property_key(&key_value);
 
                     // Check if there's already an accessor with a getter
                     let existing_getter =
@@ -5829,7 +5829,7 @@ impl Interpreter {
                                     iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(false));
                                     let js_queue = js_queue.clone();
-                                    promise.resolve_with_js_jobs(
+                                    JsPromise::resolve_with_js_jobs(promise, 
                                         Value::object(iter_result),
                                         move |job, args| {
                                             if let Some(queue) = &js_queue {
@@ -5847,7 +5847,7 @@ impl Interpreter {
                                     iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(true));
                                     let js_queue = js_queue.clone();
-                                    promise.resolve_with_js_jobs(
+                                    JsPromise::resolve_with_js_jobs(promise, 
                                         Value::object(iter_result),
                                         move |job, args| {
                                             if let Some(queue) = &js_queue {
@@ -5859,7 +5859,7 @@ impl Interpreter {
                                 GeneratorResult::Error(e) => {
                                     let error_msg = e.to_string();
                                     let js_queue = js_queue.clone();
-                                    promise.reject_with_js_jobs(
+                                    JsPromise::reject_with_js_jobs(promise, 
                                         Value::string(JsString::intern(&error_msg)),
                                         move |job, args| {
                                             if let Some(queue) = &js_queue {
@@ -5886,7 +5886,7 @@ impl Interpreter {
                                             Value::boolean(false),
                                         );
                                         let js_queue = js_queue.clone();
-                                        result_promise.resolve_with_js_jobs(
+                                        JsPromise::resolve_with_js_jobs(result_promise, 
                                             Value::object(iter_result),
                                             move |job, args| {
                                                 if let Some(queue) = &js_queue {
@@ -6072,8 +6072,8 @@ impl Interpreter {
 
             Instruction::Spread { dst, src } => {
                 // Spread elements from src array into dst array
-                let dst_arr = ctx.get_register(dst.0);
-                let src_arr = ctx.get_register(src.0);
+                let dst_arr = ctx.get_register(dst.0).clone();
+                let src_arr = ctx.get_register(src.0).clone();
 
                 if let (Some(dst_obj), Some(src_obj)) = (dst_arr.as_object(), src_arr.as_object()) {
                     // Get current length of dst array
@@ -6144,7 +6144,7 @@ impl Interpreter {
                 const SYMBOL_ITERATOR_ID: u64 = 1;
                 let iterator_method = if let Some(proxy) = obj.as_proxy() {
                     let key = PropertyKey::Symbol(SYMBOL_ITERATOR_ID);
-                    let key_value = Value::symbol(Arc::new(crate::value::Symbol {
+                    let key_value = Value::symbol(GcRef::new(crate::value::Symbol {
                         description: None,
                         id: SYMBOL_ITERATOR_ID,
                     }));
@@ -6203,7 +6203,7 @@ impl Interpreter {
 
                 let mut iterator_method = if let Some(proxy) = obj.as_proxy() {
                     let key = PropertyKey::Symbol(SYMBOL_ASYNC_ITERATOR_ID);
-                    let key_value = Value::symbol(Arc::new(crate::value::Symbol {
+                    let key_value = Value::symbol(GcRef::new(crate::value::Symbol {
                         description: None,
                         id: SYMBOL_ASYNC_ITERATOR_ID,
                     }));
@@ -6228,7 +6228,7 @@ impl Interpreter {
                 if iterator_method.is_none() {
                     if let Some(proxy) = obj.as_proxy() {
                         let key = PropertyKey::Symbol(SYMBOL_ITERATOR_ID);
-                        let key_value = Value::symbol(Arc::new(crate::value::Symbol {
+                        let key_value = Value::symbol(GcRef::new(crate::value::Symbol {
                             description: None,
                             id: SYMBOL_ITERATOR_ID,
                         }));
@@ -6638,45 +6638,58 @@ impl Interpreter {
 
             // ==================== Bitwise operators ====================
             Instruction::BitAnd { dst, lhs, rhs } => {
-                let l = self.to_int32_from(self.coerce_number(ctx.get_register(lhs.0))?);
-                let r = self.to_int32_from(self.coerce_number(ctx.get_register(rhs.0))?);
+                let l_val = ctx.get_register(lhs.0).clone();
+                let r_val = ctx.get_register(rhs.0).clone();
+                let l = self.to_int32_from(self.coerce_number(ctx, l_val)?);
+                let r = self.to_int32_from(self.coerce_number(ctx, r_val)?);
                 ctx.set_register(dst.0, Value::number((l & r) as f64));
                 Ok(InstructionResult::Continue)
             }
             Instruction::BitOr { dst, lhs, rhs } => {
-                let l = self.to_int32_from(self.coerce_number(ctx.get_register(lhs.0))?);
-                let r = self.to_int32_from(self.coerce_number(ctx.get_register(rhs.0))?);
+                let l_val = ctx.get_register(lhs.0).clone();
+                let r_val = ctx.get_register(rhs.0).clone();
+                let l = self.to_int32_from(self.coerce_number(ctx, l_val)?);
+                let r = self.to_int32_from(self.coerce_number(ctx, r_val)?);
                 ctx.set_register(dst.0, Value::number((l | r) as f64));
                 Ok(InstructionResult::Continue)
             }
             Instruction::BitXor { dst, lhs, rhs } => {
-                let l = self.to_int32_from(self.coerce_number(ctx.get_register(lhs.0))?);
-                let r = self.to_int32_from(self.coerce_number(ctx.get_register(rhs.0))?);
+                let l_val = ctx.get_register(lhs.0).clone();
+                let r_val = ctx.get_register(rhs.0).clone();
+                let l = self.to_int32_from(self.coerce_number(ctx, l_val)?);
+                let r = self.to_int32_from(self.coerce_number(ctx, r_val)?);
                 ctx.set_register(dst.0, Value::number((l ^ r) as f64));
                 Ok(InstructionResult::Continue)
             }
             Instruction::BitNot { dst, src } => {
-                let v = self.to_int32_from(self.coerce_number(ctx.get_register(src.0))?);
+                let v_val = ctx.get_register(src.0).clone();
+                let v = self.to_int32_from(self.coerce_number(ctx, v_val)?);
                 ctx.set_register(dst.0, Value::number((!v) as f64));
                 Ok(InstructionResult::Continue)
             }
             Instruction::Shl { dst, lhs, rhs } => {
-                let l = self.to_int32_from(self.coerce_number(ctx.get_register(lhs.0))?);
-                let r = self.to_uint32_from(self.coerce_number(ctx.get_register(rhs.0))?);
+                let l_val = ctx.get_register(lhs.0).clone();
+                let r_val = ctx.get_register(rhs.0).clone();
+                let l = self.to_int32_from(self.coerce_number(ctx, l_val)?);
+                let r = self.to_uint32_from(self.coerce_number(ctx, r_val)?);
                 let shift = (r & 0x1f) as u32;
                 ctx.set_register(dst.0, Value::number((l.wrapping_shl(shift)) as f64));
                 Ok(InstructionResult::Continue)
             }
             Instruction::Shr { dst, lhs, rhs } => {
-                let l = self.to_int32_from(self.coerce_number(ctx.get_register(lhs.0))?);
-                let r = self.to_uint32_from(self.coerce_number(ctx.get_register(rhs.0))?);
+                let l_val = ctx.get_register(lhs.0).clone();
+                let r_val = ctx.get_register(rhs.0).clone();
+                let l = self.to_int32_from(self.coerce_number(ctx, l_val)?);
+                let r = self.to_uint32_from(self.coerce_number(ctx, r_val)?);
                 let shift = (r & 0x1f) as u32;
                 ctx.set_register(dst.0, Value::number((l.wrapping_shr(shift)) as f64));
                 Ok(InstructionResult::Continue)
             }
             Instruction::Ushr { dst, lhs, rhs } => {
-                let l = self.to_uint32_from(self.coerce_number(ctx.get_register(lhs.0))?);
-                let r = self.to_uint32_from(self.coerce_number(ctx.get_register(rhs.0))?);
+                let l_val = ctx.get_register(lhs.0).clone();
+                let r_val = ctx.get_register(rhs.0).clone();
+                let l = self.to_uint32_from(self.coerce_number(ctx, l_val)?);
+                let r = self.to_uint32_from(self.coerce_number(ctx, r_val)?);
                 let shift = (r & 0x1f) as u32;
                 ctx.set_register(dst.0, Value::number((l.wrapping_shr(shift)) as f64));
                 Ok(InstructionResult::Continue)
@@ -6718,7 +6731,7 @@ impl Interpreter {
                     None
                 };
 
-                let js_regex = Arc::new(JsRegExp::new(
+                let js_regex = GcRef::new(JsRegExp::new(
                     pattern.to_string(),
                     flags.to_string(),
                     proto,
@@ -6730,7 +6743,7 @@ impl Interpreter {
                 Err(VmError::internal("Template literals not yet supported"))
             }
             Constant::Symbol(id) => {
-                let sym = Arc::new(crate::value::Symbol {
+                let sym = GcRef::new(crate::value::Symbol {
                     id: *id,
                     description: None,
                 });
@@ -7100,7 +7113,7 @@ impl Interpreter {
                             iter_result.set(PropertyKey::string("value"), v);
                             iter_result.set(PropertyKey::string("done"), Value::boolean(false));
                             let js_queue = js_queue.clone();
-                            promise.resolve_with_js_jobs(
+                            JsPromise::resolve_with_js_jobs(promise, 
                                 Value::object(iter_result),
                                 move |job, args| {
                                     if let Some(queue) = &js_queue {
@@ -7117,7 +7130,7 @@ impl Interpreter {
                             iter_result.set(PropertyKey::string("value"), v);
                             iter_result.set(PropertyKey::string("done"), Value::boolean(true));
                             let js_queue = js_queue.clone();
-                            promise.resolve_with_js_jobs(
+                            JsPromise::resolve_with_js_jobs(promise, 
                                 Value::object(iter_result),
                                 move |job, args| {
                                     if let Some(queue) = &js_queue {
@@ -7129,7 +7142,7 @@ impl Interpreter {
                         GeneratorResult::Error(e) => {
                             let error_msg = e.to_string();
                             let js_queue = js_queue.clone();
-                            promise.reject_with_js_jobs(
+                            JsPromise::reject_with_js_jobs(promise, 
                                 Value::string(JsString::intern(&error_msg)),
                                 move |job, args| {
                                     if let Some(queue) = &js_queue {
@@ -7151,7 +7164,7 @@ impl Interpreter {
                                 iter_result.set(PropertyKey::string("value"), resolved_value);
                                 iter_result.set(PropertyKey::string("done"), Value::boolean(false));
                                 let js_queue = js_queue.clone();
-                                result_promise.resolve_with_js_jobs(
+                                JsPromise::resolve_with_js_jobs(result_promise, 
                                     Value::object(iter_result),
                                     move |job, args| {
                                         if let Some(queue) = &js_queue {
@@ -7266,7 +7279,7 @@ impl Interpreter {
     }
 
     /// Add operation (handles string concatenation)
-    fn op_add(&self, left: &Value, right: &Value) -> VmResult<Value> {
+    fn op_add(&self, ctx: &mut VmContext, left: &Value, right: &Value) -> VmResult<Value> {
         // String concatenation
         if left.is_string() || right.is_string() {
             let left_str = self.to_string(left);
@@ -7288,8 +7301,8 @@ impl Interpreter {
         }
 
         // Numeric addition
-        let left_num = self.coerce_number(left)?;
-        let right_num = self.coerce_number(right)?;
+        let left_num = self.coerce_number(ctx, left.clone())?;
+        let right_num = self.coerce_number(ctx, right.clone())?;
         Ok(Value::number(left_num + right_num))
     }
 
@@ -7416,7 +7429,7 @@ impl Interpreter {
 
     /// Create a JavaScript Promise object from an internal promise
     /// This creates an object with _internal field and copies methods from Promise.prototype
-    fn create_js_promise(&self, ctx: &VmContext, internal: Arc<JsPromise>) -> Value {
+    fn create_js_promise(&self, ctx: &VmContext, internal: GcRef<JsPromise>) -> Value {
         let obj = GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
 
         // Set _internal to the raw promise
@@ -7447,6 +7460,51 @@ impl Interpreter {
         Value::object(obj)
     }
 
+    /// Convert object to primitive using valueOf/toString (number hint).
+    fn to_primitive_number(&self, ctx: &mut VmContext, value: &Value) -> VmResult<Value> {
+        if !value.is_object() {
+            return Ok(value.clone());
+        }
+        let Some(obj) = value.as_object() else {
+            return Ok(value.clone());
+        };
+        if let Some(prim) = obj.get(&PropertyKey::string("__value__")) {
+            if !prim.is_object() {
+                return Ok(prim);
+            }
+        }
+        if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
+            if !prim.is_object() {
+                return Ok(prim);
+            }
+        }
+        let try_method = |name: &str,
+                          this_val: &Value,
+                          obj: &GcRef<JsObject>,
+                          ctx: &mut VmContext,
+                          interp: &Interpreter|
+         -> VmResult<Option<Value>> {
+            if let Some(method) = obj.get(&PropertyKey::string(name)) {
+                if method.is_callable() {
+                    let result = interp.call_function(ctx, &method, this_val.clone(), &[])?;
+                    if !result.is_object() {
+                        return Ok(Some(result));
+                    }
+                }
+            }
+            Ok(None)
+        };
+
+        if let Some(result) = try_method("valueOf", value, &obj, ctx, self)? {
+            return Ok(result);
+        }
+        if let Some(result) = try_method("toString", value, &obj, ctx, self)? {
+            return Ok(result);
+        }
+
+        Err(VmError::type_error("Cannot convert object to primitive value"))
+    }
+
     /// Convert value to number (very small ToNumber subset).
     fn to_number(&self, value: &Value) -> f64 {
         if let Some(n) = value.as_number() {
@@ -7467,6 +7525,15 @@ impl Interpreter {
                 return 0.0;
             }
             return trimmed.parse::<f64>().unwrap_or(f64::NAN);
+        }
+        if let Some(obj) = value.as_object() {
+            use crate::object::PropertyKey;
+            if let Some(prim) = obj.get(&PropertyKey::string("__value__")) {
+                return self.to_number(&prim);
+            }
+            if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
+                return self.to_number(&prim);
+            }
         }
         f64::NAN
     }
@@ -7531,11 +7598,19 @@ impl Interpreter {
         Value::object(obj)
     }
 
-    fn coerce_number(&self, value: &Value) -> VmResult<f64> {
+    fn coerce_number(&self, ctx: &mut VmContext, value: Value) -> VmResult<f64> {
         if value.is_symbol() || value.is_bigint() {
             return Err(VmError::type_error("Cannot convert to number"));
         }
-        Ok(self.to_number(value))
+        let prim = if value.is_object() {
+            self.to_primitive_number(ctx, &value)?
+        } else {
+            value
+        };
+        if prim.is_bigint() {
+            return Err(VmError::type_error("Cannot convert to number"));
+        }
+        Ok(self.to_number(&prim))
     }
 
     fn bigint_value(&self, value: &Value) -> VmResult<Option<NumBigInt>> {
@@ -7547,7 +7622,7 @@ impl Interpreter {
     }
 
     fn to_numeric(&self, value: &Value) -> VmResult<Numeric> {
-        if let Some(bigint) = self.bigint_value(value)? {
+        if let Some(bigint) = self.bigint_value(&value)? {
             return Ok(Numeric::BigInt(bigint));
         }
         if value.is_symbol() {
@@ -7879,7 +7954,7 @@ pub enum GeneratorResult {
     /// Async generator suspended on await (waiting for promise)
     Suspended {
         /// The promise being awaited
-        promise: Arc<JsPromise>,
+        promise: GcRef<JsPromise>,
         /// The register to store the resolved value
         resume_reg: u16,
         /// The generator (for resumption)
@@ -8577,7 +8652,7 @@ enum InstructionResult {
     },
     /// Suspend execution waiting for Promise
     Suspend {
-        promise: Arc<JsPromise>,
+        promise: GcRef<JsPromise>,
         resume_reg: u16,
     },
     /// Yield from generator

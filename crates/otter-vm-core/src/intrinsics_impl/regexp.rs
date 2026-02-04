@@ -22,7 +22,7 @@ use std::sync::Arc;
 // ============================================================================
 
 /// Extract the JsRegExp from a this value, returning a TypeError if not a regex.
-fn get_regex(this_val: &Value) -> Result<&Arc<JsRegExp>, VmError> {
+fn get_regex(this_val: &Value) -> Result<GcRef<JsRegExp>, VmError> {
     this_val
         .as_regex()
         .ok_or_else(|| VmError::type_error("Method called on incompatible receiver"))
@@ -89,7 +89,7 @@ fn find_all(regex: &JsRegExp, input: &JsString) -> Vec<regress::Match> {
     let len = input.len_utf16();
 
     while start <= len {
-        let next = find_first(regex, input, start);
+        let next = find_first(&*regex, input, start);
         let Some(mat) = next else { break };
         let end = mat.end();
         let begin = mat.start();
@@ -243,7 +243,7 @@ pub fn init_regexp_prototype(
                     .first()
                     .map(val_to_js_string)
                     .unwrap_or_else(|| JsString::intern("undefined"));
-                Ok(Value::boolean(find_first(regex, &input, 0).is_some()))
+                Ok(Value::boolean(find_first(&*regex, &input, 0).is_some()))
             },
             mm.clone(),
             fn_proto,
@@ -262,7 +262,7 @@ pub fn init_regexp_prototype(
                     .first()
                     .map(val_to_js_string)
                     .unwrap_or_else(|| JsString::intern("undefined"));
-                match find_first(regex, &input, 0) {
+                match find_first(&*regex, &input, 0) {
                     Some(mat) => Ok(build_exec_result(&input, &mat, ncx.memory_manager())),
                     None => Ok(Value::null()),
                 }
@@ -312,7 +312,7 @@ pub fn init_regexp_prototype(
 
                 if is_global {
                     // Global: return array of all match strings
-                    let matches = find_all(regex, &input);
+                    let matches = find_all(&*regex, &input);
                     if matches.is_empty() {
                         return Ok(Value::null());
                     }
@@ -328,7 +328,7 @@ pub fn init_regexp_prototype(
                     Ok(Value::array(GcRef::new(arr)))
                 } else {
                     // Non-global: same as exec
-                    match find_first(regex, &input, 0) {
+                    match find_first(&*regex, &input, 0) {
                         Some(mat) => Ok(build_exec_result(&input, &mat, ncx.memory_manager())),
                         None => Ok(Value::null()),
                     }
@@ -358,7 +358,7 @@ pub fn init_regexp_prototype(
                     ));
                 }
 
-                let matches = find_all(regex, &input);
+                let matches = find_all(&*regex, &input);
                 let arr = JsObject::array(matches.len(), ncx.memory_manager().clone());
                 for (i, mat) in matches.iter().enumerate() {
                     let exec_result = build_exec_result(&input, mat, ncx.memory_manager());
@@ -391,9 +391,9 @@ pub fn init_regexp_prototype(
 
                 let is_global = regex.flags.contains('g');
                 let matches = if is_global {
-                    find_all(regex, &input)
+                    find_all(&*regex, &input)
                 } else {
-                    find_first(regex, &input, 0)
+                    find_first(&*regex, &input, 0)
                         .into_iter()
                         .collect()
                 };
@@ -440,7 +440,7 @@ pub fn init_regexp_prototype(
                     .first()
                     .map(val_to_js_string)
                     .unwrap_or_else(|| JsString::intern("undefined"));
-                match find_first(regex, &input, 0) {
+                match find_first(&*regex, &input, 0) {
                     Some(mat) => Ok(Value::int32(mat.start() as i32)),
                     None => Ok(Value::int32(-1)),
                 }
@@ -477,7 +477,7 @@ pub fn init_regexp_prototype(
                 let mut parts: Vec<Value> = Vec::new();
                 let mut last_end: usize = 0;
 
-                let matches = find_all(regex, &input);
+                let matches = find_all(&*regex, &input);
                 for mat in &matches {
                     if let Some(lim) = limit {
                         if parts.len() >= lim {
@@ -675,7 +675,7 @@ pub fn create_regexp_constructor(
             (p, f)
         };
 
-        let regex = Arc::new(JsRegExp::new(pattern, flags, Some(regexp_proto), ncx.memory_manager().clone()));
+        let regex = GcRef::new(JsRegExp::new(pattern, flags, Some(regexp_proto), ncx.memory_manager().clone()));
         Ok(Value::regex(regex))
     })
 }

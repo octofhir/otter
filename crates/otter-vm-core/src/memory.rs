@@ -2,6 +2,76 @@
 //!
 //! This module provides tools to track and limit heap allocations
 //! for JavaScript objects, strings, and other VM structures.
+//!
+//! # Separation of Concerns
+//!
+//! The MemoryManager is NOT a garbage collector - it's a lightweight
+//! accounting layer that decides *when* to trigger GC. The actual
+//! mark-sweep collection happens in the `otter-vm-gc` crate.
+//!
+//! | Component | Responsibility |
+//! |-----------|---------------|
+//! | MemoryManager | Track bytes, decide when to GC |
+//! | otter-vm-gc | Perform mark-sweep collection |
+//! | HandleScope | Provide safe GC boundaries |
+//!
+//! ## GC Decision Criteria
+//!
+//! GC is triggered when ANY of these conditions are met:
+//! 1. Explicit GC request (e.g., from Test262 harness via `gc_requested` flag)
+//! 2. Allocation count exceeds threshold (default 10,000 allocations)
+//! 3. Heap size exceeds adaptive threshold (2x live set size, minimum 1MB)
+//!
+//! ## Why MemoryManager is Separate from otter-vm-gc
+//!
+//! **Performance:** The interpreter checks `should_collect_garbage()` every
+//! ~10,000 instructions. This check must be extremely fast:
+//! - MemoryManager uses atomic operations (no locks)
+//! - Simple integer comparisons
+//! - No expensive registry lookups
+//!
+//! **otter-vm-gc** uses:
+//! - RwLock for AllocationRegistry
+//! - Per-object metadata (GcHeader)
+//! - Type-erased drop/trace function pointers
+//! - Tri-color marking algorithm
+//!
+//! Mixing these concerns would make the fast path (GC decision) slow.
+//!
+//! ## Adaptive Threshold
+//!
+//! The GC threshold adapts based on the live set size:
+//! - After GC completes, threshold = max(2 × live_bytes, MIN_GC_THRESHOLD)
+//! - Prevents thrashing when heap is small
+//! - Reduces GC frequency when heap is large and stable
+//!
+//! ## Usage Pattern
+//!
+//! ```ignore
+//! let mm = MemoryManager::new(10_000_000); // 10MB limit
+//!
+//! // Fast path: check if GC needed (called frequently)
+//! if mm.should_collect_garbage() {
+//!     // Slow path: run actual collection (otter-vm-gc)
+//!     let reclaimed = collect_garbage();
+//!     mm.on_gc_complete(live_bytes);
+//! }
+//!
+//! // Book memory for allocation
+//! mm.alloc(size)?;
+//! ```
+//!
+//! ## Architecture
+//!
+//! ```text
+//! VmContext (interpreter loop)
+//!     ↓ every ~10k instructions
+//! MemoryManager::should_collect_garbage() (fast atomic checks)
+//!     ↓ if true
+//! otter-vm-gc::collect() (expensive mark-sweep)
+//!     ↓ returns live_bytes
+//! MemoryManager::on_gc_complete() (update stats, reset threshold)
+//! ```
 
 use crate::error::{VmError, VmResult};
 use std::sync::Arc;

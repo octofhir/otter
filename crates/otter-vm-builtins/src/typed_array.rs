@@ -52,9 +52,9 @@ pub fn ops() -> Vec<Op> {
 }
 
 /// Helper to extract BigInt value from a Value
-fn get_bigint_value(value: &VmValue) -> Option<&Arc<BigInt>> {
+fn get_bigint_value(value: &VmValue) -> Option<GcRef<BigInt>> {
     match value.heap_ref() {
-        Some(HeapRef::BigInt(bi)) => Some(bi),
+        Some(HeapRef::BigInt(bi)) => Some(*bi),
         _ => None,
     }
 }
@@ -151,7 +151,7 @@ fn native_typed_array_create(
     let ta = JsTypedArray::new(object, ab, kind, byte_offset, actual_length)
         .map_err(|e| VmError::range_error(format!("{}", e)))?;
 
-    Ok(VmValue::typed_array(Arc::new(ta)))
+    Ok(VmValue::typed_array(GcRef::new(ta)))
 }
 
 /// Create TypedArray from length (creates new buffer)
@@ -170,7 +170,7 @@ fn native_typed_array_create_from_length(
     let kind = parse_kind(kind_str.as_str()).ok_or("TypeError: invalid TypedArray kind")?;
 
     let ta = JsTypedArray::with_length(kind, length, None, _mm);
-    Ok(VmValue::typed_array(Arc::new(ta)))
+    Ok(VmValue::typed_array(GcRef::new(ta)))
 }
 
 /// Create TypedArray from array-like (creates new buffer with values)
@@ -214,7 +214,7 @@ fn native_typed_array_create_from_array(
         }
     }
 
-    Ok(VmValue::typed_array(Arc::new(ta)))
+    Ok(VmValue::typed_array(GcRef::new(ta)))
 }
 
 // ============================================================================
@@ -374,7 +374,7 @@ fn native_typed_array_subarray(
     let new_ta = ta
         .subarray(begin, end)
         .map_err(|e| format!("TypeError: {}", e))?;
-    Ok(VmValue::typed_array(Arc::new(new_ta)))
+    Ok(VmValue::typed_array(GcRef::new(new_ta)))
 }
 
 /// Create slice (copy)
@@ -403,7 +403,7 @@ fn native_typed_array_slice(
     let new_ta = ta
         .slice(begin, end)
         .map_err(|e| format!("TypeError: {}", e))?;
-    Ok(VmValue::typed_array(Arc::new(new_ta)))
+    Ok(VmValue::typed_array(GcRef::new(new_ta)))
 }
 
 /// Fill with value

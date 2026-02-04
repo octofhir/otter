@@ -29,13 +29,13 @@ fn create_args_array(ncx: &mut NativeContext, args: &[Value]) -> GcRef<JsObject>
     arr
 }
 
-fn proxy_target_value(proxy: &Arc<JsProxy>) -> VmResult<Value> {
+fn proxy_target_value(proxy: GcRef<JsProxy>) -> VmResult<Value> {
     proxy
         .target()
         .ok_or_else(|| VmError::type_error("Proxy target is not available"))
 }
 
-fn proxy_handler_value(proxy: &Arc<JsProxy>) -> VmResult<Value> {
+fn proxy_handler_value(proxy: GcRef<JsProxy>) -> VmResult<Value> {
     proxy
         .handler()
         .ok_or_else(|| VmError::type_error("Proxy handler is not available"))
@@ -45,7 +45,7 @@ fn property_key_to_value(key: &PropertyKey) -> Value {
     match key {
         PropertyKey::String(s) => Value::string(*s),
         PropertyKey::Index(n) => Value::string(JsString::intern(&n.to_string())),
-        PropertyKey::Symbol(sym) => Value::symbol(Arc::new(crate::value::Symbol {
+        PropertyKey::Symbol(sym) => Value::symbol(GcRef::new(crate::value::Symbol {
             description: None,
             id: *sym,
         })),
@@ -256,7 +256,7 @@ fn target_prevent_extensions(ncx: &mut NativeContext, target: &Value) -> VmResul
 /// - `Err(...)` if the trap exists but threw an error or isn't callable
 fn invoke_trap(
     ncx: &mut NativeContext,
-    proxy: &Arc<JsProxy>,
+    proxy: GcRef<JsProxy>,
     trap_name: &str,
     args: &[Value],
 ) -> VmResult<Option<Value>> {
@@ -295,7 +295,7 @@ fn invoke_trap(
 /// Implements the `get` trap with proper invariant validation.
 pub fn proxy_get(
     ncx: &mut NativeContext,
-    proxy: &Arc<JsProxy>,
+    proxy: GcRef<JsProxy>,
     key: &PropertyKey,
     key_value: Value,
     receiver: Value,
@@ -372,7 +372,7 @@ fn validate_get_trap_invariants(
 /// Implements the `set` trap with proper invariant validation.
 pub fn proxy_set(
     ncx: &mut NativeContext,
-    proxy: &Arc<JsProxy>,
+    proxy: GcRef<JsProxy>,
     key: &PropertyKey,
     key_value: Value,
     value: Value,
@@ -453,7 +453,7 @@ fn validate_set_trap_invariants(
 /// Implements the `has` trap with proper invariant validation.
 pub fn proxy_has(
     ncx: &mut NativeContext,
-    proxy: &Arc<JsProxy>,
+    proxy: GcRef<JsProxy>,
     key: &PropertyKey,
     key_value: Value,
 ) -> VmResult<bool> {
@@ -516,7 +516,7 @@ fn validate_has_trap_invariants(
 /// Implements the `deleteProperty` trap with proper invariant validation.
 pub fn proxy_delete_property(
     ncx: &mut NativeContext,
-    proxy: &Arc<JsProxy>,
+    proxy: GcRef<JsProxy>,
     key: &PropertyKey,
     key_value: Value,
 ) -> VmResult<bool> {
@@ -569,7 +569,7 @@ fn validate_delete_trap_invariants(
 /// Implements the `ownKeys` trap with proper invariant validation.
 pub fn proxy_own_keys(
     ncx: &mut NativeContext,
-    proxy: &Arc<JsProxy>,
+    proxy: GcRef<JsProxy>,
 ) -> VmResult<Vec<PropertyKey>> {
     // Get target
     let target = proxy_target_value(proxy)?;
@@ -678,7 +678,7 @@ fn validate_own_keys_trap_invariants(
 /// Implements the `getOwnPropertyDescriptor` trap with proper invariant validation.
 pub fn proxy_get_own_property_descriptor(
     ncx: &mut NativeContext,
-    proxy: &Arc<JsProxy>,
+    proxy: GcRef<JsProxy>,
     key: &PropertyKey,
     key_value: Value,
 ) -> VmResult<Option<PropertyDescriptor>> {
@@ -804,7 +804,7 @@ fn validate_get_own_property_descriptor_invariants(
 /// Implements the `defineProperty` trap with proper invariant validation.
 pub fn proxy_define_property(
     ncx: &mut NativeContext,
-    proxy: &Arc<JsProxy>,
+    proxy: GcRef<JsProxy>,
     key: &PropertyKey,
     key_value: Value,
     desc: &PropertyDescriptor,
@@ -958,7 +958,7 @@ fn descriptor_from_object(obj: &GcRef<JsObject>) -> VmResult<PropertyDescriptor>
 /// Implements the `getPrototypeOf` trap with proper invariant validation.
 pub fn proxy_get_prototype_of(
     ncx: &mut NativeContext,
-    proxy: &Arc<JsProxy>,
+    proxy: GcRef<JsProxy>,
 ) -> VmResult<Option<GcRef<JsObject>>> {
     // Get target
     let target = proxy_target_value(proxy)?;
@@ -1023,7 +1023,7 @@ fn validate_get_prototype_of_invariants(
 /// Implements the `setPrototypeOf` trap with proper invariant validation.
 pub fn proxy_set_prototype_of(
     ncx: &mut NativeContext,
-    proxy: &Arc<JsProxy>,
+    proxy: GcRef<JsProxy>,
     proto: Option<GcRef<JsObject>>,
 ) -> VmResult<bool> {
     // Get target
@@ -1086,7 +1086,7 @@ fn validate_set_prototype_of_invariants(
 /// Implements the `isExtensible` trap with proper invariant validation.
 pub fn proxy_is_extensible(
     ncx: &mut NativeContext,
-    proxy: &Arc<JsProxy>,
+    proxy: GcRef<JsProxy>,
 ) -> VmResult<bool> {
     // Get target
     let target = proxy_target_value(proxy)?;
@@ -1119,7 +1119,7 @@ pub fn proxy_is_extensible(
 /// Implements the `preventExtensions` trap with proper invariant validation.
 pub fn proxy_prevent_extensions(
     ncx: &mut NativeContext,
-    proxy: &Arc<JsProxy>,
+    proxy: GcRef<JsProxy>,
 ) -> VmResult<bool> {
     // Get target
     let target = proxy_target_value(proxy)?;
@@ -1151,7 +1151,7 @@ pub fn proxy_prevent_extensions(
 /// Implements the `apply` trap for function calls.
 pub fn proxy_apply(
     ncx: &mut NativeContext,
-    proxy: &Arc<JsProxy>,
+    proxy: GcRef<JsProxy>,
     this_value: Value,
     args: &[Value],
 ) -> VmResult<Value> {
@@ -1186,7 +1186,7 @@ pub fn proxy_apply(
 /// Implements the `construct` trap for constructor calls.
 pub fn proxy_construct(
     ncx: &mut NativeContext,
-    proxy: &Arc<JsProxy>,
+    proxy: GcRef<JsProxy>,
     args: &[Value],
     new_target: Value,
 ) -> VmResult<Value> {

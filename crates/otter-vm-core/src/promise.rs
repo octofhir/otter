@@ -14,6 +14,7 @@
 //! Value::promise(resolvers.promise)
 //! ```
 
+use crate::gc::GcRef;
 use crate::string::JsString;
 use crate::value::Value;
 use parking_lot::Mutex;
@@ -73,7 +74,7 @@ pub struct JsPromiseJob {
     /// The `this` binding for the call
     pub this_arg: Value,
     /// The result promise to resolve/reject with the callback's return value
-    pub result_promise: Option<Arc<JsPromise>>,
+    pub result_promise: Option<crate::gc::GcRef<JsPromise>>,
 }
 
 /// A JavaScript Promise
@@ -90,6 +91,14 @@ pub struct JsPromise {
     js_fulfill_jobs: Mutex<Vec<JsPromiseJob>>,
     /// JS callback jobs for rejection (Promise.then/catch onRejected)
     js_reject_jobs: Mutex<Vec<JsPromiseJob>>,
+}
+
+impl otter_vm_gc::GcTraceable for JsPromise {
+    const NEEDS_TRACE: bool = true;
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // Use the existing trace_roots method
+        self.trace_roots(tracer);
+    }
 }
 
 impl std::fmt::Debug for JsPromise {
@@ -109,7 +118,7 @@ impl std::fmt::Debug for JsPromise {
 /// Provides a promise along with its resolve and reject functions for manual control.
 pub struct PromiseWithResolvers {
     /// The promise
-    pub promise: Arc<JsPromise>,
+    pub promise: GcRef<JsPromise>,
     /// Function to resolve the promise
     pub resolve: Arc<dyn Fn(Value) + Send + Sync>,
     /// Function to reject the promise
@@ -118,8 +127,8 @@ pub struct PromiseWithResolvers {
 
 impl JsPromise {
     /// Create a new pending promise
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new() -> GcRef<Self> {
+        GcRef::new(Self {
             state: Mutex::new(PromiseState::Pending),
             on_fulfilled: Mutex::new(Vec::new()),
             on_rejected: Mutex::new(Vec::new()),
@@ -174,7 +183,7 @@ impl JsPromise {
             let enqueue = Arc::clone(&enqueue);
             Arc::new(move |v: Value| {
                 let enqueue = Arc::clone(&enqueue);
-                p.resolve_with_js_jobs(v, move |job, args| {
+                JsPromise::resolve_with_js_jobs(p, v, move |job, args| {
                     (enqueue)(job, args);
                 });
             }) as Arc<dyn Fn(Value) + Send + Sync>
@@ -185,7 +194,7 @@ impl JsPromise {
             let enqueue = Arc::clone(&enqueue);
             Arc::new(move |e: Value| {
                 let enqueue = Arc::clone(&enqueue);
-                p.reject_with_js_jobs(e, move |job, args| {
+                JsPromise::reject_with_js_jobs(p, e, move |job, args| {
                     (enqueue)(job, args);
                 });
             }) as Arc<dyn Fn(Value) + Send + Sync>
@@ -199,8 +208,8 @@ impl JsPromise {
     }
 
     /// Create an already resolved promise
-    pub fn resolved(value: Value) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn resolved(value: Value) -> GcRef<Self> {
+        GcRef::new(Self {
             state: Mutex::new(PromiseState::Fulfilled(value)),
             on_fulfilled: Mutex::new(Vec::new()),
             on_rejected: Mutex::new(Vec::new()),
@@ -211,8 +220,8 @@ impl JsPromise {
     }
 
     /// Create an already rejected promise
-    pub fn rejected(error: Value) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn rejected(error: Value) -> GcRef<Self> {
+        GcRef::new(Self {
             state: Mutex::new(PromiseState::Rejected(error)),
             on_fulfilled: Mutex::new(Vec::new()),
             on_rejected: Mutex::new(Vec::new()),
@@ -480,7 +489,8 @@ impl JsPromise {
             job.callback.trace(tracer);
             job.this_arg.trace(tracer);
             if let Some(promise) = &job.result_promise {
-                promise.trace_roots(tracer);
+                // Trace the GcRef header (GC will handle recursive tracing)
+                tracer(promise.header() as *const _);
             }
         }
 
@@ -489,7 +499,8 @@ impl JsPromise {
             job.callback.trace(tracer);
             job.this_arg.trace(tracer);
             if let Some(promise) = &job.result_promise {
-                promise.trace_roots(tracer);
+                // Trace the GcRef header (GC will handle recursive tracing)
+                tracer(promise.header() as *const _);
             }
         }
     }
@@ -547,31 +558,31 @@ impl JsPromise {
     /// Resolve the promise and enqueue JS callback jobs
     ///
     /// This version enqueues both Rust closures and JS callbacks via the provided function.
-    pub fn resolve_with_js_jobs<E>(self: &Arc<Self>, value: Value, enqueue: E)
+    pub fn resolve_with_js_jobs<E>(promise: GcRef<Self>, value: Value, enqueue: E)
     where
         E: Fn(JsPromiseJob, Vec<Value>) + Clone,
     {
-        self.resolve_with_js_jobs_internal(value, enqueue, false, true);
+        Self::resolve_with_js_jobs_internal(promise, value, enqueue, false, true);
     }
 
     /// Resolve the promise from a thenable (allows settling while resolving)
-    pub fn resolve_from_thenable_with_js_jobs<E>(self: &Arc<Self>, value: Value, enqueue: E)
+    pub fn resolve_from_thenable_with_js_jobs<E>(promise: GcRef<Self>, value: Value, enqueue: E)
     where
         E: Fn(JsPromiseJob, Vec<Value>) + Clone,
     {
-        self.resolve_with_js_jobs_internal(value, enqueue, true, true);
+        Self::resolve_with_js_jobs_internal(promise, value, enqueue, true, true);
     }
 
     /// Fulfill the promise without thenable assimilation (used after then lookup)
-    pub fn fulfill_with_js_jobs<E>(self: &Arc<Self>, value: Value, enqueue: E)
+    pub fn fulfill_with_js_jobs<E>(promise: GcRef<Self>, value: Value, enqueue: E)
     where
         E: Fn(JsPromiseJob, Vec<Value>) + Clone,
     {
-        self.resolve_with_js_jobs_internal(value, enqueue, true, false);
+        Self::resolve_with_js_jobs_internal(promise, value, enqueue, true, false);
     }
 
     fn resolve_with_js_jobs_internal<E>(
-        self: &Arc<Self>,
+        promise: GcRef<Self>,
         value: Value,
         enqueue: E,
         allow_pending_thenable: bool,
@@ -579,7 +590,7 @@ impl JsPromise {
     ) where
         E: Fn(JsPromiseJob, Vec<Value>) + Clone,
     {
-        let mut state = self.state.lock();
+        let mut state = promise.state.lock();
         match &*state {
             PromiseState::Pending => {}
             PromiseState::PendingThenable(_) if allow_pending_thenable => {}
@@ -588,13 +599,13 @@ impl JsPromise {
 
         if check_thenable && value.is_object() {
             if let Some(inner) = value.as_promise() {
-                let self_ptr = self.as_ref() as *const JsPromise;
-                if std::ptr::eq(Arc::as_ptr(inner), self_ptr) {
+                let self_ptr = promise.as_ref() as *const JsPromise;
+                if std::ptr::eq(inner.as_ptr(), self_ptr) {
                     drop(state);
                     let error = Value::string(JsString::intern(
                         "TypeError: Promise cannot resolve itself",
                     ));
-                    self.reject_from_thenable_with_js_jobs(error, enqueue);
+                    Self::reject_from_thenable_with_js_jobs(promise, error, enqueue);
                     return;
                 }
             }
@@ -605,7 +616,7 @@ impl JsPromise {
                 kind: JsPromiseJobKind::ResolveThenableLookup,
                 callback: Value::undefined(),
                 this_arg: value,
-                result_promise: Some(self.clone()),
+                result_promise: Some(promise),
             };
             enqueue(job, Vec::new());
             return;
@@ -615,19 +626,19 @@ impl JsPromise {
         drop(state);
 
         // Enqueue JS callback jobs
-        let js_jobs = std::mem::take(&mut *self.js_fulfill_jobs.lock());
+        let js_jobs = std::mem::take(&mut *promise.js_fulfill_jobs.lock());
         for job in js_jobs {
             enqueue(job, vec![value.clone()]);
         }
 
         // Run Rust closure callbacks
-        let callbacks = std::mem::take(&mut *self.on_fulfilled.lock());
+        let callbacks = std::mem::take(&mut *promise.on_fulfilled.lock());
         for callback in callbacks {
             callback(value.clone());
         }
 
         // Run finally callbacks
-        let finally_callbacks = std::mem::take(&mut *self.on_finally.lock());
+        let finally_callbacks = std::mem::take(&mut *promise.on_finally.lock());
         for callback in finally_callbacks {
             callback();
         }
@@ -636,30 +647,30 @@ impl JsPromise {
     /// Reject the promise and enqueue JS callback jobs
     ///
     /// This version enqueues both Rust closures and JS callbacks via the provided function.
-    pub fn reject_with_js_jobs<E>(self: &Arc<Self>, error: Value, enqueue: E)
+    pub fn reject_with_js_jobs<E>(promise: GcRef<Self>, error: Value, enqueue: E)
     where
         E: Fn(JsPromiseJob, Vec<Value>) + Clone,
     {
-        self.reject_with_js_jobs_internal(error, enqueue, false);
+        Self::reject_with_js_jobs_internal(promise, error, enqueue, false);
     }
 
     /// Reject the promise from a thenable (allows settling while resolving)
-    pub fn reject_from_thenable_with_js_jobs<E>(self: &Arc<Self>, error: Value, enqueue: E)
+    pub fn reject_from_thenable_with_js_jobs<E>(promise: GcRef<Self>, error: Value, enqueue: E)
     where
         E: Fn(JsPromiseJob, Vec<Value>) + Clone,
     {
-        self.reject_with_js_jobs_internal(error, enqueue, true);
+        Self::reject_with_js_jobs_internal(promise, error, enqueue, true);
     }
 
     fn reject_with_js_jobs_internal<E>(
-        self: &Arc<Self>,
+        promise: GcRef<Self>,
         error: Value,
         enqueue: E,
         allow_pending_thenable: bool,
     ) where
         E: Fn(JsPromiseJob, Vec<Value>) + Clone,
     {
-        let mut state = self.state.lock();
+        let mut state = promise.state.lock();
         match &*state {
             PromiseState::Pending => {}
             PromiseState::PendingThenable(_) if allow_pending_thenable => {}
@@ -670,19 +681,19 @@ impl JsPromise {
         drop(state);
 
         // Enqueue JS callback jobs
-        let js_jobs = std::mem::take(&mut *self.js_reject_jobs.lock());
+        let js_jobs = std::mem::take(&mut *promise.js_reject_jobs.lock());
         for job in js_jobs {
             enqueue(job, vec![error.clone()]);
         }
 
         // Run Rust closure callbacks
-        let callbacks = std::mem::take(&mut *self.on_rejected.lock());
+        let callbacks = std::mem::take(&mut *promise.on_rejected.lock());
         for callback in callbacks {
             callback(error.clone());
         }
 
         // Run finally callbacks
-        let finally_callbacks = std::mem::take(&mut *self.on_finally.lock());
+        let finally_callbacks = std::mem::take(&mut *promise.on_finally.lock());
         for callback in finally_callbacks {
             callback();
         }

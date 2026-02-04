@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use otter_vm_bytecode::Module;
 
+use crate::gc::GcRef;
 use crate::promise::JsPromise;
 use crate::value::{UpvalueCell, Value};
 
@@ -21,9 +22,9 @@ pub struct AsyncContext {
     pub frames: Vec<SavedFrame>,
     /// The result promise for this async function
     /// This is what the caller awaits on
-    pub result_promise: Arc<JsPromise>,
+    pub result_promise: GcRef<JsPromise>,
     /// The promise we're currently awaiting
-    pub awaited_promise: Arc<JsPromise>,
+    pub awaited_promise: GcRef<JsPromise>,
     /// Register where the await result should be stored
     pub resume_register: u16,
     /// Whether the VM was running before suspension
@@ -34,8 +35,8 @@ impl AsyncContext {
     /// Create a new async context
     pub fn new(
         frames: Vec<SavedFrame>,
-        result_promise: Arc<JsPromise>,
-        awaited_promise: Arc<JsPromise>,
+        result_promise: GcRef<JsPromise>,
+        awaited_promise: GcRef<JsPromise>,
         resume_register: u16,
         was_running: bool,
     ) -> Self {

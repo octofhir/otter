@@ -80,7 +80,7 @@ pub struct JsTypedArray {
     /// Associated JavaScript object (for properties and prototype)
     pub object: GcRef<JsObject>,
     /// The underlying ArrayBuffer
-    buffer: Arc<JsArrayBuffer>,
+    buffer: GcRef<JsArrayBuffer>,
     /// Byte offset into the buffer
     byte_offset: usize,
     /// Number of elements (not bytes)
@@ -89,11 +89,21 @@ pub struct JsTypedArray {
     kind: TypedArrayKind,
 }
 
+impl otter_vm_gc::GcTraceable for JsTypedArray {
+    const NEEDS_TRACE: bool = true;
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // Trace the object field
+        tracer(self.object.header() as *const _);
+        // Trace the buffer's object field
+        tracer(self.buffer.object.header() as *const _);
+    }
+}
+
 impl JsTypedArray {
     /// Create a new TypedArray view over an ArrayBuffer
     pub fn new(
         object: GcRef<JsObject>,
-        buffer: Arc<JsArrayBuffer>,
+        buffer: GcRef<JsArrayBuffer>,
         kind: TypedArrayKind,
         byte_offset: usize,
         length: usize,
@@ -128,7 +138,7 @@ impl JsTypedArray {
         memory_manager: Arc<MemoryManager>,
     ) -> Self {
         let byte_length = length * kind.element_size();
-        let buffer = Arc::new(JsArrayBuffer::new(byte_length, None, memory_manager.clone()));
+        let buffer = GcRef::new(JsArrayBuffer::new(byte_length, None, memory_manager.clone()));
         let proto_value = prototype.map(Value::object).unwrap_or_else(Value::null);
         let object = GcRef::new(JsObject::new(proto_value, memory_manager));
         Self {
@@ -146,8 +156,8 @@ impl JsTypedArray {
     }
 
     /// Get the underlying ArrayBuffer
-    pub fn buffer(&self) -> &Arc<JsArrayBuffer> {
-        &self.buffer
+    pub fn buffer(&self) -> GcRef<JsArrayBuffer> {
+        self.buffer
     }
 
     /// Get the byte offset into the buffer
@@ -383,7 +393,7 @@ impl JsTypedArray {
         // Get prototype and memory_manager from existing buffer
         let prototype = self.buffer.object.prototype().as_object();
         let memory_manager = self.buffer.object.memory_manager().clone();
-        let new_buffer = Arc::new(JsArrayBuffer::new(
+        let new_buffer = GcRef::new(JsArrayBuffer::new(
             new_byte_length,
             prototype,
             memory_manager,
@@ -527,7 +537,7 @@ mod tests {
     #[test]
     fn test_create_int32_array() {
         let mm = make_mm();
-        let buf = Arc::new(JsArrayBuffer::new(16, None, mm.clone()));
+        let buf = GcRef::new(JsArrayBuffer::new(16, None, mm.clone()));
         let object = GcRef::new(JsObject::new(Value::null(), mm));
         let arr = JsTypedArray::new(object, buf, TypedArrayKind::Int32, 0, 4).unwrap();
         assert_eq!(arr.length(), 4);
@@ -631,7 +641,7 @@ mod tests {
     #[test]
     fn test_detached_buffer() {
         let mm = make_mm();
-        let buf = Arc::new(JsArrayBuffer::new(16, None, mm.clone()));
+        let buf = GcRef::new(JsArrayBuffer::new(16, None, mm.clone()));
         let object = GcRef::new(JsObject::new(Value::null(), mm));
         let arr = JsTypedArray::new(object, buf.clone(), TypedArrayKind::Int32, 0, 4).unwrap();
 
@@ -649,7 +659,7 @@ mod tests {
     #[test]
     fn test_alignment_error() {
         let mm = make_mm();
-        let buf = Arc::new(JsArrayBuffer::new(16, None, mm.clone()));
+        let buf = GcRef::new(JsArrayBuffer::new(16, None, mm.clone()));
         let object = GcRef::new(JsObject::new(Value::null(), mm));
         let result = JsTypedArray::new(object, buf, TypedArrayKind::Int32, 1, 3);
         assert!(result.is_err());

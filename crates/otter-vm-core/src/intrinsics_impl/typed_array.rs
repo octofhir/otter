@@ -87,17 +87,17 @@ pub fn init_specific_typed_array_prototype(
 // ============================================================================
 
 /// Helper to get TypedArray from this_val (handles both direct value and hidden property)
-fn get_typed_array(this_val: &Value) -> Result<Arc<JsTypedArray>, VmError> {
+fn get_typed_array(this_val: &Value) -> Result<GcRef<JsTypedArray>, VmError> {
     // Try to get TypedArray from the value directly first
     if let Some(ta) = this_val.as_typed_array() {
-        return Ok(Arc::clone(ta));
+        return Ok(ta);
     }
 
     // If this_val is an object, try to get the TypedArray from a hidden property
     if let Some(obj) = this_val.as_object() {
         if let Some(ta_val) = obj.get(&PropertyKey::string("__TypedArrayData__")) {
             if let Some(ta) = ta_val.as_typed_array() {
-                return Ok(Arc::clone(ta));
+                return Ok(ta);
             }
         }
     }
@@ -454,7 +454,7 @@ fn init_typed_array_methods(
                 let new_ta = ta.slice(start, end)
                     .map_err(|e| VmError::type_error(e))?;
 
-                Ok(Value::typed_array(Arc::new(new_ta)))
+                Ok(Value::typed_array(GcRef::new(new_ta)))
             },
             mm.clone(),
             fn_proto,
@@ -479,7 +479,7 @@ fn init_typed_array_methods(
                 let new_ta = ta.subarray(begin, end)
                     .map_err(|e| VmError::type_error(e))?;
 
-                Ok(Value::typed_array(Arc::new(new_ta)))
+                Ok(Value::typed_array(GcRef::new(new_ta)))
             },
             mm.clone(),
             fn_proto,

@@ -20,6 +20,14 @@ pub struct JsRegExp {
     pub native_regex: Option<Regex>,
 }
 
+impl otter_vm_gc::GcTraceable for JsRegExp {
+    const NEEDS_TRACE: bool = true;
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // Trace the object field (GC-managed)
+        tracer(self.object.header() as *const _);
+    }
+}
+
 impl JsRegExp {
     /// Create a new JsRegExp
     pub fn new(

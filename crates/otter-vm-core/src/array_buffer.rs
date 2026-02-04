@@ -23,6 +23,14 @@ pub struct JsArrayBuffer {
     max_byte_length: Option<usize>,
 }
 
+impl otter_vm_gc::GcTraceable for JsArrayBuffer {
+    const NEEDS_TRACE: bool = true;
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // Trace the object field (GC-managed)
+        tracer(self.object.header() as *const _);
+    }
+}
+
 impl JsArrayBuffer {
     /// Create a new ArrayBuffer with the specified byte length
     pub fn new(

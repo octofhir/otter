@@ -46,7 +46,7 @@ pub fn init_generator_prototype(
     proto.define_property(
         PropertyKey::string("next"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, ncx| {
+            |this_val, _args, ncx| {
                 // Extract the generator from `this`
                 let generator = this_val
                     .as_generator()
@@ -107,7 +107,7 @@ pub fn init_generator_prototype(
     proto.define_property(
         PropertyKey::string("throw"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, ncx| {
+            |this_val, args, _ncx| {
                 let generator = this_val
                     .as_generator()
                     .ok_or_else(|| VmError::type_error("Generator.prototype.throw called on non-generator"))?;
@@ -177,7 +177,7 @@ pub fn init_async_generator_prototype(
     proto.define_property(
         PropertyKey::string("next"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, ncx| {
+            |this_val, _args, ncx| {
                 let generator = this_val
                     .as_generator()
                     .ok_or_else(|| {

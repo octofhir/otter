@@ -132,27 +132,27 @@ pub enum HeapRef {
     /// Function closure
     Function(Arc<Closure>),
     /// Symbol
-    Symbol(Arc<Symbol>),
+    Symbol(GcRef<Symbol>),
     /// BigInt
-    BigInt(Arc<BigInt>),
+    BigInt(GcRef<BigInt>),
     /// Promise
-    Promise(Arc<JsPromise>),
+    Promise(GcRef<JsPromise>),
     /// Proxy object
-    Proxy(Arc<JsProxy>),
+    Proxy(GcRef<JsProxy>),
     /// Generator object
     Generator(Arc<JsGenerator>),
     /// ArrayBuffer (raw binary data buffer)
-    ArrayBuffer(Arc<JsArrayBuffer>),
+    ArrayBuffer(GcRef<JsArrayBuffer>),
     /// TypedArray (view over ArrayBuffer)
-    TypedArray(Arc<JsTypedArray>),
+    TypedArray(GcRef<JsTypedArray>),
     /// DataView (arbitrary byte-order access to ArrayBuffer)
-    DataView(Arc<JsDataView>),
+    DataView(GcRef<JsDataView>),
     /// SharedArrayBuffer (can be shared between workers)
-    SharedArrayBuffer(Arc<SharedArrayBuffer>),
+    SharedArrayBuffer(GcRef<SharedArrayBuffer>),
     /// Native function (implemented in Rust)
     NativeFunction(Arc<NativeFunctionObject>),
     /// RegExp
-    RegExp(Arc<JsRegExp>),
+    RegExp(GcRef<JsRegExp>),
 }
 
 impl std::fmt::Debug for HeapRef {
@@ -215,11 +215,25 @@ pub struct Symbol {
     pub id: u64,
 }
 
+impl otter_vm_gc::GcTraceable for Symbol {
+    const NEEDS_TRACE: bool = false;
+    fn trace(&self, _tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // Symbol contains only primitives (String, u64), no GC references
+    }
+}
+
 /// A JavaScript BigInt (arbitrary precision integer)
 #[derive(Debug)]
 pub struct BigInt {
     /// String representation (for now)
     pub value: String,
+}
+
+impl otter_vm_gc::GcTraceable for BigInt {
+    const NEEDS_TRACE: bool = false;
+    fn trace(&self, _tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // BigInt contains only a String, no GC references
+    }
 }
 
 impl Value {
@@ -324,16 +338,16 @@ impl Value {
     }
 
     /// Create promise value
-    pub fn promise(promise: Arc<JsPromise>) -> Self {
-        let ptr = Arc::as_ptr(&promise) as u64;
+    pub fn promise(promise: GcRef<JsPromise>) -> Self {
+        let ptr = promise.as_ptr() as u64;
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::Promise(promise)),
         }
     }
 
-    pub fn regex(regex: Arc<JsRegExp>) -> Self {
-        let ptr = Arc::as_ptr(&regex) as u64;
+    pub fn regex(regex: GcRef<JsRegExp>) -> Self {
+        let ptr = regex.as_ptr() as u64;
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::RegExp(regex)),
@@ -341,8 +355,8 @@ impl Value {
     }
 
     /// Create proxy value
-    pub fn proxy(proxy: Arc<JsProxy>) -> Self {
-        let ptr = Arc::as_ptr(&proxy) as u64;
+    pub fn proxy(proxy: GcRef<JsProxy>) -> Self {
+        let ptr = proxy.as_ptr() as u64;
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::Proxy(proxy)),
@@ -359,8 +373,8 @@ impl Value {
     }
 
     /// Create ArrayBuffer value
-    pub fn array_buffer(ab: Arc<JsArrayBuffer>) -> Self {
-        let ptr = Arc::as_ptr(&ab) as u64;
+    pub fn array_buffer(ab: GcRef<JsArrayBuffer>) -> Self {
+        let ptr = ab.as_ptr() as u64;
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::ArrayBuffer(ab)),
@@ -368,8 +382,8 @@ impl Value {
     }
 
     /// Create TypedArray value
-    pub fn typed_array(ta: Arc<JsTypedArray>) -> Self {
-        let ptr = Arc::as_ptr(&ta) as u64;
+    pub fn typed_array(ta: GcRef<JsTypedArray>) -> Self {
+        let ptr = ta.as_ptr() as u64;
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::TypedArray(ta)),
@@ -377,8 +391,8 @@ impl Value {
     }
 
     /// Create DataView value
-    pub fn data_view(dv: Arc<JsDataView>) -> Self {
-        let ptr = Arc::as_ptr(&dv) as u64;
+    pub fn data_view(dv: GcRef<JsDataView>) -> Self {
+        let ptr = dv.as_ptr() as u64;
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::DataView(dv)),
@@ -386,8 +400,8 @@ impl Value {
     }
 
     /// Create SharedArrayBuffer value
-    pub fn shared_array_buffer(sab: Arc<SharedArrayBuffer>) -> Self {
-        let ptr = Arc::as_ptr(&sab) as u64;
+    pub fn shared_array_buffer(sab: GcRef<SharedArrayBuffer>) -> Self {
+        let ptr = sab.as_ptr() as u64;
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::SharedArrayBuffer(sab)),
@@ -405,8 +419,8 @@ impl Value {
 
     /// Create BigInt value
     pub fn bigint(value: String) -> Self {
-        let bi = Arc::new(BigInt { value });
-        let ptr = Arc::as_ptr(&bi) as u64;
+        let bi = GcRef::new(BigInt { value });
+        let ptr = bi.as_ptr() as u64;
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::BigInt(bi)),
@@ -414,8 +428,8 @@ impl Value {
     }
 
     /// Create Symbol value
-    pub fn symbol(sym: Arc<Symbol>) -> Self {
-        let ptr = Arc::as_ptr(&sym) as u64;
+    pub fn symbol(sym: GcRef<Symbol>) -> Self {
+        let ptr = sym.as_ptr() as u64;
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::Symbol(sym)),
@@ -738,17 +752,17 @@ impl Value {
     }
 
     /// Get as promise
-    pub fn as_promise(&self) -> Option<&Arc<JsPromise>> {
+    pub fn as_promise(&self) -> Option<GcRef<JsPromise>> {
         match &self.heap_ref {
-            Some(HeapRef::Promise(p)) => Some(p),
+            Some(HeapRef::Promise(p)) => Some(*p),
             _ => None,
         }
     }
 
     /// Get as proxy
-    pub fn as_proxy(&self) -> Option<&Arc<JsProxy>> {
+    pub fn as_proxy(&self) -> Option<GcRef<JsProxy>> {
         match &self.heap_ref {
-            Some(HeapRef::Proxy(p)) => Some(p),
+            Some(HeapRef::Proxy(p)) => Some(*p),
             _ => None,
         }
     }
@@ -762,49 +776,49 @@ impl Value {
     }
 
     /// Get as regex
-    pub fn as_regex(&self) -> Option<&Arc<JsRegExp>> {
+    pub fn as_regex(&self) -> Option<GcRef<JsRegExp>> {
         match &self.heap_ref {
-            Some(HeapRef::RegExp(r)) => Some(r),
+            Some(HeapRef::RegExp(r)) => Some(*r),
             _ => None,
         }
     }
 
     /// Get as ArrayBuffer
-    pub fn as_array_buffer(&self) -> Option<&Arc<JsArrayBuffer>> {
+    pub fn as_array_buffer(&self) -> Option<GcRef<JsArrayBuffer>> {
         match &self.heap_ref {
-            Some(HeapRef::ArrayBuffer(ab)) => Some(ab),
+            Some(HeapRef::ArrayBuffer(ab)) => Some(*ab),
             _ => None,
         }
     }
 
     /// Get as TypedArray
-    pub fn as_typed_array(&self) -> Option<&Arc<JsTypedArray>> {
+    pub fn as_typed_array(&self) -> Option<GcRef<JsTypedArray>> {
         match &self.heap_ref {
-            Some(HeapRef::TypedArray(ta)) => Some(ta),
+            Some(HeapRef::TypedArray(ta)) => Some(*ta),
             _ => None,
         }
     }
 
     /// Get as DataView
-    pub fn as_data_view(&self) -> Option<&Arc<JsDataView>> {
+    pub fn as_data_view(&self) -> Option<GcRef<JsDataView>> {
         match &self.heap_ref {
-            Some(HeapRef::DataView(dv)) => Some(dv),
+            Some(HeapRef::DataView(dv)) => Some(*dv),
             _ => None,
         }
     }
 
     /// Get as SharedArrayBuffer
-    pub fn as_shared_array_buffer(&self) -> Option<&Arc<SharedArrayBuffer>> {
+    pub fn as_shared_array_buffer(&self) -> Option<GcRef<SharedArrayBuffer>> {
         match &self.heap_ref {
-            Some(HeapRef::SharedArrayBuffer(sab)) => Some(sab),
+            Some(HeapRef::SharedArrayBuffer(sab)) => Some(*sab),
             _ => None,
         }
     }
 
     /// Get as symbol
-    pub fn as_symbol(&self) -> Option<&Arc<Symbol>> {
+    pub fn as_symbol(&self) -> Option<GcRef<Symbol>> {
         match &self.heap_ref {
-            Some(HeapRef::Symbol(s)) => Some(s),
+            Some(HeapRef::Symbol(s)) => Some(*s),
             _ => None,
         }
     }
@@ -1106,6 +1120,7 @@ impl Value {
                     tracer(ab.object.header() as *const _);
                 }
                 HeapRef::TypedArray(ta) => {
+                    tracer(ta.object.header() as *const _);
                     tracer(ta.buffer().object.header() as *const _);
                 }
                 HeapRef::DataView(dv) => {
@@ -1117,6 +1132,15 @@ impl Value {
                 HeapRef::Proxy(p) => {
                     p.target.trace(tracer);
                     p.handler.trace(tracer);
+                }
+                HeapRef::Symbol(_) => {
+                    // Symbol has no GC references (NEEDS_TRACE = false)
+                }
+                HeapRef::BigInt(_) => {
+                    // BigInt has no GC references (NEEDS_TRACE = false)
+                }
+                HeapRef::SharedArrayBuffer(_) => {
+                    // SharedArrayBuffer has no GC references (NEEDS_TRACE = false)
                 }
                 // Other types use Arc, not GcRef, so no GC tracing needed
                 _ => {}

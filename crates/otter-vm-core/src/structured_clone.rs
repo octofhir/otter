@@ -90,7 +90,7 @@ impl StructuredCloner {
 
             Some(HeapRef::SharedArrayBuffer(sab)) => {
                 // SharedArrayBuffer: share the same underlying buffer (not cloned!)
-                Ok(Value::shared_array_buffer(Arc::clone(sab)))
+                Ok(Value::shared_array_buffer(*sab))
             }
 
             Some(HeapRef::Object(obj)) => self.clone_object(*obj),
@@ -117,7 +117,7 @@ impl StructuredCloner {
                 // New object with same pattern/flags
                 // NOTE: This does not restrictively clone all properties yet, just the basic regex part.
                 // Improving strict spec compliance later if needed.
-                let new_regex = Arc::new(crate::regexp::JsRegExp::new(
+                let new_regex = GcRef::new(crate::regexp::JsRegExp::new(
                     r.pattern.clone(),
                     r.flags.clone(),
                     None,
@@ -131,7 +131,7 @@ impl StructuredCloner {
                 let len = ab.byte_length();
                 // Slice creates a copy
                 if let Some(new_ab) = ab.slice(0, len) {
-                    Ok(Value::array_buffer(Arc::new(new_ab)))
+                    Ok(Value::array_buffer(GcRef::new(new_ab)))
                 } else {
                     Err(StructuredCloneError::DataCloneError(
                         "ArrayBuffer is detached",
@@ -272,10 +272,10 @@ mod tests {
     fn test_shared_array_buffer_shares_memory() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         let mut cloner = StructuredCloner::new(memory_manager.clone());
-        let sab = Arc::new(SharedArrayBuffer::new(4));
+        let sab = GcRef::new(SharedArrayBuffer::new(4));
         sab.set(0, 42);
 
-        let val = Value::shared_array_buffer(Arc::clone(&sab));
+        let val = Value::shared_array_buffer(sab);
         let cloned = cloner.clone(&val).unwrap();
 
         // SharedArrayBuffer should share the same memory

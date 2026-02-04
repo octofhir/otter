@@ -42,7 +42,7 @@ use crate::value::Value;
 /// Extract the internal promise from `this`.
 ///
 /// Handles both raw `Value::promise` and JS wrapper objects `{ _internal: <promise> }`.
-fn get_promise_from_this(this_val: &Value) -> Result<Arc<JsPromise>, VmError> {
+fn get_promise_from_this(this_val: &Value) -> Result<GcRef<JsPromise>, VmError> {
     if let Some(p) = this_val.as_promise() {
         return Ok(p.clone());
     }
@@ -57,14 +57,14 @@ fn get_promise_from_this(this_val: &Value) -> Result<Arc<JsPromise>, VmError> {
 }
 
 /// Extract the internal promise from a value (Option variant for combinators).
-fn extract_internal_promise(value: &Value) -> Option<Arc<JsPromise>> {
+fn extract_internal_promise(value: &Value) -> Option<GcRef<JsPromise>> {
     if let Some(promise) = value.as_promise() {
-        return Some(promise.clone());
+        return Some(promise);
     }
     if let Some(obj) = value.as_object() {
         if let Some(internal) = obj.get(&PropertyKey::string("_internal")) {
             if let Some(promise) = internal.as_promise() {
-                return Some(promise.clone());
+                return Some(promise);
             }
         }
     }
@@ -105,7 +105,7 @@ fn extract_array_items(value: Option<&Value>) -> Result<Vec<Value>, VmError> {
 /// Creates an object with `_internal` field and copies methods from Promise.prototype.
 fn create_js_promise_wrapper(
     ncx: &crate::context::NativeContext<'_>,
-    internal: Arc<JsPromise>,
+    internal: GcRef<JsPromise>,
 ) -> Value {
     create_js_promise_wrapper_with_mm(ncx.memory_manager(), ncx.ctx, internal)
 }
@@ -114,7 +114,7 @@ fn create_js_promise_wrapper(
 fn create_js_promise_wrapper_with_mm(
     mm: &Arc<MemoryManager>,
     ctx: &crate::context::VmContext,
-    internal: Arc<JsPromise>,
+    internal: GcRef<JsPromise>,
 ) -> Value {
     let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
@@ -183,7 +183,7 @@ pub fn init_promise_prototype(
                     },
                     callback: on_fulfilled,
                     this_arg: Value::undefined(),
-                    result_promise: Some(result_promise.clone()),
+                    result_promise: Some(result_promise),
                 };
 
                 let reject_job = JsPromiseJob {
@@ -194,7 +194,7 @@ pub fn init_promise_prototype(
                     },
                     callback: on_rejected,
                     this_arg: Value::undefined(),
-                    result_promise: Some(result_promise.clone()),
+                    result_promise: Some(result_promise),
                 };
 
                 source.then_js(fulfill_job, |job, job_args| {
@@ -227,7 +227,7 @@ pub fn init_promise_prototype(
                     kind: JsPromiseJobKind::PassthroughFulfill,
                     callback: Value::undefined(),
                     this_arg: Value::undefined(),
-                    result_promise: Some(result_promise.clone()),
+                    result_promise: Some(result_promise),
                 };
 
                 let reject_job = JsPromiseJob {
@@ -238,7 +238,7 @@ pub fn init_promise_prototype(
                     },
                     callback: on_rejected,
                     this_arg: Value::undefined(),
-                    result_promise: Some(result_promise.clone()),
+                    result_promise: Some(result_promise),
                 };
 
                 source.then_js(fulfill_job, |job, job_args| {
@@ -288,14 +288,14 @@ pub fn init_promise_prototype(
                     kind: fulfill_kind,
                     callback: fulfill_callback,
                     this_arg: Value::undefined(),
-                    result_promise: Some(result_promise.clone()),
+                    result_promise: Some(result_promise),
                 };
 
                 let reject_job = JsPromiseJob {
                     kind: reject_kind,
                     callback: reject_callback,
                     this_arg: Value::undefined(),
-                    result_promise: Some(result_promise.clone()),
+                    result_promise: Some(result_promise),
                 };
 
                 source.then_js(fulfill_job, |job, job_args| {
@@ -363,12 +363,12 @@ pub fn create_promise_constructor() -> Box<
             .ok_or_else(|| VmError::internal("Function.prototype is not defined"))?;
 
         // Create resolve function
-        let resolve_promise = promise.clone();
+        let resolve_promise = promise;
         let enqueue_resolve = enqueue_js_job.clone();
         let resolve_fn = Value::native_function_with_proto(
             move |_this, args, _ncx| {
                 let value = args.first().cloned().unwrap_or(Value::undefined());
-                resolve_promise.resolve_with_js_jobs(value, enqueue_resolve.clone());
+                JsPromise::resolve_with_js_jobs(resolve_promise, value, enqueue_resolve.clone());
                 Ok(Value::undefined())
             },
             ncx.memory_manager().clone(),
@@ -376,12 +376,12 @@ pub fn create_promise_constructor() -> Box<
         );
 
         // Create reject function
-        let reject_promise = promise.clone();
+        let reject_promise = promise;
         let enqueue_reject = enqueue_js_job.clone();
         let reject_fn = Value::native_function_with_proto(
             move |_this, args, _ncx| {
                 let reason = args.first().cloned().unwrap_or(Value::undefined());
-                reject_promise.reject_with_js_jobs(reason, enqueue_reject.clone());
+                JsPromise::reject_with_js_jobs(reject_promise, reason, enqueue_reject.clone());
                 Ok(Value::undefined())
             },
             ncx.memory_manager().clone(),
@@ -409,7 +409,7 @@ pub fn create_promise_constructor() -> Box<
                     Value::string(JsString::intern(&message))
                 }
             };
-            promise.reject_with_js_jobs(error_val, enqueue_js_job);
+            JsPromise::reject_with_js_jobs(promise, error_val, enqueue_js_job);
         }
 
         // Create and return the JS promise wrapper
@@ -476,7 +476,7 @@ pub fn install_promise_statics(
 
                 // If raw promise, wrap it
                 if let Some(promise) = value.as_promise() {
-                    return Ok(create_js_promise_wrapper(ncx, promise.clone()));
+                    return Ok(create_js_promise_wrapper(ncx, promise));
                 }
 
                 let result_promise = JsPromise::new();
@@ -491,7 +491,7 @@ pub fn install_promise_statics(
                                     kind: JsPromiseJobKind::ResolveThenable,
                                     callback: then_val,
                                     this_arg: value,
-                                    result_promise: Some(result_promise.clone()),
+                                    result_promise: Some(result_promise),
                                 };
                                 ncx.enqueue_js_job(job, Vec::new());
                                 return Ok(create_js_promise_wrapper(ncx, result_promise));
@@ -501,7 +501,7 @@ pub fn install_promise_statics(
                 }
 
                 // Resolve with the value directly
-                result_promise.resolve_with_js_jobs(value, |job, args| {
+                JsPromise::resolve_with_js_jobs(result_promise, value, |job, args| {
                     ncx.enqueue_js_job(job, args);
                 });
                 Ok(create_js_promise_wrapper(ncx, result_promise))
@@ -518,7 +518,7 @@ pub fn install_promise_statics(
             |_this, args, ncx| {
                 let reason = args.first().cloned().unwrap_or(Value::undefined());
                 let result_promise = JsPromise::new();
-                result_promise.reject_with_js_jobs(reason, |job, args| {
+                JsPromise::reject_with_js_jobs(result_promise, reason, |job, args| {
                     ncx.enqueue_js_job(job, args);
                 });
                 Ok(create_js_promise_wrapper(ncx, result_promise))
@@ -540,7 +540,7 @@ pub fn install_promise_statics(
                 // Empty array resolves immediately with []
                 if items.is_empty() {
                     let arr = GcRef::new(JsObject::array(0, mm));
-                    result_promise.resolve_with_js_jobs(Value::array(arr), |job, args| {
+                    JsPromise::resolve_with_js_jobs(result_promise, Value::array(arr), |job, args| {
                         ncx.enqueue_js_job(job, args);
                     });
                     return Ok(create_js_promise_wrapper(ncx, result_promise));
@@ -559,7 +559,7 @@ pub fn install_promise_statics(
                 let rejected = Arc::new(AtomicBool::new(false));
 
                 for (index, item) in items.into_iter().enumerate() {
-                    let result_p = result_promise.clone();
+                    let result_p = result_promise;
                     let remaining = remaining.clone();
                     let results = results.clone();
                     let rejected = rejected.clone();
@@ -571,7 +571,7 @@ pub fn install_promise_statics(
                         promise
                     } else {
                         let p = JsPromise::new();
-                        p.resolve_with_js_jobs(item, enqueue.clone());
+                        JsPromise::resolve_with_js_jobs(p, item, enqueue.clone());
                         p
                     };
 
@@ -594,13 +594,12 @@ pub fn install_promise_statics(
                                     }
                                 }
                             }
-                            result_p
-                                .resolve_with_js_jobs(Value::array(arr), enqueue_fulfill.clone());
+                            JsPromise::resolve_with_js_jobs(result_p, Value::array(arr), enqueue_fulfill.clone());
                         }
                     });
                     source_promise.catch(move |error| {
                         if !rejected_check.swap(true, Ordering::AcqRel) {
-                            result_p_reject.reject_with_js_jobs(error, enqueue_reject.clone());
+                            JsPromise::reject_with_js_jobs(result_p_reject, error, enqueue_reject.clone());
                         }
                     });
                 }
@@ -628,8 +627,8 @@ pub fn install_promise_statics(
                 let enqueue = make_enqueue_fn(queue);
 
                 for item in items {
-                    let result_p = result_promise.clone();
-                    let result_p_reject = result_promise.clone();
+                    let result_p = result_promise;
+                    let result_p_reject = result_promise;
                     let settled1 = settled.clone();
                     let settled2 = settled.clone();
                     let enqueue_fulfill = enqueue.clone();
@@ -639,18 +638,18 @@ pub fn install_promise_statics(
                         promise
                     } else {
                         let p = JsPromise::new();
-                        p.resolve_with_js_jobs(item, enqueue.clone());
+                        JsPromise::resolve_with_js_jobs(p, item, enqueue.clone());
                         p
                     };
 
                     source_promise.then(move |value| {
                         if !settled1.swap(true, Ordering::AcqRel) {
-                            result_p.resolve_with_js_jobs(value, enqueue_fulfill.clone());
+                            JsPromise::resolve_with_js_jobs(result_p, value, enqueue_fulfill.clone());
                         }
                     });
                     source_promise.catch(move |error| {
                         if !settled2.swap(true, Ordering::AcqRel) {
-                            result_p_reject.reject_with_js_jobs(error, enqueue_reject.clone());
+                            JsPromise::reject_with_js_jobs(result_p_reject, error, enqueue_reject.clone());
                         }
                     });
                 }
@@ -674,7 +673,7 @@ pub fn install_promise_statics(
                 // Empty array resolves immediately with []
                 if items.is_empty() {
                     let arr = GcRef::new(JsObject::array(0, mm));
-                    result_promise.resolve_with_js_jobs(Value::array(arr), |job, args| {
+                    JsPromise::resolve_with_js_jobs(result_promise, Value::array(arr), |job, args| {
                         ncx.enqueue_js_job(job, args);
                     });
                     return Ok(create_js_promise_wrapper(ncx, result_promise));
@@ -692,8 +691,8 @@ pub fn install_promise_statics(
                     Arc::new(Mutex::new(vec![None; count]));
 
                 for (index, item) in items.into_iter().enumerate() {
-                    let result_p = result_promise.clone();
-                    let result_p2 = result_promise.clone();
+                    let result_p = result_promise;
+                    let result_p2 = result_promise;
                     let remaining = remaining.clone();
                     let remaining2 = remaining.clone();
                     let results = results.clone();
@@ -707,7 +706,7 @@ pub fn install_promise_statics(
                         promise
                     } else {
                         let p = JsPromise::new();
-                        p.resolve_with_js_jobs(item, enqueue.clone());
+                        JsPromise::resolve_with_js_jobs(p, item, enqueue.clone());
                         p
                     };
 
@@ -730,8 +729,7 @@ pub fn install_promise_statics(
                                     }
                                 }
                             }
-                            result_p
-                                .resolve_with_js_jobs(Value::array(arr), enqueue_fulfill.clone());
+                            JsPromise::resolve_with_js_jobs(result_p, Value::array(arr), enqueue_fulfill.clone());
                         }
                     });
                     source_promise.catch(move |error| {
@@ -750,8 +748,7 @@ pub fn install_promise_statics(
                                     }
                                 }
                             }
-                            result_p2
-                                .resolve_with_js_jobs(Value::array(arr), enqueue_reject.clone());
+                            JsPromise::resolve_with_js_jobs(result_p2, Value::array(arr), enqueue_reject.clone());
                         }
                     });
                 }
@@ -775,7 +772,7 @@ pub fn install_promise_statics(
                 // Empty array rejects with AggregateError
                 if items.is_empty() {
                     let err = Value::string(JsString::intern("All promises were rejected"));
-                    result_promise.reject_with_js_jobs(err, |job, args| {
+                    JsPromise::reject_with_js_jobs(result_promise, err, |job, args| {
                         ncx.enqueue_js_job(job, args);
                     });
                     return Ok(create_js_promise_wrapper(ncx, result_promise));
@@ -794,8 +791,8 @@ pub fn install_promise_statics(
                     Arc::new(Mutex::new(vec![None; count]));
 
                 for (index, item) in items.into_iter().enumerate() {
-                    let result_p = result_promise.clone();
-                    let result_p2 = result_promise.clone();
+                    let result_p = result_promise;
+                    let result_p2 = result_promise;
                     let fulfilled1 = fulfilled.clone();
                     let fulfilled2 = fulfilled.clone();
                     let remaining = remaining.clone();
@@ -808,13 +805,13 @@ pub fn install_promise_statics(
                         promise
                     } else {
                         let p = JsPromise::new();
-                        p.resolve_with_js_jobs(item, enqueue.clone());
+                        JsPromise::resolve_with_js_jobs(p, item, enqueue.clone());
                         p
                     };
 
                     source_promise.then(move |value| {
                         if !fulfilled1.swap(true, Ordering::AcqRel) {
-                            result_p.resolve_with_js_jobs(value, enqueue_fulfill.clone());
+                            JsPromise::resolve_with_js_jobs(result_p, value, enqueue_fulfill.clone());
                         }
                     });
                     source_promise.catch(move |error| {
@@ -840,8 +837,7 @@ pub fn install_promise_statics(
                                 Value::string(JsString::intern("All promises were rejected")),
                             );
                             agg.set("errors".into(), Value::array(arr));
-                            result_p2
-                                .reject_with_js_jobs(Value::object(agg), enqueue_reject.clone());
+                            JsPromise::reject_with_js_jobs(result_p2, Value::object(agg), enqueue_reject.clone());
                         }
                     });
                 }
@@ -867,17 +863,17 @@ pub fn install_promise_statics(
                     let queue = ncx.js_job_queue();
 
                     // Create wrapped promise for the result
-                    let wrapped_promise = create_js_promise_wrapper(ncx, promise.clone());
+                    let wrapped_promise = create_js_promise_wrapper(ncx, promise);
                     result.set("promise".into(), wrapped_promise);
 
                     // Create resolve function that captures the promise
-                    let promise_for_resolve = promise.clone();
+                    let promise_for_resolve = promise;
                     let queue_for_resolve = queue.clone();
                     let resolve_fn = Value::native_function_with_proto(
                         move |_this: &Value, args: &[Value], _ncx: &mut crate::context::NativeContext<'_>| {
                             let value = args.first().cloned().unwrap_or(Value::undefined());
                             if let Some(q) = &queue_for_resolve {
-                                promise_for_resolve.resolve_with_js_jobs(value, |job, args| {
+                                JsPromise::resolve_with_js_jobs(promise_for_resolve, value, |job, args| {
                                     q.enqueue(job, args);
                                 });
                             } else {
@@ -898,7 +894,7 @@ pub fn install_promise_statics(
                         move |_this: &Value, args: &[Value], _ncx: &mut crate::context::NativeContext<'_>| {
                             let reason = args.first().cloned().unwrap_or(Value::undefined());
                             if let Some(q) = &queue_for_reject {
-                                promise_for_reject.reject_with_js_jobs(reason, |job, args| {
+                                JsPromise::reject_with_js_jobs(promise_for_reject, reason, |job, args| {
                                     q.enqueue(job, args);
                                 });
                             } else {

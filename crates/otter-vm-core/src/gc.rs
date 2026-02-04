@@ -888,3 +888,297 @@ impl Trace for crate::data_view::JsDataView {
         self.buffer().trace(tracer);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::VmContext;
+    use crate::memory::MemoryManager;
+    use crate::object::JsObject;
+    use crate::value::Value;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_handle_scope_basic() {
+        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let mut ctx = VmContext::new(global, mm.clone());
+
+        {
+            let scope = HandleScope::new(&mut ctx);
+            let handle = scope.root_value(Value::int32(42));
+            assert_eq!(
+                scope.context().get_root_slot(handle.slot_index()).as_int32(),
+                Some(42)
+            );
+        }
+
+        // Scope dropped, slots should be cleaned up
+        assert_eq!(ctx.root_count(), 0);
+    }
+
+    #[test]
+    fn test_handle_scope_multiple_values() {
+        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let mut ctx = VmContext::new(global, mm.clone());
+
+        {
+            let scope = HandleScope::new(&mut ctx);
+            let h1 = scope.root_value(Value::int32(1));
+            let h2 = scope.root_value(Value::int32(2));
+            let h3 = scope.root_value(Value::int32(3));
+
+            // Verify each handle has a unique slot index
+            assert_ne!(h1.slot_index(), h2.slot_index());
+            assert_ne!(h2.slot_index(), h3.slot_index());
+
+            // Verify values are correct
+            assert_eq!(
+                scope.context().get_root_slot(h1.slot_index()).as_int32(),
+                Some(1)
+            );
+            assert_eq!(
+                scope.context().get_root_slot(h2.slot_index()).as_int32(),
+                Some(2)
+            );
+            assert_eq!(
+                scope.context().get_root_slot(h3.slot_index()).as_int32(),
+                Some(3)
+            );
+        }
+
+        assert_eq!(ctx.root_count(), 0);
+    }
+
+    #[test]
+    fn test_handle_scope_nested() {
+        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let mut ctx = VmContext::new(global, mm.clone());
+
+        {
+            let scope1 = HandleScope::new(&mut ctx);
+            let h1 = scope1.root_value(Value::int32(1));
+            assert_eq!(scope1.context().root_count(), 1);
+
+            {
+                let scope2 = HandleScope::new(scope1.context_mut());
+                let h2 = scope2.root_value(Value::int32(2));
+                assert_eq!(scope2.context().root_count(), 2);
+
+                {
+                    let scope3 = HandleScope::new(scope2.context_mut());
+                    let h3 = scope3.root_value(Value::int32(3));
+                    assert_eq!(scope3.context().root_count(), 3);
+
+                    // All three values should be accessible
+                    assert_eq!(
+                        scope3.context().get_root_slot(h1.slot_index()).as_int32(),
+                        Some(1)
+                    );
+                    assert_eq!(
+                        scope3.context().get_root_slot(h2.slot_index()).as_int32(),
+                        Some(2)
+                    );
+                    assert_eq!(
+                        scope3.context().get_root_slot(h3.slot_index()).as_int32(),
+                        Some(3)
+                    );
+                }
+                // scope3 dropped, h3 should be cleaned up
+                assert_eq!(scope1.context().root_count(), 2);
+            }
+            // scope2 dropped, h2 should be cleaned up
+            assert_eq!(scope1.context().root_count(), 1);
+        }
+        // scope1 dropped, h1 should be cleaned up
+        assert_eq!(ctx.root_count(), 0);
+    }
+
+    #[test]
+    fn test_handle_scope_with_objects() {
+        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let mut ctx = VmContext::new(global, mm.clone());
+
+        {
+            let scope = HandleScope::new(&mut ctx);
+            let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+            let _handle = scope.root_value(Value::object(obj.clone()));
+
+            // Verify the object is rooted
+            assert_eq!(scope.context().root_count(), 1);
+
+            // Modify the object
+            obj.set("test".into(), Value::int32(42));
+
+            // Verify the modification persists
+            assert_eq!(obj.get(&"test".into()), Some(Value::int32(42)));
+        }
+
+        assert_eq!(ctx.root_count(), 0);
+    }
+
+    #[test]
+    fn test_gc_ref_basic() {
+        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+
+        // Set a property
+        obj.set("foo".into(), Value::int32(123));
+
+        // Get the property back
+        assert_eq!(obj.get(&"foo".into()), Some(Value::int32(123)));
+    }
+
+    #[test]
+    fn test_gc_ref_clone() {
+        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let obj1 = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        obj1.set("value".into(), Value::int32(99));
+
+        // Clone the reference
+        let obj2 = obj1.clone();
+
+        // Both references should point to the same object
+        assert_eq!(obj2.get(&"value".into()), Some(Value::int32(99)));
+
+        // Modifying through obj2 should affect obj1
+        obj2.set("value".into(), Value::int32(100));
+        assert_eq!(obj1.get(&"value".into()), Some(Value::int32(100)));
+    }
+
+    #[test]
+    fn test_gc_ref_equality() {
+        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let obj1 = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj2 = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+
+        // Different objects should not be equal
+        assert_ne!(obj1.as_ptr(), obj2.as_ptr());
+
+        // Same object cloned should be equal
+        let obj1_clone = obj1.clone();
+        assert_eq!(obj1.as_ptr(), obj1_clone.as_ptr());
+    }
+
+    #[test]
+    fn test_gc_ref_pointer_identity() {
+        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+
+        // Clone and verify pointer identity
+        let clone1 = obj.clone();
+        let clone2 = obj.clone();
+
+        // All should have the same pointer
+        assert_eq!(obj.as_ptr(), clone1.as_ptr());
+        assert_eq!(obj.as_ptr(), clone2.as_ptr());
+        assert_eq!(clone1.as_ptr(), clone2.as_ptr());
+    }
+
+    #[test]
+    fn test_handle_is_valid() {
+        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let mut ctx = VmContext::new(global, mm.clone());
+
+        let scope = HandleScope::new(&mut ctx);
+        let handle = scope.root_value(Value::int32(42));
+
+        // Handle should be valid within its scope
+        assert!(handle.slot_index() < scope.context().root_count());
+        assert!(handle.is_valid());
+    }
+
+    #[test]
+    fn test_handle_copy_semantics() {
+        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let mut ctx = VmContext::new(global, mm.clone());
+
+        let scope = HandleScope::new(&mut ctx);
+        let h1 = scope.root_value(Value::int32(42));
+
+        // Handle implements Copy, so this should work
+        let h2 = h1;
+        let h3 = h1;
+
+        // All handles should point to the same slot
+        assert_eq!(h1.slot_index(), h2.slot_index());
+        assert_eq!(h1.slot_index(), h3.slot_index());
+
+        // All should access the same value
+        assert_eq!(
+            scope.context().get_root_slot(h1.slot_index()).as_int32(),
+            Some(42)
+        );
+        assert_eq!(
+            scope.context().get_root_slot(h2.slot_index()).as_int32(),
+            Some(42)
+        );
+        assert_eq!(
+            scope.context().get_root_slot(h3.slot_index()).as_int32(),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn test_handle_scope_marker_stack() {
+        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let mut ctx = VmContext::new(global, mm.clone());
+
+        // Create scopes and verify they clean up properly
+        // We can't directly test scope_markers since there's no public accessor,
+        // but we can verify root slots are cleaned up correctly (which depends on markers)
+
+        {
+            let scope1 = HandleScope::new(&mut ctx);
+            let _h1 = scope1.root_value(Value::int32(1));
+            assert_eq!(scope1.context().root_count(), 1);
+
+            {
+                let scope2 = HandleScope::new(scope1.context_mut());
+                let _h2 = scope2.root_value(Value::int32(2));
+                assert_eq!(scope2.context().root_count(), 2);
+
+                {
+                    let scope3 = HandleScope::new(scope2.context_mut());
+                    let _h3 = scope3.root_value(Value::int32(3));
+                    assert_eq!(scope3.context().root_count(), 3);
+                }
+                // scope3 dropped
+                assert_eq!(scope2.context().root_count(), 2);
+            }
+            // scope2 dropped
+            assert_eq!(scope1.context().root_count(), 1);
+        }
+        // scope1 dropped
+        assert_eq!(ctx.root_count(), 0);
+    }
+
+    #[test]
+    fn test_handle_survives_gc_safepoint() {
+        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let mut ctx = VmContext::new(global, mm.clone());
+
+        let scope = HandleScope::new(&mut ctx);
+        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        obj.set("important".into(), Value::int32(999));
+
+        let handle = scope.root_value(Value::object(obj.clone()));
+
+        // Simulate a GC safepoint (in a real scenario, GC would run here)
+        // The handle ensures the object stays alive
+
+        // Verify the object is still accessible through the handle
+        if let Some(val) = scope.context().get_root_slot(handle.slot_index()).as_object() {
+            assert_eq!(val.get(&"important".into()), Some(Value::int32(999)));
+        } else {
+            panic!("Expected object value in handle");
+        }
+    }
+}

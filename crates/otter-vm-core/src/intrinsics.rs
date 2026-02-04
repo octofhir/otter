@@ -224,7 +224,7 @@ impl Intrinsics {
 
         // Create well-known symbols
         let make_symbol = |id: u64, desc: &str| -> Value {
-            Value::symbol(Arc::new(Symbol {
+            Value::symbol(GcRef::new(Symbol {
                 description: Some(desc.to_string()),
                 id,
             }))
@@ -926,7 +926,12 @@ impl Intrinsics {
             } else {
                 0.0
             };
-            Ok(Value::number(n))
+            if let Some(obj) = _this.as_object() {
+                obj.set(PropertyKey::string("__value__"), Value::number(n));
+                Ok(_this.clone())
+            } else {
+                Ok(Value::number(n))
+            }
         });
         install(
             "Number",

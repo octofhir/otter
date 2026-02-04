@@ -27,6 +27,15 @@ pub struct JsProxy {
     revoked: AtomicBool,
 }
 
+impl otter_vm_gc::GcTraceable for JsProxy {
+    const NEEDS_TRACE: bool = true;
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // Trace target and handler Values (they may contain GC refs)
+        self.target.trace(tracer);
+        self.handler.trace(tracer);
+    }
+}
+
 impl std::fmt::Debug for JsProxy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_revoked() {
@@ -40,15 +49,15 @@ impl std::fmt::Debug for JsProxy {
 /// Result of creating a revocable proxy
 pub struct RevocableProxy {
     /// The proxy object
-    pub proxy: Arc<JsProxy>,
+    pub proxy: GcRef<JsProxy>,
     /// Function to revoke the proxy (internally calls `proxy.revoke()`)
     pub revoke: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl JsProxy {
     /// Create a new proxy
-    pub fn new(target: Value, handler: Value) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(target: Value, handler: Value) -> GcRef<Self> {
+        GcRef::new(Self {
             target,
             handler,
             revoked: AtomicBool::new(false),
@@ -58,7 +67,7 @@ impl JsProxy {
     /// Create a revocable proxy
     pub fn revocable(target: Value, handler: Value) -> RevocableProxy {
         let proxy = Self::new(target, handler);
-        let proxy_for_revoke = proxy.clone();
+        let proxy_for_revoke = proxy; // GcRef is Copy
 
         RevocableProxy {
             proxy,

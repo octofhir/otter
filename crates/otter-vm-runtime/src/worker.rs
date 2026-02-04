@@ -365,6 +365,7 @@ impl Drop for WorkerPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otter_vm_core::gc::GcRef;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
@@ -526,8 +527,8 @@ mod tests {
     fn test_shared_array_buffer_between_workers() {
         use otter_vm_core::SharedArrayBuffer;
 
-        let sab = Arc::new(SharedArrayBuffer::new(4));
-        let sab_clone = Arc::clone(&sab);
+        let sab = GcRef::new(SharedArrayBuffer::new(4));
+        let sab_clone = sab; // GcRef is Copy
 
         let main_mm = Arc::new(MemoryManager::test());
         let worker_mm = Arc::new(MemoryManager::test());

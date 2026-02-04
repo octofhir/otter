@@ -302,7 +302,7 @@ impl Otter {
             &mut ctx,
             code,
             "main.js",
-            Arc::clone(&result_promise),
+            result_promise,
         )?;
 
         // 8. Handle execution result with async resume loop
@@ -319,7 +319,7 @@ impl Otter {
                     // Execution suspended waiting for a Promise
                     // Set up signal for when the promise resolves
                     let signal = ResumeSignal::new();
-                    self.register_promise_signal(&async_ctx.awaited_promise, Arc::clone(&signal));
+                    self.register_promise_signal(async_ctx.awaited_promise, Arc::clone(&signal));
 
                     // Wait for the promise to resolve
                     let resolved_value = loop {
@@ -482,7 +482,7 @@ impl Otter {
         ctx: &mut VmContext,
         code: &str,
         source_url: &str,
-        result_promise: Arc<JsPromise>,
+        result_promise: GcRef<JsPromise>,
     ) -> Result<VmExecutionResult, OtterError> {
         let compiler = Compiler::new();
         let module = compiler
@@ -496,7 +496,7 @@ impl Otter {
     }
 
     /// Register a signal on a promise to be notified when it resolves/rejects
-    fn register_promise_signal(&self, promise: &Arc<JsPromise>, signal: Arc<ResumeSignal>) {
+    fn register_promise_signal(&self, promise: GcRef<JsPromise>, signal: Arc<ResumeSignal>) {
         let event_loop = Arc::clone(&self.event_loop);
 
         // Handle fulfillment
@@ -1023,12 +1023,12 @@ impl Otter {
         };
 
         let resolve_result_promise =
-            |interpreter: &mut Interpreter, ctx: &mut VmContext, result_promise: Arc<JsPromise>, value: Value| {
-                if let Some(promise) = value.as_promise().cloned() {
-                    if Arc::ptr_eq(&promise, &result_promise) {
+            |interpreter: &mut Interpreter, ctx: &mut VmContext, result_promise: GcRef<JsPromise>, value: Value| {
+                if let Some(promise) = value.as_promise() {
+                    if std::ptr::eq(promise.as_ptr(), result_promise.as_ptr()) {
                         let error_val =
                             make_error_value(ctx, "TypeError", "Promise cannot resolve itself");
-                        result_promise.reject_with_js_jobs(error_val, make_js_enqueuer());
+                        JsPromise::reject_with_js_jobs(result_promise, error_val, make_js_enqueuer());
                         return;
                     }
 
@@ -1081,24 +1081,24 @@ impl Otter {
                         Ok(_) => {}
                         Err(vm_err) => {
                             let error_val = vm_error_to_value(ctx, vm_err);
-                            result_promise.reject_with_js_jobs(error_val, make_js_enqueuer());
+                            JsPromise::reject_with_js_jobs(result_promise, error_val, make_js_enqueuer());
                             return;
                         }
                     }
                 }
 
-                result_promise.resolve_with_js_jobs(value, make_js_enqueuer());
+                JsPromise::resolve_with_js_jobs(result_promise, value, make_js_enqueuer());
             };
 
         let mut call_thenable = |interpreter: &mut Interpreter,
                                  ctx: &mut VmContext,
                                  then_fn: Value,
                                  then_this: Value,
-                                 promise: Arc<JsPromise>,
+                                 promise: GcRef<JsPromise>,
                                  first_error: &mut Option<String>| {
             if !then_fn.is_callable() {
                 let js_queue = Arc::clone(&js_queue);
-                promise.fulfill_with_js_jobs(then_this, move |job, args| {
+                JsPromise::fulfill_with_js_jobs(promise, then_this, move |job, args| {
                     js_queue.enqueue(job, args);
                 });
                 return;
@@ -1118,7 +1118,7 @@ impl Otter {
                             }
                             let value = args.get(0).cloned().unwrap_or(Value::undefined());
                             let js_queue = Arc::clone(&js_queue);
-                            result_promise.resolve_from_thenable_with_js_jobs(value, move |job, args| {
+                            JsPromise::resolve_from_thenable_with_js_jobs(result_promise, value, move |job, args| {
                                 js_queue.enqueue(job, args);
                             });
                             Ok(Value::undefined())
@@ -1134,7 +1134,7 @@ impl Otter {
                             }
                             let value = args.get(0).cloned().unwrap_or(Value::undefined());
                             let js_queue = Arc::clone(&js_queue);
-                            result_promise.resolve_from_thenable_with_js_jobs(value, move |job, args| {
+                            JsPromise::resolve_from_thenable_with_js_jobs(result_promise, value, move |job, args| {
                                 js_queue.enqueue(job, args);
                             });
                             Ok(Value::undefined())
@@ -1156,7 +1156,7 @@ impl Otter {
                             }
                             let value = args.get(0).cloned().unwrap_or(Value::undefined());
                             let js_queue = Arc::clone(&js_queue);
-                            result_promise.reject_from_thenable_with_js_jobs(value, move |job, args| {
+                            JsPromise::reject_from_thenable_with_js_jobs(result_promise, value, move |job, args| {
                                 js_queue.enqueue(job, args);
                             });
                             Ok(Value::undefined())
@@ -1172,7 +1172,7 @@ impl Otter {
                             }
                             let value = args.get(0).cloned().unwrap_or(Value::undefined());
                             let js_queue = Arc::clone(&js_queue);
-                            result_promise.reject_from_thenable_with_js_jobs(value, move |job, args| {
+                            JsPromise::reject_from_thenable_with_js_jobs(result_promise, value, move |job, args| {
                                 js_queue.enqueue(job, args);
                             });
                             Ok(Value::undefined())
@@ -1194,7 +1194,7 @@ impl Otter {
                     if !called.load(Ordering::Acquire) {
                         let err_msg = vm_err.to_string();
                         let error_val = vm_error_to_value(ctx, vm_err);
-                        promise.reject_from_thenable_with_js_jobs(error_val, make_js_enqueuer());
+                        JsPromise::reject_from_thenable_with_js_jobs(promise, error_val, make_js_enqueuer());
                         runtime_error = Some(format!("Error in thenable resolve: {}", err_msg));
                     }
                 }
@@ -1208,7 +1208,7 @@ impl Otter {
                             "Unknown panic in thenable resolve".to_string()
                         };
                         let error_val = Value::string(JsString::intern(&error_msg));
-                        promise.reject_from_thenable_with_js_jobs(error_val, make_js_enqueuer());
+                        JsPromise::reject_from_thenable_with_js_jobs(promise, error_val, make_js_enqueuer());
                         runtime_error = Some(error_msg);
                     }
                 }
@@ -1249,7 +1249,7 @@ impl Otter {
                 match kind {
                     JsPromiseJobKind::PassthroughFulfill => {
                         if let Some(promise) = result_promise {
-                            promise.resolve_from_thenable_with_js_jobs(
+                            JsPromise::resolve_from_thenable_with_js_jobs(promise, 
                                 passthrough_value,
                                 make_js_enqueuer(),
                             );
@@ -1258,7 +1258,7 @@ impl Otter {
                     }
                     JsPromiseJobKind::PassthroughReject => {
                         if let Some(promise) = result_promise {
-                            promise.reject_from_thenable_with_js_jobs(
+                            JsPromise::reject_from_thenable_with_js_jobs(promise, 
                                 passthrough_value,
                                 make_js_enqueuer(),
                             );
@@ -1284,7 +1284,7 @@ impl Otter {
                             }
                             Err(vm_err) => {
                                 let error_val = vm_error_to_value(ctx, vm_err);
-                                promise.reject_from_thenable_with_js_jobs(
+                                JsPromise::reject_from_thenable_with_js_jobs(promise, 
                                     error_val,
                                     make_js_enqueuer(),
                                 );
@@ -1345,7 +1345,7 @@ impl Otter {
                             Ok(Err(vm_err)) => {
                                 runtime_error = Some(format!("Error in finally callback: {}", vm_err));
                                 let error_val = vm_error_to_value(ctx, vm_err);
-                                promise.reject_with_js_jobs(error_val, make_js_enqueuer());
+                                JsPromise::reject_with_js_jobs(promise, error_val, make_js_enqueuer());
                             }
                             Err(panic_err) => {
                                 let error_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
@@ -1356,7 +1356,7 @@ impl Otter {
                                     "Unknown panic in finally callback".to_string()
                                 };
                                 let error_val = Value::string(JsString::intern(&error_msg));
-                                promise.reject_with_js_jobs(error_val, make_js_enqueuer());
+                                JsPromise::reject_with_js_jobs(promise, error_val, make_js_enqueuer());
                                 runtime_error = Some(error_msg);
                             }
                         }
@@ -1422,7 +1422,7 @@ impl Otter {
                             Ok(Err(vm_err)) => {
                                 runtime_error = Some(format!("Error in finally callback: {}", vm_err));
                                 let error_val = vm_error_to_value(ctx, vm_err);
-                                promise.reject_with_js_jobs(error_val, make_js_enqueuer());
+                                JsPromise::reject_with_js_jobs(promise, error_val, make_js_enqueuer());
                             }
                             Err(panic_err) => {
                                 let error_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
@@ -1433,7 +1433,7 @@ impl Otter {
                                     "Unknown panic in finally callback".to_string()
                                 };
                                 let error_val = Value::string(JsString::intern(&error_msg));
-                                promise.reject_with_js_jobs(error_val, make_js_enqueuer());
+                                JsPromise::reject_with_js_jobs(promise, error_val, make_js_enqueuer());
                                 runtime_error = Some(error_msg);
                             }
                         }
@@ -1468,13 +1468,13 @@ impl Otter {
                     if let Some(promise) = result_promise {
                         match kind {
                             JsPromiseJobKind::Reject | JsPromiseJobKind::FinallyReject => {
-                                promise.reject_from_thenable_with_js_jobs(
+                                JsPromise::reject_from_thenable_with_js_jobs(promise, 
                                     passthrough_value,
                                     make_js_enqueuer(),
                                 );
                             }
                             _ => {
-                                promise.resolve_from_thenable_with_js_jobs(
+                                JsPromise::resolve_from_thenable_with_js_jobs(promise, 
                                     passthrough_value,
                                     make_js_enqueuer(),
                                 );
@@ -1503,7 +1503,7 @@ impl Otter {
                         Ok(Err(vm_err)) => {
                             runtime_error = Some(format!("Error in JS callback: {}", vm_err));
                             let error_val = vm_error_to_value(ctx, vm_err);
-                            promise.reject_with_js_jobs(error_val, make_js_enqueuer());
+                            JsPromise::reject_with_js_jobs(promise, error_val, make_js_enqueuer());
                         }
                         Err(panic_err) => {
                             let error_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
@@ -1514,7 +1514,7 @@ impl Otter {
                                 "Unknown panic in JS callback".to_string()
                             };
                             let error_val = Value::string(JsString::intern(&error_msg));
-                            promise.reject_with_js_jobs(error_val, make_js_enqueuer());
+                            JsPromise::reject_with_js_jobs(promise, error_val, make_js_enqueuer());
                             runtime_error = Some(error_msg);
                         }
                     }

@@ -9,6 +9,7 @@
 
 use otter_vm_core::error::VmError;
 use otter_vm_core::array_buffer::JsArrayBuffer;
+use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
 use otter_vm_core::value::Value as VmValue;
 use otter_vm_runtime::{op_native_with_mm as op_native, Op};
@@ -74,7 +75,7 @@ fn native_array_buffer_create(
         JsArrayBuffer::new(byte_length, None, _mm)
     };
 
-    Ok(VmValue::array_buffer(Arc::new(ab)))
+    Ok(VmValue::array_buffer(GcRef::new(ab)))
 }
 
 // ============================================================================
@@ -191,7 +192,7 @@ fn native_array_buffer_slice(
         .slice(start, end_pos)
         .ok_or("TypeError: ArrayBuffer is detached")?;
 
-    Ok(VmValue::array_buffer(Arc::new(new_ab)))
+    Ok(VmValue::array_buffer(GcRef::new(new_ab)))
 }
 
 /// Transfer the ArrayBuffer (detaches the original)
@@ -211,7 +212,7 @@ fn native_array_buffer_transfer(
 
     let new_ab = ab.transfer().ok_or("TypeError: ArrayBuffer is detached")?;
 
-    Ok(VmValue::array_buffer(Arc::new(new_ab)))
+    Ok(VmValue::array_buffer(GcRef::new(new_ab)))
 }
 
 /// Transfer the ArrayBuffer to a fixed-length buffer
@@ -245,7 +246,7 @@ fn native_array_buffer_transfer_to_fixed_length(
         .transfer_to_fixed_length(new_length)
         .ok_or("TypeError: ArrayBuffer is detached")?;
 
-    Ok(VmValue::array_buffer(Arc::new(new_ab)))
+    Ok(VmValue::array_buffer(GcRef::new(new_ab)))
 }
 
 /// Resize a resizable ArrayBuffer

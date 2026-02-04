@@ -222,7 +222,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                         0
                     };
 
-                    let ab = Arc::new(JsArrayBuffer::new(len, Some(fn_proto), ncx.memory_manager().clone()));
+                    let ab = GcRef::new(JsArrayBuffer::new(len, Some(fn_proto), ncx.memory_manager().clone()));
                     Ok(Value::array_buffer(ab))
                 },
                 mm_clone,
@@ -260,12 +260,12 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                 move |_this, args: &[Value], ncx| {
                     // Helper to create TypedArray with hidden property for getter access
                     let make_typed_array = |ta: JsTypedArray| -> Value {
-                        let ta_arc = Arc::new(ta);
+                        let ta_arc = GcRef::new(ta);
                         let obj = ta_arc.object;
                         // Store TypedArray as hidden property so getters can access it
                         obj.define_property(
                             PropertyKey::string("__TypedArrayData__"),
-                            PropertyDescriptor::data(Value::typed_array(ta_arc.clone())),
+                            PropertyDescriptor::data(Value::typed_array(ta_arc)),
                         );
                         // Return the object directly, not the TypedArray value
                         Value::object(obj)
@@ -280,7 +280,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
 
                     if args.is_empty() {
                         // new TypedArray() - create empty with length 0
-                        let buffer = Arc::new(JsArrayBuffer::new(0, None, ncx.memory_manager().clone()));
+                        let buffer = GcRef::new(JsArrayBuffer::new(0, None, ncx.memory_manager().clone()));
                         let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
                         let ta = JsTypedArray::new(object, buffer, kind, 0, 0)
                             .map_err(|e| VmError::type_error(e))?;
@@ -312,7 +312,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                     // Check if arg0 is another TypedArray
                     if let Some(other_ta) = arg0.as_typed_array() {
                         let length = other_ta.length();
-                        let buffer = Arc::new(JsArrayBuffer::new(
+                        let buffer = GcRef::new(JsArrayBuffer::new(
                             length * kind.element_size(),
                             None,
                             ncx.memory_manager().clone(),
@@ -338,7 +338,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                         } else {
                             length_num as usize
                         };
-                        let buffer = Arc::new(JsArrayBuffer::new(
+                        let buffer = GcRef::new(JsArrayBuffer::new(
                             length * kind.element_size(),
                             None,
                             ncx.memory_manager().clone(),
@@ -351,7 +351,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
 
                     if let Some(length_int) = arg0.as_int32() {
                         let length = length_int.max(0) as usize;
-                        let buffer = Arc::new(JsArrayBuffer::new(
+                        let buffer = GcRef::new(JsArrayBuffer::new(
                             length * kind.element_size(),
                             None,
                             ncx.memory_manager().clone(),
@@ -367,7 +367,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                         if let Some(length_val) = obj.get(&PropertyKey::string("length")) {
                             if let Some(length) = length_val.as_int32() {
                                 let length = length.max(0) as usize;
-                                let buffer = Arc::new(JsArrayBuffer::new(
+                                let buffer = GcRef::new(JsArrayBuffer::new(
                                     length * kind.element_size(),
                                     None,
                                     ncx.memory_manager().clone(),
@@ -393,7 +393,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                     }
 
                     // Default: treat as length 0
-                    let buffer = Arc::new(JsArrayBuffer::new(0, None, ncx.memory_manager().clone()));
+                    let buffer = GcRef::new(JsArrayBuffer::new(0, None, ncx.memory_manager().clone()));
                     let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
                     let ta = JsTypedArray::new(object, buffer, kind, 0, 0)
                         .map_err(|e| VmError::type_error(e))?;
@@ -582,7 +582,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                             };
 
                             // Create new TypedArray
-                            let buffer = Arc::new(JsArrayBuffer::new(
+                            let buffer = GcRef::new(JsArrayBuffer::new(
                                 length * kind.element_size(),
                                 None,
                                 ncx.memory_manager().clone(),
@@ -612,10 +612,10 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                                 }
                             }
 
-                            let ta_arc = Arc::new(ta);
+                            let ta_arc = GcRef::new(ta);
                             object.define_property(
                                 PropertyKey::string("__TypedArrayData__"),
-                                PropertyDescriptor::data(Value::typed_array(ta_arc.clone())),
+                                PropertyDescriptor::data(Value::typed_array(ta_arc)),
                             );
                             Ok(Value::object(object))
                         },
@@ -634,7 +634,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                             let length = args.len();
 
                             // Create new TypedArray
-                            let buffer = Arc::new(JsArrayBuffer::new(
+                            let buffer = GcRef::new(JsArrayBuffer::new(
                                 length * kind.element_size(),
                                 None,
                                 ncx.memory_manager().clone(),
@@ -652,10 +652,10 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                                 }
                             }
 
-                            let ta_arc = Arc::new(ta);
+                            let ta_arc = GcRef::new(ta);
                             object.define_property(
                                 PropertyKey::string("__TypedArrayData__"),
-                                PropertyDescriptor::data(Value::typed_array(ta_arc.clone())),
+                                PropertyDescriptor::data(Value::typed_array(ta_arc)),
                             );
                             Ok(Value::object(object))
                         },
@@ -711,7 +711,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
             proto.define_property(
                 PropertyKey::string("byteLength"),
                 PropertyDescriptor::getter(Value::native_function_with_proto(
-                    |this_val, args, _ncx| {
+                    |this_val, _args, _ncx| {
                         if let Some(this) = this_val.as_array_buffer() {
                             Ok(Value::number(this.byte_length() as f64))
                         } else {
@@ -752,7 +752,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                         };
 
                         let new_ab = ab.slice(start, end).ok_or("Failed to slice ArrayBuffer")?;
-                        Ok(Value::array_buffer(Arc::new(new_ab)))
+                        Ok(Value::array_buffer(GcRef::new(new_ab)))
                     },
                     mm.clone(),
                     fn_proto,
@@ -1093,6 +1093,15 @@ pub fn to_number(value: &Value) -> f64 {
             return 0.0;
         }
         trimmed.parse::<f64>().unwrap_or(f64::NAN)
+    } else if let Some(obj) = value.as_object() {
+        use crate::object::PropertyKey;
+        if let Some(prim) = obj.get(&PropertyKey::string("__value__")) {
+            return to_number(&prim);
+        }
+        if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
+            return to_number(&prim);
+        }
+        f64::NAN
     } else {
         f64::NAN
     }

@@ -4,6 +4,7 @@
 //! number types in an ArrayBuffer, with control over byte order (endianness).
 
 use crate::array_buffer::JsArrayBuffer;
+use crate::gc::GcRef;
 use std::sync::Arc;
 
 /// A JavaScript DataView
@@ -13,17 +14,25 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct JsDataView {
     /// The underlying ArrayBuffer
-    buffer: Arc<JsArrayBuffer>,
+    buffer: GcRef<JsArrayBuffer>,
     /// Byte offset into the buffer
     byte_offset: usize,
     /// Length of the view in bytes
     byte_length: usize,
 }
 
+impl otter_vm_gc::GcTraceable for JsDataView {
+    const NEEDS_TRACE: bool = true;
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // Trace the buffer's object field
+        tracer(self.buffer.object.header() as *const _);
+    }
+}
+
 impl JsDataView {
     /// Create a new DataView over an ArrayBuffer
     pub fn new(
-        buffer: Arc<JsArrayBuffer>,
+        buffer: GcRef<JsArrayBuffer>,
         byte_offset: usize,
         byte_length: Option<usize>,
     ) -> Result<Self, &'static str> {
@@ -55,8 +64,8 @@ impl JsDataView {
     }
 
     /// Get the underlying ArrayBuffer
-    pub fn buffer(&self) -> &Arc<JsArrayBuffer> {
-        &self.buffer
+    pub fn buffer(&self) -> GcRef<JsArrayBuffer> {
+        self.buffer
     }
 
     /// Get the byte offset into the buffer
@@ -480,6 +489,7 @@ impl JsDataView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gc::GcRef;
     use crate::memory::MemoryManager;
 
     fn make_mm() -> Arc<MemoryManager> {
@@ -489,7 +499,7 @@ mod tests {
     #[test]
     fn test_create_dataview() {
         let mm = make_mm();
-        let buf = Arc::new(JsArrayBuffer::new(16, None, mm));
+        let buf = GcRef::new(JsArrayBuffer::new(16, None, mm));
         let dv = JsDataView::new(buf.clone(), 0, None).unwrap();
         assert_eq!(dv.byte_length(), 16);
         assert_eq!(dv.byte_offset(), 0);
@@ -498,7 +508,7 @@ mod tests {
     #[test]
     fn test_create_with_offset() {
         let mm = make_mm();
-        let buf = Arc::new(JsArrayBuffer::new(16, None, mm));
+        let buf = GcRef::new(JsArrayBuffer::new(16, None, mm));
         let dv = JsDataView::new(buf.clone(), 4, Some(8)).unwrap();
         assert_eq!(dv.byte_length(), 8);
         assert_eq!(dv.byte_offset(), 4);
@@ -507,7 +517,7 @@ mod tests {
     #[test]
     fn test_int8() {
         let mm = make_mm();
-        let buf = Arc::new(JsArrayBuffer::new(4, None, mm));
+        let buf = GcRef::new(JsArrayBuffer::new(4, None, mm));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
         dv.set_int8(0, -128).unwrap();
@@ -522,7 +532,7 @@ mod tests {
     #[test]
     fn test_uint8() {
         let mm = make_mm();
-        let buf = Arc::new(JsArrayBuffer::new(4, None, mm));
+        let buf = GcRef::new(JsArrayBuffer::new(4, None, mm));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
         dv.set_uint8(0, 0).unwrap();
@@ -537,7 +547,7 @@ mod tests {
     #[test]
     fn test_int16_endianness() {
         let mm = make_mm();
-        let buf = Arc::new(JsArrayBuffer::new(4, None, mm));
+        let buf = GcRef::new(JsArrayBuffer::new(4, None, mm));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
         dv.set_int16(0, 0x0102, true).unwrap(); // Little-endian: 02 01
@@ -552,7 +562,7 @@ mod tests {
     #[test]
     fn test_int32_endianness() {
         let mm = make_mm();
-        let buf = Arc::new(JsArrayBuffer::new(8, None, mm));
+        let buf = GcRef::new(JsArrayBuffer::new(8, None, mm));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
         dv.set_int32(0, 0x01020304, true).unwrap();
@@ -565,7 +575,7 @@ mod tests {
     #[test]
     fn test_float32() {
         let mm = make_mm();
-        let buf = Arc::new(JsArrayBuffer::new(8, None, mm));
+        let buf = GcRef::new(JsArrayBuffer::new(8, None, mm));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
         dv.set_float32(0, 3.14, true).unwrap();
@@ -580,7 +590,7 @@ mod tests {
     #[test]
     fn test_float64() {
         let mm = make_mm();
-        let buf = Arc::new(JsArrayBuffer::new(16, None, mm));
+        let buf = GcRef::new(JsArrayBuffer::new(16, None, mm));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
         dv.set_float64(0, std::f64::consts::PI, true).unwrap();
@@ -595,7 +605,7 @@ mod tests {
     #[test]
     fn test_big_int64() {
         let mm = make_mm();
-        let buf = Arc::new(JsArrayBuffer::new(16, None, mm));
+        let buf = GcRef::new(JsArrayBuffer::new(16, None, mm));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
         dv.set_big_int64(0, i64::MAX, true).unwrap();
@@ -608,7 +618,7 @@ mod tests {
     #[test]
     fn test_bounds_check() {
         let mm = make_mm();
-        let buf = Arc::new(JsArrayBuffer::new(4, None, mm));
+        let buf = GcRef::new(JsArrayBuffer::new(4, None, mm));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
         assert!(dv.get_int32(1, true).is_err()); // Would read past end
@@ -618,7 +628,7 @@ mod tests {
     #[test]
     fn test_detached_buffer() {
         let mm = make_mm();
-        let buf = Arc::new(JsArrayBuffer::new(16, None, mm));
+        let buf = GcRef::new(JsArrayBuffer::new(16, None, mm));
         let dv = JsDataView::new(buf.clone(), 0, None).unwrap();
 
         dv.set_int32(0, 42, true).unwrap();
@@ -634,7 +644,7 @@ mod tests {
     #[test]
     fn test_invalid_construction() {
         let mm = make_mm();
-        let buf = Arc::new(JsArrayBuffer::new(8, None, mm));
+        let buf = GcRef::new(JsArrayBuffer::new(8, None, mm));
 
         // Offset past end
         assert!(JsDataView::new(buf.clone(), 10, None).is_err());

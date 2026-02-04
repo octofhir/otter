@@ -6,6 +6,7 @@
 //! - Symbol.keyFor() - get key from global symbol
 //! - Well-known symbols: iterator, asyncIterator, toStringTag, hasInstance, toPrimitive
 
+use otter_vm_core::gc::GcRef;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::{Symbol, Value};
 use otter_vm_core::{VmError, memory};
@@ -18,7 +19,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 static SYMBOL_ID_COUNTER: AtomicU64 = AtomicU64::new(1000); // Start after well-known symbols
 
 /// Global symbol registry for Symbol.for() / Symbol.keyFor()
-static GLOBAL_REGISTRY: OnceLock<RwLock<HashMap<String, Arc<Symbol>>>> = OnceLock::new();
+static GLOBAL_REGISTRY: OnceLock<RwLock<HashMap<String, GcRef<Symbol>>>> = OnceLock::new();
 
 /// Well-known symbol IDs (fixed, pre-defined)
 pub mod well_known {
@@ -43,7 +44,7 @@ fn next_symbol_id() -> u64 {
 }
 
 /// Get or initialize the global registry
-fn global_registry() -> &'static RwLock<HashMap<String, Arc<Symbol>>> {
+fn global_registry() -> &'static RwLock<HashMap<String, GcRef<Symbol>>> {
     GLOBAL_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -76,7 +77,7 @@ fn symbol_create(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Valu
         }
     });
 
-    let sym = Arc::new(Symbol {
+    let sym = GcRef::new(Symbol {
         description,
         id: next_symbol_id(),
     });
@@ -99,12 +100,12 @@ fn symbol_for(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, 
     {
         let read = registry.read().unwrap();
         if let Some(sym) = read.get(&key) {
-            return Ok(Value::symbol(Arc::clone(sym)));
+            return Ok(Value::symbol(*sym));
         }
     }
 
     // Create new symbol and register it
-    let sym = Arc::new(Symbol {
+    let sym = GcRef::new(Symbol {
         description: Some(key.clone()),
         id: next_symbol_id(),
     });
@@ -113,9 +114,9 @@ fn symbol_for(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, 
         let mut write = registry.write().unwrap();
         // Double-check in case another thread added it
         if let Some(existing) = write.get(&key) {
-            return Ok(Value::symbol(Arc::clone(existing)));
+            return Ok(Value::symbol(*existing));
         }
-        write.insert(key, Arc::clone(&sym));
+        write.insert(key, sym);
     }
 
     Ok(Value::symbol(sym))
@@ -214,7 +215,7 @@ fn symbol_get_well_known(
         _ => return Err(VmError::type_error(format!("Unknown well-known symbol: {}", name))),
     };
 
-    let sym = Arc::new(Symbol {
+    let sym = GcRef::new(Symbol {
         description: Some(desc.to_string()),
         id,
     });

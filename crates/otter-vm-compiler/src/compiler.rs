@@ -4512,20 +4512,26 @@ impl Compiler {
             // Add the expression if there's one at this position
             if i < template.expressions.len() {
                 let expr_reg = self.compile_expression(&template.expressions[i])?;
+                let str_reg = self.codegen.alloc_reg();
+                self.codegen.emit(Instruction::ToString {
+                    dst: str_reg,
+                    src: expr_reg,
+                });
+                self.codegen.free_reg(expr_reg);
 
                 result = Some(match result {
-                    None => expr_reg,
+                    None => str_reg,
                     Some(acc) => {
                         let dst = self.codegen.alloc_reg();
                         let feedback_index = self.codegen.alloc_ic();
                         self.codegen.emit(Instruction::Add {
                             dst,
                             lhs: acc,
-                            rhs: expr_reg,
+                            rhs: str_reg,
                             feedback_index,
                         });
                         self.codegen.free_reg(acc);
-                        self.codegen.free_reg(expr_reg);
+                        self.codegen.free_reg(str_reg);
                         dst
                     }
                 });

@@ -93,6 +93,11 @@ impl VmError {
         Self::RangeError(msg.into())
     }
 
+    /// Create a syntax error
+    pub fn syntax_error(msg: impl Into<String>) -> Self {
+        Self::SyntaxError(msg.into())
+    }
+
     /// Create an internal error
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::InternalError(msg.into())

@@ -116,6 +116,8 @@ pub enum Opcode {
     TypeOfName = 0x5C,
     /// RequireObjectCoercible - throws TypeError if value is null or undefined
     RequireCoercible = 0x5D,
+    /// ToString conversion: dst = ToString(src)
+    ToString = 0x5E,
 
     // ==================== Objects ====================
     /// Get property: dst = obj\[key\]
@@ -305,6 +307,7 @@ impl Opcode {
             0x5B => Some(Self::ToNumber),
             0x5C => Some(Self::TypeOfName),
             0x5D => Some(Self::RequireCoercible),
+            0x5E => Some(Self::ToString),
 
             0x60 => Some(Self::GetProp),
             0x61 => Some(Self::SetProp),
@@ -437,6 +440,7 @@ impl Opcode {
             Self::ToNumber => "ToNumber",
             Self::TypeOfName => "TypeOfName",
             Self::RequireCoercible => "RequireCoercible",
+            Self::ToString => "ToString",
             // Objects
             Self::GetProp => "GetProp",
             Self::SetProp => "SetProp",
@@ -783,6 +787,11 @@ pub enum Instruction {
     },
     /// ToNumber conversion
     ToNumber {
+        dst: Register,
+        src: Register,
+    },
+    /// ToString conversion
+    ToString {
         dst: Register,
         src: Register,
     },

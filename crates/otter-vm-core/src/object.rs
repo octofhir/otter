@@ -440,6 +440,21 @@ impl JsObject {
         obj
     }
 
+    /// Create an array-like object (e.g., for `arguments`)
+    ///
+    /// This creates an object with indexed storage like an array,
+    /// but is_array=false so Array.isArray() returns false.
+    /// Per ES2026 §10.4.4, arguments objects are ordinary objects, not arrays.
+    pub fn array_like(length: usize, memory_manager: Arc<crate::memory::MemoryManager>) -> Self {
+        let obj = Self::new(Value::null(), memory_manager);
+        const MAX_DENSE_PREALLOC: usize = 1 << 24;
+        if length <= MAX_DENSE_PREALLOC {
+            obj.elements.write().resize(length, Value::undefined());
+        }
+        // Note: is_array remains false (default)
+        obj
+    }
+
     /// Get property value by offset (for Inline Cache fast path)
     /// First INLINE_PROPERTY_COUNT properties are stored inline, rest in overflow.
     /// Returns None for accessor properties - caller should use get_property_entry_by_offset instead.
@@ -817,7 +832,16 @@ impl JsObject {
         // Dictionary mode: lookup in HashMap
         if self.is_dictionary_mode() {
             if let Some(dict) = self.dictionary_properties.read().as_ref() {
-                return dict.get(key).map(|e| e.desc.clone());
+                if let Some(e) = dict.get(key) {
+                    return Some(e.desc.clone());
+                }
+                // For Index keys, also try as String (e.g., Index(2) -> String("2"))
+                if let PropertyKey::Index(i) = key {
+                    let str_key = PropertyKey::string(&i.to_string());
+                    if let Some(e) = dict.get(&str_key) {
+                        return Some(e.desc.clone());
+                    }
+                }
             }
             return None;
         }
@@ -825,6 +849,13 @@ impl JsObject {
         let shape = self.shape.read();
         if let Some(offset) = shape.get_offset(key) {
             return self.get_property_entry_by_offset(offset);
+        }
+        // For Index keys, also try as String (e.g., Index(2) -> String("2"))
+        if let PropertyKey::Index(i) = key {
+            let str_key = PropertyKey::string(&i.to_string());
+            if let Some(offset) = shape.get_offset(&str_key) {
+                return self.get_property_entry_by_offset(offset);
+            }
         }
         None
     }
@@ -1122,19 +1153,43 @@ impl JsObject {
 
     /// Get own property keys
     pub fn own_keys(&self) -> Vec<PropertyKey> {
-        let mut keys = Vec::new();
+        let mut integer_keys: Vec<u32> = Vec::new();
+        let mut string_keys: Vec<PropertyKey> = Vec::new();
 
         // Dictionary mode: get keys from HashMap
         if self.is_dictionary_mode() {
             if let Some(dict) = self.dictionary_properties.read().as_ref() {
-                keys.extend(dict.keys().cloned());
+                for key in dict.keys() {
+                    match key {
+                        PropertyKey::Index(i) => integer_keys.push(*i),
+                        PropertyKey::String(s) => {
+                            // Check if it's a valid array index string
+                            if let Ok(n) = s.as_str().parse::<u32>() {
+                                integer_keys.push(n);
+                            } else {
+                                string_keys.push(key.clone());
+                            }
+                        }
+                        _ => string_keys.push(key.clone()),
+                    }
+                }
             }
         } else {
             let shape_keys = self.shape.read().own_keys();
-            keys.reserve(shape_keys.len());
             for key in shape_keys {
                 if self.get_own_property_descriptor(&key).is_some() {
-                    keys.push(key);
+                    match &key {
+                        PropertyKey::Index(i) => integer_keys.push(*i),
+                        PropertyKey::String(s) => {
+                            // Check if it's a valid array index string
+                            if let Ok(n) = s.as_str().parse::<u32>() {
+                                integer_keys.push(n);
+                            } else {
+                                string_keys.push(key);
+                            }
+                        }
+                        _ => string_keys.push(key),
+                    }
                 }
             }
         }
@@ -1142,8 +1197,21 @@ impl JsObject {
         // Add indexed elements
         let elements = self.elements.read();
         for i in 0..elements.len() {
-            keys.push(PropertyKey::Index(i as u32));
+            // Check if not already in integer_keys to avoid duplicates
+            if !integer_keys.contains(&(i as u32)) {
+                integer_keys.push(i as u32);
+            }
         }
+
+        // Sort integer keys numerically
+        integer_keys.sort_unstable();
+
+        // Build result: integer indices first, then string keys
+        let mut keys = Vec::with_capacity(integer_keys.len() + string_keys.len());
+        for i in integer_keys {
+            keys.push(PropertyKey::Index(i));
+        }
+        keys.extend(string_keys);
 
         keys
     }
@@ -1305,6 +1373,12 @@ impl JsObject {
     /// Check if object is an array
     pub fn is_array(&self) -> bool {
         self.flags.read().is_array
+    }
+
+    /// Mark this object as an array exotic object
+    /// Used for Array.prototype per ES2026 §23.1.3
+    pub fn mark_as_array(&self) {
+        self.flags.write().is_array = true;
     }
 
     // ========================================================================

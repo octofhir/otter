@@ -8,6 +8,9 @@
 
 use std::sync::Arc;
 
+use num_bigint::BigInt as NumBigInt;
+use num_traits::ToPrimitive;
+
 use crate::array_buffer::JsArrayBuffer;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -1073,6 +1076,24 @@ fn decode_uri_impl(encoded: &str, preserve_reserved: bool) -> Result<Value, VmEr
 pub fn to_number(value: &Value) -> f64 {
     if let Some(n) = value.as_number() {
         return n;
+    }
+    if let Some(crate::value::HeapRef::BigInt(b)) = value.heap_ref() {
+        let mut s = b.value.as_str();
+        let negative = s.starts_with('-');
+        if negative {
+            s = &s[1..];
+        }
+        if let Some(mut bigint) = NumBigInt::parse_bytes(s.as_bytes(), 10) {
+            if negative {
+                bigint = -bigint;
+            }
+            return bigint.to_f64().unwrap_or(if negative {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            });
+        }
+        return f64::NAN;
     }
 
     if value.is_undefined() {

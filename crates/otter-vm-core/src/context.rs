@@ -11,8 +11,11 @@ use crate::async_context::SavedFrame;
 use crate::error::{VmError, VmResult};
 use crate::gc::GcRef;
 use crate::object::JsObject;
+use crate::symbol_registry::{SymbolRegistry, global_symbol_registry};
 use crate::string::JsString;
 use crate::value::{UpvalueCell, Value};
+use crate::interpreter::PreferredType;
+use num_bigint::BigInt as NumBigInt;
 
 #[cfg(feature = "profiling")]
 use otter_profiler::RuntimeStats;
@@ -107,6 +110,22 @@ impl<'a> NativeContext<'a> {
 
         self.interpreter
             .call_function(self.ctx, &current_func, current_this, &current_args)
+    }
+
+    pub(crate) fn to_primitive(&mut self, value: &Value, hint: PreferredType) -> VmResult<Value> {
+        self.interpreter.to_primitive(self.ctx, value, hint)
+    }
+
+    pub(crate) fn to_string_value(&mut self, value: &Value) -> VmResult<String> {
+        self.interpreter.to_string_value(self.ctx, value)
+    }
+
+    pub(crate) fn to_number_value(&mut self, value: &Value) -> VmResult<f64> {
+        self.interpreter.to_number_value(self.ctx, value)
+    }
+
+    pub(crate) fn parse_bigint_str(&self, value: &str) -> VmResult<NumBigInt> {
+        self.interpreter.parse_bigint_str(value)
     }
 
     /// Access the memory manager.
@@ -282,6 +301,8 @@ pub struct VmContext {
     /// External root sets registered by the runtime (e.g., job queues).
     /// These are traced during GC root collection.
     external_root_sets: Vec<Arc<dyn ExternalRootSet + Send + Sync>>,
+    /// Global Symbol registry shared across contexts.
+    symbol_registry: Arc<SymbolRegistry>,
     /// Trace state (if tracing is enabled)
     pub(crate) trace_state: Option<crate::trace::TraceState>,
 }
@@ -405,6 +426,7 @@ impl VmContext {
             microtask_enqueue: None,
             js_job_queue: None,
             external_root_sets: Vec::new(),
+            symbol_registry: global_symbol_registry(),
             trace_state: None,
         }
     }
@@ -412,6 +434,10 @@ impl VmContext {
     /// Get the memory manager
     pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
         &self.memory_manager
+    }
+
+    pub(crate) fn symbol_registry(&self) -> &Arc<SymbolRegistry> {
+        &self.symbol_registry
     }
 
     /// Attach a debug snapshot target to update periodically.
@@ -1173,6 +1199,16 @@ impl VmContext {
 
     /// Pop the current call frame
     pub fn pop_frame(&mut self) -> Option<CallFrame> {
+        // Remove any try handlers associated with this frame.
+        let current_depth = self.call_stack.len();
+        while self
+            .try_stack
+            .last()
+            .is_some_and(|handler| handler.frame_depth == current_depth)
+        {
+            self.try_stack.pop();
+        }
+
         if let Some(frame) = self.call_stack.last() {
             // Clean up open upvalues for this frame
             // (cells are already synced via set_local updates)
@@ -1669,6 +1705,10 @@ impl VmContext {
         for root_set in &self.external_root_sets {
             root_set.trace_roots(&mut |header| roots.push(header));
         }
+
+        // Add global symbol registry
+        self.symbol_registry
+            .trace_roots(&mut |header| roots.push(header));
 
         // Add global string intern table
         // Interned strings are used by Shape property keys and must survive GC

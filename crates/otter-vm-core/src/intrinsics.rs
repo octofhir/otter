@@ -523,6 +523,16 @@ impl Intrinsics {
         );
 
         // ===================================================================
+        // Symbol.prototype methods (extracted to intrinsics_impl/symbol.rs)
+        // ===================================================================
+        crate::intrinsics_impl::symbol::init_symbol_prototype(self.symbol_prototype, fn_proto, mm);
+
+        // ===================================================================
+        // BigInt.prototype methods (extracted to intrinsics_impl/bigint.rs)
+        // ===================================================================
+        crate::intrinsics_impl::bigint::init_bigint_prototype(self.bigint_prototype, fn_proto, mm);
+
+        // ===================================================================
         // Date.prototype methods (extracted to intrinsics_impl/date.rs)
         // ===================================================================
         crate::intrinsics_impl::date::init_date_prototype(self.date_prototype, fn_proto, mm);
@@ -546,6 +556,9 @@ impl Intrinsics {
         // ===================================================================
         // Array.prototype methods (extracted to intrinsics_impl/array.rs)
         // ===================================================================
+        // ES2026 §23.1.3: Array.prototype is itself an Array exotic object
+        // Its [[DefineOwnProperty]] is as specified in §10.4.2.1, length is 0
+        self.array_prototype.mark_as_array();
         crate::intrinsics_impl::array::init_array_prototype(
             self.array_prototype,
             fn_proto,
@@ -811,9 +824,28 @@ impl Intrinsics {
                 ) -> Result<Value, VmError>
                 + Send
                 + Sync,
-        > = Box::new(|this, args, _ncx| {
+        > = Box::new(|this, args, ncx| {
             let s = if let Some(arg) = args.first() {
-                crate::globals::to_string(arg)
+                let symbol_to_string = |sym: &crate::value::Symbol| {
+                    if let Some(desc) = sym.description.as_deref() {
+                        format!("Symbol({})", desc)
+                    } else {
+                        "Symbol()".to_string()
+                    }
+                };
+
+                if let Some(sym) = arg.as_symbol() {
+                    symbol_to_string(&sym)
+                } else if arg.is_object() {
+                    let prim = ncx.to_primitive(arg, crate::interpreter::PreferredType::String)?;
+                    if let Some(sym) = prim.as_symbol() {
+                        symbol_to_string(&sym)
+                    } else {
+                        ncx.to_string_value(&prim)?
+                    }
+                } else {
+                    ncx.to_string_value(arg)?
+                }
             } else {
                 String::new()
             };
@@ -920,15 +952,15 @@ impl Intrinsics {
                 ) -> Result<Value, VmError>
                 + Send
                 + Sync,
-        > = Box::new(|_this, args, _ncx| {
+        > = Box::new(|this, args, ncx| {
             let n = if let Some(arg) = args.first() {
-                crate::globals::to_number(arg)
+                ncx.to_number_value(arg)?
             } else {
                 0.0
             };
-            if let Some(obj) = _this.as_object() {
+            if let Some(obj) = this.as_object() {
                 obj.set(PropertyKey::string("__value__"), Value::number(n));
-                Ok(_this.clone())
+                Ok(this.clone())
             } else {
                 Ok(Value::number(n))
             }
@@ -953,11 +985,25 @@ impl Intrinsics {
 
         // Symbol
         let symbol_ctor = alloc_ctor();
-        install("Symbol", symbol_ctor, self.symbol_prototype, None);
+        let symbol_ctor_fn = crate::intrinsics_impl::symbol::create_symbol_constructor();
+        install(
+            "Symbol",
+            symbol_ctor,
+            self.symbol_prototype,
+            Some(symbol_ctor_fn),
+        );
+        crate::intrinsics_impl::symbol::install_symbol_statics(symbol_ctor, fn_proto, mm);
 
         // BigInt
         let bigint_ctor = alloc_ctor();
-        install("BigInt", bigint_ctor, self.bigint_prototype, None);
+        let bigint_ctor_fn = crate::intrinsics_impl::bigint::create_bigint_constructor();
+        install(
+            "BigInt",
+            bigint_ctor,
+            self.bigint_prototype,
+            Some(bigint_ctor_fn),
+        );
+        crate::intrinsics_impl::bigint::install_bigint_statics(bigint_ctor, fn_proto, mm);
 
         // ====================================================================
         // Collection constructors
@@ -1145,19 +1191,20 @@ impl Intrinsics {
                 ) -> Result<Value, VmError>
                 + Send
                 + Sync,
-        > = Box::new(|this, args, _ncx| {
+        > = Box::new(|this, args, ncx| {
             use std::time::{SystemTime, UNIX_EPOCH};
             let timestamp = if args.is_empty() {
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_millis() as f64)
                     .unwrap_or(0.0)
-            } else if let Some(n) = args[0].as_number() {
-                n
-            } else if args[0].as_string().is_some() {
-                f64::NAN // TODO: proper date parsing
             } else {
-                f64::NAN
+                let prim = ncx.to_primitive(&args[0], crate::interpreter::PreferredType::Number)?;
+                if prim.as_string().is_some() {
+                    f64::NAN // TODO: proper date parsing
+                } else {
+                    ncx.to_number_value(&prim)?
+                }
             };
             // Set timestamp on `this` (created by Construct with Date.prototype)
             if let Some(obj) = this.as_object() {
@@ -1332,5 +1379,11 @@ impl Intrinsics {
         // support and will be added in a future update.
         // ====================================================================
         crate::intrinsics_impl::reflect::install_reflect_namespace(global, mm);
+
+        // ====================================================================
+        // JSON namespace (extracted to intrinsics_impl/json.rs)
+        // Implements JSON.parse and JSON.stringify using serde_json
+        // ====================================================================
+        crate::intrinsics_impl::json::install_json_namespace(global, mm);
     }
 }

@@ -8,9 +8,53 @@ use crate::intrinsics::well_known;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
+use crate::context::NativeContext;
 use crate::memory::MemoryManager;
 use crate::value::Symbol;
 use std::sync::Arc;
+
+fn get_builtin_proto(global: &GcRef<JsObject>, name: &str) -> Option<GcRef<JsObject>> {
+    global
+        .get(&PropertyKey::string(name))
+        .and_then(|v| v.as_object())
+        .and_then(|ctor| ctor.get(&PropertyKey::string("prototype")))
+        .and_then(|v| v.as_object())
+}
+
+fn to_object_for_builtin(ncx: &mut NativeContext<'_>, value: &Value) -> Result<GcRef<JsObject>, VmError> {
+    if let Some(obj) = value.as_object() {
+        return Ok(obj);
+    }
+    if value.is_null() || value.is_undefined() {
+        return Err(VmError::type_error("Cannot convert undefined or null to object"));
+    }
+
+    let global = ncx.ctx.global();
+    let mm = ncx.memory_manager().clone();
+    let (proto_name, slot_key, slot_value) = if let Some(s) = value.as_string() {
+        ("String", "__primitiveValue__", Value::string(s))
+    } else if let Some(n) = value.as_number() {
+        ("Number", "__value__", Value::number(n))
+    } else if let Some(i) = value.as_int32() {
+        ("Number", "__value__", Value::number(i as f64))
+    } else if let Some(b) = value.as_boolean() {
+        ("Boolean", "__value__", Value::boolean(b))
+    } else if value.is_symbol() {
+        ("Symbol", "__primitiveValue__", value.clone())
+    } else if value.is_bigint() {
+        ("BigInt", "__value__", value.clone())
+    } else {
+        ("Object", "__value__", value.clone())
+    };
+
+    let proto = get_builtin_proto(&global, proto_name).or_else(|| get_builtin_proto(&global, "Object"));
+    let obj = GcRef::new(JsObject::new(
+        proto.map(Value::object).unwrap_or_else(Value::null),
+        mm,
+    ));
+    obj.set(PropertyKey::string(slot_key), slot_value);
+    Ok(obj)
+}
 
 /// Initialize Object.prototype methods
 pub fn init_object_prototype(
@@ -124,10 +168,10 @@ pub fn init_object_prototype(
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, ncx| {
                 let key_val = args.first().cloned().unwrap_or(Value::undefined());
+                use crate::intrinsics_impl::reflect::to_property_key;
 
                 // Handle proxy
                 if let Some(proxy) = this_val.as_proxy() {
-                    use crate::intrinsics_impl::reflect::to_property_key;
                     let key = to_property_key(&key_val);
 
                     // Use proxy_has which goes through the 'has' trap
@@ -135,15 +179,9 @@ pub fn init_object_prototype(
                     return Ok(Value::boolean(result));
                 }
 
-                // Handle regular object
-                if let Some(obj) = this_val.as_object() {
-                    if let Some(s) = key_val.as_string() {
-                        return Ok(Value::boolean(
-                            obj.has_own(&PropertyKey::string(s.as_str())),
-                        ));
-                    }
-                }
-                Ok(Value::boolean(false))
+                let obj = to_object_for_builtin(ncx, this_val)?;
+                let key = to_property_key(&key_val);
+                Ok(Value::boolean(obj.has_own(&key)))
             },
             mm.clone(),
             fn_proto.clone(),
@@ -180,18 +218,28 @@ pub fn init_object_prototype(
     object_proto.define_property(
         PropertyKey::string("propertyIsEnumerable"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, _ncx| {
-                if let Some(obj) = this_val.as_object() {
-                    if let Some(key) = args.first() {
-                        if let Some(s) = key.as_string() {
-                            let pk = PropertyKey::string(s.as_str());
-                            if let Some(desc) = obj.get_own_property_descriptor(&pk) {
-                                return Ok(Value::boolean(desc.enumerable()));
-                            }
-                        }
-                    }
+            |this_val, args, ncx| {
+                let key_val = args.first().cloned().unwrap_or(Value::undefined());
+                use crate::intrinsics_impl::reflect::to_property_key;
+
+                if let Some(proxy) = this_val.as_proxy() {
+                    let key = to_property_key(&key_val);
+                    let desc = crate::proxy_operations::proxy_get_own_property_descriptor(
+                        ncx,
+                        proxy,
+                        &key,
+                        key_val,
+                    )?;
+                    return Ok(Value::boolean(desc.map(|d| d.enumerable()).unwrap_or(false)));
                 }
-                Ok(Value::boolean(false))
+
+                let obj = to_object_for_builtin(ncx, this_val)?;
+                let key = to_property_key(&key_val);
+                Ok(Value::boolean(
+                    obj.get_own_property_descriptor(&key)
+                        .map(|d| d.enumerable())
+                        .unwrap_or(false),
+                ))
             },
             mm.clone(),
             fn_proto,
@@ -209,12 +257,37 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("getPrototypeOf"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _ncx| {
-                if let Some(obj) = args.first().and_then(|v| v.as_object()) {
-                    Ok(obj.prototype())
-                } else {
-                    Ok(Value::null())
+            |_this, args, ncx| {
+                let target = args.first().cloned().unwrap_or(Value::undefined());
+                if let Some(proxy) = target.as_proxy() {
+                    let proto =
+                        crate::proxy_operations::proxy_get_prototype_of(ncx, proxy)?;
+                    return Ok(proto.map(Value::object).unwrap_or_else(Value::null));
                 }
+                if let Some(obj) = target.as_object() {
+                    return Ok(obj.prototype());
+                }
+                if target.is_null() || target.is_undefined() {
+                    return Err(VmError::type_error(
+                        "Object.getPrototypeOf requires an object",
+                    ));
+                }
+
+                let global = ncx.ctx.global();
+                let proto = if target.is_string() {
+                    get_builtin_proto(&global, "String")
+                } else if target.is_number() {
+                    get_builtin_proto(&global, "Number")
+                } else if target.is_boolean() {
+                    get_builtin_proto(&global, "Boolean")
+                } else if target.is_symbol() {
+                    get_builtin_proto(&global, "Symbol")
+                } else if target.is_bigint() {
+                    get_builtin_proto(&global, "BigInt")
+                } else {
+                    get_builtin_proto(&global, "Object")
+                };
+                Ok(proto.map(Value::object).unwrap_or_else(Value::null))
             },
             mm.clone(),
             fn_proto.clone(),
@@ -290,60 +363,54 @@ pub fn init_object_constructor(
                     }
                 }
 
-                // Handle regular object case
-                let target = args.first().and_then(|v| v.as_object());
-                let key = args.get(1).and_then(|v| v.as_string());
-                if let (Some(obj), Some(key_str)) = (target, key) {
-                    let pk = PropertyKey::string(key_str.as_str());
-                    if let Some(desc) = obj.get_own_property_descriptor(&pk) {
-                        // Build descriptor object
-                        let desc_obj =
-                            GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
-                        match &desc {
-                            PropertyDescriptor::Data { value, attributes } => {
-                                desc_obj.set(
-                                    PropertyKey::string("value"),
-                                    value.clone(),
-                                );
-                                desc_obj.set(
-                                    PropertyKey::string("writable"),
-                                    Value::boolean(attributes.writable),
-                                );
-                                desc_obj.set(
-                                    PropertyKey::string("enumerable"),
-                                    Value::boolean(attributes.enumerable),
-                                );
-                                desc_obj.set(
-                                    PropertyKey::string("configurable"),
-                                    Value::boolean(attributes.configurable),
-                                );
-                            }
-                            PropertyDescriptor::Accessor {
-                                get,
-                                set,
-                                attributes,
-                            } => {
-                                desc_obj.set(
-                                    PropertyKey::string("get"),
-                                    get.clone().unwrap_or(Value::undefined()),
-                                );
-                                desc_obj.set(
-                                    PropertyKey::string("set"),
-                                    set.clone().unwrap_or(Value::undefined()),
-                                );
-                                desc_obj.set(
-                                    PropertyKey::string("enumerable"),
-                                    Value::boolean(attributes.enumerable),
-                                );
-                                desc_obj.set(
-                                    PropertyKey::string("configurable"),
-                                    Value::boolean(attributes.configurable),
-                                );
-                            }
-                            PropertyDescriptor::Deleted => {}
+                // Handle regular object case (including primitives via ToObject)
+                let target = args.first().cloned().unwrap_or(Value::undefined());
+                let obj = to_object_for_builtin(ncx_inner, &target)?;
+                let key_val = args.get(1).cloned().unwrap_or(Value::undefined());
+                use crate::intrinsics_impl::reflect::to_property_key;
+                let pk = to_property_key(&key_val);
+
+                if let Some(desc) = obj.get_own_property_descriptor(&pk) {
+                    // Build descriptor object
+                    let desc_obj =
+                        GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
+                    match &desc {
+                        PropertyDescriptor::Data { value, attributes } => {
+                            desc_obj.set(PropertyKey::string("value"), value.clone());
+                            desc_obj.set(
+                                PropertyKey::string("writable"),
+                                Value::boolean(attributes.writable),
+                            );
+                            desc_obj.set(
+                                PropertyKey::string("enumerable"),
+                                Value::boolean(attributes.enumerable),
+                            );
+                            desc_obj.set(
+                                PropertyKey::string("configurable"),
+                                Value::boolean(attributes.configurable),
+                            );
                         }
-                        return Ok(Value::object(desc_obj));
+                        PropertyDescriptor::Accessor { get, set, attributes } => {
+                            desc_obj.set(
+                                PropertyKey::string("get"),
+                                get.clone().unwrap_or(Value::undefined()),
+                            );
+                            desc_obj.set(
+                                PropertyKey::string("set"),
+                                set.clone().unwrap_or(Value::undefined()),
+                            );
+                            desc_obj.set(
+                                PropertyKey::string("enumerable"),
+                                Value::boolean(attributes.enumerable),
+                            );
+                            desc_obj.set(
+                                PropertyKey::string("configurable"),
+                                Value::boolean(attributes.configurable),
+                            );
+                        }
+                        PropertyDescriptor::Deleted => {}
                     }
+                    return Ok(Value::object(desc_obj));
                 }
                 Ok(Value::undefined())
             },
@@ -1330,6 +1397,8 @@ pub fn create_object_constructor() -> Box<
                 ("Number", "__value__", Value::number(i as f64))
             } else if let Some(b) = arg.as_boolean() {
                 ("Boolean", "__value__", Value::boolean(b))
+            } else if arg.is_symbol() {
+                ("Symbol", "__primitiveValue__", arg.clone())
             } else if arg.is_bigint() {
                 ("BigInt", "__value__", arg.clone())
             } else {

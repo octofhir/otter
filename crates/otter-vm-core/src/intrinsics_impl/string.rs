@@ -169,11 +169,21 @@ pub fn init_string_prototype(
             PropertyKey::string("toString"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, _args, _ncx| {
+                    // String primitive
                     if let Some(s) = this_val.as_string() {
-                        Ok(Value::string(s))
-                    } else {
-                        Ok(Value::string(JsString::intern(&format!("{:?}", this_val))))
+                        return Ok(Value::string(s));
                     }
+                    // String wrapper object
+                    if let Some(obj) = this_val.as_object() {
+                        if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
+                            if let Some(s) = prim.as_string() {
+                                return Ok(Value::string(s));
+                            }
+                        }
+                    }
+                    Err(VmError::type_error(
+                        "String.prototype.toString requires that 'this' be a String",
+                    ))
                 },
                 mm.clone(),
                 fn_proto,
@@ -182,7 +192,23 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("valueOf"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, _args, _ncx| Ok(this_val.clone()),
+                |this_val, _args, _ncx| {
+                    // String primitive
+                    if let Some(s) = this_val.as_string() {
+                        return Ok(Value::string(s));
+                    }
+                    // String wrapper object
+                    if let Some(obj) = this_val.as_object() {
+                        if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
+                            if let Some(s) = prim.as_string() {
+                                return Ok(Value::string(s));
+                            }
+                        }
+                    }
+                    Err(VmError::type_error(
+                        "String.prototype.valueOf requires that 'this' be a String",
+                    ))
+                },
                 mm.clone(),
                 fn_proto,
             )),
@@ -645,21 +671,12 @@ pub fn init_string_prototype(
         string_proto.define_property(
             PropertyKey::string("concat"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _ncx| {
+                |this_val, args, ncx| {
                     let s = this_string_value(this_val)?;
                     let mut result = s.as_str().to_string();
                     for arg in args {
-                        if let Some(s) = arg.as_string() {
-                            result.push_str(s.as_str());
-                        } else if let Some(n) = arg.as_number() {
-                            result.push_str(&n.to_string());
-                        } else if let Some(b) = arg.as_boolean() {
-                            result.push_str(if b { "true" } else { "false" });
-                        } else if arg.is_null() {
-                            result.push_str("null");
-                        } else if arg.is_undefined() {
-                            result.push_str("undefined");
-                        }
+                        let arg_str = ncx.to_string_value(arg)?;
+                        result.push_str(&arg_str);
                     }
                     Ok(Value::string(JsString::intern(&result)))
                 },

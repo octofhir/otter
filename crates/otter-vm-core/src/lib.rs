@@ -39,6 +39,7 @@ pub mod shape;
 pub mod shared_buffer;
 pub mod string;
 pub mod structured_clone;
+pub mod symbol_registry;
 pub mod trace;
 pub mod typed_array;
 pub mod value;

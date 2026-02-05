@@ -398,7 +398,7 @@ pub fn init_array_prototype(
         arr_proto.define_property(
             PropertyKey::string("join"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _ncx| {
+                |this_val, args, ncx| {
                     let obj = this_val
                         .as_object()
                         .ok_or_else(|| "Array.prototype.join: not an object".to_string())?;
@@ -422,18 +422,8 @@ pub fn init_array_prototype(
                             .unwrap_or(Value::undefined());
                         if val.is_undefined() || val.is_null() {
                             parts.push(String::new());
-                        } else if let Some(s) = val.as_string() {
-                            parts.push(s.as_str().to_string());
-                        } else if let Some(n) = val.as_number() {
-                            if n.fract() == 0.0 && n.abs() < 1e15 {
-                                parts.push(format!("{}", n as i64));
-                            } else {
-                                parts.push(format!("{}", n));
-                            }
-                        } else if let Some(b) = val.as_boolean() {
-                            parts.push(if b { "true" } else { "false" }.to_string());
                         } else {
-                            parts.push("[object Object]".to_string());
+                            parts.push(ncx.to_string_value(&val)?);
                         }
                     }
                     Ok(Value::string(JsString::intern(&parts.join(&sep))))
@@ -447,7 +437,7 @@ pub fn init_array_prototype(
         arr_proto.define_property(
             PropertyKey::string("toString"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, _args, _ncx| {
+                |this_val, _args, ncx| {
                     // toString delegates to join
                     let obj = this_val
                         .as_object()
@@ -460,18 +450,8 @@ pub fn init_array_prototype(
                             .unwrap_or(Value::undefined());
                         if val.is_undefined() || val.is_null() {
                             parts.push(String::new());
-                        } else if let Some(s) = val.as_string() {
-                            parts.push(s.as_str().to_string());
-                        } else if let Some(n) = val.as_number() {
-                            if n.fract() == 0.0 && n.abs() < 1e15 {
-                                parts.push(format!("{}", n as i64));
-                            } else {
-                                parts.push(format!("{}", n));
-                            }
-                        } else if let Some(b) = val.as_boolean() {
-                            parts.push(if b { "true" } else { "false" }.to_string());
                         } else {
-                            parts.push("[object Object]".to_string());
+                            parts.push(ncx.to_string_value(&val)?);
                         }
                     }
                     Ok(Value::string(JsString::intern(&parts.join(","))))
@@ -1356,20 +1336,50 @@ pub fn install_array_statics(
     mm: &Arc<MemoryManager>,
 ) {
     // Array.isArray(arg) — §23.1.2.2
+    // Helper to recursively unwrap proxies when checking for arrays
+    fn is_array_value(value: &Value) -> Result<bool, VmError> {
+        if let Some(proxy) = value.as_proxy() {
+            let target = proxy.target().ok_or_else(|| {
+                VmError::type_error("Cannot perform 'isArray' on a proxy that has been revoked")
+            })?;
+            return is_array_value(&target);
+        }
+        if let Some(obj) = value.as_object() {
+            return Ok(obj.is_array());
+        }
+        Ok(false)
+    }
+
+    let is_array_fn = Value::native_function_with_proto(
+        |_this, args, _ncx| {
+            let arg = args.first().cloned().unwrap_or(Value::undefined());
+            let is_arr = is_array_value(&arg)?;
+            Ok(Value::boolean(is_arr))
+        },
+        mm.clone(),
+        fn_proto,
+    );
+    // Set function name and length, mark as non-constructor
+    if let Some(obj) = is_array_fn.as_object() {
+        // Array.isArray.length = 1
+        obj.define_property(
+            PropertyKey::string("length"),
+            PropertyDescriptor::function_length(Value::int32(1)),
+        );
+        // Array.isArray.name = "isArray"
+        obj.define_property(
+            PropertyKey::string("name"),
+            PropertyDescriptor::function_length(Value::string(JsString::intern("isArray"))),
+        );
+        // Mark as non-constructor so `new Array.isArray()` throws TypeError
+        obj.define_property(
+            PropertyKey::string("__non_constructor"),
+            PropertyDescriptor::builtin_data(Value::boolean(true)),
+        );
+    }
     ctor.define_property(
         PropertyKey::string("isArray"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _ncx| {
-                let is_arr = args
-                    .first()
-                    .and_then(|v| v.as_object())
-                    .map(|o| o.is_array())
-                    .unwrap_or(false);
-                Ok(Value::boolean(is_arr))
-            },
-            mm.clone(),
-            fn_proto,
-        )),
+        PropertyDescriptor::builtin_method(is_array_fn),
     );
 
     // Array.from(arrayLike) — §23.1.2.1 (simplified)

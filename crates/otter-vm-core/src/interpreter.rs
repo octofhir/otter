@@ -38,7 +38,7 @@ enum Numeric {
 }
 
 #[derive(Copy, Clone, Debug)]
-enum PreferredType {
+pub(crate) enum PreferredType {
     Default,
     Number,
     String,
@@ -1560,8 +1560,25 @@ impl Interpreter {
 
             Instruction::ToNumber { dst, src } => {
                 let value = ctx.get_register(src.0).clone();
-                let number = self.coerce_number(ctx, value)?;
+                let number = if value.is_object() {
+                    let prim = self.to_primitive(ctx, &value, PreferredType::Number)?;
+                    if prim.is_bigint() {
+                        return Err(VmError::type_error("Cannot convert BigInt to number"));
+                    }
+                    self.to_number_value(ctx, &prim)?
+                } else {
+                    if value.is_bigint() {
+                        return Err(VmError::type_error("Cannot convert BigInt to number"));
+                    }
+                    self.to_number_value(ctx, &value)?
+                };
                 ctx.set_register(dst.0, Value::number(number));
+                Ok(InstructionResult::Continue)
+            }
+            Instruction::ToString { dst, src } => {
+                let value = ctx.get_register(src.0).clone();
+                let s = self.to_string_value(ctx, &value)?;
+                ctx.set_register(dst.0, Value::string(JsString::intern(&s)));
                 Ok(InstructionResult::Continue)
             }
 
@@ -1658,50 +1675,50 @@ impl Interpreter {
                     }
                 }
 
-                // Generic path
-                let left_bigint = self.bigint_value(&left_value)?;
-                let right_bigint = self.bigint_value(&right_value)?;
+                // Generic path (ToNumeric)
+                let left_num = self.to_numeric(ctx, &left_value)?;
+                let right_num = self.to_numeric(ctx, &right_value)?;
 
-                if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
-                    let result = left_bigint - right_bigint;
-                    ctx.set_register(dst.0, Value::bigint(result.to_string()));
-                    return Ok(InstructionResult::Continue);
+                match (left_num, right_num) {
+                    (Numeric::BigInt(left), Numeric::BigInt(right)) => {
+                        let result = left - right;
+                        ctx.set_register(dst.0, Value::bigint(result.to_string()));
+                    }
+                    (Numeric::Number(left), Numeric::Number(right)) => {
+                        ctx.set_register(dst.0, Value::number(left - right));
+                    }
+                    _ => return Err(VmError::type_error("Cannot mix BigInt and other types")),
                 }
-
-                if left_value.is_bigint() || right_value.is_bigint() {
-                    return Err(VmError::type_error("Cannot mix BigInt and other types"));
-                }
-
-                let left = self.coerce_number(ctx, left_value)?;
-                let right = self.coerce_number(ctx, right_value)?;
-
-                ctx.set_register(dst.0, Value::number(left - right));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Inc { dst, src } => {
                 let value = ctx.get_register(src.0).clone();
-                if let Some(bigint) = self.bigint_value(&value)? {
-                    let result = bigint + NumBigInt::one();
-                    ctx.set_register(dst.0, Value::bigint(result.to_string()));
-                    return Ok(InstructionResult::Continue);
+                let numeric = self.to_numeric(ctx, &value)?;
+                match numeric {
+                    Numeric::BigInt(bigint) => {
+                        let result = bigint + NumBigInt::one();
+                        ctx.set_register(dst.0, Value::bigint(result.to_string()));
+                    }
+                    Numeric::Number(num) => {
+                        ctx.set_register(dst.0, Value::number(num + 1.0));
+                    }
                 }
-
-                let val = self.coerce_number(ctx, value)?;
-                ctx.set_register(dst.0, Value::number(val + 1.0));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Dec { dst, src } => {
                 let value = ctx.get_register(src.0).clone();
-                if let Some(bigint) = self.bigint_value(&value)? {
-                    let result = bigint - NumBigInt::one();
-                    ctx.set_register(dst.0, Value::bigint(result.to_string()));
-                    return Ok(InstructionResult::Continue);
+                let numeric = self.to_numeric(ctx, &value)?;
+                match numeric {
+                    Numeric::BigInt(bigint) => {
+                        let result = bigint - NumBigInt::one();
+                        ctx.set_register(dst.0, Value::bigint(result.to_string()));
+                    }
+                    Numeric::Number(num) => {
+                        ctx.set_register(dst.0, Value::number(num - 1.0));
+                    }
                 }
-
-                let val = self.coerce_number(ctx, value)?;
-                ctx.set_register(dst.0, Value::number(val - 1.0));
                 Ok(InstructionResult::Continue)
             }
 
@@ -1742,24 +1759,20 @@ impl Interpreter {
                     }
                 }
 
-                // Generic path
-                let left_bigint = self.bigint_value(&left_value)?;
-                let right_bigint = self.bigint_value(&right_value)?;
+                // Generic path (ToNumeric)
+                let left_num = self.to_numeric(ctx, &left_value)?;
+                let right_num = self.to_numeric(ctx, &right_value)?;
 
-                if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
-                    let result = left_bigint * right_bigint;
-                    ctx.set_register(dst.0, Value::bigint(result.to_string()));
-                    return Ok(InstructionResult::Continue);
+                match (left_num, right_num) {
+                    (Numeric::BigInt(left), Numeric::BigInt(right)) => {
+                        let result = left * right;
+                        ctx.set_register(dst.0, Value::bigint(result.to_string()));
+                    }
+                    (Numeric::Number(left), Numeric::Number(right)) => {
+                        ctx.set_register(dst.0, Value::number(left * right));
+                    }
+                    _ => return Err(VmError::type_error("Cannot mix BigInt and other types")),
                 }
-
-                if left_value.is_bigint() || right_value.is_bigint() {
-                    return Err(VmError::type_error("Cannot mix BigInt and other types"));
-                }
-
-                let left = self.coerce_number(ctx, left_value)?;
-                let right = self.coerce_number(ctx, right_value)?;
-
-                ctx.set_register(dst.0, Value::number(left * right));
                 Ok(InstructionResult::Continue)
             }
 
@@ -1801,27 +1814,23 @@ impl Interpreter {
                     }
                 }
 
-                // Generic path
-                let left_bigint = self.bigint_value(&left_value)?;
-                let right_bigint = self.bigint_value(&right_value)?;
+                // Generic path (ToNumeric)
+                let left_num = self.to_numeric(ctx, &left_value)?;
+                let right_num = self.to_numeric(ctx, &right_value)?;
 
-                if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
-                    if right_bigint.is_zero() {
-                        return Err(VmError::range_error("Division by zero"));
+                match (left_num, right_num) {
+                    (Numeric::BigInt(left), Numeric::BigInt(right)) => {
+                        if right.is_zero() {
+                            return Err(VmError::range_error("Division by zero"));
+                        }
+                        let result = left / right;
+                        ctx.set_register(dst.0, Value::bigint(result.to_string()));
                     }
-                    let result = left_bigint / right_bigint;
-                    ctx.set_register(dst.0, Value::bigint(result.to_string()));
-                    return Ok(InstructionResult::Continue);
+                    (Numeric::Number(left), Numeric::Number(right)) => {
+                        ctx.set_register(dst.0, Value::number(left / right));
+                    }
+                    _ => return Err(VmError::type_error("Cannot mix BigInt and other types")),
                 }
-
-                if left_value.is_bigint() || right_value.is_bigint() {
-                    return Err(VmError::type_error("Cannot mix BigInt and other types"));
-                }
-
-                let left = self.coerce_number(ctx, left_value)?;
-                let right = self.coerce_number(ctx, right_value)?;
-
-                ctx.set_register(dst.0, Value::number(left / right));
                 Ok(InstructionResult::Continue)
             }
 
@@ -2014,78 +2023,64 @@ impl Interpreter {
             Instruction::Mod { dst, lhs, rhs } => {
                 let left_value = ctx.get_register(lhs.0).clone();
                 let right_value = ctx.get_register(rhs.0).clone();
-                let left_bigint = self.bigint_value(&left_value)?;
-                let right_bigint = self.bigint_value(&right_value)?;
+                let left_num = self.to_numeric(ctx, &left_value)?;
+                let right_num = self.to_numeric(ctx, &right_value)?;
 
-                if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
-                    if right_bigint.is_zero() {
-                        return Err(VmError::range_error("Division by zero"));
+                match (left_num, right_num) {
+                    (Numeric::BigInt(left), Numeric::BigInt(right)) => {
+                        if right.is_zero() {
+                            return Err(VmError::range_error("Division by zero"));
+                        }
+                        let result = left % right;
+                        ctx.set_register(dst.0, Value::bigint(result.to_string()));
                     }
-                    let result = left_bigint % right_bigint;
-                    ctx.set_register(dst.0, Value::bigint(result.to_string()));
-                    return Ok(InstructionResult::Continue);
+                    (Numeric::Number(left), Numeric::Number(right)) => {
+                        ctx.set_register(dst.0, Value::number(left % right));
+                    }
+                    _ => return Err(VmError::type_error("Cannot mix BigInt and other types")),
                 }
-
-                if left_value.is_bigint() || right_value.is_bigint() {
-                    return Err(VmError::type_error("Cannot mix BigInt and other types"));
-                }
-
-                let left = self.coerce_number(ctx, left_value)?;
-                let right = self.coerce_number(ctx, right_value)?;
-
-                ctx.set_register(dst.0, Value::number(left % right));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Pow { dst, lhs, rhs } => {
                 let left_value = ctx.get_register(lhs.0).clone();
                 let right_value = ctx.get_register(rhs.0).clone();
-                let left_bigint = self.bigint_value(&left_value)?;
-                let right_bigint = self.bigint_value(&right_value)?;
+                let left_num = self.to_numeric(ctx, &left_value)?;
+                let right_num = self.to_numeric(ctx, &right_value)?;
 
-                if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
-                    if right_bigint < NumBigInt::zero() {
-                        return Err(VmError::range_error(
-                            "Exponent must be non-negative for BigInt",
-                        ));
+                match (left_num, right_num) {
+                    (Numeric::BigInt(left), Numeric::BigInt(right)) => {
+                        if right < NumBigInt::zero() {
+                            return Err(VmError::range_error(
+                                "Exponent must be non-negative for BigInt",
+                            ));
+                        }
+                        let exponent = right
+                            .to_u32()
+                            .ok_or_else(|| VmError::range_error("Exponent too large for BigInt"))?;
+                        let result = left.pow(exponent);
+                        ctx.set_register(dst.0, Value::bigint(result.to_string()));
                     }
-                    let exponent = right_bigint
-                        .to_u32()
-                        .ok_or_else(|| VmError::range_error("Exponent too large for BigInt"))?;
-                    let result = left_bigint.pow(exponent);
-                    ctx.set_register(dst.0, Value::bigint(result.to_string()));
-                    return Ok(InstructionResult::Continue);
+                    (Numeric::Number(left), Numeric::Number(right)) => {
+                        ctx.set_register(dst.0, Value::number(left.powf(right)));
+                    }
+                    _ => return Err(VmError::type_error("Cannot mix BigInt and other types")),
                 }
-
-                if left_value.is_bigint() || right_value.is_bigint() {
-                    return Err(VmError::type_error("Cannot mix BigInt and other types"));
-                }
-
-                let left = self.coerce_number(ctx, left_value)?;
-                let right = self.coerce_number(ctx, right_value)?;
-
-                ctx.set_register(dst.0, Value::number(left.powf(right)));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Neg { dst, src } => {
                 let val = ctx.get_register(src.0).clone();
-                if let Some(crate::value::HeapRef::BigInt(b)) = val.heap_ref() {
-                    let s = &b.value;
-                    let result_s = if s.starts_with('-') {
-                        s[1..].to_string()
-                    } else if s == "0" {
-                        "0".to_string()
-                    } else {
-                        format!("-{}", s)
-                    };
-                    ctx.set_register(dst.0, Value::bigint(result_s));
-                    return Ok(InstructionResult::Continue);
+                let numeric = self.to_numeric(ctx, &val)?;
+                match numeric {
+                    Numeric::BigInt(bigint) => {
+                        let result = -bigint;
+                        ctx.set_register(dst.0, Value::bigint(result.to_string()));
+                    }
+                    Numeric::Number(num) => {
+                        ctx.set_register(dst.0, Value::number(-num));
+                    }
                 }
-
-                let value = self.coerce_number(ctx, val)?;
-
-                ctx.set_register(dst.0, Value::number(-value));
                 Ok(InstructionResult::Continue)
             }
 
@@ -3713,6 +3708,30 @@ impl Interpreter {
                     proto
                         .get(&Self::utf16_key(method_name))
                         .unwrap_or_else(Value::undefined)
+                } else if receiver.is_symbol() {
+                    let symbol_obj = ctx
+                        .get_global("Symbol")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("Symbol is not defined"))?;
+                    let proto = symbol_obj
+                        .get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("Symbol.prototype is not defined"))?;
+                    proto
+                        .get(&Self::utf16_key(method_name))
+                        .unwrap_or_else(Value::undefined)
+                } else if receiver.is_bigint() {
+                    let bigint_obj = ctx
+                        .get_global("BigInt")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("BigInt is not defined"))?;
+                    let proto = bigint_obj
+                        .get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("BigInt.prototype is not defined"))?;
+                    proto
+                        .get(&Self::utf16_key(method_name))
+                        .unwrap_or_else(Value::undefined)
                 } else if let Some(regex) = receiver.as_regex() {
                     // RegExp: look up method on the regex's internal object (which has the prototype chain)
                     regex
@@ -4075,15 +4094,17 @@ impl Interpreter {
                 let argc = frame.argc;
                 let mm = ctx.memory_manager().clone();
 
-                // Get Array.prototype for the arguments object
-                let array_proto = ctx
-                    .get_global("Array")
+                // Get Object.prototype for the arguments object
+                // Per ES2026 §10.4.4, arguments objects are ordinary objects with Object.prototype
+                let obj_proto = ctx
+                    .get_global("Object")
                     .and_then(|v| v.as_object())
                     .and_then(|o| o.get(&PropertyKey::string("prototype")))
                     .and_then(|v| v.as_object());
 
-                let args_obj = GcRef::new(JsObject::array(argc, mm));
-                if let Some(proto) = array_proto {
+                // Use array_like (not array) so Array.isArray(arguments) returns false
+                let args_obj = GcRef::new(JsObject::array_like(argc, mm));
+                if let Some(proto) = obj_proto {
                     args_obj.set_prototype(Value::object(proto));
                 }
 
@@ -4562,6 +4583,22 @@ impl Interpreter {
                     }
                     ctx.set_register(dst.0, Value::undefined());
                     Ok(InstructionResult::Continue)
+                } else if object.is_symbol() {
+                    // Autobox symbol -> Symbol.prototype
+                    let key = Self::utf16_key(name_str);
+                    if let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object())
+                    {
+                        if let Some(proto) = symbol_obj
+                            .get(&PropertyKey::string("prototype"))
+                            .and_then(|v| v.as_object())
+                        {
+                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                            ctx.set_register(dst.0, value);
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                    ctx.set_register(dst.0, Value::undefined());
+                    Ok(InstructionResult::Continue)
                 } else {
                     ctx.set_register(dst.0, Value::undefined());
                     Ok(InstructionResult::Continue)
@@ -4890,14 +4927,7 @@ impl Interpreter {
                 // Function property access
                 if let Some(closure) = object.as_function() {
                     // Convert key to property key
-                    let key = if let Some(s) = key_value.as_string() {
-                        PropertyKey::from_js_string(s)
-                    } else if let Some(sym) = key_value.as_symbol() {
-                        PropertyKey::Symbol(sym.id)
-                    } else {
-                        let key_str = self.to_string(&key_value);
-                        PropertyKey::string(&key_str)
-                    };
+                    let key = self.value_to_property_key(ctx, &key_value)?;
 
                     // Check the function's internal object first (for properties like .prototype, .length, .name)
                     if let Some(val) = closure.object.get(&key) {
@@ -4918,14 +4948,7 @@ impl Interpreter {
                 // Generator property access
                 if let Some(generator) = object.as_generator() {
                     // Convert key to property key
-                    let key = if let Some(s) = key_value.as_string() {
-                        PropertyKey::from_js_string(s)
-                    } else if let Some(sym) = key_value.as_symbol() {
-                        PropertyKey::Symbol(sym.id)
-                    } else {
-                        let key_str = self.to_string(&key_value);
-                        PropertyKey::string(&key_str)
-                    };
+                    let key = self.value_to_property_key(ctx, &key_value)?;
 
                     // Check the generator's internal object first
                     if let Some(val) = generator.object.get(&key) {
@@ -4947,16 +4970,7 @@ impl Interpreter {
                     let receiver = object.clone();
 
                     // Convert key to property key
-                    let key = if let Some(n) = key_value.as_int32() {
-                        PropertyKey::Index(n as u32)
-                    } else if let Some(s) = key_value.as_string() {
-                        PropertyKey::string(s.as_str())
-                    } else if let Some(sym) = key_value.as_symbol() {
-                        PropertyKey::Symbol(sym.id)
-                    } else {
-                        let key_str = self.to_string(&key_value);
-                        PropertyKey::string(&key_str)
-                    };
+                    let key = self.value_to_property_key(ctx, &key_value)?;
 
                     // IC Fast Path - only for string keys (not index or symbol)
                     if matches!(&key, PropertyKey::String(_)) {
@@ -5101,12 +5115,7 @@ impl Interpreter {
                     }
                 } else if object.is_number() {
                     // Autobox number -> Number.prototype
-                    let key = if let Some(s) = key_value.as_string() {
-                        PropertyKey::from_js_string(s)
-                    } else {
-                        let key_str = self.to_string(&key_value);
-                        PropertyKey::string(&key_str)
-                    };
+                    let key = self.value_to_property_key(ctx, &key_value)?;
                     if let Some(number_obj) = ctx.get_global("Number").and_then(|v| v.as_object()) {
                         if let Some(proto) = number_obj
                             .get(&PropertyKey::string("prototype"))
@@ -5121,15 +5130,26 @@ impl Interpreter {
                     Ok(InstructionResult::Continue)
                 } else if object.is_boolean() {
                     // Autobox boolean -> Boolean.prototype
-                    let key = if let Some(s) = key_value.as_string() {
-                        PropertyKey::from_js_string(s)
-                    } else {
-                        let key_str = self.to_string(&key_value);
-                        PropertyKey::string(&key_str)
-                    };
+                    let key = self.value_to_property_key(ctx, &key_value)?;
                     if let Some(boolean_obj) = ctx.get_global("Boolean").and_then(|v| v.as_object())
                     {
                         if let Some(proto) = boolean_obj
+                            .get(&PropertyKey::string("prototype"))
+                            .and_then(|v| v.as_object())
+                        {
+                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                            ctx.set_register(dst.0, value);
+                            return Ok(InstructionResult::Continue);
+                        }
+                    }
+                    ctx.set_register(dst.0, Value::undefined());
+                    Ok(InstructionResult::Continue)
+                } else if object.is_symbol() {
+                    // Autobox symbol -> Symbol.prototype
+                    let key = self.value_to_property_key(ctx, &key_value)?;
+                    if let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object())
+                    {
+                        if let Some(proto) = symbol_obj
                             .get(&PropertyKey::string("prototype"))
                             .and_then(|v| v.as_object())
                         {
@@ -5158,16 +5178,7 @@ impl Interpreter {
 
                 // Proxy check - must be first
                 if let Some(proxy) = object.as_proxy() {
-                    let prop_key = if let Some(n) = key_value.as_int32() {
-                        PropertyKey::Index(n as u32)
-                    } else if let Some(s) = key_value.as_string() {
-                        PropertyKey::from_js_string(s)
-                    } else if let Some(sym) = key_value.as_symbol() {
-                        PropertyKey::Symbol(sym.id)
-                    } else {
-                        let key_str = self.to_string(&key_value);
-                        PropertyKey::string(&key_str)
-                    };
+                    let prop_key = self.value_to_property_key(ctx, &key_value)?;
                     let receiver = object.clone();
                     {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
@@ -5184,16 +5195,7 @@ impl Interpreter {
                 }
 
                 if let Some(obj) = object.as_object() {
-                    let key = if let Some(n) = key_value.as_int32() {
-                        PropertyKey::Index(n as u32)
-                    } else if let Some(s) = key_value.as_string() {
-                        PropertyKey::string(s.as_str())
-                    } else if let Some(sym) = key_value.as_symbol() {
-                        PropertyKey::Symbol(sym.id)
-                    } else {
-                        let key_str = self.to_string(&key_value);
-                        PropertyKey::string(&key_str)
-                    };
+                    let key = self.value_to_property_key(ctx, &key_value)?;
 
                     // IC Fast Path
                     let mut cached = false;
@@ -5347,7 +5349,7 @@ impl Interpreter {
                 let getter_fn = ctx.get_register(func.0).clone();
 
                 if let Some(obj) = object.as_object() {
-                    let prop_key = self.value_to_property_key(&key_value);
+                    let prop_key = self.value_to_property_key(ctx, &key_value)?;
 
                     // Check if there's already an accessor with a setter
                     let existing_setter =
@@ -5374,7 +5376,7 @@ impl Interpreter {
                 let setter_fn = ctx.get_register(func.0).clone();
 
                 if let Some(obj) = object.as_object() {
-                    let prop_key = self.value_to_property_key(&key_value);
+                    let prop_key = self.value_to_property_key(ctx, &key_value)?;
 
                     // Check if there's already an accessor with a getter
                     let existing_getter =
@@ -5433,14 +5435,7 @@ impl Interpreter {
                     }
 
                     // Convert index to property key
-                    let key = if let Some(n) = index.as_int32() {
-                        PropertyKey::Index(n as u32)
-                    } else if let Some(s) = index.as_string() {
-                        PropertyKey::string(s.as_str())
-                    } else {
-                        let idx_str = self.to_string(&index);
-                        PropertyKey::string(&idx_str)
-                    };
+                    let key = self.value_to_property_key(ctx, &index)?;
 
                     // IC Fast Path - only for string keys
                     if matches!(&key, PropertyKey::String(_)) {
@@ -5582,14 +5577,7 @@ impl Interpreter {
                     }
 
                     // Convert index to property key
-                    let key = if let Some(n) = index.as_int32() {
-                        PropertyKey::Index(n as u32)
-                    } else if let Some(s) = index.as_string() {
-                        PropertyKey::string(s.as_str())
-                    } else {
-                        let idx_str = self.to_string(&index);
-                        PropertyKey::string(&idx_str)
-                    };
+                    let key = self.value_to_property_key(ctx, &index)?;
 
                     // IC Fast Path - only for string keys
                     if matches!(&key, PropertyKey::String(_)) {
@@ -5766,7 +5754,7 @@ impl Interpreter {
                 }
 
                 if let Some(proxy) = receiver.as_proxy() {
-                    let prop_key = self.value_to_property_key(&key_value);
+                    let prop_key = self.value_to_property_key(ctx, &key_value)?;
                     let method_value = {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
                         crate::proxy_operations::proxy_get(
@@ -5936,7 +5924,7 @@ impl Interpreter {
                     }
                 }
 
-                let key = self.value_to_property_key(&key_value);
+                let key = self.value_to_property_key(ctx, &key_value)?;
                 let method_value = if let Some(obj_ref) = receiver.as_object() {
                     obj_ref.get(&key).unwrap_or_else(Value::undefined)
                 } else {
@@ -6030,7 +6018,7 @@ impl Interpreter {
                 }
 
                 if let Some(proxy) = receiver.as_proxy() {
-                    let prop_key = self.value_to_property_key(&key_value);
+                    let prop_key = self.value_to_property_key(ctx, &key_value)?;
                     let method_value = {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
                         crate::proxy_operations::proxy_get(
@@ -6050,7 +6038,7 @@ impl Interpreter {
                     );
                 }
 
-                let key = self.value_to_property_key(&key_value);
+                let key = self.value_to_property_key(ctx, &key_value)?;
                 let method_value = if let Some(obj_ref) = receiver.as_object() {
                     obj_ref.get(&key).unwrap_or_else(Value::undefined)
                 } else {
@@ -7445,8 +7433,30 @@ impl Interpreter {
         }
     }
 
+    fn get_property_value(
+        &self,
+        ctx: &mut VmContext,
+        obj: &GcRef<JsObject>,
+        key: &PropertyKey,
+        receiver: &Value,
+    ) -> VmResult<Value> {
+        match obj.lookup_property_descriptor(key) {
+            Some(PropertyDescriptor::Accessor { get, .. }) => {
+                let Some(getter) = get else {
+                    return Ok(Value::undefined());
+                };
+                if !getter.is_callable() {
+                    return Err(VmError::type_error("getter is not a function"));
+                }
+                self.call_function(ctx, &getter, receiver.clone(), &[])
+            }
+            Some(PropertyDescriptor::Data { value, .. }) => Ok(value),
+            _ => Ok(Value::undefined()),
+        }
+    }
+
     /// Convert value to primitive per ES2023 §7.1.1.
-    fn to_primitive(
+    pub(crate) fn to_primitive(
         &self,
         ctx: &mut VmContext,
         value: &Value,
@@ -7461,51 +7471,37 @@ impl Interpreter {
 
         // 1. @@toPrimitive
         let to_prim_key = PropertyKey::Symbol(crate::intrinsics::well_known::TO_PRIMITIVE);
-        if let Some(method) = obj.get(&to_prim_key) {
-            if !method.is_undefined() {
-                if !method.is_callable() {
-                    return Err(VmError::type_error(
-                        "Cannot convert object to primitive value",
-                    ));
-                }
-                let hint_str = match hint {
-                    PreferredType::Default => "default",
-                    PreferredType::Number => "number",
-                    PreferredType::String => "string",
-                };
-                let hint_val = Value::string(JsString::intern(hint_str));
-                let result = self.call_function(ctx, &method, value.clone(), &[hint_val])?;
-                if !result.is_object() {
-                    return Ok(result);
-                }
-                return Err(VmError::type_error("Cannot convert object to primitive value"));
+        let method = self.get_property_value(ctx, &obj, &to_prim_key, value)?;
+        if !method.is_undefined() && !method.is_null() {
+            if !method.is_callable() {
+                return Err(VmError::type_error(
+                    "Cannot convert object to primitive value",
+                ));
             }
+            let hint_str = match hint {
+                PreferredType::Default => "default",
+                PreferredType::Number => "number",
+                PreferredType::String => "string",
+            };
+            let hint_val = Value::string(JsString::intern(hint_str));
+            let result = self.call_function(ctx, &method, value.clone(), &[hint_val])?;
+            if !result.is_object() {
+                return Ok(result);
+            }
+            return Err(VmError::type_error("Cannot convert object to primitive value"));
         }
 
-        // 2. Internal primitive slots used by wrapper objects.
-        if let Some(prim) = obj.get(&PropertyKey::string("__value__")) {
-            if !prim.is_object() {
-                return Ok(prim);
-            }
-        }
-        if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
-            if !prim.is_object() {
-                return Ok(prim);
-            }
-        }
-
-        // 3. OrdinaryToPrimitive.
+        // 2. OrdinaryToPrimitive.
         let (first, second) = match hint {
             PreferredType::String => ("toString", "valueOf"),
             _ => ("valueOf", "toString"),
         };
         for name in [first, second] {
-            if let Some(method) = obj.get(&PropertyKey::string(name)) {
-                if method.is_callable() {
-                    let result = self.call_function(ctx, &method, value.clone(), &[])?;
-                    if !result.is_object() {
-                        return Ok(result);
-                    }
+            let method = self.get_property_value(ctx, &obj, &PropertyKey::string(name), value)?;
+            if method.is_callable() {
+                let result = self.call_function(ctx, &method, value.clone(), &[])?;
+                if !result.is_object() {
+                    return Ok(result);
                 }
             }
         }
@@ -7514,7 +7510,7 @@ impl Interpreter {
     }
 
     /// Convert value to string per ES2023 §7.1.17.
-    fn to_string_value(&self, ctx: &mut VmContext, value: &Value) -> VmResult<String> {
+    pub(crate) fn to_string_value(&self, ctx: &mut VmContext, value: &Value) -> VmResult<String> {
         if value.is_undefined() {
             return Ok("undefined".to_string());
         }
@@ -7557,14 +7553,25 @@ impl Interpreter {
     }
 
     /// Convert value to number per ES2023 §7.1.4.
-    fn to_number_value(&self, ctx: &mut VmContext, value: &Value) -> VmResult<f64> {
+    pub(crate) fn to_number_value(&self, ctx: &mut VmContext, value: &Value) -> VmResult<f64> {
         let prim = if value.is_object() {
             self.to_primitive(ctx, value, PreferredType::Number)?
         } else {
             value.clone()
         };
-        if prim.is_symbol() || prim.is_bigint() {
+        if prim.is_symbol() {
             return Err(VmError::type_error("Cannot convert to number"));
+        }
+        if let Some(HeapRef::BigInt(b)) = prim.heap_ref() {
+            let bigint = self.parse_bigint_str(&b.value)?;
+            if let Some(n) = bigint.to_f64() {
+                return Ok(n);
+            }
+            return Ok(if bigint.sign() == num_bigint::Sign::Minus {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            });
         }
         Ok(self.to_number(&prim))
     }
@@ -7805,19 +7812,31 @@ impl Interpreter {
         Some(scaled.cmp(&numerator))
     }
 
-    fn parse_bigint_str(&self, value: &str) -> VmResult<NumBigInt> {
+    pub(crate) fn parse_bigint_str(&self, value: &str) -> VmResult<NumBigInt> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
-            return Err(VmError::type_error("Invalid BigInt"));
+            return Ok(NumBigInt::zero());
         }
 
-        let (sign, digits) = if let Some(rest) = trimmed.strip_prefix('-') {
-            (true, rest)
+        let (sign, digits, had_sign) = if let Some(rest) = trimmed.strip_prefix('-') {
+            (true, rest, true)
         } else if let Some(rest) = trimmed.strip_prefix('+') {
-            (false, rest)
+            (false, rest, true)
         } else {
-            (false, trimmed)
+            (false, trimmed, false)
         };
+
+        if had_sign {
+            if digits.starts_with("0x")
+                || digits.starts_with("0X")
+                || digits.starts_with("0o")
+                || digits.starts_with("0O")
+                || digits.starts_with("0b")
+                || digits.starts_with("0B")
+            {
+                return Err(VmError::syntax_error("Invalid BigInt"));
+            }
+        }
 
         let (radix, digits) = if let Some(rest) = digits.strip_prefix("0x") {
             (16, rest)
@@ -7837,10 +7856,10 @@ impl Interpreter {
 
         let cleaned: String = digits.chars().filter(|c| *c != '_').collect();
         if cleaned.is_empty() {
-            return Err(VmError::type_error("Invalid BigInt"));
+            return Err(VmError::syntax_error("Invalid BigInt"));
         }
         let mut bigint = NumBigInt::parse_bytes(cleaned.as_bytes(), radix)
-            .ok_or_else(|| VmError::type_error("Invalid BigInt"))?;
+            .ok_or_else(|| VmError::syntax_error("Invalid BigInt"))?;
         if sign {
             bigint = -bigint;
         }
@@ -7888,34 +7907,29 @@ impl Interpreter {
     }
 
     /// Convert a Value to a PropertyKey for object property access
-    fn value_to_property_key(&self, value: &Value) -> PropertyKey {
-        if let Some(n) = value.as_int32() {
-            if n >= 0 {
-                PropertyKey::Index(n as u32)
-            } else {
-                PropertyKey::string(&n.to_string())
-            }
-        } else if let Some(s) = value.as_string() {
-            // Check if the string is a valid array index (canonical numeric string)
-            if let Ok(n) = s.as_str().parse::<u32>() {
-                // Verify it's canonical (no leading zeros except for "0")
-                if n.to_string() == s.as_str() {
-                    return PropertyKey::Index(n);
-                }
-            }
-            PropertyKey::string(s.as_str())
-        } else if let Some(sym) = value.as_symbol() {
-            PropertyKey::Symbol(sym.id)
-        } else {
-            let key_str = self.to_string(value);
-            // Also check if the stringified value is a valid array index
-            if let Ok(n) = key_str.parse::<u32>() {
-                if n.to_string() == key_str {
-                    return PropertyKey::Index(n);
-                }
-            }
-            PropertyKey::string(&key_str)
+    fn value_to_property_key(
+        &self,
+        ctx: &mut VmContext,
+        value: &Value,
+    ) -> VmResult<PropertyKey> {
+        if let Some(sym) = value.as_symbol() {
+            return Ok(PropertyKey::Symbol(sym.id));
         }
+        let prim = if value.is_object() {
+            self.to_primitive(ctx, value, PreferredType::String)?
+        } else {
+            value.clone()
+        };
+        if let Some(sym) = prim.as_symbol() {
+            return Ok(PropertyKey::Symbol(sym.id));
+        }
+        let key_str = self.to_string_value(ctx, &prim)?;
+        if let Ok(n) = key_str.parse::<u32>() {
+            if n.to_string() == key_str {
+                return Ok(PropertyKey::Index(n));
+            }
+        }
+        Ok(PropertyKey::string(&key_str))
     }
 
     /// Abstract equality comparison (==)

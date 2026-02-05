@@ -28,6 +28,9 @@ pub struct Shape {
     /// Cache of all property offsets in this shape (inherited + own).
     /// This is built lazily or during creation for fast lookups.
     property_map: FxHashMap<PropertyKey, usize>,
+
+    /// Keys in insertion order for JSON.stringify and Object.keys()
+    keys_ordered: Vec<PropertyKey>,
 }
 
 impl Shape {
@@ -54,6 +57,7 @@ impl Shape {
             offset: None,
             transitions: RwLock::new(FxHashMap::default()),
             property_map: FxHashMap::default(),
+            keys_ordered: Vec::new(),
         })
     }
 
@@ -84,12 +88,16 @@ impl Shape {
         let mut next_property_map = self.property_map.clone();
         next_property_map.insert(key.clone(), next_offset);
 
+        let mut next_keys_ordered = self.keys_ordered.clone();
+        next_keys_ordered.push(key.clone());
+
         let new_shape = Arc::new(Self {
             parent: Some(Arc::clone(self)),
             key: Some(key.clone()),
             offset: Some(next_offset),
             transitions: RwLock::new(FxHashMap::default()),
             property_map: next_property_map,
+            keys_ordered: next_keys_ordered,
         });
 
         transitions.insert(key, Arc::downgrade(&new_shape));
@@ -101,12 +109,9 @@ impl Shape {
         self.property_map.get(key).copied()
     }
 
-    /// Get all own property keys in this shape.
+    /// Get all own property keys in this shape in insertion order.
     pub fn own_keys(&self) -> Vec<PropertyKey> {
-        let keys: Vec<_> = self.property_map.keys().cloned().collect();
-        // In a more advanced implementation, we might want to preserve insertion order.
-        // For now, sorting or returning as is.
-        keys
+        self.keys_ordered.clone()
     }
 
     /// Get the number of properties defined in this shape.

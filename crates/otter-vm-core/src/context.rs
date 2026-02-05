@@ -1670,6 +1670,10 @@ impl VmContext {
             root_set.trace_roots(&mut |header| roots.push(header));
         }
 
+        // Add global string intern table
+        // Interned strings are used by Shape property keys and must survive GC
+        crate::string::trace_global_string_table(&mut |header| roots.push(header));
+
         roots
     }
 

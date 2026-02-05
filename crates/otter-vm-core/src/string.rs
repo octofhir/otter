@@ -521,3 +521,15 @@ impl otter_vm_gc::GcTraceable for JsString {
         // No references to trace
     }
 }
+
+/// Trace all interned strings in the global STRING_TABLE
+///
+/// This must be called during GC root collection to prevent
+/// interned strings from being incorrectly collected.
+pub fn trace_global_string_table(tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+    for bucket in STRING_TABLE.iter() {
+        for js_str in bucket.value().iter() {
+            tracer(js_str.header() as *const _);
+        }
+    }
+}

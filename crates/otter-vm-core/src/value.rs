@@ -140,7 +140,7 @@ pub enum HeapRef {
     /// Proxy object
     Proxy(GcRef<JsProxy>),
     /// Generator object
-    Generator(Arc<JsGenerator>),
+    Generator(GcRef<JsGenerator>),
     /// ArrayBuffer (raw binary data buffer)
     ArrayBuffer(GcRef<JsArrayBuffer>),
     /// TypedArray (view over ArrayBuffer)
@@ -398,8 +398,8 @@ impl Value {
     }
 
     /// Create generator value
-    pub fn generator(generator: Arc<JsGenerator>) -> Self {
-        let ptr = Arc::as_ptr(&generator) as u64;
+    pub fn generator(generator: GcRef<JsGenerator>) -> Self {
+        let ptr = generator.as_ptr() as u64;
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::Generator(generator)),
@@ -481,9 +481,9 @@ impl Value {
         let func: NativeFn = Arc::new(f);
         let object = GcRef::new(JsObject::new(Value::null(), memory_manager));
         let native = GcRef::new(NativeFunctionObject { func, object });
-        // Use a dummy pointer for NaN-boxing (the actual function is in heap_ref)
+        let ptr = native.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER,
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::NativeFunction(native)),
         }
     }
@@ -520,7 +520,7 @@ impl Value {
         );
         let native = GcRef::new(NativeFunctionObject { func, object });
         Self {
-            bits: TAG_POINTER,
+            bits: TAG_POINTER | (native.as_ptr() as u64 & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::NativeFunction(native)),
         }
     }
@@ -536,7 +536,7 @@ impl Value {
     ) -> Self {
         let native = GcRef::new(NativeFunctionObject { func, object });
         Self {
-            bits: TAG_POINTER,
+            bits: TAG_POINTER | (native.as_ptr() as u64 & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::NativeFunction(native)),
         }
     }
@@ -802,9 +802,9 @@ impl Value {
     }
 
     /// Get as generator
-    pub fn as_generator(&self) -> Option<&Arc<JsGenerator>> {
+    pub fn as_generator(&self) -> Option<GcRef<JsGenerator>> {
         match &self.heap_ref {
-            Some(HeapRef::Generator(g)) => Some(g),
+            Some(HeapRef::Generator(g)) => Some(*g),
             _ => None,
         }
     }
@@ -1049,6 +1049,7 @@ impl PartialEq for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_undefined() {
@@ -1121,6 +1122,24 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Value>();
     }
+
+    #[test]
+    fn test_native_function_identity() {
+        fn noop(
+            _this: &Value,
+            _args: &[Value],
+            _cx: &mut crate::context::NativeContext<'_>,
+        ) -> Result<Value, crate::error::VmError> {
+            Ok(Value::undefined())
+        }
+
+        let mm = Arc::new(crate::memory::MemoryManager::test());
+        let v1 = Value::native_function(noop, mm.clone());
+        let v2 = Value::native_function(noop, mm.clone());
+
+        assert_eq!(v1, v1.clone());
+        assert_ne!(v1, v2);
+    }
 }
 
 // ============================================================================
@@ -1148,7 +1167,7 @@ impl Value {
                     tracer(r.object.header() as *const _);
                 }
                 HeapRef::Generator(g) => {
-                    tracer(g.object.header() as *const _);
+                    tracer(g.header() as *const _);
                 }
                 HeapRef::ArrayBuffer(ab) => {
                     tracer(ab.object.header() as *const _);

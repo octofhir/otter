@@ -37,6 +37,13 @@ enum Numeric {
     BigInt(NumBigInt),
 }
 
+#[derive(Copy, Clone, Debug)]
+enum PreferredType {
+    Default,
+    Number,
+    String,
+}
+
 impl Interpreter {
     /// Create a new interpreter
     pub fn new() -> Self {
@@ -2087,7 +2094,7 @@ impl Interpreter {
                 let left = ctx.get_register(lhs.0).clone();
                 let right = ctx.get_register(rhs.0).clone();
 
-                let result = self.abstract_equal(&left, &right);
+                let result = self.abstract_equal(ctx, &left, &right)?;
                 ctx.set_register(dst.0, Value::boolean(result));
                 Ok(InstructionResult::Continue)
             }
@@ -2096,7 +2103,7 @@ impl Interpreter {
                 let left = ctx.get_register(lhs.0).clone();
                 let right = ctx.get_register(rhs.0).clone();
 
-                let result = !self.abstract_equal(&left, &right);
+                let result = !self.abstract_equal(ctx, &left, &right)?;
                 ctx.set_register(dst.0, Value::boolean(result));
                 Ok(InstructionResult::Continue)
             }
@@ -2135,8 +2142,10 @@ impl Interpreter {
             }
 
             Instruction::Lt { dst, lhs, rhs } => {
-                let left = self.to_numeric(ctx.get_register(lhs.0))?;
-                let right = self.to_numeric(ctx.get_register(rhs.0))?;
+                let left_val = ctx.get_register(lhs.0).clone();
+                let right_val = ctx.get_register(rhs.0).clone();
+                let left = self.to_numeric(ctx, &left_val)?;
+                let right = self.to_numeric(ctx, &right_val)?;
                 let result = matches!(self.numeric_compare(left, right)?, Some(Ordering::Less));
 
                 ctx.set_register(dst.0, Value::boolean(result));
@@ -2144,8 +2153,10 @@ impl Interpreter {
             }
 
             Instruction::Le { dst, lhs, rhs } => {
-                let left = self.to_numeric(ctx.get_register(lhs.0))?;
-                let right = self.to_numeric(ctx.get_register(rhs.0))?;
+                let left_val = ctx.get_register(lhs.0).clone();
+                let right_val = ctx.get_register(rhs.0).clone();
+                let left = self.to_numeric(ctx, &left_val)?;
+                let right = self.to_numeric(ctx, &right_val)?;
                 let result = matches!(
                     self.numeric_compare(left, right)?,
                     Some(Ordering::Less | Ordering::Equal)
@@ -2156,8 +2167,10 @@ impl Interpreter {
             }
 
             Instruction::Gt { dst, lhs, rhs } => {
-                let left = self.to_numeric(ctx.get_register(lhs.0))?;
-                let right = self.to_numeric(ctx.get_register(rhs.0))?;
+                let left_val = ctx.get_register(lhs.0).clone();
+                let right_val = ctx.get_register(rhs.0).clone();
+                let left = self.to_numeric(ctx, &left_val)?;
+                let right = self.to_numeric(ctx, &right_val)?;
                 let result = matches!(self.numeric_compare(left, right)?, Some(Ordering::Greater));
 
                 ctx.set_register(dst.0, Value::boolean(result));
@@ -2165,8 +2178,10 @@ impl Interpreter {
             }
 
             Instruction::Ge { dst, lhs, rhs } => {
-                let left = self.to_numeric(ctx.get_register(lhs.0))?;
-                let right = self.to_numeric(ctx.get_register(rhs.0))?;
+                let left_val = ctx.get_register(lhs.0).clone();
+                let right_val = ctx.get_register(rhs.0).clone();
+                let left = self.to_numeric(ctx, &left_val)?;
+                let right = self.to_numeric(ctx, &right_val)?;
                 let result = matches!(
                     self.numeric_compare(left, right)?,
                     Some(Ordering::Greater | Ordering::Equal)
@@ -7280,29 +7295,32 @@ impl Interpreter {
 
     /// Add operation (handles string concatenation)
     fn op_add(&self, ctx: &mut VmContext, left: &Value, right: &Value) -> VmResult<Value> {
+        let left_prim = self.to_primitive(ctx, left, PreferredType::Default)?;
+        let right_prim = self.to_primitive(ctx, right, PreferredType::Default)?;
+
         // String concatenation
-        if left.is_string() || right.is_string() {
-            let left_str = self.to_string(left);
-            let right_str = self.to_string(right);
+        if left_prim.is_string() || right_prim.is_string() {
+            let left_str = self.to_string_value(ctx, &left_prim)?;
+            let right_str = self.to_string_value(ctx, &right_prim)?;
             let result = format!("{}{}", left_str, right_str);
             let js_str = JsString::intern(&result);
             return Ok(Value::string(js_str));
         }
 
-        let left_bigint = self.bigint_value(left)?;
-        let right_bigint = self.bigint_value(right)?;
+        let left_bigint = self.bigint_value(&left_prim)?;
+        let right_bigint = self.bigint_value(&right_prim)?;
         if let (Some(left_bigint), Some(right_bigint)) = (left_bigint, right_bigint) {
             let result = left_bigint + right_bigint;
             return Ok(Value::bigint(result.to_string()));
         }
 
-        if left.is_bigint() || right.is_bigint() {
+        if left_prim.is_bigint() || right_prim.is_bigint() {
             return Err(VmError::type_error("Cannot mix BigInt and other types"));
         }
 
         // Numeric addition
-        let left_num = self.coerce_number(ctx, left.clone())?;
-        let right_num = self.coerce_number(ctx, right.clone())?;
+        let left_num = self.to_number_value(ctx, &left_prim)?;
+        let right_num = self.to_number_value(ctx, &right_prim)?;
         Ok(Value::number(left_num + right_num))
     }
 
@@ -7427,6 +7445,177 @@ impl Interpreter {
         }
     }
 
+    /// Convert value to primitive per ES2023 §7.1.1.
+    fn to_primitive(
+        &self,
+        ctx: &mut VmContext,
+        value: &Value,
+        hint: PreferredType,
+    ) -> VmResult<Value> {
+        if !value.is_object() {
+            return Ok(value.clone());
+        }
+        let Some(obj) = value.as_object() else {
+            return Ok(value.clone());
+        };
+
+        // 1. @@toPrimitive
+        let to_prim_key = PropertyKey::Symbol(crate::intrinsics::well_known::TO_PRIMITIVE);
+        if let Some(method) = obj.get(&to_prim_key) {
+            if !method.is_undefined() {
+                if !method.is_callable() {
+                    return Err(VmError::type_error(
+                        "Cannot convert object to primitive value",
+                    ));
+                }
+                let hint_str = match hint {
+                    PreferredType::Default => "default",
+                    PreferredType::Number => "number",
+                    PreferredType::String => "string",
+                };
+                let hint_val = Value::string(JsString::intern(hint_str));
+                let result = self.call_function(ctx, &method, value.clone(), &[hint_val])?;
+                if !result.is_object() {
+                    return Ok(result);
+                }
+                return Err(VmError::type_error("Cannot convert object to primitive value"));
+            }
+        }
+
+        // 2. Internal primitive slots used by wrapper objects.
+        if let Some(prim) = obj.get(&PropertyKey::string("__value__")) {
+            if !prim.is_object() {
+                return Ok(prim);
+            }
+        }
+        if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
+            if !prim.is_object() {
+                return Ok(prim);
+            }
+        }
+
+        // 3. OrdinaryToPrimitive.
+        let (first, second) = match hint {
+            PreferredType::String => ("toString", "valueOf"),
+            _ => ("valueOf", "toString"),
+        };
+        for name in [first, second] {
+            if let Some(method) = obj.get(&PropertyKey::string(name)) {
+                if method.is_callable() {
+                    let result = self.call_function(ctx, &method, value.clone(), &[])?;
+                    if !result.is_object() {
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+
+        Err(VmError::type_error("Cannot convert object to primitive value"))
+    }
+
+    /// Convert value to string per ES2023 §7.1.17.
+    fn to_string_value(&self, ctx: &mut VmContext, value: &Value) -> VmResult<String> {
+        if value.is_undefined() {
+            return Ok("undefined".to_string());
+        }
+        if value.is_null() {
+            return Ok("null".to_string());
+        }
+        if let Some(b) = value.as_boolean() {
+            return Ok(if b { "true" } else { "false" }.to_string());
+        }
+        if let Some(n) = value.as_number() {
+            if n.is_nan() {
+                return Ok("NaN".to_string());
+            }
+            if n.is_infinite() {
+                return Ok(if n > 0.0 {
+                    "Infinity".to_string()
+                } else {
+                    "-Infinity".to_string()
+                });
+            }
+            if n.fract() == 0.0 {
+                return Ok(format!("{}", n as i64));
+            }
+            return Ok(format!("{}", n));
+        }
+        if let Some(s) = value.as_string() {
+            return Ok(s.as_str().to_string());
+        }
+        if let Some(crate::value::HeapRef::BigInt(b)) = value.heap_ref() {
+            return Ok(b.value.clone());
+        }
+        if value.is_symbol() {
+            return Err(VmError::type_error("Cannot convert a Symbol value to a string"));
+        }
+        if value.is_object() {
+            let prim = self.to_primitive(ctx, value, PreferredType::String)?;
+            return self.to_string_value(ctx, &prim);
+        }
+        Ok("[object Object]".to_string())
+    }
+
+    /// Convert value to number per ES2023 §7.1.4.
+    fn to_number_value(&self, ctx: &mut VmContext, value: &Value) -> VmResult<f64> {
+        let prim = if value.is_object() {
+            self.to_primitive(ctx, value, PreferredType::Number)?
+        } else {
+            value.clone()
+        };
+        if prim.is_symbol() || prim.is_bigint() {
+            return Err(VmError::type_error("Cannot convert to number"));
+        }
+        Ok(self.to_number(&prim))
+    }
+
+    fn parse_string_to_number(&self, input: &str) -> f64 {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return 0.0;
+        }
+
+        let (sign, rest) = if let Some(stripped) = trimmed.strip_prefix('-') {
+            (-1.0, stripped)
+        } else if let Some(stripped) = trimmed.strip_prefix('+') {
+            (1.0, stripped)
+        } else {
+            (1.0, trimmed)
+        };
+
+        if rest == "Infinity" {
+            return sign * f64::INFINITY;
+        }
+
+        let (radix, digits) = if let Some(rest) = rest.strip_prefix("0x") {
+            (16, rest)
+        } else if let Some(rest) = rest.strip_prefix("0X") {
+            (16, rest)
+        } else if let Some(rest) = rest.strip_prefix("0o") {
+            (8, rest)
+        } else if let Some(rest) = rest.strip_prefix("0O") {
+            (8, rest)
+        } else if let Some(rest) = rest.strip_prefix("0b") {
+            (2, rest)
+        } else if let Some(rest) = rest.strip_prefix("0B") {
+            (2, rest)
+        } else {
+            (10, "")
+        };
+
+        if radix != 10 {
+            if digits.is_empty() {
+                return f64::NAN;
+            }
+            if let Some(bigint) = NumBigInt::parse_bytes(digits.as_bytes(), radix) {
+                return bigint.to_f64().unwrap_or(f64::INFINITY) * sign;
+            }
+            return f64::NAN;
+        }
+
+        trimmed.parse::<f64>().unwrap_or(f64::NAN)
+    }
+
     /// Create a JavaScript Promise object from an internal promise
     /// This creates an object with _internal field and copies methods from Promise.prototype
     fn create_js_promise(&self, ctx: &VmContext, internal: GcRef<JsPromise>) -> Value {
@@ -7460,49 +7649,9 @@ impl Interpreter {
         Value::object(obj)
     }
 
-    /// Convert object to primitive using valueOf/toString (number hint).
+    /// Convert object to primitive using number hint.
     fn to_primitive_number(&self, ctx: &mut VmContext, value: &Value) -> VmResult<Value> {
-        if !value.is_object() {
-            return Ok(value.clone());
-        }
-        let Some(obj) = value.as_object() else {
-            return Ok(value.clone());
-        };
-        if let Some(prim) = obj.get(&PropertyKey::string("__value__")) {
-            if !prim.is_object() {
-                return Ok(prim);
-            }
-        }
-        if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
-            if !prim.is_object() {
-                return Ok(prim);
-            }
-        }
-        let try_method = |name: &str,
-                          this_val: &Value,
-                          obj: &GcRef<JsObject>,
-                          ctx: &mut VmContext,
-                          interp: &Interpreter|
-         -> VmResult<Option<Value>> {
-            if let Some(method) = obj.get(&PropertyKey::string(name)) {
-                if method.is_callable() {
-                    let result = interp.call_function(ctx, &method, this_val.clone(), &[])?;
-                    if !result.is_object() {
-                        return Ok(Some(result));
-                    }
-                }
-            }
-            Ok(None)
-        };
-
-        if let Some(result) = try_method("valueOf", value, &obj, ctx, self)? {
-            return Ok(result);
-        }
-        if let Some(result) = try_method("toString", value, &obj, ctx, self)? {
-            return Ok(result);
-        }
-
-        Err(VmError::type_error("Cannot convert object to primitive value"))
+        self.to_primitive(ctx, value, PreferredType::Number)
     }
 
     /// Convert value to number (very small ToNumber subset).
@@ -7520,11 +7669,7 @@ impl Interpreter {
             return if b { 1.0 } else { 0.0 };
         }
         if let Some(s) = value.as_string() {
-            let trimmed = s.as_str().trim();
-            if trimmed.is_empty() {
-                return 0.0;
-            }
-            return trimmed.parse::<f64>().unwrap_or(f64::NAN);
+            return self.parse_string_to_number(s.as_str());
         }
         if let Some(obj) = value.as_object() {
             use crate::object::PropertyKey;
@@ -7599,18 +7744,7 @@ impl Interpreter {
     }
 
     fn coerce_number(&self, ctx: &mut VmContext, value: Value) -> VmResult<f64> {
-        if value.is_symbol() || value.is_bigint() {
-            return Err(VmError::type_error("Cannot convert to number"));
-        }
-        let prim = if value.is_object() {
-            self.to_primitive_number(ctx, &value)?
-        } else {
-            value
-        };
-        if prim.is_bigint() {
-            return Err(VmError::type_error("Cannot convert to number"));
-        }
-        Ok(self.to_number(&prim))
+        self.to_number_value(ctx, &value)
     }
 
     fn bigint_value(&self, value: &Value) -> VmResult<Option<NumBigInt>> {
@@ -7621,14 +7755,19 @@ impl Interpreter {
         Ok(None)
     }
 
-    fn to_numeric(&self, value: &Value) -> VmResult<Numeric> {
-        if let Some(bigint) = self.bigint_value(&value)? {
+    fn to_numeric(&self, ctx: &mut VmContext, value: &Value) -> VmResult<Numeric> {
+        let prim = if value.is_object() {
+            self.to_primitive(ctx, value, PreferredType::Number)?
+        } else {
+            value.clone()
+        };
+        if let Some(bigint) = self.bigint_value(&prim)? {
             return Ok(Numeric::BigInt(bigint));
         }
-        if value.is_symbol() {
+        if prim.is_symbol() {
             return Err(VmError::type_error("Cannot convert to number"));
         }
-        Ok(Numeric::Number(self.to_number(value)))
+        Ok(Numeric::Number(self.to_number(&prim)))
     }
 
     fn numeric_compare(&self, left: Numeric, right: Numeric) -> VmResult<Option<Ordering>> {
@@ -7780,27 +7919,116 @@ impl Interpreter {
     }
 
     /// Abstract equality comparison (==)
-    fn abstract_equal(&self, left: &Value, right: &Value) -> bool {
-        // Same type: use strict equality
-        if left.type_of() == right.type_of() {
-            return self.strict_equal(left, right);
+    fn abstract_equal(&self, ctx: &mut VmContext, left: &Value, right: &Value) -> VmResult<bool> {
+        // Same type fast paths
+        if left.is_undefined() && right.is_undefined() {
+            return Ok(true);
+        }
+        if left.is_null() && right.is_null() {
+            return Ok(true);
+        }
+        if left.is_number() && right.is_number() {
+            let a = left.as_number().unwrap();
+            let b = right.as_number().unwrap();
+            return Ok(a == b);
+        }
+        if let (Some(a), Some(b)) = (left.as_string(), right.as_string()) {
+            return Ok(a == b);
+        }
+        if let (Some(a), Some(b)) = (left.as_boolean(), right.as_boolean()) {
+            return Ok(a == b);
+        }
+        if left.is_bigint() && right.is_bigint() {
+            let left_bigint = self.bigint_value(left)?.unwrap_or_else(NumBigInt::zero);
+            let right_bigint = self.bigint_value(right)?.unwrap_or_else(NumBigInt::zero);
+            return Ok(left_bigint == right_bigint);
+        }
+        if left.is_symbol() && right.is_symbol() {
+            return Ok(left == right);
+        }
+        if left.is_object() && right.is_object() {
+            return Ok(self.strict_equal(left, right));
         }
 
         // null == undefined
-        if left.is_null() && right.is_undefined() {
-            return true;
-        }
-        if left.is_undefined() && right.is_null() {
-            return true;
+        if (left.is_null() && right.is_undefined()) || (left.is_undefined() && right.is_null()) {
+            return Ok(true);
         }
 
-        // Number comparisons
-        if let (Some(a), Some(b)) = (left.as_number(), right.as_number()) {
-            return a == b;
+        // Number <-> String
+        if left.is_number() && right.is_string() {
+            let right_num = self.to_number(right);
+            let left_num = left.as_number().unwrap();
+            return Ok(left_num == right_num);
+        }
+        if left.is_string() && right.is_number() {
+            let left_num = self.to_number(left);
+            let right_num = right.as_number().unwrap();
+            return Ok(left_num == right_num);
         }
 
-        // TODO: More coercion rules
-        false
+        // BigInt <-> String
+        if left.is_bigint() && right.is_string() {
+            let right_str = right.as_string().unwrap();
+            if let Ok(parsed) = self.parse_bigint_str(right_str.as_str()) {
+                let left_bigint = self.bigint_value(left)?.unwrap_or_else(NumBigInt::zero);
+                return Ok(left_bigint == parsed);
+            }
+            return Ok(false);
+        }
+        if left.is_string() && right.is_bigint() {
+            let left_str = left.as_string().unwrap();
+            if let Ok(parsed) = self.parse_bigint_str(left_str.as_str()) {
+                let right_bigint = self.bigint_value(right)?.unwrap_or_else(NumBigInt::zero);
+                return Ok(parsed == right_bigint);
+            }
+            return Ok(false);
+        }
+
+        // BigInt <-> Number
+        if left.is_bigint() && right.is_number() {
+            let right_num = right.as_number().unwrap();
+            let left_bigint = self.bigint_value(left)?.unwrap_or_else(NumBigInt::zero);
+            return Ok(matches!(
+                self.compare_bigint_number(&left_bigint, right_num),
+                Some(Ordering::Equal)
+            ));
+        }
+        if left.is_number() && right.is_bigint() {
+            let left_num = left.as_number().unwrap();
+            let right_bigint = self.bigint_value(right)?.unwrap_or_else(NumBigInt::zero);
+            return Ok(matches!(
+                self.compare_bigint_number(&right_bigint, left_num),
+                Some(Ordering::Equal)
+            ));
+        }
+
+        // Boolean
+        if let Some(b) = left.as_boolean() {
+            let num = if b { 1.0 } else { 0.0 };
+            return self.abstract_equal(ctx, &Value::number(num), right);
+        }
+        if let Some(b) = right.as_boolean() {
+            let num = if b { 1.0 } else { 0.0 };
+            return self.abstract_equal(ctx, left, &Value::number(num));
+        }
+
+        // Object <-> Primitive
+        if left.is_object() && !right.is_object() {
+            let prim = self.to_primitive(ctx, left, PreferredType::Default)?;
+            return self.abstract_equal(ctx, &prim, right);
+        }
+        if right.is_object() && !left.is_object() {
+            let prim = self.to_primitive(ctx, right, PreferredType::Default)?;
+            return self.abstract_equal(ctx, left, &prim);
+        }
+
+        // Symbol with non-symbol
+        if left.is_symbol() || right.is_symbol() {
+            return Ok(false);
+        }
+
+        Ok(false)
     }
 
     /// Strict equality comparison (===)
@@ -7958,7 +8186,7 @@ pub enum GeneratorResult {
         /// The register to store the resolved value
         resume_reg: u16,
         /// The generator (for resumption)
-        generator: Arc<JsGenerator>,
+        generator: GcRef<JsGenerator>,
     },
 }
 
@@ -7979,7 +8207,7 @@ impl Interpreter {
     /// * `GeneratorResult::Error(err)` - Generator threw an error
     pub fn execute_generator(
         &self,
-        generator: &Arc<JsGenerator>,
+        generator: GcRef<JsGenerator>,
         ctx: &mut VmContext,
         sent_value: Option<Value>,
     ) -> GeneratorResult {
@@ -8010,7 +8238,7 @@ impl Interpreter {
     /// Start generator execution from the beginning
     fn start_generator_execution(
         &self,
-        generator: &Arc<JsGenerator>,
+        generator: GcRef<JsGenerator>,
         ctx: &mut VmContext,
         _sent_value: Option<Value>,
     ) -> GeneratorResult {
@@ -8067,7 +8295,7 @@ impl Interpreter {
     /// Resume generator execution from saved frame
     fn resume_generator_execution(
         &self,
-        generator: &Arc<JsGenerator>,
+        generator: GcRef<JsGenerator>,
         ctx: &mut VmContext,
         sent_value: Option<Value>,
     ) -> GeneratorResult {
@@ -8253,7 +8481,7 @@ impl Interpreter {
     /// This is used to correctly identify when the generator has returned.
     fn run_generator_loop(
         &self,
-        generator: &Arc<JsGenerator>,
+        generator: GcRef<JsGenerator>,
         ctx: &mut VmContext,
         initial_depth: usize,
     ) -> GeneratorResult {
@@ -8607,7 +8835,7 @@ impl Interpreter {
                         return GeneratorResult::Suspended {
                             promise,
                             resume_reg,
-                            generator: Arc::clone(generator),
+                            generator,
                         };
                     } else {
                         // Sync generators cannot await

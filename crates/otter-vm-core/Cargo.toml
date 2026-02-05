@@ -38,3 +38,7 @@ harness = false
 [[bench]]
 name = "numeric_loops"
 harness = false
+
+[[bench]]
+name = "gc_bench"
+harness = false

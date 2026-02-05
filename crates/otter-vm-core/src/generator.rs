@@ -101,6 +101,47 @@ pub struct GeneratorFrame {
 }
 
 impl GeneratorFrame {
+    /// Trace all GC-managed values in this frame
+    /// CRITICAL: This must trace ALL Value fields to prevent GC from collecting live objects
+    pub(crate) fn trace_frame(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // Trace all local variables
+        for value in &self.locals {
+            value.trace(tracer);
+        }
+
+        // Trace all register values
+        for value in &self.registers {
+            value.trace(tracer);
+        }
+
+        // Trace upvalue values (each UpvalueCell contains Arc<Mutex<Value>>)
+        for upvalue in &self.upvalues {
+            let value = upvalue.get(); // Locks and clones the Value
+            value.trace(tracer);
+        }
+
+        // Trace this value
+        self.this_value.trace(tracer);
+
+        // Trace optional values
+        if let Some(v) = &self.received_value {
+            v.trace(tracer);
+        }
+        if let Some(v) = &self.pending_throw {
+            v.trace(tracer);
+        }
+
+        // Trace completion type values
+        match &self.completion_type {
+            CompletionType::Return(v) | CompletionType::Throw(v) => {
+                v.trace(tracer);
+            }
+            CompletionType::Normal => {}
+        }
+    }
+}
+
+impl GeneratorFrame {
     /// Create a new generator frame with all execution state
     pub fn new(
         pc: usize,
@@ -269,6 +310,42 @@ impl std::fmt::Debug for JsGenerator {
     }
 }
 
+impl otter_vm_gc::GcTraceable for JsGenerator {
+    const NEEDS_TRACE: bool = true;
+
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // Trace the generator object
+        tracer(self.object.header() as *const _);
+
+        // CRITICAL FIX: Trace generator upvalues
+        for upvalue in &self.upvalues {
+            let value = upvalue.get();
+            value.trace(tracer);
+        }
+
+        // CRITICAL FIX: Trace frame state (all locals, registers, etc.)
+        if let Some(frame) = self.frame.lock().as_ref() {
+            frame.trace_frame(tracer);
+        }
+
+        // CRITICAL FIX: Trace initial arguments
+        for value in self.initial_args.lock().iter() {
+            value.trace(tracer);
+        }
+
+        // CRITICAL FIX: Trace initial this value
+        self.initial_this.lock().trace(tracer);
+
+        // CRITICAL FIX: Trace abrupt completion values
+        if let Some(v) = self.abrupt_return.lock().as_ref() {
+            v.trace(tracer);
+        }
+        if let Some(v) = self.abrupt_throw.lock().as_ref() {
+            v.trace(tracer);
+        }
+    }
+}
+
 impl JsGenerator {
     /// Create a new generator in suspended-start state
     ///
@@ -283,8 +360,8 @@ impl JsGenerator {
         is_construct: bool,
         is_async: bool,
         object: GcRef<JsObject>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+    ) -> GcRef<Self> {
+        GcRef::new(Self {
             object,
             function_index,
             module,
@@ -305,8 +382,8 @@ impl JsGenerator {
         function_index: u32,
         upvalues: Vec<UpvalueCell>,
         object: GcRef<JsObject>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+    ) -> GcRef<Self> {
+        GcRef::new(Self {
             object,
             function_index,
             module: Arc::new(Module::builder("").build()),

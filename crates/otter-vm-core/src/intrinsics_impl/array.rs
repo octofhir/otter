@@ -186,7 +186,7 @@ pub fn init_array_prototype(
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
     iterator_proto: GcRef<JsObject>,
-    symbol_iterator_id: u64,
+    symbol_iterator: crate::gc::GcRef<crate::value::Symbol>,
 ) {
         // Array.prototype.push
         arr_proto.define_property(
@@ -1269,7 +1269,7 @@ pub fn init_array_prototype(
         // ================================================================
         {
             let iter_proto = iterator_proto;
-            let sym_id = symbol_iterator_id;
+            let sym_ref = symbol_iterator;
 
             // Array.prototype.values()
             let fn_p = fn_proto;
@@ -1317,7 +1317,7 @@ pub fn init_array_prototype(
             let fn_p = fn_proto;
             let ip = iter_proto;
             arr_proto.define_property(
-                PropertyKey::Symbol(sym_id),
+                PropertyKey::Symbol(sym_ref),
                 PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                     move |this_val, _args, ncx| {
                         make_array_iterator(this_val, "value", ncx.memory_manager(), fn_p, ip)

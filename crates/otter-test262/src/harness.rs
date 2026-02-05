@@ -40,11 +40,47 @@ var $262 = {
         }
     },
     createRealm: function() {
-        // NOTE: Real realms are not implemented yet.
-        // For now, return the current global object so cross-realm tests
-        // can at least access eval and builtins.
+        if (typeof __otter_create_realm === 'function') {
+            return __otter_create_realm();
+        }
+        // Fallback shim when real realms are not available.
+        var parentGlobal = this.global;
+        var realmGlobal = Object.create(parentGlobal);
+        var ParentSymbol = parentGlobal.Symbol;
+
+        function SymbolWrapper(description) {
+            if (new.target) {
+                throw new TypeError('Symbol is not a constructor');
+            }
+            return ParentSymbol(description);
+        }
+
+        // Share Symbol.prototype across realms for now.
+        SymbolWrapper.prototype = ParentSymbol.prototype;
+
+        // Copy well-known symbols (shared across realms per spec).
+        SymbolWrapper.iterator = ParentSymbol.iterator;
+        SymbolWrapper.asyncIterator = ParentSymbol.asyncIterator;
+        SymbolWrapper.toStringTag = ParentSymbol.toStringTag;
+        SymbolWrapper.hasInstance = ParentSymbol.hasInstance;
+        SymbolWrapper.toPrimitive = ParentSymbol.toPrimitive;
+        SymbolWrapper.isConcatSpreadable = ParentSymbol.isConcatSpreadable;
+        SymbolWrapper.match = ParentSymbol.match;
+        SymbolWrapper.matchAll = ParentSymbol.matchAll;
+        SymbolWrapper.replace = ParentSymbol.replace;
+        SymbolWrapper.search = ParentSymbol.search;
+        SymbolWrapper.split = ParentSymbol.split;
+        SymbolWrapper.species = ParentSymbol.species;
+        SymbolWrapper.unscopables = ParentSymbol.unscopables;
+
+        // Wrap registry accessors to keep behavior but ensure function identity differs.
+        SymbolWrapper.for = function(key) { return ParentSymbol.for(key); };
+        SymbolWrapper.keyFor = function(sym) { return ParentSymbol.keyFor(sym); };
+
+        realmGlobal.Symbol = SymbolWrapper;
+
         return {
-            global: this.global,
+            global: realmGlobal,
             evalScript: function(code) {
                 return $262.evalScript(code);
             }

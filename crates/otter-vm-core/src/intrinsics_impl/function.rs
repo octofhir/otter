@@ -20,9 +20,11 @@
 //! - bind §20.2.3.2
 //! - toString §20.2.3.5
 
+use crate::context::NativeContext;
 use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
+use crate::realm::RealmId;
 use crate::value::Value;
 use crate::memory::MemoryManager;
 use crate::error::VmError;
@@ -241,4 +243,119 @@ pub fn init_function_prototype(
             fn_proto,
         )),
     );
+}
+
+/// Create a dynamic Function constructor (Function/GeneratorFunction/AsyncFunction).
+pub fn create_function_constructor(
+    realm_id: RealmId,
+) -> Box<
+    dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+> {
+    create_dynamic_function_constructor(DynamicFunctionKind::Normal, realm_id)
+}
+
+pub fn create_generator_function_constructor(
+    realm_id: RealmId,
+) -> Box<
+    dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+> {
+    create_dynamic_function_constructor(DynamicFunctionKind::Generator, realm_id)
+}
+
+pub fn create_async_function_constructor(
+    realm_id: RealmId,
+) -> Box<
+    dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+> {
+    create_dynamic_function_constructor(DynamicFunctionKind::Async, realm_id)
+}
+
+pub fn create_async_generator_function_constructor(
+    realm_id: RealmId,
+) -> Box<
+    dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+> {
+    create_dynamic_function_constructor(DynamicFunctionKind::AsyncGenerator, realm_id)
+}
+
+#[derive(Clone, Copy)]
+enum DynamicFunctionKind {
+    Normal,
+    Generator,
+    Async,
+    AsyncGenerator,
+}
+
+fn build_dynamic_function_source(
+    kind: DynamicFunctionKind,
+    params: &[String],
+    body: &str,
+) -> String {
+    let params = params.join(",");
+    match kind {
+        DynamicFunctionKind::Normal => format!("(function anonymous({}) {{ {} }})", params, body),
+        DynamicFunctionKind::Generator => {
+            format!("(function* anonymous({}) {{ {} }})", params, body)
+        }
+        DynamicFunctionKind::Async => format!("(async function anonymous({}) {{ {} }})", params, body),
+        DynamicFunctionKind::AsyncGenerator => {
+            format!("(async function* anonymous({}) {{ {} }})", params, body)
+        }
+    }
+}
+
+fn dynamic_function_fallback_proto(ncx: &NativeContext<'_>, kind: DynamicFunctionKind) -> Value {
+    let realm_id = ncx.ctx.realm_id();
+    let intrinsics = ncx.ctx.realm_intrinsics(realm_id);
+    match kind {
+        DynamicFunctionKind::Normal => intrinsics
+            .map(|i| Value::object(i.function_prototype))
+            .or_else(|| ncx.ctx.function_prototype().map(Value::object))
+            .unwrap_or_else(Value::null),
+        DynamicFunctionKind::Generator => intrinsics
+            .map(|i| Value::object(i.generator_function_prototype))
+            .unwrap_or_else(Value::null),
+        DynamicFunctionKind::Async => intrinsics
+            .map(|i| Value::object(i.async_function_prototype))
+            .unwrap_or_else(Value::null),
+        DynamicFunctionKind::AsyncGenerator => intrinsics
+            .map(|i| Value::object(i.async_generator_function_prototype))
+            .unwrap_or_else(Value::null),
+    }
+}
+
+fn create_dynamic_function_constructor(
+    kind: DynamicFunctionKind,
+    constructor_realm_id: RealmId,
+) -> Box<
+    dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+> {
+    Box::new(move |this, args, ncx| {
+        let mut params = Vec::new();
+        let mut body = String::new();
+        if !args.is_empty() {
+            for arg in &args[..args.len() - 1] {
+                params.push(ncx.to_string_value(arg)?);
+            }
+            body = ncx.to_string_value(args.last().unwrap())?;
+        }
+
+        let source = build_dynamic_function_source(kind, &params, &body);
+        let module = ncx.ctx.compile_eval(&source, false)?;
+        let func_value = ncx.execute_eval_module_in_realm(constructor_realm_id, &module)?;
+
+        let proto_value = if ncx.is_construct() {
+            this.as_object()
+                .map(|obj| obj.prototype())
+                .unwrap_or_else(Value::null)
+        } else {
+            dynamic_function_fallback_proto(ncx, kind)
+        };
+
+        if let Some(obj) = func_value.as_object() {
+            obj.set_prototype(proto_value);
+        }
+
+        Ok(func_value)
+    })
 }

@@ -45,10 +45,7 @@ fn property_key_to_value(key: &PropertyKey) -> Value {
     match key {
         PropertyKey::String(s) => Value::string(*s),
         PropertyKey::Index(n) => Value::string(JsString::intern(&n.to_string())),
-        PropertyKey::Symbol(sym) => Value::symbol(GcRef::new(crate::value::Symbol {
-            description: None,
-            id: *sym,
-        })),
+        PropertyKey::Symbol(sym) => Value::symbol(*sym),
     }
 }
 
@@ -607,7 +604,7 @@ pub fn proxy_own_keys(
         if let Some(s) = element.as_string() {
             trap_keys.push(PropertyKey::String(s.clone()));
         } else if let Some(sym) = element.as_symbol() {
-            trap_keys.push(PropertyKey::Symbol(sym.id));
+            trap_keys.push(PropertyKey::Symbol(sym));
         } else {
             // Per spec, throw TypeError for any other type
             return Err(VmError::type_error(

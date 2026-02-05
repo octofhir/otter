@@ -14,6 +14,7 @@ use crate::object::{
 };
 use crate::promise::{JsPromise, PromiseState};
 use crate::regexp::JsRegExp;
+use crate::realm::RealmId;
 use crate::string::JsString;
 use crate::value::{Closure, HeapRef, UpvalueCell, Value};
 
@@ -43,6 +44,10 @@ pub(crate) enum PreferredType {
     Number,
     String,
 }
+
+/// Maximum recursion depth for abstract equality comparison.
+/// Prevents stack overflow from malicious valueOf/toString chains.
+const MAX_ABSTRACT_EQUAL_DEPTH: usize = 128;
 
 impl Interpreter {
     /// Create a new interpreter
@@ -200,6 +205,8 @@ impl Interpreter {
         }
 
         let argc = args.len();
+        let realm_id = self.realm_id_for_function(ctx, func);
+        ctx.set_pending_realm_id(realm_id);
         ctx.push_frame(
             closure.function_index,
             Arc::clone(&closure.module),
@@ -2229,15 +2236,44 @@ impl Interpreter {
                 let left = ctx.get_register(lhs.0).clone();
                 let right = ctx.get_register(rhs.0).clone();
 
+                // Step 1: If right is not an object, throw TypeError
+                let Some(right_obj) = right.as_object() else {
+                    return Err(VmError::type_error(
+                        "Right-hand side of 'instanceof' is not an object",
+                    ));
+                };
+
+                // Step 2: Check for Symbol.hasInstance (@@hasInstance)
+                // Use get_property_value to properly call getters
+                let has_instance_key =
+                    PropertyKey::Symbol(crate::intrinsics::well_known::has_instance_symbol());
+                let handler = self.get_property_value(ctx, &right_obj, &has_instance_key, &right)?;
+
+                if !handler.is_undefined() && !handler.is_null() {
+                    // Step 2a: If handler is not callable, throw TypeError
+                    if !handler.is_callable() {
+                        return Err(VmError::type_error(
+                            "@@hasInstance is not callable",
+                        ));
+                    }
+                    // Step 2b: Call handler with this=right, args=[left]
+                    let result = self.call_function(ctx, &handler, right.clone(), &[left.clone()])?;
+                    // Step 2c: Return ToBoolean(result)
+                    ctx.set_register(dst.0, Value::boolean(result.to_boolean()));
+                    return Ok(InstructionResult::Continue);
+                }
+
+                // Step 3: If right is not callable, throw TypeError (OrdinaryHasInstance step 1)
+                if !right.is_callable() {
+                    return Err(VmError::type_error(
+                        "Right-hand side of 'instanceof' is not callable",
+                    ));
+                }
+
+                // Step 4: OrdinaryHasInstance - check if left is an object
                 let Some(left_obj) = left.as_object() else {
                     ctx.set_register(dst.0, Value::boolean(false));
                     return Ok(InstructionResult::Continue);
-                };
-
-                let Some(right_obj) = right.as_object() else {
-                    return Err(VmError::type_error(
-                        "Right-hand side of instanceof is not an object",
-                    ));
                 };
 
                 // IC Fast Path - cache the prototype property lookup on the constructor
@@ -2391,7 +2427,7 @@ impl Interpreter {
                     } else if let Some(s) = left.as_string() {
                         PropertyKey::from_js_string(s)
                     } else if let Some(sym) = left.as_symbol() {
-                        PropertyKey::Symbol(sym.id)
+                        PropertyKey::Symbol(sym)
                     } else {
                         let idx_str = self.to_string(&left);
                         PropertyKey::string(&idx_str)
@@ -2415,7 +2451,7 @@ impl Interpreter {
                 } else if let Some(s) = left.as_string() {
                     PropertyKey::from_js_string(s)
                 } else if let Some(sym) = left.as_symbol() {
-                    PropertyKey::Symbol(sym.id)
+                    PropertyKey::Symbol(sym)
                 } else {
                     let idx_str = self.to_string(&left);
                     PropertyKey::string(&idx_str)
@@ -2648,6 +2684,14 @@ impl Interpreter {
                 if let Some(fn_proto) = ctx.function_prototype() {
                     func_obj.set_prototype(Value::object(fn_proto));
                 }
+                func_obj.define_property(
+                    PropertyKey::string("__realm_id__"),
+                    PropertyDescriptor::builtin_data(Value::int32(ctx.realm_id() as i32)),
+                );
+                func_obj.define_property(
+                    PropertyKey::string("__realm_id__"),
+                    PropertyDescriptor::builtin_data(Value::int32(ctx.realm_id() as i32)),
+                );
 
                 // Set function length and name properties with correct attributes
                 // (writable: false, enumerable: false, configurable: true)
@@ -2804,6 +2848,10 @@ impl Interpreter {
                         .unwrap_or_else(Value::null),
                     ctx.memory_manager().clone(),
                 ));
+                func_obj.define_property(
+                    PropertyKey::string("__realm_id__"),
+                    PropertyDescriptor::builtin_data(Value::int32(ctx.realm_id() as i32)),
+                );
 
                 // Set function length and name properties
                 let fn_attrs = crate::object::PropertyAttributes {
@@ -2884,6 +2932,10 @@ impl Interpreter {
                         .unwrap_or_else(Value::null),
                     ctx.memory_manager().clone(),
                 ));
+                func_obj.define_property(
+                    PropertyKey::string("__realm_id__"),
+                    PropertyDescriptor::builtin_data(Value::int32(ctx.realm_id() as i32)),
+                );
 
                 // Set function length and name properties
                 let fn_attrs = crate::object::PropertyAttributes {
@@ -3188,7 +3240,8 @@ impl Interpreter {
                     let ctor_proto = func_value
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
-                        .and_then(|v| v.as_object());
+                        .and_then(|v| v.as_object())
+                        .or_else(|| self.default_object_prototype_for_constructor(ctx, &func_value));
                     let new_obj = GcRef::new(JsObject::new(
                         ctor_proto
                             .clone()
@@ -3270,7 +3323,8 @@ impl Interpreter {
                         let ctor_proto = func_value
                             .as_object()
                             .and_then(|o| o.get(&PropertyKey::string("prototype")))
-                            .and_then(|v| v.as_object());
+                            .and_then(|v| v.as_object())
+                            .or_else(|| self.default_object_prototype_for_constructor(ctx, &func_value));
                         let new_obj = GcRef::new(JsObject::new(
                             ctor_proto
                                 .clone()
@@ -3298,6 +3352,8 @@ impl Interpreter {
                         ctx.set_register(dst.0, new_obj_value);
                     }
 
+                    let realm_id = self.realm_id_for_function(ctx, &func_value);
+                    ctx.set_pending_realm_id(realm_id);
                     Ok(InstructionResult::Call {
                         func_index: closure.function_index,
                         module: Arc::clone(&closure.module),
@@ -3956,7 +4012,8 @@ impl Interpreter {
                     let ctor_proto = func_value
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
-                        .and_then(|v| v.as_object());
+                        .and_then(|v| v.as_object())
+                        .or_else(|| self.default_object_prototype_for_constructor(ctx, &func_value));
                     let new_obj = GcRef::new(JsObject::new(
                         ctor_proto.map(Value::object).unwrap_or_else(Value::null),
                         ctx.memory_manager().clone(),
@@ -3982,7 +4039,8 @@ impl Interpreter {
                 let ctor_proto = func_value
                     .as_object()
                     .and_then(|o| o.get(&PropertyKey::string("prototype")))
-                    .and_then(|v| v.as_object());
+                    .and_then(|v| v.as_object())
+                    .or_else(|| self.default_object_prototype_for_constructor(ctx, &func_value));
                 let new_obj = GcRef::new(JsObject::new(
                     ctor_proto.map(Value::object).unwrap_or_else(Value::null),
                     ctx.memory_manager().clone(),
@@ -4592,7 +4650,7 @@ impl Interpreter {
                             .get(&PropertyKey::string("prototype"))
                             .and_then(|v| v.as_object())
                         {
-                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                            let value = self.get_property_value(ctx, &proto, &key, &object)?;
                             ctx.set_register(dst.0, value);
                             return Ok(InstructionResult::Continue);
                         }
@@ -4612,6 +4670,11 @@ impl Interpreter {
                 ic_index,
             } => {
                 let object = ctx.get_register(obj.0).clone();
+                let is_strict = ctx
+                    .current_frame()
+                    .and_then(|frame| frame.module.function(frame.function_index))
+                    .map(|func| func.flags.is_strict)
+                    .unwrap_or(false);
                 let name_const = module
                     .constants
                     .get(name.0)
@@ -4657,20 +4720,29 @@ impl Interpreter {
                                 match &ic.ic_state {
                                     InlineCacheState::Monomorphic { shape_id, offset } => {
                                         if obj_shape_ptr == *shape_id {
-                                            if obj.set_by_offset(*offset as usize, val_val.clone())
-                                            {
+                                            let success = obj.set_by_offset(*offset as usize, val_val.clone());
+                                            if success {
                                                 cached = true;
+                                            } else if is_strict {
+                                                return Err(VmError::type_error(
+                                                    "Cannot assign to read-only property",
+                                                ));
                                             }
                                         }
                                     }
                                     InlineCacheState::Polymorphic { count, entries } => {
                                         for i in 0..(*count as usize) {
                                             if obj_shape_ptr == entries[i].0 {
-                                                if obj.set_by_offset(
+                                                let success = obj.set_by_offset(
                                                     entries[i].1 as usize,
                                                     val_val.clone(),
-                                                ) {
+                                                );
+                                                if success {
                                                     cached = true;
+                                                } else if is_strict {
+                                                    return Err(VmError::type_error(
+                                                        "Cannot assign to read-only property",
+                                                    ));
                                                 }
                                                 break;
                                             }
@@ -4713,7 +4785,12 @@ impl Interpreter {
                         }
                         _ => {
                             // Slow path: update IC
-                            obj.set(key, val_val);
+                            let success = obj.set(key, val_val);
+                            if !success && is_strict {
+                                return Err(VmError::type_error(
+                                    "Cannot assign to read-only property",
+                                ));
+                            }
                             // Skip IC for dictionary mode objects
                             if !obj.is_dictionary_mode() {
                                 if let Some(offset) =
@@ -4783,6 +4860,9 @@ impl Interpreter {
                         }
                     }
                 } else {
+                    if is_strict {
+                        return Err(VmError::type_error("Cannot set property on non-object"));
+                    }
                     Ok(InstructionResult::Continue)
                 }
             }
@@ -4798,7 +4878,7 @@ impl Interpreter {
                     } else if let Some(s) = key_value.as_string() {
                         PropertyKey::from_js_string(s)
                     } else if let Some(sym) = key_value.as_symbol() {
-                        PropertyKey::Symbol(sym.id)
+                        PropertyKey::Symbol(sym)
                     } else {
                         let key_str = self.to_string(&key_value);
                         PropertyKey::string(&key_str)
@@ -4819,7 +4899,7 @@ impl Interpreter {
                 } else if let Some(s) = key_value.as_string() {
                     PropertyKey::from_js_string(s)
                 } else if let Some(sym) = key_value.as_symbol() {
-                    PropertyKey::Symbol(sym.id)
+                    PropertyKey::Symbol(sym)
                 } else {
                     let key_str = self.to_string(&key_value);
                     PropertyKey::string(&key_str)
@@ -4842,6 +4922,20 @@ impl Interpreter {
                     true
                 };
 
+                // Strict mode: throw TypeError if delete failed (non-configurable property)
+                if !result {
+                    let is_strict = ctx
+                        .current_frame()
+                        .and_then(|frame| frame.module.function(frame.function_index))
+                        .map(|func| func.flags.is_strict)
+                        .unwrap_or(false);
+                    if is_strict {
+                        return Err(VmError::type_error(
+                            "Cannot delete non-configurable property",
+                        ));
+                    }
+                }
+
                 ctx.set_register(dst.0, Value::boolean(result));
                 Ok(InstructionResult::Continue)
             }
@@ -4862,7 +4956,7 @@ impl Interpreter {
                     } else if let Some(s) = key_value.as_string() {
                         PropertyKey::from_js_string(s)
                     } else if let Some(sym) = key_value.as_symbol() {
-                        PropertyKey::Symbol(sym.id)
+                        PropertyKey::Symbol(sym)
                     } else {
                         let key_str = self.to_string(&key_value);
                         PropertyKey::string(&key_str)
@@ -4888,7 +4982,7 @@ impl Interpreter {
                     } else if let Some(s) = key_value.as_string() {
                         PropertyKey::from_js_string(s)
                     } else if let Some(sym) = key_value.as_symbol() {
-                        PropertyKey::Symbol(sym.id)
+                        PropertyKey::Symbol(sym)
                     } else {
                         let key_str = self.to_string(&key_value);
                         PropertyKey::string(&key_str)
@@ -4926,22 +5020,10 @@ impl Interpreter {
 
                 // Function property access
                 if let Some(closure) = object.as_function() {
-                    // Convert key to property key
                     let key = self.value_to_property_key(ctx, &key_value)?;
-
-                    // Check the function's internal object first (for properties like .prototype, .length, .name)
-                    if let Some(val) = closure.object.get(&key) {
-                        ctx.set_register(dst.0, val);
-                        return Ok(InstructionResult::Continue);
-                    }
-                    // Check prototype chain
-                    if let Some(proto) = closure.object.prototype().as_object() {
-                        if let Some(val) = proto.get(&key) {
-                            ctx.set_register(dst.0, val);
-                            return Ok(InstructionResult::Continue);
-                        }
-                    }
-                    ctx.set_register(dst.0, Value::undefined());
+                    let receiver = object.clone();
+                    let value = self.get_property_value(ctx, &closure.object, &key, &receiver)?;
+                    ctx.set_register(dst.0, value);
                     return Ok(InstructionResult::Continue);
                 }
 
@@ -5153,7 +5235,7 @@ impl Interpreter {
                             .get(&PropertyKey::string("prototype"))
                             .and_then(|v| v.as_object())
                         {
-                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                            let value = self.get_property_value(ctx, &proto, &key, &object)?;
                             ctx.set_register(dst.0, value);
                             return Ok(InstructionResult::Continue);
                         }
@@ -5175,6 +5257,11 @@ impl Interpreter {
                 let object = ctx.get_register(obj.0).clone();
                 let key_value = ctx.get_register(key.0).clone();
                 let val_val = ctx.get_register(val.0).clone();
+                let is_strict = ctx
+                    .current_frame()
+                    .and_then(|frame| frame.module.function(frame.function_index))
+                    .map(|func| func.flags.is_strict)
+                    .unwrap_or(false);
 
                 // Proxy check - must be first
                 if let Some(proxy) = object.as_proxy() {
@@ -5216,20 +5303,29 @@ impl Interpreter {
                                 match &ic.ic_state {
                                     InlineCacheState::Monomorphic { shape_id, offset } => {
                                         if obj_shape_ptr == *shape_id {
-                                            if obj.set_by_offset(*offset as usize, val_val.clone())
-                                            {
+                                            let success = obj.set_by_offset(*offset as usize, val_val.clone());
+                                            if success {
                                                 cached = true;
+                                            } else if is_strict {
+                                                return Err(VmError::type_error(
+                                                    "Cannot assign to read-only property",
+                                                ));
                                             }
                                         }
                                     }
                                     InlineCacheState::Polymorphic { count, entries } => {
                                         for i in 0..(*count as usize) {
                                             if obj_shape_ptr == entries[i].0 {
-                                                if obj.set_by_offset(
+                                                let success = obj.set_by_offset(
                                                     entries[i].1 as usize,
                                                     val_val.clone(),
-                                                ) {
+                                                );
+                                                if success {
                                                     cached = true;
+                                                } else if is_strict {
+                                                    return Err(VmError::type_error(
+                                                        "Cannot assign to read-only property",
+                                                    ));
                                                 }
                                                 break;
                                             }
@@ -5272,7 +5368,12 @@ impl Interpreter {
                         }
                         _ => {
                             // Slow path: update IC (skip for dictionary mode)
-                            obj.set(key.clone(), val_val);
+                            let success = obj.set(key.clone(), val_val);
+                            if !success && is_strict {
+                                return Err(VmError::type_error(
+                                    "Cannot assign to read-only property",
+                                ));
+                            }
                             if !obj.is_dictionary_mode() {
                                 if let Some(offset) = obj.shape().get_offset(&key) {
                                     let frame = ctx
@@ -5339,6 +5440,9 @@ impl Interpreter {
                         }
                     }
                 } else {
+                    if is_strict {
+                        return Err(VmError::type_error("Cannot set property on non-object"));
+                    }
                     Ok(InstructionResult::Continue)
                 }
             }
@@ -5562,6 +5666,11 @@ impl Interpreter {
                 let array = ctx.get_register(arr.0).clone();
                 let index = ctx.get_register(idx.0).clone();
                 let val_val = ctx.get_register(val.0).clone();
+                let is_strict = ctx
+                    .current_frame()
+                    .and_then(|frame| frame.module.function(frame.function_index))
+                    .map(|func| func.flags.is_strict)
+                    .unwrap_or(false);
 
                 if let Some(obj) = array.as_object() {
                     // Fast path for integer index access on arrays
@@ -5599,22 +5708,32 @@ impl Interpreter {
                                     match &ic.ic_state {
                                         InlineCacheState::Monomorphic { shape_id, offset } => {
                                             if obj_shape_ptr == *shape_id {
-                                                if obj.set_by_offset(
+                                                let success = obj.set_by_offset(
                                                     *offset as usize,
                                                     val_val.clone(),
-                                                ) {
+                                                );
+                                                if success {
                                                     cached = true;
+                                                } else if is_strict {
+                                                    return Err(VmError::type_error(
+                                                        "Cannot assign to read-only property",
+                                                    ));
                                                 }
                                             }
                                         }
                                         InlineCacheState::Polymorphic { count, entries } => {
                                             for i in 0..(*count as usize) {
                                                 if obj_shape_ptr == entries[i].0 {
-                                                    if obj.set_by_offset(
+                                                    let success = obj.set_by_offset(
                                                         entries[i].1 as usize,
                                                         val_val.clone(),
-                                                    ) {
+                                                    );
+                                                    if success {
                                                         cached = true;
+                                                    } else if is_strict {
+                                                        return Err(VmError::type_error(
+                                                            "Cannot assign to read-only property",
+                                                        ));
                                                     }
                                                     break;
                                                 }
@@ -5695,7 +5814,14 @@ impl Interpreter {
                         }
                     }
 
-                    obj.set(key, val_val);
+                    let success = obj.set(key, val_val);
+                    if !success && is_strict {
+                        return Err(VmError::type_error(
+                            "Cannot assign to read-only property",
+                        ));
+                    }
+                } else if is_strict {
+                    return Err(VmError::type_error("Cannot set property on non-object"));
                 }
                 Ok(InstructionResult::Continue)
             }
@@ -5927,6 +6053,19 @@ impl Interpreter {
                 let key = self.value_to_property_key(ctx, &key_value)?;
                 let method_value = if let Some(obj_ref) = receiver.as_object() {
                     obj_ref.get(&key).unwrap_or_else(Value::undefined)
+                } else if receiver.is_symbol() {
+                    if let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object()) {
+                        if let Some(proto) = symbol_obj
+                            .get(&PropertyKey::string("prototype"))
+                            .and_then(|v| v.as_object())
+                        {
+                            self.get_property_value(ctx, &proto, &key, &receiver)?
+                        } else {
+                            Value::undefined()
+                        }
+                    } else {
+                        Value::undefined()
+                    }
                 } else {
                     Value::undefined()
                 };
@@ -6041,6 +6180,19 @@ impl Interpreter {
                 let key = self.value_to_property_key(ctx, &key_value)?;
                 let method_value = if let Some(obj_ref) = receiver.as_object() {
                     obj_ref.get(&key).unwrap_or_else(Value::undefined)
+                } else if receiver.is_symbol() {
+                    if let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object()) {
+                        if let Some(proto) = symbol_obj
+                            .get(&PropertyKey::string("prototype"))
+                            .and_then(|v| v.as_object())
+                        {
+                            self.get_property_value(ctx, &proto, &key, &receiver)?
+                        } else {
+                            Value::undefined()
+                        }
+                    } else {
+                        Value::undefined()
+                    }
                 } else {
                     Value::undefined()
                 };
@@ -6143,14 +6295,11 @@ impl Interpreter {
 
                 let obj = ctx.get_register(src.0).clone();
 
-                // Get Symbol.iterator method using well-known symbol ID (1)
-                const SYMBOL_ITERATOR_ID: u64 = 1;
+                // Get Symbol.iterator method
+                let iterator_sym = crate::intrinsics::well_known::iterator_symbol();
                 let iterator_method = if let Some(proxy) = obj.as_proxy() {
-                    let key = PropertyKey::Symbol(SYMBOL_ITERATOR_ID);
-                    let key_value = Value::symbol(GcRef::new(crate::value::Symbol {
-                        description: None,
-                        id: SYMBOL_ITERATOR_ID,
-                    }));
+                    let key = PropertyKey::Symbol(iterator_sym);
+                    let key_value = Value::symbol(iterator_sym);
                     let mut ncx = crate::context::NativeContext::new(ctx, self);
                     Some(crate::proxy_operations::proxy_get(
                         &mut ncx,
@@ -6162,7 +6311,7 @@ impl Interpreter {
                 } else {
                     match obj.heap_ref() {
                         Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
-                            o.get(&PropertyKey::Symbol(SYMBOL_ITERATOR_ID))
+                            o.get(&PropertyKey::Symbol(iterator_sym))
                         }
                         _ => None,
                     }
@@ -6200,16 +6349,13 @@ impl Interpreter {
 
                 let obj = ctx.get_register(src.0).clone();
 
-                // 1. Try Symbol.asyncIterator (ID 2)
-                const SYMBOL_ASYNC_ITERATOR_ID: u64 = 2;
-                const SYMBOL_ITERATOR_ID: u64 = 1;
+                // 1. Try Symbol.asyncIterator
+                let async_iterator_sym = crate::intrinsics::well_known::async_iterator_symbol();
+                let iterator_sym = crate::intrinsics::well_known::iterator_symbol();
 
                 let mut iterator_method = if let Some(proxy) = obj.as_proxy() {
-                    let key = PropertyKey::Symbol(SYMBOL_ASYNC_ITERATOR_ID);
-                    let key_value = Value::symbol(GcRef::new(crate::value::Symbol {
-                        description: None,
-                        id: SYMBOL_ASYNC_ITERATOR_ID,
-                    }));
+                    let key = PropertyKey::Symbol(async_iterator_sym);
+                    let key_value = Value::symbol(async_iterator_sym);
                     let mut ncx = crate::context::NativeContext::new(ctx, self);
                     Some(crate::proxy_operations::proxy_get(
                         &mut ncx,
@@ -6221,20 +6367,17 @@ impl Interpreter {
                 } else {
                     match obj.heap_ref() {
                         Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
-                            o.get(&PropertyKey::Symbol(SYMBOL_ASYNC_ITERATOR_ID))
+                            o.get(&PropertyKey::Symbol(async_iterator_sym))
                         }
                         _ => None,
                     }
                 };
 
-                // 2. Fallback to Symbol.iterator (ID 1)
+                // 2. Fallback to Symbol.iterator
                 if iterator_method.is_none() {
                     if let Some(proxy) = obj.as_proxy() {
-                        let key = PropertyKey::Symbol(SYMBOL_ITERATOR_ID);
-                        let key_value = Value::symbol(GcRef::new(crate::value::Symbol {
-                            description: None,
-                            id: SYMBOL_ITERATOR_ID,
-                        }));
+                        let key = PropertyKey::Symbol(iterator_sym);
+                        let key_value = Value::symbol(iterator_sym);
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
                         iterator_method = Some(crate::proxy_operations::proxy_get(
                             &mut ncx,
@@ -6246,7 +6389,7 @@ impl Interpreter {
                     } else {
                         iterator_method = match obj.heap_ref() {
                             Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
-                                o.get(&PropertyKey::Symbol(SYMBOL_ITERATOR_ID))
+                                o.get(&PropertyKey::Symbol(iterator_sym))
                             }
                             _ => None,
                         };
@@ -6761,7 +6904,7 @@ impl Interpreter {
     /// stack depth and returns when the eval frame finishes, without
     /// consuming outer call frames. This is the same pattern used by
     /// `call_function`.
-    fn execute_eval_module(&self, ctx: &mut VmContext, module: &Module) -> VmResult<Value> {
+    pub(crate) fn execute_eval_module(&self, ctx: &mut VmContext, module: &Module) -> VmResult<Value> {
         let module = Arc::new(module.clone());
         let entry_func = module
             .entry_function()
@@ -6960,6 +7103,218 @@ impl Interpreter {
         // ncx dropped here — ctx borrow released
         ctx.exit_native_call();
         result
+    }
+
+    /// Call a function value as a constructor (native or closure).
+    ///
+    /// This sets the construct flag so `return` uses the constructed `this`
+    /// when the constructor returns a non-object.
+    pub fn call_function_construct(
+        &self,
+        ctx: &mut VmContext,
+        func: &Value,
+        this_value: Value,
+        args: &[Value],
+    ) -> VmResult<Value> {
+        // Check if it's a native function
+        if let Some(native_fn) = func.as_native_function() {
+            return self.call_native_fn_construct(ctx, native_fn, &this_value, args);
+        }
+
+        // Regular closure call
+        let closure = func
+            .as_function()
+            .ok_or_else(|| VmError::type_error("not a function"))?;
+
+        // Save current state
+        let was_running = ctx.is_running();
+        let prev_stack_depth = ctx.stack_depth();
+
+        // Get function info
+        let func_info = closure
+            .module
+            .function(closure.function_index)
+            .ok_or_else(|| VmError::internal("function not found"))?;
+
+        // Set up the call
+        ctx.set_pending_args(args.to_vec());
+        ctx.set_pending_this(this_value);
+        ctx.set_pending_upvalues(closure.upvalues.clone());
+        // Propagate home_object from closure to the new call frame
+        if let Some(ref ho) = closure.home_object {
+            ctx.set_pending_home_object(ho.clone());
+        }
+
+        let argc = args.len();
+        let realm_id = self.realm_id_for_function(ctx, func);
+        ctx.set_pending_realm_id(realm_id);
+        ctx.push_frame(
+            closure.function_index,
+            Arc::clone(&closure.module),
+            func_info.local_count,
+            Some(0), // Return register (unused, we get result from Return)
+            true,    // Construct call
+            closure.is_async,
+            argc,
+        )?;
+        ctx.set_running(true);
+
+        // Execute until this call returns
+        let result = loop {
+            let frame = match ctx.current_frame() {
+                Some(f) => f,
+                None => return Err(VmError::internal("no frame")),
+            };
+
+            let current_module = Arc::clone(&frame.module);
+            let func = match current_module.function(frame.function_index) {
+                Some(f) => f,
+                None => return Err(VmError::internal("function not found")),
+            };
+
+            // Check if we've reached the end of the function
+            if frame.pc >= func.instructions.len() {
+                // Check if we've returned to the original depth
+                if ctx.stack_depth() <= prev_stack_depth {
+                    break Value::undefined();
+                }
+                ctx.pop_frame();
+                continue;
+            }
+
+            let instruction = &func.instructions[frame.pc];
+
+            match self.execute_instruction(instruction, &current_module, ctx) {
+                Ok(InstructionResult::Continue) => {
+                    ctx.advance_pc();
+                }
+                Ok(InstructionResult::Jump(offset)) => {
+                    ctx.jump(offset);
+                }
+                Ok(InstructionResult::Return(value)) => {
+                    let (return_reg, is_construct, construct_this, is_async) = {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        (
+                            frame.return_register,
+                            frame.is_construct,
+                            frame.this_value.clone(),
+                            frame.is_async,
+                        )
+                    };
+                    let value = if is_construct && !value.is_object() {
+                        construct_this
+                    } else if is_async {
+                        self.create_js_promise(ctx, JsPromise::resolved(value))
+                    } else {
+                        value
+                    };
+                    // Check if we've returned to the original depth
+                    if ctx.stack_depth() <= prev_stack_depth + 1 {
+                        ctx.pop_frame();
+                        break value;
+                    }
+                    // Handle return from nested call
+                    ctx.pop_frame();
+                    if let Some(reg) = return_reg {
+                        ctx.set_register(reg, value);
+                    } else {
+                        ctx.set_register(0, value);
+                    }
+                }
+                Ok(InstructionResult::Call {
+                    func_index,
+                    module,
+                    argc,
+                    return_reg,
+                    is_construct,
+                    is_async,
+                    upvalues,
+                }) => {
+                    ctx.advance_pc();
+                    let func = module
+                        .function(func_index)
+                        .ok_or_else(|| VmError::internal("function not found"))?;
+
+                    // Record the function call for hot function detection
+                    let became_hot = func.record_call();
+                    if became_hot {
+                        // JIT trigger hook: function just became hot
+                        // In Phase 3, this will trigger JIT compilation
+                        #[cfg(feature = "jit")]
+                        {
+                            // TODO: Queue function for JIT compilation
+                        }
+                        let _ = became_hot; // Silence unused warning when jit feature is off
+                    }
+
+                    let local_count = func.local_count;
+                    ctx.set_pending_upvalues(upvalues);
+                    ctx.push_frame(
+                        func_index,
+                        module,
+                        local_count,
+                        Some(return_reg),
+                        is_construct,
+                        is_async,
+                        argc as usize,
+                    )?;
+                }
+                Ok(InstructionResult::TailCall {
+                    func_index,
+                    module,
+                    argc,
+                    return_reg,
+                    is_async,
+                    upvalues,
+                }) => {
+                    // Tail call: pop current frame and push new one
+                    ctx.pop_frame();
+                    let local_count = module
+                        .function(func_index)
+                        .ok_or_else(|| VmError::internal("function not found"))?
+                        .local_count;
+                    ctx.set_pending_upvalues(upvalues);
+                    ctx.push_frame(
+                        func_index,
+                        module,
+                        local_count,
+                        Some(return_reg),
+                        false,
+                        is_async,
+                        argc as usize,
+                    )?;
+                }
+                Ok(InstructionResult::Suspend { .. }) => {
+                    // Can't handle suspension in direct call, return undefined
+                    break Value::undefined();
+                }
+                Ok(InstructionResult::Yield { .. }) => {
+                    // Can't handle yield in direct call, return undefined
+                    break Value::undefined();
+                }
+                Ok(InstructionResult::Throw(error)) => {
+                    // Pop the frame we pushed and unwind to original depth
+                    while ctx.stack_depth() > prev_stack_depth {
+                        ctx.pop_frame();
+                    }
+                    ctx.set_running(was_running);
+                    return Err(VmError::exception(error));
+                }
+                Err(e) => {
+                    // Pop the frame we pushed and unwind to original depth
+                    while ctx.stack_depth() > prev_stack_depth {
+                        ctx.pop_frame();
+                    }
+                    ctx.set_running(was_running);
+                    return Err(e);
+                }
+            }
+        };
+
+        ctx.set_running(was_running);
+        Ok(result)
     }
 
     /// Call a native function as a constructor (via `new`).
@@ -7211,12 +7566,29 @@ impl Interpreter {
         // 3. Handle closures
         if let Some(closure) = current_func.as_function() {
             if closure.is_generator {
-                // Use intrinsic generator prototype for correct prototype chain
-                let proto = if closure.is_async {
-                    ctx.async_generator_prototype_intrinsic()
-                } else {
-                    ctx.generator_prototype_intrinsic()
-                };
+                // Use generator prototype from the function's realm, not the caller's.
+                let realm_id = closure
+                    .object
+                    .get(&PropertyKey::string("__realm_id__"))
+                    .and_then(|v| v.as_int32())
+                    .map(|id| id as u32)
+                    .unwrap_or_else(|| ctx.realm_id());
+                let proto = ctx
+                    .realm_intrinsics(realm_id)
+                    .map(|intrinsics| {
+                        if closure.is_async {
+                            intrinsics.async_generator_prototype
+                        } else {
+                            intrinsics.generator_prototype
+                        }
+                    })
+                    .or_else(|| {
+                        if closure.is_async {
+                            ctx.async_generator_prototype_intrinsic()
+                        } else {
+                            ctx.generator_prototype_intrinsic()
+                        }
+                    });
 
                 // Create the generator's internal object
                 let gen_obj = GcRef::new(JsObject::new(
@@ -7232,6 +7604,7 @@ impl Interpreter {
                     current_this,
                     false, // is_construct
                     closure.is_async,
+                    realm_id,
                     gen_obj,
                 );
                 ctx.set_register(return_reg, Value::generator(generator));
@@ -7239,6 +7612,8 @@ impl Interpreter {
             }
 
             let argc = current_args.len() as u8;
+            let realm_id = self.realm_id_for_function(ctx, &current_func);
+            ctx.set_pending_realm_id(realm_id);
             ctx.set_pending_this(current_this);
             ctx.set_pending_args(current_args);
             // Propagate home_object from closure to the new call frame
@@ -7470,7 +7845,7 @@ impl Interpreter {
         };
 
         // 1. @@toPrimitive
-        let to_prim_key = PropertyKey::Symbol(crate::intrinsics::well_known::TO_PRIMITIVE);
+        let to_prim_key = PropertyKey::Symbol(crate::intrinsics::well_known::to_primitive_symbol());
         let method = self.get_property_value(ctx, &obj, &to_prim_key, value)?;
         if !method.is_undefined() && !method.is_null() {
             if !method.is_callable() {
@@ -7661,7 +8036,9 @@ impl Interpreter {
         self.to_primitive(ctx, value, PreferredType::Number)
     }
 
-    /// Convert value to number (very small ToNumber subset).
+    /// Convert primitive value to number (small ToNumber subset).
+    /// Does NOT handle objects - for objects, use `to_number_value()` which
+    /// invokes ToPrimitive first per ES2023 §7.1.4.
     fn to_number(&self, value: &Value) -> f64 {
         if let Some(n) = value.as_number() {
             return n;
@@ -7678,15 +8055,7 @@ impl Interpreter {
         if let Some(s) = value.as_string() {
             return self.parse_string_to_number(s.as_str());
         }
-        if let Some(obj) = value.as_object() {
-            use crate::object::PropertyKey;
-            if let Some(prim) = obj.get(&PropertyKey::string("__value__")) {
-                return self.to_number(&prim);
-            }
-            if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
-                return self.to_number(&prim);
-            }
-        }
+        // Objects should be converted via to_number_value() which calls ToPrimitive
         f64::NAN
     }
 
@@ -7913,7 +8282,7 @@ impl Interpreter {
         value: &Value,
     ) -> VmResult<PropertyKey> {
         if let Some(sym) = value.as_symbol() {
-            return Ok(PropertyKey::Symbol(sym.id));
+            return Ok(PropertyKey::Symbol(sym));
         }
         let prim = if value.is_object() {
             self.to_primitive(ctx, value, PreferredType::String)?
@@ -7921,7 +8290,7 @@ impl Interpreter {
             value.clone()
         };
         if let Some(sym) = prim.as_symbol() {
-            return Ok(PropertyKey::Symbol(sym.id));
+            return Ok(PropertyKey::Symbol(sym));
         }
         let key_str = self.to_string_value(ctx, &prim)?;
         if let Ok(n) = key_str.parse::<u32>() {
@@ -7932,8 +8301,33 @@ impl Interpreter {
         Ok(PropertyKey::string(&key_str))
     }
 
-    /// Abstract equality comparison (==)
+    /// Abstract equality comparison (==) per ES2023 §7.2.14 IsLooselyEqual
+    ///
+    /// # NaN Handling
+    /// NaN == NaN returns false (IEEE 754 semantics via f64 comparison)
+    ///
+    /// # Recursion Protection
+    /// Depth-limited to MAX_ABSTRACT_EQUAL_DEPTH to prevent stack overflow
+    /// from malicious valueOf/toString implementations.
     fn abstract_equal(&self, ctx: &mut VmContext, left: &Value, right: &Value) -> VmResult<bool> {
+        self.abstract_equal_impl(ctx, left, right, 0)
+    }
+
+    /// Internal implementation with depth tracking
+    fn abstract_equal_impl(
+        &self,
+        ctx: &mut VmContext,
+        left: &Value,
+        right: &Value,
+        depth: usize,
+    ) -> VmResult<bool> {
+        // Prevent stack overflow from malicious valueOf/toString chains
+        if depth > MAX_ABSTRACT_EQUAL_DEPTH {
+            return Err(VmError::range_error(
+                "Maximum recursion depth exceeded in equality comparison",
+            ));
+        }
+
         // Same type fast paths
         if left.is_undefined() && right.is_undefined() {
             return Ok(true);
@@ -7944,6 +8338,7 @@ impl Interpreter {
         if left.is_number() && right.is_number() {
             let a = left.as_number().unwrap();
             let b = right.as_number().unwrap();
+            // NaN == NaN returns false per IEEE 754
             return Ok(a == b);
         }
         if let (Some(a), Some(b)) = (left.as_string(), right.as_string()) {
@@ -8017,24 +8412,24 @@ impl Interpreter {
             ));
         }
 
-        // Boolean
+        // Boolean -> ToNumber, recurse
         if let Some(b) = left.as_boolean() {
             let num = if b { 1.0 } else { 0.0 };
-            return self.abstract_equal(ctx, &Value::number(num), right);
+            return self.abstract_equal_impl(ctx, &Value::number(num), right, depth + 1);
         }
         if let Some(b) = right.as_boolean() {
             let num = if b { 1.0 } else { 0.0 };
-            return self.abstract_equal(ctx, left, &Value::number(num));
+            return self.abstract_equal_impl(ctx, left, &Value::number(num), depth + 1);
         }
 
-        // Object <-> Primitive
+        // Object <-> Primitive: ToPrimitive, recurse
         if left.is_object() && !right.is_object() {
             let prim = self.to_primitive(ctx, left, PreferredType::Default)?;
-            return self.abstract_equal(ctx, &prim, right);
+            return self.abstract_equal_impl(ctx, &prim, right, depth + 1);
         }
         if right.is_object() && !left.is_object() {
             let prim = self.to_primitive(ctx, right, PreferredType::Default)?;
-            return self.abstract_equal(ctx, left, &prim);
+            return self.abstract_equal_impl(ctx, left, &prim, depth + 1);
         }
 
         // Symbol with non-symbol
@@ -8054,6 +8449,58 @@ impl Interpreter {
 
         // Use Value's PartialEq
         left == right
+    }
+
+    /// Determine the realm id for a constructor function (best-effort).
+    pub(crate) fn realm_id_for_function(&self, ctx: &VmContext, value: &Value) -> RealmId {
+        let mut current = value.clone();
+        if let Some(proxy) = current.as_proxy() {
+            if let Some(target) = proxy.target() {
+                current = target;
+            }
+        }
+
+        if let Some(obj) = current.as_object() {
+            if let Some(id) = obj
+                .get(&PropertyKey::string("__realm_id__"))
+                .and_then(|v| v.as_int32())
+            {
+                return id as RealmId;
+            }
+        }
+        ctx.realm_id()
+    }
+
+    /// Default Object.prototype for a constructor's realm (GetPrototypeFromConstructor fallback).
+    pub(crate) fn default_object_prototype_for_constructor(
+        &self,
+        ctx: &VmContext,
+        ctor: &Value,
+    ) -> Option<GcRef<JsObject>> {
+        let realm_id = self.realm_id_for_function(ctx, ctor);
+        if let Some(intrinsics) = ctx.realm_intrinsics(realm_id) {
+            let mut current = ctor.clone();
+            if let Some(proxy) = current.as_proxy() {
+                if let Some(target) = proxy.target() {
+                    current = target;
+                }
+            }
+            if let Some(tag) = current
+                .as_object()
+                .and_then(|o| o.get(&PropertyKey::string("__builtin_tag__")))
+                .and_then(|v| v.as_string())
+            {
+                if let Some(proto) = intrinsics.prototype_for_builtin_tag(tag.as_str()) {
+                    return Some(proto);
+                }
+            }
+            return Some(intrinsics.object_prototype);
+        }
+        ctx.global()
+            .get(&PropertyKey::string("Object"))
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get(&PropertyKey::string("prototype")))
+            .and_then(|v| v.as_object())
     }
 
     /// Capture upvalues from the current frame based on upvalue specifications.
@@ -8282,6 +8729,7 @@ impl Interpreter {
         let argc = args.len();
 
         // Set up pending args and push initial frame
+        ctx.set_pending_realm_id(generator.realm_id);
         ctx.set_pending_args(args);
         ctx.set_pending_this(this_value);
         ctx.set_pending_upvalues(generator.upvalues.clone());
@@ -8334,6 +8782,7 @@ impl Interpreter {
         let initial_depth = ctx.stack_depth();
 
         // Restore the frame to context
+        ctx.set_pending_realm_id(generator.realm_id);
         if let Err(e) = self.restore_generator_frame(ctx, &frame) {
             generator.complete();
             return GeneratorResult::Error(e);

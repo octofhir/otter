@@ -21,6 +21,7 @@ use otter_vm_core::gc::GcRef;
 use otter_vm_core::interpreter::Interpreter;
 use otter_vm_core::object::{JsObject, PropertyDescriptor, PropertyKey};
 use otter_vm_core::promise::{JsPromise, JsPromiseJob, JsPromiseJobKind};
+use otter_vm_core::realm::RealmId;
 use otter_vm_core::runtime::VmRuntime;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
@@ -92,6 +93,14 @@ pub struct Otter {
     debug_snapshot: Arc<parking_lot::Mutex<VmContextSnapshot>>,
     /// Trace configuration (if tracing is enabled)
     trace_config: Option<otter_vm_core::TraceConfig>,
+    /// Stored realm contexts created via createRealm().
+    realms: Arc<parking_lot::Mutex<Vec<RealmSlot>>>,
+}
+
+#[derive(Debug)]
+struct RealmSlot {
+    id: RealmId,
+    ctx: VmContext,
 }
 
 impl Otter {
@@ -116,6 +125,7 @@ impl Otter {
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             debug_snapshot: Arc::new(parking_lot::Mutex::new(VmContextSnapshot::default())),
             trace_config: None,
+            realms: Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
     }
 
@@ -573,7 +583,9 @@ impl Otter {
     fn register_ops_in_context(&self, ctx: &mut VmContext) {
         let global = ctx.global().clone();
         let pending_ops = self.event_loop.get_pending_async_ops_count();
-        let fn_proto = self.vm.function_prototype();
+        let fn_proto = ctx
+            .function_prototype()
+            .unwrap_or_else(|| self.vm.function_prototype());
 
         for op_name in self.extensions.op_names() {
             if let Some(handler) = self.extensions.get_op(op_name) {
@@ -593,6 +605,8 @@ impl Otter {
 
         let ctx_ptr = ctx as *mut VmContext as usize;
         let vm_ptr = &self.vm as *const VmRuntime as usize;
+        let otter_ptr = self as *const Otter as usize;
+        let realms_store = Arc::clone(&self.realms);
         let mm_eval = self.vm.memory_manager().clone();
         let mm_eval_closure = mm_eval.clone();
         global.set(
@@ -674,6 +688,77 @@ impl Otter {
                 },
                 mm_eval,
                 fn_proto,
+            ),
+        );
+
+        // Create a new realm and return { global, evalScript }
+        let mm_realm = self.vm.memory_manager().clone();
+        let fn_proto_realm = fn_proto;
+        let realms_for_create = Arc::clone(&realms_store);
+        let mm_realm_for_create = mm_realm.clone();
+        global.set(
+            PropertyKey::string("__otter_create_realm"),
+            Value::native_function_with_proto(
+                move |_this: &Value, _args: &[Value], _mm| {
+                    unsafe {
+                        let otter = &*(otter_ptr as *const Otter);
+                        let realm_id = otter.vm.create_realm();
+                        let mut realm_ctx = otter.vm.create_context_in_realm(realm_id);
+                        otter
+                            .setup_context(&mut realm_ctx)
+                            .map_err(|e| VmError::internal(e.to_string()))?;
+
+                        let realm_global = realm_ctx.global();
+
+                        // Store the realm context for future evalScript calls.
+                        {
+                            let mut guard = realms_for_create.lock();
+                            guard.push(RealmSlot { id: realm_id, ctx: realm_ctx });
+                        }
+
+                        let realms_for_eval = Arc::clone(&realms_for_create);
+                        let mm_eval_realm = mm_realm_for_create.clone();
+                        let eval_fn = Value::native_function_with_proto(
+                            move |_this: &Value, args: &[Value], _mm| {
+                                let code_value = match args.first() {
+                                    Some(value) => value.clone(),
+                                    None => return Ok(Value::undefined()),
+                                };
+
+                                if !code_value.is_string() {
+                                    return Ok(code_value);
+                                }
+
+                                let code = code_value
+                                    .as_string()
+                                    .map(|s| s.as_str().to_string())
+                                    .unwrap_or_default();
+
+                                unsafe {
+                                    let otter = &*(otter_ptr as *const Otter);
+                                    let mut guard = realms_for_eval.lock();
+                                    let slot = guard
+                                        .iter_mut()
+                                        .find(|slot| slot.id == realm_id)
+                                        .ok_or_else(|| VmError::internal("Realm not found"))?;
+                                    otter
+                                        .eval_in_context(&mut slot.ctx, &code)
+                                        .map_err(|e| VmError::type_error(e.to_string()))
+                                }
+                            },
+                            mm_eval_realm,
+                            fn_proto_realm,
+                        );
+
+                        let realm_obj =
+                            GcRef::new(JsObject::new(Value::null(), mm_realm_for_create.clone()));
+                        realm_obj.set(PropertyKey::string("global"), Value::object(realm_global));
+                        realm_obj.set(PropertyKey::string("evalScript"), eval_fn);
+                        Ok(Value::object(realm_obj))
+                    }
+                },
+                mm_realm.clone(),
+                fn_proto_realm,
             ),
         );
 
@@ -908,23 +993,28 @@ impl Otter {
     /// The caller owns the context and can reuse it across multiple `eval_in_context` calls.
     pub fn create_test_context(&self) -> Result<VmContext, OtterError> {
         let mut ctx = self.vm.create_context();
+        self.setup_context(&mut ctx)?;
+        Ok(ctx)
+    }
+
+    /// Configure a context with runtime hooks, ops, and extension setup JS.
+    fn setup_context(&self, ctx: &mut VmContext) -> Result<(), OtterError> {
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
         ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
-        Self::configure_eval(&mut ctx);
-        Self::configure_js_job_queue(&mut ctx, &self.event_loop);
+        Self::configure_eval(ctx);
+        Self::configure_js_job_queue(ctx, &self.event_loop);
 
         // Register extension ops as global native functions
-        self.register_ops_in_context(&mut ctx);
+        self.register_ops_in_context(ctx);
 
         // Execute setup JS from extensions
         for js in self.extensions.all_js() {
-            self.execute_js(&mut ctx, js, "setup.js")?;
+            self.execute_js(ctx, js, "setup.js")?;
         }
 
         // ES spec: Drain microtasks after extension setup JS execution
-        self.drain_microtasks(&mut ctx)?;
-
-        Ok(ctx)
+        self.drain_microtasks(ctx)?;
+        Ok(())
     }
 
     /// Execute JS code in an existing context (no context creation/teardown).

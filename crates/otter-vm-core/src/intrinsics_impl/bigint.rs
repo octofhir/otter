@@ -214,7 +214,7 @@ pub fn init_bigint_prototype(
 
     // BigInt.prototype[Symbol.toStringTag] = "BigInt"
     bigint_proto.define_property(
-        PropertyKey::Symbol(well_known::TO_STRING_TAG),
+        PropertyKey::Symbol(well_known::to_string_tag_symbol()),
         PropertyDescriptor::data_with_attrs(
             Value::string(JsString::intern("BigInt")),
             PropertyAttributes::function_length(),

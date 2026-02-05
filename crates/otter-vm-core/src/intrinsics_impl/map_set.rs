@@ -297,7 +297,7 @@ pub fn init_map_prototype(
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
     iterator_proto: GcRef<JsObject>,
-    symbol_iterator_id: u64,
+    symbol_iterator: crate::gc::GcRef<crate::value::Symbol>,
 ) {
     // Map.prototype.get(key)
     map_proto.define_property(
@@ -543,7 +543,7 @@ pub fn init_map_prototype(
     let mm_for_symbol = mm.clone();
     let fn_proto_for_symbol = fn_proto;
     map_proto.define_property(
-        PropertyKey::Symbol(symbol_iterator_id),
+        PropertyKey::Symbol(symbol_iterator),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             move |this_val, _args, ncx| {
                 make_map_iterator(this_val, "entry", ncx.memory_manager().clone(), fn_proto_for_symbol, iter_proto_for_symbol)
@@ -555,7 +555,7 @@ pub fn init_map_prototype(
 
     // Map.prototype[Symbol.toStringTag] = "Map"
     map_proto.define_property(
-        PropertyKey::Symbol(crate::intrinsics::well_known::TO_STRING_TAG),
+        PropertyKey::Symbol(crate::intrinsics::well_known::to_string_tag_symbol()),
         PropertyDescriptor::data_with_attrs(
             Value::string(JsString::intern("Map")),
             PropertyAttributes {
@@ -716,7 +716,7 @@ pub fn init_set_prototype(
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
     iterator_proto: GcRef<JsObject>,
-    symbol_iterator_id: u64,
+    symbol_iterator: crate::gc::GcRef<crate::value::Symbol>,
 ) {
     // Set.prototype.add(value)
     set_proto.define_property(
@@ -1233,7 +1233,7 @@ pub fn init_set_prototype(
     let mm_for_symbol = mm.clone();
     let fn_proto_for_symbol = fn_proto;
     set_proto.define_property(
-        PropertyKey::Symbol(symbol_iterator_id),
+        PropertyKey::Symbol(symbol_iterator),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             move |this_val, _args, ncx| {
                 make_set_iterator(this_val, "value", ncx.memory_manager().clone(), fn_proto_for_symbol, iter_proto_for_symbol)
@@ -1245,7 +1245,7 @@ pub fn init_set_prototype(
 
     // Set.prototype[Symbol.toStringTag] = "Set"
     set_proto.define_property(
-        PropertyKey::Symbol(crate::intrinsics::well_known::TO_STRING_TAG),
+        PropertyKey::Symbol(crate::intrinsics::well_known::to_string_tag_symbol()),
         PropertyDescriptor::data_with_attrs(
             Value::string(JsString::intern("Set")),
             PropertyAttributes {
@@ -1385,7 +1385,7 @@ pub fn init_weak_map_prototype(
 
     // WeakMap.prototype[Symbol.toStringTag] = "WeakMap"
     wm_proto.define_property(
-        PropertyKey::Symbol(crate::intrinsics::well_known::TO_STRING_TAG),
+        PropertyKey::Symbol(crate::intrinsics::well_known::to_string_tag_symbol()),
         PropertyDescriptor::data_with_attrs(
             Value::string(JsString::intern("WeakMap")),
             PropertyAttributes {
@@ -1490,7 +1490,7 @@ pub fn init_weak_set_prototype(
 
     // WeakSet.prototype[Symbol.toStringTag] = "WeakSet"
     ws_proto.define_property(
-        PropertyKey::Symbol(crate::intrinsics::well_known::TO_STRING_TAG),
+        PropertyKey::Symbol(crate::intrinsics::well_known::to_string_tag_symbol()),
         PropertyDescriptor::data_with_attrs(
             Value::string(JsString::intern("WeakSet")),
             PropertyAttributes {

@@ -47,6 +47,80 @@ pub mod well_known {
     pub const SPECIES: u64 = 12;
     /// `Symbol.unscopables`
     pub const UNSCOPABLES: u64 = 13;
+
+    /// Create a GcRef<crate::value::Symbol> for a well-known symbol.
+    /// These are compared by ID, so multiple GcRef instances with the same ID are equal.
+    pub fn symbol_ref(id: u64, desc: &'static str) -> crate::gc::GcRef<crate::value::Symbol> {
+        crate::gc::GcRef::new(crate::value::Symbol {
+            description: Some(desc.to_string()),
+            id,
+        })
+    }
+
+    /// Get Symbol.iterator as GcRef<crate::value::Symbol>
+    pub fn iterator_symbol() -> crate::gc::GcRef<crate::value::Symbol> {
+        symbol_ref(ITERATOR, "Symbol.iterator")
+    }
+
+    /// Get Symbol.asyncIterator as GcRef<crate::value::Symbol>
+    pub fn async_iterator_symbol() -> crate::gc::GcRef<crate::value::Symbol> {
+        symbol_ref(ASYNC_ITERATOR, "Symbol.asyncIterator")
+    }
+
+    /// Get Symbol.toStringTag as GcRef<crate::value::Symbol>
+    pub fn to_string_tag_symbol() -> crate::gc::GcRef<crate::value::Symbol> {
+        symbol_ref(TO_STRING_TAG, "Symbol.toStringTag")
+    }
+
+    /// Get Symbol.hasInstance as GcRef<crate::value::Symbol>
+    pub fn has_instance_symbol() -> crate::gc::GcRef<crate::value::Symbol> {
+        symbol_ref(HAS_INSTANCE, "Symbol.hasInstance")
+    }
+
+    /// Get Symbol.toPrimitive as GcRef<crate::value::Symbol>
+    pub fn to_primitive_symbol() -> crate::gc::GcRef<crate::value::Symbol> {
+        symbol_ref(TO_PRIMITIVE, "Symbol.toPrimitive")
+    }
+
+    /// Get Symbol.isConcatSpreadable as GcRef<crate::value::Symbol>
+    pub fn is_concat_spreadable_symbol() -> crate::gc::GcRef<crate::value::Symbol> {
+        symbol_ref(IS_CONCAT_SPREADABLE, "Symbol.isConcatSpreadable")
+    }
+
+    /// Get Symbol.match as GcRef<crate::value::Symbol>
+    pub fn match_symbol() -> crate::gc::GcRef<crate::value::Symbol> {
+        symbol_ref(MATCH, "Symbol.match")
+    }
+
+    /// Get Symbol.matchAll as GcRef<crate::value::Symbol>
+    pub fn match_all_symbol() -> crate::gc::GcRef<crate::value::Symbol> {
+        symbol_ref(MATCH_ALL, "Symbol.matchAll")
+    }
+
+    /// Get Symbol.replace as GcRef<crate::value::Symbol>
+    pub fn replace_symbol() -> crate::gc::GcRef<crate::value::Symbol> {
+        symbol_ref(REPLACE, "Symbol.replace")
+    }
+
+    /// Get Symbol.search as GcRef<crate::value::Symbol>
+    pub fn search_symbol() -> crate::gc::GcRef<crate::value::Symbol> {
+        symbol_ref(SEARCH, "Symbol.search")
+    }
+
+    /// Get Symbol.split as GcRef<crate::value::Symbol>
+    pub fn split_symbol() -> crate::gc::GcRef<crate::value::Symbol> {
+        symbol_ref(SPLIT, "Symbol.split")
+    }
+
+    /// Get Symbol.species as GcRef<crate::value::Symbol>
+    pub fn species_symbol() -> crate::gc::GcRef<crate::value::Symbol> {
+        symbol_ref(SPECIES, "Symbol.species")
+    }
+
+    /// Get Symbol.unscopables as GcRef<crate::value::Symbol>
+    pub fn unscopables_symbol() -> crate::gc::GcRef<crate::value::Symbol> {
+        symbol_ref(UNSCOPABLES, "Symbol.unscopables")
+    }
 }
 
 /// Registry of all ECMAScript intrinsic objects and well-known symbols.
@@ -62,6 +136,12 @@ pub struct Intrinsics {
     pub object_prototype: GcRef<JsObject>,
     /// `Function.prototype` — `[[Prototype]]` is `Object.prototype`
     pub function_prototype: GcRef<JsObject>,
+    /// `%GeneratorFunction.prototype%` — prototype of generator functions
+    pub generator_function_prototype: GcRef<JsObject>,
+    /// `%AsyncFunction.prototype%` — prototype of async functions
+    pub async_function_prototype: GcRef<JsObject>,
+    /// `%AsyncGeneratorFunction.prototype%` — prototype of async generator functions
+    pub async_generator_function_prototype: GcRef<JsObject>,
 
     // ========================================================================
     // Core constructors
@@ -211,6 +291,51 @@ pub struct Intrinsics {
 }
 
 impl Intrinsics {
+    /// Resolve the intrinsic prototype for a builtin tag.
+    pub fn prototype_for_builtin_tag(&self, tag: &str) -> Option<GcRef<JsObject>> {
+        match tag {
+            "Object" => Some(self.object_prototype),
+            "Function" => Some(self.function_prototype),
+            "GeneratorFunction" => Some(self.generator_function_prototype),
+            "AsyncFunction" => Some(self.async_function_prototype),
+            "AsyncGeneratorFunction" => Some(self.async_generator_function_prototype),
+            "Array" => Some(self.array_prototype),
+            "Map" => Some(self.map_prototype),
+            "Set" => Some(self.set_prototype),
+            "WeakMap" => Some(self.weak_map_prototype),
+            "WeakSet" => Some(self.weak_set_prototype),
+            "Promise" => Some(self.promise_prototype),
+            "RegExp" => Some(self.regexp_prototype),
+            "Date" => Some(self.date_prototype),
+            "ArrayBuffer" => Some(self.array_buffer_prototype),
+            "DataView" => Some(self.data_view_prototype),
+            "Error" => Some(self.error_prototype),
+            "TypeError" => Some(self.type_error_prototype),
+            "RangeError" => Some(self.range_error_prototype),
+            "ReferenceError" => Some(self.reference_error_prototype),
+            "SyntaxError" => Some(self.syntax_error_prototype),
+            "URIError" => Some(self.uri_error_prototype),
+            "EvalError" => Some(self.eval_error_prototype),
+            "String" => Some(self.string_prototype),
+            "Number" => Some(self.number_prototype),
+            "Boolean" => Some(self.boolean_prototype),
+            "Symbol" => Some(self.symbol_prototype),
+            "BigInt" => Some(self.bigint_prototype),
+            "Int8Array" => Some(self.int8_array_prototype),
+            "Uint8Array" => Some(self.uint8_array_prototype),
+            "Uint8ClampedArray" => Some(self.uint8_clamped_array_prototype),
+            "Int16Array" => Some(self.int16_array_prototype),
+            "Uint16Array" => Some(self.uint16_array_prototype),
+            "Int32Array" => Some(self.int32_array_prototype),
+            "Uint32Array" => Some(self.uint32_array_prototype),
+            "Float32Array" => Some(self.float32_array_prototype),
+            "Float64Array" => Some(self.float64_array_prototype),
+            "BigInt64Array" => Some(self.bigint64_array_prototype),
+            "BigUint64Array" => Some(self.biguint64_array_prototype),
+            _ => None,
+        }
+    }
+
     /// Create a new `Intrinsics` with all objects allocated but NOT yet initialized.
     ///
     /// This is Stage 1 of the two-stage initialization. Call `init()` after
@@ -234,6 +359,9 @@ impl Intrinsics {
             // Core prototypes
             object_prototype: alloc(),
             function_prototype: fn_proto, // Reuse existing intrinsic
+            generator_function_prototype: alloc(),
+            async_function_prototype: alloc(),
+            async_generator_function_prototype: alloc(),
             // Core constructors
             object_constructor: alloc(),
             function_constructor: alloc(),
@@ -366,6 +494,16 @@ impl Intrinsics {
         // Function.prototype.[[Prototype]] = Object.prototype
         self.function_prototype
             .set_prototype(Value::object(self.object_prototype));
+
+        // Generator/Async function prototypes inherit from Function.prototype
+        let function_like_protos = [
+            self.generator_function_prototype,
+            self.async_function_prototype,
+            self.async_generator_function_prototype,
+        ];
+        for proto in &function_like_protos {
+            proto.set_prototype(Value::object(self.function_prototype));
+        }
 
         // All other prototypes chain to Object.prototype
         let protos_to_obj = [
@@ -503,7 +641,7 @@ impl Intrinsics {
             fn_proto,
             mm,
             self.iterator_prototype,
-            well_known::ITERATOR,
+            well_known::iterator_symbol(),
         );
 
         // ====================================================================
@@ -542,7 +680,7 @@ impl Intrinsics {
         // ====================================================================
         if let Some(sym) = self.symbol_iterator.as_symbol() {
             self.iterator_prototype.define_property(
-                PropertyKey::Symbol(sym.id),
+                PropertyKey::Symbol(sym),
                 PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                     |this_val, _args, _ncx| Ok(this_val.clone()),
                     mm.clone(),
@@ -564,7 +702,7 @@ impl Intrinsics {
             fn_proto,
             mm,
             self.iterator_prototype,
-            well_known::ITERATOR,
+            well_known::iterator_symbol(),
         );
 
         // ===================================================================
@@ -575,14 +713,14 @@ impl Intrinsics {
             fn_proto,
             mm,
             self.iterator_prototype,
-            well_known::ITERATOR,
+            well_known::iterator_symbol(),
         );
         crate::intrinsics_impl::map_set::init_set_prototype(
             self.set_prototype,
             fn_proto,
             mm,
             self.iterator_prototype,
-            well_known::ITERATOR,
+            well_known::iterator_symbol(),
         );
         crate::intrinsics_impl::map_set::init_weak_map_prototype(
             self.weak_map_prototype,
@@ -616,16 +754,16 @@ impl Intrinsics {
             self.generator_prototype,
             fn_proto,
             mm,
-            well_known::ITERATOR,
-            well_known::TO_STRING_TAG,
+            well_known::iterator_symbol(),
+            well_known::to_string_tag_symbol(),
         );
 
         crate::intrinsics_impl::generator::init_async_generator_prototype(
             self.async_generator_prototype,
             fn_proto,
             mm,
-            well_known::ASYNC_ITERATOR,
-            well_known::TO_STRING_TAG,
+            well_known::async_iterator_symbol(),
+            well_known::to_string_tag_symbol(),
         );
 
         // ===================================================================
@@ -635,8 +773,8 @@ impl Intrinsics {
             self.typed_array_prototype,
             fn_proto,
             mm,
-            well_known::ITERATOR,
-            well_known::TO_STRING_TAG,
+            well_known::iterator_symbol(),
+            well_known::to_string_tag_symbol(),
         );
 
         // Initialize each specific typed array prototype
@@ -644,57 +782,57 @@ impl Intrinsics {
         crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
             self.int8_array_prototype,
             TypedArrayKind::Int8,
-            well_known::TO_STRING_TAG,
+            well_known::to_string_tag_symbol(),
         );
         crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
             self.uint8_array_prototype,
             TypedArrayKind::Uint8,
-            well_known::TO_STRING_TAG,
+            well_known::to_string_tag_symbol(),
         );
         crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
             self.uint8_clamped_array_prototype,
             TypedArrayKind::Uint8Clamped,
-            well_known::TO_STRING_TAG,
+            well_known::to_string_tag_symbol(),
         );
         crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
             self.int16_array_prototype,
             TypedArrayKind::Int16,
-            well_known::TO_STRING_TAG,
+            well_known::to_string_tag_symbol(),
         );
         crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
             self.uint16_array_prototype,
             TypedArrayKind::Uint16,
-            well_known::TO_STRING_TAG,
+            well_known::to_string_tag_symbol(),
         );
         crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
             self.int32_array_prototype,
             TypedArrayKind::Int32,
-            well_known::TO_STRING_TAG,
+            well_known::to_string_tag_symbol(),
         );
         crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
             self.uint32_array_prototype,
             TypedArrayKind::Uint32,
-            well_known::TO_STRING_TAG,
+            well_known::to_string_tag_symbol(),
         );
         crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
             self.float32_array_prototype,
             TypedArrayKind::Float32,
-            well_known::TO_STRING_TAG,
+            well_known::to_string_tag_symbol(),
         );
         crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
             self.float64_array_prototype,
             TypedArrayKind::Float64,
-            well_known::TO_STRING_TAG,
+            well_known::to_string_tag_symbol(),
         );
         crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
             self.bigint64_array_prototype,
             TypedArrayKind::BigInt64,
-            well_known::TO_STRING_TAG,
+            well_known::to_string_tag_symbol(),
         );
         crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
             self.biguint64_array_prototype,
             TypedArrayKind::BigUint64,
-            well_known::TO_STRING_TAG,
+            well_known::to_string_tag_symbol(),
         );
     }
 
@@ -707,6 +845,12 @@ impl Intrinsics {
         use crate::string::JsString;
 
         let fn_proto = self.function_prototype;
+        let realm_id = fn_proto
+            .get(&PropertyKey::string("__realm_id__"))
+            .and_then(|v| v.as_int32())
+            .map(|id| id as u32)
+            .unwrap_or(0);
+        let alloc_ctor = || GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
 
         // Helper: install a constructor+prototype pair on the global
         let install = |name: &str,
@@ -723,6 +867,15 @@ impl Intrinsics {
                     + Sync,
             >,
         >| {
+            // Tag constructor to enable realm-aware GetPrototypeFromConstructor defaults.
+            ctor_obj.define_property(
+                PropertyKey::string("__builtin_tag__"),
+                PropertyDescriptor::data_with_attrs(
+                    Value::string(JsString::intern(name)),
+                    PropertyAttributes::permanent(),
+                ),
+            );
+
             // Wire constructor.prototype = prototype
             ctor_obj.define_property(
                 PropertyKey::string("prototype"),
@@ -792,7 +945,53 @@ impl Intrinsics {
             "Function",
             self.function_constructor,
             self.function_prototype,
-            None,
+            Some(crate::intrinsics_impl::function::create_function_constructor(realm_id)),
+        );
+        let gen_fn_ctor = alloc_ctor();
+        install(
+            "GeneratorFunction",
+            gen_fn_ctor,
+            self.generator_function_prototype,
+            Some(crate::intrinsics_impl::function::create_generator_function_constructor(realm_id)),
+        );
+        let async_fn_ctor = alloc_ctor();
+        install(
+            "AsyncFunction",
+            async_fn_ctor,
+            self.async_function_prototype,
+            Some(crate::intrinsics_impl::function::create_async_function_constructor(realm_id)),
+        );
+        let async_gen_fn_ctor = alloc_ctor();
+        install(
+            "AsyncGeneratorFunction",
+            async_gen_fn_ctor,
+            self.async_generator_function_prototype,
+            Some(crate::intrinsics_impl::function::create_async_generator_function_constructor(
+                realm_id,
+            )),
+        );
+
+        // Internal globals used by the interpreter for function prototype lookups.
+        global.define_property(
+            PropertyKey::string("GeneratorFunctionPrototype"),
+            PropertyDescriptor::data_with_attrs(
+                Value::object(self.generator_function_prototype),
+                PropertyAttributes::permanent(),
+            ),
+        );
+        global.define_property(
+            PropertyKey::string("AsyncFunctionPrototype"),
+            PropertyDescriptor::data_with_attrs(
+                Value::object(self.async_function_prototype),
+                PropertyAttributes::permanent(),
+            ),
+        );
+        global.define_property(
+            PropertyKey::string("AsyncGeneratorFunctionPrototype"),
+            PropertyDescriptor::data_with_attrs(
+                Value::object(self.async_generator_function_prototype),
+                PropertyAttributes::permanent(),
+            ),
         );
 
         // Register global aliases for interpreter interception
@@ -812,7 +1011,6 @@ impl Intrinsics {
         // For constructors that need actual implementations, we allocate fresh
         // constructor objects (since intrinsics only pre-allocated prototypes).
         // The prototype still comes from intrinsics with correct [[Prototype]] chain.
-        let alloc_ctor = || GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
 
         // String
         let string_ctor = alloc_ctor();
@@ -1043,14 +1241,17 @@ impl Intrinsics {
             Some(array_ctor_fn),
         );
         crate::intrinsics_impl::array::install_array_statics(array_ctor, fn_proto, mm);
+        crate::intrinsics_impl::helpers::define_species_getter(array_ctor, fn_proto, mm);
 
         let map_ctor = alloc_ctor();
         let map_ctor_fn = crate::intrinsics_impl::map_set::create_map_constructor();
         install("Map", map_ctor, self.map_prototype, Some(map_ctor_fn));
+        crate::intrinsics_impl::helpers::define_species_getter(map_ctor, fn_proto, mm);
 
         let set_ctor = alloc_ctor();
         let set_ctor_fn = crate::intrinsics_impl::map_set::create_set_constructor();
         install("Set", set_ctor, self.set_prototype, Some(set_ctor_fn));
+        crate::intrinsics_impl::helpers::define_species_getter(set_ctor, fn_proto, mm);
 
         let weak_map_ctor = alloc_ctor();
         let weak_map_ctor_fn = crate::intrinsics_impl::map_set::create_weak_map_constructor();
@@ -1154,6 +1355,7 @@ impl Intrinsics {
             Some(crate::intrinsics_impl::promise::create_promise_constructor()),
         );
         crate::intrinsics_impl::promise::install_promise_statics(promise_ctor, fn_proto, mm);
+        crate::intrinsics_impl::helpers::define_species_getter(promise_ctor, fn_proto, mm);
 
         let regexp_ctor = alloc_ctor();
         let regexp_ctor_fn =
@@ -1164,6 +1366,7 @@ impl Intrinsics {
             self.regexp_prototype,
             Some(regexp_ctor_fn),
         );
+        crate::intrinsics_impl::helpers::define_species_getter(regexp_ctor, fn_proto, mm);
 
         // RegExp.escape (ES2026 §22.2.4.1)
         regexp_ctor.define_property(
@@ -1208,7 +1411,7 @@ impl Intrinsics {
             };
             // Set timestamp on `this` (created by Construct with Date.prototype)
             if let Some(obj) = this.as_object() {
-                obj.set(PropertyKey::string("__timestamp"), Value::number(timestamp));
+                obj.set(PropertyKey::string("__timestamp__"), Value::number(timestamp));
             }
             Ok(Value::undefined())
         });
@@ -1384,6 +1587,6 @@ impl Intrinsics {
         // JSON namespace (extracted to intrinsics_impl/json.rs)
         // Implements JSON.parse and JSON.stringify using serde_json
         // ====================================================================
-        crate::intrinsics_impl::json::install_json_namespace(global, mm);
+        crate::intrinsics_impl::json::install_json_namespace(global, mm, self.function_prototype);
     }
 }

@@ -34,6 +34,7 @@ pub mod promise;
 pub mod proxy;
 pub mod proxy_operations;
 pub mod regexp;
+pub mod realm;
 pub mod runtime;
 pub mod shape;
 pub mod shared_buffer;

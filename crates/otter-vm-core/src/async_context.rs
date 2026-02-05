@@ -60,6 +60,8 @@ pub struct SavedFrame {
     pub function_index: u32,
     /// The module this function belongs to
     pub module: Arc<Module>,
+    /// Realm id for this frame
+    pub realm_id: crate::realm::RealmId,
     /// Program counter (instruction index)
     pub pc: usize,
     /// Local variables snapshot
@@ -87,6 +89,7 @@ impl SavedFrame {
     pub fn new(
         function_index: u32,
         module: Arc<Module>,
+        realm_id: crate::realm::RealmId,
         pc: usize,
         locals: Vec<Value>,
         registers: Vec<Value>,
@@ -101,6 +104,7 @@ impl SavedFrame {
         Self {
             function_index,
             module,
+            realm_id,
             pc,
             locals,
             registers,

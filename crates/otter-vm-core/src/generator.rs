@@ -276,6 +276,8 @@ use crate::object::JsObject;
 pub struct JsGenerator {
     /// Associated JavaScript object (for properties and prototype)
     pub object: GcRef<JsObject>,
+    /// Realm id for this generator's function
+    pub realm_id: crate::realm::RealmId,
     /// Function index in the module
     pub function_index: u32,
     /// The module containing the generator function
@@ -359,10 +361,12 @@ impl JsGenerator {
         this_value: Value,
         is_construct: bool,
         is_async: bool,
+        realm_id: crate::realm::RealmId,
         object: GcRef<JsObject>,
     ) -> GcRef<Self> {
         GcRef::new(Self {
             object,
+            realm_id,
             function_index,
             module,
             upvalues,
@@ -385,6 +389,7 @@ impl JsGenerator {
     ) -> GcRef<Self> {
         GcRef::new(Self {
             object,
+            realm_id: 0,
             function_index,
             module: Arc::new(Module::builder("").build()),
             upvalues,
@@ -649,6 +654,7 @@ mod tests {
             Value::undefined(),
             false,
             false,
+            0,
             obj,
         );
         assert!(generator.is_suspended());
@@ -670,6 +676,7 @@ mod tests {
             Value::undefined(),
             false,
             false,
+            0,
             obj,
         );
 
@@ -715,6 +722,7 @@ mod tests {
             Value::undefined(),
             false,
             false,
+            0,
             obj,
         );
 
@@ -804,6 +812,7 @@ mod tests {
             Value::undefined(),
             false,
             false,
+            0,
             obj,
         );
 

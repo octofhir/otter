@@ -13,6 +13,7 @@ use crate::gc::GcRef;
 use crate::globals;
 use crate::interpreter::Interpreter;
 use crate::intrinsics::Intrinsics;
+use crate::realm::{RealmId, RealmRecord, RealmRegistry};
 use crate::object::JsObject;
 use crate::value::Value;
 
@@ -36,6 +37,10 @@ pub struct VmRuntime {
     /// All intrinsic objects and well-known symbols.
     /// Created once at runtime init, shared across contexts.
     intrinsics: Intrinsics,
+    /// Realm registry for cross-realm lookups.
+    realm_registry: std::sync::Arc<RealmRegistry>,
+    /// Default realm id.
+    default_realm_id: RealmId,
 }
 
 /// Runtime configuration
@@ -68,6 +73,8 @@ impl VmRuntime {
     /// Create a new runtime with custom configuration
     pub fn with_config(config: RuntimeConfig) -> Self {
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(config.max_heap_size));
+        let realm_registry = RealmRegistry::new();
+        let default_realm_id = realm_registry.allocate_id();
 
         // Create intrinsic %Function.prototype% FIRST, before any other objects.
         // Per ES2023 §10.3.1, every built-in function object must have this
@@ -75,6 +82,11 @@ impl VmRuntime {
         // can receive it at construction time (BOA/V8/SpiderMonkey pattern).
         let function_prototype = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         function_prototype.mark_as_intrinsic();
+        // Realm id for the default realm.
+        function_prototype.define_property(
+            crate::object::PropertyKey::string("__realm_id__"),
+            crate::object::PropertyDescriptor::builtin_data(Value::int32(default_realm_id as i32)),
+        );
 
         // Stage 1: Allocate all intrinsic objects (empty, no properties yet)
         let intrinsics = Intrinsics::allocate(&memory_manager, function_prototype);
@@ -84,9 +96,21 @@ impl VmRuntime {
         intrinsics.init_core(&memory_manager);
 
         let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        global.define_property(
+            crate::object::PropertyKey::string("__realm_id__"),
+            crate::object::PropertyDescriptor::builtin_data(Value::int32(default_realm_id as i32)),
+        );
         globals::setup_global_object(global, function_prototype, Some(&intrinsics));
         // Install intrinsic constructors on global (Object, Function, etc.)
         intrinsics.install_on_global(global, &memory_manager);
+
+        // Register default realm in registry.
+        realm_registry.insert(RealmRecord {
+            id: default_realm_id,
+            intrinsics: intrinsics.clone(),
+            function_prototype,
+            global,
+        });
 
         Self {
             modules: DashMap::new(),
@@ -95,6 +119,8 @@ impl VmRuntime {
             intrinsics,
             memory_manager,
             config,
+            realm_registry,
+            default_realm_id,
         }
     }
 
@@ -113,14 +139,57 @@ impl VmRuntime {
 
     /// Create a new execution context
     pub fn create_context(&self) -> VmContext {
-        // Clone global object for isolation
-        // TODO: Proper cloning with prototype chain
-        let global = GcRef::new(JsObject::new(Value::null(), self.memory_manager.clone()));
-        globals::setup_global_object(global, self.function_prototype, Some(&self.intrinsics));
+        self.create_context_in_realm(self.default_realm_id)
+    }
 
-        // Install intrinsic constructors on the new global
-        self.intrinsics
-            .install_on_global(global, &self.memory_manager);
+    /// Create a new realm with its own intrinsics and Function.prototype.
+    pub fn create_realm(&self) -> RealmId {
+        let realm_id = self.realm_registry.allocate_id();
+        let mm = self.memory_manager.clone();
+
+        let function_prototype = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        function_prototype.mark_as_intrinsic();
+        function_prototype.define_property(
+            crate::object::PropertyKey::string("__realm_id__"),
+            crate::object::PropertyDescriptor::builtin_data(Value::int32(realm_id as i32)),
+        );
+
+        let intrinsics = Intrinsics::allocate(&mm, function_prototype);
+        intrinsics.wire_prototype_chains();
+        intrinsics.init_core(&mm);
+
+        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        global.define_property(
+            crate::object::PropertyKey::string("__realm_id__"),
+            crate::object::PropertyDescriptor::builtin_data(Value::int32(realm_id as i32)),
+        );
+        globals::setup_global_object(global, function_prototype, Some(&intrinsics));
+        // Install intrinsic constructors on the realm global
+        intrinsics.install_on_global(global, &mm);
+
+        self.realm_registry.insert(RealmRecord {
+            id: realm_id,
+            intrinsics,
+            function_prototype,
+            global,
+        });
+
+        realm_id
+    }
+
+    /// Create a new execution context in the given realm.
+    pub fn create_context_in_realm(&self, realm_id: RealmId) -> VmContext {
+        let realm = self
+            .realm_registry
+            .get(realm_id)
+            .unwrap_or_else(|| RealmRecord {
+                id: self.default_realm_id,
+                intrinsics: self.intrinsics.clone(),
+                function_prototype: self.function_prototype,
+                global: self.global_template,
+            });
+
+        let global = realm.global;
 
         let mut ctx = VmContext::with_config(
             global,
@@ -128,9 +197,10 @@ impl VmRuntime {
             crate::context::DEFAULT_MAX_NATIVE_DEPTH,
             Arc::clone(&self.memory_manager),
         );
-        ctx.set_function_prototype_intrinsic(self.function_prototype);
-        ctx.set_generator_prototype_intrinsic(self.intrinsics.generator_prototype);
-        ctx.set_async_generator_prototype_intrinsic(self.intrinsics.async_generator_prototype);
+        ctx.set_function_prototype_intrinsic(realm.function_prototype);
+        ctx.set_generator_prototype_intrinsic(realm.intrinsics.generator_prototype);
+        ctx.set_async_generator_prototype_intrinsic(realm.intrinsics.async_generator_prototype);
+        ctx.set_realm(realm.id, Arc::clone(&self.realm_registry));
         ctx
     }
 
@@ -142,6 +212,11 @@ impl VmRuntime {
     /// Get the intrinsics registry (all intrinsic objects and well-known symbols).
     pub fn intrinsics(&self) -> &Intrinsics {
         &self.intrinsics
+    }
+
+    /// Get the realm registry.
+    pub fn realm_registry(&self) -> &Arc<RealmRegistry> {
+        &self.realm_registry
     }
 
     /// Execute a module

@@ -2059,6 +2059,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "half",
+ "indexmap",
  "num-bigint",
  "num-traits",
  "otter-profiler",

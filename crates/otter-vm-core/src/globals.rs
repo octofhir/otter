@@ -14,7 +14,7 @@ use num_traits::ToPrimitive;
 use crate::array_buffer::JsArrayBuffer;
 use crate::error::VmError;
 use crate::gc::GcRef;
-use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
+use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::memory::MemoryManager;
 use crate::value::Value;
@@ -92,6 +92,17 @@ pub fn setup_global_object(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>, i
 /// `intrinsics_opt` is optional intrinsics for TypedArray prototypes.
 fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>, intrinsics_opt: Option<&crate::intrinsics::Intrinsics>) {
     let mm = global.memory_manager().clone();
+    let tag_builtin = |ctor: &Value, name: &str| {
+        if let Some(obj) = ctor.as_object() {
+            obj.define_property(
+                PropertyKey::string("__builtin_tag__"),
+                PropertyDescriptor::data_with_attrs(
+                    Value::string(JsString::intern(name)),
+                    PropertyAttributes::permanent(),
+                ),
+            );
+        }
+    };
     let builtins = [
         "Object",
         "Function",
@@ -430,6 +441,8 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                 fn_proto,
             )
         };
+
+        tag_builtin(&ctor, name);
 
         // Add basic toString to prototypes
         if name == "Object" {
@@ -789,14 +802,25 @@ fn get_arg(args: &[Value], index: usize) -> Value {
 ///
 /// Currently, indirect eval is not fully supported. When called with a string,
 /// it returns an error. This is a limitation to be addressed in a future update.
-fn global_eval(_this: &Value, args: &[Value], _ncx: &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> {
+fn global_eval(this: &Value, args: &[Value], ncx: &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> {
     // Per spec: if argument is not a string, return it unchanged
     let arg = get_arg(args, 0);
 
     if arg.is_string() {
-        // TODO: Implement indirect eval with NativeContext
-        // For now, return an error indicating eval is not supported
-        Err(VmError::type_error("eval() is not supported in this context"))
+        let source = arg
+            .as_string()
+            .ok_or_else(|| VmError::type_error("eval argument is not a string"))?;
+        let module = ncx.ctx.compile_eval(source.as_str(), false)?;
+        let realm_id = this
+            .as_object()
+            .and_then(|obj| obj.get(&PropertyKey::string("__realm_id__")))
+            .and_then(|v| v.as_int32())
+            .map(|id| id as u32);
+        if let Some(realm_id) = realm_id {
+            ncx.execute_eval_module_in_realm(realm_id, &module)
+        } else {
+            ncx.execute_eval_module(&module)
+        }
     } else {
         // Non-string argument: return it unchanged (per spec §19.2.1.1)
         Ok(arg)

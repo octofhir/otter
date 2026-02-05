@@ -11,7 +11,7 @@
 //! properties.
 
 use parking_lot::RwLock;
-use rustc_hash::FxHashMap;
+use indexmap::IndexMap;
 use std::sync::Arc;
 
 use crate::gc::GcRef;
@@ -59,8 +59,8 @@ use crate::value::Value;
 pub enum PropertyKey {
     /// String property key (GC-managed)
     String(GcRef<JsString>),
-    /// Symbol property key
-    Symbol(u64),
+    /// Symbol property key (GC-managed)
+    Symbol(GcRef<crate::value::Symbol>),
     /// Integer index (for arrays)
     Index(u32),
 }
@@ -362,7 +362,7 @@ pub struct JsObject {
     overflow_properties: RwLock<Vec<PropertyEntry>>,
     /// Dictionary mode property storage (used when is_dictionary flag is set)
     /// When in dictionary mode, shape/inline/overflow are ignored for property access.
-    dictionary_properties: RwLock<Option<FxHashMap<PropertyKey, PropertyEntry>>>,
+    dictionary_properties: RwLock<Option<IndexMap<PropertyKey, PropertyEntry>>>,
     /// Prototype (null for Object.prototype, mutable via Reflect.setPrototypeOf)
     /// Can be Value::object, Value::proxy, or Value::null
     prototype: RwLock<Value>,
@@ -596,7 +596,7 @@ impl JsObject {
         }
 
         // Build HashMap from existing properties
-        let mut dict = FxHashMap::default();
+        let mut dict = IndexMap::new();
 
         let shape = self.shape.read();
         let inline = self.inline_properties.read();
@@ -819,17 +819,7 @@ impl JsObject {
 
     /// Get own property descriptor (does not walk prototype chain).
     pub fn get_own_property_descriptor(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-        // Handle array indexed elements as own data properties.
-        if self.is_array() {
-            if let PropertyKey::Index(i) = key {
-                let elements = self.elements.read();
-                if (*i as usize) < elements.len() {
-                    return Some(PropertyDescriptor::data(elements[*i as usize].clone()));
-                }
-            }
-        }
-
-        // Dictionary mode: lookup in HashMap
+        // Dictionary mode: lookup in HashMap first (may contain accessor properties)
         if self.is_dictionary_mode() {
             if let Some(dict) = self.dictionary_properties.read().as_ref() {
                 if let Some(e) = dict.get(key) {
@@ -846,17 +836,32 @@ impl JsObject {
             return None;
         }
 
+        // Check shape first - it may contain accessor properties defined via Object.defineProperty
         let shape = self.shape.read();
         if let Some(offset) = shape.get_offset(key) {
             return self.get_property_entry_by_offset(offset);
         }
         // For Index keys, also try as String (e.g., Index(2) -> String("2"))
+        // Note: Must use PropertyKey::String directly, not PropertyKey::string() which canonicalizes
         if let PropertyKey::Index(i) = key {
-            let str_key = PropertyKey::string(&i.to_string());
+            let str_key = PropertyKey::String(JsString::intern(&i.to_string()));
             if let Some(offset) = shape.get_offset(&str_key) {
                 return self.get_property_entry_by_offset(offset);
             }
         }
+        drop(shape);
+
+        // For arrays, fall back to indexed elements as own data properties
+        // (only if not found in shape - shape takes precedence for accessor properties)
+        if self.is_array() {
+            if let PropertyKey::Index(i) = key {
+                let elements = self.elements.read();
+                if (*i as usize) < elements.len() {
+                    return Some(PropertyDescriptor::data(elements[*i as usize].clone()));
+                }
+            }
+        }
+
         None
     }
 
@@ -1022,12 +1027,33 @@ impl JsObject {
 
     /// Delete property
     pub fn delete(&self, key: &PropertyKey) -> bool {
-        // Array element deletion (best-effort).
-        //
-        // NOTE: We currently don't model array holes, so we can't fully implement
-        // `delete arr[i]`. Setting the element to `undefined` preserves the read
-        // behavior, but `i in arr` will still be true.
+        // For index keys, first check if there's a non-configurable property descriptor.
+        // This handles cases like Object.defineProperty(arr, '1', {configurable: false}).
         if let PropertyKey::Index(i) = key {
+            // Check if there's a property descriptor in the shape (set via defineProperty)
+            // Use string form of key since defineProperty stores with string key
+            let str_key = PropertyKey::String(JsString::intern(&i.to_string()));
+            if let Some(desc) = {
+                let shape = self.shape.read();
+                if let Some(offset) = shape.get_offset(&str_key) {
+                    drop(shape);
+                    self.get_property_entry_by_offset(offset)
+                } else {
+                    None
+                }
+            } {
+                // Found a property descriptor - check if configurable
+                if !desc.is_configurable() {
+                    return false; // Cannot delete non-configurable property
+                }
+                // Configurable descriptor - proceed with deletion below
+            }
+
+            // Array element deletion (best-effort).
+            //
+            // NOTE: We currently don't model array holes, so we can't fully implement
+            // `delete arr[i]`. Setting the element to `undefined` preserves the read
+            // behavior, but `i in arr` will still be true.
             let idx = *i as usize;
             let mut elements = self.elements.write();
             if idx < elements.len() {
@@ -1040,7 +1066,7 @@ impl JsObject {
         if self.is_dictionary_mode() {
             let mut dict = self.dictionary_properties.write();
             if let Some(map) = dict.as_mut() {
-                map.remove(key);
+                map.shift_remove(key);
             }
             return true;
         }
@@ -1074,7 +1100,7 @@ impl JsObject {
             // Now remove from dictionary
             let mut dict = self.dictionary_properties.write();
             if let Some(map) = dict.as_mut() {
-                map.remove(key);
+                map.shift_remove(key);
             }
             return true;
         }
@@ -1216,6 +1242,74 @@ impl JsObject {
         keys
     }
 
+    /// ES2023 §9.1.6.3 ValidateAndApplyPropertyDescriptor
+    ///
+    /// Validates whether a property descriptor change is allowed.
+    /// Returns Ok(true) if the change should proceed, Ok(false) if no change needed,
+    /// or Err with a message if the change violates invariants.
+    fn validate_property_descriptor_change(
+        current: &PropertyDescriptor,
+        desc: &PropertyDescriptor,
+    ) -> Result<bool, &'static str> {
+        // If current is Deleted, it's like a new property - always allowed
+        if matches!(current, PropertyDescriptor::Deleted) {
+            return Ok(true);
+        }
+
+        let current_configurable = current.is_configurable();
+
+        // Get the new configurable value (default to current if not specified in desc)
+        let new_configurable = desc.is_configurable();
+
+        // If current is non-configurable, many changes are forbidden
+        if !current_configurable {
+            // Cannot change configurable from false to true
+            if new_configurable {
+                return Err("Cannot redefine non-configurable property as configurable");
+            }
+
+            // Cannot change enumerable on non-configurable property
+            if current.enumerable() != desc.enumerable() {
+                return Err("Cannot change enumerable on non-configurable property");
+            }
+
+            // Check data vs accessor conversion
+            match (current, desc) {
+                // Cannot convert data to accessor on non-configurable property
+                (PropertyDescriptor::Data { .. }, PropertyDescriptor::Accessor { .. }) => {
+                    return Err("Cannot convert data property to accessor on non-configurable property");
+                }
+                // Cannot convert accessor to data on non-configurable property
+                (PropertyDescriptor::Accessor { .. }, PropertyDescriptor::Data { .. }) => {
+                    return Err("Cannot convert accessor property to data on non-configurable property");
+                }
+                // Data to data: check writable constraints
+                (
+                    PropertyDescriptor::Data {
+                        attributes: curr_attrs,
+                        ..
+                    },
+                    PropertyDescriptor::Data {
+                        attributes: new_attrs,
+                        ..
+                    },
+                ) => {
+                    // Cannot change writable from false to true on non-configurable property
+                    if !curr_attrs.writable && new_attrs.writable {
+                        return Err("Cannot make non-configurable non-writable property writable");
+                    }
+                    // Note: Changing value on non-configurable non-writable requires SameValue check
+                    // which we skip for now as it requires value comparison
+                }
+                // Accessor to accessor: getter/setter changes require SameValue check
+                // which we skip for now
+                _ => {}
+            }
+        }
+
+        Ok(true)
+    }
+
     /// Define a property with descriptor
     pub fn define_property(&self, key: PropertyKey, desc: PropertyDescriptor) -> bool {
         let flags = self.flags.read();
@@ -1230,6 +1324,15 @@ impl JsObject {
             drop(flags);
             let mut dict = self.dictionary_properties.write();
             if let Some(map) = dict.as_mut() {
+                // Validate change against existing property (if any)
+                if let Some(existing) = map.get(&key) {
+                    if Self::validate_property_descriptor_change(&existing.desc, &desc).is_err() {
+                        return false;
+                    }
+                } else if !self.flags.read().extensible {
+                    // Cannot add new property to non-extensible object
+                    return false;
+                }
                 map.insert(key, PropertyEntry { desc });
                 return true;
             }
@@ -1247,10 +1350,14 @@ impl JsObject {
                 return false;
             }
 
-            // Update existing property
+            // Update existing property - validate change
             if off < INLINE_PROPERTY_COUNT {
                 let mut inline = self.inline_properties.write();
                 if let Some(entry) = inline[off].as_mut() {
+                    // Validate the property descriptor change
+                    if Self::validate_property_descriptor_change(&entry.desc, &desc).is_err() {
+                        return false;
+                    }
                     entry.desc = desc;
                     return true;
                 }
@@ -1258,6 +1365,10 @@ impl JsObject {
                 let mut overflow = self.overflow_properties.write();
                 let overflow_idx = off - INLINE_PROPERTY_COUNT;
                 if let Some(entry) = overflow.get_mut(overflow_idx) {
+                    // Validate the property descriptor change
+                    if Self::validate_property_descriptor_change(&entry.desc, &desc).is_err() {
+                        return false;
+                    }
                     entry.desc = desc;
                     return true;
                 }
@@ -1394,9 +1505,23 @@ impl JsObject {
         flags.extensible = false;
         drop(flags);
 
-        // Note: Inline properties store only values with implicit default (writable) attrs.
-        // When frozen, we could move them to overflow to track frozen state, but for
-        // simplicity we just set the frozen flag and check it on write operations.
+        // Make all inline properties non-writable and non-configurable
+        let mut inline = self.inline_properties.write();
+        for entry_opt in inline.iter_mut() {
+            if let Some(entry) = entry_opt {
+                match &mut entry.desc {
+                    PropertyDescriptor::Data { attributes, .. } => {
+                        attributes.writable = false;
+                        attributes.configurable = false;
+                    }
+                    PropertyDescriptor::Accessor { attributes, .. } => {
+                        attributes.configurable = false;
+                    }
+                    PropertyDescriptor::Deleted => {}
+                }
+            }
+        }
+        drop(inline);
 
         // Make all overflow properties non-writable and non-configurable
         let mut overflow = self.overflow_properties.write();
@@ -1427,8 +1552,24 @@ impl JsObject {
         flags.extensible = false;
         drop(flags);
 
+        // Make all inline properties non-configurable
+        let mut inline = self.inline_properties.write();
+        for entry_opt in inline.iter_mut() {
+            if let Some(entry) = entry_opt {
+                match &mut entry.desc {
+                    PropertyDescriptor::Data { attributes, .. } => {
+                        attributes.configurable = false;
+                    }
+                    PropertyDescriptor::Accessor { attributes, .. } => {
+                        attributes.configurable = false;
+                    }
+                    PropertyDescriptor::Deleted => {}
+                }
+            }
+        }
+        drop(inline);
+
         // Make all overflow properties non-configurable
-        // (inline properties are implicitly configurable by default)
         let mut overflow = self.overflow_properties.write();
         for entry in overflow.iter_mut() {
             match &mut entry.desc {

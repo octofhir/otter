@@ -103,6 +103,21 @@ just node-compat-module fs           # Test specific module
 just node-compat-status              # Show pass rate
 ```
 
+### Test-Driven Development Workflow
+When working on features with conformance tests (Test262, Node.js compat):
+
+1. **Measure before**: Run tests, note the pass rate (e.g., "JSON: 39% passing")
+2. **Fix incrementally**: Focus on the most common failure patterns first
+3. **Measure after**: Re-run tests, report the delta (e.g., "JSON: 39% → 42.4%")
+4. **Run `cargo test` after every change** to core implementations
+
+```bash
+# Track progress on a feature
+just test262-filter "JSON" 2>&1 | tail -5  # Before
+# ... make changes ...
+just test262-filter "JSON" 2>&1 | tail -5  # After — compare pass rates
+```
+
 ## Debugging
 
 ### Logging
@@ -134,6 +149,51 @@ Deny-by-default capabilities via `otter-engine`:
 - `subprocess`, `ffi`: Boolean flags
 
 **Never bypass capability checks.** Always enforce at Rust boundary with test coverage.
+
+## Rust Best Practices
+
+### Collection Types for Deterministic Output
+When implementing features that need deterministic output (JSON serializers, iterators, test comparisons):
+- **Use ordered collections**: `BTreeMap`, `IndexMap` instead of `HashMap`, `FxHashMap`
+- Hash-based maps don't preserve insertion order — this causes flaky tests and non-reproducible output
+- Add `indexmap` to `Cargo.toml` when you need both performance and insertion order
+
+```rust
+// Bad: non-deterministic key order
+use rustc_hash::FxHashMap;
+let map: FxHashMap<String, Value> = ...;
+
+// Good: preserves insertion order
+use indexmap::IndexMap;
+let map: IndexMap<String, Value> = ...;
+```
+
+### Recursive Algorithm Safety
+Before implementing recursive algorithms (JSON parsing, AST traversal, nested structures):
+- Add explicit depth limits to prevent stack overflow
+- Consider iterative alternatives with explicit stack for deeply nested inputs
+- Test with pathological cases (deeply nested JSON, recursive structures)
+
+```rust
+// Bad: unbounded recursion
+fn process(value: &Value) -> Result<(), Error> {
+    match value {
+        Value::Array(arr) => arr.iter().try_for_each(|v| process(v)),
+        // ...
+    }
+}
+
+// Good: depth-limited
+fn process(value: &Value, depth: usize) -> Result<(), Error> {
+    if depth > MAX_DEPTH {
+        return Err(Error::MaxDepthExceeded);
+    }
+    match value {
+        Value::Array(arr) => arr.iter().try_for_each(|v| process(v, depth + 1)),
+        // ...
+    }
+}
+```
 
 ## Development Guidelines
 

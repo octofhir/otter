@@ -127,14 +127,14 @@ pub fn init_object_prototype(
                 };
 
                 let tag_value = if let Some(proxy) = this_val.as_proxy() {
-                    let key = PropertyKey::Symbol(well_known::TO_STRING_TAG);
+                    let key = PropertyKey::Symbol(well_known::to_string_tag_symbol());
                     let key_value = Value::symbol(GcRef::new(Symbol {
                         description: None,
                         id: well_known::TO_STRING_TAG,
                     }));
                     crate::proxy_operations::proxy_get(ncx, proxy, &key, key_value, this_val.clone())?
                 } else if let Some(obj) = this_val.as_object() {
-                    obj.get(&PropertyKey::Symbol(well_known::TO_STRING_TAG))
+                    obj.get(&PropertyKey::Symbol(well_known::to_string_tag_symbol()))
                         .unwrap_or(Value::undefined())
                 } else {
                     Value::undefined()
@@ -516,12 +516,7 @@ pub fn init_object_constructor(
                     let key_value = match &key {
                         PropertyKey::String(s) => Value::string(*s),
                         PropertyKey::Index(i) => Value::string(JsString::intern(&i.to_string())),
-                        PropertyKey::Symbol(sym_id) => {
-                            Value::symbol(GcRef::new(crate::value::Symbol {
-                                description: None,
-                                id: *sym_id,
-                            }))
-                        }
+                        PropertyKey::Symbol(sym) => Value::symbol(*sym),
                     };
                     let desc = if let Some(proxy) = args.first().and_then(|v| v.as_proxy()) {
                         crate::proxy_operations::proxy_get_own_property_descriptor(
@@ -589,12 +584,7 @@ pub fn init_object_constructor(
                     let key_value = match &key {
                         PropertyKey::String(s) => Value::string(*s),
                         PropertyKey::Index(i) => Value::string(JsString::intern(&i.to_string())),
-                        PropertyKey::Symbol(sym_id) => {
-                            Value::symbol(GcRef::new(crate::value::Symbol {
-                                description: None,
-                                id: *sym_id,
-                            }))
-                        }
+                        PropertyKey::Symbol(sym) => Value::symbol(*sym),
                     };
                     let desc = if let Some(proxy) = args.first().and_then(|v| v.as_proxy()) {
                         crate::proxy_operations::proxy_get_own_property_descriptor(
@@ -724,7 +714,7 @@ pub fn init_object_constructor(
                 let key = if let Some(s) = prop.as_string() {
                     PropertyKey::String(s)
                 } else if let Some(sym) = prop.as_symbol() {
-                    PropertyKey::Symbol(sym.id)
+                    PropertyKey::Symbol(sym)
                 } else if let Some(n) = prop.as_number() {
                     if n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64 {
                         PropertyKey::Index(n as u32)
@@ -866,7 +856,7 @@ pub fn init_object_constructor(
                 let key = if let Some(s) = key_val.as_string() {
                     PropertyKey::String(s)
                 } else if let Some(sym) = key_val.as_symbol() {
-                    PropertyKey::Symbol(sym.id)
+                    PropertyKey::Symbol(sym)
                 } else if let Some(n) = key_val.as_number() {
                     if n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64 {
                         PropertyKey::Index(n as u32)
@@ -891,7 +881,7 @@ pub fn init_object_constructor(
                 let get = attr_obj.get(&PropertyKey::from("get"));
                 let set = attr_obj.get(&PropertyKey::from("set"));
 
-                if get.is_some() || set.is_some() {
+                let success = if get.is_some() || set.is_some() {
                     let enumerable = read_bool("enumerable", false);
                     let configurable = read_bool("configurable", false);
 
@@ -920,7 +910,7 @@ pub fn init_object_constructor(
                                 configurable,
                             },
                         },
-                    );
+                    )
                 } else {
                     let value = attr_obj
                         .get(&PropertyKey::from("value"))
@@ -939,8 +929,15 @@ pub fn init_object_constructor(
                                 configurable,
                             },
                         ),
-                    );
+                    )
+                };
+
+                if !success {
+                    return Err(VmError::type_error(
+                        "Cannot define property: object is not extensible or property is non-configurable",
+                    ));
                 }
+
                 Ok(obj_val.clone())
             },
             mm.clone(),
@@ -1140,6 +1137,66 @@ pub fn init_object_constructor(
                 }
                 for (i, name) in names.into_iter().enumerate() {
                     result.set(PropertyKey::Index(i as u32), name);
+                }
+                Ok(Value::array(result))
+            },
+            mm.clone(),
+            fn_proto.clone(),
+        )),
+    );
+
+    // Object.getOwnPropertySymbols
+    object_ctor.define_property(
+        PropertyKey::string("getOwnPropertySymbols"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |_this, args, ncx_inner| {
+                let arg = args.first().cloned().unwrap_or(Value::undefined());
+
+                // ToObject - throws TypeError for undefined/null
+                if arg.is_undefined() || arg.is_null() {
+                    return Err(VmError::type_error(
+                        "Cannot convert undefined or null to object",
+                    ));
+                }
+
+                let obj = match arg.as_object() {
+                    Some(o) => o,
+                    None => {
+                        // Primitives (string, number, boolean, symbol) have no own symbol properties
+                        let arr =
+                            GcRef::new(JsObject::array(0, ncx_inner.memory_manager().clone()));
+                        if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array")) {
+                            if let Some(array_obj) = array_ctor.as_object() {
+                                if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
+                                    if let Some(proto_obj) = proto_val.as_object() {
+                                        arr.set_prototype(Value::object(proto_obj));
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(Value::array(arr));
+                    }
+                };
+                let keys = obj.own_keys();
+                let mut symbols = Vec::new();
+                for key in keys {
+                    if let PropertyKey::Symbol(sym) = key {
+                        symbols.push(Value::symbol(sym));
+                    }
+                }
+                let result =
+                    GcRef::new(JsObject::array(symbols.len(), ncx_inner.memory_manager().clone()));
+                if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array")) {
+                    if let Some(array_obj) = array_ctor.as_object() {
+                        if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
+                            if let Some(proto_obj) = proto_val.as_object() {
+                                result.set_prototype(Value::object(proto_obj));
+                            }
+                        }
+                    }
+                }
+                for (i, sym) in symbols.into_iter().enumerate() {
+                    result.set(PropertyKey::Index(i as u32), sym);
                 }
                 Ok(Value::array(result))
             },

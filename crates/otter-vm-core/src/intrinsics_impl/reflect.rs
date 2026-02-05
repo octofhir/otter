@@ -42,7 +42,7 @@ pub fn to_property_key(value: &Value) -> PropertyKey {
         return PropertyKey::String(s);
     }
     if let Some(sym) = value.as_symbol() {
-        return PropertyKey::Symbol(sym.id);
+        return PropertyKey::Symbol(sym);
     }
     // Fallback: convert to string
     let s = if value.is_undefined() {
@@ -65,6 +65,30 @@ fn get_target_object(value: &Value) -> Result<GcRef<JsObject>, String> {
             value.type_of()
         )
     })
+}
+
+fn builtin_tag_for_value(value: &Value) -> Option<GcRef<JsString>> {
+    let mut current = value.clone();
+    if let Some(proxy) = current.as_proxy() {
+        if let Some(target) = proxy.target() {
+            current = target;
+        }
+    }
+    current
+        .as_object()
+        .and_then(|o| o.get(&PropertyKey::string("__builtin_tag__")))
+        .and_then(|v| v.as_string())
+}
+
+fn default_proto_for_construct(
+    ncx: &NativeContext,
+    target: &Value,
+    new_target: &Value,
+) -> Option<GcRef<JsObject>> {
+    let tag = builtin_tag_for_value(target)?;
+    let realm_id = ncx.realm_id_for_function(new_target);
+    let intrinsics = ncx.ctx.realm_intrinsics(realm_id)?;
+    intrinsics.prototype_for_builtin_tag(tag.as_str())
 }
 
 fn is_constructor_value(value: &Value) -> bool {
@@ -646,12 +670,17 @@ pub fn install_reflect_namespace(
             return Err(VmError::type_error("Reflect.construct argumentsList must be an object"));
         };
 
-        // Create new instance
-        let new_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+        // Create new instance using GetPrototypeFromConstructor(newTarget, %Object.prototype%)
+        let default_proto = default_proto_for_construct(ncx, target, &new_target);
+        let proto = ncx
+            .get_prototype_from_constructor_with_default(&new_target, default_proto)
+            .map(Value::object)
+            .unwrap_or_else(Value::null);
+        let new_obj = GcRef::new(JsObject::new(proto, ncx.memory_manager().clone()));
         let this_val = Value::object(new_obj);
 
         // Call constructor (handles both closures and native functions)
-        let result = ncx.call_function(target, this_val.clone(), &args_array)?;
+        let result = ncx.call_function_construct(target, this_val.clone(), &args_array)?;
 
         // If constructor returns an object, use it; otherwise use this_val
         if result.is_object() {

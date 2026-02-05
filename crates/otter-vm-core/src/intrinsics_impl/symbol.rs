@@ -118,8 +118,8 @@ pub fn init_symbol_prototype(
     );
     set_function_properties(&to_primitive_fn, "[Symbol.toPrimitive]", 1, true);
     symbol_proto.define_property(
-        PropertyKey::Symbol(well_known::TO_PRIMITIVE),
-        PropertyDescriptor::builtin_method(to_primitive_fn),
+        PropertyKey::Symbol(well_known::to_primitive_symbol()),
+        PropertyDescriptor::data_with_attrs(to_primitive_fn, PropertyAttributes::function_length()),
     );
 
     // Symbol.prototype.description (getter)
@@ -148,8 +148,11 @@ pub fn init_symbol_prototype(
 
     // Symbol.prototype[Symbol.toStringTag] = "Symbol"
     symbol_proto.define_property(
-        PropertyKey::Symbol(well_known::TO_STRING_TAG),
-        PropertyDescriptor::builtin_data(Value::string(JsString::intern("Symbol"))),
+        PropertyKey::Symbol(well_known::to_string_tag_symbol()),
+        PropertyDescriptor::data_with_attrs(
+            Value::string(JsString::intern("Symbol")),
+            PropertyAttributes::function_length(),
+        ),
     );
 }
 
@@ -206,9 +209,9 @@ pub fn install_symbol_statics(
         PropertyDescriptor::builtin_method(key_for_fn),
     );
 
-    // Symbol.length = 0 and Symbol is not a constructor
+    // Symbol.length = 0 (Symbol has [[Construct]] but throws on construction)
     let ctor_val = Value::object(symbol_ctor);
-    set_function_properties(&ctor_val, "Symbol", 0, true);
+    set_function_properties(&ctor_val, "Symbol", 0, false);
 }
 
 /// Create Symbol constructor function (callable, not constructable).

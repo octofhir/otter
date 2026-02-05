@@ -406,7 +406,7 @@ impl BuiltInBuilder {
                         make_native_fn(&mm, fn_proto, func, &format!("[{sym_name}]"), length);
                     if let Some(sym) = symbol.as_symbol() {
                         prototype.define_property(
-                            PropertyKey::Symbol(sym.id),
+                            PropertyKey::Symbol(sym),
                             PropertyDescriptor::builtin_method(fn_val),
                         );
                     }

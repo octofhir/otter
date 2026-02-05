@@ -249,6 +249,20 @@ pub struct Symbol {
     pub id: u64,
 }
 
+impl PartialEq for Symbol {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Symbol {}
+
+impl std::hash::Hash for Symbol {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
 impl otter_vm_gc::GcTraceable for Symbol {
     const NEEDS_TRACE: bool = false;
     fn trace(&self, _tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
@@ -518,6 +532,15 @@ impl Value {
                 crate::string::JsString::intern(""),
             )),
         );
+        if let Some(realm_id) = prototype
+            .get(&crate::object::PropertyKey::string("__realm_id__"))
+            .and_then(|v| v.as_int32())
+        {
+            object.define_property(
+                crate::object::PropertyKey::string("__realm_id__"),
+                crate::object::PropertyDescriptor::builtin_data(Value::int32(realm_id)),
+            );
+        }
         let native = GcRef::new(NativeFunctionObject { func, object });
         Self {
             bits: TAG_POINTER | (native.as_ptr() as u64 & PAYLOAD_MASK),
@@ -531,9 +554,18 @@ impl Value {
     pub fn native_function_with_proto_and_object(
         func: NativeFn,
         _memory_manager: Arc<crate::memory::MemoryManager>,
-        _prototype: GcRef<JsObject>,
+        prototype: GcRef<JsObject>,
         object: GcRef<JsObject>,
     ) -> Self {
+        if let Some(realm_id) = prototype
+            .get(&crate::object::PropertyKey::string("__realm_id__"))
+            .and_then(|v| v.as_int32())
+        {
+            object.define_property(
+                crate::object::PropertyKey::string("__realm_id__"),
+                crate::object::PropertyDescriptor::builtin_data(Value::int32(realm_id)),
+            );
+        }
         let native = GcRef::new(NativeFunctionObject { func, object });
         Self {
             bits: TAG_POINTER | (native.as_ptr() as u64 & PAYLOAD_MASK),

@@ -66,6 +66,43 @@ This separation:
 - **Idiomatic Rust**: Follow Rust best practices, use proper error handling, leverage the type system.
 - **Secure defaults**: deny-by-default permissions; new capabilities must be explicit and testable.
 
+## Common Pitfalls to Avoid
+
+### 1. Wrong Collection Type
+**Problem**: Using `HashMap`/`FxHashMap` when output order matters (JSON, iterators).
+**Solution**: Use `BTreeMap` or `IndexMap` for deterministic iteration order.
+
+```rust
+// JSON object keys must preserve insertion order per spec
+use indexmap::IndexMap;
+struct JsObject {
+    properties: IndexMap<String, Value>,  // NOT HashMap
+}
+```
+
+### 2. Unbounded Recursion
+**Problem**: Stack overflow on deeply nested structures (JSON, AST, objects).
+**Solution**: Add depth limits or use iterative algorithms with explicit stack.
+
+```rust
+const MAX_NESTING_DEPTH: usize = 512;
+
+fn stringify(value: &Value, depth: usize) -> Result<String, Error> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(Error::TooDeep);
+    }
+    // ... recurse with depth + 1
+}
+```
+
+### 3. Forgetting GC Roots
+**Problem**: Values get collected while still in use.
+**Solution**: Root values before operations that might trigger GC (allocations, function calls).
+
+### 4. Non-deterministic Test Failures
+**Problem**: Tests pass/fail randomly due to hash map iteration order.
+**Solution**: Sort keys before comparison, or use ordered collections throughout.
+
 ## Build Commands
 
 ```bash
@@ -195,6 +232,35 @@ Practical rules when adding/altering APIs:
 - VM tests: `cargo test -p otter-vm-core`
 - Compiler tests: `cargo test -p otter-vm-compiler`
 - Test262 conformance: `cargo test -p otter-test262`
+
+## Test-Driven Workflow
+
+When implementing features covered by Test262 or Node.js compatibility tests:
+
+### 1. Establish Baseline
+```bash
+just test262-filter "FeatureName" 2>&1 | grep -E "(passed|failed|Pass rate)"
+# Example output: "Pass rate: 39.0% (156/400)"
+```
+
+### 2. Fix by Failure Category
+Prioritize fixes by impact:
+1. Most common error type first (e.g., "TypeError: X is not a function")
+2. Then edge cases and spec compliance details
+
+### 3. Track Progress
+After each fix, re-run and document the delta:
+```bash
+# Before: 39.0% (156/400)
+# After:  42.4% (170/400)  ← +14 tests passing
+```
+
+### 4. Validate No Regressions
+Run full test suite after changes to core modules:
+```bash
+cargo test -p otter-vm-core
+cargo test -p otter-vm-runtime
+```
 
 ## Key Files
 

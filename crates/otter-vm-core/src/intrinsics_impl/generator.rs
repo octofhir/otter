@@ -39,8 +39,8 @@ pub fn init_generator_prototype(
     proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
-    symbol_iterator_id: u64,
-    symbol_to_string_tag_id: u64,
+    symbol_iterator: crate::gc::GcRef<crate::value::Symbol>,
+    symbol_to_string_tag: crate::gc::GcRef<crate::value::Symbol>,
 ) {
     // Generator.prototype.next(value) — §27.5.1.2
     proto.define_property(
@@ -129,7 +129,7 @@ pub fn init_generator_prototype(
 
     // Generator.prototype[Symbol.iterator] — returns `this`
     proto.define_property(
-        PropertyKey::Symbol(symbol_iterator_id),
+        PropertyKey::Symbol(symbol_iterator),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, _args, _ncx| {
                 // Generators are iterable - Symbol.iterator returns the generator itself
@@ -142,7 +142,7 @@ pub fn init_generator_prototype(
 
     // Generator.prototype[Symbol.toStringTag] = "Generator"
     proto.define_property(
-        PropertyKey::Symbol(symbol_to_string_tag_id),
+        PropertyKey::Symbol(symbol_to_string_tag),
         PropertyDescriptor::data_with_attrs(
             Value::string(JsString::intern("Generator")),
             PropertyAttributes {
@@ -170,8 +170,8 @@ pub fn init_async_generator_prototype(
     proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
-    symbol_async_iterator_id: u64,
-    symbol_to_string_tag_id: u64,
+    symbol_async_iterator: crate::gc::GcRef<crate::value::Symbol>,
+    symbol_to_string_tag: crate::gc::GcRef<crate::value::Symbol>,
 ) {
     // AsyncGenerator.prototype.next(value) — §27.6.1.2
     proto.define_property(
@@ -256,7 +256,7 @@ pub fn init_async_generator_prototype(
 
     // AsyncGenerator.prototype[Symbol.asyncIterator] — returns `this`
     proto.define_property(
-        PropertyKey::Symbol(symbol_async_iterator_id),
+        PropertyKey::Symbol(symbol_async_iterator),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, _args, _ncx| {
                 // Async generators are async-iterable - Symbol.asyncIterator returns the generator itself
@@ -269,7 +269,7 @@ pub fn init_async_generator_prototype(
 
     // AsyncGenerator.prototype[Symbol.toStringTag] = "AsyncGenerator"
     proto.define_property(
-        PropertyKey::Symbol(symbol_to_string_tag_id),
+        PropertyKey::Symbol(symbol_to_string_tag),
         PropertyDescriptor::data_with_attrs(
             Value::string(JsString::intern("AsyncGenerator")),
             PropertyAttributes {

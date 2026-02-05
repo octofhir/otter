@@ -3491,10 +3491,10 @@ impl Compiler {
                 .any(|d| d.directive.as_str() == "use strict");
             let has_use_strict = has_use_strict || self.has_use_strict_directive(&body.statements);
 
-            if has_use_strict {
-                self.set_strict_mode(true);
-                // ES2023 §10.2.1: Save strict mode in function flags
+            // ES2023 §10.2.1: Inherit strict mode from parent scope or from directive
+            if saved_strict || has_use_strict {
                 self.codegen.current.flags.is_strict = true;
+                self.literal_validator.set_strict_mode(true);
             }
 
             // Validate directives
@@ -3513,7 +3513,9 @@ impl Compiler {
                 }
             }
 
-            self.set_strict_mode(saved_strict);
+            // Only restore literal_validator strict mode, not codegen.current.flags.is_strict
+            // The function's own is_strict flag must be preserved until exit_function()
+            self.literal_validator.set_strict_mode(saved_strict);
         }
 
         // Ensure return
@@ -3681,10 +3683,10 @@ impl Compiler {
                 .any(|d| d.directive.as_str() == "use strict");
             let has_use_strict = has_use_strict || self.has_use_strict_directive(&body.statements);
 
-            if has_use_strict {
-                self.set_strict_mode(true);
-                // ES2023 §10.2.1: Save strict mode in function flags
+            // ES2023 §10.2.1: Inherit strict mode from parent scope or from directive
+            if saved_strict || has_use_strict {
                 self.codegen.current.flags.is_strict = true;
+                self.literal_validator.set_strict_mode(true);
             }
 
             // Validate directives
@@ -3703,7 +3705,9 @@ impl Compiler {
                 }
             }
 
-            self.set_strict_mode(saved_strict);
+            // Only restore literal_validator strict mode, not codegen.current.flags.is_strict
+            // The function's own is_strict flag must be preserved until exit_function()
+            self.literal_validator.set_strict_mode(saved_strict);
         }
 
         // Ensure return
@@ -3885,10 +3889,10 @@ impl Compiler {
                 .any(|d| d.directive.as_str() == "use strict");
             let has_use_strict = has_use_strict || self.has_use_strict_directive(&body.statements);
 
-            if has_use_strict {
-                self.set_strict_mode(true);
-                // ES2023 §10.2.1: Save strict mode in function flags
+            // ES2023 §10.2.1: Inherit strict mode from parent scope or from directive
+            if saved_strict || has_use_strict {
                 self.codegen.current.flags.is_strict = true;
+                self.literal_validator.set_strict_mode(true);
             }
 
             // Validate directives
@@ -3907,7 +3911,9 @@ impl Compiler {
                 }
             }
 
-            self.set_strict_mode(saved_strict);
+            // Only restore literal_validator strict mode, not codegen.current.flags.is_strict
+            // The function's own is_strict flag must be preserved until exit_function()
+            self.literal_validator.set_strict_mode(saved_strict);
         }
 
         // Ensure return
@@ -4047,8 +4053,10 @@ impl Compiler {
         let has_use_strict =
             has_use_strict || self.has_use_strict_directive(&arrow.body.statements);
 
-        if has_use_strict {
-            self.set_strict_mode(true);
+        // ES2023 §10.2.1: Inherit strict mode from parent scope or from directive
+        if saved_strict || has_use_strict {
+            self.codegen.current.flags.is_strict = true;
+            self.literal_validator.set_strict_mode(true);
         }
 
         // Validate directives
@@ -4080,7 +4088,9 @@ impl Compiler {
             self.codegen.emit(Instruction::ReturnUndefined);
         }
 
-        self.set_strict_mode(saved_strict);
+        // Only restore literal_validator strict mode, not codegen.current.flags.is_strict
+        // The function's own is_strict flag must be preserved until exit_function()
+        self.literal_validator.set_strict_mode(saved_strict);
 
         // Exit function and get index
         let func_idx = self.codegen.exit_function();

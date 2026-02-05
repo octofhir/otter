@@ -11,17 +11,25 @@ use crate::memory::MemoryManager;
 use std::sync::Arc;
 
 /// Helper to extract timestamp from Date object
-fn get_timestamp(this_val: &Value) -> Result<i64, String> {
+fn get_timestamp_value(this_val: &Value) -> Result<f64, String> {
     let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
     let ts_val = obj.get(&PropertyKey::string("__timestamp__"))
         .ok_or("Date object missing __timestamp__")?;
     if let Some(n) = ts_val.as_number() {
-        Ok(n as i64)
+        Ok(n)
     } else if let Some(i) = ts_val.as_int32() {
-        Ok(i as i64)
+        Ok(i as f64)
     } else {
         Err("Invalid timestamp".to_string())
     }
+}
+
+fn get_timestamp(this_val: &Value) -> Result<i64, String> {
+    let ts = get_timestamp_value(this_val)?;
+    if ts.is_nan() || ts.is_infinite() {
+        return Err("Invalid timestamp".to_string());
+    }
+    Ok(ts as i64)
 }
 
 /// Wire all Date.prototype methods to the prototype object
@@ -35,8 +43,8 @@ pub fn init_date_prototype(
         PropertyKey::string("getTime"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, _args, _ncx| {
-                let ts = get_timestamp(this_val)?;
-                Ok(Value::number(ts as f64))
+                let ts = get_timestamp_value(this_val)?;
+                Ok(Value::number(ts))
             },
             mm.clone(),
             fn_proto,
@@ -48,8 +56,8 @@ pub fn init_date_prototype(
         PropertyKey::string("valueOf"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, _args, _ncx| {
-                let ts = get_timestamp(this_val)?;
-                Ok(Value::number(ts as f64))
+                let ts = get_timestamp_value(this_val)?;
+                Ok(Value::number(ts))
             },
             mm.clone(),
             fn_proto,

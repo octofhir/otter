@@ -11,11 +11,13 @@ use crate::async_context::SavedFrame;
 use crate::error::{VmError, VmResult};
 use crate::gc::GcRef;
 use crate::object::JsObject;
+use crate::realm::{RealmId, RealmRegistry};
 use crate::symbol_registry::{SymbolRegistry, global_symbol_registry};
 use crate::string::JsString;
 use crate::value::{UpvalueCell, Value};
 use crate::interpreter::PreferredType;
 use num_bigint::BigInt as NumBigInt;
+use otter_vm_bytecode::Module;
 
 #[cfg(feature = "profiling")]
 use otter_profiler::RuntimeStats;
@@ -112,6 +114,17 @@ impl<'a> NativeContext<'a> {
             .call_function(self.ctx, &current_func, current_this, &current_args)
     }
 
+    /// Call a function as a constructor (native or closure).
+    pub fn call_function_construct(
+        &mut self,
+        func: &crate::value::Value,
+        this_value: crate::value::Value,
+        args: &[crate::value::Value],
+    ) -> crate::error::VmResult<crate::value::Value> {
+        self.interpreter
+            .call_function_construct(self.ctx, func, this_value, args)
+    }
+
     pub(crate) fn to_primitive(&mut self, value: &Value, hint: PreferredType) -> VmResult<Value> {
         self.interpreter.to_primitive(self.ctx, value, hint)
     }
@@ -126,6 +139,37 @@ impl<'a> NativeContext<'a> {
 
     pub(crate) fn parse_bigint_str(&self, value: &str) -> VmResult<NumBigInt> {
         self.interpreter.parse_bigint_str(value)
+    }
+
+    pub(crate) fn default_object_prototype_for_constructor(
+        &self,
+        ctor: &Value,
+    ) -> Option<GcRef<JsObject>> {
+        self.interpreter
+            .default_object_prototype_for_constructor(self.ctx, ctor)
+    }
+
+    pub(crate) fn get_prototype_from_constructor(&self, ctor: &Value) -> Option<GcRef<JsObject>> {
+        ctor.as_object()
+            .and_then(|o| o.get(&crate::object::PropertyKey::string("prototype")))
+            .and_then(|v| v.as_object())
+            .or_else(|| self.default_object_prototype_for_constructor(ctor))
+    }
+
+    pub(crate) fn get_prototype_from_constructor_with_default(
+        &self,
+        ctor: &Value,
+        default: Option<GcRef<JsObject>>,
+    ) -> Option<GcRef<JsObject>> {
+        ctor.as_object()
+            .and_then(|o| o.get(&crate::object::PropertyKey::string("prototype")))
+            .and_then(|v| v.as_object())
+            .or(default)
+            .or_else(|| self.default_object_prototype_for_constructor(ctor))
+    }
+
+    pub(crate) fn realm_id_for_function(&self, value: &Value) -> RealmId {
+        self.interpreter.realm_id_for_function(self.ctx, value)
     }
 
     /// Access the memory manager.
@@ -157,6 +201,29 @@ impl<'a> NativeContext<'a> {
     pub fn interpreter(&self) -> &crate::interpreter::Interpreter {
         self.interpreter
     }
+
+    /// Execute an eval-compiled module within this context.
+    pub fn execute_eval_module(&mut self, module: &Module) -> VmResult<Value> {
+        let interpreter = self.interpreter;
+        let ctx = &mut *self.ctx;
+        interpreter.execute_eval_module(ctx, module)
+    }
+
+    /// Execute an eval-compiled module within a specific realm/global.
+    pub fn execute_eval_module_in_realm(
+        &mut self,
+        realm_id: RealmId,
+        module: &Module,
+    ) -> VmResult<Value> {
+        if let Some(global) = self.ctx.realm_global(realm_id) {
+            let interpreter = self.interpreter;
+            self.ctx.with_realm(realm_id, global, |ctx| {
+                interpreter.execute_eval_module(ctx, module)
+            })
+        } else {
+            self.execute_eval_module(module)
+        }
+    }
 }
 
 /// Default maximum native call depth to prevent Rust stack overflow
@@ -176,6 +243,8 @@ pub struct CallFrame {
     pub function_index: u32,
     /// The module this function belongs to
     pub module: std::sync::Arc<otter_vm_bytecode::Module>,
+    /// Realm id for this call frame
+    pub realm_id: RealmId,
     /// Program counter (instruction index)
     pub pc: usize,
     /// Base register index
@@ -251,6 +320,8 @@ pub struct VmContext {
     pending_is_derived: bool,
     /// Pending new_target_proto for multi-level super() chain
     pending_new_target_proto: Option<GcRef<JsObject>>,
+    /// Pending realm id for next call frame
+    pending_realm_id: Option<RealmId>,
     /// Open upvalues: maps (frame_id, local_idx) to the cell.
     /// When a closure captures a local, we create/reuse a cell here.
     /// Multiple closures in the same frame share the same cell.
@@ -303,6 +374,10 @@ pub struct VmContext {
     external_root_sets: Vec<Arc<dyn ExternalRootSet + Send + Sync>>,
     /// Global Symbol registry shared across contexts.
     symbol_registry: Arc<SymbolRegistry>,
+    /// Realm id for this context.
+    realm_id: RealmId,
+    /// Registry of all realms (for cross-realm lookups).
+    realm_registry: Option<Arc<RealmRegistry>>,
     /// Trace state (if tracing is enabled)
     pub(crate) trace_state: Option<crate::trace::TraceState>,
 }
@@ -406,6 +481,7 @@ impl VmContext {
             pending_home_object: None,
             pending_is_derived: false,
             pending_new_target_proto: None,
+            pending_realm_id: None,
             open_upvalues: HashMap::new(),
             next_frame_id: 0,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
@@ -427,6 +503,8 @@ impl VmContext {
             js_job_queue: None,
             external_root_sets: Vec::new(),
             symbol_registry: global_symbol_registry(),
+            realm_id: 0,
+            realm_registry: None,
             trace_state: None,
         }
     }
@@ -438,6 +516,80 @@ impl VmContext {
 
     pub(crate) fn symbol_registry(&self) -> &Arc<SymbolRegistry> {
         &self.symbol_registry
+    }
+
+    /// Set the realm metadata for this context.
+    pub fn set_realm(&mut self, realm_id: RealmId, registry: Arc<RealmRegistry>) {
+        self.realm_id = realm_id;
+        self.realm_registry = Some(registry);
+    }
+
+    /// Get the realm id for this context.
+    pub fn realm_id(&self) -> RealmId {
+        self.realm_id
+    }
+
+    /// Lookup intrinsics for a realm id.
+    pub fn realm_intrinsics(&self, realm_id: RealmId) -> Option<crate::intrinsics::Intrinsics> {
+        self.realm_registry.as_ref().and_then(|registry| registry.get(realm_id)).map(|rec| rec.intrinsics)
+    }
+
+    /// Lookup global object for a realm id.
+    pub fn realm_global(&self, realm_id: RealmId) -> Option<GcRef<JsObject>> {
+        self.realm_registry.as_ref().and_then(|registry| registry.get(realm_id)).map(|rec| rec.global)
+    }
+
+    /// Lookup the realm's Function.prototype for a realm id.
+    pub fn realm_function_prototype(&self, realm_id: RealmId) -> Option<GcRef<JsObject>> {
+        self.realm_registry.as_ref().and_then(|registry| registry.get(realm_id)).map(|rec| rec.function_prototype)
+    }
+
+    /// Temporarily run with a different realm/global, restoring after the closure.
+    pub fn with_realm<R>(
+        &mut self,
+        realm_id: RealmId,
+        global: GcRef<JsObject>,
+        f: impl FnOnce(&mut VmContext) -> R,
+    ) -> R {
+        let old_realm_id = self.realm_id;
+        let old_global = self.global;
+        let old_fn_proto = self.function_prototype_intrinsic;
+        let old_gen_proto = self.generator_prototype_intrinsic;
+        let old_async_gen_proto = self.async_generator_prototype_intrinsic;
+
+        self.realm_id = realm_id;
+        self.global = global;
+        if let Some(intrinsics) = self.realm_intrinsics(realm_id) {
+            self.function_prototype_intrinsic = Some(intrinsics.function_prototype);
+            self.generator_prototype_intrinsic = Some(intrinsics.generator_prototype);
+            self.async_generator_prototype_intrinsic = Some(intrinsics.async_generator_prototype);
+        }
+
+        let result = f(self);
+
+        self.realm_id = old_realm_id;
+        self.global = old_global;
+        self.function_prototype_intrinsic = old_fn_proto;
+        self.generator_prototype_intrinsic = old_gen_proto;
+        self.async_generator_prototype_intrinsic = old_async_gen_proto;
+
+        result
+    }
+
+    /// Switch this context to a different realm/global.
+    pub fn switch_realm(&mut self, realm_id: RealmId) {
+        if realm_id == self.realm_id {
+            return;
+        }
+        if let Some(global) = self.realm_global(realm_id) {
+            self.global = global;
+        }
+        if let Some(intrinsics) = self.realm_intrinsics(realm_id) {
+            self.function_prototype_intrinsic = Some(intrinsics.function_prototype);
+            self.generator_prototype_intrinsic = Some(intrinsics.generator_prototype);
+            self.async_generator_prototype_intrinsic = Some(intrinsics.async_generator_prototype);
+        }
+        self.realm_id = realm_id;
     }
 
     /// Attach a debug snapshot target to update periodically.
@@ -1156,11 +1308,14 @@ impl VmContext {
             }
         }
 
+        let frame_realm_id = self.pending_realm_id.take().unwrap_or(self.realm_id);
+        let frame_global = self.realm_global(frame_realm_id).unwrap_or(self.global);
+
         // Take pending this value (defaults to undefined)
         // ES2023 §10.2.1.1: In non-strict mode, undefined/null this becomes globalThis
         let mut this_value = self.take_pending_this();
         if this_value.is_undefined() && !func.flags.is_strict && !is_construct {
-            this_value = Value::object(self.global());
+            this_value = Value::object(frame_global);
         }
 
         // Take pending upvalues (captured closure cells)
@@ -1177,6 +1332,7 @@ impl VmContext {
         self.call_stack.push(CallFrame {
             function_index,
             module,
+            realm_id: frame_realm_id,
             pc: 0,
             register_base,
             locals,
@@ -1194,6 +1350,7 @@ impl VmContext {
             this_initialized: !is_derived,
             is_derived,
         });
+        self.switch_realm(frame_realm_id);
         Ok(())
     }
 
@@ -1215,7 +1372,11 @@ impl VmContext {
             let frame_id = frame.frame_id;
             self.open_upvalues.retain(|(fid, _), _| *fid != frame_id);
         }
-        self.call_stack.pop()
+        let popped = self.call_stack.pop();
+        if let Some(frame) = self.call_stack.last() {
+            self.switch_realm(frame.realm_id);
+        }
+        popped
     }
 
     /// Get current call frame
@@ -1327,6 +1488,10 @@ impl VmContext {
 
     pub fn set_pending_new_target_proto(&mut self, proto: GcRef<JsObject>) {
         self.pending_new_target_proto = Some(proto);
+    }
+
+    pub fn set_pending_realm_id(&mut self, realm_id: RealmId) {
+        self.pending_realm_id = Some(realm_id);
     }
 
     /// Get an upvalue value from the current call frame
@@ -1485,6 +1650,7 @@ impl VmContext {
                 SavedFrame::new(
                     frame.function_index,
                     Arc::clone(&frame.module),
+                    frame.realm_id,
                     frame.pc,
                     frame.locals.clone(),
                     frame_registers,
@@ -1529,6 +1695,7 @@ impl VmContext {
             self.call_stack.push(CallFrame {
                 function_index: saved.function_index,
                 module: saved.module,
+                realm_id: saved.realm_id,
                 pc: saved.pc,
                 register_base,
                 locals: saved.locals,
@@ -1550,6 +1717,10 @@ impl VmContext {
             if saved.frame_id >= self.next_frame_id {
                 self.next_frame_id = saved.frame_id + 1;
             }
+        }
+
+        if let Some(frame) = self.call_stack.last() {
+            self.switch_realm(frame.realm_id);
         }
 
         Ok(())

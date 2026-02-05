@@ -299,7 +299,7 @@ pub fn init_regexp_prototype(
     // RegExp.prototype[Symbol.match](string) §22.2.5.6
     // ====================================================================
     regexp_proto.define_property(
-        PropertyKey::Symbol(crate::intrinsics::well_known::MATCH),
+        PropertyKey::Symbol(crate::intrinsics::well_known::match_symbol()),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, ncx| {
                 let regex = get_regex(this_val)?;
@@ -343,7 +343,7 @@ pub fn init_regexp_prototype(
     // RegExp.prototype[Symbol.matchAll](string) §22.2.5.7
     // ====================================================================
     regexp_proto.define_property(
-        PropertyKey::Symbol(crate::intrinsics::well_known::MATCH_ALL),
+        PropertyKey::Symbol(crate::intrinsics::well_known::match_all_symbol()),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, ncx| {
                 let regex = get_regex(this_val)?;
@@ -375,7 +375,7 @@ pub fn init_regexp_prototype(
     // RegExp.prototype[Symbol.replace](string, replaceValue) §22.2.5.8
     // ====================================================================
     regexp_proto.define_property(
-        PropertyKey::Symbol(crate::intrinsics::well_known::REPLACE),
+        PropertyKey::Symbol(crate::intrinsics::well_known::replace_symbol()),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, _ncx| {
                 let regex = get_regex(this_val)?;
@@ -432,7 +432,7 @@ pub fn init_regexp_prototype(
     // RegExp.prototype[Symbol.search](string) §22.2.5.9
     // ====================================================================
     regexp_proto.define_property(
-        PropertyKey::Symbol(crate::intrinsics::well_known::SEARCH),
+        PropertyKey::Symbol(crate::intrinsics::well_known::search_symbol()),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, _ncx| {
                 let regex = get_regex(this_val)?;
@@ -454,7 +454,7 @@ pub fn init_regexp_prototype(
     // RegExp.prototype[Symbol.split](string, limit?) §22.2.5.11
     // ====================================================================
     regexp_proto.define_property(
-        PropertyKey::Symbol(crate::intrinsics::well_known::SPLIT),
+        PropertyKey::Symbol(crate::intrinsics::well_known::split_symbol()),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, ncx| {
                 let regex = get_regex(this_val)?;

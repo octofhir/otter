@@ -163,7 +163,7 @@ pub fn init_string_prototype(
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
     iterator_proto: GcRef<JsObject>,
-    symbol_iterator_id: u64,
+    symbol_iterator: crate::gc::GcRef<crate::value::Symbol>,
 ) {
         string_proto.define_property(
             PropertyKey::string("toString"),
@@ -697,7 +697,7 @@ pub fn init_string_prototype(
                         if let Some(regex) = sep.as_regex() {
                             let method = regex
                                 .object
-                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::SPLIT))
+                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::split_symbol()))
                                 .unwrap_or_else(Value::undefined);
                             if let Some(func) = method.as_native_function() {
                                 let mut sym_args = vec![Value::string(s.clone())];
@@ -765,7 +765,7 @@ pub fn init_string_prototype(
                         if let Some(regex) = search_val.as_regex() {
                             let method = regex
                                 .object
-                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::REPLACE))
+                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::replace_symbol()))
                                 .unwrap_or_else(Value::undefined);
                             if let Some(func) = method.as_native_function() {
                                 let mut sym_args = vec![Value::string(s.clone())];
@@ -824,7 +824,7 @@ pub fn init_string_prototype(
                             }
                             let method = regex
                                 .object
-                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::REPLACE))
+                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::replace_symbol()))
                                 .unwrap_or_else(Value::undefined);
                             if let Some(func) = method.as_native_function() {
                                 let mut sym_args = vec![Value::string(s.clone())];
@@ -869,7 +869,7 @@ pub fn init_string_prototype(
                         if let Some(regex) = search_val.as_regex() {
                             let method = regex
                                 .object
-                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::SEARCH))
+                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::search_symbol()))
                                 .unwrap_or_else(Value::undefined);
                             if let Some(func) = method.as_native_function() {
                                 let sym_args = vec![Value::string(s.clone())];
@@ -907,7 +907,7 @@ pub fn init_string_prototype(
                         if let Some(regex) = search_val.as_regex() {
                             let method = regex
                                 .object
-                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::MATCH))
+                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::match_symbol()))
                                 .unwrap_or_else(Value::undefined);
                             if let Some(func) = method.as_native_function() {
                                 let sym_args = vec![Value::string(s.clone())];
@@ -958,7 +958,7 @@ pub fn init_string_prototype(
                             }
                             let method = regex
                                 .object
-                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::MATCH_ALL))
+                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::match_all_symbol()))
                                 .unwrap_or_else(Value::undefined);
                             if let Some(func) = method.as_native_function() {
                                 let sym_args = vec![Value::string(s.clone())];
@@ -1002,7 +1002,7 @@ pub fn init_string_prototype(
     let mm_for_symbol = mm.clone();
     let fn_proto_for_symbol = fn_proto;
     string_proto.define_property(
-        PropertyKey::Symbol(symbol_iterator_id),
+        PropertyKey::Symbol(symbol_iterator),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             move |this_val, _args, ncx| {
                 make_string_iterator(this_val, ncx.memory_manager().clone(), fn_proto_for_symbol, iter_proto_for_symbol)

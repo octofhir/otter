@@ -143,7 +143,7 @@ fn to_property_key(value: &VmValue) -> PropertyKey {
         return PropertyKey::String(s);
     }
     if let Some(sym) = value.as_symbol() {
-        return PropertyKey::Symbol(sym.id);
+        return PropertyKey::Symbol(sym);
     }
     // Fallback: convert to string
     let s = if value.is_undefined() {
@@ -713,7 +713,7 @@ fn native_object_has_own(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<Vm
     let key = if let Some(s) = prop_val.as_string() {
         PropertyKey::String(s.clone())
     } else if let Some(sym) = prop_val.as_symbol() {
-        PropertyKey::Symbol(sym.id)
+        PropertyKey::Symbol(sym)
     } else {
         // Convert to string
         let s = JsString::intern(&format!("{:?}", prop_val));
@@ -741,19 +741,15 @@ fn native_object_get_own_property_symbols(
         ))));
     };
 
-    let _keys = obj.own_keys();
-    let symbols = Vec::new();
+    let keys = obj.own_keys();
+    let mut symbols: Vec<VmValue> = Vec::new();
 
-    // FIXME: We currently only store symbol IDs in PropertyKey, so we can't
-    // easily reconstruct the Arc<Symbol> here. This requires a global symbol
-    // registry or storing Arc<Symbol> in PropertyKey.
-    /*
+    // Collect all symbol keys
     for key in keys {
-        if let PropertyKey::Symbol(id) = key {
-            // ...
+        if let PropertyKey::Symbol(sym) = key {
+            symbols.push(VmValue::symbol(sym));
         }
     }
-    */
 
     let result = GcRef::new(JsObject::array(symbols.len(), Arc::clone(&mm)));
     for (i, sym) in symbols.into_iter().enumerate() {

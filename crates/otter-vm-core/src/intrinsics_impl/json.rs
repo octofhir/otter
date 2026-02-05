@@ -16,8 +16,86 @@ use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// Tracks visited objects during JSON serialization to detect circular references.
+/// Also maintains a path for generating helpful error messages.
+struct CircularTracker {
+    /// Maps object pointer to index in path
+    visited: HashMap<usize, usize>,
+    /// Path from root: (property_key, object_ptr, is_array)
+    path: Vec<(String, usize, bool)>,
+}
+
+impl CircularTracker {
+    fn new() -> Self {
+        Self {
+            visited: HashMap::new(),
+            path: Vec::new(),
+        }
+    }
+
+    /// Try to enter an object. Returns Err with formatted message if circular.
+    fn enter(&mut self, key: &str, ptr: usize, is_array: bool) -> Result<(), String> {
+        if let Some(&cycle_start) = self.visited.get(&ptr) {
+            return Err(self.format_circular_error(key, cycle_start));
+        }
+        let idx = self.path.len();
+        self.visited.insert(ptr, idx);
+        self.path.push((key.to_string(), ptr, is_array));
+        Ok(())
+    }
+
+    /// Exit an object (after serialization)
+    fn exit(&mut self, ptr: usize) {
+        self.visited.remove(&ptr);
+        self.path.pop();
+    }
+
+    /// Format a circular reference error message like Node.js/Chrome
+    fn format_circular_error(&self, closing_key: &str, cycle_start: usize) -> String {
+        let mut msg = String::from("Converting circular structure to JSON");
+
+        if self.path.is_empty() {
+            return msg;
+        }
+
+        // Get the starting object info
+        let (start_key, _, start_is_array) = &self.path[cycle_start];
+        let start_type = if *start_is_array { "Array" } else { "Object" };
+
+        if cycle_start == 0 {
+            msg.push_str(&format!(
+                "\n    --> starting at object with constructor '{}'",
+                start_type
+            ));
+        } else {
+            msg.push_str(&format!(
+                "\n    --> starting at object with constructor '{}' (property '{}')",
+                start_type, start_key
+            ));
+        }
+
+        // Show intermediate path if there is one
+        for i in (cycle_start + 1)..self.path.len() {
+            let (key, _, is_array) = &self.path[i];
+            let obj_type = if *is_array { "Array" } else { "Object" };
+            msg.push_str(&format!(
+                "\n    |     property '{}' -> object with constructor '{}'",
+                key, obj_type
+            ));
+        }
+
+        // Show the closing property
+        msg.push_str(&format!(
+            "\n    --- property '{}' closes the circle",
+            closing_key
+        ));
+
+        msg
+    }
+}
 
 /// Convert serde_json::Value to JavaScript Value
 /// object_proto and array_proto are used to set proper prototypes on created objects
@@ -125,10 +203,35 @@ fn escape_json_string_utf16(units: &[u16]) -> String {
     result
 }
 
-/// Format a number for JSON output
+/// Format a number for JSON output (NaN and Infinity become "null")
 fn format_number(n: f64) -> String {
     if n.is_nan() || n.is_infinite() {
         return "null".to_string();
+    }
+    // Check if it's a whole number within safe integer range
+    if n.fract() == 0.0 && n.abs() < 9007199254740992.0 {
+        format!("{}", n as i64)
+    } else {
+        format!("{}", n)
+    }
+}
+
+/// Format a number as a property key (JavaScript ToString semantics)
+/// Unlike JSON serialization, ToString preserves NaN, Infinity, -Infinity
+fn number_to_property_key(n: f64) -> String {
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n.is_sign_positive() {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        };
+    }
+    // Handle -0 specially (becomes "0")
+    if n == 0.0 {
+        return "0".to_string();
     }
     // Check if it's a whole number within safe integer range
     if n.fract() == 0.0 && n.abs() < 9007199254740992.0 {
@@ -181,17 +284,18 @@ fn format_object(items: &[(String, String)], indent: &Option<String>, depth: usi
 }
 
 /// Call toJSON method on value if it exists
+/// Note: Does NOT throw for BigInt - that's handled after the replacer is called
 fn call_to_json(value: &Value, key: &str, ncx: &mut NativeContext) -> Result<Value, VmError> {
     // Check if value has toJSON method
     if let Some(obj) = value.as_object().or_else(|| value.as_array()) {
-        if let Some(to_json) = obj.get(&PropertyKey::string("toJSON")) {
-            if to_json.is_callable() {
-                let key_val = Value::string(JsString::intern(key));
-                return ncx.call_function(&to_json, value.clone(), &[key_val]);
-            }
+        // Use get_property_value to properly invoke getter accessors
+        let to_json = get_property_value(&obj, &PropertyKey::string("toJSON"), value, ncx)?;
+        if to_json.is_callable() {
+            let key_val = Value::string(JsString::intern(key));
+            return ncx.call_function(&to_json, value.clone(), &[key_val]);
         }
     }
-    // For BigInt, check BigInt.prototype.toJSON
+    // For BigInt, check BigInt.prototype.toJSON (but don't throw if not present)
     if value.is_bigint() {
         // Try to get BigInt.prototype from global
         let global = ncx.ctx.global();
@@ -199,20 +303,24 @@ fn call_to_json(value: &Value, key: &str, ncx: &mut NativeContext) -> Result<Val
             if let Some(bigint_ctor_obj) = bigint_ctor.as_object() {
                 if let Some(bigint_proto) = bigint_ctor_obj.get(&PropertyKey::string("prototype")) {
                     if let Some(proto_obj) = bigint_proto.as_object() {
-                        if let Some(to_json) = proto_obj.get(&PropertyKey::string("toJSON")) {
-                            if to_json.is_callable() {
-                                let key_val = Value::string(JsString::intern(key));
-                                return ncx.call_function(&to_json, value.clone(), &[key_val]);
-                            }
+                        // Use get_property_value to invoke getter accessors
+                        // The receiver should be the BigInt value itself for proper `this` binding
+                        let to_json = get_property_value(
+                            &proto_obj,
+                            &PropertyKey::string("toJSON"),
+                            value,
+                            ncx,
+                        )?;
+                        if to_json.is_callable() {
+                            let key_val = Value::string(JsString::intern(key));
+                            return ncx.call_function(&to_json, value.clone(), &[key_val]);
                         }
                     }
                 }
             }
         }
-        // BigInt without toJSON should throw TypeError
-        return Err(VmError::type_error(
-            "Do not know how to serialize a BigInt",
-        ));
+        // Don't throw here - let the replacer have a chance first
+        // The BigInt error is thrown in stringify_with_replacer after the replacer call
     }
     Ok(value.clone())
 }
@@ -230,6 +338,29 @@ fn call_replacer(
         return ncx.call_function(replacer, holder.clone(), &[key_val, value]);
     }
     Ok(value)
+}
+
+/// Check if value is an array (including through proxies)
+/// Per ES spec, IsArray recursively unwraps proxies to check the target
+fn is_array_value(value: &Value) -> Result<bool, VmError> {
+    // Direct array check
+    if value.as_array().is_some() {
+        return Ok(true);
+    }
+    // Object with is_array flag
+    if let Some(obj) = value.as_object() {
+        if obj.is_array() {
+            return Ok(true);
+        }
+    }
+    // Proxy: recursively check target
+    if let Some(proxy) = value.as_proxy() {
+        let target = proxy.target().ok_or_else(|| {
+            VmError::type_error("Cannot perform 'IsArray' on a proxy that has been revoked")
+        })?;
+        return is_array_value(&target);
+    }
+    Ok(false)
 }
 
 /// Get property value from object, properly invoking accessor getters
@@ -260,7 +391,34 @@ fn get_property_value(
     }
 }
 
-/// Unwrap Number/String/Boolean wrapper objects
+/// Convert a value to usize using ToNumber semantics (may throw)
+fn value_to_usize(value: &Value, ncx: &mut NativeContext) -> Result<usize, VmError> {
+    // Fast path for primitives
+    if let Some(n) = value.as_int32() {
+        return Ok(n.max(0) as usize);
+    }
+    if let Some(n) = value.as_number() {
+        return Ok((n.max(0.0) as usize).min(usize::MAX));
+    }
+    // For objects, call valueOf to convert to number
+    if let Some(obj) = value.as_object() {
+        if let Some(value_of) = obj.get(&PropertyKey::string("valueOf")) {
+            if value_of.is_callable() {
+                let result = ncx.call_function(&value_of, Value::object(obj.clone()), &[])?;
+                if let Some(n) = result.as_int32() {
+                    return Ok(n.max(0) as usize);
+                }
+                if let Some(n) = result.as_number() {
+                    return Ok((n.max(0.0) as usize).min(usize::MAX));
+                }
+            }
+        }
+    }
+    // Default to 0 for other cases
+    Ok(0)
+}
+
+/// Unwrap Number/String/Boolean wrapper objects (simple version, no function calls)
 fn unwrap_primitive(value: &Value) -> Value {
     if let Some(obj) = value.as_object() {
         // Check for __value__ (Number and Boolean wrapper - both use __value__)
@@ -281,12 +439,53 @@ fn unwrap_primitive(value: &Value) -> Value {
     value.clone()
 }
 
+/// Unwrap wrapper objects per ES spec - calls ToString for String wrappers, ToNumber for Number wrappers
+fn unwrap_primitive_with_calls(value: &Value, ncx: &mut NativeContext) -> Result<Value, VmError> {
+    if let Some(obj) = value.as_object() {
+        // Check for [[StringData]] (String wrapper) - call ToString
+        if obj.get(&PropertyKey::string("__primitiveValue__")).is_some() {
+            if let Some(to_string) = obj.get(&PropertyKey::string("toString")) {
+                if to_string.is_callable() {
+                    return ncx.call_function(&to_string, value.clone(), &[]);
+                }
+            }
+            // Fallback to primitive value
+            if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
+                if prim.as_string().is_some() {
+                    return Ok(prim);
+                }
+            }
+        }
+        // Check for [[NumberData]] (Number wrapper) - call valueOf (ToNumber)
+        if let Some(prim) = obj.get(&PropertyKey::string("__value__")) {
+            if prim.as_number().is_some() || prim.as_int32().is_some() {
+                // Call valueOf to get the number
+                if let Some(value_of) = obj.get(&PropertyKey::string("valueOf")) {
+                    if value_of.is_callable() {
+                        return ncx.call_function(&value_of, value.clone(), &[]);
+                    }
+                }
+                // Fallback to primitive value
+                return Ok(prim);
+            }
+        }
+        // Check for [[BooleanData]] (Boolean wrapper)
+        if let Some(prim) = obj.get(&PropertyKey::string("__value__")) {
+            if prim.as_boolean().is_some() {
+                return Ok(prim);
+            }
+        }
+    }
+    Ok(value.clone())
+}
+
 /// Serialize a value to JSON string (without toJSON/replacer handling)
 fn serialize_value_simple(
     value: &Value,
+    key: &str,
     indent: &Option<String>,
     property_list: &Option<Vec<String>>,
-    stack: &mut HashSet<usize>,
+    tracker: &mut CircularTracker,
     depth: usize,
     ncx: &mut NativeContext,
 ) -> Result<Option<String>, VmError> {
@@ -330,17 +529,14 @@ fn serialize_value_simple(
         return Ok(Some(format!("\"{}\"", escape_json_string_utf16(s.as_utf16()))));
     }
 
-    // Check for array first (both HeapRef::Array and objects with is_array flag)
-    let is_array =
-        value.as_array().is_some() || value.as_object().map(|o| o.is_array()).unwrap_or(false);
-
-    if is_array {
-        return serialize_array_simple(value, indent, property_list, stack, depth, ncx);
+    // Check for array (including proxy arrays)
+    if is_array_value(value)? {
+        return serialize_array_simple(value, key, indent, property_list, tracker, depth, ncx);
     }
 
     // Regular object
     if value.as_object().is_some() {
-        return serialize_object_simple(value, indent, property_list, stack, depth, ncx);
+        return serialize_object_simple(value, key, indent, property_list, tracker, depth, ncx);
     }
 
     // Default to null for unknown types
@@ -350,9 +546,10 @@ fn serialize_value_simple(
 /// Serialize an array (simple version, no toJSON/replacer)
 fn serialize_array_simple(
     value: &Value,
+    key: &str,
     indent: &Option<String>,
     property_list: &Option<Vec<String>>,
-    stack: &mut HashSet<usize>,
+    tracker: &mut CircularTracker,
     depth: usize,
     ncx: &mut NativeContext,
 ) -> Result<Option<String>, VmError> {
@@ -363,10 +560,9 @@ fn serialize_array_simple(
 
     // Check for circular reference
     let ptr = obj.as_ptr() as usize;
-    if stack.contains(&ptr) {
-        return Err(VmError::type_error("Converting circular structure to JSON"));
+    if let Err(msg) = tracker.enter(key, ptr, true) {
+        return Err(VmError::type_error(msg));
     }
-    stack.insert(ptr);
 
     let len = obj
         .get(&PropertyKey::string("length"))
@@ -384,22 +580,24 @@ fn serialize_array_simple(
             .get(&PropertyKey::Index(i as u32))
             .unwrap_or(Value::undefined());
         let elem = unwrap_primitive(&elem);
-        match serialize_value_simple(&elem, indent, property_list, stack, depth + 1, ncx)? {
+        let elem_key = i.to_string();
+        match serialize_value_simple(&elem, &elem_key, indent, property_list, tracker, depth + 1, ncx)? {
             Some(s) => items.push(s),
             None => items.push("null".to_string()),
         }
     }
 
-    stack.remove(&ptr);
+    tracker.exit(ptr);
     Ok(Some(format_array(&items, indent, depth)))
 }
 
 /// Serialize an object (simple version, no toJSON/replacer)
 fn serialize_object_simple(
     value: &Value,
+    obj_key: &str,
     indent: &Option<String>,
     property_list: &Option<Vec<String>>,
-    stack: &mut HashSet<usize>,
+    tracker: &mut CircularTracker,
     depth: usize,
     ncx: &mut NativeContext,
 ) -> Result<Option<String>, VmError> {
@@ -409,10 +607,9 @@ fn serialize_object_simple(
 
     // Check for circular reference
     let ptr = obj.as_ptr() as usize;
-    if stack.contains(&ptr) {
-        return Err(VmError::type_error("Converting circular structure to JSON"));
+    if let Err(msg) = tracker.enter(obj_key, ptr, false) {
+        return Err(VmError::type_error(msg));
     }
-    stack.insert(ptr);
 
     // Get keys - either from property_list (replacer array) or from object
     // Include enumerable own properties (both string keys and integer indices)
@@ -453,14 +650,14 @@ fn serialize_object_simple(
         if let Some(val) = obj.get(&PropertyKey::string(&key)) {
             let val = unwrap_primitive(&val);
             if let Some(json_val) =
-                serialize_value_simple(&val, indent, property_list, stack, depth + 1, ncx)?
+                serialize_value_simple(&val, &key, indent, property_list, tracker, depth + 1, ncx)?
             {
                 items.push((key, json_val));
             }
         }
     }
 
-    stack.remove(&ptr);
+    tracker.exit(ptr);
     Ok(Some(format_object(&items, indent, depth)))
 }
 
@@ -471,7 +668,7 @@ fn stringify_with_replacer(
     replacer_fn: &Option<Value>,
     indent: &Option<String>,
     property_list: &Option<Vec<String>>,
-    stack: &mut HashSet<usize>,
+    tracker: &mut CircularTracker,
     depth: usize,
     ncx: &mut NativeContext,
 ) -> Result<Option<String>, VmError> {
@@ -481,13 +678,17 @@ fn stringify_with_replacer(
     }
 
     // Step 1: Get value from holder (properly invoking getters)
+    let (prop_key, key_value) = if let Ok(idx) = key.parse::<u32>() {
+        // For numeric keys, pass as number so Reflect.get works correctly with arrays
+        (PropertyKey::Index(idx), Value::int32(idx as i32))
+    } else {
+        (PropertyKey::string(key), Value::string(JsString::intern(key)))
+    };
     let value = if let Some(obj) = holder.as_object().or_else(|| holder.as_array()) {
-        let prop_key = if let Ok(idx) = key.parse::<u32>() {
-            PropertyKey::Index(idx)
-        } else {
-            PropertyKey::string(key)
-        };
         get_property_value(&obj, &prop_key, holder, ncx)?
+    } else if let Some(proxy) = holder.as_proxy() {
+        // For proxies, invoke the get trap
+        crate::proxy_operations::proxy_get(ncx, proxy, &prop_key, key_value, holder.clone())?
     } else {
         return Ok(None);
     };
@@ -498,8 +699,8 @@ fn stringify_with_replacer(
     // Step 3: Call replacer function if present
     let value = call_replacer(replacer_fn, holder, key, value, ncx)?;
 
-    // Step 4: Unwrap wrapper objects
-    let value = unwrap_primitive(&value);
+    // Step 4: Unwrap wrapper objects (calls ToString for String wrappers per spec)
+    let value = unwrap_primitive_with_calls(&value, ncx)?;
 
     // Step 5: Serialize based on type
     // undefined, functions, symbols return None (omitted)
@@ -537,30 +738,29 @@ fn stringify_with_replacer(
         return Ok(Some(format!("\"{}\"", escape_json_string_utf16(s.as_utf16()))));
     }
 
-    // Check for array
-    let is_array =
-        value.as_array().is_some() || value.as_object().map(|o| o.is_array()).unwrap_or(false);
-
-    if is_array {
+    // Check for array (including proxy arrays)
+    if is_array_value(&value)? {
         return stringify_array_with_replacer(
             &value,
+            key,
             replacer_fn,
             indent,
             property_list,
-            stack,
+            tracker,
             depth,
             ncx,
         );
     }
 
-    // Regular object
-    if value.as_object().is_some() {
+    // Regular object or proxy
+    if value.as_object().is_some() || value.as_proxy().is_some() {
         return stringify_object_with_replacer(
             &value,
+            key,
             replacer_fn,
             indent,
             property_list,
-            stack,
+            tracker,
             depth,
             ncx,
         );
@@ -572,32 +772,47 @@ fn stringify_with_replacer(
 /// Stringify array with replacer support
 fn stringify_array_with_replacer(
     value: &Value,
+    arr_key: &str,
     replacer_fn: &Option<Value>,
     indent: &Option<String>,
     property_list: &Option<Vec<String>>,
-    stack: &mut HashSet<usize>,
+    tracker: &mut CircularTracker,
     depth: usize,
     ncx: &mut NativeContext,
 ) -> Result<Option<String>, VmError> {
-    let obj = value
-        .as_array()
-        .or_else(|| value.as_object())
-        .ok_or_else(|| VmError::type_error("Expected array"))?;
+    // Get pointer for circular reference checking
+    // Works for arrays, objects, and proxies
+    let ptr = if let Some(obj) = value.as_array().or_else(|| value.as_object()) {
+        obj.as_ptr() as usize
+    } else if let Some(proxy) = value.as_proxy() {
+        proxy.as_ptr() as usize
+    } else {
+        return Err(VmError::type_error("Expected array"));
+    };
 
-    let ptr = obj.as_ptr() as usize;
-    if stack.contains(&ptr) {
-        return Err(VmError::type_error("Converting circular structure to JSON"));
+    if let Err(msg) = tracker.enter(arr_key, ptr, true) {
+        return Err(VmError::type_error(msg));
     }
-    stack.insert(ptr);
 
-    let len = obj
-        .get(&PropertyKey::string("length"))
-        .and_then(|v| {
-            v.as_int32()
-                .map(|i| i as usize)
-                .or_else(|| v.as_number().map(|n| n as usize))
-        })
-        .unwrap_or(0);
+    // Get length - use property access that works for both objects and proxies
+    let length_key = PropertyKey::string("length");
+    let length_val = if let Some(obj) = value.as_array().or_else(|| value.as_object()) {
+        obj.get(&length_key).unwrap_or(Value::int32(0))
+    } else if let Some(proxy) = value.as_proxy() {
+        // For proxies, invoke the get trap
+        crate::proxy_operations::proxy_get(
+            ncx,
+            proxy,
+            &length_key,
+            Value::string(JsString::intern("length")),
+            value.clone(),
+        )?
+    } else {
+        Value::int32(0)
+    };
+
+    // Convert length to number using ToNumber semantics (may throw)
+    let len = value_to_usize(&length_val, ncx)?;
 
     let mut items = Vec::with_capacity(len);
 
@@ -609,7 +824,7 @@ fn stringify_array_with_replacer(
             replacer_fn,
             indent,
             property_list,
-            stack,
+            tracker,
             depth + 1,
             ncx,
         )? {
@@ -618,61 +833,81 @@ fn stringify_array_with_replacer(
         }
     }
 
-    stack.remove(&ptr);
+    tracker.exit(ptr);
     Ok(Some(format_array(&items, indent, depth)))
 }
 
 /// Stringify object with replacer support
 fn stringify_object_with_replacer(
     value: &Value,
+    obj_key: &str,
     replacer_fn: &Option<Value>,
     indent: &Option<String>,
     property_list: &Option<Vec<String>>,
-    stack: &mut HashSet<usize>,
+    tracker: &mut CircularTracker,
     depth: usize,
     ncx: &mut NativeContext,
 ) -> Result<Option<String>, VmError> {
-    let obj = value
-        .as_object()
-        .ok_or_else(|| VmError::type_error("Expected object"))?;
-
-    let ptr = obj.as_ptr() as usize;
-    if stack.contains(&ptr) {
-        return Err(VmError::type_error("Converting circular structure to JSON"));
-    }
-    stack.insert(ptr);
-
-    // Get keys - include enumerable own properties (both string keys and integer indices)
-    // Per spec, integer indices come first in numeric order, then string keys in insertion order
-    let keys: Vec<String> = if let Some(list) = property_list {
-        list.clone()
+    // Get pointer for circular reference checking - works for objects and proxies
+    let (ptr, keys) = if let Some(obj) = value.as_object() {
+        let ptr = obj.as_ptr() as usize;
+        // Get keys - include enumerable own properties (both string keys and integer indices)
+        // Per spec, integer indices come first in numeric order, then string keys in insertion order
+        let keys: Vec<String> = if let Some(list) = property_list {
+            list.clone()
+        } else {
+            obj.own_keys()
+                .into_iter()
+                .filter_map(|k| {
+                    // Check if property is enumerable
+                    // Note: own_keys() may return Index(i) for properties stored as String("i")
+                    // so we need to check both forms
+                    let desc = obj.get_own_property_descriptor(&k).or_else(|| {
+                        if let PropertyKey::Index(i) = &k {
+                            obj.get_own_property_descriptor(&PropertyKey::string(&i.to_string()))
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(desc) = desc {
+                        if desc.enumerable() {
+                            return match &k {
+                                PropertyKey::String(s) => Some(s.as_str().to_string()),
+                                PropertyKey::Index(i) => Some(i.to_string()),
+                                PropertyKey::Symbol(_) => None, // Symbols are not included in JSON
+                            };
+                        }
+                    }
+                    None
+                })
+                .collect()
+        };
+        (ptr, keys)
+    } else if let Some(proxy) = value.as_proxy() {
+        let ptr = proxy.as_ptr() as usize;
+        // For proxies, use the property list if available, otherwise use proxy ownKeys trap
+        let keys: Vec<String> = if let Some(list) = property_list {
+            list.clone()
+        } else {
+            // Get keys from proxy using ownKeys trap
+            let proxy_keys = crate::proxy_operations::proxy_own_keys(ncx, proxy)?;
+            proxy_keys
+                .into_iter()
+                .filter_map(|k| match k {
+                    PropertyKey::String(s) => Some(s.as_str().to_string()),
+                    PropertyKey::Index(i) => Some(i.to_string()),
+                    PropertyKey::Symbol(_) => None,
+                })
+                .collect()
+        };
+        (ptr, keys)
     } else {
-        obj.own_keys()
-            .into_iter()
-            .filter_map(|k| {
-                // Check if property is enumerable
-                // Note: own_keys() may return Index(i) for properties stored as String("i")
-                // so we need to check both forms
-                let desc = obj.get_own_property_descriptor(&k).or_else(|| {
-                    if let PropertyKey::Index(i) = &k {
-                        obj.get_own_property_descriptor(&PropertyKey::string(&i.to_string()))
-                    } else {
-                        None
-                    }
-                });
-                if let Some(desc) = desc {
-                    if desc.enumerable() {
-                        return match &k {
-                            PropertyKey::String(s) => Some(s.as_str().to_string()),
-                            PropertyKey::Index(i) => Some(i.to_string()),
-                            PropertyKey::Symbol(_) => None, // Symbols are not included in JSON
-                        };
-                    }
-                }
-                None
-            })
-            .collect()
+        return Err(VmError::type_error("Expected object"));
     };
+
+    if let Err(msg) = tracker.enter(obj_key, ptr, false) {
+        return Err(VmError::type_error(msg));
+    }
 
     let mut items = Vec::new();
 
@@ -683,7 +918,7 @@ fn stringify_object_with_replacer(
             replacer_fn,
             indent,
             property_list,
-            stack,
+            tracker,
             depth + 1,
             ncx,
         )? {
@@ -691,12 +926,16 @@ fn stringify_object_with_replacer(
         }
     }
 
-    stack.remove(&ptr);
+    tracker.exit(ptr);
     Ok(Some(format_object(&items, indent, depth)))
 }
 
 /// Create and install JSON namespace on global object
-pub fn install_json_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManager>) {
+pub fn install_json_namespace(
+    global: GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+    function_prototype: GcRef<JsObject>,
+) {
     let json_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
     // JSON.parse(text, reviver?) — §25.5.1
@@ -770,6 +1009,8 @@ pub fn install_json_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManager>) 
         mm.clone(),
     );
     if let Some(obj) = parse_fn.as_object() {
+        // Set Function.prototype as prototype
+        obj.set_prototype(Value::object(function_prototype));
         obj.define_property(
             PropertyKey::string("length"),
             PropertyDescriptor::Data {
@@ -833,7 +1074,7 @@ pub fn install_json_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManager>) 
             wrapper.set(PropertyKey::string(""), val.clone());
             let wrapper_val = Value::object(wrapper);
 
-            let mut stack = HashSet::new();
+            let mut tracker = CircularTracker::new();
 
             // Serialize
             let result = stringify_with_replacer(
@@ -842,7 +1083,7 @@ pub fn install_json_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManager>) 
                 &replacer_fn,
                 &space_str,
                 &property_list,
-                &mut stack,
+                &mut tracker,
                 0,
                 ncx,
             )?;
@@ -855,6 +1096,8 @@ pub fn install_json_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManager>) 
         mm.clone(),
     );
     if let Some(obj) = stringify_fn.as_object() {
+        // Set Function.prototype as prototype
+        obj.set_prototype(Value::object(function_prototype));
         obj.define_property(
             PropertyKey::string("length"),
             PropertyDescriptor::Data {
@@ -906,6 +1149,71 @@ pub fn install_json_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManager>) 
     );
 }
 
+/// Get a property value from replacer (array or proxy), invoking accessor getters and proxy traps
+fn get_replacer_element(
+    replacer: &Value,
+    index: u32,
+    ncx: &mut NativeContext,
+) -> Result<Value, VmError> {
+    let key = PropertyKey::Index(index);
+    // Also try string key for accessor properties defined with string "0", "1", etc.
+    let str_key = PropertyKey::String(JsString::intern(&index.to_string()));
+
+    // For arrays/objects
+    if let Some(obj) = replacer.as_array().or_else(|| replacer.as_object()) {
+        // First check if there's an accessor property (could be defined on string key)
+        if let Some(PropertyDescriptor::Accessor { get, .. }) =
+            obj.get_own_property_descriptor(&str_key)
+        {
+            if let Some(getter) = get {
+                if getter.is_callable() {
+                    return ncx.call_function(&getter, replacer.clone(), &[]);
+                }
+            }
+            return Ok(Value::undefined());
+        }
+        // Otherwise use direct access
+        return Ok(obj.get(&key).unwrap_or(Value::undefined()));
+    }
+
+    // For proxies, use proxy_get to invoke the get trap
+    if let Some(proxy) = replacer.as_proxy() {
+        return crate::proxy_operations::proxy_get(
+            ncx,
+            proxy,
+            &key,
+            Value::int32(index as i32),
+            replacer.clone(),
+        );
+    }
+
+    Ok(Value::undefined())
+}
+
+/// Get length from replacer (array or proxy), converting to number (may throw)
+fn get_replacer_length(replacer: &Value, ncx: &mut NativeContext) -> Result<usize, VmError> {
+    let length_key = PropertyKey::string("length");
+
+    // Get the length value - either from object or proxy
+    let len_val = if let Some(obj) = replacer.as_array().or_else(|| replacer.as_object()) {
+        // Use obj.get() which has special handling for array "length"
+        obj.get(&length_key).unwrap_or(Value::int32(0))
+    } else if let Some(proxy) = replacer.as_proxy() {
+        crate::proxy_operations::proxy_get(
+            ncx,
+            proxy,
+            &length_key,
+            Value::string(JsString::intern("length")),
+            replacer.clone(),
+        )?
+    } else {
+        return Ok(0);
+    };
+
+    // Convert to number using ToNumber semantics (may throw for objects with throwing valueOf)
+    value_to_usize(&len_val, ncx)
+}
+
 /// Parse the replacer argument (can be function or array)
 /// Per spec, for objects with [[StringData]] or [[NumberData]], call ToString(v)
 fn parse_replacer(
@@ -920,43 +1228,35 @@ fn parse_replacer(
         return Ok((Some(r.clone()), None));
     }
 
-    // Check for array - either HeapRef::Array or object with is_array flag
-    let arr = r
-        .as_array()
-        .or_else(|| r.as_object().filter(|obj| obj.is_array()));
-    if let Some(arr) = arr {
-        let len = arr
-            .get(&PropertyKey::string("length"))
-            .and_then(|v| v.as_int32().or_else(|| v.as_number().map(|n| n as i32)))
-            .unwrap_or(0) as usize;
+    // Check for array - use is_array_value to handle proxies wrapping arrays
+    if is_array_value(r)? {
+        let len = get_replacer_length(r, ncx)?;
 
         let mut list = Vec::new();
         let mut seen = HashSet::new();
 
         for i in 0..len {
-            if let Some(item) = arr.get(&PropertyKey::Index(i as u32)) {
-                let key = if let Some(s) = item.as_string() {
-                    Some(s.as_str().to_string())
-                } else if let Some(n) = item.as_int32() {
-                    Some(n.to_string())
-                } else if let Some(n) = item.as_number() {
-                    Some(format_number(n))
-                } else if let Some(obj) = item.as_object() {
-                    // Check if it's a String or Number wrapper object
-                    let is_string_wrapper =
-                        obj.get(&PropertyKey::string("__primitiveValue__")).is_some();
-                    let is_number_wrapper = obj.get(&PropertyKey::string("__value__")).is_some();
+            let item = get_replacer_element(r, i as u32, ncx)?;
 
-                    if is_string_wrapper || is_number_wrapper {
-                        // Per spec: call ToString(v) for both String and Number wrappers
-                        if let Some(to_string) = obj.get(&PropertyKey::string("toString")) {
-                            if to_string.is_callable() {
-                                let result =
-                                    ncx.call_function(&to_string, Value::object(obj), &[])?;
-                                result.as_string().map(|s| s.as_str().to_string())
-                            } else {
-                                None
-                            }
+            let key = if let Some(s) = item.as_string() {
+                Some(s.as_str().to_string())
+            } else if let Some(n) = item.as_int32() {
+                Some(n.to_string())
+            } else if let Some(n) = item.as_number() {
+                // Use JavaScript ToString semantics for property keys (preserves NaN, Infinity)
+                Some(number_to_property_key(n))
+            } else if let Some(obj) = item.as_object() {
+                // Check if it's a String or Number wrapper object
+                let is_string_wrapper =
+                    obj.get(&PropertyKey::string("__primitiveValue__")).is_some();
+                let is_number_wrapper = obj.get(&PropertyKey::string("__value__")).is_some();
+
+                if is_string_wrapper || is_number_wrapper {
+                    // Per spec: call ToString(v) for both String and Number wrappers
+                    if let Some(to_string) = obj.get(&PropertyKey::string("toString")) {
+                        if to_string.is_callable() {
+                            let result = ncx.call_function(&to_string, Value::object(obj), &[])?;
+                            result.as_string().map(|s| s.as_str().to_string())
                         } else {
                             None
                         }
@@ -965,13 +1265,15 @@ fn parse_replacer(
                     }
                 } else {
                     None
-                };
+                }
+            } else {
+                None
+            };
 
-                if let Some(k) = key {
-                    if !seen.contains(&k) {
-                        seen.insert(k.clone());
-                        list.push(k);
-                    }
+            if let Some(k) = key {
+                if !seen.contains(&k) {
+                    seen.insert(k.clone());
+                    list.push(k);
                 }
             }
         }
@@ -1078,45 +1380,38 @@ fn walk_reviver(
     reviver: &Value,
     ncx: &mut NativeContext,
 ) -> Result<Value, VmError> {
-    let value = if let Some(obj) = holder.as_object().or_else(|| holder.as_array()) {
-        if let Ok(idx) = key.parse::<u32>() {
-            obj.get(&PropertyKey::Index(idx))
-                .unwrap_or(Value::undefined())
-        } else {
-            obj.get(&PropertyKey::string(key))
-                .unwrap_or(Value::undefined())
-        }
-    } else {
-        return Ok(Value::undefined());
-    };
+    // Get value from holder
+    let value = get_reviver_value(holder, key, ncx)?;
 
-    // If value is array or object, recurse
-    if let Some(arr) = value.as_array() {
-        let len = arr
-            .get(&PropertyKey::string("length"))
-            .and_then(|v| v.as_int32())
-            .unwrap_or(0) as usize;
+    // If value is array, recurse into array elements
+    if is_array_for_reviver(&value, ncx)? {
+        let len = get_length_for_reviver(&value, ncx)?;
 
         for i in 0..len {
             let elem_key = i.to_string();
             let new_elem = walk_reviver(&value, &elem_key, reviver, ncx)?;
+            let prop_key = PropertyKey::Index(i as u32);
+            let key_val = Value::string(JsString::intern(&elem_key));
             if new_elem.is_undefined() {
                 // Delete the property
-                arr.delete(&PropertyKey::Index(i as u32));
+                delete_reviver_property(&value, &prop_key, key_val, ncx)?;
             } else {
-                arr.set(PropertyKey::Index(i as u32), new_elem);
+                // CreateDataProperty - triggers proxy defineProperty trap
+                create_data_property(&value, &prop_key, key_val, new_elem, ncx)?;
             }
         }
-    } else if let Some(obj) = value.as_object() {
-        let keys = obj.own_keys();
-        for k in keys {
-            if let PropertyKey::String(s) = &k {
-                let new_val = walk_reviver(&value, s.as_str(), reviver, ncx)?;
-                if new_val.is_undefined() {
-                    obj.delete(&k);
-                } else {
-                    obj.set(k, new_val);
-                }
+    } else if is_object_for_reviver(&value) {
+        // Get enumerable own property keys
+        let keys = get_enumerable_keys(&value, ncx)?;
+        for key_str in keys {
+            let new_val = walk_reviver(&value, &key_str, reviver, ncx)?;
+            let prop_key = PropertyKey::string(&key_str);
+            let key_val = Value::string(JsString::intern(&key_str));
+            if new_val.is_undefined() {
+                delete_reviver_property(&value, &prop_key, key_val, ncx)?;
+            } else {
+                // CreateDataProperty - triggers proxy defineProperty trap
+                create_data_property(&value, &prop_key, key_val, new_val, ncx)?;
             }
         }
     }
@@ -1124,4 +1419,149 @@ fn walk_reviver(
     // Call reviver
     let key_val = Value::string(JsString::intern(key));
     ncx.call_function(reviver, holder.clone(), &[key_val, value])
+}
+
+/// Get value from holder during reviver walk
+fn get_reviver_value(holder: &Value, key: &str, ncx: &mut NativeContext) -> Result<Value, VmError> {
+    let prop_key = if let Ok(idx) = key.parse::<u32>() {
+        PropertyKey::Index(idx)
+    } else {
+        PropertyKey::string(key)
+    };
+    let key_val = Value::string(JsString::intern(key));
+
+    if let Some(proxy) = holder.as_proxy() {
+        crate::proxy_operations::proxy_get(ncx, proxy, &prop_key, key_val, holder.clone())
+    } else if let Some(obj) = holder.as_object().or_else(|| holder.as_array()) {
+        Ok(obj.get(&prop_key).unwrap_or(Value::undefined()))
+    } else {
+        Ok(Value::undefined())
+    }
+}
+
+/// Check if value is an array (handles proxies)
+fn is_array_for_reviver(value: &Value, ncx: &mut NativeContext) -> Result<bool, VmError> {
+    if let Some(proxy) = value.as_proxy() {
+        let target = proxy
+            .target()
+            .ok_or_else(|| VmError::type_error("Cannot check isArray on revoked proxy"))?;
+        return is_array_for_reviver(&target, ncx);
+    }
+    if let Some(obj) = value.as_object().or_else(|| value.as_array()) {
+        return Ok(obj.is_array());
+    }
+    Ok(false)
+}
+
+/// Check if value is an object (not array, handles proxies)
+fn is_object_for_reviver(value: &Value) -> bool {
+    if let Some(proxy) = value.as_proxy() {
+        if let Some(target) = proxy.target() {
+            return is_object_for_reviver(&target);
+        }
+        return false;
+    }
+    if value.as_array().is_some() {
+        return false;
+    }
+    value.as_object().is_some()
+}
+
+/// Get length for array during reviver walk
+fn get_length_for_reviver(value: &Value, ncx: &mut NativeContext) -> Result<usize, VmError> {
+    let length_key = PropertyKey::string("length");
+    let key_val = Value::string(JsString::intern("length"));
+
+    let len_val = if let Some(proxy) = value.as_proxy() {
+        crate::proxy_operations::proxy_get(ncx, proxy, &length_key, key_val, value.clone())?
+    } else if let Some(obj) = value.as_object().or_else(|| value.as_array()) {
+        obj.get(&length_key).unwrap_or(Value::int32(0))
+    } else {
+        return Ok(0);
+    };
+
+    value_to_usize(&len_val, ncx)
+}
+
+/// Get enumerable own property keys from object/proxy
+fn get_enumerable_keys(value: &Value, ncx: &mut NativeContext) -> Result<Vec<String>, VmError> {
+    // Helper to convert PropertyKey to string representation
+    fn key_to_string(k: PropertyKey) -> String {
+        match k {
+            PropertyKey::String(s) => s.as_str().to_string(),
+            PropertyKey::Index(i) => i.to_string(),
+            PropertyKey::Symbol(_) => String::new(), // Symbols not included in enumerable keys
+        }
+    }
+
+    if let Some(proxy) = value.as_proxy() {
+        // proxy_own_keys returns Vec<PropertyKey>
+        let keys = crate::proxy_operations::proxy_own_keys(ncx, proxy)?;
+        return Ok(keys
+            .into_iter()
+            .map(key_to_string)
+            .filter(|s| !s.is_empty())
+            .collect());
+    }
+    if let Some(obj) = value.as_object().or_else(|| value.as_array()) {
+        let keys = obj.own_keys();
+        return Ok(keys
+            .into_iter()
+            .map(key_to_string)
+            .filter(|s| !s.is_empty())
+            .collect());
+    }
+    Ok(Vec::new())
+}
+
+/// Delete property during reviver walk (handles proxies)
+fn delete_reviver_property(
+    value: &Value,
+    key: &PropertyKey,
+    key_val: Value,
+    ncx: &mut NativeContext,
+) -> Result<(), VmError> {
+    if let Some(proxy) = value.as_proxy() {
+        crate::proxy_operations::proxy_delete_property(ncx, proxy, key, key_val)?;
+    } else if let Some(obj) = value.as_object().or_else(|| value.as_array()) {
+        obj.delete(key);
+    }
+    Ok(())
+}
+
+/// CreateDataProperty - creates data property, triggering proxy traps if applicable
+/// Per spec, this fails silently for non-configurable properties
+fn create_data_property(
+    value: &Value,
+    key: &PropertyKey,
+    key_val: Value,
+    new_value: Value,
+    ncx: &mut NativeContext,
+) -> Result<(), VmError> {
+    if let Some(proxy) = value.as_proxy() {
+        // Use defineProperty trap to create data property
+        let desc = PropertyDescriptor::Data {
+            value: new_value,
+            attributes: PropertyAttributes {
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            },
+        };
+        crate::proxy_operations::proxy_define_property(ncx, proxy, key, key_val, &desc)?;
+    } else if let Some(obj) = value.as_object().or_else(|| value.as_array()) {
+        // Check if property is non-configurable - if so, CreateDataProperty fails silently
+        // We need to check both Index key and String key forms for array indices
+        let existing_desc = obj.get_own_property_descriptor(key);
+
+        if let Some(desc) = existing_desc {
+            if !desc.is_configurable() {
+                // Cannot redefine non-configurable property - fail silently
+                return Ok(());
+            }
+        }
+
+        obj.set(key.clone(), new_value);
+    }
+    Ok(())
 }

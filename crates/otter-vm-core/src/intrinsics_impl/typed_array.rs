@@ -34,8 +34,8 @@ pub fn init_typed_array_prototype(
     proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
-    symbol_iterator_id: u64,
-    symbol_to_string_tag_id: u64,
+    symbol_iterator: crate::gc::GcRef<crate::value::Symbol>,
+    symbol_to_string_tag: crate::gc::GcRef<crate::value::Symbol>,
 ) {
     // Getters (ES2026 §22.2.3.1-4)
     init_typed_array_getters(proto, fn_proto, mm);
@@ -44,11 +44,11 @@ pub fn init_typed_array_prototype(
     init_typed_array_methods(proto, fn_proto, mm);
 
     // Iterators (ES2026 §22.2.3.6, 11, 29, 31)
-    init_typed_array_iterators(proto, fn_proto, mm, symbol_iterator_id);
+    init_typed_array_iterators(proto, fn_proto, mm, symbol_iterator);
 
     // %TypedArray%.prototype[Symbol.toStringTag] = "TypedArray"
     proto.define_property(
-        PropertyKey::Symbol(symbol_to_string_tag_id),
+        PropertyKey::Symbol(symbol_to_string_tag),
         PropertyDescriptor::data_with_attrs(
             Value::string(JsString::intern("TypedArray")),
             PropertyAttributes {
@@ -66,11 +66,11 @@ pub fn init_typed_array_prototype(
 pub fn init_specific_typed_array_prototype(
     proto: GcRef<JsObject>,
     kind: TypedArrayKind,
-    symbol_to_string_tag_id: u64,
+    symbol_to_string_tag: crate::gc::GcRef<crate::value::Symbol>,
 ) {
     // Int8Array.prototype[Symbol.toStringTag] = "Int8Array"
     proto.define_property(
-        PropertyKey::Symbol(symbol_to_string_tag_id),
+        PropertyKey::Symbol(symbol_to_string_tag),
         PropertyDescriptor::data_with_attrs(
             Value::string(JsString::intern(kind.name())),
             PropertyAttributes {
@@ -545,7 +545,7 @@ fn init_typed_array_iterators(
     proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
-    symbol_iterator_id: u64,
+    symbol_iterator: crate::gc::GcRef<crate::value::Symbol>,
 ) {
     let fn_proto_clone1 = fn_proto;
     let fn_proto_clone2 = fn_proto;
@@ -616,7 +616,7 @@ fn init_typed_array_iterators(
 
     // %TypedArray%.prototype[Symbol.iterator] = %TypedArray%.prototype.values
     proto.define_property(
-        PropertyKey::Symbol(symbol_iterator_id),
+        PropertyKey::Symbol(symbol_iterator),
         PropertyDescriptor::builtin_method(values_method),
     );
 

@@ -64,7 +64,7 @@ fn to_property_key(value: &VmValue) -> PropertyKey {
         return PropertyKey::String(s);
     }
     if let Some(sym) = value.as_symbol() {
-        return PropertyKey::Symbol(sym.id);
+        return PropertyKey::Symbol(sym);
     }
     // Fallback: for primitives, create a string key
     // This is a simplified conversion - in full ES spec this would call ToString

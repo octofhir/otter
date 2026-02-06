@@ -970,6 +970,31 @@ impl JsObject {
             drop(flags);
             let mut dict = self.dictionary_properties.write();
             if let Some(map) = dict.as_mut() {
+                // If the property already exists, check writability and preserve attributes
+                if let Some(existing) = map.get(&key) {
+                    match &existing.desc {
+                        PropertyDescriptor::Data { attributes, .. } => {
+                            if !attributes.writable {
+                                return false; // Non-writable property
+                            }
+                            // Preserve existing attributes, only update value
+                            let attrs = *attributes;
+                            map.insert(key, PropertyEntry {
+                                desc: PropertyDescriptor::Data { value, attributes: attrs },
+                            });
+                            return true;
+                        }
+                        PropertyDescriptor::Accessor { .. } => {
+                            // For accessor properties, the set operation should call
+                            // the setter, but for now just return false
+                            return false;
+                        }
+                        PropertyDescriptor::Deleted => {
+                            // Deleted — treat as new property
+                        }
+                    }
+                }
+                // New property or deleted slot — use default attributes
                 let entry = PropertyEntry {
                     desc: PropertyDescriptor::data(value),
                 };

@@ -147,6 +147,9 @@ impl StructuredCloner {
                 Err(StructuredCloneError::NotCloneable("DataView"))
             }
 
+            Some(HeapRef::MapData(_)) => Err(StructuredCloneError::NotCloneable("MapData")),
+            Some(HeapRef::SetData(_)) => Err(StructuredCloneError::NotCloneable("SetData")),
+
             None => Ok(Value::undefined()),
         }
     }

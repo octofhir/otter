@@ -30,6 +30,7 @@ use crate::array_buffer::JsArrayBuffer;
 use crate::data_view::JsDataView;
 use crate::gc::GcRef;
 use crate::generator::JsGenerator;
+use crate::map_data::{MapData, SetData};
 use crate::object::JsObject;
 use crate::promise::JsPromise;
 use crate::proxy::JsProxy;
@@ -154,6 +155,10 @@ pub enum HeapRef {
     NativeFunction(GcRef<NativeFunctionObject>),
     /// RegExp
     RegExp(GcRef<JsRegExp>),
+    /// Map internal data
+    MapData(GcRef<MapData>),
+    /// Set internal data
+    SetData(GcRef<SetData>),
 }
 
 impl std::fmt::Debug for HeapRef {
@@ -174,6 +179,8 @@ impl std::fmt::Debug for HeapRef {
             HeapRef::SharedArrayBuffer(s) => f.debug_tuple("SharedArrayBuffer").field(s).finish(),
             HeapRef::NativeFunction(_) => f.debug_tuple("NativeFunction").finish(),
             HeapRef::RegExp(r) => f.debug_tuple("RegExp").field(r).finish(),
+            HeapRef::MapData(m) => f.debug_tuple("MapData").field(m).finish(),
+            HeapRef::SetData(s) => f.debug_tuple("SetData").field(s).finish(),
         }
     }
 }
@@ -476,6 +483,24 @@ impl Value {
         }
     }
 
+    /// Create Map internal data value
+    pub fn map_data(data: GcRef<MapData>) -> Self {
+        let ptr = data.as_ptr() as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::MapData(data)),
+        }
+    }
+
+    /// Create Set internal data value
+    pub fn set_data(data: GcRef<SetData>) -> Self {
+        let ptr = data.as_ptr() as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::SetData(data)),
+        }
+    }
+
     /// Create array value (GC-managed)
     pub fn array(arr: GcRef<JsObject>) -> Self {
         let ptr = arr.as_ptr() as u64;
@@ -714,7 +739,7 @@ impl Value {
         matches!(&self.heap_ref, Some(HeapRef::NativeFunction(_)))
     }
 
-    /// Check if value is callable (function or native function)
+    /// Check if value is callable (function, native function, or bound function)
     #[inline]
     pub fn is_callable(&self) -> bool {
         if self.is_function() || self.is_native_function() {
@@ -725,6 +750,12 @@ impl Value {
                 return target.is_callable();
             }
             return proxy.target_raw().is_callable();
+        }
+        // Bound functions are plain objects with __boundFunction__ property
+        if let Some(obj) = self.as_object() {
+            if obj.get(&crate::object::PropertyKey::string("__boundFunction__")).is_some() {
+                return true;
+            }
         }
         false
     }
@@ -837,6 +868,15 @@ impl Value {
         }
     }
 
+    /// Get the properties object of a native function, for setting `name`, `length`, etc.
+    /// Returns `None` if the value is not a `NativeFunction`.
+    pub fn native_function_object(&self) -> Option<GcRef<JsObject>> {
+        match &self.heap_ref {
+            Some(HeapRef::NativeFunction(f)) => Some(f.object),
+            _ => None,
+        }
+    }
+
     /// Get as promise
     pub fn as_promise(&self) -> Option<GcRef<JsPromise>> {
         match &self.heap_ref {
@@ -909,6 +949,22 @@ impl Value {
         }
     }
 
+    /// Get as Map internal data
+    pub fn as_map_data(&self) -> Option<GcRef<MapData>> {
+        match &self.heap_ref {
+            Some(HeapRef::MapData(m)) => Some(*m),
+            _ => None,
+        }
+    }
+
+    /// Get as Set internal data
+    pub fn as_set_data(&self) -> Option<GcRef<SetData>> {
+        match &self.heap_ref {
+            Some(HeapRef::SetData(s)) => Some(*s),
+            _ => None,
+        }
+    }
+
     /// Get the heap reference (for structured clone)
     #[doc(hidden)]
     pub fn heap_ref(&self) -> &Option<HeapRef> {
@@ -936,7 +992,9 @@ impl Value {
             | Some(HeapRef::ArrayBuffer(_))
             | Some(HeapRef::TypedArray(_))
             | Some(HeapRef::DataView(_))
-            | Some(HeapRef::SharedArrayBuffer(_)) => None,
+            | Some(HeapRef::SharedArrayBuffer(_))
+            | Some(HeapRef::MapData(_))
+            | Some(HeapRef::SetData(_)) => None,
             None => None,
         }
     }
@@ -997,7 +1055,9 @@ impl Value {
                     | HeapRef::ArrayBuffer(_)
                     | HeapRef::TypedArray(_)
                     | HeapRef::DataView(_)
-                    | HeapRef::SharedArrayBuffer(_),
+                    | HeapRef::SharedArrayBuffer(_)
+                    | HeapRef::MapData(_)
+                    | HeapRef::SetData(_),
                 ) => "object",
                 Some(HeapRef::Proxy(_)) => {
                     if self.is_callable() {
@@ -1058,6 +1118,8 @@ impl std::fmt::Debug for Value {
                 Some(HeapRef::SharedArrayBuffer(sab)) => {
                     write!(f, "SharedArrayBuffer({})", sab.byte_length())
                 }
+                Some(HeapRef::MapData(m)) => write!(f, "[MapData {:?}]", m),
+                Some(HeapRef::SetData(s)) => write!(f, "[SetData {:?}]", s),
                 None => write!(f, "<unknown>"),
             },
         }
@@ -1250,14 +1312,20 @@ impl Value {
                     p.target.trace(tracer);
                     p.handler.trace(tracer);
                 }
-                HeapRef::Symbol(_) => {
-                    // Symbol has no GC references (NEEDS_TRACE = false)
+                HeapRef::Symbol(s) => {
+                    tracer(s.header() as *const _);
                 }
-                HeapRef::BigInt(_) => {
-                    // BigInt has no GC references (NEEDS_TRACE = false)
+                HeapRef::BigInt(b) => {
+                    tracer(b.header() as *const _);
                 }
-                HeapRef::SharedArrayBuffer(_) => {
-                    // SharedArrayBuffer has no GC references (NEEDS_TRACE = false)
+                HeapRef::SharedArrayBuffer(sab) => {
+                    tracer(sab.header() as *const _);
+                }
+                HeapRef::MapData(m) => {
+                    otter_vm_gc::GcTraceable::trace(&**m, tracer);
+                }
+                HeapRef::SetData(s) => {
+                    otter_vm_gc::GcTraceable::trace(&**s, tracer);
                 }
                 // Other types use Arc, not GcRef, so no GC tracing needed
                 _ => {}

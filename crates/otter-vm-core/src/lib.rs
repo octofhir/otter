@@ -28,6 +28,7 @@ pub mod globals;
 pub mod interpreter;
 pub mod intrinsics_impl;
 pub mod intrinsics;
+pub mod map_data;
 pub mod memory;
 pub mod object;
 pub mod promise;

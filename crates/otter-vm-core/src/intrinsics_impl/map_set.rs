@@ -1,16 +1,18 @@
 //! Map, Set, WeakMap, and WeakSet constructor and prototype implementations
 //!
-//! Complete ES2026 implementation:
-//! - Map: constructor + 10 prototype methods + Symbol.toStringTag
-//! - Set: constructor + 10 prototype methods + 7 ES2025 set methods + Symbol.toStringTag
+//! ES2023 compliant implementation using proper SameValueZero semantics
+//! via `MapKey`, insertion-ordered storage with tombstone-based deletion
+//! for live iteration support.
+//!
+//! - Map: constructor (with iterable) + 10 prototype methods + Symbol.toStringTag
+//! - Set: constructor (with iterable) + 10 prototype methods + 7 ES2025 set methods + Symbol.toStringTag
 //! - WeakMap: constructor + 4 prototype methods + Symbol.toStringTag
 //! - WeakSet: constructor + 3 prototype methods + Symbol.toStringTag
-//!
-//! All methods use inline implementations for optimal performance.
-//! Internal storage uses the same pattern as `otter-vm-builtins/src/map.rs` and `set.rs`.
 
 use crate::error::VmError;
 use crate::gc::GcRef;
+use crate::intrinsics_impl::helpers::MapKey;
+use crate::map_data::{MapData, SetData};
 use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
@@ -18,138 +20,155 @@ use crate::value::Value;
 use std::sync::Arc;
 
 // ============================================================================
-// Internal storage keys (must match otter-vm-builtins/src/map.rs and set.rs)
+// Internal slot keys
 // ============================================================================
-const MAP_ENTRIES_KEY: &str = "__map_entries__";
-const MAP_SIZE_KEY: &str = "__map_size__";
+const MAP_DATA_KEY: &str = "__map_data__";
+const SET_DATA_KEY: &str = "__set_data__";
 const IS_MAP_KEY: &str = "__is_map__";
-const IS_WEAKMAP_KEY: &str = "__is_weakmap__";
-
-const SET_VALUES_KEY: &str = "__set_values__";
-const SET_SIZE_KEY: &str = "__set_size__";
 const IS_SET_KEY: &str = "__is_set__";
+const IS_WEAKMAP_KEY: &str = "__is_weakmap__";
 const IS_WEAKSET_KEY: &str = "__is_weakset__";
+const WEAKMAP_ENTRIES_KEY: &str = "__weakmap_entries__";
+const WEAKSET_ENTRIES_KEY: &str = "__weakset_entries__";
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
-/// Compute a hash key string for a value (for string-keyed internal storage).
-/// Must match `otter-vm-builtins/src/map.rs::value_to_key`.
-fn value_to_key(value: &Value) -> String {
-    if value.is_undefined() {
-        return "__undefined__".to_string();
-    }
-    if value.is_null() {
-        return "__null__".to_string();
-    }
-    if let Some(b) = value.as_boolean() {
-        return format!("__bool_{}__", b);
-    }
-    if let Some(n) = value.as_number() {
-        if n.is_nan() {
-            return "__nan__".to_string();
-        }
-        return format!("__num_{}__", n);
-    }
-    if let Some(s) = value.as_string() {
-        return format!("__str_{}__", s.as_str());
-    }
-    if let Some(sym) = value.as_symbol() {
-        return format!("__sym_{}__", sym.id);
-    }
-    if let Some(obj) = value.as_object() {
-        return format!("__obj_{:p}__", obj.as_ptr());
-    }
-    if let Some(func) = value.as_function() {
-        return format!("__func_{:p}__", func.as_ptr());
-    }
-    format!("__unknown_{:?}__", value)
-}
-
-/// Convert string to PropertyKey (intern for fast lookups).
 fn pk(s: &str) -> PropertyKey {
     PropertyKey::String(JsString::intern(s))
 }
 
-/// Verify an object is a Map (has `__is_map__` = true).
+/// Create a native function Value with proper `name`, `length`, and `__non_constructor` properties.
+/// Per ES2023 §10.2.8, built-in function objects have:
+///   - `length`: { [[Value]]: argCount, [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: true }
+///   - `name`: { [[Value]]: name, [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: true }
+/// Per ES2023 §17, built-in prototype methods do not have a [[Construct]] internal method.
+fn make_builtin<F>(
+    name: &str,
+    length: i32,
+    f: F,
+    mm: Arc<MemoryManager>,
+    fn_proto: GcRef<JsObject>,
+) -> Value
+where
+    F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
+        + Send
+        + Sync
+        + 'static,
+{
+    let val = Value::native_function_with_proto(f, mm, fn_proto);
+    if let Some(obj) = val.native_function_object() {
+        obj.define_property(
+            PropertyKey::string("length"),
+            PropertyDescriptor::function_length(Value::int32(length)),
+        );
+        obj.define_property(
+            PropertyKey::string("name"),
+            PropertyDescriptor::function_length(Value::string(JsString::intern(name))),
+        );
+        // Built-in prototype methods are not constructors (ES2023 §17)
+        obj.set(pk("__non_constructor"), Value::boolean(true));
+    }
+    val
+}
+
 fn is_map(obj: &GcRef<JsObject>) -> bool {
     obj.get(&pk(IS_MAP_KEY))
         .and_then(|v| v.as_boolean())
         == Some(true)
 }
 
-/// Verify an object is a Set (has `__is_set__` = true).
 fn is_set(obj: &GcRef<JsObject>) -> bool {
     obj.get(&pk(IS_SET_KEY))
         .and_then(|v| v.as_boolean())
         == Some(true)
 }
 
-/// Verify an object is a WeakMap.
 fn is_weakmap(obj: &GcRef<JsObject>) -> bool {
     obj.get(&pk(IS_WEAKMAP_KEY))
         .and_then(|v| v.as_boolean())
         == Some(true)
 }
 
-/// Verify an object is a WeakSet.
 fn is_weakset(obj: &GcRef<JsObject>) -> bool {
     obj.get(&pk(IS_WEAKSET_KEY))
         .and_then(|v| v.as_boolean())
         == Some(true)
 }
 
-/// Get the entries object from a Map/WeakMap.
-fn get_entries(obj: &GcRef<JsObject>) -> Option<GcRef<JsObject>> {
-    obj.get(&pk(MAP_ENTRIES_KEY))
-        .and_then(|v| v.as_object())
+fn get_map_data(obj: &GcRef<JsObject>) -> Option<GcRef<MapData>> {
+    obj.get(&pk(MAP_DATA_KEY)).and_then(|v| v.as_map_data())
 }
 
-/// Get the values object from a Set/WeakSet.
-fn get_set_values_obj(obj: &GcRef<JsObject>) -> Option<GcRef<JsObject>> {
-    obj.get(&pk(SET_VALUES_KEY))
-        .and_then(|v| v.as_object())
+fn get_set_data(obj: &GcRef<JsObject>) -> Option<GcRef<SetData>> {
+    obj.get(&pk(SET_DATA_KEY)).and_then(|v| v.as_set_data())
 }
 
-/// Get current size from a Map or Set.
-fn get_size(obj: &GcRef<JsObject>, key: &str) -> i32 {
-    obj.get(&pk(key))
-        .and_then(|v| v.as_int32())
-        .unwrap_or(0)
-}
-
-/// Check if a value is valid as a WeakMap/WeakSet key.
 fn is_valid_weak_key(value: &Value) -> bool {
     value.is_object() || value.is_symbol() || value.is_function()
 }
 
-/// Initialize Map internal slots on an object.
-fn init_map_slots(obj: &GcRef<JsObject>, mm: &Arc<MemoryManager>) {
-    let entries = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-    obj.set(pk(MAP_ENTRIES_KEY), Value::object(entries));
-    obj.set(pk(MAP_SIZE_KEY), Value::int32(0));
+/// Get a stable pointer key for WeakMap/WeakSet (object identity).
+fn weak_key_id(value: &Value) -> Option<usize> {
+    if let Some(obj) = value.as_object() {
+        Some(obj.as_ptr() as usize)
+    } else if let Some(arr) = value.as_array() {
+        Some(arr.as_ptr() as usize)
+    } else if let Some(f) = value.as_function() {
+        Some(f.as_ptr() as usize)
+    } else if let Some(sym) = value.as_symbol() {
+        // Registered symbols can be weak keys
+        Some(sym.as_ptr() as usize)
+    } else if let Some(p) = value.as_proxy() {
+        Some(p.as_ptr() as usize)
+    } else {
+        value.as_promise().map(|p| p.as_ptr() as usize)
+    }
+}
+
+fn init_map_slots(obj: &GcRef<JsObject>) {
+    let data = GcRef::new(MapData::new());
+    obj.set(pk(MAP_DATA_KEY), Value::map_data(data));
     obj.set(pk(IS_MAP_KEY), Value::boolean(true));
 }
 
-/// Initialize Set internal slots on an object.
-fn init_set_slots(obj: &GcRef<JsObject>, mm: &Arc<MemoryManager>) {
-    let values = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-    obj.set(pk(SET_VALUES_KEY), Value::object(values));
-    obj.set(pk(SET_SIZE_KEY), Value::int32(0));
+fn init_set_slots(obj: &GcRef<JsObject>) {
+    let data = GcRef::new(SetData::new());
+    obj.set(pk(SET_DATA_KEY), Value::set_data(data));
     obj.set(pk(IS_SET_KEY), Value::boolean(true));
 }
 
-// ============================================================================
-// Map.prototype
-// ============================================================================
+/// Require `this` to be a Map and extract its data.
+fn require_map(this_val: &Value, method: &str) -> Result<(GcRef<JsObject>, GcRef<MapData>), VmError> {
+    let obj = this_val
+        .as_object()
+        .ok_or_else(|| VmError::type_error(format!("Method Map.prototype.{} called on incompatible receiver", method)))?;
+    if !is_map(&obj) {
+        return Err(VmError::type_error(format!("Method Map.prototype.{} called on incompatible receiver", method)));
+    }
+    let data = get_map_data(&obj)
+        .ok_or_else(|| VmError::type_error("Map object missing internal data"))?;
+    Ok((obj, data))
+}
+
+/// Require `this` to be a Set and extract its data.
+fn require_set(this_val: &Value, method: &str) -> Result<(GcRef<JsObject>, GcRef<SetData>), VmError> {
+    let obj = this_val
+        .as_object()
+        .ok_or_else(|| VmError::type_error(format!("Method Set.prototype.{} called on incompatible receiver", method)))?;
+    if !is_set(&obj) {
+        return Err(VmError::type_error(format!("Method Set.prototype.{} called on incompatible receiver", method)));
+    }
+    let data = get_set_data(&obj)
+        .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
+    Ok((obj, data))
+}
 
 // ============================================================================
-// Map Iterator
+// Map Iterator (live iteration)
 // ============================================================================
 
-/// Create a Map iterator object following the array iterator pattern.
-/// Snapshots keys at creation for stable iteration.
 fn make_map_iterator(
     this_val: &Value,
     kind: &str,
@@ -157,141 +176,91 @@ fn make_map_iterator(
     fn_proto: GcRef<JsObject>,
     iter_proto: GcRef<JsObject>,
 ) -> Result<Value, VmError> {
-    let obj = this_val
-        .as_object()
-        .ok_or_else(|| VmError::type_error("Map iterator: this is not an object"))?;
-    if !is_map(&obj) {
-        return Err(VmError::type_error("Map iterator called on incompatible receiver"));
-    }
+    let (_obj, data) = require_map(this_val, "entries")?;
 
-    // Create iterator object with %IteratorPrototype% as prototype
     let iter = GcRef::new(JsObject::new(Value::object(iter_proto), mm.clone()));
+    // Store MapData reference for live iteration
+    iter.set(pk("__map_data_ref__"), Value::map_data(data));
+    iter.set(pk("__iter_index__"), Value::number(0.0));
+    iter.set(pk("__iter_kind__"), Value::string(JsString::intern(kind)));
 
-    // Store the map reference, snapshot keys, current index, and kind
-    iter.set(PropertyKey::string("__map_ref__"), Value::object(obj));
-    iter.set(PropertyKey::string("__iter_index__"), Value::number(0.0));
-    iter.set(
-        PropertyKey::string("__iter_kind__"),
-        Value::string(JsString::intern(kind)),
-    );
-
-    // Snapshot keys at iterator creation (for stable iteration)
-    let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
-    let keys_snapshot = GcRef::new(JsObject::array(0, mm.clone()));
-    let props = entries.own_keys();
-    let mut index = 0u32;
-    for prop in props {
-        if let Some(entry) = entries.get(&prop) {
-            if let Some(entry_obj) = entry.as_object() {
-                let key = entry_obj.get(&pk("k")).unwrap_or(Value::undefined());
-                keys_snapshot.set(PropertyKey::Index(index), key);
-                index += 1;
-            }
-        }
-    }
-    keys_snapshot.set(pk("length"), Value::int32(index as i32));
-    iter.set(PropertyKey::string("__iter_keys__"), Value::array(keys_snapshot));
-
-    // Define next() method
     let fn_proto_for_next = fn_proto;
+    let mm_for_next = mm;
     iter.define_property(
         PropertyKey::string("next"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "next",
+            0,
             |this_val, _args, ncx| {
                 let iter_obj = this_val
                     .as_object()
-                    .ok_or_else(|| "not an iterator object".to_string())?;
-                let map = iter_obj
-                    .get(&PropertyKey::string("__map_ref__"))
-                    .and_then(|v| v.as_object())
-                    .ok_or_else(|| "iterator: missing map ref".to_string())?;
-                let keys_snapshot = iter_obj
-                    .get(&PropertyKey::string("__iter_keys__"))
-                    .and_then(|v| v.as_object())
-                    .ok_or_else(|| "iterator: missing keys snapshot".to_string())?;
-                let len = keys_snapshot
-                    .get(&PropertyKey::string("length"))
-                    .and_then(|v| v.as_number())
-                    .unwrap_or(0.0) as usize;
+                    .ok_or_else(|| VmError::type_error("not an iterator object"))?;
+                let data = iter_obj
+                    .get(&pk("__map_data_ref__"))
+                    .and_then(|v| v.as_map_data())
+                    .ok_or_else(|| VmError::type_error("iterator: missing map data ref"))?;
                 let kind = iter_obj
-                    .get(&PropertyKey::string("__iter_kind__"))
+                    .get(&pk("__iter_kind__"))
                     .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
                     .unwrap_or_else(|| "entry".to_string());
 
-                // Loop to skip deleted entries
-                loop {
-                    let idx = iter_obj
-                        .get(&PropertyKey::string("__iter_index__"))
-                        .and_then(|v| v.as_number())
-                        .unwrap_or(0.0) as usize;
+                let mut idx = iter_obj
+                    .get(&pk("__iter_index__"))
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as usize;
 
-                    if idx >= len {
-                        // Done
+                // Scan forward, skipping tombstones
+                loop {
+                    let entries_len = data.entries_len();
+                    if idx >= entries_len {
                         let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                        result.set(PropertyKey::string("value"), Value::undefined());
-                        result.set(PropertyKey::string("done"), Value::boolean(true));
+                        result.set(pk("value"), Value::undefined());
+                        result.set(pk("done"), Value::boolean(true));
+                        // Park index at end
+                        iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
                         return Ok(Value::object(result));
                     }
 
-                    // Get key from snapshot
-                    let key = keys_snapshot
-                        .get(&PropertyKey::Index(idx as u32))
-                        .unwrap_or(Value::undefined());
+                    if let Some((key, value)) = data.entry_at(idx) {
+                        idx += 1;
+                        iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
 
-                    // Advance index
-                    iter_obj.set(
-                        PropertyKey::string("__iter_index__"),
-                        Value::number((idx + 1) as f64),
-                    );
-
-                    // Look up current value in live map (handle deleted entries)
-                    let entries = get_entries(&map).ok_or("Internal error: missing entries")?;
-                    let hash_key = value_to_key(&key);
-                    let entry_opt = entries.get(&pk(&hash_key));
-
-                    // If entry was deleted, continue to next iteration
-                    if entry_opt.is_none() {
-                        continue;
+                        let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                        match kind.as_str() {
+                            "key" => {
+                                result.set(pk("value"), key);
+                            }
+                            "entry" => {
+                                let entry = GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
+                                entry.set(PropertyKey::Index(0), key);
+                                entry.set(PropertyKey::Index(1), value);
+                                result.set(pk("value"), Value::array(entry));
+                            }
+                            _ => {
+                                // "value"
+                                result.set(pk("value"), value);
+                            }
+                        }
+                        result.set(pk("done"), Value::boolean(false));
+                        return Ok(Value::object(result));
+                    } else {
+                        // Tombstone, skip
+                        idx += 1;
                     }
-
-                    let entry_obj = entry_opt
-                        .and_then(|v| v.as_object())
-                        .ok_or_else(|| "invalid entry".to_string())?;
-                    let value = entry_obj.get(&pk("v")).unwrap_or(Value::undefined());
-
-                    let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                    match kind.as_str() {
-                        "key" => {
-                            result.set(PropertyKey::string("value"), key);
-                        }
-                        "entry" => {
-                            let entry = GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
-                            entry.set(PropertyKey::Index(0), key);
-                            entry.set(PropertyKey::Index(1), value);
-                            result.set(PropertyKey::string("value"), Value::array(entry));
-                        }
-                        _ => {
-                            // "value"
-                            result.set(PropertyKey::string("value"), value);
-                        }
-                    }
-                    result.set(PropertyKey::string("done"), Value::boolean(false));
-                    return Ok(Value::object(result));
                 }
             },
-            mm,
+            mm_for_next,
             fn_proto_for_next,
         )),
     );
     Ok(Value::object(iter))
 }
 
-/// Initialize Map.prototype with all ES2026 methods.
-///
-/// # Methods
-/// - get, set, has, delete, clear
-/// - size (getter-like), keys, values, entries, forEach
-/// - Symbol.toStringTag = "Map"
+// ============================================================================
+// Map.prototype
+// ============================================================================
+
+/// Initialize Map.prototype with all ES2023 methods.
 pub fn init_map_prototype(
     map_proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
@@ -302,23 +271,13 @@ pub fn init_map_prototype(
     // Map.prototype.get(key)
     map_proto.define_property(
         PropertyKey::string("get"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "get",
+            1,
             |this_val, args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.get called on incompatible receiver"))?;
-                if !is_map(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Map.prototype.get called on incompatible receiver"));
-                }
+                let (_, data) = require_map(this_val, "get")?;
                 let key = args.first().cloned().unwrap_or(Value::undefined());
-                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
-                let hash_key = value_to_key(&key);
-                if let Some(entry) = entries.get(&pk(&hash_key)) {
-                    if let Some(entry_obj) = entry.as_object() {
-                        return Ok(entry_obj.get(&pk("v")).unwrap_or(Value::undefined()));
-                    }
-                }
-                Ok(Value::undefined())
+                Ok(data.get(&MapKey(key)).unwrap_or(Value::undefined()))
             },
             mm.clone(),
             fn_proto,
@@ -328,30 +287,22 @@ pub fn init_map_prototype(
     // Map.prototype.set(key, value)
     map_proto.define_property(
         PropertyKey::string("set"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.set called on incompatible receiver"))?;
-                if !is_map(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Map.prototype.set called on incompatible receiver"));
-                }
+        PropertyDescriptor::builtin_method(make_builtin(
+            "set",
+            2,
+            |this_val, args, _ncx| {
+                let (_, data) = require_map(this_val, "set")?;
                 let key = args.first().cloned().unwrap_or(Value::undefined());
                 let value = args.get(1).cloned().unwrap_or(Value::undefined());
-                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
-                let hash_key = value_to_key(&key);
-                let is_new = entries.get(&pk(&hash_key)).is_none();
-
-                // Create entry object with k/v
-                let entry = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                entry.set(pk("k"), key);
-                entry.set(pk("v"), value);
-                entries.set(pk(&hash_key), Value::object(entry));
-
-                if is_new {
-                    let size = get_size(&obj, MAP_SIZE_KEY);
-                    obj.set(pk(MAP_SIZE_KEY), Value::int32(size + 1));
-                }
+                // Normalize -0 to +0 for keys (SameValueZero)
+                let normalized_key = if let Some(n) = key.as_number() {
+                    if n == 0.0 { Value::number(0.0) } else { key }
+                } else if let Some(i) = key.as_int32() {
+                    if i == 0 { Value::number(0.0) } else { key }
+                } else {
+                    key
+                };
+                data.set(MapKey(normalized_key), value);
                 Ok(this_val.clone())
             },
             mm.clone(),
@@ -362,18 +313,13 @@ pub fn init_map_prototype(
     // Map.prototype.has(key)
     map_proto.define_property(
         PropertyKey::string("has"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "has",
+            1,
             |this_val, args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.has called on incompatible receiver"))?;
-                if !is_map(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Map.prototype.has called on incompatible receiver"));
-                }
+                let (_, data) = require_map(this_val, "has")?;
                 let key = args.first().cloned().unwrap_or(Value::undefined());
-                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
-                let hash_key = value_to_key(&key);
-                Ok(Value::boolean(entries.get(&pk(&hash_key)).is_some()))
+                Ok(Value::boolean(data.has(&MapKey(key))))
             },
             mm.clone(),
             fn_proto,
@@ -383,26 +329,13 @@ pub fn init_map_prototype(
     // Map.prototype.delete(key)
     map_proto.define_property(
         PropertyKey::string("delete"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "delete",
+            1,
             |this_val, args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.delete called on incompatible receiver"))?;
-                if !is_map(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Map.prototype.delete called on incompatible receiver"));
-                }
+                let (_, data) = require_map(this_val, "delete")?;
                 let key = args.first().cloned().unwrap_or(Value::undefined());
-                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
-                let hash_key = value_to_key(&key);
-                if entries.get(&pk(&hash_key)).is_none() {
-                    return Ok(Value::boolean(false));
-                }
-                entries.delete(&pk(&hash_key));
-                let size = get_size(&obj, MAP_SIZE_KEY);
-                if size > 0 {
-                    obj.set(pk(MAP_SIZE_KEY), Value::int32(size - 1));
-                }
-                Ok(Value::boolean(true))
+                Ok(Value::boolean(data.delete(&MapKey(key))))
             },
             mm.clone(),
             fn_proto,
@@ -412,17 +345,12 @@ pub fn init_map_prototype(
     // Map.prototype.clear()
     map_proto.define_property(
         PropertyKey::string("clear"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.clear called on incompatible receiver"))?;
-                if !is_map(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Map.prototype.clear called on incompatible receiver"));
-                }
-                let new_entries = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                obj.set(pk(MAP_ENTRIES_KEY), Value::object(new_entries));
-                obj.set(pk(MAP_SIZE_KEY), Value::int32(0));
+        PropertyDescriptor::builtin_method(make_builtin(
+            "clear",
+            0,
+            |this_val, _args, _ncx| {
+                let (_, data) = require_map(this_val, "clear")?;
+                data.clear();
                 Ok(Value::undefined())
             },
             mm.clone(),
@@ -430,19 +358,16 @@ pub fn init_map_prototype(
         )),
     );
 
-    // Map.prototype.size (accessor getter per spec §24.1.3.10)
+    // Map.prototype.size (accessor getter)
     map_proto.define_property(
         PropertyKey::string("size"),
         PropertyDescriptor::Accessor {
-            get: Some(Value::native_function_with_proto(
+            get: Some(make_builtin(
+                "get size",
+                0,
                 |this_val, _args, _ncx| {
-                    let obj = this_val
-                        .as_object()
-                        .ok_or_else(|| crate::error::VmError::type_error("get Map.prototype.size called on incompatible receiver"))?;
-                    if !is_map(&obj) {
-                        return Err(crate::error::VmError::type_error("get Map.prototype.size called on incompatible receiver"));
-                    }
-                    Ok(Value::int32(get_size(&obj, MAP_SIZE_KEY)))
+                    let (_, data) = require_map(this_val, "size")?;
+                    Ok(Value::int32(data.size() as i32))
                 },
                 mm.clone(),
                 fn_proto,
@@ -456,13 +381,15 @@ pub fn init_map_prototype(
         },
     );
 
-    // Map.prototype.keys() - returns iterator
+    // Map.prototype.keys()
     let iter_proto_for_keys = iterator_proto;
     let mm_for_keys = mm.clone();
     let fn_proto_for_keys = fn_proto;
     map_proto.define_property(
         PropertyKey::string("keys"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "keys",
+            0,
             move |this_val, _args, ncx| {
                 make_map_iterator(this_val, "key", ncx.memory_manager().clone(), fn_proto_for_keys, iter_proto_for_keys)
             },
@@ -471,13 +398,15 @@ pub fn init_map_prototype(
         )),
     );
 
-    // Map.prototype.values() - returns iterator
+    // Map.prototype.values()
     let iter_proto_for_values = iterator_proto;
     let mm_for_values = mm.clone();
     let fn_proto_for_values = fn_proto;
     map_proto.define_property(
         PropertyKey::string("values"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "values",
+            0,
             move |this_val, _args, ncx| {
                 make_map_iterator(this_val, "value", ncx.memory_manager().clone(), fn_proto_for_values, iter_proto_for_values)
             },
@@ -486,13 +415,15 @@ pub fn init_map_prototype(
         )),
     );
 
-    // Map.prototype.entries() - returns iterator
+    // Map.prototype.entries()
     let iter_proto_for_entries = iterator_proto;
     let mm_for_entries = mm.clone();
     let fn_proto_for_entries = fn_proto;
     map_proto.define_property(
         PropertyKey::string("entries"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "entries",
+            0,
             move |this_val, _args, ncx| {
                 make_map_iterator(this_val, "entry", ncx.memory_manager().clone(), fn_proto_for_entries, iter_proto_for_entries)
             },
@@ -504,32 +435,29 @@ pub fn init_map_prototype(
     // Map.prototype.forEach(callback [, thisArg])
     map_proto.define_property(
         PropertyKey::string("forEach"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "forEach",
+            1,
             |this_val, args, ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Map.prototype.forEach called on incompatible receiver"))?;
-                if !is_map(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Map.prototype.forEach called on incompatible receiver"));
-                }
+                let (_, data) = require_map(this_val, "forEach")?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
                 if !callback.is_callable() {
-                    return Err(crate::error::VmError::type_error("Map.prototype.forEach: callback is not a function"));
+                    return Err(VmError::type_error("Map.prototype.forEach: callback is not a function"));
                 }
 
-                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
-                let props = entries.own_keys();
-                for prop in props {
-                    if let Some(entry) = entries.get(&prop) {
-                        if let Some(entry_obj) = entry.as_object() {
-                            let key = entry_obj.get(&pk("k")).unwrap_or(Value::undefined());
-                            let value = entry_obj.get(&pk("v")).unwrap_or(Value::undefined());
-                            // Call callback(value, key, map)
-                            ncx.call_function(&callback, this_arg.clone(), &[value, key, this_val.clone()])?;
-                        }
+                // Live iteration: check entries_len each round to see new entries
+                let mut pos = 0;
+                loop {
+                    let len = data.entries_len();
+                    if pos >= len {
+                        break;
                     }
+                    if let Some((key, value)) = data.entry_at(pos) {
+                        ncx.call_function(&callback, this_arg.clone(), &[value, key, this_val.clone()])?;
+                    }
+                    pos += 1;
                 }
                 Ok(Value::undefined())
             },
@@ -538,13 +466,72 @@ pub fn init_map_prototype(
         )),
     );
 
-    // Map.prototype[Symbol.iterator] - same as entries per ES spec
+    // Map.prototype.getOrInsert(key, value) — ES2026 upsert proposal
+    map_proto.define_property(
+        PropertyKey::string("getOrInsert"),
+        PropertyDescriptor::builtin_method(make_builtin(
+            "getOrInsert",
+            2,
+            |this_val, args, _ncx| {
+                let (_, data) = require_map(this_val, "getOrInsert")?;
+                let key = args.first().cloned().unwrap_or(Value::undefined());
+                let default_value = args.get(1).cloned().unwrap_or(Value::undefined());
+                // Normalize -0 to +0
+                let key = if let Some(n) = key.as_number() {
+                    if n == 0.0 { Value::number(0.0) } else { key }
+                } else {
+                    key
+                };
+                Ok(data.get_or_insert(MapKey(key), default_value))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Map.prototype.getOrInsertComputed(key, callbackfn) — ES2026 upsert proposal
+    map_proto.define_property(
+        PropertyKey::string("getOrInsertComputed"),
+        PropertyDescriptor::builtin_method(make_builtin(
+            "getOrInsertComputed",
+            2,
+            |this_val, args, ncx| {
+                let (_, data) = require_map(this_val, "getOrInsertComputed")?;
+                let key = args.first().cloned().unwrap_or(Value::undefined());
+                let callback = args.get(1).cloned().unwrap_or(Value::undefined());
+                // Normalize -0 to +0
+                let key = if let Some(n) = key.as_number() {
+                    if n == 0.0 { Value::number(0.0) } else { key }
+                } else {
+                    key
+                };
+                if !callback.is_callable() {
+                    return Err(VmError::type_error("Map.prototype.getOrInsertComputed: callbackfn is not a function"));
+                }
+                // Check if key exists first
+                let mk = MapKey(key.clone());
+                if let Some(existing) = data.get(&mk) {
+                    return Ok(existing);
+                }
+                // Key not found: Call(callbackfn, undefined, « key »)
+                let value = ncx.call_function(&callback, Value::undefined(), &[key.clone()])?;
+                data.set(MapKey(key), value.clone());
+                Ok(value)
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // Map.prototype[Symbol.iterator] = Map.prototype.entries
     let iter_proto_for_symbol = iterator_proto;
     let mm_for_symbol = mm.clone();
     let fn_proto_for_symbol = fn_proto;
     map_proto.define_property(
         PropertyKey::Symbol(symbol_iterator),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "[Symbol.iterator]",
+            0,
             move |this_val, _args, ncx| {
                 make_map_iterator(this_val, "entry", ncx.memory_manager().clone(), fn_proto_for_symbol, iter_proto_for_symbol)
             },
@@ -568,15 +555,9 @@ pub fn init_map_prototype(
 }
 
 // ============================================================================
-// Set.prototype
+// Set Iterator (live iteration)
 // ============================================================================
 
-// ============================================================================
-// Set Iterator
-// ============================================================================
-
-/// Create a Set iterator object following the array iterator pattern.
-/// Snapshots values at creation for stable iteration.
 fn make_set_iterator(
     this_val: &Value,
     kind: &str,
@@ -584,133 +565,84 @@ fn make_set_iterator(
     fn_proto: GcRef<JsObject>,
     iter_proto: GcRef<JsObject>,
 ) -> Result<Value, VmError> {
-    let obj = this_val
-        .as_object()
-        .ok_or_else(|| VmError::type_error("Set iterator: this is not an object"))?;
-    if !is_set(&obj) {
-        return Err(VmError::type_error("Set iterator called on incompatible receiver"));
-    }
+    let (_obj, data) = require_set(this_val, "values")?;
 
-    // Create iterator object with %IteratorPrototype% as prototype
     let iter = GcRef::new(JsObject::new(Value::object(iter_proto), mm.clone()));
+    iter.set(pk("__set_data_ref__"), Value::set_data(data));
+    iter.set(pk("__iter_index__"), Value::number(0.0));
+    iter.set(pk("__iter_kind__"), Value::string(JsString::intern(kind)));
 
-    // Store the set reference, snapshot values, current index, and kind
-    iter.set(PropertyKey::string("__set_ref__"), Value::object(obj));
-    iter.set(PropertyKey::string("__iter_index__"), Value::number(0.0));
-    iter.set(
-        PropertyKey::string("__iter_kind__"),
-        Value::string(JsString::intern(kind)),
-    );
-
-    // Snapshot values at iterator creation (for stable iteration)
-    let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
-    let values_snapshot = GcRef::new(JsObject::array(0, mm.clone()));
-    let props = values.own_keys();
-    let mut index = 0u32;
-    for prop in props {
-        if let Some(value) = values.get(&prop) {
-            values_snapshot.set(PropertyKey::Index(index), value);
-            index += 1;
-        }
-    }
-    values_snapshot.set(pk("length"), Value::int32(index as i32));
-    iter.set(PropertyKey::string("__iter_values__"), Value::array(values_snapshot));
-
-    // Define next() method
     let fn_proto_for_next = fn_proto;
+    let mm_for_next = mm;
     iter.define_property(
         PropertyKey::string("next"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "next",
+            0,
             |this_val, _args, ncx| {
                 let iter_obj = this_val
                     .as_object()
-                    .ok_or_else(|| "not an iterator object".to_string())?;
-                let set = iter_obj
-                    .get(&PropertyKey::string("__set_ref__"))
-                    .and_then(|v| v.as_object())
-                    .ok_or_else(|| "iterator: missing set ref".to_string())?;
-                let values_snapshot = iter_obj
-                    .get(&PropertyKey::string("__iter_values__"))
-                    .and_then(|v| v.as_object())
-                    .ok_or_else(|| "iterator: missing values snapshot".to_string())?;
-                let len = values_snapshot
-                    .get(&PropertyKey::string("length"))
-                    .and_then(|v| v.as_number())
-                    .unwrap_or(0.0) as usize;
+                    .ok_or_else(|| VmError::type_error("not an iterator object"))?;
+                let data = iter_obj
+                    .get(&pk("__set_data_ref__"))
+                    .and_then(|v| v.as_set_data())
+                    .ok_or_else(|| VmError::type_error("iterator: missing set data ref"))?;
                 let kind = iter_obj
-                    .get(&PropertyKey::string("__iter_kind__"))
+                    .get(&pk("__iter_kind__"))
                     .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
                     .unwrap_or_else(|| "value".to_string());
 
-                // Loop to skip deleted entries
-                loop {
-                    let idx = iter_obj
-                        .get(&PropertyKey::string("__iter_index__"))
-                        .and_then(|v| v.as_number())
-                        .unwrap_or(0.0) as usize;
+                let mut idx = iter_obj
+                    .get(&pk("__iter_index__"))
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as usize;
 
-                    if idx >= len {
-                        // Done
+                loop {
+                    let entries_len = data.entries_len();
+                    if idx >= entries_len {
                         let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                        result.set(PropertyKey::string("value"), Value::undefined());
-                        result.set(PropertyKey::string("done"), Value::boolean(true));
+                        result.set(pk("value"), Value::undefined());
+                        result.set(pk("done"), Value::boolean(true));
+                        iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
                         return Ok(Value::object(result));
                     }
 
-                    // Get value from snapshot
-                    let value = values_snapshot
-                        .get(&PropertyKey::Index(idx as u32))
-                        .unwrap_or(Value::undefined());
+                    if let Some(value) = data.entry_at(idx) {
+                        idx += 1;
+                        iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
 
-                    // Advance index
-                    iter_obj.set(
-                        PropertyKey::string("__iter_index__"),
-                        Value::number((idx + 1) as f64),
-                    );
-
-                    // Check if value still exists in live set (handle deleted entries)
-                    let values_obj = get_set_values_obj(&set).ok_or("Internal error: missing values")?;
-                    let hash_key = value_to_key(&value);
-                    let still_exists = values_obj.get(&pk(&hash_key)).is_some();
-
-                    // If entry was deleted, continue to next iteration
-                    if !still_exists {
-                        continue;
-                    }
-
-                    let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                    match kind.as_str() {
-                        "entry" => {
-                            // For Sets, entries are [value, value] per ES spec
-                            let entry = GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
-                            entry.set(PropertyKey::Index(0), value.clone());
-                            entry.set(PropertyKey::Index(1), value);
-                            result.set(PropertyKey::string("value"), Value::array(entry));
+                        let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                        match kind.as_str() {
+                            "entry" => {
+                                let entry = GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
+                                entry.set(PropertyKey::Index(0), value.clone());
+                                entry.set(PropertyKey::Index(1), value);
+                                result.set(pk("value"), Value::array(entry));
+                            }
+                            _ => {
+                                // "value" or "key" (both same for Sets)
+                                result.set(pk("value"), value);
+                            }
                         }
-                        _ => {
-                            // "value" or "key" (both are the same for Sets)
-                            result.set(PropertyKey::string("value"), value);
-                        }
+                        result.set(pk("done"), Value::boolean(false));
+                        return Ok(Value::object(result));
+                    } else {
+                        idx += 1;
                     }
-                    result.set(PropertyKey::string("done"), Value::boolean(false));
-                    return Ok(Value::object(result));
                 }
             },
-            mm,
+            mm_for_next,
             fn_proto_for_next,
         )),
     );
     Ok(Value::object(iter))
 }
 
-/// Initialize Set.prototype with all ES2026 + ES2025 methods.
-///
-/// # Methods
-/// - add, has, delete, clear
-/// - size (getter-like), values, keys (= values), entries, forEach
-/// - ES2025: union, intersection, difference, symmetricDifference,
-///   isSubsetOf, isSupersetOf, isDisjointFrom
-/// - Symbol.toStringTag = "Set"
+// ============================================================================
+// Set.prototype
+// ============================================================================
+
+/// Initialize Set.prototype with all ES2023 + ES2025 methods.
 pub fn init_set_prototype(
     set_proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
@@ -721,23 +653,21 @@ pub fn init_set_prototype(
     // Set.prototype.add(value)
     set_proto.define_property(
         PropertyKey::string("add"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "add",
+            1,
             |this_val, args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.add called on incompatible receiver"))?;
-                if !is_set(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Set.prototype.add called on incompatible receiver"));
-                }
+                let (_, data) = require_set(this_val, "add")?;
                 let value = args.first().cloned().unwrap_or(Value::undefined());
-                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
-                let hash_key = value_to_key(&value);
-                let is_new = values.get(&pk(&hash_key)).is_none();
-                values.set(pk(&hash_key), value);
-                if is_new {
-                    let size = get_size(&obj, SET_SIZE_KEY);
-                    obj.set(pk(SET_SIZE_KEY), Value::int32(size + 1));
-                }
+                // Normalize -0 to +0 for SameValueZero
+                let normalized = if let Some(n) = value.as_number() {
+                    if n == 0.0 { Value::number(0.0) } else { value }
+                } else if let Some(i) = value.as_int32() {
+                    if i == 0 { Value::number(0.0) } else { value }
+                } else {
+                    value
+                };
+                data.add(MapKey(normalized));
                 Ok(this_val.clone())
             },
             mm.clone(),
@@ -748,18 +678,13 @@ pub fn init_set_prototype(
     // Set.prototype.has(value)
     set_proto.define_property(
         PropertyKey::string("has"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "has",
+            1,
             |this_val, args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.has called on incompatible receiver"))?;
-                if !is_set(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Set.prototype.has called on incompatible receiver"));
-                }
+                let (_, data) = require_set(this_val, "has")?;
                 let value = args.first().cloned().unwrap_or(Value::undefined());
-                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
-                let hash_key = value_to_key(&value);
-                Ok(Value::boolean(values.get(&pk(&hash_key)).is_some()))
+                Ok(Value::boolean(data.has(&MapKey(value))))
             },
             mm.clone(),
             fn_proto,
@@ -769,26 +694,13 @@ pub fn init_set_prototype(
     // Set.prototype.delete(value)
     set_proto.define_property(
         PropertyKey::string("delete"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "delete",
+            1,
             |this_val, args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.delete called on incompatible receiver"))?;
-                if !is_set(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Set.prototype.delete called on incompatible receiver"));
-                }
+                let (_, data) = require_set(this_val, "delete")?;
                 let value = args.first().cloned().unwrap_or(Value::undefined());
-                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
-                let hash_key = value_to_key(&value);
-                if values.get(&pk(&hash_key)).is_none() {
-                    return Ok(Value::boolean(false));
-                }
-                values.delete(&pk(&hash_key));
-                let size = get_size(&obj, SET_SIZE_KEY);
-                if size > 0 {
-                    obj.set(pk(SET_SIZE_KEY), Value::int32(size - 1));
-                }
-                Ok(Value::boolean(true))
+                Ok(Value::boolean(data.delete(&MapKey(value))))
             },
             mm.clone(),
             fn_proto,
@@ -798,17 +710,12 @@ pub fn init_set_prototype(
     // Set.prototype.clear()
     set_proto.define_property(
         PropertyKey::string("clear"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.clear called on incompatible receiver"))?;
-                if !is_set(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Set.prototype.clear called on incompatible receiver"));
-                }
-                let new_values = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                obj.set(pk(SET_VALUES_KEY), Value::object(new_values));
-                obj.set(pk(SET_SIZE_KEY), Value::int32(0));
+        PropertyDescriptor::builtin_method(make_builtin(
+            "clear",
+            0,
+            |this_val, _args, _ncx| {
+                let (_, data) = require_set(this_val, "clear")?;
+                data.clear();
                 Ok(Value::undefined())
             },
             mm.clone(),
@@ -816,19 +723,16 @@ pub fn init_set_prototype(
         )),
     );
 
-    // Set.prototype.size (accessor getter per spec §24.2.3.9)
+    // Set.prototype.size (accessor getter)
     set_proto.define_property(
         PropertyKey::string("size"),
         PropertyDescriptor::Accessor {
-            get: Some(Value::native_function_with_proto(
+            get: Some(make_builtin(
+                "get size",
+                0,
                 |this_val, _args, _ncx| {
-                    let obj = this_val
-                        .as_object()
-                        .ok_or_else(|| crate::error::VmError::type_error("get Set.prototype.size called on incompatible receiver"))?;
-                    if !is_set(&obj) {
-                        return Err(crate::error::VmError::type_error("get Set.prototype.size called on incompatible receiver"));
-                    }
-                    Ok(Value::int32(get_size(&obj, SET_SIZE_KEY)))
+                    let (_, data) = require_set(this_val, "size")?;
+                    Ok(Value::int32(data.size() as i32))
                 },
                 mm.clone(),
                 fn_proto,
@@ -842,13 +746,15 @@ pub fn init_set_prototype(
         },
     );
 
-    // Set.prototype.values() - returns iterator
+    // Set.prototype.values()
     let iter_proto_for_values = iterator_proto;
     let mm_for_values = mm.clone();
     let fn_proto_for_values = fn_proto;
     set_proto.define_property(
         PropertyKey::string("values"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "values",
+            0,
             move |this_val, _args, ncx| {
                 make_set_iterator(this_val, "value", ncx.memory_manager().clone(), fn_proto_for_values, iter_proto_for_values)
             },
@@ -857,13 +763,15 @@ pub fn init_set_prototype(
         )),
     );
 
-    // Set.prototype.keys() - same as values() per spec, returns iterator
+    // Set.prototype.keys() - same as values() per spec
     let iter_proto_for_keys = iterator_proto;
     let mm_for_keys = mm.clone();
     let fn_proto_for_keys = fn_proto;
     set_proto.define_property(
         PropertyKey::string("keys"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "keys",
+            0,
             move |this_val, _args, ncx| {
                 make_set_iterator(this_val, "value", ncx.memory_manager().clone(), fn_proto_for_keys, iter_proto_for_keys)
             },
@@ -872,13 +780,15 @@ pub fn init_set_prototype(
         )),
     );
 
-    // Set.prototype.entries() - returns iterator
+    // Set.prototype.entries()
     let iter_proto_for_entries = iterator_proto;
     let mm_for_entries = mm.clone();
     let fn_proto_for_entries = fn_proto;
     set_proto.define_property(
         PropertyKey::string("entries"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "entries",
+            0,
             move |this_val, _args, ncx| {
                 make_set_iterator(this_val, "entry", ncx.memory_manager().clone(), fn_proto_for_entries, iter_proto_for_entries)
             },
@@ -890,28 +800,29 @@ pub fn init_set_prototype(
     // Set.prototype.forEach(callback [, thisArg])
     set_proto.define_property(
         PropertyKey::string("forEach"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "forEach",
+            1,
             |this_val, args, ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.forEach called on incompatible receiver"))?;
-                if !is_set(&obj) {
-                    return Err(crate::error::VmError::type_error("Method Set.prototype.forEach called on incompatible receiver"));
-                }
+                let (_, data) = require_set(this_val, "forEach")?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
                 if !callback.is_callable() {
-                    return Err(crate::error::VmError::type_error("Set.prototype.forEach: callback is not a function"));
+                    return Err(VmError::type_error("Set.prototype.forEach: callback is not a function"));
                 }
 
-                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
-                let props = values.own_keys();
-                for prop in props {
-                    if let Some(value) = values.get(&prop) {
-                        // Call callback(value, value, set) - Set passes value as both args
+                // Live iteration: check entries_len each round to see new entries
+                let mut pos = 0;
+                loop {
+                    let len = data.entries_len();
+                    if pos >= len {
+                        break;
+                    }
+                    if let Some(value) = data.entry_at(pos) {
                         ncx.call_function(&callback, this_arg.clone(), &[value.clone(), value, this_val.clone()])?;
                     }
+                    pos += 1;
                 }
                 Ok(Value::undefined())
             },
@@ -921,57 +832,36 @@ pub fn init_set_prototype(
     );
 
     // ========================================================================
-    // ES2025 Set Methods (§24.2.3.x)
+    // ES2025 Set Methods
     // ========================================================================
 
     // Set.prototype.union(other)
     set_proto.define_property(
         PropertyKey::string("union"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "union",
+            1,
             |this_val, args, ncx| {
-                let this_obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.union called on incompatible receiver"))?;
-                if !is_set(&this_obj) {
-                    return Err(crate::error::VmError::type_error("Method Set.prototype.union called on incompatible receiver"));
-                }
-                let other = args.first().ok_or_else(|| crate::error::VmError::type_error("Set.prototype.union requires argument"))?;
-                let other_obj = other
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Set.prototype.union requires a Set-like argument"))?;
+                let (_, this_data) = require_set(this_val, "union")?;
+                let other = args.first().ok_or_else(|| VmError::type_error("Set.prototype.union requires argument"))?;
+                let other_obj = other.as_object()
+                    .ok_or_else(|| VmError::type_error("Set.prototype.union requires a Set-like argument"))?;
                 if !is_set(&other_obj) {
-                    return Err(crate::error::VmError::type_error("Set.prototype.union requires a Set-like argument"));
+                    return Err(VmError::type_error("Set.prototype.union requires a Set-like argument"));
                 }
+                let other_data = get_set_data(&other_obj)
+                    .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
 
-                // Create new set
                 let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                init_set_slots(&result, ncx.memory_manager());
-                let result_values = get_set_values_obj(&result).unwrap();
-                let mut count = 0i32;
+                init_set_slots(&result);
+                let result_data = get_set_data(&result).unwrap();
 
-                // Add all from this
-                let this_vals = get_set_values_obj(&this_obj).ok_or("Internal error")?;
-                for prop in this_vals.own_keys() {
-                    if let Some(value) = this_vals.get(&prop) {
-                        let hash = value_to_key(&value);
-                        if result_values.get(&pk(&hash)).is_none() {
-                            result_values.set(pk(&hash), value);
-                            count += 1;
-                        }
-                    }
+                for val in this_data.for_each_entries() {
+                    result_data.add(MapKey(val));
                 }
-                // Add all from other
-                let other_vals = get_set_values_obj(&other_obj).ok_or("Internal error")?;
-                for prop in other_vals.own_keys() {
-                    if let Some(value) = other_vals.get(&prop) {
-                        let hash = value_to_key(&value);
-                        if result_values.get(&pk(&hash)).is_none() {
-                            result_values.set(pk(&hash), value);
-                            count += 1;
-                        }
-                    }
+                for val in other_data.for_each_entries() {
+                    result_data.add(MapKey(val));
                 }
-                result.set(pk(SET_SIZE_KEY), Value::int32(count));
                 Ok(Value::object(result))
             },
             mm.clone(),
@@ -982,39 +872,29 @@ pub fn init_set_prototype(
     // Set.prototype.intersection(other)
     set_proto.define_property(
         PropertyKey::string("intersection"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "intersection",
+            1,
             |this_val, args, ncx| {
-                let this_obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.intersection called on incompatible receiver"))?;
-                if !is_set(&this_obj) {
-                    return Err(crate::error::VmError::type_error("Method Set.prototype.intersection called on incompatible receiver"));
-                }
-                let other = args.first().ok_or_else(|| crate::error::VmError::type_error("Set.prototype.intersection requires argument"))?;
-                let other_obj = other
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Set.prototype.intersection requires a Set-like argument"))?;
+                let (_, this_data) = require_set(this_val, "intersection")?;
+                let other = args.first().ok_or_else(|| VmError::type_error("Set.prototype.intersection requires argument"))?;
+                let other_obj = other.as_object()
+                    .ok_or_else(|| VmError::type_error("Set.prototype.intersection requires a Set-like argument"))?;
                 if !is_set(&other_obj) {
-                    return Err(crate::error::VmError::type_error("Set.prototype.intersection requires a Set-like argument"));
+                    return Err(VmError::type_error("Set.prototype.intersection requires a Set-like argument"));
                 }
+                let other_data = get_set_data(&other_obj)
+                    .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
 
                 let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                init_set_slots(&result, ncx.memory_manager());
-                let result_values = get_set_values_obj(&result).unwrap();
-                let mut count = 0i32;
+                init_set_slots(&result);
+                let result_data = get_set_data(&result).unwrap();
 
-                let this_vals = get_set_values_obj(&this_obj).ok_or("Internal error")?;
-                let other_vals = get_set_values_obj(&other_obj).ok_or("Internal error")?;
-                for prop in this_vals.own_keys() {
-                    if let Some(value) = this_vals.get(&prop) {
-                        let hash = value_to_key(&value);
-                        if other_vals.get(&pk(&hash)).is_some() {
-                            result_values.set(pk(&hash), value);
-                            count += 1;
-                        }
+                for val in this_data.for_each_entries() {
+                    if other_data.has(&MapKey(val.clone())) {
+                        result_data.add(MapKey(val));
                     }
                 }
-                result.set(pk(SET_SIZE_KEY), Value::int32(count));
                 Ok(Value::object(result))
             },
             mm.clone(),
@@ -1025,39 +905,29 @@ pub fn init_set_prototype(
     // Set.prototype.difference(other)
     set_proto.define_property(
         PropertyKey::string("difference"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "difference",
+            1,
             |this_val, args, ncx| {
-                let this_obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.difference called on incompatible receiver"))?;
-                if !is_set(&this_obj) {
-                    return Err(crate::error::VmError::type_error("Method Set.prototype.difference called on incompatible receiver"));
-                }
-                let other = args.first().ok_or_else(|| crate::error::VmError::type_error("Set.prototype.difference requires argument"))?;
-                let other_obj = other
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Set.prototype.difference requires a Set-like argument"))?;
+                let (_, this_data) = require_set(this_val, "difference")?;
+                let other = args.first().ok_or_else(|| VmError::type_error("Set.prototype.difference requires argument"))?;
+                let other_obj = other.as_object()
+                    .ok_or_else(|| VmError::type_error("Set.prototype.difference requires a Set-like argument"))?;
                 if !is_set(&other_obj) {
-                    return Err(crate::error::VmError::type_error("Set.prototype.difference requires a Set-like argument"));
+                    return Err(VmError::type_error("Set.prototype.difference requires a Set-like argument"));
                 }
+                let other_data = get_set_data(&other_obj)
+                    .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
 
                 let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                init_set_slots(&result, ncx.memory_manager());
-                let result_values = get_set_values_obj(&result).unwrap();
-                let mut count = 0i32;
+                init_set_slots(&result);
+                let result_data = get_set_data(&result).unwrap();
 
-                let this_vals = get_set_values_obj(&this_obj).ok_or("Internal error")?;
-                let other_vals = get_set_values_obj(&other_obj).ok_or("Internal error")?;
-                for prop in this_vals.own_keys() {
-                    if let Some(value) = this_vals.get(&prop) {
-                        let hash = value_to_key(&value);
-                        if other_vals.get(&pk(&hash)).is_none() {
-                            result_values.set(pk(&hash), value);
-                            count += 1;
-                        }
+                for val in this_data.for_each_entries() {
+                    if !other_data.has(&MapKey(val.clone())) {
+                        result_data.add(MapKey(val));
                     }
                 }
-                result.set(pk(SET_SIZE_KEY), Value::int32(count));
                 Ok(Value::object(result))
             },
             mm.clone(),
@@ -1068,51 +938,36 @@ pub fn init_set_prototype(
     // Set.prototype.symmetricDifference(other)
     set_proto.define_property(
         PropertyKey::string("symmetricDifference"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "symmetricDifference",
+            1,
             |this_val, args, ncx| {
-                let this_obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.symmetricDifference called on incompatible receiver"))?;
-                if !is_set(&this_obj) {
-                    return Err(crate::error::VmError::type_error("Method Set.prototype.symmetricDifference called on incompatible receiver"));
-                }
-                let other = args.first().ok_or_else(|| crate::error::VmError::type_error("Set.prototype.symmetricDifference requires argument"))?;
-                let other_obj = other
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Set.prototype.symmetricDifference requires a Set-like argument"))?;
+                let (_, this_data) = require_set(this_val, "symmetricDifference")?;
+                let other = args.first().ok_or_else(|| VmError::type_error("Set.prototype.symmetricDifference requires argument"))?;
+                let other_obj = other.as_object()
+                    .ok_or_else(|| VmError::type_error("Set.prototype.symmetricDifference requires a Set-like argument"))?;
                 if !is_set(&other_obj) {
-                    return Err(crate::error::VmError::type_error("Set.prototype.symmetricDifference requires a Set-like argument"));
+                    return Err(VmError::type_error("Set.prototype.symmetricDifference requires a Set-like argument"));
                 }
+                let other_data = get_set_data(&other_obj)
+                    .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
 
                 let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                init_set_slots(&result, ncx.memory_manager());
-                let result_values = get_set_values_obj(&result).unwrap();
-                let mut count = 0i32;
-
-                let this_vals = get_set_values_obj(&this_obj).ok_or("Internal error")?;
-                let other_vals = get_set_values_obj(&other_obj).ok_or("Internal error")?;
+                init_set_slots(&result);
+                let result_data = get_set_data(&result).unwrap();
 
                 // In this but not other
-                for prop in this_vals.own_keys() {
-                    if let Some(value) = this_vals.get(&prop) {
-                        let hash = value_to_key(&value);
-                        if other_vals.get(&pk(&hash)).is_none() {
-                            result_values.set(pk(&hash), value);
-                            count += 1;
-                        }
+                for val in this_data.for_each_entries() {
+                    if !other_data.has(&MapKey(val.clone())) {
+                        result_data.add(MapKey(val));
                     }
                 }
                 // In other but not this
-                for prop in other_vals.own_keys() {
-                    if let Some(value) = other_vals.get(&prop) {
-                        let hash = value_to_key(&value);
-                        if this_vals.get(&pk(&hash)).is_none() {
-                            result_values.set(pk(&hash), value);
-                            count += 1;
-                        }
+                for val in other_data.for_each_entries() {
+                    if !this_data.has(&MapKey(val.clone())) {
+                        result_data.add(MapKey(val));
                     }
                 }
-                result.set(pk(SET_SIZE_KEY), Value::int32(count));
                 Ok(Value::object(result))
             },
             mm.clone(),
@@ -1123,30 +978,23 @@ pub fn init_set_prototype(
     // Set.prototype.isSubsetOf(other)
     set_proto.define_property(
         PropertyKey::string("isSubsetOf"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "isSubsetOf",
+            1,
             |this_val, args, _ncx| {
-                let this_obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.isSubsetOf called on incompatible receiver"))?;
-                if !is_set(&this_obj) {
-                    return Err(crate::error::VmError::type_error("Method Set.prototype.isSubsetOf called on incompatible receiver"));
-                }
-                let other = args.first().ok_or_else(|| crate::error::VmError::type_error("Set.prototype.isSubsetOf requires argument"))?;
-                let other_obj = other
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Set.prototype.isSubsetOf requires a Set-like argument"))?;
+                let (_, this_data) = require_set(this_val, "isSubsetOf")?;
+                let other = args.first().ok_or_else(|| VmError::type_error("Set.prototype.isSubsetOf requires argument"))?;
+                let other_obj = other.as_object()
+                    .ok_or_else(|| VmError::type_error("Set.prototype.isSubsetOf requires a Set-like argument"))?;
                 if !is_set(&other_obj) {
-                    return Err(crate::error::VmError::type_error("Set.prototype.isSubsetOf requires a Set-like argument"));
+                    return Err(VmError::type_error("Set.prototype.isSubsetOf requires a Set-like argument"));
                 }
+                let other_data = get_set_data(&other_obj)
+                    .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
 
-                let this_vals = get_set_values_obj(&this_obj).ok_or("Internal error")?;
-                let other_vals = get_set_values_obj(&other_obj).ok_or("Internal error")?;
-                for prop in this_vals.own_keys() {
-                    if let Some(value) = this_vals.get(&prop) {
-                        let hash = value_to_key(&value);
-                        if other_vals.get(&pk(&hash)).is_none() {
-                            return Ok(Value::boolean(false));
-                        }
+                for val in this_data.for_each_entries() {
+                    if !other_data.has(&MapKey(val)) {
+                        return Ok(Value::boolean(false));
                     }
                 }
                 Ok(Value::boolean(true))
@@ -1159,30 +1007,23 @@ pub fn init_set_prototype(
     // Set.prototype.isSupersetOf(other)
     set_proto.define_property(
         PropertyKey::string("isSupersetOf"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "isSupersetOf",
+            1,
             |this_val, args, _ncx| {
-                let this_obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.isSupersetOf called on incompatible receiver"))?;
-                if !is_set(&this_obj) {
-                    return Err(crate::error::VmError::type_error("Method Set.prototype.isSupersetOf called on incompatible receiver"));
-                }
-                let other = args.first().ok_or_else(|| crate::error::VmError::type_error("Set.prototype.isSupersetOf requires argument"))?;
-                let other_obj = other
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Set.prototype.isSupersetOf requires a Set-like argument"))?;
+                let (_, this_data) = require_set(this_val, "isSupersetOf")?;
+                let other = args.first().ok_or_else(|| VmError::type_error("Set.prototype.isSupersetOf requires argument"))?;
+                let other_obj = other.as_object()
+                    .ok_or_else(|| VmError::type_error("Set.prototype.isSupersetOf requires a Set-like argument"))?;
                 if !is_set(&other_obj) {
-                    return Err(crate::error::VmError::type_error("Set.prototype.isSupersetOf requires a Set-like argument"));
+                    return Err(VmError::type_error("Set.prototype.isSupersetOf requires a Set-like argument"));
                 }
+                let other_data = get_set_data(&other_obj)
+                    .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
 
-                let this_vals = get_set_values_obj(&this_obj).ok_or("Internal error")?;
-                let other_vals = get_set_values_obj(&other_obj).ok_or("Internal error")?;
-                for prop in other_vals.own_keys() {
-                    if let Some(value) = other_vals.get(&prop) {
-                        let hash = value_to_key(&value);
-                        if this_vals.get(&pk(&hash)).is_none() {
-                            return Ok(Value::boolean(false));
-                        }
+                for val in other_data.for_each_entries() {
+                    if !this_data.has(&MapKey(val)) {
+                        return Ok(Value::boolean(false));
                     }
                 }
                 Ok(Value::boolean(true))
@@ -1195,30 +1036,23 @@ pub fn init_set_prototype(
     // Set.prototype.isDisjointFrom(other)
     set_proto.define_property(
         PropertyKey::string("isDisjointFrom"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "isDisjointFrom",
+            1,
             |this_val, args, _ncx| {
-                let this_obj = this_val
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method Set.prototype.isDisjointFrom called on incompatible receiver"))?;
-                if !is_set(&this_obj) {
-                    return Err(crate::error::VmError::type_error("Method Set.prototype.isDisjointFrom called on incompatible receiver"));
-                }
-                let other = args.first().ok_or_else(|| crate::error::VmError::type_error("Set.prototype.isDisjointFrom requires argument"))?;
-                let other_obj = other
-                    .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Set.prototype.isDisjointFrom requires a Set-like argument"))?;
+                let (_, this_data) = require_set(this_val, "isDisjointFrom")?;
+                let other = args.first().ok_or_else(|| VmError::type_error("Set.prototype.isDisjointFrom requires argument"))?;
+                let other_obj = other.as_object()
+                    .ok_or_else(|| VmError::type_error("Set.prototype.isDisjointFrom requires a Set-like argument"))?;
                 if !is_set(&other_obj) {
-                    return Err(crate::error::VmError::type_error("Set.prototype.isDisjointFrom requires a Set-like argument"));
+                    return Err(VmError::type_error("Set.prototype.isDisjointFrom requires a Set-like argument"));
                 }
+                let other_data = get_set_data(&other_obj)
+                    .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
 
-                let this_vals = get_set_values_obj(&this_obj).ok_or("Internal error")?;
-                let other_vals = get_set_values_obj(&other_obj).ok_or("Internal error")?;
-                for prop in this_vals.own_keys() {
-                    if let Some(value) = this_vals.get(&prop) {
-                        let hash = value_to_key(&value);
-                        if other_vals.get(&pk(&hash)).is_some() {
-                            return Ok(Value::boolean(false));
-                        }
+                for val in this_data.for_each_entries() {
+                    if other_data.has(&MapKey(val)) {
+                        return Ok(Value::boolean(false));
                     }
                 }
                 Ok(Value::boolean(true))
@@ -1228,13 +1062,15 @@ pub fn init_set_prototype(
         )),
     );
 
-    // Set.prototype[Symbol.iterator] - same as values per ES spec
+    // Set.prototype[Symbol.iterator] = Set.prototype.values
     let iter_proto_for_symbol = iterator_proto;
     let mm_for_symbol = mm.clone();
     let fn_proto_for_symbol = fn_proto;
     set_proto.define_property(
         PropertyKey::Symbol(symbol_iterator),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "[Symbol.iterator]",
+            0,
             move |this_val, _args, ncx| {
                 make_set_iterator(this_val, "value", ncx.memory_manager().clone(), fn_proto_for_symbol, iter_proto_for_symbol)
             },
@@ -1258,14 +1094,17 @@ pub fn init_set_prototype(
 }
 
 // ============================================================================
-// WeakMap.prototype
+// WeakMap.prototype (pointer-identity keys, no iteration)
 // ============================================================================
 
-/// Initialize WeakMap.prototype with all ES2026 methods.
-///
-/// # Methods
-/// - get, set, has, delete
-/// - Symbol.toStringTag = "WeakMap"
+/// WeakMap uses a HashMap<usize, Value> keyed by object pointer.
+/// NOT actually weak yet (requires GC ephemeron support), but uses proper
+/// pointer identity instead of string serialization.
+fn get_weakmap_entries(obj: &GcRef<JsObject>) -> Option<GcRef<JsObject>> {
+    obj.get(&pk(WEAKMAP_ENTRIES_KEY)).and_then(|v| v.as_object())
+}
+
+/// Initialize WeakMap.prototype with all ES2023 methods.
 pub fn init_weak_map_prototype(
     wm_proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
@@ -1274,26 +1113,24 @@ pub fn init_weak_map_prototype(
     // WeakMap.prototype.get(key)
     wm_proto.define_property(
         PropertyKey::string("get"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "get",
+            1,
             |this_val, args, _ncx| {
                 let obj = this_val
                     .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method WeakMap.prototype.get called on incompatible receiver"))?;
+                    .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.get called on incompatible receiver"))?;
                 if !is_weakmap(&obj) {
-                    return Err(crate::error::VmError::type_error("Method WeakMap.prototype.get called on incompatible receiver"));
+                    return Err(VmError::type_error("Method WeakMap.prototype.get called on incompatible receiver"));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
                 if !is_valid_weak_key(&key) {
                     return Ok(Value::undefined());
                 }
-                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
-                let hash_key = value_to_key(&key);
-                if let Some(entry) = entries.get(&pk(&hash_key)) {
-                    if let Some(entry_obj) = entry.as_object() {
-                        return Ok(entry_obj.get(&pk("v")).unwrap_or(Value::undefined()));
-                    }
-                }
-                Ok(Value::undefined())
+                let id = weak_key_id(&key).ok_or_else(|| VmError::type_error("Invalid weak key"))?;
+                let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
+                let pk_id = PropertyKey::string(&format!("__wk_{}", id));
+                Ok(entries.get(&pk_id).unwrap_or(Value::undefined()))
             },
             mm.clone(),
             fn_proto,
@@ -1303,27 +1140,25 @@ pub fn init_weak_map_prototype(
     // WeakMap.prototype.set(key, value)
     wm_proto.define_property(
         PropertyKey::string("set"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, args, ncx| {
+        PropertyDescriptor::builtin_method(make_builtin(
+            "set",
+            2,
+            |this_val, args, _ncx| {
                 let obj = this_val
                     .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method WeakMap.prototype.set called on incompatible receiver"))?;
+                    .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.set called on incompatible receiver"))?;
                 if !is_weakmap(&obj) {
-                    return Err(crate::error::VmError::type_error("Method WeakMap.prototype.set called on incompatible receiver"));
+                    return Err(VmError::type_error("Method WeakMap.prototype.set called on incompatible receiver"));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
                 if !is_valid_weak_key(&key) {
-                    return Err(crate::error::VmError::type_error("Invalid value used as weak map key"));
+                    return Err(VmError::type_error("Invalid value used as weak map key"));
                 }
                 let value = args.get(1).cloned().unwrap_or(Value::undefined());
-                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
-                let hash_key = value_to_key(&key);
-
-                let entry = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                entry.set(pk("k"), key);
-                entry.set(pk("v"), value);
-                entries.set(pk(&hash_key), Value::object(entry));
-
+                let id = weak_key_id(&key).ok_or_else(|| VmError::type_error("Invalid weak key"))?;
+                let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
+                let pk_id = PropertyKey::string(&format!("__wk_{}", id));
+                entries.set(pk_id, value);
                 Ok(this_val.clone())
             },
             mm.clone(),
@@ -1334,21 +1169,27 @@ pub fn init_weak_map_prototype(
     // WeakMap.prototype.has(key)
     wm_proto.define_property(
         PropertyKey::string("has"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "has",
+            1,
             |this_val, args, _ncx| {
                 let obj = this_val
                     .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method WeakMap.prototype.has called on incompatible receiver"))?;
+                    .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.has called on incompatible receiver"))?;
                 if !is_weakmap(&obj) {
-                    return Err(crate::error::VmError::type_error("Method WeakMap.prototype.has called on incompatible receiver"));
+                    return Err(VmError::type_error("Method WeakMap.prototype.has called on incompatible receiver"));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
                 if !is_valid_weak_key(&key) {
                     return Ok(Value::boolean(false));
                 }
-                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
-                let hash_key = value_to_key(&key);
-                Ok(Value::boolean(entries.get(&pk(&hash_key)).is_some()))
+                let id = match weak_key_id(&key) {
+                    Some(id) => id,
+                    None => return Ok(Value::boolean(false)),
+                };
+                let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
+                let pk_id = PropertyKey::string(&format!("__wk_{}", id));
+                Ok(Value::boolean(entries.get(&pk_id).is_some()))
             },
             mm.clone(),
             fn_proto,
@@ -1358,24 +1199,30 @@ pub fn init_weak_map_prototype(
     // WeakMap.prototype.delete(key)
     wm_proto.define_property(
         PropertyKey::string("delete"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "delete",
+            1,
             |this_val, args, _ncx| {
                 let obj = this_val
                     .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method WeakMap.prototype.delete called on incompatible receiver"))?;
+                    .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.delete called on incompatible receiver"))?;
                 if !is_weakmap(&obj) {
-                    return Err(crate::error::VmError::type_error("Method WeakMap.prototype.delete called on incompatible receiver"));
+                    return Err(VmError::type_error("Method WeakMap.prototype.delete called on incompatible receiver"));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
                 if !is_valid_weak_key(&key) {
                     return Ok(Value::boolean(false));
                 }
-                let entries = get_entries(&obj).ok_or("Internal error: missing entries")?;
-                let hash_key = value_to_key(&key);
-                if entries.get(&pk(&hash_key)).is_none() {
+                let id = match weak_key_id(&key) {
+                    Some(id) => id,
+                    None => return Ok(Value::boolean(false)),
+                };
+                let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
+                let pk_id = PropertyKey::string(&format!("__wk_{}", id));
+                if entries.get(&pk_id).is_none() {
                     return Ok(Value::boolean(false));
                 }
-                entries.delete(&pk(&hash_key));
+                entries.delete(&pk_id);
                 Ok(Value::boolean(true))
             },
             mm.clone(),
@@ -1401,11 +1248,11 @@ pub fn init_weak_map_prototype(
 // WeakSet.prototype
 // ============================================================================
 
-/// Initialize WeakSet.prototype with all ES2026 methods.
-///
-/// # Methods
-/// - add, has, delete
-/// - Symbol.toStringTag = "WeakSet"
+fn get_weakset_entries(obj: &GcRef<JsObject>) -> Option<GcRef<JsObject>> {
+    obj.get(&pk(WEAKSET_ENTRIES_KEY)).and_then(|v| v.as_object())
+}
+
+/// Initialize WeakSet.prototype with all ES2023 methods.
 pub fn init_weak_set_prototype(
     ws_proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
@@ -1414,21 +1261,24 @@ pub fn init_weak_set_prototype(
     // WeakSet.prototype.add(value)
     ws_proto.define_property(
         PropertyKey::string("add"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "add",
+            1,
             |this_val, args, _ncx| {
                 let obj = this_val
                     .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method WeakSet.prototype.add called on incompatible receiver"))?;
+                    .ok_or_else(|| VmError::type_error("Method WeakSet.prototype.add called on incompatible receiver"))?;
                 if !is_weakset(&obj) {
-                    return Err(crate::error::VmError::type_error("Method WeakSet.prototype.add called on incompatible receiver"));
+                    return Err(VmError::type_error("Method WeakSet.prototype.add called on incompatible receiver"));
                 }
                 let value = args.first().cloned().unwrap_or(Value::undefined());
                 if !is_valid_weak_key(&value) {
-                    return Err(crate::error::VmError::type_error("Invalid value used in weak set"));
+                    return Err(VmError::type_error("Invalid value used in weak set"));
                 }
-                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
-                let hash_key = value_to_key(&value);
-                values.set(pk(&hash_key), value);
+                let id = weak_key_id(&value).ok_or_else(|| VmError::type_error("Invalid weak key"))?;
+                let entries = get_weakset_entries(&obj).ok_or("Internal error: missing entries")?;
+                let pk_id = PropertyKey::string(&format!("__wk_{}", id));
+                entries.set(pk_id, Value::boolean(true));
                 Ok(this_val.clone())
             },
             mm.clone(),
@@ -1439,21 +1289,27 @@ pub fn init_weak_set_prototype(
     // WeakSet.prototype.has(value)
     ws_proto.define_property(
         PropertyKey::string("has"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "has",
+            1,
             |this_val, args, _ncx| {
                 let obj = this_val
                     .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method WeakSet.prototype.has called on incompatible receiver"))?;
+                    .ok_or_else(|| VmError::type_error("Method WeakSet.prototype.has called on incompatible receiver"))?;
                 if !is_weakset(&obj) {
-                    return Err(crate::error::VmError::type_error("Method WeakSet.prototype.has called on incompatible receiver"));
+                    return Err(VmError::type_error("Method WeakSet.prototype.has called on incompatible receiver"));
                 }
                 let value = args.first().cloned().unwrap_or(Value::undefined());
                 if !is_valid_weak_key(&value) {
                     return Ok(Value::boolean(false));
                 }
-                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
-                let hash_key = value_to_key(&value);
-                Ok(Value::boolean(values.get(&pk(&hash_key)).is_some()))
+                let id = match weak_key_id(&value) {
+                    Some(id) => id,
+                    None => return Ok(Value::boolean(false)),
+                };
+                let entries = get_weakset_entries(&obj).ok_or("Internal error: missing entries")?;
+                let pk_id = PropertyKey::string(&format!("__wk_{}", id));
+                Ok(Value::boolean(entries.get(&pk_id).is_some()))
             },
             mm.clone(),
             fn_proto,
@@ -1463,24 +1319,30 @@ pub fn init_weak_set_prototype(
     // WeakSet.prototype.delete(value)
     ws_proto.define_property(
         PropertyKey::string("delete"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(make_builtin(
+            "delete",
+            1,
             |this_val, args, _ncx| {
                 let obj = this_val
                     .as_object()
-                    .ok_or_else(|| crate::error::VmError::type_error("Method WeakSet.prototype.delete called on incompatible receiver"))?;
+                    .ok_or_else(|| VmError::type_error("Method WeakSet.prototype.delete called on incompatible receiver"))?;
                 if !is_weakset(&obj) {
-                    return Err(crate::error::VmError::type_error("Method WeakSet.prototype.delete called on incompatible receiver"));
+                    return Err(VmError::type_error("Method WeakSet.prototype.delete called on incompatible receiver"));
                 }
                 let value = args.first().cloned().unwrap_or(Value::undefined());
                 if !is_valid_weak_key(&value) {
                     return Ok(Value::boolean(false));
                 }
-                let values = get_set_values_obj(&obj).ok_or("Internal error: missing values")?;
-                let hash_key = value_to_key(&value);
-                if values.get(&pk(&hash_key)).is_none() {
+                let id = match weak_key_id(&value) {
+                    Some(id) => id,
+                    None => return Ok(Value::boolean(false)),
+                };
+                let entries = get_weakset_entries(&obj).ok_or("Internal error: missing entries")?;
+                let pk_id = PropertyKey::string(&format!("__wk_{}", id));
+                if entries.get(&pk_id).is_none() {
                     return Ok(Value::boolean(false));
                 }
-                values.delete(&pk(&hash_key));
+                entries.delete(&pk_id);
                 Ok(Value::boolean(true))
             },
             mm.clone(),
@@ -1507,109 +1369,122 @@ pub fn init_weak_set_prototype(
 // ============================================================================
 
 /// Create Map constructor function.
-///
-/// - **new Map()** — Creates a new empty Map
-/// - **Map()** without new — TypeError (Map is not callable without new)
+/// Supports `new Map()` and `new Map(iterable)`.
 pub fn create_map_constructor() -> Box<
-    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, crate::error::VmError>
+    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
         + Send
         + Sync,
 > {
-    Box::new(|this_val, _args, ncx| {
+    Box::new(|this_val, args, _ncx| {
         if this_val.is_undefined() {
-            return Err(crate::error::VmError::type_error(
-                "Constructor Map requires 'new'",
-            ));
+            return Err(VmError::type_error("Constructor Map requires 'new'"));
         }
         if let Some(obj) = this_val.as_object() {
-            init_map_slots(&obj, ncx.memory_manager());
+            init_map_slots(&obj);
+
+            // Handle iterable argument: new Map([[k1, v1], [k2, v2], ...])
+            let iterable = args.first().cloned().unwrap_or(Value::undefined());
+            if !iterable.is_undefined() && !iterable.is_null() {
+                let data = get_map_data(&obj).unwrap();
+                // Try to iterate the argument as an array-like
+                if let Some(arr) = iterable.as_array().or_else(|| iterable.as_object()) {
+                    let len = arr.get(&PropertyKey::string("length"))
+                        .and_then(|v| v.as_number())
+                        .unwrap_or(0.0) as usize;
+                    for i in 0..len {
+                        if let Some(entry) = arr.get(&PropertyKey::Index(i as u32))
+                            && let Some(entry_obj) = entry.as_array().or_else(|| entry.as_object())
+                        {
+                            let key = entry_obj.get(&PropertyKey::Index(0)).unwrap_or(Value::undefined());
+                            let value = entry_obj.get(&PropertyKey::Index(1)).unwrap_or(Value::undefined());
+                            data.set(MapKey(key), value);
+                        }
+                    }
+                }
+            }
+
             Ok(this_val.clone())
         } else {
-            Err(crate::error::VmError::type_error(
-                "Constructor Map requires 'new'",
-            ))
+            Err(VmError::type_error("Constructor Map requires 'new'"))
         }
     })
 }
 
 /// Create Set constructor function.
-///
-/// - **new Set()** — Creates a new empty Set
-/// - **Set()** without new — TypeError (Set is not callable without new)
+/// Supports `new Set()` and `new Set(iterable)`.
 pub fn create_set_constructor() -> Box<
-    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, crate::error::VmError>
+    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
         + Send
         + Sync,
 > {
-    Box::new(|this_val, _args, ncx| {
+    Box::new(|this_val, args, _ncx| {
         if this_val.is_undefined() {
-            return Err(crate::error::VmError::type_error(
-                "Constructor Set requires 'new'",
-            ));
+            return Err(VmError::type_error("Constructor Set requires 'new'"));
         }
         if let Some(obj) = this_val.as_object() {
-            init_set_slots(&obj, ncx.memory_manager());
+            init_set_slots(&obj);
+
+            // Handle iterable argument: new Set([v1, v2, ...])
+            let iterable = args.first().cloned().unwrap_or(Value::undefined());
+            if !iterable.is_undefined() && !iterable.is_null() {
+                let data = get_set_data(&obj).unwrap();
+                if let Some(arr) = iterable.as_array().or_else(|| iterable.as_object()) {
+                    let len = arr.get(&PropertyKey::string("length"))
+                        .and_then(|v| v.as_number())
+                        .unwrap_or(0.0) as usize;
+                    for i in 0..len {
+                        if let Some(value) = arr.get(&PropertyKey::Index(i as u32)) {
+                            data.add(MapKey(value));
+                        }
+                    }
+                }
+            }
+
             Ok(this_val.clone())
         } else {
-            Err(crate::error::VmError::type_error(
-                "Constructor Set requires 'new'",
-            ))
+            Err(VmError::type_error("Constructor Set requires 'new'"))
         }
     })
 }
 
 /// Create WeakMap constructor function.
-///
-/// - **new WeakMap()** — Creates a new empty WeakMap
-/// - **WeakMap()** without new — TypeError
 pub fn create_weak_map_constructor() -> Box<
-    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, crate::error::VmError>
+    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
         + Send
         + Sync,
 > {
     Box::new(|this_val, _args, ncx| {
         if this_val.is_undefined() {
-            return Err(crate::error::VmError::type_error(
-                "Constructor WeakMap requires 'new'",
-            ));
+            return Err(VmError::type_error("Constructor WeakMap requires 'new'"));
         }
         if let Some(obj) = this_val.as_object() {
             let entries = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-            obj.set(pk(MAP_ENTRIES_KEY), Value::object(entries));
+            obj.set(pk(WEAKMAP_ENTRIES_KEY), Value::object(entries));
             obj.set(pk(IS_WEAKMAP_KEY), Value::boolean(true));
             Ok(this_val.clone())
         } else {
-            Err(crate::error::VmError::type_error(
-                "Constructor WeakMap requires 'new'",
-            ))
+            Err(VmError::type_error("Constructor WeakMap requires 'new'"))
         }
     })
 }
 
 /// Create WeakSet constructor function.
-///
-/// - **new WeakSet()** — Creates a new empty WeakSet
-/// - **WeakSet()** without new — TypeError
 pub fn create_weak_set_constructor() -> Box<
-    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, crate::error::VmError>
+    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
         + Send
         + Sync,
 > {
     Box::new(|this_val, _args, ncx| {
         if this_val.is_undefined() {
-            return Err(crate::error::VmError::type_error(
-                "Constructor WeakSet requires 'new'",
-            ));
+            return Err(VmError::type_error("Constructor WeakSet requires 'new'"));
         }
         if let Some(obj) = this_val.as_object() {
-            let values = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-            obj.set(pk(SET_VALUES_KEY), Value::object(values));
+            let entries = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+            obj.set(pk(WEAKSET_ENTRIES_KEY), Value::object(entries));
             obj.set(pk(IS_WEAKSET_KEY), Value::boolean(true));
             Ok(this_val.clone())
         } else {
-            Err(crate::error::VmError::type_error(
-                "Constructor WeakSet requires 'new'",
-            ))
+            Err(VmError::type_error("Constructor WeakSet requires 'new'"))
         }
     })
 }

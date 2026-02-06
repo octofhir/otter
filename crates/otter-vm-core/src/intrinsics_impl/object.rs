@@ -424,30 +424,31 @@ pub fn init_object_constructor(
         PropertyKey::string("keys"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |_this, args, ncx| {
-                let keys = if let Some(proxy) = args.first().and_then(|v| v.as_proxy()) {
-                    crate::proxy_operations::proxy_own_keys(ncx, proxy)?
-                } else if let Some(obj) = args.first().and_then(|v| v.as_object()) {
-                    obj.own_keys()
+                let arg = args.first().cloned().unwrap_or(Value::undefined());
+                let proxy = arg.as_proxy();
+                let obj = if proxy.is_none() {
+                    Some(to_object_for_builtin(ncx, &arg)?)
                 } else {
-                    return Err(VmError::type_error("Object.keys requires an object"));
+                    None
+                };
+
+                let keys = if let Some(p) = proxy {
+                    crate::proxy_operations::proxy_own_keys(ncx, p)?
+                } else {
+                    obj.unwrap().own_keys()
                 };
 
                 let mut names = Vec::new();
                 for key in keys {
                     match &key {
                         PropertyKey::String(s) => {
-                            let desc = if let Some(proxy) = args.first().and_then(|v| v.as_proxy()) {
+                            let desc = if let Some(p) = proxy {
                                 let key_value = Value::string(*s);
                                 crate::proxy_operations::proxy_get_own_property_descriptor(
-                                    ncx,
-                                    proxy,
-                                    &key,
-                                    key_value,
+                                    ncx, p, &key, key_value,
                                 )?
-                            } else if let Some(obj) = args.first().and_then(|v| v.as_object()) {
-                                obj.get_own_property_descriptor(&key)
                             } else {
-                                None
+                                obj.unwrap().get_own_property_descriptor(&key)
                             };
                             if let Some(desc) = desc {
                                 if desc.enumerable() {
@@ -456,18 +457,13 @@ pub fn init_object_constructor(
                             }
                         }
                         PropertyKey::Index(i) => {
-                            let desc = if let Some(proxy) = args.first().and_then(|v| v.as_proxy()) {
+                            let desc = if let Some(p) = proxy {
                                 let key_value = Value::string(JsString::intern(&i.to_string()));
                                 crate::proxy_operations::proxy_get_own_property_descriptor(
-                                    ncx,
-                                    proxy,
-                                    &key,
-                                    key_value,
+                                    ncx, p, &key, key_value,
                                 )?
-                            } else if let Some(obj) = args.first().and_then(|v| v.as_object()) {
-                                obj.get_own_property_descriptor(&key)
                             } else {
-                                None
+                                obj.unwrap().get_own_property_descriptor(&key)
                             };
                             if let Some(desc) = desc {
                                 if desc.enumerable() {
@@ -503,45 +499,44 @@ pub fn init_object_constructor(
         PropertyKey::string("values"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |_this, args, ncx| {
-                let keys = if let Some(proxy) = args.first().and_then(|v| v.as_proxy()) {
-                    crate::proxy_operations::proxy_own_keys(ncx, proxy)?
-                } else if let Some(obj) = args.first().and_then(|v| v.as_object()) {
-                    obj.own_keys()
+                let arg = args.first().cloned().unwrap_or(Value::undefined());
+                let proxy = arg.as_proxy();
+                let obj = if proxy.is_none() {
+                    Some(to_object_for_builtin(ncx, &arg)?)
                 } else {
-                    return Err(VmError::type_error("Object.values requires an object"));
+                    None
+                };
+
+                let keys = if let Some(p) = proxy {
+                    crate::proxy_operations::proxy_own_keys(ncx, p)?
+                } else {
+                    obj.unwrap().own_keys()
                 };
                 let mut values = Vec::new();
-                let receiver = args.first().cloned().unwrap_or(Value::undefined());
+                let receiver = arg.clone();
                 for key in keys {
                     let key_value = match &key {
                         PropertyKey::String(s) => Value::string(*s),
                         PropertyKey::Index(i) => Value::string(JsString::intern(&i.to_string())),
                         PropertyKey::Symbol(sym) => Value::symbol(*sym),
                     };
-                    let desc = if let Some(proxy) = args.first().and_then(|v| v.as_proxy()) {
+                    let desc = if let Some(p) = proxy {
                         crate::proxy_operations::proxy_get_own_property_descriptor(
-                            ncx,
-                            proxy,
-                            &key,
-                            key_value.clone(),
+                            ncx, p, &key, key_value.clone(),
                         )?
-                    } else if let Some(obj) = args.first().and_then(|v| v.as_object()) {
-                        obj.get_own_property_descriptor(&key)
                     } else {
-                        None
+                        obj.unwrap().get_own_property_descriptor(&key)
                     };
                     if let Some(desc) = desc {
                         if !desc.enumerable() {
                             continue;
                         }
-                        let value = if let Some(proxy) = args.first().and_then(|v| v.as_proxy()) {
+                        let value = if let Some(p) = proxy {
                             crate::proxy_operations::proxy_get(
-                                ncx, proxy, &key, key_value, receiver.clone(),
+                                ncx, p, &key, key_value, receiver.clone(),
                             )?
-                        } else if let Some(obj) = args.first().and_then(|v| v.as_object()) {
-                            obj.get(&key).unwrap_or(Value::undefined())
                         } else {
-                            Value::undefined()
+                            obj.unwrap().get(&key).unwrap_or(Value::undefined())
                         };
                         values.push(value);
                     }
@@ -571,45 +566,44 @@ pub fn init_object_constructor(
         PropertyKey::string("entries"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |_this, args, ncx_inner| {
-                let keys = if let Some(proxy) = args.first().and_then(|v| v.as_proxy()) {
-                    crate::proxy_operations::proxy_own_keys(ncx_inner, proxy)?
-                } else if let Some(obj) = args.first().and_then(|v| v.as_object()) {
-                    obj.own_keys()
+                let arg = args.first().cloned().unwrap_or(Value::undefined());
+                let proxy = arg.as_proxy();
+                let obj = if proxy.is_none() {
+                    Some(to_object_for_builtin(ncx_inner, &arg)?)
                 } else {
-                    return Err(VmError::type_error("Object.entries requires an object"));
+                    None
+                };
+
+                let keys = if let Some(p) = proxy {
+                    crate::proxy_operations::proxy_own_keys(ncx_inner, p)?
+                } else {
+                    obj.unwrap().own_keys()
                 };
                 let mut entries = Vec::new();
-                let receiver = args.first().cloned().unwrap_or(Value::undefined());
+                let receiver = arg.clone();
                 for key in keys {
                     let key_value = match &key {
                         PropertyKey::String(s) => Value::string(*s),
                         PropertyKey::Index(i) => Value::string(JsString::intern(&i.to_string())),
                         PropertyKey::Symbol(sym) => Value::symbol(*sym),
                     };
-                    let desc = if let Some(proxy) = args.first().and_then(|v| v.as_proxy()) {
+                    let desc = if let Some(p) = proxy {
                         crate::proxy_operations::proxy_get_own_property_descriptor(
-                            ncx_inner,
-                            proxy,
-                            &key,
-                            key_value.clone(),
+                            ncx_inner, p, &key, key_value.clone(),
                         )?
-                    } else if let Some(obj) = args.first().and_then(|v| v.as_object()) {
-                        obj.get_own_property_descriptor(&key)
                     } else {
-                        None
+                        obj.unwrap().get_own_property_descriptor(&key)
                     };
                     if let Some(desc) = desc {
                         if !desc.enumerable() {
                             continue;
                         }
-                        let value = if let Some(proxy) = args.first().and_then(|v| v.as_proxy()) {
+                        let value = if let Some(p) = proxy {
                             crate::proxy_operations::proxy_get(
-                                ncx_inner, proxy, &key, key_value, receiver.clone(),
+                                ncx_inner, p, &key, key_value, receiver.clone(),
                             )?
-                        } else if let Some(obj) = args.first().and_then(|v| v.as_object()) {
-                            obj.get(&key).unwrap_or(Value::undefined())
                         } else {
-                            Value::undefined()
+                            obj.unwrap().get(&key).unwrap_or(Value::undefined())
                         };
                         let key_str = match &key {
                             PropertyKey::String(s) => Value::string(*s),

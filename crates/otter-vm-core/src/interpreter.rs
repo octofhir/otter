@@ -195,8 +195,35 @@ impl Interpreter {
             .function(closure.function_index)
             .ok_or_else(|| VmError::internal("function not found"))?;
 
-        // Set up the call
-        ctx.set_pending_args(args.to_vec());
+        // Set up the call — handle rest parameters
+        let mut call_args: Vec<Value> = args.to_vec();
+        if func_info.flags.has_rest {
+            let param_count = func_info.param_count as usize;
+            let rest_args: Vec<Value> = if call_args.len() > param_count {
+                call_args.drain(param_count..).collect()
+            } else {
+                Vec::new()
+            };
+            let rest_arr = crate::gc::GcRef::new(crate::object::JsObject::array(
+                rest_args.len(),
+                ctx.memory_manager().clone(),
+            ));
+            if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object()) {
+                if let Some(array_proto) = array_obj
+                    .get(&crate::object::PropertyKey::string("prototype"))
+                    .and_then(|v| v.as_object())
+                {
+                    rest_arr.set_prototype(Value::object(array_proto));
+                }
+            }
+            for (i, arg) in rest_args.into_iter().enumerate() {
+                rest_arr.set(crate::object::PropertyKey::Index(i as u32), arg);
+            }
+            call_args.push(Value::object(rest_arr));
+        }
+
+        let argc = call_args.len();
+        ctx.set_pending_args(call_args);
         ctx.set_pending_this(this_value);
         ctx.set_pending_upvalues(closure.upvalues.clone());
         // Propagate home_object from closure to the new call frame
@@ -204,7 +231,6 @@ impl Interpreter {
             ctx.set_pending_home_object(ho.clone());
         }
 
-        let argc = args.len();
         let realm_id = self.realm_id_for_function(ctx, func);
         ctx.set_pending_realm_id(realm_id);
         ctx.push_frame(
@@ -2726,9 +2752,8 @@ impl Interpreter {
                     home_object: None,
                 });
                 let func_value = Value::function(closure);
-                func_obj.set(PropertyKey::string("prototype"), Value::object(proto));
-                proto.set(PropertyKey::string("constructor"), func_value.clone());
                 if func_def.is_arrow() || func_def.is_async() {
+                    // Arrow and async functions are not constructors and have no prototype
                     func_obj.define_property(
                         PropertyKey::string("__non_constructor"),
                         PropertyDescriptor::Data {
@@ -2740,6 +2765,20 @@ impl Interpreter {
                             },
                         },
                     );
+                } else {
+                    // Regular functions: prototype is {writable: true, enumerable: false, configurable: false}
+                    func_obj.define_property(
+                        PropertyKey::string("prototype"),
+                        PropertyDescriptor::Data {
+                            value: Value::object(proto),
+                            attributes: PropertyAttributes {
+                                writable: true,
+                                enumerable: false,
+                                configurable: false,
+                            },
+                        },
+                    );
+                    proto.set(PropertyKey::string("constructor"), func_value.clone());
                 }
                 ctx.set_register(dst.0, func_value);
                 Ok(InstructionResult::Continue)
@@ -2810,8 +2849,7 @@ impl Interpreter {
                     home_object: None,
                 });
                 let func_value = Value::function(closure);
-                func_obj.set(PropertyKey::string("prototype"), Value::object(proto));
-                proto.set(PropertyKey::string("constructor"), func_value.clone());
+                // Async functions are not constructors and have no prototype
                 func_obj.define_property(
                     PropertyKey::string("__non_constructor"),
                     PropertyDescriptor::Data {
@@ -2894,7 +2932,18 @@ impl Interpreter {
                     home_object: None,
                 });
                 let func_value = Value::function(closure);
-                func_obj.set(PropertyKey::string("prototype"), Value::object(proto));
+                // Generator prototype: {writable: true, enumerable: false, configurable: false}
+                func_obj.define_property(
+                    PropertyKey::string("prototype"),
+                    PropertyDescriptor::Data {
+                        value: Value::object(proto),
+                        attributes: PropertyAttributes {
+                            writable: true,
+                            enumerable: false,
+                            configurable: false,
+                        },
+                    },
+                );
                 proto.set(PropertyKey::string("constructor"), func_value.clone());
                 func_obj.define_property(
                     PropertyKey::string("__non_constructor"),
@@ -2978,7 +3027,18 @@ impl Interpreter {
                     home_object: None,
                 });
                 let func_value = Value::function(closure);
-                func_obj.set(PropertyKey::string("prototype"), Value::object(proto));
+                // Async generator prototype: {writable: true, enumerable: false, configurable: false}
+                func_obj.define_property(
+                    PropertyKey::string("prototype"),
+                    PropertyDescriptor::Data {
+                        value: Value::object(proto),
+                        attributes: PropertyAttributes {
+                            writable: true,
+                            enumerable: false,
+                            configurable: false,
+                        },
+                    },
+                );
                 proto.set(PropertyKey::string("constructor"), func_value.clone());
                 func_obj.define_property(
                     PropertyKey::string("__non_constructor"),
@@ -7136,8 +7196,35 @@ impl Interpreter {
             .function(closure.function_index)
             .ok_or_else(|| VmError::internal("function not found"))?;
 
-        // Set up the call
-        ctx.set_pending_args(args.to_vec());
+        // Set up the call — handle rest parameters
+        let mut call_args: Vec<Value> = args.to_vec();
+        if func_info.flags.has_rest {
+            let param_count = func_info.param_count as usize;
+            let rest_args: Vec<Value> = if call_args.len() > param_count {
+                call_args.drain(param_count..).collect()
+            } else {
+                Vec::new()
+            };
+            let rest_arr = crate::gc::GcRef::new(crate::object::JsObject::array(
+                rest_args.len(),
+                ctx.memory_manager().clone(),
+            ));
+            if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object()) {
+                if let Some(array_proto) = array_obj
+                    .get(&crate::object::PropertyKey::string("prototype"))
+                    .and_then(|v| v.as_object())
+                {
+                    rest_arr.set_prototype(Value::object(array_proto));
+                }
+            }
+            for (i, arg) in rest_args.into_iter().enumerate() {
+                rest_arr.set(crate::object::PropertyKey::Index(i as u32), arg);
+            }
+            call_args.push(Value::object(rest_arr));
+        }
+
+        let argc = call_args.len();
+        ctx.set_pending_args(call_args);
         ctx.set_pending_this(this_value);
         ctx.set_pending_upvalues(closure.upvalues.clone());
         // Propagate home_object from closure to the new call frame
@@ -7145,7 +7232,6 @@ impl Interpreter {
             ctx.set_pending_home_object(ho.clone());
         }
 
-        let argc = args.len();
         let realm_id = self.realm_id_for_function(ctx, func);
         ctx.set_pending_realm_id(realm_id);
         ctx.push_frame(

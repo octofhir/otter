@@ -6528,7 +6528,37 @@ impl Compiler {
                     self.codegen.free_reg(src);
                 }
                 ArrayExpressionElement::Elision(_) => {
-                    // TODO: elision should advance length; skip for now
+                    // Elision: advance array length by 1 (creates a hole).
+                    // Emit: len = arr.length; len = len + 1; arr.length = len
+                    let len_reg = self.codegen.alloc_reg();
+                    let one_reg = self.codegen.alloc_reg();
+                    let ic_get = self.codegen.alloc_ic();
+                    self.codegen.emit(Instruction::GetPropConst {
+                        dst: len_reg,
+                        obj: dst,
+                        name: length_key,
+                        ic_index: ic_get,
+                    });
+                    self.codegen.emit(Instruction::LoadInt32 {
+                        dst: one_reg,
+                        value: 1,
+                    });
+                    let fb = self.codegen.alloc_ic();
+                    self.codegen.emit(Instruction::Add {
+                        dst: len_reg,
+                        lhs: len_reg,
+                        rhs: one_reg,
+                        feedback_index: fb,
+                    });
+                    let ic_set = self.codegen.alloc_ic();
+                    self.codegen.emit(Instruction::SetPropConst {
+                        obj: dst,
+                        name: length_key,
+                        val: len_reg,
+                        ic_index: ic_set,
+                    });
+                    self.codegen.free_reg(one_reg);
+                    self.codegen.free_reg(len_reg);
                 }
                 _ => {
                     let value = self.compile_expression(elem.to_expression())?;

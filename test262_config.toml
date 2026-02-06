@@ -67,7 +67,6 @@ skip_features = [
     "class-static-methods-private",
     # Other proposals
     "Array.fromAsync",
-    "change-array-by-copy",
 ]
 
 # Test path patterns to ignore (tests matching these patterns will be skipped)

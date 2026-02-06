@@ -1740,6 +1740,21 @@ impl Otter {
 
         MemoryProfiler::with_heap_provider(provider)
     }
+
+    /// Clear the global string intern table and deallocate all GC objects.
+    ///
+    /// **WARNING**: This invalidates ALL `GcRef` pointers system-wide,
+    /// including those held by this engine. Only call this when the engine
+    /// is about to be replaced (e.g. between test runs).
+    ///
+    /// The correct sequence is:
+    /// 1. Drop or replace this `Otter` instance (releases Rust-side refs)
+    /// 2. Call `Otter::reset_gc()` (frees all GC memory)
+    /// 3. Create a fresh engine
+    pub fn reset_gc() {
+        otter_vm_core::clear_global_string_table();
+        otter_vm_gc::global_registry().dealloc_all();
+    }
 }
 
 impl Default for Otter {

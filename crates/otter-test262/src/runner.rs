@@ -141,6 +141,16 @@ impl Test262Runner {
 
     /// Rebuild engine after a panic to restore consistent state.
     fn rebuild_engine(&mut self) {
+        // Phase 1: Replace old engine with a fresh default (drops old Otter,
+        // releasing all its GcRef/Arc references).
+        self.engine = Otter::default();
+
+        // Phase 2: Now that Rust-side references are gone, wipe all GC memory.
+        // This invalidates GcRefs held by the placeholder above, but we
+        // immediately replace it in Phase 3.
+        Otter::reset_gc();
+
+        // Phase 3: Build the real engine from scratch on a clean GC heap.
         let (harness_ext, harness_state) =
             crate::harness::create_harness_extension_with_state();
         let mut engine = EngineBuilder::new()

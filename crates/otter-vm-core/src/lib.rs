@@ -69,7 +69,7 @@ pub use array_buffer::JsArrayBuffer;
 pub use data_view::JsDataView;
 pub use shared_buffer::SharedArrayBuffer;
 pub use typed_array::{JsTypedArray, TypedArrayKind};
-pub use string::JsString;
+pub use string::{JsString, clear_global_string_table, global_string_table_size};
 pub use structured_clone::{StructuredCloneError, StructuredCloner, structured_clone};
 pub use trace::{TraceConfig, TraceEntry, TraceMode, TraceRingBuffer, TraceState};
 pub use value::{NativeFn, Symbol, Value};

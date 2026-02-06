@@ -432,7 +432,9 @@ impl JsObject {
         flags.is_array = true;
         if length <= MAX_DENSE_PREALLOC {
             drop(flags);
-            obj.elements.write().resize(length, Value::undefined());
+            // Use holes, not undefined: `new Array(5)` creates 5 absent slots.
+            // `0 in arr` → false, `arr[0]` → undefined (via get() hole handling).
+            obj.elements.write().resize(length, Value::hole());
         } else {
             flags.sparse_array_length = Some(length as u32);
             drop(flags);
@@ -673,11 +675,16 @@ impl JsObject {
             }
         }
 
-        // Check indexed elements for arrays
+        // Check indexed elements for arrays (holes resolve to None → undefined)
         if let PropertyKey::Index(i) = key {
             let elements = self.elements.read();
-            if (*i as usize) < elements.len() {
-                return Some(elements[*i as usize].clone());
+            let idx = *i as usize;
+            if idx < elements.len() {
+                let val = &elements[idx];
+                if !val.is_hole() {
+                    return Some(val.clone());
+                }
+                // Hole: fall through to prototype chain (returns None → undefined)
             }
             drop(elements);
             // For non-arrays, also try string property lookup
@@ -853,11 +860,13 @@ impl JsObject {
 
         // For arrays, fall back to indexed elements as own data properties
         // (only if not found in shape - shape takes precedence for accessor properties)
+        // Holes are treated as absent (return None).
         if self.is_array() {
             if let PropertyKey::Index(i) = key {
                 let elements = self.elements.read();
-                if (*i as usize) < elements.len() {
-                    return Some(PropertyDescriptor::data(elements[*i as usize].clone()));
+                let idx = *i as usize;
+                if idx < elements.len() && !elements[idx].is_hole() {
+                    return Some(PropertyDescriptor::data(elements[idx].clone()));
                 }
             }
         }
@@ -917,6 +926,20 @@ impl JsObject {
             return false;
         }
 
+        // Array exotic: intercept `length` writes to truncate/extend
+        if flags.is_array {
+            if let PropertyKey::String(s) = &key {
+                if s.as_str() == "length" {
+                    drop(flags);
+                    let new_len = value.as_number().unwrap_or(0.0);
+                    if new_len < 0.0 || new_len != (new_len as u32 as f64) || new_len.is_nan() {
+                        return false; // RangeError in spec, but return false here
+                    }
+                    return self.set_array_length(new_len as u32);
+                }
+            }
+        }
+
         // Handle indexed elements for arrays
         if let PropertyKey::Index(i) = &key {
             let mut elements = self.elements.write();
@@ -929,7 +952,7 @@ impl JsObject {
                 // Indices beyond this limit are stored as dictionary properties.
                 const MAX_DENSE_LENGTH: usize = 1 << 24; // 16M elements
                 if idx < MAX_DENSE_LENGTH {
-                    elements.resize(idx + 1, Value::undefined());
+                    elements.resize(idx + 1, Value::hole());
                     elements[idx] = value;
                     return true;
                 }
@@ -1049,15 +1072,17 @@ impl JsObject {
                 // Configurable descriptor - proceed with deletion below
             }
 
-            // Array element deletion (best-effort).
-            //
-            // NOTE: We currently don't model array holes, so we can't fully implement
-            // `delete arr[i]`. Setting the element to `undefined` preserves the read
-            // behavior, but `i in arr` will still be true.
+            // Array element deletion: set to hole (absent).
+            // This correctly models sparse arrays: `i in arr` will return false
+            // and iteration methods will skip holes per spec.
             let idx = *i as usize;
             let mut elements = self.elements.write();
             if idx < elements.len() {
-                elements[idx] = Value::undefined();
+                elements[idx] = Value::hole();
+                // Trim trailing holes to keep elements vec compact
+                while elements.last().map_or(false, |v| v.is_hole()) {
+                    elements.pop();
+                }
             }
             return true;
         }
@@ -1125,10 +1150,11 @@ impl JsObject {
             }
         }
 
-        // Check indexed elements
+        // Check indexed elements (holes are absent)
         if let PropertyKey::Index(i) = key {
             let elements = self.elements.read();
-            return (*i as usize) < elements.len();
+            let idx = *i as usize;
+            return idx < elements.len() && !elements[idx].is_hole();
         }
 
         false
@@ -1220,11 +1246,10 @@ impl JsObject {
             }
         }
 
-        // Add indexed elements
+        // Add indexed elements (skip holes — they are absent per spec)
         let elements = self.elements.read();
         for i in 0..elements.len() {
-            // Check if not already in integer_keys to avoid duplicates
-            if !integer_keys.contains(&(i as u32)) {
+            if !elements[i].is_hole() && !integer_keys.contains(&(i as u32)) {
                 integer_keys.push(i as u32);
             }
         }
@@ -1609,6 +1634,46 @@ impl JsObject {
         self.flags.read().is_intrinsic
     }
 
+    /// Set array length (exotic [[DefineOwnProperty]] behavior per ES2023 §10.4.2.4).
+    ///
+    /// - If `new_len < current_len`: truncate elements to `new_len`
+    /// - If `new_len > current_len`: extend with holes (absent elements)
+    pub fn set_array_length(&self, new_len: u32) -> bool {
+        let current_len = self.array_length() as u32;
+        if new_len == current_len {
+            return true;
+        }
+
+        const MAX_DENSE_PREALLOC: usize = 1 << 24; // 16M elements
+
+        if new_len < current_len {
+            // Truncate
+            let mut elements = self.elements.write();
+            let dense_len = elements.len();
+            let target = (new_len as usize).min(dense_len);
+            elements.truncate(target);
+            // Update sparse_array_length if it was set
+            let mut flags = self.flags.write();
+            if flags.sparse_array_length.is_some() {
+                if (new_len as usize) <= elements.len() {
+                    flags.sparse_array_length = None;
+                } else {
+                    flags.sparse_array_length = Some(new_len);
+                }
+            }
+        } else {
+            // Extend with holes
+            let new = new_len as usize;
+            if new <= MAX_DENSE_PREALLOC {
+                self.elements.write().resize(new, Value::hole());
+                self.flags.write().sparse_array_length = None;
+            } else {
+                self.flags.write().sparse_array_length = Some(new_len);
+            }
+        }
+        true
+    }
+
     /// Get array length (for arrays)
     pub fn array_length(&self) -> usize {
         if let Some(sparse_len) = self.flags.read().sparse_array_length {
@@ -1703,6 +1768,83 @@ mod tests {
         assert_eq!(arr.get(&PropertyKey::Index(0)), Some(Value::int32(1)));
         assert_eq!(arr.get(&PropertyKey::Index(1)), Some(Value::int32(2)));
         assert_eq!(arr.get(&PropertyKey::Index(2)), Some(Value::int32(3)));
+    }
+
+    #[test]
+    fn test_array_holes() {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let arr = JsObject::array(3, memory_manager);
+        arr.set(PropertyKey::Index(0), Value::int32(10));
+        arr.set(PropertyKey::Index(1), Value::int32(20));
+        arr.set(PropertyKey::Index(2), Value::int32(30));
+
+        // Delete creates a hole
+        assert!(arr.delete(&PropertyKey::Index(1)));
+
+        // has_own returns false for holes
+        assert!(arr.has_own(&PropertyKey::Index(0)));
+        assert!(!arr.has_own(&PropertyKey::Index(1)));
+        assert!(arr.has_own(&PropertyKey::Index(2)));
+
+        // get returns None for holes
+        assert_eq!(arr.get(&PropertyKey::Index(0)), Some(Value::int32(10)));
+        assert_eq!(arr.get(&PropertyKey::Index(1)), None);
+        assert_eq!(arr.get(&PropertyKey::Index(2)), Some(Value::int32(30)));
+
+        // own_keys skips holes
+        let keys = arr.own_keys();
+        assert!(keys.contains(&PropertyKey::Index(0)));
+        assert!(!keys.contains(&PropertyKey::Index(1)));
+        assert!(keys.contains(&PropertyKey::Index(2)));
+    }
+
+    #[test]
+    fn test_array_prefill_holes() {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let arr = JsObject::array(5, memory_manager);
+        // new Array(5) should create holes, not present elements
+        assert!(!arr.has_own(&PropertyKey::Index(0)));
+        assert!(!arr.has_own(&PropertyKey::Index(4)));
+        assert_eq!(arr.array_length(), 5);
+    }
+
+    #[test]
+    fn test_array_length_truncate() {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let arr = JsObject::array(0, memory_manager);
+        arr.set(PropertyKey::Index(0), Value::int32(1));
+        arr.set(PropertyKey::Index(1), Value::int32(2));
+        arr.set(PropertyKey::Index(2), Value::int32(3));
+        arr.set(PropertyKey::Index(3), Value::int32(4));
+        arr.set(PropertyKey::Index(4), Value::int32(5));
+        assert_eq!(arr.array_length(), 5);
+
+        // arr.length = 2 should truncate
+        arr.set_array_length(2);
+        assert_eq!(arr.array_length(), 2);
+        assert_eq!(arr.get(&PropertyKey::Index(0)), Some(Value::int32(1)));
+        assert_eq!(arr.get(&PropertyKey::Index(1)), Some(Value::int32(2)));
+        assert_eq!(arr.get(&PropertyKey::Index(2)), None);
+
+        // arr.length = 10 should extend with holes
+        arr.set_array_length(10);
+        assert_eq!(arr.array_length(), 10);
+        assert!(!arr.has_own(&PropertyKey::Index(5)));
+    }
+
+    #[test]
+    fn test_array_length_set_via_property() {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let arr = JsObject::array(0, memory_manager);
+        arr.set(PropertyKey::Index(0), Value::int32(10));
+        arr.set(PropertyKey::Index(1), Value::int32(20));
+        arr.set(PropertyKey::Index(2), Value::int32(30));
+
+        // Setting length via set("length", 1) should truncate
+        arr.set(PropertyKey::string("length"), Value::number(1.0));
+        assert_eq!(arr.array_length(), 1);
+        assert_eq!(arr.get(&PropertyKey::Index(0)), Some(Value::int32(10)));
+        assert_eq!(arr.get(&PropertyKey::Index(1)), None);
     }
 
     #[test]

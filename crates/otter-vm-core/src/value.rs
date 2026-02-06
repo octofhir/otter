@@ -89,6 +89,7 @@ const TAG_UNDEFINED: u64 = 0x7FF8_0000_0000_0000;
 const TAG_NULL: u64 = 0x7FF8_0000_0000_0001;
 const TAG_TRUE: u64 = 0x7FF8_0000_0000_0002;
 const TAG_FALSE: u64 = 0x7FF8_0000_0000_0003;
+const TAG_HOLE: u64 = 0x7FF8_0000_0000_0004; // Array hole sentinel (not user-visible)
 const TAG_NAN: u64 = 0x7FFA_0000_0000_0000; // Canonical NaN (distinct from undefined)
 const TAG_INT32: u64 = 0x7FF8_0001_0000_0000;
 const TAG_POINTER: u64 = 0x7FFC_0000_0000_0000;
@@ -310,6 +311,25 @@ impl Value {
             bits: if b { TAG_TRUE } else { TAG_FALSE },
             heap_ref: None,
         }
+    }
+
+    /// Create an array hole sentinel.
+    ///
+    /// Holes represent absent elements in sparse arrays (e.g. `[1,,3]` or after
+    /// `delete arr[i]`). They are never user-visible: `get()` converts them to
+    /// `undefined`, and `has_own()` / `in` treats them as absent.
+    #[inline]
+    pub const fn hole() -> Self {
+        Self {
+            bits: TAG_HOLE,
+            heap_ref: None,
+        }
+    }
+
+    /// Check if value is an array hole sentinel
+    #[inline]
+    pub fn is_hole(&self) -> bool {
+        self.bits == TAG_HOLE
     }
 
     /// Create 32-bit integer value
@@ -924,7 +944,7 @@ impl Value {
     /// Convert to boolean (ToBoolean)
     pub fn to_boolean(&self) -> bool {
         match self.bits {
-            TAG_UNDEFINED | TAG_NULL | TAG_FALSE | TAG_NAN => false, // NaN is falsy
+            TAG_UNDEFINED | TAG_NULL | TAG_FALSE | TAG_NAN | TAG_HOLE => false, // NaN is falsy, holes treated as undefined
             TAG_TRUE => true,
             _ if self.is_int32() => self.as_int32().unwrap() != 0,
             _ if !self.is_nan_boxed() => {
@@ -951,7 +971,7 @@ impl Value {
         use crate::object::PropertyKey;
 
         match self.bits {
-            TAG_UNDEFINED => "undefined",
+            TAG_UNDEFINED | TAG_HOLE => "undefined",
             TAG_NULL => "object", // typeof null === "object" (historical bug)
             TAG_TRUE | TAG_FALSE => "boolean",
             TAG_NAN => "number", // NaN is a number
@@ -1002,6 +1022,7 @@ impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.bits {
             TAG_UNDEFINED => write!(f, "undefined"),
+            TAG_HOLE => write!(f, "<hole>"),
             TAG_NULL => write!(f, "null"),
             TAG_TRUE => write!(f, "true"),
             TAG_FALSE => write!(f, "false"),
@@ -1147,6 +1168,17 @@ mod tests {
 
         // NaN != NaN (per IEEE 754)
         assert_ne!(v, v2); // Our PartialEq uses a == b which returns false for NaN
+    }
+
+    #[test]
+    fn test_hole() {
+        let v = Value::hole();
+        assert!(v.is_hole());
+        assert!(!v.is_undefined());
+        assert!(!v.is_null());
+        assert!(!v.is_nullish());
+        assert!(!v.to_boolean());
+        assert_eq!(v.type_of(), "undefined");
     }
 
     #[test]

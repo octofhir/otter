@@ -312,6 +312,31 @@ impl AllocationRegistry {
 
         reclaimed
     }
+
+    /// Deallocate ALL tracked allocations without marking.
+    ///
+    /// Use this when tearing down an engine/isolate to reclaim all memory.
+    /// After calling this, no GcRef pointers from this registry are valid.
+    pub fn dealloc_all(&self) -> usize {
+        let mut allocations = self.allocations.write();
+        let mut reclaimed: usize = 0;
+
+        let entries: Vec<AllocationEntry> = allocations.drain(..).collect();
+        let total = self.total_bytes.load(Ordering::Relaxed);
+        self.total_bytes.store(0, Ordering::Relaxed);
+        drop(allocations);
+
+        for entry in entries {
+            reclaimed += entry.size;
+            unsafe {
+                (entry.drop_fn)(entry.header as *mut u8);
+            }
+        }
+
+        // reclaimed may differ from total due to race conditions; use actual total
+        let _ = reclaimed;
+        total
+    }
 }
 
 impl Default for AllocationRegistry {

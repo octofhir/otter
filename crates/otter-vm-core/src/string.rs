@@ -128,6 +128,20 @@ impl Default for StringTable {
     }
 }
 
+/// Clear the global string intern table.
+///
+/// Call this when tearing down a VM isolate to allow the GC to reclaim
+/// interned string memory. After calling this, all existing `GcRef<JsString>`
+/// from the global table are dangling — only use this when no VM is active.
+pub fn clear_global_string_table() {
+    STRING_TABLE.clear();
+}
+
+/// Get the number of entries in the global string intern table.
+pub fn global_string_table_size() -> usize {
+    STRING_TABLE.len()
+}
+
 /// An interned JavaScript string with GC support
 ///
 /// `JsString` is allocated via `GcRef<JsString>` which wraps it in a `GcBox`.

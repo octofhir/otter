@@ -252,6 +252,40 @@ impl VmRuntime {
     pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
         &self.memory_manager
     }
+
+    /// Replace the default realm with a freshly created one.
+    ///
+    /// Creates a new realm (fresh intrinsics, global, Function.prototype),
+    /// sets it as the default, removes the old realm from the registry
+    /// (dropping GcRef roots so old objects can be GC'd), and clears the
+    /// module cache.
+    ///
+    /// After this call, `create_context()` will use the new realm.
+    /// Extensions are re-applied by Otter::eval() automatically.
+    pub fn reset_default_realm(&mut self) {
+        let old_realm_id = self.default_realm_id;
+
+        // Create new realm (allocate → wire → init_core → install_on_global)
+        let new_realm_id = self.create_realm();
+
+        // Get new realm record to update cached fields
+        let new_realm = self
+            .realm_registry
+            .get(new_realm_id)
+            .expect("freshly created realm must exist in registry");
+
+        // Swap default
+        self.default_realm_id = new_realm_id;
+        self.intrinsics = new_realm.intrinsics.clone();
+        self.function_prototype = new_realm.function_prototype;
+        self.global_template = new_realm.global;
+
+        // Drop old realm roots → GC can collect old objects
+        self.realm_registry.remove(old_realm_id);
+
+        // Clear module cache (compiled modules may reference old realm state)
+        self.modules.clear();
+    }
 }
 
 impl Default for VmRuntime {

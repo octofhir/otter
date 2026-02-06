@@ -27,8 +27,8 @@ pub struct Test262Runner {
     skip_features: Vec<String>,
     /// Shared harness state for capturing async test results
     harness_state: TestHarnessState,
-    /// Reusable engine (created once, used for all tests)
-    engine: Otter,
+    /// Reusable engine (Option to allow safe drop-before-reset in post-panic rebuild)
+    engine: Option<Otter>,
     /// Whether to dump on timeout
     dump_on_timeout: bool,
     /// Dump output path (None = stderr)
@@ -127,7 +127,7 @@ impl Test262Runner {
             filter: None,
             skip_features: Vec::new(),
             harness_state,
-            engine,
+            engine: Some(engine),
             dump_on_timeout,
             dump_file,
             dump_buffer_size,
@@ -140,14 +140,16 @@ impl Test262Runner {
     }
 
     /// Rebuild engine after a panic to restore consistent state.
+    ///
+    /// Only called after a panic — normal test runs reuse the same engine.
+    /// Uses Option to safely drop the old engine before resetting GC,
+    /// avoiding the dangling-GcRef crash.
     fn rebuild_engine(&mut self) {
-        // Phase 1: Replace old engine with a fresh default (drops old Otter,
-        // releasing all its GcRef/Arc references).
-        self.engine = Otter::default();
+        // Phase 1: Drop old engine cleanly (dealloc flag guards VmContext::Drop).
+        // Setting to None ensures no live Otter holds GcRefs when we reset.
+        self.engine = None;
 
         // Phase 2: Now that Rust-side references are gone, wipe all GC memory.
-        // This invalidates GcRefs held by the placeholder above, but we
-        // immediately replace it in Phase 3.
         Otter::reset_gc();
 
         // Phase 3: Build the real engine from scratch on a clean GC heap.
@@ -169,8 +171,18 @@ impl Test262Runner {
             });
         }
 
-        self.engine = engine;
+        self.engine = Some(engine);
         self.harness_state = harness_state;
+    }
+
+    /// Get a reference to the engine (panics if engine is None — only during rebuild).
+    fn engine(&self) -> &Otter {
+        self.engine.as_ref().expect("engine not available (mid-rebuild)")
+    }
+
+    /// Get a mutable reference to the engine.
+    fn engine_mut(&mut self) -> &mut Otter {
+        self.engine.as_mut().expect("engine not available (mid-rebuild)")
     }
 
     /// Create a new test runner that skips no features (runs everything).
@@ -347,8 +359,10 @@ impl Test262Runner {
         mode: ExecutionMode,
         timeout: Option<Duration>,
     ) -> (TestOutcome, Option<String>) {
-        // Ensure a clean realm per mode to avoid cross-mode contamination.
-        self.rebuild_engine();
+        // Reset realm per mode: creates fresh global + intrinsics on the same
+        // GC heap. Much faster than full engine rebuild for large suites (no
+        // GC reset, no extension recompilation). Extensions re-applied by eval().
+        self.engine_mut().reset_realm();
 
         let relative_path = path.strip_prefix(&self.test_dir).unwrap_or(path);
         let test_name = format!("{} ({})", relative_path.to_string_lossy(), mode);
@@ -540,12 +554,14 @@ impl Test262Runner {
             PathBuf::from(format!("test262-trace-{}.txt", sanitized_name))
         };
 
-        self.engine.set_trace_config(otter_vm_core::TraceConfig {
+        let buffer_size = self.dump_buffer_size;
+        let filter = self.trace_filter.clone();
+        self.engine_mut().set_trace_config(otter_vm_core::TraceConfig {
             enabled: true,
             mode,
-            ring_buffer_size: self.dump_buffer_size,
+            ring_buffer_size: buffer_size,
             output_path: Some(trace_path),
-            filter: self.trace_filter.clone(),
+            filter,
             capture_timing: false,
         });
     }
@@ -561,7 +577,7 @@ impl Test262Runner {
         }
 
         // Get snapshot and write to file
-        let snapshot = self.engine.debug_snapshot();
+        let snapshot = self.engine().debug_snapshot();
         if snapshot.recent_instructions.is_empty() {
             return;
         }
@@ -612,14 +628,14 @@ impl Test262Runner {
                 .open(dump_file)
             {
                 let _ = write!(file, "{}", header);
-                let _ = self.engine.dump_snapshot(&mut file);
+                let _ = self.engine().dump_snapshot(&mut file);
             } else {
                 eprintln!("Failed to open dump file: {:?}", dump_file);
             }
         } else {
             // Write to stderr
             eprintln!("{}", header);
-            let _ = self.engine.dump_snapshot(&mut std::io::stderr());
+            let _ = self.engine().dump_snapshot(&mut std::io::stderr());
         }
     }
 
@@ -704,13 +720,13 @@ impl Test262Runner {
             // Cooperative timeout: spawn a tokio task as watchdog on a separate
             // worker thread (runtime is multi-threaded). It sets the interrupt
             // flag after the deadline; the VM checks it every ~10K instructions.
-            let flag = self.engine.interrupt_flag();
+            let flag = self.engine().interrupt_flag();
             let watchdog = tokio::spawn(async move {
                 tokio::time::sleep(duration).await;
                 flag.store(true, Ordering::Relaxed);
             });
 
-            let result = AssertUnwindSafe(self.engine.eval(source))
+            let result = AssertUnwindSafe(self.engine_mut().eval(source))
                 .catch_unwind()
                 .await;
 
@@ -719,7 +735,7 @@ impl Test262Runner {
 
             result
         } else {
-            AssertUnwindSafe(self.engine.eval(source))
+            AssertUnwindSafe(self.engine_mut().eval(source))
                 .catch_unwind()
                 .await
         };

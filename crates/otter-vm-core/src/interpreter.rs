@@ -1493,6 +1493,7 @@ impl Interpreter {
                 name,
                 src,
                 ic_index,
+                is_declaration,
             } => {
                 let name_const = module
                     .constants
@@ -1537,6 +1538,31 @@ impl Interpreter {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+
+                // Strict mode: ReferenceError on assignment to undeclared variable
+                if !is_declaration {
+                    let is_strict = ctx
+                        .current_frame()
+                        .and_then(|frame| frame.module.function(frame.function_index))
+                        .map(|func| func.flags.is_strict)
+                        .unwrap_or(false);
+
+                    if is_strict {
+                        let global_obj = ctx.global().clone();
+                        let key = Self::utf16_key(name_str);
+                        let property_exists = if global_obj.is_dictionary_mode() {
+                            global_obj.has_own(&key)
+                        } else {
+                            global_obj.shape().get_offset(&key).is_some()
+                        };
+                        if !property_exists {
+                            return Err(VmError::ReferenceError(format!(
+                                "{} is not defined",
+                                String::from_utf16_lossy(name_str)
+                            )));
                         }
                     }
                 }
@@ -4930,6 +4956,16 @@ impl Interpreter {
             Instruction::DeleteProp { dst, obj, key } => {
                 let object = ctx.get_register(obj.0).clone();
                 let key_value = ctx.get_register(key.0).clone();
+
+                // TypeError for null/undefined base
+                if object.is_null() || object.is_undefined() {
+                    let key_str = self.to_string(&key_value);
+                    let base = if object.is_null() { "null" } else { "undefined" };
+                    return Err(VmError::type_error(format!(
+                        "Cannot delete property '{}' of {}",
+                        key_str, base
+                    )));
+                }
 
                 // Proxy check - must be first
                 if let Some(proxy) = object.as_proxy() {

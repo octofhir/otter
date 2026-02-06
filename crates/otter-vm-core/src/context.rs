@@ -2022,6 +2022,12 @@ impl VmContext {
 
 impl Drop for VmContext {
     fn drop(&mut self) {
+        // During dealloc_all, GC objects are freed in arbitrary order.
+        // Teardown accesses self.global (a GcRef) which may already be freed.
+        // Skip teardown entirely — all memory will be reclaimed by dealloc_all anyway.
+        if otter_vm_gc::is_dealloc_in_progress() {
+            return;
+        }
         self.teardown();
     }
 }

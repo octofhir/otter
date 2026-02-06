@@ -568,6 +568,9 @@ pub enum Instruction {
         src: Register,
         /// Index into the feedback vector for Inline Cache
         ic_index: u16,
+        /// true for var/function declarations; false for unresolved assignments.
+        /// Strict mode throws ReferenceError on unresolved assignment to nonexistent global.
+        is_declaration: bool,
     },
     /// Load `this` value into register
     LoadThis {

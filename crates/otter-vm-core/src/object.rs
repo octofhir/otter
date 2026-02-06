@@ -1112,10 +1112,15 @@ impl JsObject {
             return true;
         }
 
-        // Dictionary mode: remove from HashMap
+        // Dictionary mode: remove from HashMap (but check configurable first)
         if self.is_dictionary_mode() {
             let mut dict = self.dictionary_properties.write();
             if let Some(map) = dict.as_mut() {
+                if let Some(entry) = map.get(key) {
+                    if !entry.desc.is_configurable() {
+                        return false;
+                    }
+                }
                 map.shift_remove(key);
             }
             return true;

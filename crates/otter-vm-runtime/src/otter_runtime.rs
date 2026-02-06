@@ -163,6 +163,30 @@ impl Otter {
         self.interrupt_flag.store(false, Ordering::Relaxed);
     }
 
+    /// Reset the default realm for test isolation.
+    ///
+    /// Creates a fresh realm (intrinsics, global, Function.prototype) on the
+    /// existing GC heap, sets it as the default, and removes the old realm
+    /// from the registry so its objects can be GC'd.
+    ///
+    /// Much lighter than rebuilding the entire engine:
+    /// - Reuses the same MemoryManager, EventLoop, ExtensionRegistry
+    /// - Extensions are re-applied by eval() automatically
+    /// - The GC heap is NOT wiped; old objects are collected normally
+    ///
+    /// For post-panic recovery, use full engine rebuild instead.
+    pub fn reset_realm(&mut self) {
+        // Drop stored realm contexts from $262.createRealm()
+        self.realms.lock().clear();
+
+        // Create fresh realm, swap default, drop old
+        self.vm.reset_default_realm();
+
+        // Reset execution state
+        self.clear_interrupt();
+        *self.debug_snapshot.lock() = VmContextSnapshot::default();
+    }
+
     /// Set trace configuration for instruction-level tracing
     pub fn set_trace_config(&mut self, config: otter_vm_core::TraceConfig) {
         self.trace_config = Some(config);
@@ -500,7 +524,7 @@ impl Otter {
             .map_err(|e| OtterError::Compile(e.to_string()))?;
 
         let module_arc = Arc::new(module);
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
 
         Ok(interpreter.execute_with_suspension(module_arc, ctx, result_promise))
     }

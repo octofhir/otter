@@ -11,8 +11,22 @@
 //! - **Sweep**: Frees all white (unreachable) objects after marking
 
 use parking_lot::RwLock;
+use std::cell::Cell;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+thread_local! {
+    /// Flag indicating that `dealloc_all` is in progress on this thread.
+    /// When true, Drop impls should NOT access other GC-managed objects
+    /// because they may have already been freed.
+    static GC_DEALLOC_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Returns true if the GC is currently freeing all allocations on this thread.
+/// Drop impls should check this and skip any access to other GC objects.
+pub fn is_dealloc_in_progress() -> bool {
+    GC_DEALLOC_IN_PROGRESS.with(|f| f.get())
+}
 use std::time::{Duration, Instant};
 
 use crate::object::{GcHeader, MarkColor};
@@ -326,12 +340,18 @@ impl AllocationRegistry {
         self.total_bytes.store(0, Ordering::Relaxed);
         drop(allocations);
 
+        // Set the dealloc-in-progress flag so that Drop impls skip
+        // accessing other GC objects (which may already be freed).
+        GC_DEALLOC_IN_PROGRESS.with(|f| f.set(true));
+
         for entry in entries {
             reclaimed += entry.size;
             unsafe {
                 (entry.drop_fn)(entry.header as *mut u8);
             }
         }
+
+        GC_DEALLOC_IN_PROGRESS.with(|f| f.set(false));
 
         // reclaimed may differ from total due to race conditions; use actual total
         let _ = reclaimed;

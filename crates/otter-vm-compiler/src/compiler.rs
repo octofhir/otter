@@ -501,6 +501,7 @@ impl Compiler {
                         name: name_idx,
                         src: undef_reg,
                         ic_index,
+                        is_declaration: true,
                     });
                     self.codegen.free_reg(undef_reg);
                 } else {
@@ -1007,6 +1008,7 @@ impl Compiler {
                             name: name_idx,
                             src: ctor,
                             ic_index,
+                            is_declaration: true,
                         });
                     }
                 }
@@ -1072,6 +1074,7 @@ impl Compiler {
                     name: name_idx,
                     src: ctor,
                     ic_index,
+                    is_declaration: true,
                 });
             }
         }
@@ -1741,6 +1744,7 @@ impl Compiler {
                         name: name_idx,
                         src: value_reg,
                         ic_index,
+                        is_declaration: true,
                     });
                 } else {
                     let local_idx =
@@ -2736,13 +2740,24 @@ impl Compiler {
                             src: source_reg,
                         });
                     }
-                    Some(ResolvedBinding::Global(_)) | None => {
+                    Some(ResolvedBinding::Global(_)) => {
                         let name_idx = self.codegen.add_string(&ident.name);
                         let ic_index = self.codegen.alloc_ic();
                         self.codegen.emit(Instruction::SetGlobal {
                             name: name_idx,
                             src: source_reg,
                             ic_index,
+                            is_declaration: true,
+                        });
+                    }
+                    None => {
+                        let name_idx = self.codegen.add_string(&ident.name);
+                        let ic_index = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::SetGlobal {
+                            name: name_idx,
+                            src: source_reg,
+                            ic_index,
+                            is_declaration: false,
                         });
                     }
                     Some(ResolvedBinding::Upvalue { index, depth }) => {
@@ -2926,13 +2941,24 @@ impl Compiler {
                                         src: prop_reg,
                                     });
                                 }
-                                Some(ResolvedBinding::Global(_)) | None => {
+                                Some(ResolvedBinding::Global(_)) => {
                                     let name_idx = self.codegen.add_string(&ident.binding.name);
                                     let ic_index_set = self.codegen.alloc_ic();
                                     self.codegen.emit(Instruction::SetGlobal {
                                         name: name_idx,
                                         src: prop_reg,
                                         ic_index: ic_index_set,
+                                        is_declaration: true,
+                                    });
+                                }
+                                None => {
+                                    let name_idx = self.codegen.add_string(&ident.binding.name);
+                                    let ic_index_set = self.codegen.alloc_ic();
+                                    self.codegen.emit(Instruction::SetGlobal {
+                                        name: name_idx,
+                                        src: prop_reg,
+                                        ic_index: ic_index_set,
+                                        is_declaration: false,
                                     });
                                 }
                                 Some(ResolvedBinding::Upvalue { index, depth }) => {
@@ -3571,6 +3597,7 @@ impl Compiler {
                     name: name_idx,
                     src: dst,
                     ic_index,
+                    is_declaration: true,
                 });
             }
             self.codegen.free_reg(dst);
@@ -3753,6 +3780,7 @@ impl Compiler {
                     name: name_idx,
                     src: dst,
                     ic_index,
+                    is_declaration: true,
                 });
             }
             self.codegen.free_reg(dst);
@@ -4869,6 +4897,14 @@ impl Compiler {
 
             return match &unary.argument {
                 Expression::Identifier(_ident) => {
+                    // Strict mode: delete identifier is a SyntaxError (ES5.1 11.4.1)
+                    if self.codegen.current.flags.is_strict {
+                        return Err(CompileError::syntax(
+                            "Delete of an unqualified identifier in strict mode",
+                            0,
+                            0,
+                        ));
+                    }
                     self.codegen.emit(Instruction::LoadTrue { dst });
                     Ok(dst)
                 }
@@ -5005,13 +5041,24 @@ impl Compiler {
                             src: val,
                         });
                     }
-                    Some(ResolvedBinding::Global(_)) | None => {
+                    Some(ResolvedBinding::Global(_)) => {
                         let name_idx = self.codegen.add_string(&ident.name);
                         let ic_index = self.codegen.alloc_ic();
                         self.codegen.emit(Instruction::SetGlobal {
                             name: name_idx,
                             src: val,
                             ic_index,
+                            is_declaration: true,
+                        });
+                    }
+                    None => {
+                        let name_idx = self.codegen.add_string(&ident.name);
+                        let ic_index = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::SetGlobal {
+                            name: name_idx,
+                            src: val,
+                            ic_index,
+                            is_declaration: false,
                         });
                     }
                     Some(ResolvedBinding::Upvalue { index, depth }) => {
@@ -5239,13 +5286,24 @@ impl Compiler {
                             src: dst,
                         });
                     }
-                    Some(ResolvedBinding::Global(_)) | None => {
+                    Some(ResolvedBinding::Global(_)) => {
                         let name_idx = self.codegen.add_string(&ident.name);
                         let ic_index = self.codegen.alloc_ic();
                         self.codegen.emit(Instruction::SetGlobal {
                             name: name_idx,
                             src: dst,
                             ic_index,
+                            is_declaration: true,
+                        });
+                    }
+                    None => {
+                        let name_idx = self.codegen.add_string(&ident.name);
+                        let ic_index = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::SetGlobal {
+                            name: name_idx,
+                            src: dst,
+                            ic_index,
+                            is_declaration: false,
                         });
                     }
                     Some(ResolvedBinding::Upvalue { index, depth }) => {
@@ -6163,6 +6221,7 @@ impl Compiler {
                     name: name_idx,
                     src,
                     ic_index,
+                    is_declaration: true,
                 });
             }
             Some(ResolvedBinding::Upvalue { index, depth }) => {
@@ -6181,6 +6240,7 @@ impl Compiler {
                     name: name_idx,
                     src,
                     ic_index,
+                    is_declaration: false,
                 });
             }
         }

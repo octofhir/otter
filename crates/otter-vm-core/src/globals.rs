@@ -57,15 +57,45 @@ fn define_global_fn<F>(
 pub fn setup_global_object(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>, intrinsics_opt: Option<&crate::intrinsics::Intrinsics>) {
     let mm = global.memory_manager().clone();
 
-    // globalThis - self-referencing
-    global.set(PropertyKey::string("globalThis"), Value::object(global));
+    // globalThis - self-referencing, per spec: {writable: true, enumerable: false, configurable: false}
+    global.define_property(
+        PropertyKey::string("globalThis"),
+        PropertyDescriptor::Data {
+            value: Value::object(global),
+            attributes: PropertyAttributes {
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+        },
+    );
 
-    // Primitive values
-    global.set(PropertyKey::string("undefined"), Value::undefined());
-    global.set(PropertyKey::string("NaN"), Value::number(f64::NAN));
-    global.set(
+    // Primitive values — per ES2023 §19.1: {writable: false, enumerable: false, configurable: false}
+    let immutable_attrs = PropertyAttributes {
+        writable: false,
+        enumerable: false,
+        configurable: false,
+    };
+    global.define_property(
+        PropertyKey::string("undefined"),
+        PropertyDescriptor::Data {
+            value: Value::undefined(),
+            attributes: immutable_attrs,
+        },
+    );
+    global.define_property(
+        PropertyKey::string("NaN"),
+        PropertyDescriptor::Data {
+            value: Value::number(f64::NAN),
+            attributes: immutable_attrs,
+        },
+    );
+    global.define_property(
         PropertyKey::string("Infinity"),
-        Value::number(f64::INFINITY),
+        PropertyDescriptor::Data {
+            value: Value::number(f64::INFINITY),
+            attributes: immutable_attrs,
+        },
     );
 
     // Global functions — all get fn_proto as [[Prototype]] with proper length/name

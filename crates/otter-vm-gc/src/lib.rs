@@ -38,5 +38,6 @@ pub use concurrent::{
 pub use heap::{GcConfig, GcHeap};
 pub use mark_sweep::{
     AllocationRegistry, GcTraceable, RegistryStats, gc_alloc, gc_alloc_in, global_registry,
+    is_dealloc_in_progress,
 };
 pub use object::{GcHeader, GcObject};

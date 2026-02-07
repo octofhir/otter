@@ -5,12 +5,12 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use otter_vm_bytecode::{Function, Instruction, Module, Register};
-use otter_vm_core::{GcRef, Interpreter, JsObject, MemoryManager, VmContext};
+use otter_vm_core::{GcRef, Interpreter, JsObject, MemoryManager, VmContext, value::Value};
 use std::sync::Arc;
 
 fn create_test_context() -> VmContext {
     let memory_manager = Arc::new(MemoryManager::test());
-    let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
+    let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
     VmContext::new(global, memory_manager)
 }
 

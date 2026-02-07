@@ -163,7 +163,7 @@ pub fn install_math_namespace(
     // Helper macro to define a Math method
     macro_rules! math_method {
         ($name:literal, $body:expr) => {
-            math_obj.set(
+            let _ = math_obj.set(
                 PropertyKey::string($name),
                 Value::native_function(
                     $body,
@@ -467,5 +467,5 @@ pub fn install_math_namespace(
     // ====================================================================
     // Install Math on global
     // ====================================================================
-    global.set(PropertyKey::string("Math"), Value::object(math_obj));
+    let _ = global.set(PropertyKey::string("Math"), Value::object(math_obj));
 }

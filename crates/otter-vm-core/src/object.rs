@@ -10,12 +10,13 @@
 //! locality and reduces indirection for common cases where objects have few
 //! properties.
 
-use parking_lot::RwLock;
 use indexmap::IndexMap;
+use crate::object_cell::ObjectCell;
 use std::sync::Arc;
 
 use crate::gc::GcRef;
 use crate::shape::Shape;
+use crate::value::UpvalueCell;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -344,9 +345,47 @@ pub(crate) struct PropertyEntry {
     pub(crate) desc: PropertyDescriptor,
 }
 
+/// Error returned when a property assignment fails.
+///
+/// In strict mode, these map to specific `TypeError` messages per the spec.
+/// In sloppy mode, the assignment silently fails.
+#[derive(Debug)]
+pub enum SetPropertyError {
+    /// Object is frozen — no properties can be changed or added.
+    Frozen,
+    /// Property exists but is non-writable.
+    NonWritable,
+    /// Object is not extensible — new properties cannot be added.
+    NonExtensible,
+    /// Object is sealed — new properties cannot be added and existing
+    /// properties cannot be reconfigured.
+    Sealed,
+    /// Property is an accessor without a setter.
+    AccessorWithoutSetter,
+}
+
+impl std::fmt::Display for SetPropertyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Frozen => write!(f, "Cannot assign to property of a frozen object"),
+            Self::NonWritable => write!(f, "Cannot assign to read only property"),
+            Self::NonExtensible => write!(f, "Cannot add property, object is not extensible"),
+            Self::Sealed => write!(f, "Cannot add property to a sealed object"),
+            Self::AccessorWithoutSetter => write!(f, "Cannot set property which has only a getter"),
+        }
+    }
+}
+
+/// Parameter mapping for mapped arguments objects (ES2024 §10.4.4).
+/// Each cell aliases a formal parameter's local variable slot via UpvalueCell.
+pub struct ArgumentMapping {
+    /// One entry per formal parameter. Some(cell) = aliased, None = unmapped.
+    pub cells: Vec<Option<UpvalueCell>>,
+}
+
 /// A JavaScript object
 ///
-/// Thread-safe with interior mutability.
+/// Thread-confined with zero-cost interior mutability via `ObjectCell`.
 ///
 /// ## Inline Properties
 ///
@@ -355,23 +394,26 @@ pub(crate) struct PropertyEntry {
 /// Both inline and overflow use `PropertyEntry` to support accessor properties.
 pub struct JsObject {
     /// Current shape of the object
-    shape: RwLock<Arc<Shape>>,
+    shape: ObjectCell<Arc<Shape>>,
     /// Inline property storage for first N properties (JSC-style)
-    inline_properties: RwLock<[Option<PropertyEntry>; INLINE_PROPERTY_COUNT]>,
+    inline_properties: ObjectCell<[Option<PropertyEntry>; INLINE_PROPERTY_COUNT]>,
     /// Overflow properties storage (for properties beyond INLINE_PROPERTY_COUNT)
-    overflow_properties: RwLock<Vec<PropertyEntry>>,
+    overflow_properties: ObjectCell<Vec<PropertyEntry>>,
     /// Dictionary mode property storage (used when is_dictionary flag is set)
     /// When in dictionary mode, shape/inline/overflow are ignored for property access.
-    dictionary_properties: RwLock<Option<IndexMap<PropertyKey, PropertyEntry>>>,
+    dictionary_properties: ObjectCell<Option<IndexMap<PropertyKey, PropertyEntry>>>,
     /// Prototype (null for Object.prototype, mutable via Reflect.setPrototypeOf)
     /// Can be Value::object, Value::proxy, or Value::null
-    prototype: RwLock<Value>,
+    prototype: ObjectCell<Value>,
     /// Array elements (for array-like objects)
-    elements: RwLock<Vec<Value>>,
+    elements: ObjectCell<Vec<Value>>,
     /// Object flags (mutable for freeze/seal/preventExtensions)
-    flags: RwLock<ObjectFlags>,
+    flags: ObjectCell<ObjectFlags>,
     /// Memory manager for accounting
     memory_manager: Arc<crate::memory::MemoryManager>,
+    /// Parameter mapping for mapped arguments objects (sloppy mode).
+    /// None for all non-arguments objects (8 bytes overhead).
+    argument_mapping: ObjectCell<Option<Box<ArgumentMapping>>>,
 }
 
 /// Object flags
@@ -405,17 +447,56 @@ impl JsObject {
         let _ = memory_manager.alloc(size); // ignore err in basic constructor for now or return Result
 
         Self {
-            shape: RwLock::new(Shape::root()),
-            inline_properties: RwLock::new([None, None, None, None]),
-            overflow_properties: RwLock::new(Vec::new()),
-            dictionary_properties: RwLock::new(None),
-            prototype: RwLock::new(prototype),
-            elements: RwLock::new(Vec::new()),
-            flags: RwLock::new(ObjectFlags {
+            shape: ObjectCell::new(Shape::root()),
+            inline_properties: ObjectCell::new([None, None, None, None]),
+            overflow_properties: ObjectCell::new(Vec::new()),
+            dictionary_properties: ObjectCell::new(None),
+            prototype: ObjectCell::new(prototype),
+            elements: ObjectCell::new(Vec::new()),
+            flags: ObjectCell::new(ObjectFlags {
                 extensible: true,
                 ..Default::default()
             }),
             memory_manager,
+            argument_mapping: ObjectCell::new(None),
+        }
+    }
+
+    /// Set the argument mapping for mapped arguments objects
+    pub fn set_argument_mapping(&self, mapping: ArgumentMapping) {
+        *self.argument_mapping.borrow_mut() = Some(Box::new(mapping));
+    }
+
+    /// Get the UpvalueCell for a mapped argument index, if any
+    pub fn get_argument_cell(&self, index: usize) -> Option<UpvalueCell> {
+        let mapping = self.argument_mapping.borrow();
+        mapping
+            .as_ref()
+            .and_then(|m| m.cells.get(index))
+            .and_then(|cell| cell.clone())
+    }
+
+    /// Unmap a specific argument index (e.g., after defineProperty with accessor)
+    pub fn unmap_argument(&self, index: usize) {
+        let mut mapping = self.argument_mapping.borrow_mut();
+        if let Some(m) = mapping.as_mut() {
+            if index < m.cells.len() {
+                m.cells[index] = None;
+            }
+        }
+    }
+
+    /// Check if this object has any argument mapping
+    pub fn has_argument_mapping(&self) -> bool {
+        self.argument_mapping.borrow().is_some()
+    }
+
+    /// Get argument mapping for GC tracing
+    pub fn argument_mapping_cells(&self) -> Vec<UpvalueCell> {
+        let mapping = self.argument_mapping.borrow();
+        match mapping.as_ref() {
+            Some(m) => m.cells.iter().filter_map(|c| c.clone()).collect(),
+            None => Vec::new(),
         }
     }
 
@@ -428,13 +509,13 @@ impl JsObject {
         let obj = Self::new(Value::null(), memory_manager);
         // Cap dense element pre-allocation to avoid OOM on large sparse arrays.
         const MAX_DENSE_PREALLOC: usize = 1 << 24; // 16M elements
-        let mut flags = obj.flags.write();
+        let mut flags = obj.flags.borrow_mut();
         flags.is_array = true;
         if length <= MAX_DENSE_PREALLOC {
             drop(flags);
             // Use holes, not undefined: `new Array(5)` creates 5 absent slots.
             // `0 in arr` → false, `arr[0]` → undefined (via get() hole handling).
-            obj.elements.write().resize(length, Value::hole());
+            obj.elements.borrow_mut().resize(length, Value::hole());
         } else {
             flags.sparse_array_length = Some(length as u32);
             drop(flags);
@@ -451,7 +532,7 @@ impl JsObject {
         let obj = Self::new(Value::null(), memory_manager);
         const MAX_DENSE_PREALLOC: usize = 1 << 24;
         if length <= MAX_DENSE_PREALLOC {
-            obj.elements.write().resize(length, Value::undefined());
+            obj.elements.borrow_mut().resize(length, Value::undefined());
         }
         // Note: is_array remains false (default)
         obj
@@ -463,12 +544,12 @@ impl JsObject {
     #[inline]
     pub fn get_by_offset(&self, offset: usize) -> Option<Value> {
         if offset < INLINE_PROPERTY_COUNT {
-            let inline = self.inline_properties.read();
+            let inline = self.inline_properties.borrow();
             inline[offset]
                 .as_ref()
                 .and_then(|e| e.desc.value().cloned())
         } else {
-            let overflow = self.overflow_properties.read();
+            let overflow = self.overflow_properties.borrow();
             let overflow_idx = offset - INLINE_PROPERTY_COUNT;
             overflow
                 .get(overflow_idx)
@@ -480,10 +561,10 @@ impl JsObject {
     #[inline]
     pub fn get_property_entry_by_offset(&self, offset: usize) -> Option<PropertyDescriptor> {
         let desc = if offset < INLINE_PROPERTY_COUNT {
-            let inline = self.inline_properties.read();
+            let inline = self.inline_properties.borrow();
             inline[offset].as_ref().map(|e| e.desc.clone())?
         } else {
-            let overflow = self.overflow_properties.read();
+            let overflow = self.overflow_properties.borrow();
             let overflow_idx = offset - INLINE_PROPERTY_COUNT;
             overflow.get(overflow_idx).map(|e| e.desc.clone())?
         };
@@ -497,24 +578,28 @@ impl JsObject {
     /// Set property by offset (for Inline Cache fast path)
     /// First INLINE_PROPERTY_COUNT properties are stored inline, rest in overflow.
     #[inline]
-    pub fn set_by_offset(&self, offset: usize, value: Value) -> bool {
-        let flags = self.flags.read();
+    pub fn set_by_offset(&self, offset: usize, value: Value) -> Result<(), SetPropertyError> {
+        let flags = self.flags.borrow();
         if flags.frozen {
-            return false;
+            return Err(SetPropertyError::Frozen);
         }
-        let can_add = flags.extensible && !flags.sealed;
+        let is_sealed = flags.sealed;
+        let is_extensible = flags.extensible;
         drop(flags);
 
         if offset < INLINE_PROPERTY_COUNT {
-            let mut inline = self.inline_properties.write();
+            let mut inline = self.inline_properties.borrow_mut();
             if let Some(entry) = inline[offset].as_mut() {
                 match &mut entry.desc {
                     PropertyDescriptor::Deleted => {
-                        if !can_add {
-                            return false;
+                        if !is_extensible {
+                            return Err(SetPropertyError::NonExtensible);
+                        }
+                        if is_sealed {
+                            return Err(SetPropertyError::Sealed);
                         }
                         entry.desc = PropertyDescriptor::data(value);
-                        return true;
+                        return Ok(());
                     }
                     PropertyDescriptor::Data {
                         value: v,
@@ -522,24 +607,30 @@ impl JsObject {
                     } => {
                         if attributes.writable {
                             *v = value;
-                            return true;
+                            return Ok(());
                         }
+                        return Err(SetPropertyError::NonWritable);
                     }
-                    PropertyDescriptor::Accessor { .. } => {}
+                    PropertyDescriptor::Accessor { .. } => {
+                        return Err(SetPropertyError::AccessorWithoutSetter);
+                    }
                 }
             }
-            false
+            Err(SetPropertyError::NonExtensible)
         } else {
-            let mut overflow = self.overflow_properties.write();
+            let mut overflow = self.overflow_properties.borrow_mut();
             let overflow_idx = offset - INLINE_PROPERTY_COUNT;
             if let Some(entry) = overflow.get_mut(overflow_idx) {
                 match &mut entry.desc {
                     PropertyDescriptor::Deleted => {
-                        if !can_add {
-                            return false;
+                        if !is_extensible {
+                            return Err(SetPropertyError::NonExtensible);
+                        }
+                        if is_sealed {
+                            return Err(SetPropertyError::Sealed);
                         }
                         entry.desc = PropertyDescriptor::data(value);
-                        return true;
+                        return Ok(());
                     }
                     PropertyDescriptor::Data {
                         value: v,
@@ -547,52 +638,55 @@ impl JsObject {
                     } => {
                         if attributes.writable {
                             *v = value;
-                            return true;
+                            return Ok(());
                         }
+                        return Err(SetPropertyError::NonWritable);
                     }
-                    PropertyDescriptor::Accessor { .. } => {}
+                    PropertyDescriptor::Accessor { .. } => {
+                        return Err(SetPropertyError::AccessorWithoutSetter);
+                    }
                 }
             }
-            false
+            Err(SetPropertyError::NonExtensible)
         }
     }
 
     /// Get total property count (inline + overflow)
     #[allow(dead_code)]
     fn property_count(&self) -> usize {
-        let inline = self.inline_properties.read();
+        let inline = self.inline_properties.borrow();
         let inline_count = inline.iter().filter(|v| v.is_some()).count();
-        let overflow = self.overflow_properties.read();
+        let overflow = self.overflow_properties.borrow();
         inline_count + overflow.len()
     }
 
     /// Get current shape
     pub fn shape(&self) -> Arc<Shape> {
-        self.shape.read().clone()
+        self.shape.borrow().clone()
     }
 
     /// Check if object is in dictionary mode (IC-uncacheable).
     /// Objects in dictionary mode use HashMap storage instead of shape-based indexed storage.
     #[inline]
     pub fn is_dictionary_mode(&self) -> bool {
-        self.flags.read().is_dictionary
+        self.flags.borrow().is_dictionary
     }
 
     /// Debug: get the number of keys in the shape
     pub fn get_shape_key_count(&self) -> usize {
-        self.shape.read().own_keys().len()
+        self.shape.borrow().own_keys().len()
     }
 
     /// Debug: get number of non-None inline property slots
     pub fn get_inline_occupied_count(&self) -> usize {
-        self.inline_properties.read().iter().filter(|e| e.is_some()).count()
+        self.inline_properties.borrow().iter().filter(|e| e.is_some()).count()
     }
 
     /// Transition object to dictionary mode.
     /// This converts shape-based indexed storage to HashMap storage.
     /// Called when property count exceeds DICTIONARY_THRESHOLD or on delete operations.
     fn transition_to_dictionary(&self) {
-        let mut flags = self.flags.write();
+        let mut flags = self.flags.borrow_mut();
         if flags.is_dictionary {
             return; // Already in dictionary mode
         }
@@ -600,9 +694,9 @@ impl JsObject {
         // Build HashMap from existing properties
         let mut dict = IndexMap::new();
 
-        let shape = self.shape.read();
-        let inline = self.inline_properties.read();
-        let overflow = self.overflow_properties.read();
+        let shape = self.shape.borrow();
+        let inline = self.inline_properties.borrow();
+        let overflow = self.overflow_properties.borrow();
 
         // Iterate over all properties in the shape
         // IMPORTANT: Use the actual offset from shape, not a sequential counter
@@ -628,7 +722,10 @@ impl JsObject {
         drop(overflow);
 
         // Store the dictionary
-        *self.dictionary_properties.write() = Some(dict);
+        *self.dictionary_properties.borrow_mut() = Some(dict);
+        // Replace shape with a fresh root — the unique Arc pointer invalidates
+        // all IC entries that cached the old shape_id for this object.
+        *self.shape.borrow_mut() = Shape::root();
         flags.is_dictionary = true;
     }
 
@@ -639,17 +736,17 @@ impl JsObject {
             && let PropertyKey::String(s) = key
             && s.as_str() == "length"
         {
-            let flags = self.flags.read();
+            let flags = self.flags.borrow();
             if let Some(sparse_len) = flags.sparse_array_length {
                 return Some(Value::number(sparse_len as f64));
             }
             drop(flags);
-            return Some(Value::int32(self.elements.read().len() as i32));
+            return Some(Value::int32(self.elements.borrow().len() as i32));
         }
 
         // Dictionary mode: use HashMap lookup
         if self.is_dictionary_mode() {
-            if let Some(dict) = self.dictionary_properties.read().as_ref() {
+            if let Some(dict) = self.dictionary_properties.borrow().as_ref() {
                 if let Some(entry) = dict.get(key) {
                     match &entry.desc {
                         PropertyDescriptor::Data { value, .. } => return Some(value.clone()),
@@ -661,7 +758,7 @@ impl JsObject {
             // Fall through to indexed elements and prototype chain
         } else {
             // Check own properties first via shape lookup
-            let shape = self.shape.read();
+            let shape = self.shape.borrow();
             if let Some(offset) = shape.get_offset(key) {
                 if let Some(desc) = self.get_property_entry_by_offset(offset) {
                     match desc {
@@ -677,8 +774,12 @@ impl JsObject {
 
         // Check indexed elements for arrays (holes resolve to None → undefined)
         if let PropertyKey::Index(i) = key {
-            let elements = self.elements.read();
             let idx = *i as usize;
+            // For mapped arguments: read through UpvalueCell for aliased parameters
+            if let Some(cell) = self.get_argument_cell(idx) {
+                return Some(cell.get());
+            }
+            let elements = self.elements.borrow();
             if idx < elements.len() {
                 let val = &elements[idx];
                 if !val.is_hole() {
@@ -693,7 +794,7 @@ impl JsObject {
         }
 
         // Check prototype chain iteratively to avoid stack overflow
-        let mut current_proto: Value = self.prototype.read().clone();
+        let mut current_proto: Value = self.prototype.borrow().clone();
         let mut depth = 0;
 
         loop {
@@ -707,7 +808,7 @@ impl JsObject {
 
                 // Check proto: dictionary mode first, then shape lookup
                 if proto_obj.is_dictionary_mode() {
-                    if let Some(dict) = proto_obj.dictionary_properties.read().as_ref() {
+                    if let Some(dict) = proto_obj.dictionary_properties.borrow().as_ref() {
                         if let Some(entry) = dict.get(key) {
                             match &entry.desc {
                                 PropertyDescriptor::Data { value, .. } => return Some(value.clone()),
@@ -717,7 +818,7 @@ impl JsObject {
                         }
                     }
                 } else {
-                    let shape = proto_obj.shape.read();
+                    let shape = proto_obj.shape.borrow();
                     if let Some(offset) = shape.get_offset(key) {
                         if let Some(desc) = proto_obj.get_property_entry_by_offset(offset) {
                             match desc {
@@ -729,7 +830,7 @@ impl JsObject {
                     }
                 }
 
-                current_proto = proto_obj.prototype.read().clone();
+                current_proto = proto_obj.prototype.borrow().clone();
             } else if let Some(proxy) = current_proto.as_proxy() {
                 // Proxy in prototype chain - look at target transparently
                 // Note: This bypasses proxy traps, which is incorrect per spec, but
@@ -766,7 +867,7 @@ impl JsObject {
 
         // Clear inline properties
         {
-            let mut inline = self.inline_properties.write();
+            let mut inline = self.inline_properties.borrow_mut();
             for slot in inline.iter_mut() {
                 if let Some(entry) = slot.take() {
                     match entry.desc {
@@ -787,7 +888,7 @@ impl JsObject {
 
         // Clear overflow properties
         {
-            let mut overflow = self.overflow_properties.write();
+            let mut overflow = self.overflow_properties.borrow_mut();
             for entry in overflow.drain(..) {
                 match entry.desc {
                     PropertyDescriptor::Data { value, .. } => values.push(value),
@@ -806,7 +907,7 @@ impl JsObject {
 
         // Clear elements
         {
-            let mut elems = self.elements.write();
+            let mut elems = self.elements.borrow_mut();
             for val in elems.drain(..) {
                 values.push(val);
             }
@@ -814,7 +915,7 @@ impl JsObject {
 
         // Clear prototype
         {
-            let mut proto = self.prototype.write();
+            let mut proto = self.prototype.borrow_mut();
             let proto_val = std::mem::replace(&mut *proto, Value::null());
             if !proto_val.is_null() && !proto_val.is_undefined() {
                 values.push(proto_val);
@@ -828,7 +929,7 @@ impl JsObject {
     pub fn get_own_property_descriptor(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         // Dictionary mode: lookup in HashMap first (may contain accessor properties)
         if self.is_dictionary_mode() {
-            if let Some(dict) = self.dictionary_properties.read().as_ref() {
+            if let Some(dict) = self.dictionary_properties.borrow().as_ref() {
                 if let Some(e) = dict.get(key) {
                     return Some(e.desc.clone());
                 }
@@ -844,7 +945,7 @@ impl JsObject {
         }
 
         // Check shape first - it may contain accessor properties defined via Object.defineProperty
-        let shape = self.shape.read();
+        let shape = self.shape.borrow();
         if let Some(offset) = shape.get_offset(key) {
             return self.get_property_entry_by_offset(offset);
         }
@@ -858,12 +959,20 @@ impl JsObject {
         }
         drop(shape);
 
-        // For arrays, fall back to indexed elements as own data properties
+        // For mapped arguments: synthesize a data descriptor with the aliased value
+        if let PropertyKey::Index(i) = key {
+            let idx = *i as usize;
+            if let Some(cell) = self.get_argument_cell(idx) {
+                return Some(PropertyDescriptor::data(cell.get()));
+            }
+        }
+
+        // For arrays and array-like objects, fall back to indexed elements as own data properties
         // (only if not found in shape - shape takes precedence for accessor properties)
         // Holes are treated as absent (return None).
-        if self.is_array() {
+        if self.is_array() || self.has_argument_mapping() {
             if let PropertyKey::Index(i) = key {
-                let elements = self.elements.read();
+                let elements = self.elements.borrow();
                 let idx = *i as usize;
                 if idx < elements.len() && !elements[idx].is_hole() {
                     return Some(PropertyDescriptor::data(elements[idx].clone()));
@@ -881,7 +990,7 @@ impl JsObject {
         }
 
         // Walk prototype chain iteratively to avoid stack overflow
-        let mut current_proto: Value = self.prototype.read().clone();
+        let mut current_proto: Value = self.prototype.borrow().clone();
         let mut depth = 0;
 
         loop {
@@ -895,7 +1004,7 @@ impl JsObject {
                     return Some(desc);
                 }
 
-                current_proto = proto_obj.prototype.read().clone();
+                current_proto = proto_obj.prototype.borrow().clone();
             } else if let Some(proxy) = current_proto.as_proxy() {
                 // Proxy in prototype chain - look at target transparently
                 depth += 1;
@@ -918,12 +1027,12 @@ impl JsObject {
     }
 
     /// Set property by key
-    pub fn set(&self, key: PropertyKey, value: Value) -> bool {
-        let flags = self.flags.read();
+    pub fn set(&self, key: PropertyKey, value: Value) -> Result<(), SetPropertyError> {
+        let flags = self.flags.borrow();
 
         // Frozen objects cannot have properties changed
         if flags.frozen {
-            return false;
+            return Err(SetPropertyError::Frozen);
         }
 
         // Array exotic: intercept `length` writes to truncate/extend
@@ -933,20 +1042,33 @@ impl JsObject {
                     drop(flags);
                     let new_len = value.as_number().unwrap_or(0.0);
                     if new_len < 0.0 || new_len != (new_len as u32 as f64) || new_len.is_nan() {
-                        return false; // RangeError in spec, but return false here
+                        return Err(SetPropertyError::NonExtensible); // RangeError in spec
                     }
-                    return self.set_array_length(new_len as u32);
+                    if self.set_array_length(new_len as u32) {
+                        return Ok(());
+                    }
+                    return Err(SetPropertyError::NonExtensible);
                 }
             }
         }
 
         // Handle indexed elements for arrays
         if let PropertyKey::Index(i) = &key {
-            let mut elements = self.elements.write();
             let idx = *i as usize;
+            // For mapped arguments: write through UpvalueCell for aliased parameters
+            if let Some(cell) = self.get_argument_cell(idx) {
+                cell.set(value.clone());
+                // Also update elements for when mapping is later removed
+                let mut elements = self.elements.borrow_mut();
+                if idx < elements.len() {
+                    elements[idx] = value;
+                }
+                return Ok(());
+            }
+            let mut elements = self.elements.borrow_mut();
             if idx < elements.len() {
                 elements[idx] = value;
-                return true;
+                return Ok(());
             } else if flags.is_array && flags.extensible && !flags.sealed {
                 // Cap dense element storage to avoid OOM on sparse arrays.
                 // Indices beyond this limit are stored as dictionary properties.
@@ -954,7 +1076,7 @@ impl JsObject {
                 if idx < MAX_DENSE_LENGTH {
                     elements.resize(idx + 1, Value::hole());
                     elements[idx] = value;
-                    return true;
+                    return Ok(());
                 }
                 // Large sparse index — fall through to dictionary/string storage
             }
@@ -968,26 +1090,24 @@ impl JsObject {
         // Dictionary mode: use HashMap storage
         if flags.is_dictionary {
             drop(flags);
-            let mut dict = self.dictionary_properties.write();
+            let mut dict = self.dictionary_properties.borrow_mut();
             if let Some(map) = dict.as_mut() {
                 // If the property already exists, check writability and preserve attributes
                 if let Some(existing) = map.get(&key) {
                     match &existing.desc {
                         PropertyDescriptor::Data { attributes, .. } => {
                             if !attributes.writable {
-                                return false; // Non-writable property
+                                return Err(SetPropertyError::NonWritable);
                             }
                             // Preserve existing attributes, only update value
                             let attrs = *attributes;
                             map.insert(key, PropertyEntry {
                                 desc: PropertyDescriptor::Data { value, attributes: attrs },
                             });
-                            return true;
+                            return Ok(());
                         }
                         PropertyDescriptor::Accessor { .. } => {
-                            // For accessor properties, the set operation should call
-                            // the setter, but for now just return false
-                            return false;
+                            return Err(SetPropertyError::AccessorWithoutSetter);
                         }
                         PropertyDescriptor::Deleted => {
                             // Deleted — treat as new property
@@ -999,14 +1119,14 @@ impl JsObject {
                     desc: PropertyDescriptor::data(value),
                 };
                 map.insert(key, entry);
-                return true;
+                return Ok(());
             }
-            return false;
+            return Err(SetPropertyError::NonExtensible);
         }
 
         // Check if property exists
         {
-            let shape = self.shape.read();
+            let shape = self.shape.borrow();
             if let Some(offset) = shape.get_offset(&key) {
                 // Property exists, use set_by_offset
                 drop(shape);
@@ -1019,7 +1139,7 @@ impl JsObject {
         if flags.extensible && !flags.sealed {
             drop(flags);
 
-            let mut shape_write = self.shape.write();
+            let mut shape_write = self.shape.borrow_mut();
             // Transition to new shape
             let next_shape = shape_write.transition(key);
             let offset = next_shape
@@ -1031,16 +1151,16 @@ impl JsObject {
                 drop(shape_write);
                 self.transition_to_dictionary();
                 // Now set in dictionary mode
-                let mut dict = self.dictionary_properties.write();
+                let mut dict = self.dictionary_properties.borrow_mut();
                 if let Some(map) = dict.as_mut() {
                     let entry = PropertyEntry {
                         desc: PropertyDescriptor::data(value),
                     };
                     // Re-insert the key we were adding
                     map.insert(next_shape.key.clone().unwrap(), entry);
-                    return true;
+                    return Ok(());
                 }
-                return false;
+                return Err(SetPropertyError::NonExtensible);
             }
 
             *shape_write = next_shape;
@@ -1051,11 +1171,11 @@ impl JsObject {
 
             if offset < INLINE_PROPERTY_COUNT {
                 // Store in inline slot
-                let mut inline = self.inline_properties.write();
+                let mut inline = self.inline_properties.borrow_mut();
                 inline[offset] = Some(entry);
             } else {
                 // Store in overflow
-                let mut overflow = self.overflow_properties.write();
+                let mut overflow = self.overflow_properties.borrow_mut();
                 let overflow_idx = offset - INLINE_PROPERTY_COUNT;
                 if overflow_idx >= overflow.len() {
                     overflow.resize(
@@ -1067,14 +1187,20 @@ impl JsObject {
                 }
                 overflow[overflow_idx] = entry;
             }
-            true
+            Ok(())
+        } else if !flags.extensible {
+            Err(SetPropertyError::NonExtensible)
         } else {
-            false
+            Err(SetPropertyError::Sealed)
         }
     }
 
     /// Delete property
     pub fn delete(&self, key: &PropertyKey) -> bool {
+        // For mapped arguments: unmap the index on delete
+        if let PropertyKey::Index(i) = key {
+            self.unmap_argument(*i as usize);
+        }
         // For index keys, first check if there's a non-configurable property descriptor.
         // This handles cases like Object.defineProperty(arr, '1', {configurable: false}).
         if let PropertyKey::Index(i) = key {
@@ -1082,7 +1208,7 @@ impl JsObject {
             // Use string form of key since defineProperty stores with string key
             let str_key = PropertyKey::String(JsString::intern(&i.to_string()));
             if let Some(desc) = {
-                let shape = self.shape.read();
+                let shape = self.shape.borrow();
                 if let Some(offset) = shape.get_offset(&str_key) {
                     drop(shape);
                     self.get_property_entry_by_offset(offset)
@@ -1101,7 +1227,7 @@ impl JsObject {
             // This correctly models sparse arrays: `i in arr` will return false
             // and iteration methods will skip holes per spec.
             let idx = *i as usize;
-            let mut elements = self.elements.write();
+            let mut elements = self.elements.borrow_mut();
             if idx < elements.len() {
                 elements[idx] = Value::hole();
                 // Trim trailing holes to keep elements vec compact
@@ -1114,7 +1240,7 @@ impl JsObject {
 
         // Dictionary mode: remove from HashMap (but check configurable first)
         if self.is_dictionary_mode() {
-            let mut dict = self.dictionary_properties.write();
+            let mut dict = self.dictionary_properties.borrow_mut();
             if let Some(map) = dict.as_mut() {
                 if let Some(entry) = map.get(key) {
                     if !entry.desc.is_configurable() {
@@ -1126,7 +1252,7 @@ impl JsObject {
             return true;
         }
 
-        let Some(offset) = self.shape.read().get_offset(key) else {
+        let Some(offset) = self.shape.borrow().get_offset(key) else {
             // Per JS semantics, deleting a non-existent property succeeds.
             return true;
         };
@@ -1137,7 +1263,7 @@ impl JsObject {
         }
 
         // Sealed or frozen objects cannot have properties deleted.
-        let flags = self.flags.read();
+        let flags = self.flags.borrow();
         if flags.sealed || flags.frozen {
             return false;
         }
@@ -1153,7 +1279,7 @@ impl JsObject {
             self.transition_to_dictionary();
 
             // Now remove from dictionary
-            let mut dict = self.dictionary_properties.write();
+            let mut dict = self.dictionary_properties.borrow_mut();
             if let Some(map) = dict.as_mut() {
                 map.shift_remove(key);
             }
@@ -1169,12 +1295,12 @@ impl JsObject {
     pub fn has_own(&self, key: &PropertyKey) -> bool {
         // Dictionary mode: check HashMap
         if self.is_dictionary_mode() {
-            if let Some(dict) = self.dictionary_properties.read().as_ref() {
+            if let Some(dict) = self.dictionary_properties.borrow().as_ref() {
                 if dict.contains_key(key) {
                     return true;
                 }
             }
-        } else if let Some(offset) = self.shape.read().get_offset(key) {
+        } else if let Some(offset) = self.shape.borrow().get_offset(key) {
             if self.get_property_entry_by_offset(offset).is_some() {
                 return true;
             }
@@ -1182,7 +1308,7 @@ impl JsObject {
 
         // Check indexed elements (holes are absent)
         if let PropertyKey::Index(i) = key {
-            let elements = self.elements.read();
+            let elements = self.elements.borrow();
             let idx = *i as usize;
             return idx < elements.len() && !elements[idx].is_hole();
         }
@@ -1197,7 +1323,7 @@ impl JsObject {
         }
 
         // Walk prototype chain iteratively to avoid stack overflow
-        let mut current_proto: Value = self.prototype.read().clone();
+        let mut current_proto: Value = self.prototype.borrow().clone();
         let mut depth = 0;
 
         loop {
@@ -1211,7 +1337,7 @@ impl JsObject {
                     return true;
                 }
 
-                current_proto = proto_obj.prototype.read().clone();
+                current_proto = proto_obj.prototype.borrow().clone();
             } else if let Some(proxy) = current_proto.as_proxy() {
                 // Proxy in prototype chain - look at target transparently
                 depth += 1;
@@ -1240,7 +1366,7 @@ impl JsObject {
 
         // Dictionary mode: get keys from HashMap
         if self.is_dictionary_mode() {
-            if let Some(dict) = self.dictionary_properties.read().as_ref() {
+            if let Some(dict) = self.dictionary_properties.borrow().as_ref() {
                 for key in dict.keys() {
                     match key {
                         PropertyKey::Index(i) => integer_keys.push(*i),
@@ -1257,7 +1383,7 @@ impl JsObject {
                 }
             }
         } else {
-            let shape_keys = self.shape.read().own_keys();
+            let shape_keys = self.shape.borrow().own_keys();
             for key in shape_keys {
                 if self.get_own_property_descriptor(&key).is_some() {
                     match &key {
@@ -1277,7 +1403,7 @@ impl JsObject {
         }
 
         // Add indexed elements (skip holes — they are absent per spec)
-        let elements = self.elements.read();
+        let elements = self.elements.borrow();
         for i in 0..elements.len() {
             if !elements[i].is_hole() && !integer_keys.contains(&(i as u32)) {
                 integer_keys.push(i as u32);
@@ -1367,7 +1493,21 @@ impl JsObject {
 
     /// Define a property with descriptor
     pub fn define_property(&self, key: PropertyKey, desc: PropertyDescriptor) -> bool {
-        let flags = self.flags.read();
+        // For mapped arguments: if defining an accessor descriptor on a mapped index, unmap it
+        if let PropertyKey::Index(i) = &key {
+            let idx = *i as usize;
+            if self.get_argument_cell(idx).is_some() {
+                if matches!(&desc, PropertyDescriptor::Accessor { .. }) {
+                    self.unmap_argument(idx);
+                } else if let PropertyDescriptor::Data { value, .. } = &desc {
+                    // Data descriptor with explicit value: update through cell then unmap
+                    if let Some(cell) = self.get_argument_cell(idx) {
+                        cell.set(value.clone());
+                    }
+                }
+            }
+        }
+        let flags = self.flags.borrow();
 
         // Frozen objects cannot have properties defined
         if flags.frozen {
@@ -1377,14 +1517,14 @@ impl JsObject {
         // Dictionary mode: store directly in HashMap
         if flags.is_dictionary {
             drop(flags);
-            let mut dict = self.dictionary_properties.write();
+            let mut dict = self.dictionary_properties.borrow_mut();
             if let Some(map) = dict.as_mut() {
                 // Validate change against existing property (if any)
                 if let Some(existing) = map.get(&key) {
                     if Self::validate_property_descriptor_change(&existing.desc, &desc).is_err() {
                         return false;
                     }
-                } else if !self.flags.read().extensible {
+                } else if !self.flags.borrow().extensible {
                     // Cannot add new property to non-extensible object
                     return false;
                 }
@@ -1395,7 +1535,7 @@ impl JsObject {
         }
 
         // Check if exists
-        let offset = self.shape.read().get_offset(&key);
+        let offset = self.shape.borrow().get_offset(&key);
 
         if let Some(off) = offset {
             // Treat deleted slots as non-existent for extensibility checks.
@@ -1407,7 +1547,7 @@ impl JsObject {
 
             // Update existing property - validate change
             if off < INLINE_PROPERTY_COUNT {
-                let mut inline = self.inline_properties.write();
+                let mut inline = self.inline_properties.borrow_mut();
                 if let Some(entry) = inline[off].as_mut() {
                     // Validate the property descriptor change
                     if Self::validate_property_descriptor_change(&entry.desc, &desc).is_err() {
@@ -1417,7 +1557,7 @@ impl JsObject {
                     return true;
                 }
             } else {
-                let mut overflow = self.overflow_properties.write();
+                let mut overflow = self.overflow_properties.borrow_mut();
                 let overflow_idx = off - INLINE_PROPERTY_COUNT;
                 if let Some(entry) = overflow.get_mut(overflow_idx) {
                     // Validate the property descriptor change
@@ -1437,7 +1577,7 @@ impl JsObject {
         }
         drop(flags);
 
-        let mut shape_write = self.shape.write();
+        let mut shape_write = self.shape.borrow_mut();
 
         // Transition to new shape
         let next_shape = shape_write.transition(key.clone());
@@ -1450,7 +1590,7 @@ impl JsObject {
             drop(shape_write);
             self.transition_to_dictionary();
             // Store in dictionary
-            let mut dict = self.dictionary_properties.write();
+            let mut dict = self.dictionary_properties.borrow_mut();
             if let Some(map) = dict.as_mut() {
                 map.insert(key, PropertyEntry { desc });
                 return true;
@@ -1464,11 +1604,11 @@ impl JsObject {
 
         if offset < INLINE_PROPERTY_COUNT {
             // Store in inline slot
-            let mut inline = self.inline_properties.write();
+            let mut inline = self.inline_properties.borrow_mut();
             inline[offset] = Some(entry);
         } else {
             // Store in overflow
-            let mut overflow = self.overflow_properties.write();
+            let mut overflow = self.overflow_properties.borrow_mut();
             let overflow_idx = offset - INLINE_PROPERTY_COUNT;
             if overflow_idx >= overflow.len() {
                 overflow.resize(
@@ -1485,14 +1625,14 @@ impl JsObject {
 
     /// Get prototype
     pub fn prototype(&self) -> Value {
-        self.prototype.read().clone()
+        self.prototype.borrow().clone()
     }
 
     /// Set prototype
     /// Returns false if object is not extensible, if it would create a cycle,
     /// or if the chain would be too deep
     pub fn set_prototype(&self, prototype: Value) -> bool {
-        if !self.flags.read().extensible {
+        if !self.flags.borrow().extensible {
             return false;
         }
 
@@ -1510,7 +1650,7 @@ impl JsObject {
                 if proto_obj.as_ptr() == self_ptr {
                     return false; // Would create cycle
                 }
-                current_proto = proto_obj.prototype.read().clone();
+                current_proto = proto_obj.prototype.borrow().clone();
             } else if let Some(proxy) = current_proto.as_proxy() {
                 // Proxy in prototype chain - check its target for cycles
                 depth += 1;
@@ -1530,7 +1670,7 @@ impl JsObject {
             }
         }
 
-        *self.prototype.write() = prototype;
+        *self.prototype.borrow_mut() = prototype;
         // Bump global proto epoch to invalidate any cached prototype chain lookups
         bump_proto_epoch();
         true
@@ -1538,13 +1678,13 @@ impl JsObject {
 
     /// Check if object is an array
     pub fn is_array(&self) -> bool {
-        self.flags.read().is_array
+        self.flags.borrow().is_array
     }
 
     /// Mark this object as an array exotic object
     /// Used for Array.prototype per ES2026 §23.1.3
     pub fn mark_as_array(&self) {
-        self.flags.write().is_array = true;
+        self.flags.borrow_mut().is_array = true;
     }
 
     // ========================================================================
@@ -1554,14 +1694,14 @@ impl JsObject {
     /// Freeze the object - makes all properties non-writable and non-configurable,
     /// and prevents adding new properties
     pub fn freeze(&self) {
-        let mut flags = self.flags.write();
+        let mut flags = self.flags.borrow_mut();
         flags.frozen = true;
         flags.sealed = true;
         flags.extensible = false;
         drop(flags);
 
         // Make all inline properties non-writable and non-configurable
-        let mut inline = self.inline_properties.write();
+        let mut inline = self.inline_properties.borrow_mut();
         for entry_opt in inline.iter_mut() {
             if let Some(entry) = entry_opt {
                 match &mut entry.desc {
@@ -1579,7 +1719,7 @@ impl JsObject {
         drop(inline);
 
         // Make all overflow properties non-writable and non-configurable
-        let mut overflow = self.overflow_properties.write();
+        let mut overflow = self.overflow_properties.borrow_mut();
         for entry in overflow.iter_mut() {
             match &mut entry.desc {
                 PropertyDescriptor::Data { attributes, .. } => {
@@ -1596,19 +1736,19 @@ impl JsObject {
 
     /// Check if object is frozen
     pub fn is_frozen(&self) -> bool {
-        self.flags.read().frozen
+        self.flags.borrow().frozen
     }
 
     /// Seal the object - prevents adding new properties and makes all existing
     /// properties non-configurable
     pub fn seal(&self) {
-        let mut flags = self.flags.write();
+        let mut flags = self.flags.borrow_mut();
         flags.sealed = true;
         flags.extensible = false;
         drop(flags);
 
         // Make all inline properties non-configurable
-        let mut inline = self.inline_properties.write();
+        let mut inline = self.inline_properties.borrow_mut();
         for entry_opt in inline.iter_mut() {
             if let Some(entry) = entry_opt {
                 match &mut entry.desc {
@@ -1625,7 +1765,7 @@ impl JsObject {
         drop(inline);
 
         // Make all overflow properties non-configurable
-        let mut overflow = self.overflow_properties.write();
+        let mut overflow = self.overflow_properties.borrow_mut();
         for entry in overflow.iter_mut() {
             match &mut entry.desc {
                 PropertyDescriptor::Data { attributes, .. } => {
@@ -1641,27 +1781,27 @@ impl JsObject {
 
     /// Check if object is sealed
     pub fn is_sealed(&self) -> bool {
-        self.flags.read().sealed
+        self.flags.borrow().sealed
     }
 
     /// Prevent extensions - prevents adding new properties
     pub fn prevent_extensions(&self) {
-        self.flags.write().extensible = false;
+        self.flags.borrow_mut().extensible = false;
     }
 
     /// Check if object is extensible
     pub fn is_extensible(&self) -> bool {
-        self.flags.read().extensible
+        self.flags.borrow().extensible
     }
 
     /// Mark this object as intrinsic (shared across contexts, protected from teardown clearing)
     pub fn mark_as_intrinsic(&self) {
-        self.flags.write().is_intrinsic = true;
+        self.flags.borrow_mut().is_intrinsic = true;
     }
 
     /// Check if this object is an intrinsic
     pub fn is_intrinsic(&self) -> bool {
-        self.flags.read().is_intrinsic
+        self.flags.borrow().is_intrinsic
     }
 
     /// Set array length (exotic [[DefineOwnProperty]] behavior per ES2023 §10.4.2.4).
@@ -1678,12 +1818,12 @@ impl JsObject {
 
         if new_len < current_len {
             // Truncate
-            let mut elements = self.elements.write();
+            let mut elements = self.elements.borrow_mut();
             let dense_len = elements.len();
             let target = (new_len as usize).min(dense_len);
             elements.truncate(target);
             // Update sparse_array_length if it was set
-            let mut flags = self.flags.write();
+            let mut flags = self.flags.borrow_mut();
             if flags.sparse_array_length.is_some() {
                 if (new_len as usize) <= elements.len() {
                     flags.sparse_array_length = None;
@@ -1695,10 +1835,10 @@ impl JsObject {
             // Extend with holes
             let new = new_len as usize;
             if new <= MAX_DENSE_PREALLOC {
-                self.elements.write().resize(new, Value::hole());
-                self.flags.write().sparse_array_length = None;
+                self.elements.borrow_mut().resize(new, Value::hole());
+                self.flags.borrow_mut().sparse_array_length = None;
             } else {
-                self.flags.write().sparse_array_length = Some(new_len);
+                self.flags.borrow_mut().sparse_array_length = Some(new_len);
             }
         }
         true
@@ -1706,49 +1846,49 @@ impl JsObject {
 
     /// Get array length (for arrays)
     pub fn array_length(&self) -> usize {
-        if let Some(sparse_len) = self.flags.read().sparse_array_length {
+        if let Some(sparse_len) = self.flags.borrow().sparse_array_length {
             return sparse_len as usize;
         }
-        self.elements.read().len()
+        self.elements.borrow().len()
     }
 
     /// Push element to array
     pub fn array_push(&self, value: Value) {
-        self.elements.write().push(value);
+        self.elements.borrow_mut().push(value);
     }
 
     /// Pop element from array
     pub fn array_pop(&self) -> Value {
-        self.elements.write().pop().unwrap_or_else(Value::undefined)
+        self.elements.borrow_mut().pop().unwrap_or_else(Value::undefined)
     }
 
     /// Get inline properties storage (for GC tracing)
     pub(crate) fn get_inline_properties_storage(
         &self,
-    ) -> &RwLock<[Option<PropertyEntry>; INLINE_PROPERTY_COUNT]> {
+    ) -> &ObjectCell<[Option<PropertyEntry>; INLINE_PROPERTY_COUNT]> {
         &self.inline_properties
     }
 
     /// Get overflow properties storage (for GC tracing)
-    pub(crate) fn get_overflow_properties_storage(&self) -> &RwLock<Vec<PropertyEntry>> {
+    pub(crate) fn get_overflow_properties_storage(&self) -> &ObjectCell<Vec<PropertyEntry>> {
         &self.overflow_properties
     }
 
-    pub(crate) fn get_elements_storage(&self) -> &RwLock<Vec<Value>> {
+    pub(crate) fn get_elements_storage(&self) -> &ObjectCell<Vec<Value>> {
         &self.elements
     }
 
-    pub(crate) fn get_prototype_storage(&self) -> &RwLock<Value> {
+    pub(crate) fn get_prototype_storage(&self) -> &ObjectCell<Value> {
         &self.prototype
     }
 }
 
 impl std::fmt::Debug for JsObject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inline = self.inline_properties.read();
+        let inline = self.inline_properties.borrow();
         let inline_count = inline.iter().filter(|e| e.is_some()).count();
-        let overflow = self.overflow_properties.read();
-        let flags = self.flags.read();
+        let overflow = self.overflow_properties.borrow();
+        let flags = self.flags.borrow();
         f.debug_struct("JsObject")
             .field("inline_properties", &inline_count)
             .field("overflow_properties", &overflow.len())
@@ -1757,7 +1897,9 @@ impl std::fmt::Debug for JsObject {
     }
 }
 
-// SAFETY: JsObject uses RwLock for interior mutability
+// SAFETY: JsObject uses ObjectCell (UnsafeCell) for interior mutability.
+// Thread confinement is enforced at the VmRuntime/VmContext level.
+// Send+Sync is inherited from ObjectCell's explicit impls.
 unsafe impl Send for JsObject {}
 unsafe impl Sync for JsObject {}
 
@@ -1899,11 +2041,11 @@ mod tests {
         assert!(!obj.is_extensible());
 
         // Cannot modify existing property
-        assert!(!obj.set(PropertyKey::string("foo"), Value::int32(100)));
+        assert!(obj.set(PropertyKey::string("foo"), Value::int32(100)).is_err());
         assert_eq!(obj.get(&PropertyKey::string("foo")), Some(Value::int32(42)));
 
         // Cannot add new property
-        assert!(!obj.set(PropertyKey::string("bar"), Value::int32(200)));
+        assert!(obj.set(PropertyKey::string("bar"), Value::int32(200)).is_err());
         assert_eq!(obj.get(&PropertyKey::string("bar")), None);
 
         // Cannot delete property
@@ -1915,7 +2057,7 @@ mod tests {
     fn test_object_seal() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         let obj = JsObject::new(Value::null(), memory_manager);
-        obj.set(PropertyKey::string("foo"), Value::int32(42));
+        let _ = obj.set(PropertyKey::string("foo"), Value::int32(42));
 
         assert!(!obj.is_sealed());
 
@@ -1926,14 +2068,14 @@ mod tests {
         assert!(!obj.is_extensible());
 
         // CAN modify existing property (seal allows writes, freeze doesn't)
-        assert!(obj.set(PropertyKey::string("foo"), Value::int32(100)));
+        assert!(obj.set(PropertyKey::string("foo"), Value::int32(100)).is_ok());
         assert_eq!(
             obj.get(&PropertyKey::string("foo")),
             Some(Value::int32(100))
         );
 
         // Cannot add new property
-        assert!(!obj.set(PropertyKey::string("bar"), Value::int32(200)));
+        assert!(obj.set(PropertyKey::string("bar"), Value::int32(200)).is_err());
         assert_eq!(obj.get(&PropertyKey::string("bar")), None);
 
         // Cannot delete property
@@ -1944,7 +2086,7 @@ mod tests {
     fn test_object_prevent_extensions() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         let obj = JsObject::new(Value::null(), memory_manager);
-        obj.set(PropertyKey::string("foo"), Value::int32(42));
+        let _ = obj.set(PropertyKey::string("foo"), Value::int32(42));
 
         assert!(obj.is_extensible());
 
@@ -1955,10 +2097,10 @@ mod tests {
         assert!(!obj.is_frozen());
 
         // CAN modify existing property
-        assert!(obj.set(PropertyKey::string("foo"), Value::int32(100)));
+        assert!(obj.set(PropertyKey::string("foo"), Value::int32(100)).is_ok());
 
         // Cannot add new property
-        assert!(!obj.set(PropertyKey::string("bar"), Value::int32(200)));
+        assert!(obj.set(PropertyKey::string("bar"), Value::int32(200)).is_err());
 
         // Can delete existing (configurable) property even if not extensible
         assert!(obj.delete(&PropertyKey::string("foo")));
@@ -2042,29 +2184,29 @@ impl otter_vm_gc::GcTraceable for JsObject {
 
     fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // Trace prototype (now a Value)
-        self.prototype.read().trace(tracer);
+        self.prototype.borrow().trace(tracer);
 
         // Trace values in inline properties
-        for entry_opt in self.inline_properties.read().iter() {
+        for entry_opt in self.inline_properties.borrow().iter() {
             if let Some(entry) = entry_opt {
                 entry.desc.trace(tracer);
             }
         }
 
         // Trace values in overflow properties
-        for entry in self.overflow_properties.read().iter() {
+        for entry in self.overflow_properties.borrow().iter() {
             entry.desc.trace(tracer);
         }
 
         // Trace values in dictionary properties
-        if let Some(dict) = self.dictionary_properties.read().as_ref() {
+        if let Some(dict) = self.dictionary_properties.borrow().as_ref() {
             for entry in dict.values() {
                 entry.desc.trace(tracer);
             }
         }
 
         // Trace array elements
-        for value in self.elements.read().iter() {
+        for value in self.elements.borrow().iter() {
             value.trace(tracer);
         }
     }

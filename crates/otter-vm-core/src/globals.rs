@@ -462,7 +462,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                     // For Error types, setting 'message' is crucial.
                     if let Some(msg) = args.get(0) {
                         let obj = JsObject::new(Value::null(), ncx.memory_manager().clone());
-                        obj.set(PropertyKey::string("message"), msg.clone());
+                        let _ = obj.set(PropertyKey::string("message"), msg.clone());
                         return Ok(Value::object(GcRef::new(obj)));
                     }
                     Ok(Value::undefined())
@@ -476,7 +476,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
 
         // Add basic toString to prototypes
         if name == "Object" {
-            proto.set(
+            let _ = proto.set(
                 PropertyKey::string("toString"),
                 Value::native_function_with_proto(
                     |_this, _, _ncx| Ok(Value::string(JsString::intern("[object Object]"))),
@@ -485,7 +485,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                 ),
             );
         } else if name == "Function" {
-            proto.set(
+            let _ = proto.set(
                 PropertyKey::string("toString"),
                 Value::native_function_with_proto(
                     |_this, _, _ncx| {
@@ -498,7 +498,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                 ),
             );
         } else if name == "String" {
-            proto.set(
+            let _ = proto.set(
                 PropertyKey::string("toString"),
                 Value::native_function_with_proto(
                     |this_val, _args, _ncx| {
@@ -512,16 +512,16 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
 
         if let Some(ctor_obj) = ctor.as_object() {
             if name != "Proxy" {
-                ctor_obj.set(
+                let _ = ctor_obj.set(
                     PropertyKey::string("prototype"),
                     Value::object(proto.clone()),
                 );
-                proto.set(PropertyKey::string("constructor"), ctor.clone());
+                let _ = proto.set(PropertyKey::string("constructor"), ctor.clone());
             }
 
             // Add static methods to constructors
             if name == "String" {
-                ctor_obj.set(
+                let _ = ctor_obj.set(
                     PropertyKey::string("fromCharCode"),
                     Value::native_function_with_proto(
                         |_this, args: &[Value], _ncx| {
@@ -562,7 +562,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                     ),
                 );
             } else if name == "ArrayBuffer" {
-                ctor_obj.set(
+                let _ = ctor_obj.set(
                     PropertyKey::string("isView"),
                     Value::native_function_with_proto(
                         |_this, args, _ncx| {
@@ -603,7 +603,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                 };
 
                 // BYTES_PER_ELEMENT - ES2026 §22.2.5.1
-                ctor_obj.set(
+                let _ = ctor_obj.set(
                     PropertyKey::string("BYTES_PER_ELEMENT"),
                     Value::int32(kind.element_size() as i32),
                 );
@@ -611,7 +611,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                 // TypedArray.from(source, mapFn?, thisArg?) - ES2026 §22.2.2.1
                 let mm_from = mm.clone();
                 let proto_from = proto.clone();
-                ctor_obj.set(
+                let _ = ctor_obj.set(
                     PropertyKey::string("from"),
                     Value::native_function_with_proto(
                         move |_this, args, ncx| {
@@ -642,7 +642,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                             if let Some(obj) = source.as_object() {
                                 for i in 0..length {
                                     if let Some(val) = obj.get(&PropertyKey::Index(i as u32)) {
-                                        let final_val = if let Some(map_fn_val) = map_fn {
+                                        let final_val = if let Some(_map_fn_val) = map_fn {
                                             // TODO: Call mapFn(val, i)
                                             val
                                         } else {
@@ -673,7 +673,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                 // TypedArray.of(...items) - ES2026 §22.2.2.2
                 let mm_of = mm.clone();
                 let proto_of = proto.clone();
-                ctor_obj.set(
+                let _ = ctor_obj.set(
                     PropertyKey::string("of"),
                     Value::native_function_with_proto(
                         move |_this, args, ncx| {
@@ -714,7 +714,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
 
         // Add more prototype methods
         if name == "String" {
-            proto.set(
+            let _ = proto.set(
                 PropertyKey::string("indexOf"),
                 Value::native_function_with_proto(
                     |this_val, args, _ncx| {
@@ -731,7 +731,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                     fn_proto,
                 ),
             );
-            proto.set(
+            let _ = proto.set(
                 PropertyKey::string("valueOf"),
                 Value::native_function_with_proto(
                     |this_val, _args, _ncx| {
@@ -742,7 +742,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                 ),
             );
         } else if name == "Object" {
-            proto.set(
+            let _ = proto.set(
                 PropertyKey::string("valueOf"),
                 Value::native_function_with_proto(
                     |this_val, _args, _ncx| {
@@ -770,7 +770,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
             );
 
             // ArrayBuffer.prototype.slice
-            proto.set(
+            let _ = proto.set(
                 PropertyKey::string("slice"),
                 Value::native_function_with_proto(
                     |this_val, args, _ncx| {

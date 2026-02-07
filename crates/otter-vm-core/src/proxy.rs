@@ -9,7 +9,6 @@
 //! ```
 
 use crate::gc::GcRef;
-use crate::object::JsObject;
 use crate::value::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -154,6 +153,9 @@ impl JsProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::JsObject;
+    use crate::gc::GcRef;
+    use std::sync::Arc;
 
     #[test]
     fn test_proxy_creation() {

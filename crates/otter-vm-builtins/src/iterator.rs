@@ -33,8 +33,8 @@ pub fn ops() -> Vec<Op> {
 /// Create an iterator result object { value, done }
 fn create_iterator_result(value: VmValue, done: bool, mm: Arc<memory::MemoryManager>) -> VmValue {
     let result = GcRef::new(JsObject::new(VmValue::null(), mm));
-    result.set(PropertyKey::string("value"), value);
-    result.set(PropertyKey::string("done"), VmValue::boolean(done));
+    let _ = result.set(PropertyKey::string("value"), value);
+    let _ = result.set(PropertyKey::string("done"), VmValue::boolean(done));
     VmValue::object(result)
 }
 

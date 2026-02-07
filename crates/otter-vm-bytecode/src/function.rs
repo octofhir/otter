@@ -36,6 +36,9 @@ pub struct FunctionFlags {
     pub has_rest: bool,
     /// Is a derived constructor (class extends)
     pub is_derived: bool,
+    /// Has simple parameter list (no rest, no defaults, no destructuring)
+    /// Per ES2024 §15.1.1: determines whether arguments object is mapped
+    pub has_simple_parameters: bool,
 }
 
 /// Upvalue capture mode
@@ -246,6 +249,72 @@ impl InstructionMetadata {
 }
 
 
+/// Thread-confined mutable vector for inline cache feedback data.
+///
+/// Wraps `UnsafeCell<Vec<InstructionMetadata>>` to provide zero-overhead
+/// interior mutability. The VM is single-threaded (one isolate = one thread),
+/// so no synchronization is needed.
+#[allow(unsafe_code)]
+pub struct FeedbackVector {
+    inner: std::cell::UnsafeCell<Vec<InstructionMetadata>>,
+}
+
+// SAFETY: FeedbackVector is only accessed from a single VM thread.
+// Thread confinement is enforced at the VmRuntime level.
+#[allow(unsafe_code)]
+unsafe impl Send for FeedbackVector {}
+#[allow(unsafe_code)]
+unsafe impl Sync for FeedbackVector {}
+
+#[allow(unsafe_code)]
+impl FeedbackVector {
+    /// Create a new feedback vector from a vec.
+    pub fn new(vec: Vec<InstructionMetadata>) -> Self {
+        Self {
+            inner: std::cell::UnsafeCell::new(vec),
+        }
+    }
+
+    /// Get a shared reference to the inner vector.
+    #[inline]
+    pub fn read(&self) -> &Vec<InstructionMetadata> {
+        // SAFETY: VM is single-threaded, no concurrent mutable access
+        unsafe { &*self.inner.get() }
+    }
+
+    /// Get a mutable reference to the inner vector.
+    #[inline]
+    pub fn write(&self) -> &mut Vec<InstructionMetadata> {
+        // SAFETY: VM is single-threaded, no concurrent access
+        unsafe { &mut *self.inner.get() }
+    }
+}
+
+impl Clone for FeedbackVector {
+    fn clone(&self) -> Self {
+        Self::new(self.read().clone())
+    }
+}
+
+impl std::fmt::Debug for FeedbackVector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.read().fmt(f)
+    }
+}
+
+impl Serialize for FeedbackVector {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.read().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for FeedbackVector {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let vec = Vec::<InstructionMetadata>::deserialize(deserializer)?;
+        Ok(Self::new(vec))
+    }
+}
+
 /// A bytecode function
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Function {
@@ -272,7 +341,7 @@ pub struct Function {
 
     /// Feedback vector for Inline Caches (mutable at runtime)
     /// Contains IC state and statistics for each IC site
-    pub feedback_vector: parking_lot::RwLock<Vec<InstructionMetadata>>,
+    pub feedback_vector: FeedbackVector,
 
     /// Source location mapping (instruction index -> source offset)
     pub source_map: Option<SourceMap>,
@@ -385,7 +454,7 @@ impl Clone for Function {
             flags: self.flags,
             upvalues: self.upvalues.clone(),
             instructions: self.instructions.clone(),
-            feedback_vector: parking_lot::RwLock::new(self.feedback_vector.read().clone()),
+            feedback_vector: self.feedback_vector.clone(),
             source_map: self.source_map.clone(),
             param_names: self.param_names.clone(),
             local_names: self.local_names.clone(),
@@ -530,7 +599,7 @@ impl FunctionBuilder {
             flags: self.flags,
             upvalues: self.upvalues,
             instructions: self.instructions,
-            feedback_vector: parking_lot::RwLock::new(self.feedback_vector),
+            feedback_vector: FeedbackVector::new(self.feedback_vector),
             source_map: self.source_map,
             param_names: self.param_names,
             local_names: self.local_names,

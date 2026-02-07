@@ -151,10 +151,10 @@ fn function_create_bound(args: &[Value], mm: Arc<memory::MemoryManager>) -> Resu
     let bound = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
     // Store the original function
-    bound.set(PropertyKey::string("__boundFunction__"), original.clone());
+    let _ = bound.set(PropertyKey::string("__boundFunction__"), original.clone());
 
     // Store the thisArg
-    bound.set(PropertyKey::string("__boundThis__"), this_arg);
+    let _ = bound.set(PropertyKey::string("__boundThis__"), this_arg);
 
     // Store bound arguments (if any)
     if args.len() > 2 {
@@ -162,13 +162,13 @@ fn function_create_bound(args: &[Value], mm: Arc<memory::MemoryManager>) -> Resu
         // Store as array
         let arr = GcRef::new(JsObject::new(Value::null(), mm.clone()));
         for (i, arg) in bound_args.iter().enumerate() {
-            arr.set(PropertyKey::Index(i as u32), arg.clone());
+            let _ = arr.set(PropertyKey::Index(i as u32), arg.clone());
         }
-        arr.set(
+        let _ = arr.set(
             PropertyKey::string("length"),
             Value::int32(bound_args.len() as i32),
         );
-        bound.set(PropertyKey::string("__boundArgs__"), Value::object(arr));
+        let _ = bound.set(PropertyKey::string("__boundArgs__"), Value::object(arr));
     }
 
     // Set name property (bound <originalName>)
@@ -194,7 +194,7 @@ fn function_create_bound(args: &[Value], mm: Arc<memory::MemoryManager>) -> Resu
         String::new()
     };
     let bound_name = format!("bound {}", original_name);
-    bound.set(
+    let _ = bound.set(
         PropertyKey::string("__boundName__"),
         Value::string(JsString::intern(&bound_name)),
     );
@@ -202,13 +202,13 @@ fn function_create_bound(args: &[Value], mm: Arc<memory::MemoryManager>) -> Resu
     // Set length (original length - bound args count, min 0)
     let bound_args_len = if args.len() > 2 { args.len() - 2 } else { 0 };
     let new_length = 0i32.saturating_sub(bound_args_len as i32).max(0);
-    bound.set(
+    let _ = bound.set(
         PropertyKey::string("__boundLength__"),
         Value::int32(new_length),
     );
 
     // Mark as callable for type checking
-    bound.set(PropertyKey::string("__isCallable__"), Value::boolean(true));
+    let _ = bound.set(PropertyKey::string("__isCallable__"), Value::boolean(true));
 
     Ok(Value::object(bound))
 }

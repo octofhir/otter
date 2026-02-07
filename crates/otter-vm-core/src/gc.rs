@@ -574,7 +574,7 @@ impl Trace for crate::object::JsObject {
         // Trace inline property values (first INLINE_PROPERTY_COUNT)
         {
             let inline = self.get_inline_properties_storage();
-            let inline_props = inline.read();
+            let inline_props = inline.borrow();
             for slot in inline_props.iter() {
                 if let Some(entry) = slot {
                     match &entry.desc {
@@ -598,7 +598,7 @@ impl Trace for crate::object::JsObject {
         // Trace overflow property values (Data or Accessor)
         {
             let overflow = self.get_overflow_properties_storage();
-            let overflow_props = overflow.read();
+            let overflow_props = overflow.borrow();
             for entry in overflow_props.iter() {
                 match &entry.desc {
                     PropertyDescriptor::Data { value, .. } => {
@@ -620,7 +620,7 @@ impl Trace for crate::object::JsObject {
         // Trace indexed elements
         {
             let elements = self.get_elements_storage();
-            let elems = elements.read();
+            let elems = elements.borrow();
             for value in elems.iter() {
                 tracer.mark_value(value);
             }
@@ -629,6 +629,11 @@ impl Trace for crate::object::JsObject {
         // Trace prototype
         let proto_val = self.prototype();
         tracer.mark_value(&proto_val);
+
+        // Trace argument mapping (UpvalueCells hold Values that must be traced)
+        for cell in self.argument_mapping_cells() {
+            cell.trace(tracer);
+        }
     }
 }
 
@@ -736,6 +741,11 @@ impl Trace for crate::context::CallFrame {
         // Trace new_target_proto (for multi-level inheritance)
         if let Some(ref ntp) = self.new_target_proto {
             tracer.mark_header(ntp.header() as *const GcHeader);
+        }
+
+        // Trace callee_value (used by arguments object)
+        if let Some(ref callee) = self.callee_value {
+            tracer.mark_value(callee);
         }
     }
 }

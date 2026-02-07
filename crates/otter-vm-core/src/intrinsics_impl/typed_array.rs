@@ -555,17 +555,17 @@ fn init_typed_array_iterators(
     // This is the iterator method that returns an iterator
     let values_method = Value::native_function_with_proto(
         move |this_val, _args, ncx| {
-            let ta = get_typed_array(this_val)?;
+            let _ta = get_typed_array(this_val)?;
 
             // Create an iterator object (simplified - would need proper iterator protocol)
             let iter_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
 
             // Store the typed array reference and current index
-            iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
-            iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
+            let _ = iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
+            let _ = iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
 
             // Add next method
-            iter_obj.set(
+            let _ = iter_obj.set(
                 PropertyKey::string("next"),
                 Value::native_function_with_proto(
                     move |iter_this, _args, ncx_inner| {
@@ -585,15 +585,15 @@ fn init_typed_array_iterators(
                         let result = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
 
                         if index >= ta.length() {
-                            result.set(PropertyKey::string("done"), Value::boolean(true));
-                            result.set(PropertyKey::string("value"), Value::undefined());
+                            let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
+                            let _ = result.set(PropertyKey::string("value"), Value::undefined());
                         } else {
                             let val = ta.get(index)
                                 .map(Value::number)
                                 .unwrap_or(Value::undefined());
-                            result.set(PropertyKey::string("value"), val);
-                            result.set(PropertyKey::string("done"), Value::boolean(false));
-                            iter_obj.set(PropertyKey::string("_index"), Value::int32((index + 1) as i32));
+                            let _ = result.set(PropertyKey::string("value"), val);
+                            let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
+                            let _ = iter_obj.set(PropertyKey::string("_index"), Value::int32((index + 1) as i32));
                         }
 
                         Ok(Value::object(result))
@@ -625,13 +625,13 @@ fn init_typed_array_iterators(
         PropertyKey::string("keys"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             move |this_val, _args, ncx| {
-                let ta = get_typed_array(this_val)?;
+                let _ta = get_typed_array(this_val)?;
 
                 let iter_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
-                iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
+                let _ = iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
+                let _ = iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
 
-                iter_obj.set(
+                let _ = iter_obj.set(
                     PropertyKey::string("next"),
                     Value::native_function_with_proto(
                         move |iter_this, _args, ncx_inner| {
@@ -650,12 +650,12 @@ fn init_typed_array_iterators(
                             let result = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
 
                             if index >= ta.length() {
-                                result.set(PropertyKey::string("done"), Value::boolean(true));
-                                result.set(PropertyKey::string("value"), Value::undefined());
+                                let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
+                                let _ = result.set(PropertyKey::string("value"), Value::undefined());
                             } else {
-                                result.set(PropertyKey::string("value"), Value::int32(index as i32));
-                                result.set(PropertyKey::string("done"), Value::boolean(false));
-                                iter_obj.set(PropertyKey::string("_index"), Value::int32((index + 1) as i32));
+                                let _ = result.set(PropertyKey::string("value"), Value::int32(index as i32));
+                                let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
+                                let _ = iter_obj.set(PropertyKey::string("_index"), Value::int32((index + 1) as i32));
                             }
 
                             Ok(Value::object(result))
@@ -677,13 +677,13 @@ fn init_typed_array_iterators(
         PropertyKey::string("entries"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             move |this_val, _args, ncx| {
-                let ta = get_typed_array(this_val)?;
+                let _ta = get_typed_array(this_val)?;
 
                 let iter_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
-                iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
+                let _ = iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
+                let _ = iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
 
-                iter_obj.set(
+                let _ = iter_obj.set(
                     PropertyKey::string("next"),
                     Value::native_function_with_proto(
                         move |iter_this, _args, ncx_inner| {
@@ -702,8 +702,8 @@ fn init_typed_array_iterators(
                             let result = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
 
                             if index >= ta.length() {
-                                result.set(PropertyKey::string("done"), Value::boolean(true));
-                                result.set(PropertyKey::string("value"), Value::undefined());
+                                let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
+                                let _ = result.set(PropertyKey::string("value"), Value::undefined());
                             } else {
                                 let val = ta.get(index)
                                     .map(Value::number)
@@ -711,12 +711,12 @@ fn init_typed_array_iterators(
 
                                 // Create [index, value] array
                                 let entry = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
-                                entry.set(PropertyKey::Index(0), Value::int32(index as i32));
-                                entry.set(PropertyKey::Index(1), val);
+                                let _ = entry.set(PropertyKey::Index(0), Value::int32(index as i32));
+                                let _ = entry.set(PropertyKey::Index(1), val);
 
-                                result.set(PropertyKey::string("value"), Value::object(entry));
-                                result.set(PropertyKey::string("done"), Value::boolean(false));
-                                iter_obj.set(PropertyKey::string("_index"), Value::int32((index + 1) as i32));
+                                let _ = result.set(PropertyKey::string("value"), Value::object(entry));
+                                let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
+                                let _ = iter_obj.set(PropertyKey::string("_index"), Value::int32((index + 1) as i32));
                             }
 
                             Ok(Value::object(result))

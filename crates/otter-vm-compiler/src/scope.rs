@@ -276,6 +276,15 @@ impl ScopeChain {
             .map(|idx| self.scopes[idx].next_local)
             .unwrap_or(0)
     }
+
+    /// Allocate an anonymous local variable in the current function scope.
+    /// Returns the local index. Used for internal bindings like `arguments`.
+    pub fn alloc_anonymous_local(&mut self) -> Option<u16> {
+        let fs = self.current_function_scope_index()?;
+        let idx = self.scopes[fs].next_local;
+        self.scopes[fs].next_local += 1;
+        Some(idx)
+    }
 }
 
 /// Result of resolving a variable

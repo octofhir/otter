@@ -45,7 +45,7 @@ fn json_to_value(value: &JsonValue, mm: Arc<memory::MemoryManager>) -> Value {
         JsonValue::Array(items) => {
             let arr = JsObject::array(items.len(), mm.clone());
             for (index, item) in items.iter().enumerate() {
-                arr.set(
+                let _ = arr.set(
                     PropertyKey::Index(index as u32),
                     json_to_value(item, mm.clone()),
                 );
@@ -55,7 +55,7 @@ fn json_to_value(value: &JsonValue, mm: Arc<memory::MemoryManager>) -> Value {
         JsonValue::Object(map) => {
             let obj = JsObject::new(Value::null(), mm.clone());
             for (key, value) in map {
-                obj.set(PropertyKey::string(key), json_to_value(value, mm.clone()));
+                let _ = obj.set(PropertyKey::string(key), json_to_value(value, mm.clone()));
             }
             Value::object(GcRef::new(obj))
         }

@@ -242,10 +242,10 @@ pub fn setup_harness(ctx: &mut VmContext) {
     let obj_262 = GcRef::new(JsObject::new(Value::null(), Arc::clone(&mm)));
 
     // $262.global - Reference to the global object
-    obj_262.set(PropertyKey::string("global"), Value::object(global));
+    let _ = obj_262.set(PropertyKey::string("global"), Value::object(global));
 
     // $262.gc() - Trigger garbage collection
-    obj_262.set(
+    let _ = obj_262.set(
         PropertyKey::string("gc"),
         Value::native_function(
             |_this, _args, _mm| {
@@ -256,10 +256,10 @@ pub fn setup_harness(ctx: &mut VmContext) {
         ),
     );
 
-    global.set(PropertyKey::string("$262"), Value::object(obj_262));
+    let _ = global.set(PropertyKey::string("$262"), Value::object(obj_262));
 
     // Set up print function (for test output)
-    global.set(
+    let _ = global.set(
         PropertyKey::string("print"),
         Value::native_function(
             |_this, args, _mm| {
@@ -274,7 +274,7 @@ pub fn setup_harness(ctx: &mut VmContext) {
 
     // Set up $DONE for async tests
     // async tests call $DONE() or $DONE(error) when complete
-    global.set(
+    let _ = global.set(
         PropertyKey::string("$DONE"),
         Value::native_function(
             |_this: &Value, args: &[Value], _mm| {

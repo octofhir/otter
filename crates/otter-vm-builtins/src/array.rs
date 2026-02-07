@@ -79,7 +79,7 @@ fn get_array_length(arr: &GcRef<JsObject>) -> usize {
 }
 
 fn set_array_length(arr: &GcRef<JsObject>, len: usize) {
-    arr.set(PropertyKey::string("length"), VmValue::number(len as f64));
+    let _ = arr.set(PropertyKey::string("length"), VmValue::number(len as f64));
 }
 
 fn value_to_string(v: &VmValue) -> String {
@@ -131,7 +131,7 @@ fn native_array_from(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue
             let new_arr = GcRef::new(JsObject::array(len, Arc::clone(&mm)));
             for i in 0..len {
                 if let Some(elem) = arr.get(&PropertyKey::Index(i as u32)) {
-                    new_arr.set(PropertyKey::Index(i as u32), elem);
+                    let _ = new_arr.set(PropertyKey::Index(i as u32), elem);
                 }
             }
             return Ok(VmValue::array(new_arr));
@@ -143,7 +143,7 @@ fn native_array_from(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue
         let chars: Vec<_> = s.as_str().chars().collect();
         let arr = GcRef::new(JsObject::array(chars.len(), Arc::clone(&mm)));
         for (i, ch) in chars.into_iter().enumerate() {
-            arr.set(
+            let _ = arr.set(
                 PropertyKey::Index(i as u32),
                 VmValue::string(JsString::intern(&ch.to_string())),
             );
@@ -158,7 +158,7 @@ fn native_array_from(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue
 fn native_array_of(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr = GcRef::new(JsObject::array(args.len(), Arc::clone(&mm)));
     for (i, item) in args.iter().enumerate() {
-        arr.set(PropertyKey::Index(i as u32), item.clone());
+        let _ = arr.set(PropertyKey::Index(i as u32), item.clone());
     }
     Ok(VmValue::array(arr))
 }
@@ -177,7 +177,7 @@ fn native_array_push(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValu
 
     // Items to push are args[1..]
     for (i, item) in args[1..].iter().enumerate() {
-        arr.set(PropertyKey::Index((len + i) as u32), item.clone());
+        let _ = arr.set(PropertyKey::Index((len + i) as u32), item.clone());
     }
 
     let new_len = len + args.len() - 1;
@@ -222,7 +222,7 @@ fn native_array_shift(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmVal
     // Shift all elements down
     for i in 1..len {
         if let Some(val) = arr.get(&PropertyKey::Index(i as u32)) {
-            arr.set(PropertyKey::Index((i - 1) as u32), val);
+            let _ = arr.set(PropertyKey::Index((i - 1) as u32), val);
         } else {
             arr.delete(&PropertyKey::Index((i - 1) as u32));
         }
@@ -246,13 +246,13 @@ fn native_array_unshift(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmV
     // Shift existing elements up
     for i in (0..len).rev() {
         if let Some(val) = arr.get(&PropertyKey::Index(i as u32)) {
-            arr.set(PropertyKey::Index((i + items_len) as u32), val);
+            let _ = arr.set(PropertyKey::Index((i + items_len) as u32), val);
         }
     }
 
     // Insert new items at the beginning
     for (i, item) in items.iter().enumerate() {
-        arr.set(PropertyKey::Index(i as u32), item.clone());
+        let _ = arr.set(PropertyKey::Index(i as u32), item.clone());
     }
 
     let new_len = len + items_len;
@@ -290,7 +290,7 @@ fn native_array_splice(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmVal
     let deleted = GcRef::new(JsObject::array(delete_count, Arc::clone(&mm)));
     for i in 0..delete_count.min(len as usize - start) {
         if let Some(val) = arr.get(&PropertyKey::Index((start + i) as u32)) {
-            deleted.set(PropertyKey::Index(i as u32), val);
+            let _ = deleted.set(PropertyKey::Index(i as u32), val);
         }
     }
 
@@ -303,14 +303,14 @@ fn native_array_splice(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmVal
             // Shift elements right
             for i in (start + actual_delete..len as usize).rev() {
                 if let Some(val) = arr.get(&PropertyKey::Index(i as u32)) {
-                    arr.set(PropertyKey::Index((i as i32 + size_change) as u32), val);
+                    let _ = arr.set(PropertyKey::Index((i as i32 + size_change) as u32), val);
                 }
             }
         } else {
             // Shift elements left
             for i in start + actual_delete..len as usize {
                 if let Some(val) = arr.get(&PropertyKey::Index(i as u32)) {
-                    arr.set(PropertyKey::Index((i as i32 + size_change) as u32), val);
+                    let _ = arr.set(PropertyKey::Index((i as i32 + size_change) as u32), val);
                 } else {
                     arr.delete(&PropertyKey::Index((i as i32 + size_change) as u32));
                 }
@@ -320,7 +320,7 @@ fn native_array_splice(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmVal
 
     // Insert new items
     for (i, item) in items.iter().enumerate() {
-        arr.set(PropertyKey::Index((start + i) as u32), item.clone());
+        let _ = arr.set(PropertyKey::Index((start + i) as u32), item.clone());
     }
 
     let new_len = (len as usize as i32 + size_change) as usize;
@@ -342,15 +342,15 @@ fn native_array_reverse(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmV
 
         match (a, b) {
             (Some(val_a), Some(val_b)) => {
-                arr.set(PropertyKey::Index(i as u32), val_b);
-                arr.set(PropertyKey::Index(j as u32), val_a);
+                let _ = arr.set(PropertyKey::Index(i as u32), val_b);
+                let _ = arr.set(PropertyKey::Index(j as u32), val_a);
             }
             (Some(val_a), None) => {
                 arr.delete(&PropertyKey::Index(i as u32));
-                arr.set(PropertyKey::Index(j as u32), val_a);
+                let _ = arr.set(PropertyKey::Index(j as u32), val_a);
             }
             (None, Some(val_b)) => {
-                arr.set(PropertyKey::Index(i as u32), val_b);
+                let _ = arr.set(PropertyKey::Index(i as u32), val_b);
                 arr.delete(&PropertyKey::Index(j as u32));
             }
             (None, None) => {}
@@ -384,7 +384,7 @@ fn native_array_sort(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValu
 
     // Write back sorted elements
     for (new_i, (_old_i, val)) in elements.into_iter().enumerate() {
-        arr.set(PropertyKey::Index(new_i as u32), val);
+        let _ = arr.set(PropertyKey::Index(new_i as u32), val);
     }
 
     Ok(arr_val.clone())
@@ -423,7 +423,7 @@ fn native_array_fill(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValu
     };
 
     for i in start..end {
-        arr.set(PropertyKey::Index(i as u32), value.clone());
+        let _ = arr.set(PropertyKey::Index(i as u32), value.clone());
     }
 
     Ok(arr_val.clone())
@@ -479,7 +479,7 @@ fn native_array_copy_within(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result
     // Write them to target
     for (i, val_opt) in temp.into_iter().enumerate() {
         if let Some(val) = val_opt {
-            arr.set(PropertyKey::Index((target + i) as u32), val);
+            let _ = arr.set(PropertyKey::Index((target + i) as u32), val);
         } else {
             arr.delete(&PropertyKey::Index((target + i) as u32));
         }
@@ -526,7 +526,7 @@ fn native_array_slice(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValu
 
     for i in 0..count {
         if let Some(val) = arr.get(&PropertyKey::Index((start + i) as u32)) {
-            new_arr.set(PropertyKey::Index(i as u32), val);
+            let _ = new_arr.set(PropertyKey::Index(i as u32), val);
         }
     }
 
@@ -546,7 +546,7 @@ fn native_array_concat(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmVal
     let len = get_array_length(&arr);
     for i in 0..len {
         if let Some(val) = arr.get(&PropertyKey::Index(i as u32)) {
-            new_arr.set(PropertyKey::Index(new_len as u32), val);
+            let _ = new_arr.set(PropertyKey::Index(new_len as u32), val);
             new_len += 1;
         }
     }
@@ -558,7 +558,7 @@ fn native_array_concat(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmVal
                 let concat_len = get_array_length(&concat_arr);
                 for i in 0..concat_len {
                     if let Some(val) = concat_arr.get(&PropertyKey::Index(i as u32)) {
-                        new_arr.set(PropertyKey::Index(new_len as u32), val);
+                        let _ = new_arr.set(PropertyKey::Index(new_len as u32), val);
                         new_len += 1;
                     }
                 }
@@ -566,7 +566,7 @@ fn native_array_concat(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmVal
             }
         }
         // Non-array argument, add as single element
-        new_arr.set(PropertyKey::Index(new_len as u32), arg.clone());
+        let _ = new_arr.set(PropertyKey::Index(new_len as u32), arg.clone());
         new_len += 1;
     }
 
@@ -605,7 +605,7 @@ fn native_array_flat(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue
                         }
                     }
                 }
-                result.set(PropertyKey::Index(*result_len as u32), val);
+                let _ = result.set(PropertyKey::Index(*result_len as u32), val);
                 *result_len += 1;
             }
         }
@@ -616,7 +616,7 @@ fn native_array_flat(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue
     Ok(VmValue::array(new_arr))
 }
 
-fn native_array_flat_map(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_array_flat_map(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     // Simplified: flatMap requires callback, which is handled in builtins.js
     Err(VmError::type_error("Array.flatMap not yet implemented in native ops"))
 }
@@ -861,7 +861,7 @@ fn native_array_to_reversed(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<
 
     for i in 0..len {
         if let Some(val) = arr.get(&PropertyKey::Index(i as u32)) {
-            new_arr.set(PropertyKey::Index((len - 1 - i) as u32), val);
+            let _ = new_arr.set(PropertyKey::Index((len - 1 - i) as u32), val);
         }
     }
 
@@ -880,7 +880,7 @@ fn native_array_to_sorted(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<Vm
     // Copy elements
     for i in 0..len {
         if let Some(val) = arr.get(&PropertyKey::Index(i as u32)) {
-            new_arr.set(PropertyKey::Index(i as u32), val);
+            let _ = new_arr.set(PropertyKey::Index(i as u32), val);
         }
     }
 
@@ -899,7 +899,7 @@ fn native_array_to_sorted(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<Vm
     });
 
     for (new_i, (_old_i, val)) in elements.into_iter().enumerate() {
-        new_arr.set(PropertyKey::Index(new_i as u32), val);
+        let _ = new_arr.set(PropertyKey::Index(new_i as u32), val);
     }
 
     Ok(VmValue::array(new_arr))
@@ -936,21 +936,21 @@ fn native_array_to_spliced(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<V
     // Copy elements before start
     for i in 0..start {
         if let Some(val) = arr.get(&PropertyKey::Index(i as u32)) {
-            new_arr.set(PropertyKey::Index(new_i as u32), val);
+            let _ = new_arr.set(PropertyKey::Index(new_i as u32), val);
         }
         new_i += 1;
     }
 
     // Insert new items
     for item in items {
-        new_arr.set(PropertyKey::Index(new_i as u32), item.clone());
+        let _ = new_arr.set(PropertyKey::Index(new_i as u32), item.clone());
         new_i += 1;
     }
 
     // Copy elements after deleted range
     for i in start + delete_count..len as usize {
         if let Some(val) = arr.get(&PropertyKey::Index(i as u32)) {
-            new_arr.set(PropertyKey::Index(new_i as u32), val);
+            let _ = new_arr.set(PropertyKey::Index(new_i as u32), val);
         }
         new_i += 1;
     }
@@ -986,7 +986,7 @@ fn native_array_with(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue
             arr.get(&PropertyKey::Index(i as u32))
                 .unwrap_or(VmValue::undefined())
         };
-        new_arr.set(PropertyKey::Index(i as u32), val);
+        let _ = new_arr.set(PropertyKey::Index(i as u32), val);
     }
 
     Ok(VmValue::array(new_arr))

@@ -5,7 +5,7 @@
 //! with the same structure using a transition tree.
 
 use crate::object::PropertyKey;
-use parking_lot::RwLock;
+use std::cell::RefCell;
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, Weak};
 
@@ -23,7 +23,8 @@ pub struct Shape {
 
     /// Transitions from this shape to child shapes when a new property is added.
     /// Use Weak to break cycles: Child -> Parent (Arc), Parent -> Child (Weak)
-    transitions: RwLock<FxHashMap<PropertyKey, Weak<Shape>>>,
+    /// RefCell is used since shape transitions are not on the IC fast path.
+    transitions: RefCell<FxHashMap<PropertyKey, Weak<Shape>>>,
 
     /// Cache of all property offsets in this shape (inherited + own).
     /// This is built lazily or during creation for fast lookups.
@@ -32,6 +33,11 @@ pub struct Shape {
     /// Keys in insertion order for JSON.stringify and Object.keys()
     keys_ordered: Vec<PropertyKey>,
 }
+
+// SAFETY: Shape is only accessed from a single VM thread.
+// RefCell is !Sync, but our VM is thread-confined.
+unsafe impl Send for Shape {}
+unsafe impl Sync for Shape {}
 
 impl Shape {
     /// Trace elements in this shape for GC
@@ -55,7 +61,7 @@ impl Shape {
             parent: None,
             key: None,
             offset: None,
-            transitions: RwLock::new(FxHashMap::default()),
+            transitions: RefCell::new(FxHashMap::default()),
             property_map: FxHashMap::default(),
             keys_ordered: Vec::new(),
         })
@@ -65,7 +71,7 @@ impl Shape {
     pub fn transition(self: &Arc<Self>, key: PropertyKey) -> Arc<Self> {
         // Check if transition already exists
         {
-            let transitions = self.transitions.read();
+            let transitions = self.transitions.borrow();
             if let Some(weak_shape) = transitions.get(&key) {
                 if let Some(shape) = weak_shape.upgrade() {
                     return shape;
@@ -74,9 +80,9 @@ impl Shape {
         }
 
         // Create new transition
-        let mut transitions = self.transitions.write();
+        let mut transitions = self.transitions.borrow_mut();
 
-        // Double-check after acquiring write lock
+        // Double-check after acquiring mutable borrow
         if let Some(weak_shape) = transitions.get(&key) {
             if let Some(shape) = weak_shape.upgrade() {
                 return shape;
@@ -95,7 +101,7 @@ impl Shape {
             parent: Some(Arc::clone(self)),
             key: Some(key.clone()),
             offset: Some(next_offset),
-            transitions: RwLock::new(FxHashMap::default()),
+            transitions: RefCell::new(FxHashMap::default()),
             property_map: next_property_map,
             keys_ordered: next_keys_ordered,
         });

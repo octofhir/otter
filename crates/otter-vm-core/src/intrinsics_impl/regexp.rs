@@ -126,14 +126,14 @@ fn build_exec_result(
 
     let arr = JsObject::array(out.len(), mm.clone());
     for (i, val) in out.into_iter().enumerate() {
-        arr.set(PropertyKey::Index(i as u32), val);
+        let _ = arr.set(PropertyKey::Index(i as u32), val);
     }
-    arr.set(
+    let _ = arr.set(
         PropertyKey::string("index"),
         Value::number(mat.start() as f64),
     );
-    arr.set(PropertyKey::string("input"), Value::string(JsString::intern(input.as_str())));
-    arr.set(PropertyKey::string("groups"), Value::undefined());
+    let _ = arr.set(PropertyKey::string("input"), Value::string(JsString::intern(input.as_str())));
+    let _ = arr.set(PropertyKey::string("groups"), Value::undefined());
 
     Value::array(GcRef::new(arr))
 }
@@ -320,7 +320,7 @@ pub fn init_regexp_prototype(
                     for (i, mat) in matches.iter().enumerate() {
                         let range = mat.range();
                         let slice = &input.as_utf16()[range.start..range.end];
-                        arr.set(
+                        let _ = arr.set(
                             PropertyKey::Index(i as u32),
                             Value::string(JsString::intern_utf16(slice)),
                         );
@@ -362,7 +362,7 @@ pub fn init_regexp_prototype(
                 let arr = JsObject::array(matches.len(), ncx.memory_manager().clone());
                 for (i, mat) in matches.iter().enumerate() {
                     let exec_result = build_exec_result(&input, mat, ncx.memory_manager());
-                    arr.set(PropertyKey::Index(i as u32), exec_result);
+                    let _ = arr.set(PropertyKey::Index(i as u32), exec_result);
                 }
                 Ok(Value::array(GcRef::new(arr)))
             },
@@ -517,7 +517,7 @@ pub fn init_regexp_prototype(
 
                 let arr = JsObject::array(parts.len(), ncx.memory_manager().clone());
                 for (i, part) in parts.into_iter().enumerate() {
-                    arr.set(PropertyKey::Index(i as u32), part);
+                    let _ = arr.set(PropertyKey::Index(i as u32), part);
                 }
                 Ok(Value::array(GcRef::new(arr)))
             },

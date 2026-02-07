@@ -146,8 +146,9 @@ pub struct FunctionContext {
     pub upvalues: Vec<UpvalueCapture>,
     /// Number of Inline Cache slots
     pub ic_count: u16,
-    /// Register holding the 'arguments' object (if created)
-    pub arguments_register: Option<Register>,
+    /// Local variable index holding the 'arguments' object (if created).
+    /// Stored as a local (not a register) so it survives inner function calls.
+    pub arguments_local: Option<u16>,
 }
 
 impl FunctionContext {
@@ -165,7 +166,7 @@ impl FunctionContext {
             param_count: 0,
             upvalues: Vec::new(),
             ic_count: 0,
-            arguments_register: None,
+            arguments_local: None,
         }
     }
 

@@ -398,7 +398,7 @@ mod tests {
 
         let memory_manager = Arc::new(memory::MemoryManager::test());
         let obj = GcRef::new(JsObject::new(VmValue::null(), memory_manager.clone()));
-        obj.set("a".into(), VmValue::int32(1));
+        let _ = obj.set("a".into(), VmValue::int32(1));
 
         let value = VmValue::object(obj.clone());
         let result = native_object_freeze(std::slice::from_ref(&value), memory_manager).unwrap();
@@ -432,7 +432,7 @@ mod tests {
 
         let memory_manager = Arc::new(memory::MemoryManager::test());
         let obj = GcRef::new(JsObject::new(VmValue::null(), memory_manager.clone()));
-        obj.set("a".into(), VmValue::int32(1));
+        let _ = obj.set("a".into(), VmValue::int32(1));
 
         let value = VmValue::object(obj.clone());
         let _ = native_object_seal(std::slice::from_ref(&value), memory_manager).unwrap();
@@ -463,16 +463,16 @@ mod tests {
     fn test_native_object_rest() {
         let memory_manager = Arc::new(memory::MemoryManager::test());
         let obj = GcRef::new(JsObject::new(VmValue::null(), memory_manager.clone()));
-        obj.set("a".into(), VmValue::int32(1));
-        obj.set("b".into(), VmValue::int32(2));
-        obj.set("c".into(), VmValue::int32(3));
+        let _ = obj.set("a".into(), VmValue::int32(1));
+        let _ = obj.set("b".into(), VmValue::int32(2));
+        let _ = obj.set("c".into(), VmValue::int32(3));
 
         let excluded = GcRef::new(JsObject::array(2, memory_manager.clone()));
-        excluded.set(
+        let _ = excluded.set(
             PropertyKey::Index(0),
             VmValue::string(JsString::intern("a")),
         );
-        excluded.set(
+        let _ = excluded.set(
             PropertyKey::Index(1),
             VmValue::string(JsString::intern("b")),
         );
@@ -537,7 +537,7 @@ fn native_object_rest(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
         if let Some(desc) = source_obj.get_own_property_descriptor(&key) {
             if desc.enumerable() && !excluded.contains(&key) {
                 if let Some(val) = source_obj.get(&key) {
-                    new_obj.set(key, val);
+                    let _ = new_obj.set(key, val);
                 }
             }
         }
@@ -577,7 +577,7 @@ fn native_object_get_own_property_names(
 
     let result = GcRef::new(JsObject::array(names.len(), Arc::clone(&mm)));
     for (i, name) in names.into_iter().enumerate() {
-        result.set(PropertyKey::Index(i as u32), name);
+        let _ = result.set(PropertyKey::Index(i as u32), name);
     }
 
     Ok(VmValue::array(result))
@@ -605,7 +605,7 @@ fn native_object_keys(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValu
 
     let result = GcRef::new(JsObject::array(names.len(), Arc::clone(&mm)));
     for (i, name) in names.into_iter().enumerate() {
-        result.set(PropertyKey::Index(i as u32), name);
+        let _ = result.set(PropertyKey::Index(i as u32), name);
     }
 
     Ok(VmValue::array(result))
@@ -635,7 +635,7 @@ fn native_object_values(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmVa
 
     let result = GcRef::new(JsObject::array(values.len(), Arc::clone(&mm)));
     for (i, value) in values.into_iter().enumerate() {
-        result.set(PropertyKey::Index(i as u32), value);
+        let _ = result.set(PropertyKey::Index(i as u32), value);
     }
 
     Ok(VmValue::array(result))
@@ -658,8 +658,8 @@ fn native_object_entries(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmV
                     if let Some(value) = obj.get(&PropertyKey::String(s.clone())) {
                         // Create [key, value] array
                         let entry = GcRef::new(JsObject::array(2, Arc::clone(&mm)));
-                        entry.set(PropertyKey::Index(0), VmValue::string(s.clone()));
-                        entry.set(PropertyKey::Index(1), value);
+                        let _ = entry.set(PropertyKey::Index(0), VmValue::string(s.clone()));
+                        let _ = entry.set(PropertyKey::Index(1), value);
                         entries.push(VmValue::array(entry));
                     }
                 }
@@ -669,7 +669,7 @@ fn native_object_entries(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmV
 
     let result = GcRef::new(JsObject::array(entries.len(), Arc::clone(&mm)));
     for (i, entry) in entries.into_iter().enumerate() {
-        result.set(PropertyKey::Index(i as u32), entry);
+        let _ = result.set(PropertyKey::Index(i as u32), entry);
     }
 
     Ok(VmValue::array(result))
@@ -691,7 +691,7 @@ fn native_object_assign(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmV
         if let Some(source) = source_val.as_object() {
             for key in source.own_keys() {
                 if let Some(value) = source.get(&key) {
-                    target.set(key, value);
+                    let _ = target.set(key, value);
                 }
             }
         }
@@ -753,7 +753,7 @@ fn native_object_get_own_property_symbols(
 
     let result = GcRef::new(JsObject::array(symbols.len(), Arc::clone(&mm)));
     for (i, sym) in symbols.into_iter().enumerate() {
-        result.set(PropertyKey::Index(i as u32), sym);
+        let _ = result.set(PropertyKey::Index(i as u32), sym);
     }
 
     Ok(VmValue::array(result))
@@ -767,10 +767,10 @@ fn descriptor_to_object(
     let desc_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(mm)));
     match desc {
         PropertyDescriptor::Data { value, attributes } => {
-            desc_obj.set("value".into(), value);
-            desc_obj.set("writable".into(), VmValue::boolean(attributes.writable));
-            desc_obj.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
-            desc_obj.set(
+            let _ = desc_obj.set("value".into(), value);
+            let _ = desc_obj.set("writable".into(), VmValue::boolean(attributes.writable));
+            let _ = desc_obj.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
+            let _ = desc_obj.set(
                 "configurable".into(),
                 VmValue::boolean(attributes.configurable),
             );
@@ -780,10 +780,10 @@ fn descriptor_to_object(
             set,
             attributes,
         } => {
-            desc_obj.set("get".into(), get.unwrap_or(VmValue::undefined()));
-            desc_obj.set("set".into(), set.unwrap_or(VmValue::undefined()));
-            desc_obj.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
-            desc_obj.set(
+            let _ = desc_obj.set("get".into(), get.unwrap_or(VmValue::undefined()));
+            let _ = desc_obj.set("set".into(), set.unwrap_or(VmValue::undefined()));
+            let _ = desc_obj.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
+            let _ = desc_obj.set(
                 "configurable".into(),
                 VmValue::boolean(attributes.configurable),
             );
@@ -816,7 +816,7 @@ fn native_object_get_own_property_descriptors(
     for key in keys {
         if let Some(prop_desc) = obj.get_own_property_descriptor(&key) {
             let desc_obj = descriptor_to_object(prop_desc, &mm);
-            result.set(key, VmValue::object(desc_obj));
+            let _ = result.set(key, VmValue::object(desc_obj));
         }
     }
 

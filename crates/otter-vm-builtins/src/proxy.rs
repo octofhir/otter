@@ -77,11 +77,11 @@ fn native_proxy_revocable(
     let revocable = JsProxy::revocable(target.clone(), handler.clone());
 
     let result = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-    result.set("proxy".into(), VmValue::proxy(revocable.proxy));
+    let _ = result.set("proxy".into(), VmValue::proxy(revocable.proxy));
 
     // Create native function for revoke
     let revoke_fn = revocable.revoke;
-    result.set(
+    let _ = result.set(
         "revoke".into(),
         VmValue::native_function(
             move |_this: &VmValue, _args: &[VmValue], _ncx: &mut otter_vm_core::context::NativeContext<'_>| {

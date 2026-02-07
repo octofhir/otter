@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use crate::error::VmError;
 use crate::gc::GcRef;
-use crate::intrinsics_impl::helpers::{same_value_zero, strict_equal};
 use crate::memory::MemoryManager;
 use crate::object::JsObject;
 
@@ -592,9 +591,9 @@ impl Intrinsics {
     /// with their spec-required methods and properties. Must be called after
     /// `wire_prototype_chains()`.
     pub fn init_core(&self, mm: &Arc<MemoryManager>) {
-        use crate::builtin_builder::BuiltInBuilder;
-        use crate::object::{PropertyAttributes, PropertyDescriptor, PropertyKey};
-        use crate::string::JsString;
+        
+        use crate::object::{PropertyDescriptor, PropertyKey};
+        
 
         // ====================================================================
         // Object.prototype methods (extracted to intrinsics_impl/object.rs)
@@ -998,10 +997,10 @@ impl Intrinsics {
         // The interpreter checks for these globals to detect and intercept
         // Function.prototype.call/apply (see interpreter.rs:5647, 5651)
         if let Some(call_fn) = self.function_prototype.get(&PropertyKey::string("call")) {
-            global.set(PropertyKey::string("__Function_call"), call_fn);
+            let _ = global.set(PropertyKey::string("__Function_call"), call_fn);
         }
         if let Some(apply_fn) = self.function_prototype.get(&PropertyKey::string("apply")) {
-            global.set(PropertyKey::string("__Function_apply"), apply_fn);
+            let _ = global.set(PropertyKey::string("__Function_apply"), apply_fn);
         }
 
         // ====================================================================
@@ -1051,7 +1050,7 @@ impl Intrinsics {
             // When called as constructor (new String("...")), `this` is an object.
             // Store the primitive value so String.prototype methods can retrieve it.
             if let Some(obj) = this.as_object() {
-                obj.set(PropertyKey::string("__primitiveValue__"), str_val.clone());
+                let _ = obj.set(PropertyKey::string("__primitiveValue__"), str_val.clone());
             }
             Ok(str_val)
         });
@@ -1157,7 +1156,7 @@ impl Intrinsics {
                 0.0
             };
             if let Some(obj) = this.as_object() {
-                obj.set(PropertyKey::string("__value__"), Value::number(n));
+                let _ = obj.set(PropertyKey::string("__value__"), Value::number(n));
                 Ok(this.clone())
             } else {
                 Ok(Value::number(n))
@@ -1230,7 +1229,7 @@ impl Intrinsics {
             // Array(...items) — populate the array
             let arr = GcRef::new(JsObject::array(args.len(), ncx.memory_manager().clone()));
             for (i, arg) in args.iter().enumerate() {
-                arr.set(PropertyKey::index(i as u32), arg.clone());
+                let _ = arr.set(PropertyKey::index(i as u32), arg.clone());
             }
             Ok(Value::object(arr))
         });
@@ -1411,7 +1410,7 @@ impl Intrinsics {
             };
             // Set timestamp on `this` (created by Construct with Date.prototype)
             if let Some(obj) = this.as_object() {
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(timestamp));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(timestamp));
             }
             Ok(Value::undefined())
         });

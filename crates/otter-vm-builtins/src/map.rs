@@ -89,9 +89,9 @@ fn native_map_new(_args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<V
 
     // Create internal entries storage as a nested object
     let entries_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-    map_obj.set(str_to_key(MAP_ENTRIES_KEY), VmValue::object(entries_obj));
-    map_obj.set(str_to_key(MAP_SIZE_KEY), VmValue::int32(0));
-    map_obj.set(str_to_key(IS_MAP_KEY), VmValue::boolean(true));
+    let _ = map_obj.set(str_to_key(MAP_ENTRIES_KEY), VmValue::object(entries_obj));
+    let _ = map_obj.set(str_to_key(MAP_SIZE_KEY), VmValue::int32(0));
+    let _ = map_obj.set(str_to_key(IS_MAP_KEY), VmValue::boolean(true));
 
     Ok(VmValue::object(map_obj))
 }
@@ -166,9 +166,9 @@ fn native_map_set(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<Vm
 
     // Create entry object to store both key and value
     let entry = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-    entry.set(str_to_key("k"), key);
-    entry.set(str_to_key("v"), value);
-    entries_obj.set(str_to_key(&hash_key), VmValue::object(entry));
+    let _ = entry.set(str_to_key("k"), key);
+    let _ = entry.set(str_to_key("v"), value);
+    let _ = entries_obj.set(str_to_key(&hash_key), VmValue::object(entry));
 
     // Update size if new key
     if is_new {
@@ -176,7 +176,7 @@ fn native_map_set(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<Vm
             .get(&str_to_key(MAP_SIZE_KEY))
             .unwrap_or_else(VmValue::undefined);
         let current_size = size.as_int32().unwrap_or(0);
-        map_obj.set(str_to_key(MAP_SIZE_KEY), VmValue::int32(current_size + 1));
+        let _ = map_obj.set(str_to_key(MAP_SIZE_KEY), VmValue::int32(current_size + 1));
     }
 
     // Return the map for chaining
@@ -247,7 +247,7 @@ fn native_map_delete(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Resul
         .unwrap_or_else(VmValue::undefined);
     let current_size = size.as_int32().unwrap_or(0);
     if current_size > 0 {
-        map_obj.set(str_to_key(MAP_SIZE_KEY), VmValue::int32(current_size - 1));
+        let _ = map_obj.set(str_to_key(MAP_SIZE_KEY), VmValue::int32(current_size - 1));
     }
 
     Ok(VmValue::boolean(true))
@@ -268,8 +268,8 @@ fn native_map_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<
 
     // Replace entries with new empty object
     let new_entries = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-    map_obj.set(str_to_key(MAP_ENTRIES_KEY), VmValue::object(new_entries));
-    map_obj.set(str_to_key(MAP_SIZE_KEY), VmValue::int32(0));
+    let _ = map_obj.set(str_to_key(MAP_ENTRIES_KEY), VmValue::object(new_entries));
+    let _ = map_obj.set(str_to_key(MAP_SIZE_KEY), VmValue::int32(0));
 
     Ok(VmValue::undefined())
 }
@@ -325,13 +325,13 @@ fn native_map_keys(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<V
                 let key = entry_obj
                     .get(&str_to_key("k"))
                     .unwrap_or_else(VmValue::undefined);
-                keys_array.set(str_to_key(&index.to_string()), key);
+                let _ = keys_array.set(str_to_key(&index.to_string()), key);
                 index += 1;
             }
         }
     }
 
-    keys_array.set(str_to_key("length"), VmValue::int32(index));
+    let _ = keys_array.set(str_to_key("length"), VmValue::int32(index));
     Ok(VmValue::array(keys_array))
 }
 
@@ -367,13 +367,13 @@ fn native_map_values(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result
                 let value = entry_obj
                     .get(&str_to_key("v"))
                     .unwrap_or_else(VmValue::undefined);
-                values_array.set(str_to_key(&index.to_string()), value);
+                let _ = values_array.set(str_to_key(&index.to_string()), value);
                 index += 1;
             }
         }
     }
 
-    values_array.set(str_to_key("length"), VmValue::int32(index));
+    let _ = values_array.set(str_to_key("length"), VmValue::int32(index));
     Ok(VmValue::array(values_array))
 }
 
@@ -415,17 +415,17 @@ fn native_map_entries(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
 
                 // Create [key, value] pair as array
                 let pair = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
-                pair.set(str_to_key("0"), key);
-                pair.set(str_to_key("1"), value);
-                pair.set(str_to_key("length"), VmValue::int32(2));
+                let _ = pair.set(str_to_key("0"), key);
+                let _ = pair.set(str_to_key("1"), value);
+                let _ = pair.set(str_to_key("length"), VmValue::int32(2));
 
-                entries_array.set(str_to_key(&index.to_string()), VmValue::array(pair));
+                let _ = entries_array.set(str_to_key(&index.to_string()), VmValue::array(pair));
                 index += 1;
             }
         }
     }
 
-    entries_array.set(str_to_key("length"), VmValue::int32(index));
+    let _ = entries_array.set(str_to_key("length"), VmValue::int32(index));
     Ok(VmValue::array(entries_array))
 }
 
@@ -449,8 +449,8 @@ fn native_weakmap_new(
 
     // WeakMap uses the same internal structure but only allows object keys
     let entries_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-    map_obj.set(str_to_key(MAP_ENTRIES_KEY), VmValue::object(entries_obj));
-    map_obj.set(str_to_key(IS_WEAKMAP_KEY), VmValue::boolean(true));
+    let _ = map_obj.set(str_to_key(MAP_ENTRIES_KEY), VmValue::object(entries_obj));
+    let _ = map_obj.set(str_to_key(IS_WEAKMAP_KEY), VmValue::boolean(true));
 
     Ok(VmValue::object(map_obj))
 }
@@ -540,9 +540,9 @@ fn native_weakmap_set(
 
     // Create entry object to store both key (weakly) and value
     let entry = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-    entry.set(str_to_key("k"), key);
-    entry.set(str_to_key("v"), value);
-    entries_obj.set(str_to_key(&hash_key), VmValue::object(entry));
+    let _ = entry.set(str_to_key("k"), key);
+    let _ = entry.set(str_to_key("v"), value);
+    let _ = entries_obj.set(str_to_key(&hash_key), VmValue::object(entry));
 
     // Return the map for chaining
     Ok(map.clone())

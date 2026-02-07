@@ -68,7 +68,7 @@ where
             PropertyDescriptor::function_length(Value::string(JsString::intern(name))),
         );
         // Built-in prototype methods are not constructors (ES2023 §17)
-        obj.set(pk("__non_constructor"), Value::boolean(true));
+        let _ = obj.set(pk("__non_constructor"), Value::boolean(true));
     }
     val
 }
@@ -129,14 +129,14 @@ fn weak_key_id(value: &Value) -> Option<usize> {
 
 fn init_map_slots(obj: &GcRef<JsObject>) {
     let data = GcRef::new(MapData::new());
-    obj.set(pk(MAP_DATA_KEY), Value::map_data(data));
-    obj.set(pk(IS_MAP_KEY), Value::boolean(true));
+    let _ = obj.set(pk(MAP_DATA_KEY), Value::map_data(data));
+    let _ = obj.set(pk(IS_MAP_KEY), Value::boolean(true));
 }
 
 fn init_set_slots(obj: &GcRef<JsObject>) {
     let data = GcRef::new(SetData::new());
-    obj.set(pk(SET_DATA_KEY), Value::set_data(data));
-    obj.set(pk(IS_SET_KEY), Value::boolean(true));
+    let _ = obj.set(pk(SET_DATA_KEY), Value::set_data(data));
+    let _ = obj.set(pk(IS_SET_KEY), Value::boolean(true));
 }
 
 /// Require `this` to be a Map and extract its data.
@@ -180,9 +180,9 @@ fn make_map_iterator(
 
     let iter = GcRef::new(JsObject::new(Value::object(iter_proto), mm.clone()));
     // Store MapData reference for live iteration
-    iter.set(pk("__map_data_ref__"), Value::map_data(data));
-    iter.set(pk("__iter_index__"), Value::number(0.0));
-    iter.set(pk("__iter_kind__"), Value::string(JsString::intern(kind)));
+    let _ = iter.set(pk("__map_data_ref__"), Value::map_data(data));
+    let _ = iter.set(pk("__iter_index__"), Value::number(0.0));
+    let _ = iter.set(pk("__iter_kind__"), Value::string(JsString::intern(kind)));
 
     let fn_proto_for_next = fn_proto;
     let mm_for_next = mm;
@@ -214,34 +214,34 @@ fn make_map_iterator(
                     let entries_len = data.entries_len();
                     if idx >= entries_len {
                         let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                        result.set(pk("value"), Value::undefined());
-                        result.set(pk("done"), Value::boolean(true));
+                        let _ = result.set(pk("value"), Value::undefined());
+                        let _ = result.set(pk("done"), Value::boolean(true));
                         // Park index at end
-                        iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
+                        let _ = iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
                         return Ok(Value::object(result));
                     }
 
                     if let Some((key, value)) = data.entry_at(idx) {
                         idx += 1;
-                        iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
+                        let _ = iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
 
                         let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                         match kind.as_str() {
                             "key" => {
-                                result.set(pk("value"), key);
+                                let _ = result.set(pk("value"), key);
                             }
                             "entry" => {
                                 let entry = GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
-                                entry.set(PropertyKey::Index(0), key);
-                                entry.set(PropertyKey::Index(1), value);
-                                result.set(pk("value"), Value::array(entry));
+                                let _ = entry.set(PropertyKey::Index(0), key);
+                                let _ = entry.set(PropertyKey::Index(1), value);
+                                let _ = result.set(pk("value"), Value::array(entry));
                             }
                             _ => {
                                 // "value"
-                                result.set(pk("value"), value);
+                                let _ = result.set(pk("value"), value);
                             }
                         }
-                        result.set(pk("done"), Value::boolean(false));
+                        let _ = result.set(pk("done"), Value::boolean(false));
                         return Ok(Value::object(result));
                     } else {
                         // Tombstone, skip
@@ -302,7 +302,7 @@ pub fn init_map_prototype(
                 } else {
                     key
                 };
-                data.set(MapKey(normalized_key), value);
+                let _ = data.set(MapKey(normalized_key), value);
                 Ok(this_val.clone())
             },
             mm.clone(),
@@ -515,7 +515,7 @@ pub fn init_map_prototype(
                 }
                 // Key not found: Call(callbackfn, undefined, « key »)
                 let value = ncx.call_function(&callback, Value::undefined(), &[key.clone()])?;
-                data.set(MapKey(key), value.clone());
+                let _ = data.set(MapKey(key), value.clone());
                 Ok(value)
             },
             mm.clone(),
@@ -568,9 +568,9 @@ fn make_set_iterator(
     let (_obj, data) = require_set(this_val, "values")?;
 
     let iter = GcRef::new(JsObject::new(Value::object(iter_proto), mm.clone()));
-    iter.set(pk("__set_data_ref__"), Value::set_data(data));
-    iter.set(pk("__iter_index__"), Value::number(0.0));
-    iter.set(pk("__iter_kind__"), Value::string(JsString::intern(kind)));
+    let _ = iter.set(pk("__set_data_ref__"), Value::set_data(data));
+    let _ = iter.set(pk("__iter_index__"), Value::number(0.0));
+    let _ = iter.set(pk("__iter_kind__"), Value::string(JsString::intern(kind)));
 
     let fn_proto_for_next = fn_proto;
     let mm_for_next = mm;
@@ -601,30 +601,30 @@ fn make_set_iterator(
                     let entries_len = data.entries_len();
                     if idx >= entries_len {
                         let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                        result.set(pk("value"), Value::undefined());
-                        result.set(pk("done"), Value::boolean(true));
-                        iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
+                        let _ = result.set(pk("value"), Value::undefined());
+                        let _ = result.set(pk("done"), Value::boolean(true));
+                        let _ = iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
                         return Ok(Value::object(result));
                     }
 
                     if let Some(value) = data.entry_at(idx) {
                         idx += 1;
-                        iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
+                        let _ = iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
 
                         let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                         match kind.as_str() {
                             "entry" => {
                                 let entry = GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
-                                entry.set(PropertyKey::Index(0), value.clone());
-                                entry.set(PropertyKey::Index(1), value);
-                                result.set(pk("value"), Value::array(entry));
+                                let _ = entry.set(PropertyKey::Index(0), value.clone());
+                                let _ = entry.set(PropertyKey::Index(1), value);
+                                let _ = result.set(pk("value"), Value::array(entry));
                             }
                             _ => {
                                 // "value" or "key" (both same for Sets)
-                                result.set(pk("value"), value);
+                                let _ = result.set(pk("value"), value);
                             }
                         }
-                        result.set(pk("done"), Value::boolean(false));
+                        let _ = result.set(pk("done"), Value::boolean(false));
                         return Ok(Value::object(result));
                     } else {
                         idx += 1;
@@ -1158,7 +1158,7 @@ pub fn init_weak_map_prototype(
                 let id = weak_key_id(&key).ok_or_else(|| VmError::type_error("Invalid weak key"))?;
                 let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
                 let pk_id = PropertyKey::string(&format!("__wk_{}", id));
-                entries.set(pk_id, value);
+                let _ = entries.set(pk_id, value);
                 Ok(this_val.clone())
             },
             mm.clone(),
@@ -1278,7 +1278,7 @@ pub fn init_weak_set_prototype(
                 let id = weak_key_id(&value).ok_or_else(|| VmError::type_error("Invalid weak key"))?;
                 let entries = get_weakset_entries(&obj).ok_or("Internal error: missing entries")?;
                 let pk_id = PropertyKey::string(&format!("__wk_{}", id));
-                entries.set(pk_id, Value::boolean(true));
+                let _ = entries.set(pk_id, Value::boolean(true));
                 Ok(this_val.clone())
             },
             mm.clone(),
@@ -1397,7 +1397,7 @@ pub fn create_map_constructor() -> Box<
                         {
                             let key = entry_obj.get(&PropertyKey::Index(0)).unwrap_or(Value::undefined());
                             let value = entry_obj.get(&PropertyKey::Index(1)).unwrap_or(Value::undefined());
-                            data.set(MapKey(key), value);
+                            let _ = data.set(MapKey(key), value);
                         }
                     }
                 }
@@ -1459,8 +1459,8 @@ pub fn create_weak_map_constructor() -> Box<
         }
         if let Some(obj) = this_val.as_object() {
             let entries = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-            obj.set(pk(WEAKMAP_ENTRIES_KEY), Value::object(entries));
-            obj.set(pk(IS_WEAKMAP_KEY), Value::boolean(true));
+            let _ = obj.set(pk(WEAKMAP_ENTRIES_KEY), Value::object(entries));
+            let _ = obj.set(pk(IS_WEAKMAP_KEY), Value::boolean(true));
             Ok(this_val.clone())
         } else {
             Err(VmError::type_error("Constructor WeakMap requires 'new'"))
@@ -1480,8 +1480,8 @@ pub fn create_weak_set_constructor() -> Box<
         }
         if let Some(obj) = this_val.as_object() {
             let entries = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-            obj.set(pk(WEAKSET_ENTRIES_KEY), Value::object(entries));
-            obj.set(pk(IS_WEAKSET_KEY), Value::boolean(true));
+            let _ = obj.set(pk(WEAKSET_ENTRIES_KEY), Value::object(entries));
+            let _ = obj.set(pk(IS_WEAKSET_KEY), Value::boolean(true));
             Ok(this_val.clone())
         } else {
             Err(VmError::type_error("Constructor WeakSet requires 'new'"))

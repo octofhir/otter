@@ -39,7 +39,7 @@ pub fn init_error_prototypes(
     );
 
     // Mark as Error prototype for stack trace capture
-    error_proto.set(
+    let _ = error_proto.set(
         PropertyKey::string("__is_error__"),
         Value::boolean(true),
     );
@@ -199,7 +199,7 @@ pub fn init_error_prototypes(
             ),
         );
         // Mark as Error prototype for stack trace capture
-        proto.set(
+        let _ = proto.set(
             PropertyKey::string("__is_error__"),
             Value::boolean(true),
         );
@@ -216,13 +216,13 @@ pub fn create_error_constructor(
         if let Some(obj) = this.as_object() {
             if let Some(msg) = args.first() {
                 if !msg.is_undefined() {
-                    obj.set(
+                    let _ = obj.set(
                         PropertyKey::string("message"),
                         Value::string(JsString::intern(&crate::globals::to_string(msg))),
                     );
                 }
             }
-            obj.set(
+            let _ = obj.set(
                 PropertyKey::string("name"),
                 Value::string(JsString::intern(error_name)),
             );

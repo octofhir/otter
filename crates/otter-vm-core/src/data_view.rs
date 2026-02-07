@@ -5,7 +5,6 @@
 
 use crate::array_buffer::JsArrayBuffer;
 use crate::gc::GcRef;
-use std::sync::Arc;
 
 /// A JavaScript DataView
 ///
@@ -491,6 +490,7 @@ mod tests {
     use super::*;
     use crate::gc::GcRef;
     use crate::memory::MemoryManager;
+    use std::sync::Arc;
 
     fn make_mm() -> Arc<MemoryManager> {
         Arc::new(MemoryManager::new(1024 * 1024))

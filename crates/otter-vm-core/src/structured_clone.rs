@@ -9,7 +9,6 @@
 //! - Supports SharedArrayBuffer transfer (shares, not copies)
 //! - Throws on non-cloneable values (functions, symbols, etc.)
 
-use crate::array_buffer::JsArrayBuffer;
 use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyKey};
 use crate::value::{HeapRef, Value};
@@ -173,7 +172,7 @@ impl StructuredCloner {
         for key in obj.own_keys() {
             if let Some(val) = obj.get(&key) {
                 let cloned_val = self.internal_clone(&val)?;
-                new_obj.set(key, cloned_val);
+                let _ = new_obj.set(key, cloned_val);
             }
         }
 
@@ -201,7 +200,7 @@ impl StructuredCloner {
             let key = PropertyKey::Index(i as u32);
             if let Some(val) = arr.get(&key) {
                 let cloned_val = self.internal_clone(&val)?;
-                new_arr.set(key, cloned_val);
+                let _ = new_arr.set(key, cloned_val);
             }
         }
 
@@ -253,8 +252,8 @@ mod tests {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         let mut cloner = StructuredCloner::new(memory_manager.clone());
         let obj = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
-        obj.set(PropertyKey::string("x"), Value::int32(1));
-        obj.set(PropertyKey::string("y"), Value::int32(2));
+        let _ = obj.set(PropertyKey::string("x"), Value::int32(1));
+        let _ = obj.set(PropertyKey::string("y"), Value::int32(2));
 
         let val = Value::object(obj);
         let cloned = cloner.clone(&val).unwrap();
@@ -276,7 +275,7 @@ mod tests {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         let mut cloner = StructuredCloner::new(memory_manager.clone());
         let sab = GcRef::new(SharedArrayBuffer::new(4));
-        sab.set(0, 42);
+        let _ = sab.set(0, 42);
 
         let val = Value::shared_array_buffer(sab);
         let cloned = cloner.clone(&val).unwrap();
@@ -286,7 +285,7 @@ mod tests {
         assert_eq!(cloned_sab.get(0), Some(42));
 
         // Modify through clone, should affect original
-        cloned_sab.set(0, 100);
+        let _ = cloned_sab.set(0, 100);
         assert_eq!(sab.get(0), Some(100));
     }
 

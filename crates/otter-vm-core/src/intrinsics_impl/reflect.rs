@@ -170,18 +170,18 @@ fn descriptor_to_value(desc: PropertyDescriptor, ncx: &NativeContext) -> Value {
     match desc {
         PropertyDescriptor::Data { value, attributes } => {
             let desc_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-            desc_obj.set("value".into(), value);
-            desc_obj.set("writable".into(), Value::boolean(attributes.writable));
-            desc_obj.set("enumerable".into(), Value::boolean(attributes.enumerable));
-            desc_obj.set("configurable".into(), Value::boolean(attributes.configurable));
+            let _ = desc_obj.set("value".into(), value);
+            let _ = desc_obj.set("writable".into(), Value::boolean(attributes.writable));
+            let _ = desc_obj.set("enumerable".into(), Value::boolean(attributes.enumerable));
+            let _ = desc_obj.set("configurable".into(), Value::boolean(attributes.configurable));
             Value::object(desc_obj)
         }
         PropertyDescriptor::Accessor { get, set, attributes } => {
             let desc_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-            desc_obj.set("get".into(), get.unwrap_or(Value::undefined()));
-            desc_obj.set("set".into(), set.unwrap_or(Value::undefined()));
-            desc_obj.set("enumerable".into(), Value::boolean(attributes.enumerable));
-            desc_obj.set("configurable".into(), Value::boolean(attributes.configurable));
+            let _ = desc_obj.set("get".into(), get.unwrap_or(Value::undefined()));
+            let _ = desc_obj.set("set".into(), set.unwrap_or(Value::undefined()));
+            let _ = desc_obj.set("enumerable".into(), Value::boolean(attributes.enumerable));
+            let _ = desc_obj.set("configurable".into(), Value::boolean(attributes.configurable));
             Value::object(desc_obj)
         }
         PropertyDescriptor::Deleted => Value::undefined(),
@@ -221,7 +221,7 @@ pub fn install_reflect_namespace(
     // Helper macro to define a Reflect method
     macro_rules! reflect_method {
         ($name:literal, $body:expr) => {
-            reflect_obj.set(
+            let _ = reflect_obj.set(
                 PropertyKey::string($name),
                 Value::native_function(
                     $body,
@@ -281,7 +281,7 @@ pub fn install_reflect_namespace(
         let obj = get_target_object(target)?;
         let key = to_property_key(property_key);
 
-        obj.set(key, value);
+        let _ = obj.set(key, value);
         Ok(Value::boolean(true))
     });
 
@@ -348,7 +348,7 @@ pub fn install_reflect_namespace(
                 PropertyKey::Index(n) => Value::string(JsString::intern(&n.to_string())),
                 PropertyKey::Symbol(_) => continue, // Skip symbols for now
             };
-            result.set(PropertyKey::Index(i as u32), key_val);
+            let _ = result.set(PropertyKey::Index(i as u32), key_val);
         }
 
         Ok(Value::array(result))
@@ -379,28 +379,28 @@ pub fn install_reflect_namespace(
             match prop_desc {
                 PropertyDescriptor::Data { value, attributes } => {
                     let desc = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                    desc.set("value".into(), value);
-                    desc.set("writable".into(), Value::boolean(attributes.writable));
-                    desc.set("enumerable".into(), Value::boolean(attributes.enumerable));
-                    desc.set("configurable".into(), Value::boolean(attributes.configurable));
+                    let _ = desc.set("value".into(), value);
+                    let _ = desc.set("writable".into(), Value::boolean(attributes.writable));
+                    let _ = desc.set("enumerable".into(), Value::boolean(attributes.enumerable));
+                    let _ = desc.set("configurable".into(), Value::boolean(attributes.configurable));
                     Ok(Value::object(desc))
                 }
                 PropertyDescriptor::Accessor { get, set, attributes } => {
                     let desc = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                    desc.set("get".into(), get.unwrap_or(Value::undefined()));
-                    desc.set("set".into(), set.unwrap_or(Value::undefined()));
-                    desc.set("enumerable".into(), Value::boolean(attributes.enumerable));
-                    desc.set("configurable".into(), Value::boolean(attributes.configurable));
+                    let _ = desc.set("get".into(), get.unwrap_or(Value::undefined()));
+                    let _ = desc.set("set".into(), set.unwrap_or(Value::undefined()));
+                    let _ = desc.set("enumerable".into(), Value::boolean(attributes.enumerable));
+                    let _ = desc.set("configurable".into(), Value::boolean(attributes.configurable));
                     Ok(Value::object(desc))
                 }
                 PropertyDescriptor::Deleted => Ok(Value::undefined()),
             }
         } else if let Some(value) = obj.get(&key) {
             let desc = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-            desc.set("value".into(), value);
-            desc.set("writable".into(), Value::boolean(true));
-            desc.set("enumerable".into(), Value::boolean(true));
-            desc.set("configurable".into(), Value::boolean(true));
+            let _ = desc.set("value".into(), value);
+            let _ = desc.set("writable".into(), Value::boolean(true));
+            let _ = desc.set("enumerable".into(), Value::boolean(true));
+            let _ = desc.set("configurable".into(), Value::boolean(true));
             Ok(Value::object(desc))
         } else {
             Ok(Value::undefined())
@@ -693,5 +693,5 @@ pub fn install_reflect_namespace(
     // ====================================================================
     // Install Reflect on global
     // ====================================================================
-    global.set(PropertyKey::string("Reflect"), Value::object(reflect_obj));
+    let _ = global.set(PropertyKey::string("Reflect"), Value::object(reflect_obj));
 }

@@ -531,7 +531,7 @@ pub fn init_date_prototype(
                 let new_time = args.first()
                     .and_then(|v| v.as_number())
                     .ok_or("setTime requires a number argument")?;
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(new_time));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(new_time));
                 Ok(Value::number(new_time))
             },
             mm.clone(),
@@ -553,7 +553,7 @@ pub fn init_date_prototype(
                 let local_dt: DateTime<Local> = dt.into();
                 let new_ts = (local_dt.timestamp() * 1000) + ms;
 
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
                 Ok(Value::number(new_ts as f64))
             },
             mm.clone(),
@@ -566,7 +566,7 @@ pub fn init_date_prototype(
         PropertyKey::string("setSeconds"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, _ncx| {
-                use chrono::{DateTime, Datelike, Local, Timelike};
+                use chrono::{DateTime, Local, Timelike};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
                 let sec = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
@@ -580,10 +580,10 @@ pub fn init_date_prototype(
                 if let Some(ms_val) = ms {
                     new_ts += ms_val;
                 } else {
-                    new_ts += (ts % 1000);
+                    new_ts += ts % 1000;
                 }
 
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
                 Ok(Value::number(new_ts as f64))
             },
             mm.clone(),
@@ -596,7 +596,7 @@ pub fn init_date_prototype(
         PropertyKey::string("setMinutes"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, _ncx| {
-                use chrono::{DateTime, Datelike, Local, Timelike};
+                use chrono::{DateTime, Local, Timelike};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
                 let min = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
@@ -615,10 +615,10 @@ pub fn init_date_prototype(
                 if let Some(ms_val) = ms {
                     new_ts += ms_val;
                 } else if sec.is_none() {
-                    new_ts += (ts % 1000);
+                    new_ts += ts % 1000;
                 }
 
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
                 Ok(Value::number(new_ts as f64))
             },
             mm.clone(),
@@ -631,7 +631,7 @@ pub fn init_date_prototype(
         PropertyKey::string("setHours"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, _ncx| {
-                use chrono::{DateTime, Datelike, Local, Timelike};
+                use chrono::{DateTime, Local, Timelike};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
                 let hours = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
@@ -654,10 +654,10 @@ pub fn init_date_prototype(
                 if let Some(ms_val) = ms {
                     new_ts += ms_val;
                 } else if min.is_none() {
-                    new_ts += (ts % 1000);
+                    new_ts += ts % 1000;
                 }
 
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
                 Ok(Value::number(new_ts as f64))
             },
             mm.clone(),
@@ -670,7 +670,7 @@ pub fn init_date_prototype(
         PropertyKey::string("setDate"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, _ncx| {
-                use chrono::{DateTime, Datelike, Local, NaiveDate};
+                use chrono::{DateTime, Datelike, Local};
                 let obj = this_val.as_object().ok_or("Date method requires a Date object")?;
                 let ts = get_timestamp(this_val)?;
                 let date = args.first().and_then(|v| v.as_number()).unwrap_or(1.0) as u32;
@@ -682,7 +682,7 @@ pub fn init_date_prototype(
                 let new_dt = local_dt.with_day(date).ok_or("Invalid date")?;
                 let new_ts = new_dt.timestamp() * 1000 + (ts % 1000);
 
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
                 Ok(Value::number(new_ts as f64))
             },
             mm.clone(),
@@ -712,7 +712,7 @@ pub fn init_date_prototype(
 
                 let new_ts = local_dt.timestamp() * 1000 + (ts % 1000);
 
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
                 Ok(Value::number(new_ts as f64))
             },
             mm.clone(),
@@ -746,7 +746,7 @@ pub fn init_date_prototype(
 
                 let new_ts = local_dt.timestamp() * 1000 + (ts % 1000);
 
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
                 Ok(Value::number(new_ts as f64))
             },
             mm.clone(),
@@ -772,7 +772,7 @@ pub fn init_date_prototype(
                 let utc_dt: DateTime<Utc> = dt.into();
                 let new_ts = (utc_dt.timestamp() * 1000) + ms;
 
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
                 Ok(Value::number(new_ts as f64))
             },
             mm.clone(),
@@ -799,10 +799,10 @@ pub fn init_date_prototype(
                 if let Some(ms_val) = ms {
                     new_ts += ms_val;
                 } else {
-                    new_ts += (ts % 1000);
+                    new_ts += ts % 1000;
                 }
 
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
                 Ok(Value::number(new_ts as f64))
             },
             mm.clone(),
@@ -834,10 +834,10 @@ pub fn init_date_prototype(
                 if let Some(ms_val) = ms {
                     new_ts += ms_val;
                 } else if sec.is_none() {
-                    new_ts += (ts % 1000);
+                    new_ts += ts % 1000;
                 }
 
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
                 Ok(Value::number(new_ts as f64))
             },
             mm.clone(),
@@ -873,10 +873,10 @@ pub fn init_date_prototype(
                 if let Some(ms_val) = ms {
                     new_ts += ms_val;
                 } else if min.is_none() {
-                    new_ts += (ts % 1000);
+                    new_ts += ts % 1000;
                 }
 
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
                 Ok(Value::number(new_ts as f64))
             },
             mm.clone(),
@@ -901,7 +901,7 @@ pub fn init_date_prototype(
                 let new_dt = utc_dt.with_day(date).ok_or("Invalid date")?;
                 let new_ts = new_dt.timestamp() * 1000 + (ts % 1000);
 
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
                 Ok(Value::number(new_ts as f64))
             },
             mm.clone(),
@@ -931,7 +931,7 @@ pub fn init_date_prototype(
 
                 let new_ts = utc_dt.timestamp() * 1000 + (ts % 1000);
 
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
                 Ok(Value::number(new_ts as f64))
             },
             mm.clone(),
@@ -965,7 +965,7 @@ pub fn init_date_prototype(
 
                 let new_ts = utc_dt.timestamp() * 1000 + (ts % 1000);
 
-                obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
+                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts as f64));
                 Ok(Value::number(new_ts as f64))
             },
             mm.clone(),

@@ -202,7 +202,7 @@ impl CopySink for PostgresCopySink {
         Ok(rows_copied)
     }
 
-    async fn abort(mut self: Box<Self>, message: Option<&str>) -> SqlResult<()> {
+    async fn abort(mut self: Box<Self>, _message: Option<&str>) -> SqlResult<()> {
         // Close the sink without finishing to abort the COPY
         // The connection will rollback the incomplete COPY
         drop(self.sink);

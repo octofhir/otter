@@ -131,7 +131,7 @@ impl SqlAdapter for SqliteAdapter {
 
     async fn begin(&self, isolation: Option<IsolationLevel>) -> SqlResult<Box<dyn SqlTransaction>> {
         let conn = self.conn.clone();
-        let isolation = isolation.unwrap_or_default();
+        let _isolation = isolation.unwrap_or_default();
 
         tokio::task::spawn_blocking(move || {
             let conn_guard = conn.lock();

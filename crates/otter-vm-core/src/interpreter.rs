@@ -10,7 +10,8 @@ use crate::error::{VmError, VmResult};
 use crate::gc::GcRef;
 use crate::generator::{GeneratorFrame, GeneratorState, JsGenerator};
 use crate::object::{
-    JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey, get_proto_epoch,
+    JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey, SetPropertyError,
+    get_proto_epoch,
 };
 use crate::promise::{JsPromise, PromiseState};
 use crate::regexp::JsRegExp;
@@ -217,7 +218,7 @@ impl Interpreter {
                 }
             }
             for (i, arg) in rest_args.into_iter().enumerate() {
-                rest_arr.set(crate::object::PropertyKey::Index(i as u32), arg);
+                let _ = rest_arr.set(crate::object::PropertyKey::Index(i as u32), arg);
             }
             call_args.push(Value::object(rest_arr));
         }
@@ -233,6 +234,8 @@ impl Interpreter {
 
         let realm_id = self.realm_id_for_function(ctx, func);
         ctx.set_pending_realm_id(realm_id);
+        // Store callee value for arguments.callee
+        ctx.set_pending_callee_value(func.clone());
         ctx.push_frame(
             closure.function_index,
             Arc::clone(&closure.module),
@@ -654,7 +657,7 @@ impl Interpreter {
                             rest_arr.set_prototype(Value::object(array_proto));
                         }
                         for (i, arg) in rest_args.into_iter().enumerate() {
-                            rest_arr.set(PropertyKey::Index(i as u32), arg);
+                            let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
                         }
 
                         // Append rest array to args
@@ -726,7 +729,7 @@ impl Interpreter {
                             rest_arr.set_prototype(Value::object(array_proto));
                         }
                         for (i, arg) in rest_args.into_iter().enumerate() {
-                            rest_arr.set(PropertyKey::Index(i as u32), arg);
+                            let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
                         }
                         args.push(Value::object(rest_arr));
                         ctx.set_pending_args(args);
@@ -783,8 +786,8 @@ impl Interpreter {
                     // Generator yielded a value
                     let result =
                         GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
-                    result.set(PropertyKey::string("value"), value);
-                    result.set(PropertyKey::string("done"), Value::boolean(false));
+                    let _ = result.set(PropertyKey::string("value"), value);
+                    let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
                     ctx.advance_pc();
                     return VmExecutionResult::Complete(Value::object(result));
                 }
@@ -1039,7 +1042,7 @@ impl Interpreter {
                             rest_arr.set_prototype(Value::object(array_proto));
                         }
                         for (i, arg) in rest_args.into_iter().enumerate() {
-                            rest_arr.set(PropertyKey::Index(i as u32), arg);
+                            let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
                         }
 
                         // Append rest array to args
@@ -1106,7 +1109,7 @@ impl Interpreter {
                             rest_arr.set_prototype(Value::object(array_proto));
                         }
                         for (i, arg) in rest_args.into_iter().enumerate() {
-                            rest_arr.set(PropertyKey::Index(i as u32), arg);
+                            let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
                         }
                         args.push(Value::object(rest_arr));
                         ctx.set_pending_args(args);
@@ -1155,8 +1158,8 @@ impl Interpreter {
                     // Create an iterator result object { value, done: false }
                     let result =
                         GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
-                    result.set(PropertyKey::string("value"), value);
-                    result.set(PropertyKey::string("done"), Value::boolean(false));
+                    let _ = result.set(PropertyKey::string("value"), value);
+                    let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
                     ctx.advance_pc();
                     return Ok(Value::object(result));
                 }
@@ -1444,7 +1447,7 @@ impl Interpreter {
                                 .module
                                 .function(frame.function_index)
                                 .ok_or_else(|| VmError::internal("no function"))?;
-                            let mut feedback = func.feedback_vector.write();
+                            let feedback = func.feedback_vector.write();
                             if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                 if matches!(
                                     ic.ic_state,
@@ -1533,7 +1536,7 @@ impl Interpreter {
                             {
                                 if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr
                                 {
-                                    if global_obj.set_by_offset(*offset as usize, val_val.clone()) {
+                                    if global_obj.set_by_offset(*offset as usize, val_val.clone()).is_ok() {
                                         return Ok(InstructionResult::Continue);
                                     }
                                 }
@@ -1582,7 +1585,7 @@ impl Interpreter {
                                 .module
                                 .function(frame.function_index)
                                 .ok_or_else(|| VmError::internal("no function"))?;
-                            let mut feedback = func.feedback_vector.write();
+                            let feedback = func.feedback_vector.write();
                             if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                 if matches!(
                                     ic.ic_state,
@@ -1665,7 +1668,7 @@ impl Interpreter {
                 // Collect type feedback and check for quickening opportunity
                 let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
-                        let mut feedback = func.feedback_vector.write();
+                        let feedback = func.feedback_vector.write();
                         if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
                             Self::observe_value_type(&mut meta.type_observations, &left);
                             Self::observe_value_type(&mut meta.type_observations, &right);
@@ -1709,7 +1712,7 @@ impl Interpreter {
                 // Collect type feedback and check for quickening opportunity
                 let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
-                        let mut feedback = func.feedback_vector.write();
+                        let feedback = func.feedback_vector.write();
                         if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
                             Self::observe_value_type(&mut meta.type_observations, &left_value);
                             Self::observe_value_type(&mut meta.type_observations, &right_value);
@@ -1793,7 +1796,7 @@ impl Interpreter {
                 // Collect type feedback and check for quickening opportunity
                 let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
-                        let mut feedback = func.feedback_vector.write();
+                        let feedback = func.feedback_vector.write();
                         if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
                             Self::observe_value_type(&mut meta.type_observations, &left_value);
                             Self::observe_value_type(&mut meta.type_observations, &right_value);
@@ -1847,7 +1850,7 @@ impl Interpreter {
                 // Collect type feedback and check for quickening opportunity
                 let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
-                        let mut feedback = func.feedback_vector.write();
+                        let feedback = func.feedback_vector.write();
                         if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
                             Self::observe_value_type(&mut meta.type_observations, &left_value);
                             Self::observe_value_type(&mut meta.type_observations, &right_value);
@@ -2381,7 +2384,7 @@ impl Interpreter {
                             .module
                             .function(frame.function_index)
                             .ok_or_else(|| VmError::internal("no function"))?;
-                        let mut feedback = func.feedback_vector.write();
+                        let feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                             use otter_vm_bytecode::function::InlineCacheState;
                             // Skip IC for dictionary mode objects
@@ -2554,8 +2557,8 @@ impl Interpreter {
                         return Ok(InstructionResult::Continue);
                     }
 
-                    // Slow path with IC update
-                    let has_property = right_obj.has(&key);
+                    // Slow path with IC update (proxy-aware)
+                    let has_property = self.has_with_proxy_chain(ctx, &right_obj, &key, left.clone())?;
                     {
                         let frame = ctx
                             .current_frame()
@@ -2564,7 +2567,7 @@ impl Interpreter {
                             .module
                             .function(frame.function_index)
                             .ok_or_else(|| VmError::internal("no function"))?;
-                        let mut feedback = func.feedback_vector.write();
+                        let feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                             use otter_vm_bytecode::function::InlineCacheState;
                             // Skip IC for dictionary mode objects
@@ -2625,7 +2628,7 @@ impl Interpreter {
                     return Ok(InstructionResult::Continue);
                 }
 
-                let result = right_obj.has(&key);
+                let result = self.has_with_proxy_chain(ctx, &right_obj, &key, left.clone())?;
                 ctx.set_register(dst.0, Value::boolean(result));
                 Ok(InstructionResult::Continue)
             }
@@ -2804,7 +2807,7 @@ impl Interpreter {
                             },
                         },
                     );
-                    proto.set(PropertyKey::string("constructor"), func_value.clone());
+                    let _ = proto.set(PropertyKey::string("constructor"), func_value.clone());
                 }
                 ctx.set_register(dst.0, func_value);
                 Ok(InstructionResult::Continue)
@@ -2833,7 +2836,7 @@ impl Interpreter {
                     })
                     .and_then(|proto_val| proto_val.as_object());
 
-                let proto = GcRef::new(JsObject::new(
+                let _proto = GcRef::new(JsObject::new(
                     obj_proto.map(Value::object).unwrap_or_else(Value::null),
                     ctx.memory_manager().clone(),
                 ));
@@ -2970,7 +2973,7 @@ impl Interpreter {
                         },
                     },
                 );
-                proto.set(PropertyKey::string("constructor"), func_value.clone());
+                let _ = proto.set(PropertyKey::string("constructor"), func_value.clone());
                 func_obj.define_property(
                     PropertyKey::string("__non_constructor"),
                     PropertyDescriptor::Data {
@@ -3065,7 +3068,7 @@ impl Interpreter {
                         },
                     },
                 );
-                proto.set(PropertyKey::string("constructor"), func_value.clone());
+                let _ = proto.set(PropertyKey::string("constructor"), func_value.clone());
                 func_obj.define_property(
                     PropertyKey::string("__non_constructor"),
                     PropertyDescriptor::Data {
@@ -3701,8 +3704,8 @@ impl Interpreter {
                                         Value::null(),
                                         ctx.memory_manager().clone(),
                                     ));
-                                    iter_result.set(PropertyKey::string("value"), v);
-                                    iter_result
+                                    let _ = iter_result.set(PropertyKey::string("value"), v);
+                                    let _ = iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(false));
                                     let js_queue = js_queue.clone();
                                     JsPromise::resolve_with_js_jobs(promise, 
@@ -3719,8 +3722,8 @@ impl Interpreter {
                                         Value::null(),
                                         ctx.memory_manager().clone(),
                                     ));
-                                    iter_result.set(PropertyKey::string("value"), v);
-                                    iter_result
+                                    let _ = iter_result.set(PropertyKey::string("value"), v);
+                                    let _ = iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(true));
                                     let js_queue = js_queue.clone();
                                     JsPromise::resolve_with_js_jobs(promise, 
@@ -3760,9 +3763,9 @@ impl Interpreter {
                                         // TODO: Properly resume async generator execution
                                         let iter_result =
                                             GcRef::new(JsObject::new(Value::null(), mm.clone()));
-                                        iter_result
+                                        let _ = iter_result
                                             .set(PropertyKey::string("value"), resolved_value);
-                                        iter_result.set(
+                                        let _ = iter_result.set(
                                             PropertyKey::string("done"),
                                             Value::boolean(false),
                                         );
@@ -3797,8 +3800,8 @@ impl Interpreter {
                         // Create iterator result object { value, done }
                         let result =
                             GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
-                        result.set(PropertyKey::string("value"), result_value);
-                        result.set(PropertyKey::string("done"), Value::boolean(is_done));
+                        let _ = result.set(PropertyKey::string("value"), result_value);
+                        let _ = result.set(PropertyKey::string("done"), Value::boolean(is_done));
                         ctx.set_register(dst.0, Value::object(result));
                         return Ok(InstructionResult::Continue);
                     }
@@ -3944,7 +3947,7 @@ impl Interpreter {
                             .module
                             .function(frame.function_index)
                             .ok_or_else(|| VmError::internal("no function"))?;
-                        let mut feedback = func.feedback_vector.write();
+                        let feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                             if matches!(
                                 ic.ic_state,
@@ -4236,10 +4239,15 @@ impl Interpreter {
                     .current_frame()
                     .ok_or_else(|| VmError::internal("no frame"))?;
                 let argc = frame.argc;
+                let func = &frame.module.functions[frame.function_index as usize];
+                let param_count = func.param_count as usize;
+                let local_count = func.local_count as usize;
+                let is_strict = func.flags.is_strict;
+                let is_mapped = !is_strict && func.flags.has_simple_parameters;
+                let callee_val = frame.callee_value.clone();
                 let mm = ctx.memory_manager().clone();
 
                 // Get Object.prototype for the arguments object
-                // Per ES2026 §10.4.4, arguments objects are ordinary objects with Object.prototype
                 let obj_proto = ctx
                     .get_global("Object")
                     .and_then(|v| v.as_object())
@@ -4247,31 +4255,109 @@ impl Interpreter {
                     .and_then(|v| v.as_object());
 
                 // Use array_like (not array) so Array.isArray(arguments) returns false
-                let args_obj = GcRef::new(JsObject::array_like(argc, mm));
+                let args_obj = GcRef::new(JsObject::array_like(argc, mm.clone()));
                 if let Some(proto) = obj_proto {
                     args_obj.set_prototype(Value::object(proto));
                 }
 
-                // Populate arguments from locals
-                // Arguments 0..param_count are in locals[0..param_count]
-                // Arguments param_count..argc are in locals[local_count..]
-                let func = &frame.module.functions[frame.function_index as usize];
-                let param_count = func.param_count as usize;
-                let local_count = func.local_count as usize;
-
-                for i in 0..argc {
-                    let val = if i < param_count {
-                        ctx.get_local(i as u16)?
-                    } else {
+                if is_mapped {
+                    // --- MAPPED ARGUMENTS (sloppy mode, simple params) ---
+                    // Create UpvalueCells for each parameter to alias with locals
+                    let mut cells = Vec::with_capacity(param_count);
+                    for i in 0..param_count {
+                        if i < argc {
+                            let cell = ctx.get_or_create_open_upvalue(i as u16)?;
+                            // Set initial element value (for when mapping is later removed)
+                            let _ = args_obj.set(PropertyKey::index(i as u32), cell.get());
+                            cells.push(Some(cell));
+                        } else {
+                            cells.push(None); // param not passed, no aliasing
+                        }
+                    }
+                    // Extra args beyond param_count — just copy
+                    for i in param_count..argc {
                         let offset = local_count + (i - param_count);
-                        ctx.get_local(offset as u16)?
-                    };
-                    // println!("DEBUG: arg[{}] = {:?} (param_count={}, local_count={})", i, val, param_count, local_count);
-                    args_obj.set(PropertyKey::index(i as u32), val);
+                        let val = ctx.get_local(offset as u16)?;
+                        let _ = args_obj.set(PropertyKey::index(i as u32), val);
+                    }
+                    args_obj.set_argument_mapping(crate::object::ArgumentMapping { cells });
+
+                    // callee = current function (non-enumerable, writable, configurable)
+                    if let Some(callee) = callee_val {
+                        args_obj.define_property(
+                            PropertyKey::string("callee"),
+                            PropertyDescriptor::data_with_attrs(
+                                callee,
+                                PropertyAttributes::builtin_method(),
+                            ),
+                        );
+                    }
+                } else {
+                    // --- UNMAPPED ARGUMENTS (strict or non-simple params) ---
+                    for i in 0..argc {
+                        let val = if i < param_count {
+                            ctx.get_local(i as u16)?
+                        } else {
+                            let offset = local_count + (i - param_count);
+                            ctx.get_local(offset as u16)?
+                        };
+                        let _ = args_obj.set(PropertyKey::index(i as u32), val);
+                    }
+
+                    if is_strict {
+                        // callee = accessor that throws TypeError
+                        let thrower = Value::native_function(
+                            |_this: &Value, _args: &[Value], _ncx: &mut crate::context::NativeContext<'_>| {
+                                Err(VmError::type_error(
+                                    "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
+                                ))
+                            },
+                            mm.clone(),
+                        );
+                        args_obj.define_property(
+                            PropertyKey::string("callee"),
+                            PropertyDescriptor::Accessor {
+                                get: Some(thrower.clone()),
+                                set: Some(thrower),
+                                attributes: PropertyAttributes {
+                                    writable: false,
+                                    enumerable: false,
+                                    configurable: false,
+                                },
+                            },
+                        );
+                    }
                 }
 
-                // Set length property
-                args_obj.set(PropertyKey::string("length"), Value::number(argc as f64));
+                // Both modes: length (non-enumerable, writable, configurable)
+                args_obj.define_property(
+                    PropertyKey::string("length"),
+                    PropertyDescriptor::data_with_attrs(
+                        Value::number(argc as f64),
+                        PropertyAttributes::builtin_method(),
+                    ),
+                );
+
+                // Symbol.iterator = Array.prototype[Symbol.iterator]
+                let iterator_sym = crate::intrinsics::well_known::iterator_symbol();
+                if let Some(array_proto) = ctx
+                    .get_global("Array")
+                    .and_then(|v| v.as_object())
+                    .and_then(|o| o.get(&PropertyKey::string("prototype")))
+                    .and_then(|v| v.as_object())
+                {
+                    if let Some(iterator_fn) =
+                        array_proto.get(&PropertyKey::Symbol(iterator_sym.clone()))
+                    {
+                        args_obj.define_property(
+                            PropertyKey::Symbol(iterator_sym),
+                            PropertyDescriptor::data_with_attrs(
+                                iterator_fn,
+                                PropertyAttributes::builtin_method(),
+                            ),
+                        );
+                    }
+                }
 
                 ctx.set_register(dst.0, Value::object(args_obj));
                 Ok(InstructionResult::Continue)
@@ -4624,7 +4710,7 @@ impl Interpreter {
                                         .module
                                         .function(frame.function_index)
                                         .ok_or_else(|| VmError::internal("no function"))?;
-                                    let mut feedback = func.feedback_vector.write();
+                                    let feedback = func.feedback_vector.write();
                                     if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                         use otter_vm_bytecode::function::InlineCacheState;
                                         let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
@@ -4678,7 +4764,8 @@ impl Interpreter {
                                 }
                             }
 
-                            let value = obj.get(&key).unwrap_or_else(Value::undefined);
+                            let key_value = Value::string(JsString::intern_utf16(name_str));
+                            let value = self.get_with_proxy_chain(ctx, &obj, &key, key_value, &object)?;
                             if trace_array
                                 && (Self::utf16_eq_ascii(name_str, "Array")
                                     || Self::utf16_eq_ascii(name_str, "prototype")
@@ -4806,29 +4893,31 @@ impl Interpreter {
                                 match &ic.ic_state {
                                     InlineCacheState::Monomorphic { shape_id, offset } => {
                                         if obj_shape_ptr == *shape_id {
-                                            let success = obj.set_by_offset(*offset as usize, val_val.clone());
-                                            if success {
-                                                cached = true;
-                                            } else if is_strict {
-                                                return Err(VmError::type_error(
-                                                    "Cannot assign to read-only property",
-                                                ));
+                                            match obj.set_by_offset(*offset as usize, val_val.clone()) {
+                                                Ok(()) => cached = true,
+                                                // Accessor: fall through to slow path to call setter
+                                                Err(SetPropertyError::AccessorWithoutSetter) => {}
+                                                Err(e) if is_strict => {
+                                                    return Err(VmError::type_error(e.to_string()));
+                                                }
+                                                Err(_) => {}
                                             }
                                         }
                                     }
                                     InlineCacheState::Polymorphic { count, entries } => {
                                         for i in 0..(*count as usize) {
                                             if obj_shape_ptr == entries[i].0 {
-                                                let success = obj.set_by_offset(
+                                                match obj.set_by_offset(
                                                     entries[i].1 as usize,
                                                     val_val.clone(),
-                                                );
-                                                if success {
-                                                    cached = true;
-                                                } else if is_strict {
-                                                    return Err(VmError::type_error(
-                                                        "Cannot assign to read-only property",
-                                                    ));
+                                                ) {
+                                                    Ok(()) => cached = true,
+                                                    // Accessor: fall through to slow path to call setter
+                                                    Err(SetPropertyError::AccessorWithoutSetter) => {}
+                                                    Err(e) if is_strict => {
+                                                        return Err(VmError::type_error(e.to_string()));
+                                                    }
+                                                    Err(_) => {}
                                                 }
                                                 break;
                                             }
@@ -4871,11 +4960,10 @@ impl Interpreter {
                         }
                         _ => {
                             // Slow path: update IC
-                            let success = obj.set(key, val_val);
-                            if !success && is_strict {
-                                return Err(VmError::type_error(
-                                    "Cannot assign to read-only property",
-                                ));
+                            if let Err(e) = obj.set(key, val_val) {
+                                if is_strict {
+                                    return Err(VmError::type_error(e.to_string()));
+                                }
                             }
                             // Skip IC for dictionary mode objects
                             if !obj.is_dictionary_mode() {
@@ -4889,7 +4977,7 @@ impl Interpreter {
                                         .module
                                         .function(frame.function_index)
                                         .ok_or_else(|| VmError::internal("no function"))?;
-                                    let mut feedback = func.feedback_vector.write();
+                                    let feedback = func.feedback_vector.write();
                                     if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                         use otter_vm_bytecode::function::InlineCacheState;
                                         let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
@@ -5232,7 +5320,7 @@ impl Interpreter {
                                         .module
                                         .function(frame.function_index)
                                         .ok_or_else(|| VmError::internal("no function"))?;
-                                    let mut feedback = func.feedback_vector.write();
+                                    let feedback = func.feedback_vector.write();
                                     if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                         use otter_vm_bytecode::function::InlineCacheState;
                                         let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
@@ -5286,7 +5374,7 @@ impl Interpreter {
                                 }
                             }
 
-                            let value = obj.get(&key).unwrap_or_else(Value::undefined);
+                            let value = self.get_with_proxy_chain(ctx, &obj, &key, key_value.clone(), &receiver)?;
                             ctx.set_register(dst.0, value);
                             Ok(InstructionResult::Continue)
                         }
@@ -5399,29 +5487,31 @@ impl Interpreter {
                                 match &ic.ic_state {
                                     InlineCacheState::Monomorphic { shape_id, offset } => {
                                         if obj_shape_ptr == *shape_id {
-                                            let success = obj.set_by_offset(*offset as usize, val_val.clone());
-                                            if success {
-                                                cached = true;
-                                            } else if is_strict {
-                                                return Err(VmError::type_error(
-                                                    "Cannot assign to read-only property",
-                                                ));
+                                            match obj.set_by_offset(*offset as usize, val_val.clone()) {
+                                                Ok(()) => cached = true,
+                                                // Accessor: fall through to slow path to call setter
+                                                Err(SetPropertyError::AccessorWithoutSetter) => {}
+                                                Err(e) if is_strict => {
+                                                    return Err(VmError::type_error(e.to_string()));
+                                                }
+                                                Err(_) => {}
                                             }
                                         }
                                     }
                                     InlineCacheState::Polymorphic { count, entries } => {
                                         for i in 0..(*count as usize) {
                                             if obj_shape_ptr == entries[i].0 {
-                                                let success = obj.set_by_offset(
+                                                match obj.set_by_offset(
                                                     entries[i].1 as usize,
                                                     val_val.clone(),
-                                                );
-                                                if success {
-                                                    cached = true;
-                                                } else if is_strict {
-                                                    return Err(VmError::type_error(
-                                                        "Cannot assign to read-only property",
-                                                    ));
+                                                ) {
+                                                    Ok(()) => cached = true,
+                                                    // Accessor: fall through to slow path to call setter
+                                                    Err(SetPropertyError::AccessorWithoutSetter) => {}
+                                                    Err(e) if is_strict => {
+                                                        return Err(VmError::type_error(e.to_string()));
+                                                    }
+                                                    Err(_) => {}
                                                 }
                                                 break;
                                             }
@@ -5464,11 +5554,10 @@ impl Interpreter {
                         }
                         _ => {
                             // Slow path: update IC (skip for dictionary mode)
-                            let success = obj.set(key.clone(), val_val);
-                            if !success && is_strict {
-                                return Err(VmError::type_error(
-                                    "Cannot assign to read-only property",
-                                ));
+                            if let Err(e) = obj.set(key.clone(), val_val) {
+                                if is_strict {
+                                    return Err(VmError::type_error(e.to_string()));
+                                }
                             }
                             if !obj.is_dictionary_mode() {
                                 if let Some(offset) = obj.shape().get_offset(&key) {
@@ -5479,7 +5568,7 @@ impl Interpreter {
                                         .module
                                         .function(frame.function_index)
                                         .ok_or_else(|| VmError::internal("no function"))?;
-                                    let mut feedback = func.feedback_vector.write();
+                                    let feedback = func.feedback_vector.write();
                                     if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                         use otter_vm_bytecode::function::InlineCacheState;
                                         let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
@@ -5621,12 +5710,26 @@ impl Interpreter {
                 let array = ctx.get_register(arr.0).clone();
                 let index = ctx.get_register(idx.0).clone();
 
+                // Proxy check - must be first
+                if let Some(proxy) = array.as_proxy() {
+                    let prop_key = self.value_to_property_key(ctx, &index)?;
+                    let receiver = array.clone();
+                    let result = {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        crate::proxy_operations::proxy_get(
+                            &mut ncx, proxy, &prop_key, index, receiver,
+                        )?
+                    };
+                    ctx.set_register(dst.0, result);
+                    return Ok(InstructionResult::Continue);
+                }
+
                 if let Some(obj) = array.as_object() {
                     // Fast path for integer index access on arrays
                     if obj.is_array() {
                         if let Some(n) = index.as_int32() {
                             let idx = n as usize;
-                            let elements = obj.get_elements_storage().read();
+                            let elements = obj.get_elements_storage().borrow();
                             if idx < elements.len() {
                                 ctx.set_register(dst.0, elements[idx].clone());
                                 return Ok(InstructionResult::Continue);
@@ -5690,7 +5793,7 @@ impl Interpreter {
                                     .module
                                     .function(frame.function_index)
                                     .ok_or_else(|| VmError::internal("no function"))?;
-                                let mut feedback = func.feedback_vector.write();
+                                let feedback = func.feedback_vector.write();
                                 if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                     use otter_vm_bytecode::function::InlineCacheState;
                                     let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
@@ -5745,7 +5848,9 @@ impl Interpreter {
                         }
                     }
 
-                    let value = obj.get(&key).unwrap_or_else(Value::undefined);
+                    let key_value = crate::proxy_operations::property_key_to_value_pub(&key);
+                    let receiver = array.clone();
+                    let value = self.get_with_proxy_chain(ctx, &obj, &key, key_value, &receiver)?;
                     ctx.set_register(dst.0, value);
                 } else {
                     ctx.set_register(dst.0, Value::undefined());
@@ -5768,12 +5873,25 @@ impl Interpreter {
                     .map(|func| func.flags.is_strict)
                     .unwrap_or(false);
 
+                // Proxy check - must be first
+                if let Some(proxy) = array.as_proxy() {
+                    let prop_key = self.value_to_property_key(ctx, &index)?;
+                    let receiver = array.clone();
+                    {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        crate::proxy_operations::proxy_set(
+                            &mut ncx, proxy, &prop_key, index, val_val, receiver,
+                        )?;
+                    }
+                    return Ok(InstructionResult::Continue);
+                }
+
                 if let Some(obj) = array.as_object() {
                     // Fast path for integer index access on arrays
                     if obj.is_array() {
                         if let Some(n) = index.as_int32() {
                             let idx = n as usize;
-                            let mut elements = obj.get_elements_storage().write();
+                            let mut elements = obj.get_elements_storage().borrow_mut();
                             if idx < elements.len() {
                                 elements[idx] = val_val;
                                 return Ok(InstructionResult::Continue);
@@ -5804,32 +5922,34 @@ impl Interpreter {
                                     match &ic.ic_state {
                                         InlineCacheState::Monomorphic { shape_id, offset } => {
                                             if obj_shape_ptr == *shape_id {
-                                                let success = obj.set_by_offset(
+                                                match obj.set_by_offset(
                                                     *offset as usize,
                                                     val_val.clone(),
-                                                );
-                                                if success {
-                                                    cached = true;
-                                                } else if is_strict {
-                                                    return Err(VmError::type_error(
-                                                        "Cannot assign to read-only property",
-                                                    ));
+                                                ) {
+                                                    Ok(()) => cached = true,
+                                                    // Accessor: fall through to slow path to call setter
+                                                    Err(SetPropertyError::AccessorWithoutSetter) => {}
+                                                    Err(e) if is_strict => {
+                                                        return Err(VmError::type_error(e.to_string()));
+                                                    }
+                                                    Err(_) => {}
                                                 }
                                             }
                                         }
                                         InlineCacheState::Polymorphic { count, entries } => {
                                             for i in 0..(*count as usize) {
                                                 if obj_shape_ptr == entries[i].0 {
-                                                    let success = obj.set_by_offset(
+                                                    match obj.set_by_offset(
                                                         entries[i].1 as usize,
                                                         val_val.clone(),
-                                                    );
-                                                    if success {
-                                                        cached = true;
-                                                    } else if is_strict {
-                                                        return Err(VmError::type_error(
-                                                            "Cannot assign to read-only property",
-                                                        ));
+                                                    ) {
+                                                        Ok(()) => cached = true,
+                                                        // Accessor: fall through to slow path to call setter
+                                                        Err(SetPropertyError::AccessorWithoutSetter) => {}
+                                                        Err(e) if is_strict => {
+                                                            return Err(VmError::type_error(e.to_string()));
+                                                        }
+                                                        Err(_) => {}
                                                     }
                                                     break;
                                                 }
@@ -5855,7 +5975,7 @@ impl Interpreter {
                                     .module
                                     .function(frame.function_index)
                                     .ok_or_else(|| VmError::internal("no function"))?;
-                                let mut feedback = func.feedback_vector.write();
+                                let feedback = func.feedback_vector.write();
                                 if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                     use otter_vm_bytecode::function::InlineCacheState;
                                     let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
@@ -5910,11 +6030,44 @@ impl Interpreter {
                         }
                     }
 
-                    let success = obj.set(key, val_val);
-                    if !success && is_strict {
-                        return Err(VmError::type_error(
-                            "Cannot assign to read-only property",
-                        ));
+                    // Check for accessor setter before falling back to obj.set()
+                    match obj.lookup_property_descriptor(&key) {
+                        Some(PropertyDescriptor::Accessor { set, .. }) => {
+                            let Some(setter) = set else {
+                                if is_strict {
+                                    return Err(VmError::type_error(
+                                        "Cannot set property which has only a getter",
+                                    ));
+                                }
+                                return Ok(InstructionResult::Continue);
+                            };
+
+                            if let Some(native_fn) = setter.as_native_function() {
+                                self.call_native_fn(ctx, native_fn, &array, &[val_val])?;
+                                return Ok(InstructionResult::Continue);
+                            } else if let Some(closure) = setter.as_function() {
+                                ctx.set_pending_args(vec![val_val]);
+                                ctx.set_pending_this(array.clone());
+                                return Ok(InstructionResult::Call {
+                                    func_index: closure.function_index,
+                                    module: Arc::clone(&closure.module),
+                                    argc: 1,
+                                    return_reg: 0, // Setter return value is ignored
+                                    is_construct: false,
+                                    is_async: closure.is_async,
+                                    upvalues: closure.upvalues.clone(),
+                                });
+                            } else {
+                                return Err(VmError::type_error("setter is not a function"));
+                            }
+                        }
+                        _ => {
+                            if let Err(e) = obj.set(key, val_val) {
+                                if is_strict {
+                                    return Err(VmError::type_error(e.to_string()));
+                                }
+                            }
+                        }
                     }
                 } else if is_strict {
                     return Err(VmError::type_error("Cannot set property on non-object"));
@@ -6050,8 +6203,8 @@ impl Interpreter {
                                         Value::null(),
                                         ctx.memory_manager().clone(),
                                     ));
-                                    iter_result.set(PropertyKey::string("value"), v);
-                                    iter_result
+                                    let _ = iter_result.set(PropertyKey::string("value"), v);
+                                    let _ = iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(false));
                                     let js_queue = js_queue.clone();
                                     JsPromise::resolve_with_js_jobs(promise, 
@@ -6068,8 +6221,8 @@ impl Interpreter {
                                         Value::null(),
                                         ctx.memory_manager().clone(),
                                     ));
-                                    iter_result.set(PropertyKey::string("value"), v);
-                                    iter_result
+                                    let _ = iter_result.set(PropertyKey::string("value"), v);
+                                    let _ = iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(true));
                                     let js_queue = js_queue.clone();
                                     JsPromise::resolve_with_js_jobs(promise, 
@@ -6104,9 +6257,9 @@ impl Interpreter {
                                     awaited_promise.then(move |resolved_value| {
                                         let iter_result =
                                             GcRef::new(JsObject::new(Value::null(), mm.clone()));
-                                        iter_result
+                                        let _ = iter_result
                                             .set(PropertyKey::string("value"), resolved_value);
-                                        iter_result.set(
+                                        let _ = iter_result.set(
                                             PropertyKey::string("done"),
                                             Value::boolean(false),
                                         );
@@ -6139,8 +6292,8 @@ impl Interpreter {
                         // Create iterator result object { value, done }
                         let result =
                             GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
-                        result.set(PropertyKey::string("value"), result_value);
-                        result.set(PropertyKey::string("done"), Value::boolean(is_done));
+                        let _ = result.set(PropertyKey::string("value"), result_value);
+                        let _ = result.set(PropertyKey::string("done"), Value::boolean(is_done));
                         ctx.set_register(dst.0, Value::object(result));
                         return Ok(InstructionResult::Continue);
                     }
@@ -6176,7 +6329,7 @@ impl Interpreter {
                             .module
                             .function(frame.function_index)
                             .ok_or_else(|| VmError::internal("no function"))?;
-                        let mut feedback = func.feedback_vector.write();
+                        let feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                             if let otter_vm_bytecode::function::InlineCacheState::Uninitialized =
                                 ic.ic_state
@@ -6303,7 +6456,7 @@ impl Interpreter {
                             .module
                             .function(frame.function_index)
                             .ok_or_else(|| VmError::internal("no function"))?;
-                        let mut feedback = func.feedback_vector.write();
+                        let feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                             if let otter_vm_bytecode::function::InlineCacheState::Uninitialized =
                                 ic.ic_state
@@ -6344,11 +6497,11 @@ impl Interpreter {
                         let elem = src_obj
                             .get(&PropertyKey::Index(i))
                             .unwrap_or_else(Value::undefined);
-                        dst_obj.set(PropertyKey::Index(dst_len + i), elem);
+                        let _ = dst_obj.set(PropertyKey::Index(dst_len + i), elem);
                     }
 
                     // Update dst length
-                    dst_obj.set(
+                    let _ = dst_obj.set(
                         PropertyKey::string("length"),
                         Value::int32((dst_len + src_len) as i32),
                     );
@@ -6610,10 +6763,10 @@ impl Interpreter {
                         // Set ctor.prototype = derived_proto
                         let proto_key = PropertyKey::string("prototype");
                         if let Some(ctor_obj) = ctor_value.as_object() {
-                            ctor_obj.set(proto_key, Value::object(derived_proto.clone()));
+                            let _ = ctor_obj.set(proto_key, Value::object(derived_proto.clone()));
                             // Set derived_proto.constructor = ctor
                             let ctor_key = PropertyKey::string("constructor");
-                            derived_proto.set(ctor_key, ctor_value.clone());
+                            let _ = derived_proto.set(ctor_key, ctor_value.clone());
                         }
                     } else if let Some(super_obj) = super_value.as_object() {
                         // Get super.prototype
@@ -6644,12 +6797,12 @@ impl Interpreter {
 
                         // Set ctor.prototype = derived_proto
                         if let Some(ctor_obj) = ctor_value.as_object() {
-                            ctor_obj.set(
+                            let _ = ctor_obj.set(
                                 PropertyKey::string("prototype"),
                                 Value::object(derived_proto.clone()),
                             );
                             // Set derived_proto.constructor = ctor
-                            derived_proto
+                            let _ = derived_proto
                                 .set(PropertyKey::string("constructor"), ctor_value.clone());
                             // Static inheritance: ctor.__proto__ = super
                             ctor_obj.set_prototype(Value::object(super_obj));
@@ -6660,11 +6813,11 @@ impl Interpreter {
                         // For now, create a basic prototype chain
                         let derived_proto = GcRef::new(JsObject::new(Value::null(), mm.clone()));
                         if let Some(ctor_obj) = ctor_value.as_object() {
-                            ctor_obj.set(
+                            let _ = ctor_obj.set(
                                 PropertyKey::string("prototype"),
                                 Value::object(derived_proto.clone()),
                             );
-                            derived_proto
+                            let _ = derived_proto
                                 .set(PropertyKey::string("constructor"), ctor_value.clone());
                         }
                     } else {
@@ -6679,7 +6832,7 @@ impl Interpreter {
                         let proto_key = PropertyKey::string("prototype");
                         if let Some(proto_val) = ctor_obj.get(&proto_key) {
                             if let Some(proto_obj) = proto_val.as_object() {
-                                proto_obj
+                                let _ = proto_obj
                                     .set(PropertyKey::string("constructor"), ctor_value.clone());
                             }
                         }
@@ -7254,7 +7407,7 @@ impl Interpreter {
                 }
             }
             for (i, arg) in rest_args.into_iter().enumerate() {
-                rest_arr.set(crate::object::PropertyKey::Index(i as u32), arg);
+                let _ = rest_arr.set(crate::object::PropertyKey::Index(i as u32), arg);
             }
             call_args.push(Value::object(rest_arr));
         }
@@ -7270,6 +7423,8 @@ impl Interpreter {
 
         let realm_id = self.realm_id_for_function(ctx, func);
         ctx.set_pending_realm_id(realm_id);
+        // Store callee value for arguments.callee
+        ctx.set_pending_callee_value(func.clone());
         ctx.push_frame(
             closure.function_index,
             Arc::clone(&closure.module),
@@ -7590,8 +7745,8 @@ impl Interpreter {
                                 Value::null(),
                                 ctx.memory_manager().clone(),
                             ));
-                            iter_result.set(PropertyKey::string("value"), v);
-                            iter_result.set(PropertyKey::string("done"), Value::boolean(false));
+                            let _ = iter_result.set(PropertyKey::string("value"), v);
+                            let _ = iter_result.set(PropertyKey::string("done"), Value::boolean(false));
                             let js_queue = js_queue.clone();
                             JsPromise::resolve_with_js_jobs(promise, 
                                 Value::object(iter_result),
@@ -7607,8 +7762,8 @@ impl Interpreter {
                                 Value::null(),
                                 ctx.memory_manager().clone(),
                             ));
-                            iter_result.set(PropertyKey::string("value"), v);
-                            iter_result.set(PropertyKey::string("done"), Value::boolean(true));
+                            let _ = iter_result.set(PropertyKey::string("value"), v);
+                            let _ = iter_result.set(PropertyKey::string("done"), Value::boolean(true));
                             let js_queue = js_queue.clone();
                             JsPromise::resolve_with_js_jobs(promise, 
                                 Value::object(iter_result),
@@ -7641,8 +7796,8 @@ impl Interpreter {
                             awaited_promise.then(move |resolved_value| {
                                 let iter_result =
                                     GcRef::new(JsObject::new(Value::null(), mm.clone()));
-                                iter_result.set(PropertyKey::string("value"), resolved_value);
-                                iter_result.set(PropertyKey::string("done"), Value::boolean(false));
+                                let _ = iter_result.set(PropertyKey::string("value"), resolved_value);
+                                let _ = iter_result.set(PropertyKey::string("done"), Value::boolean(false));
                                 let js_queue = js_queue.clone();
                                 JsPromise::resolve_with_js_jobs(result_promise, 
                                     Value::object(iter_result),
@@ -7669,8 +7824,8 @@ impl Interpreter {
                 };
 
                 let result = GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
-                result.set(PropertyKey::string("value"), result_value);
-                result.set(PropertyKey::string("done"), Value::boolean(is_done));
+                let _ = result.set(PropertyKey::string("value"), result_value);
+                let _ = result.set(PropertyKey::string("done"), Value::boolean(is_done));
                 ctx.set_register(return_reg, Value::object(result));
                 return Ok(InstructionResult::Continue);
             }
@@ -7742,6 +7897,8 @@ impl Interpreter {
             if let Some(ref ho) = closure.home_object {
                 ctx.set_pending_home_object(ho.clone());
             }
+            // Store callee value for arguments.callee
+            ctx.set_pending_callee_value(current_func.clone());
             return Ok(InstructionResult::Call {
                 func_index: closure.function_index,
                 module: Arc::clone(&closure.module),
@@ -7952,6 +8109,147 @@ impl Interpreter {
         }
     }
 
+    /// Get a property from an object, walking the prototype chain with proxy trap support.
+    /// Unlike `JsObject::get()` which transparently bypasses proxy traps in the prototype chain,
+    /// this method properly dispatches to `proxy_get` when a Proxy is encountered.
+    fn get_with_proxy_chain(
+        &self,
+        ctx: &mut VmContext,
+        obj: &GcRef<JsObject>,
+        key: &PropertyKey,
+        key_value: Value,
+        receiver: &Value,
+    ) -> VmResult<Value> {
+        // 1. Check own property (shape/dictionary + elements)
+        if let Some(value) = Self::get_own_value(obj, key) {
+            return Ok(value);
+        }
+        // Check for accessor descriptors separately (getters need to be called)
+        if let Some(desc) = obj.get_own_property_descriptor(key) {
+            if let PropertyDescriptor::Accessor { get, .. } = desc {
+                if let Some(getter) = get {
+                    return self.call_function(ctx, &getter, receiver.clone(), &[]);
+                }
+                return Ok(Value::undefined());
+            }
+        }
+        // 2. Walk prototype chain with proxy support
+        let mut current = obj.prototype();
+        let mut depth = 0;
+        loop {
+            if current.is_null() || current.is_undefined() {
+                return Ok(Value::undefined());
+            }
+            depth += 1;
+            if depth > 256 {
+                return Ok(Value::undefined());
+            }
+
+            if let Some(proxy) = current.as_proxy() {
+                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                return crate::proxy_operations::proxy_get(
+                    &mut ncx,
+                    proxy,
+                    key,
+                    key_value,
+                    receiver.clone(),
+                );
+            }
+            if let Some(proto_obj) = current.as_object() {
+                if let Some(value) = Self::get_own_value(&proto_obj, key) {
+                    return Ok(value);
+                }
+                if let Some(desc) = proto_obj.get_own_property_descriptor(key) {
+                    if let PropertyDescriptor::Accessor { get, .. } = desc {
+                        if let Some(getter) = get {
+                            return self.call_function(ctx, &getter, receiver.clone(), &[]);
+                        }
+                        return Ok(Value::undefined());
+                    }
+                }
+                current = proto_obj.prototype();
+            } else {
+                break;
+            }
+        }
+        Ok(Value::undefined())
+    }
+
+    /// Get own data value from an object, checking both property descriptor and elements array.
+    /// Returns None if not found or if it's an accessor (caller must handle accessors).
+    fn get_own_value(obj: &GcRef<JsObject>, key: &PropertyKey) -> Option<Value> {
+        // Check property descriptor first
+        if let Some(desc) = obj.get_own_property_descriptor(key) {
+            match desc {
+                PropertyDescriptor::Data { value, .. } => return Some(value),
+                PropertyDescriptor::Accessor { .. } => return None, // caller handles
+                PropertyDescriptor::Deleted => return None,
+            }
+        }
+        // Check indexed elements (JsObject::get does this for all objects, not just arrays)
+        if let PropertyKey::Index(i) = key {
+            let elements = obj.get_elements_storage().borrow();
+            let idx = *i as usize;
+            if idx < elements.len() && !elements[idx].is_hole() {
+                return Some(elements[idx].clone());
+            }
+        }
+        None
+    }
+
+    /// Check if a property exists on an object, walking the prototype chain with proxy trap support.
+    fn has_with_proxy_chain(
+        &self,
+        ctx: &mut VmContext,
+        obj: &GcRef<JsObject>,
+        key: &PropertyKey,
+        key_value: Value,
+    ) -> VmResult<bool> {
+        if Self::has_own_property(obj, key) {
+            return Ok(true);
+        }
+        let mut current = obj.prototype();
+        let mut depth = 0;
+        loop {
+            if current.is_null() || current.is_undefined() {
+                return Ok(false);
+            }
+            depth += 1;
+            if depth > 256 {
+                return Ok(false);
+            }
+            if let Some(proxy) = current.as_proxy() {
+                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                return crate::proxy_operations::proxy_has(&mut ncx, proxy, key, key_value);
+            }
+            if let Some(proto_obj) = current.as_object() {
+                if Self::has_own_property(&proto_obj, key) {
+                    return Ok(true);
+                }
+                current = proto_obj.prototype();
+            } else {
+                break;
+            }
+        }
+        Ok(false)
+    }
+
+    /// Check if an object has an own property, including elements array.
+    fn has_own_property(obj: &GcRef<JsObject>, key: &PropertyKey) -> bool {
+        if obj.get_own_property_descriptor(key).is_some() {
+            return true;
+        }
+        // Also check elements for Index keys (arguments object stores values in elements)
+        if let PropertyKey::Index(i) = key {
+            let elements = obj.get_elements_storage().borrow();
+            let idx = *i as usize;
+            if idx < elements.len() && !elements[idx].is_hole() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Convert value to primitive per ES2023 §7.1.1.
     pub(crate) fn to_primitive(
         &self,
@@ -8126,7 +8424,7 @@ impl Interpreter {
         let obj = GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
 
         // Set _internal to the raw promise
-        obj.set(PropertyKey::string("_internal"), Value::promise(internal));
+        let _ = obj.set(PropertyKey::string("_internal"), Value::promise(internal));
 
         // Try to get Promise.prototype and copy its methods
         if let Some(promise_ctor) = ctx.get_global("Promise").and_then(|v| v.as_object()) {
@@ -8136,13 +8434,13 @@ impl Interpreter {
             {
                 // Copy then, catch, finally from prototype
                 if let Some(then_fn) = proto.get(&PropertyKey::string("then")) {
-                    obj.set(PropertyKey::string("then"), then_fn);
+                    let _ = obj.set(PropertyKey::string("then"), then_fn);
                 }
                 if let Some(catch_fn) = proto.get(&PropertyKey::string("catch")) {
-                    obj.set(PropertyKey::string("catch"), catch_fn);
+                    let _ = obj.set(PropertyKey::string("catch"), catch_fn);
                 }
                 if let Some(finally_fn) = proto.get(&PropertyKey::string("finally")) {
-                    obj.set(PropertyKey::string("finally"), finally_fn);
+                    let _ = obj.set(PropertyKey::string("finally"), finally_fn);
                 }
 
                 // Set prototype for proper inheritance
@@ -8212,11 +8510,11 @@ impl Interpreter {
             proto.map(Value::object).unwrap_or_else(Value::null),
             ctx.memory_manager().clone(),
         ));
-        obj.set(
+        let _ = obj.set(
             PropertyKey::string("name"),
             Value::string(JsString::intern(name)),
         );
-        obj.set(
+        let _ = obj.set(
             PropertyKey::string("message"),
             Value::string(JsString::intern(message)),
         );
@@ -8225,17 +8523,17 @@ impl Interpreter {
         } else {
             format!("{}: {}", name, message)
         };
-        obj.set(
+        let _ = obj.set(
             PropertyKey::string("stack"),
             Value::string(JsString::intern(&stack)),
         );
-        obj.set(PropertyKey::string("__isError__"), Value::boolean(true));
-        obj.set(
+        let _ = obj.set(PropertyKey::string("__isError__"), Value::boolean(true));
+        let _ = obj.set(
             PropertyKey::string("__errorType__"),
             Value::string(JsString::intern(name)),
         );
         if let Some(ctor) = ctor_value {
-            obj.set(PropertyKey::string("constructor"), ctor);
+            let _ = obj.set(PropertyKey::string("constructor"), ctor);
         }
 
         Value::object(obj)
@@ -8707,12 +9005,12 @@ impl Interpreter {
                     .name
                     .clone()
                     .unwrap_or_else(|| "<anonymous>".to_string());
-                frame_obj.set(
+                let _ = frame_obj.set(
                     PropertyKey::string("function"),
                     Value::string(JsString::intern(&func_name)),
                 );
             } else {
-                frame_obj.set(
+                let _ = frame_obj.set(
                     PropertyKey::string("function"),
                     Value::string(JsString::intern("<unknown>")),
                 );
@@ -8721,7 +9019,7 @@ impl Interpreter {
             // Get source file
             let source_url = &frame.module.source_url;
             if !source_url.is_empty() {
-                frame_obj.set(
+                let _ = frame_obj.set(
                     PropertyKey::string("file"),
                     Value::string(JsString::intern(source_url)),
                 );
@@ -8729,14 +9027,14 @@ impl Interpreter {
 
             // TODO: Get line and column from source map if available
             // For now, just set placeholder values
-            frame_obj.set(PropertyKey::string("line"), Value::number(0.0));
-            frame_obj.set(PropertyKey::string("column"), Value::number(0.0));
+            let _ = frame_obj.set(PropertyKey::string("line"), Value::number(0.0));
+            let _ = frame_obj.set(PropertyKey::string("column"), Value::number(0.0));
 
-            frames_array.set(PropertyKey::Index(i as u32), Value::object(frame_obj));
+            let _ = frames_array.set(PropertyKey::Index(i as u32), Value::object(frame_obj));
         }
 
         // Store frames array as hidden property
-        error_obj.set(
+        let _ = error_obj.set(
             PropertyKey::string("__stack_frames__"),
             Value::array(frames_array),
         );
@@ -9302,7 +9600,7 @@ impl Interpreter {
                             rest_arr.set_prototype(Value::object(array_proto));
                         }
                         for (i, arg) in rest_args.into_iter().enumerate() {
-                            rest_arr.set(PropertyKey::Index(i as u32), arg);
+                            let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
                         }
 
                         args.push(Value::object(rest_arr));
@@ -9371,7 +9669,7 @@ impl Interpreter {
                             rest_arr.set_prototype(Value::object(array_proto));
                         }
                         for (i, arg) in rest_args.into_iter().enumerate() {
-                            rest_arr.set(PropertyKey::Index(i as u32), arg);
+                            let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
                         }
                         args.push(Value::object(rest_arr));
                         ctx.set_pending_args(args);
@@ -11017,7 +11315,7 @@ mod tests {
         // Add properties up to just below threshold
         for i in 0..(DICTIONARY_THRESHOLD - 1) {
             let key = PropertyKey::String(crate::string::JsString::intern(&format!("prop{}", i)));
-            obj.set(key, Value::int32(i as i32));
+            let _ = obj.set(key, Value::int32(i as i32));
         }
         assert!(
             !obj.is_dictionary_mode(),
@@ -11029,14 +11327,14 @@ mod tests {
             "prop{}",
             DICTIONARY_THRESHOLD - 1
         )));
-        obj.set(key, Value::int32(DICTIONARY_THRESHOLD as i32 - 1));
+        let _ = obj.set(key, Value::int32(DICTIONARY_THRESHOLD as i32 - 1));
 
         // One more should trigger dictionary mode
         let key = PropertyKey::String(crate::string::JsString::intern(&format!(
             "prop{}",
             DICTIONARY_THRESHOLD
         )));
-        obj.set(key, Value::int32(DICTIONARY_THRESHOLD as i32));
+        let _ = obj.set(key, Value::int32(DICTIONARY_THRESHOLD as i32));
 
         assert!(
             obj.is_dictionary_mode(),
@@ -11055,8 +11353,8 @@ mod tests {
         // Add a few properties
         let key_a = PropertyKey::String(crate::string::JsString::intern("a"));
         let key_b = PropertyKey::String(crate::string::JsString::intern("b"));
-        obj.set(key_a.clone(), Value::int32(1));
-        obj.set(key_b.clone(), Value::int32(2));
+        let _ = obj.set(key_a.clone(), Value::int32(1));
+        let _ = obj.set(key_b.clone(), Value::int32(2));
 
         assert!(
             !obj.is_dictionary_mode(),
@@ -11085,18 +11383,18 @@ mod tests {
 
         // Add a property
         let key_a = PropertyKey::String(crate::string::JsString::intern("a"));
-        obj.set(key_a.clone(), Value::int32(42));
+        let _ = obj.set(key_a.clone(), Value::int32(42));
 
         // Trigger dictionary mode via delete
         let key_b = PropertyKey::String(crate::string::JsString::intern("b"));
-        obj.set(key_b.clone(), Value::int32(100));
+        let _ = obj.set(key_b.clone(), Value::int32(100));
         obj.delete(&key_b);
 
         assert!(obj.is_dictionary_mode());
 
         // Add a new property in dictionary mode
         let key_c = PropertyKey::String(crate::string::JsString::intern("c"));
-        obj.set(key_c.clone(), Value::int32(200));
+        let _ = obj.set(key_c.clone(), Value::int32(200));
 
         // Verify all properties work correctly
         assert_eq!(obj.get(&key_a), Some(Value::int32(42)));
@@ -11121,8 +11419,8 @@ mod tests {
         // Add and delete a property to trigger dictionary mode
         let key_a = PropertyKey::String(crate::string::JsString::intern("a"));
         let key_b = PropertyKey::String(crate::string::JsString::intern("b"));
-        obj.set(key_a.clone(), Value::int32(1));
-        obj.set(key_b.clone(), Value::int32(2));
+        let _ = obj.set(key_a.clone(), Value::int32(1));
+        let _ = obj.set(key_b.clone(), Value::int32(2));
         obj.delete(&key_a);
 
         assert!(obj.is_dictionary_mode());

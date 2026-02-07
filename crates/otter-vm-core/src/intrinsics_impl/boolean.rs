@@ -133,7 +133,7 @@ pub fn create_boolean_constructor() -> Box<dyn Fn(&Value, &[Value], &mut crate::
         } else if let Some(obj) = this_val.as_object() {
             // Construct form: new Boolean(value) → Boolean object
             // Store primitive value in internal [[BooleanData]] slot
-            obj.set(PropertyKey::string("__value__"), bool_val);
+            let _ = obj.set(PropertyKey::string("__value__"), bool_val);
             Ok(this_val.clone())
         } else {
             // Call form fallback

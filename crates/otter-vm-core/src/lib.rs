@@ -31,6 +31,8 @@ pub mod intrinsics;
 pub mod map_data;
 pub mod memory;
 pub mod object;
+/// Thread-confined interior mutability for VM objects.
+pub mod object_cell;
 pub mod promise;
 pub mod proxy;
 pub mod proxy_operations;
@@ -61,7 +63,7 @@ pub use generator::{
 };
 pub use interpreter::{GeneratorResult, Interpreter};
 pub use memory::MemoryManager;
-pub use object::{JsObject, PropertyKey};
+pub use object::{JsObject, PropertyKey, SetPropertyError};
 pub use promise::{JsPromise, PromiseState, PromiseWithResolvers};
 pub use proxy::{JsProxy, RevocableProxy};
 pub use runtime::VmRuntime;

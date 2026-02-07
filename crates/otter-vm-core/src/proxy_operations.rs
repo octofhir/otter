@@ -10,7 +10,6 @@ use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::proxy::JsProxy;
 use crate::string::JsString;
 use crate::value::Value;
-use std::sync::Arc;
 
 fn create_args_array(ncx: &mut NativeContext, args: &[Value]) -> GcRef<JsObject> {
     let arr = GcRef::new(JsObject::array(args.len(), ncx.memory_manager().clone()));
@@ -24,7 +23,7 @@ fn create_args_array(ncx: &mut NativeContext, args: &[Value]) -> GcRef<JsObject>
         }
     }
     for (i, arg) in args.iter().enumerate() {
-        arr.set(PropertyKey::Index(i as u32), arg.clone());
+        let _ = arr.set(PropertyKey::Index(i as u32), arg.clone());
     }
     arr
 }
@@ -47,6 +46,11 @@ fn property_key_to_value(key: &PropertyKey) -> Value {
         PropertyKey::Index(n) => Value::string(JsString::intern(&n.to_string())),
         PropertyKey::Symbol(sym) => Value::symbol(*sym),
     }
+}
+
+/// Public version of property_key_to_value for use by intrinsics
+pub fn property_key_to_value_pub(key: &PropertyKey) -> Value {
+    property_key_to_value(key)
 }
 
 fn get_property_value(
@@ -159,7 +163,7 @@ fn target_set(
     let obj = target
         .as_object()
         .ok_or_else(|| VmError::type_error("Proxy target must be an object"))?;
-    obj.set(*key, value);
+    let _ = obj.set(*key, value);
     Ok(true)
 }
 
@@ -867,20 +871,20 @@ fn descriptor_to_object(desc: &PropertyDescriptor, ncx: &NativeContext) -> Value
 
     match desc {
         PropertyDescriptor::Data { value, attributes } => {
-            obj.set(PropertyKey::from("value"), value.clone());
-            obj.set(PropertyKey::from("writable"), Value::boolean(attributes.writable));
-            obj.set(PropertyKey::from("enumerable"), Value::boolean(attributes.enumerable));
-            obj.set(PropertyKey::from("configurable"), Value::boolean(attributes.configurable));
+            let _ = obj.set(PropertyKey::from("value"), value.clone());
+            let _ = obj.set(PropertyKey::from("writable"), Value::boolean(attributes.writable));
+            let _ = obj.set(PropertyKey::from("enumerable"), Value::boolean(attributes.enumerable));
+            let _ = obj.set(PropertyKey::from("configurable"), Value::boolean(attributes.configurable));
         }
         PropertyDescriptor::Accessor { get, set, attributes } => {
             if let Some(getter) = get {
-                obj.set(PropertyKey::from("get"), getter.clone());
+                let _ = obj.set(PropertyKey::from("get"), getter.clone());
             }
             if let Some(setter) = set {
-                obj.set(PropertyKey::from("set"), setter.clone());
+                let _ = obj.set(PropertyKey::from("set"), setter.clone());
             }
-            obj.set(PropertyKey::from("enumerable"), Value::boolean(attributes.enumerable));
-            obj.set(PropertyKey::from("configurable"), Value::boolean(attributes.configurable));
+            let _ = obj.set(PropertyKey::from("enumerable"), Value::boolean(attributes.enumerable));
+            let _ = obj.set(PropertyKey::from("configurable"), Value::boolean(attributes.configurable));
         }
         PropertyDescriptor::Deleted => {
             // Deleted descriptor shouldn't be converted

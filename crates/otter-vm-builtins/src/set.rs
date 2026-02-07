@@ -94,9 +94,9 @@ fn native_set_new(_args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<V
 
     // Create internal values storage
     let values_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-    set_obj.set(str_to_key(SET_VALUES_KEY), VmValue::object(values_obj));
-    set_obj.set(str_to_key(SET_SIZE_KEY), VmValue::int32(0));
-    set_obj.set(str_to_key(IS_SET_KEY), VmValue::boolean(true));
+    let _ = set_obj.set(str_to_key(SET_VALUES_KEY), VmValue::object(values_obj));
+    let _ = set_obj.set(str_to_key(SET_SIZE_KEY), VmValue::int32(0));
+    let _ = set_obj.set(str_to_key(IS_SET_KEY), VmValue::boolean(true));
 
     Ok(VmValue::object(set_obj))
 }
@@ -130,7 +130,7 @@ fn native_set_add(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<V
     let is_new = existing.is_none();
 
     // Store the value (using the original value as storage)
-    values_obj.set(str_to_key(&hash_key), value);
+    let _ = values_obj.set(str_to_key(&hash_key), value);
 
     // Update size if new value
     if is_new {
@@ -138,7 +138,7 @@ fn native_set_add(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<V
             .get(&str_to_key(SET_SIZE_KEY))
             .unwrap_or_else(VmValue::undefined);
         let current_size = size.as_int32().unwrap_or(0);
-        set_obj.set(str_to_key(SET_SIZE_KEY), VmValue::int32(current_size + 1));
+        let _ = set_obj.set(str_to_key(SET_SIZE_KEY), VmValue::int32(current_size + 1));
     }
 
     // Return the set for chaining
@@ -209,7 +209,7 @@ fn native_set_delete(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Resul
         .unwrap_or_else(VmValue::undefined);
     let current_size = size.as_int32().unwrap_or(0);
     if current_size > 0 {
-        set_obj.set(str_to_key(SET_SIZE_KEY), VmValue::int32(current_size - 1));
+        let _ = set_obj.set(str_to_key(SET_SIZE_KEY), VmValue::int32(current_size - 1));
     }
 
     Ok(VmValue::boolean(true))
@@ -230,8 +230,8 @@ fn native_set_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<
 
     // Replace values with new empty object
     let new_values = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-    set_obj.set(str_to_key(SET_VALUES_KEY), VmValue::object(new_values));
-    set_obj.set(str_to_key(SET_SIZE_KEY), VmValue::int32(0));
+    let _ = set_obj.set(str_to_key(SET_VALUES_KEY), VmValue::object(new_values));
+    let _ = set_obj.set(str_to_key(SET_SIZE_KEY), VmValue::int32(0));
 
     Ok(VmValue::undefined())
 }
@@ -282,12 +282,12 @@ fn native_set_values(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result
 
     for prop in props {
         if let Some(value) = values_obj.get(&prop) {
-            values_array.set(str_to_key(&index.to_string()), value);
+            let _ = values_array.set(str_to_key(&index.to_string()), value);
             index += 1;
         }
     }
 
-    values_array.set(str_to_key("length"), VmValue::int32(index));
+    let _ = values_array.set(str_to_key("length"), VmValue::int32(index));
     Ok(VmValue::array(values_array))
 }
 
@@ -328,16 +328,16 @@ fn native_set_entries(
         if let Some(value) = values_obj.get(&prop) {
             // Create [value, value] pair as array
             let pair = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
-            pair.set(str_to_key("0"), value.clone());
-            pair.set(str_to_key("1"), value);
-            pair.set(str_to_key("length"), VmValue::int32(2));
+            let _ = pair.set(str_to_key("0"), value.clone());
+            let _ = pair.set(str_to_key("1"), value);
+            let _ = pair.set(str_to_key("length"), VmValue::int32(2));
 
-            entries_array.set(str_to_key(&index.to_string()), VmValue::array(pair));
+            let _ = entries_array.set(str_to_key(&index.to_string()), VmValue::array(pair));
             index += 1;
         }
     }
 
-    entries_array.set(str_to_key("length"), VmValue::int32(index));
+    let _ = entries_array.set(str_to_key("length"), VmValue::int32(index));
     Ok(VmValue::array(entries_array))
 }
 
@@ -538,8 +538,8 @@ fn native_weakset_new(
     let set_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
 
     let values_obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-    set_obj.set(str_to_key(SET_VALUES_KEY), VmValue::object(values_obj));
-    set_obj.set(str_to_key(IS_WEAKSET_KEY), VmValue::boolean(true));
+    let _ = set_obj.set(str_to_key(SET_VALUES_KEY), VmValue::object(values_obj));
+    let _ = set_obj.set(str_to_key(IS_WEAKSET_KEY), VmValue::boolean(true));
 
     Ok(VmValue::object(set_obj))
 }
@@ -580,7 +580,7 @@ fn native_weakset_add(
         .ok_or("Internal error: values not an object")?;
 
     let hash_key = value_to_key(&value);
-    values_obj.set(str_to_key(&hash_key), value);
+    let _ = values_obj.set(str_to_key(&hash_key), value);
 
     Ok(set.clone())
 }

@@ -115,7 +115,7 @@ fn json_to_value(
             // Set Array.prototype
             arr.set_prototype(array_proto.clone());
             for (i, item) in items.iter().enumerate() {
-                arr.set(
+                let _ = arr.set(
                     PropertyKey::Index(i as u32),
                     json_to_value(item, mm, object_proto, array_proto),
                 );
@@ -125,7 +125,7 @@ fn json_to_value(
         serde_json::Value::Object(map) => {
             let obj = GcRef::new(JsObject::new(object_proto.clone(), mm.clone()));
             for (k, v) in map {
-                obj.set(
+                let _ = obj.set(
                     PropertyKey::string(k),
                     json_to_value(v, mm, object_proto, array_proto),
                 );
@@ -1071,7 +1071,7 @@ pub fn install_json_namespace(
                 object_proto,
                 ncx.memory_manager().clone(),
             ));
-            wrapper.set(PropertyKey::string(""), val.clone());
+            let _ = wrapper.set(PropertyKey::string(""), val.clone());
             let wrapper_val = Value::object(wrapper);
 
             let mut tracker = CircularTracker::new();
@@ -1366,7 +1366,7 @@ fn apply_reviver(
 ) -> Result<Value, VmError> {
     // Create root holder
     let root = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-    root.set(PropertyKey::string(""), value.clone());
+    let _ = root.set(PropertyKey::string(""), value.clone());
     let root_val = Value::object(root);
 
     // Walk and transform
@@ -1561,7 +1561,7 @@ fn create_data_property(
             }
         }
 
-        obj.set(key.clone(), new_value);
+        let _ = obj.set(key.clone(), new_value);
     }
     Ok(())
 }

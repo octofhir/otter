@@ -119,7 +119,7 @@ fn create_js_promise_wrapper_with_mm(
     let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
     // Set _internal to the raw promise
-    obj.set(PropertyKey::string("_internal"), Value::promise(internal));
+    let _ = obj.set(PropertyKey::string("_internal"), Value::promise(internal));
 
     // Try to get Promise.prototype and copy its methods
     if let Some(promise_ctor) = ctx.get_global("Promise").and_then(|v| v.as_object()) {
@@ -129,13 +129,13 @@ fn create_js_promise_wrapper_with_mm(
         {
             // Copy then, catch, finally from prototype
             if let Some(then_fn) = proto.get(&PropertyKey::string("then")) {
-                obj.set(PropertyKey::string("then"), then_fn);
+                let _ = obj.set(PropertyKey::string("then"), then_fn);
             }
             if let Some(catch_fn) = proto.get(&PropertyKey::string("catch")) {
-                obj.set(PropertyKey::string("catch"), catch_fn);
+                let _ = obj.set(PropertyKey::string("catch"), catch_fn);
             }
             if let Some(finally_fn) = proto.get(&PropertyKey::string("finally")) {
-                obj.set(PropertyKey::string("finally"), finally_fn);
+                let _ = obj.set(PropertyKey::string("finally"), finally_fn);
             }
         }
     }
@@ -419,7 +419,7 @@ pub fn create_promise_constructor() -> Box<
 
 /// Helper to create an error value from error name and message.
 fn create_error_value(ncx: &crate::context::NativeContext<'_>, name: &str, message: &str) -> Value {
-    use crate::object::{PropertyDescriptor, PropertyKey};
+    use crate::object::PropertyKey;
 
     // Try to get the error constructor prototype
     let proto = ncx
@@ -434,11 +434,11 @@ fn create_error_value(ncx: &crate::context::NativeContext<'_>, name: &str, messa
         ncx.memory_manager().clone(),
     ));
 
-    obj.set(
+    let _ = obj.set(
         PropertyKey::string("name"),
         Value::string(JsString::intern(name)),
     );
-    obj.set(
+    let _ = obj.set(
         PropertyKey::string("message"),
         Value::string(JsString::intern(message)),
     );
@@ -448,7 +448,7 @@ fn create_error_value(ncx: &crate::context::NativeContext<'_>, name: &str, messa
     } else {
         format!("{}: {}", name, message)
     };
-    obj.set(
+    let _ = obj.set(
         PropertyKey::string("stack"),
         Value::string(JsString::intern(&stack)),
     );
@@ -590,7 +590,7 @@ pub fn install_promise_statics(
                             if let Ok(locked) = results.lock() {
                                 for (i, v) in locked.iter().enumerate() {
                                     if let Some(val) = v {
-                                        arr.set(PropertyKey::Index(i as u32), val.clone());
+                                        let _ = arr.set(PropertyKey::Index(i as u32), val.clone());
                                     }
                                 }
                             }
@@ -712,11 +712,11 @@ pub fn install_promise_statics(
 
                     source_promise.then(move |value| {
                         let obj = GcRef::new(JsObject::new(Value::null(), mm_t.clone()));
-                        obj.set(
+                        let _ = obj.set(
                             "status".into(),
                             Value::string(JsString::intern("fulfilled")),
                         );
-                        obj.set("value".into(), value);
+                        let _ = obj.set("value".into(), value);
                         if let Ok(mut locked) = results.lock() {
                             locked[index] = Some(Value::object(obj));
                         }
@@ -725,7 +725,7 @@ pub fn install_promise_statics(
                             if let Ok(locked) = results.lock() {
                                 for (i, v) in locked.iter().enumerate() {
                                     if let Some(val) = v {
-                                        arr.set(PropertyKey::Index(i as u32), val.clone());
+                                        let _ = arr.set(PropertyKey::Index(i as u32), val.clone());
                                     }
                                 }
                             }
@@ -734,8 +734,8 @@ pub fn install_promise_statics(
                     });
                     source_promise.catch(move |error| {
                         let obj = GcRef::new(JsObject::new(Value::null(), mm_c.clone()));
-                        obj.set("status".into(), Value::string(JsString::intern("rejected")));
-                        obj.set("reason".into(), error);
+                        let _ = obj.set("status".into(), Value::string(JsString::intern("rejected")));
+                        let _ = obj.set("reason".into(), error);
                         if let Ok(mut locked) = results2.lock() {
                             locked[index] = Some(Value::object(obj));
                         }
@@ -744,7 +744,7 @@ pub fn install_promise_statics(
                             if let Ok(locked) = results2.lock() {
                                 for (i, v) in locked.iter().enumerate() {
                                     if let Some(val) = v {
-                                        arr.set(PropertyKey::Index(i as u32), val.clone());
+                                        let _ = arr.set(PropertyKey::Index(i as u32), val.clone());
                                     }
                                 }
                             }
@@ -829,14 +829,14 @@ pub fn install_promise_statics(
                             };
                             let arr = GcRef::new(JsObject::array(errs.len(), mm_err.clone()));
                             for (i, e) in errs.iter().enumerate() {
-                                arr.set(PropertyKey::Index(i as u32), e.clone());
+                                let _ = arr.set(PropertyKey::Index(i as u32), e.clone());
                             }
                             let agg = GcRef::new(JsObject::new(Value::null(), mm_err.clone()));
-                            agg.set(
+                            let _ = agg.set(
                                 "message".into(),
                                 Value::string(JsString::intern("All promises were rejected")),
                             );
-                            agg.set("errors".into(), Value::array(arr));
+                            let _ = agg.set("errors".into(), Value::array(arr));
                             JsPromise::reject_with_js_jobs(result_p2, Value::object(agg), enqueue_reject.clone());
                         }
                     });
@@ -864,7 +864,7 @@ pub fn install_promise_statics(
 
                     // Create wrapped promise for the result
                     let wrapped_promise = create_js_promise_wrapper(ncx, promise);
-                    result.set("promise".into(), wrapped_promise);
+                    let _ = result.set("promise".into(), wrapped_promise);
 
                     // Create resolve function that captures the promise
                     let promise_for_resolve = promise;
@@ -885,7 +885,7 @@ pub fn install_promise_statics(
                         mm_wr.clone(),
                         fn_proto,
                     );
-                    result.set("resolve".into(), resolve_fn);
+                    let _ = result.set("resolve".into(), resolve_fn);
 
                     // Create reject function that captures the promise
                     let promise_for_reject = promise;
@@ -906,7 +906,7 @@ pub fn install_promise_statics(
                         mm_wr.clone(),
                         fn_proto,
                     );
-                    result.set("reject".into(), reject_fn);
+                    let _ = result.set("reject".into(), reject_fn);
 
                     Ok(Value::object(result))
                 },

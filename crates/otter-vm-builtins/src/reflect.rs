@@ -148,7 +148,7 @@ fn native_reflect_set(
     let obj = get_target_object(target)?;
     let key = to_property_key(property_key);
 
-    obj.set(key, value);
+    let _ = obj.set(key, value);
     Ok(VmValue::boolean(true))
 }
 
@@ -219,7 +219,7 @@ fn native_reflect_own_keys(
         }
         let result = GcRef::new(JsObject::array(keys.len(), Arc::clone(&mm)));
         for (i, key) in keys.into_iter().enumerate() {
-            result.set(PropertyKey::Index(i as u32), VmValue::string(key));
+            let _ = result.set(PropertyKey::Index(i as u32), VmValue::string(key));
         }
         return Ok(VmValue::array(result));
     }
@@ -232,7 +232,7 @@ fn native_reflect_own_keys(
         ];
         let result = GcRef::new(JsObject::array(keys.len(), Arc::clone(&mm)));
         for (i, key) in keys.into_iter().enumerate() {
-            result.set(PropertyKey::Index(i as u32), VmValue::string(key));
+            let _ = result.set(PropertyKey::Index(i as u32), VmValue::string(key));
         }
         return Ok(VmValue::array(result));
     }
@@ -253,7 +253,7 @@ fn native_reflect_own_keys(
             PropertyKey::Index(n) => VmValue::string(JsString::intern(&n.to_string())),
             PropertyKey::Symbol(_) => unreachable!(), // filtered out above
         };
-        result.set(PropertyKey::Index(i as u32), key_val);
+        let _ = result.set(PropertyKey::Index(i as u32), key_val);
     }
 
     Ok(VmValue::array(result))
@@ -289,18 +289,18 @@ fn native_reflect_get_own_property_descriptor(
         match prop_desc {
             PropertyDescriptor::Data { value, attributes } => {
                 let desc = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-                desc.set("value".into(), value);
-                desc.set("writable".into(), VmValue::boolean(attributes.writable));
-                desc.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
-                desc.set("configurable".into(), VmValue::boolean(attributes.configurable));
+                let _ = desc.set("value".into(), value);
+                let _ = desc.set("writable".into(), VmValue::boolean(attributes.writable));
+                let _ = desc.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
+                let _ = desc.set("configurable".into(), VmValue::boolean(attributes.configurable));
                 return Ok(VmValue::object(desc));
             }
             PropertyDescriptor::Accessor { get, set, attributes } => {
                 let desc = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-                desc.set("get".into(), get.unwrap_or(VmValue::undefined()));
-                desc.set("set".into(), set.unwrap_or(VmValue::undefined()));
-                desc.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
-                desc.set("configurable".into(), VmValue::boolean(attributes.configurable));
+                let _ = desc.set("get".into(), get.unwrap_or(VmValue::undefined()));
+                let _ = desc.set("set".into(), set.unwrap_or(VmValue::undefined()));
+                let _ = desc.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
+                let _ = desc.set("configurable".into(), VmValue::boolean(attributes.configurable));
                 return Ok(VmValue::object(desc));
             }
             PropertyDescriptor::Deleted => {
@@ -313,10 +313,10 @@ fn native_reflect_get_own_property_descriptor(
     // Check if property exists
     if let Some(value) = obj.get(&key) {
         let desc = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-        desc.set("value".into(), value);
-        desc.set("writable".into(), VmValue::boolean(true));
-        desc.set("enumerable".into(), VmValue::boolean(true));
-        desc.set("configurable".into(), VmValue::boolean(true));
+        let _ = desc.set("value".into(), value);
+        let _ = desc.set("writable".into(), VmValue::boolean(true));
+        let _ = desc.set("enumerable".into(), VmValue::boolean(true));
+        let _ = desc.set("configurable".into(), VmValue::boolean(true));
         Ok(VmValue::object(desc))
     } else {
         Ok(VmValue::undefined())
@@ -487,7 +487,7 @@ mod tests {
     fn test_reflect_get() {
         let mm = Arc::new(memory::MemoryManager::test());
         let obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-        obj.set("x".into(), VmValue::number(42.0));
+        let _ = obj.set("x".into(), VmValue::number(42.0));
 
         let result = native_reflect_get(
             &[VmValue::object(obj), VmValue::string(JsString::intern("x"))],
@@ -538,7 +538,7 @@ mod tests {
     fn test_reflect_has() {
         let mm = Arc::new(memory::MemoryManager::test());
         let obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-        obj.set("x".into(), VmValue::number(1.0));
+        let _ = obj.set("x".into(), VmValue::number(1.0));
 
         let result = native_reflect_has(
             &[
@@ -562,7 +562,7 @@ mod tests {
     fn test_reflect_delete_property() {
         let mm = Arc::new(memory::MemoryManager::test());
         let obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-        obj.set("x".into(), VmValue::number(1.0));
+        let _ = obj.set("x".into(), VmValue::number(1.0));
 
         let result = native_reflect_delete_property(
             &[
@@ -581,8 +581,8 @@ mod tests {
     fn test_reflect_own_keys() {
         let mm = Arc::new(memory::MemoryManager::test());
         let obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-        obj.set("a".into(), VmValue::number(1.0));
-        obj.set("b".into(), VmValue::number(2.0));
+        let _ = obj.set("a".into(), VmValue::number(1.0));
+        let _ = obj.set("b".into(), VmValue::number(2.0));
 
         let result = native_reflect_own_keys(&[VmValue::object(obj)], Arc::clone(&mm)).unwrap();
 

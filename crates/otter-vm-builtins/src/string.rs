@@ -254,7 +254,7 @@ fn native_string_split(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmVal
 
     if separator.is_none() || separator.map(|v| v.is_undefined()).unwrap_or(false) {
         let arr = GcRef::new(JsObject::array(1, Arc::clone(&mm)));
-        arr.set(PropertyKey::Index(0), VmValue::string(JsString::intern(&s)));
+        let _ = arr.set(PropertyKey::Index(0), VmValue::string(JsString::intern(&s)));
         return Ok(VmValue::array(arr));
     }
 
@@ -272,7 +272,7 @@ fn native_string_split(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmVal
 
     let arr = GcRef::new(JsObject::array(parts.len(), Arc::clone(&mm)));
     for (i, part) in parts.into_iter().enumerate() {
-        arr.set(PropertyKey::Index(i as u32), VmValue::string(JsString::intern(&part)));
+        let _ = arr.set(PropertyKey::Index(i as u32), VmValue::string(JsString::intern(&part)));
     }
     Ok(VmValue::array(arr))
 }
@@ -398,7 +398,7 @@ fn native_string_pad_end(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<Vm
         return Ok(VmValue::string(JsString::intern(&s)));
     }
 
-    let pad_len = target_len - s.len();
+    let _pad_len = target_len - s.len();
     let mut result = s.clone();
     while result.len() < target_len {
         result.push_str(&pad_str);

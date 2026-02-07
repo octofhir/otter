@@ -68,13 +68,13 @@ fn error_create(
     let obj = GcRef::new(JsObject::new(Value::null(), mm));
 
     // Set name property
-    obj.set(
+    let _ = obj.set(
         PropertyKey::string("name"),
         Value::string(JsString::intern(&name)),
     );
 
     // Set message property
-    obj.set(
+    let _ = obj.set(
         PropertyKey::string("message"),
         Value::string(JsString::intern(&message)),
     );
@@ -91,16 +91,16 @@ fn error_create(
     } else {
         format!("{}: {}", name, message)
     };
-    obj.set(
+    let _ = obj.set(
         PropertyKey::string("stack"),
         Value::string(JsString::intern(&stack_str)),
     );
 
     // Mark as error object (for instanceof checks)
-    obj.set(PropertyKey::string("__isError__"), Value::boolean(true));
+    let _ = obj.set(PropertyKey::string("__isError__"), Value::boolean(true));
 
     // Store the error type for instanceof checks
-    obj.set(
+    let _ = obj.set(
         PropertyKey::string("__errorType__"),
         Value::string(JsString::intern(&name)),
     );
@@ -171,7 +171,7 @@ fn error_set_stack(
 
     let stack = args.get(1).cloned().unwrap_or_else(Value::undefined);
 
-    obj.set(PropertyKey::string("stack"), stack);
+    let _ = obj.set(PropertyKey::string("stack"), stack);
 
     Ok(Value::undefined())
 }

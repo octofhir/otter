@@ -182,7 +182,7 @@ pub fn get_array_length(obj: &crate::gc::GcRef<crate::object::JsObject>) -> usiz
 
 /// Set array length on object
 pub fn set_array_length(obj: &crate::gc::GcRef<crate::object::JsObject>, len: usize) {
-    obj.set(
+    let _ = obj.set(
         crate::object::PropertyKey::string("length"),
         Value::number(len as f64),
     );

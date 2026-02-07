@@ -387,7 +387,7 @@ impl Otter {
                     };
 
                     // Resume VM execution with resolved value
-                    let mut interpreter = Interpreter::new();
+                    let interpreter = Interpreter::new();
                     exec_result = interpreter.resume_async(&mut ctx, async_ctx, resolved_value);
 
                     // Loop will handle the new exec_result
@@ -468,7 +468,7 @@ impl Otter {
                     Value::number(event.server_id as f64),
                     Value::number(event.request_id as f64),
                 ];
-                let mut interpreter = Interpreter::new();
+                let interpreter = Interpreter::new();
                 let _ = interpreter.call_function(ctx, &dispatch_fn, Value::undefined(), &args);
 
                 // Drain microtasks (including JS jobs) after each dispatch
@@ -497,7 +497,7 @@ impl Otter {
         for event in events {
             let payload = ws_event_to_json(&event);
             let args = vec![json_to_value(&payload, mm.clone())];
-            let mut interpreter = Interpreter::new();
+            let interpreter = Interpreter::new();
             let _ = interpreter.call_function(ctx, &dispatch_fn, Value::undefined(), &args);
 
             if let Err(e) = self.drain_microtasks(ctx) {
@@ -620,7 +620,7 @@ impl Otter {
                     self.vm.memory_manager().clone(),
                     fn_proto,
                 );
-                global.set(PropertyKey::string(op_name), native_fn);
+                let _ = global.set(PropertyKey::string(op_name), native_fn);
             }
         }
 
@@ -633,26 +633,26 @@ impl Otter {
         let realms_store = Arc::clone(&self.realms);
         let mm_eval = self.vm.memory_manager().clone();
         let mm_eval_closure = mm_eval.clone();
-        global.set(
+        let _ = global.set(
             PropertyKey::string("__otter_eval"),
             Value::native_function_with_proto(
                 move |_this: &Value, args: &[Value], _mm| {
                     let mm_result = mm_eval_closure.clone();
                     let result_ok = |value: Value| {
                         let obj = JsObject::new(Value::null(), mm_result.clone());
-                        obj.set(PropertyKey::string("ok"), Value::boolean(true));
-                        obj.set(PropertyKey::string("value"), value);
+                        let _ = obj.set(PropertyKey::string("ok"), Value::boolean(true));
+                        let _ = obj.set(PropertyKey::string("value"), value);
                         Value::object(GcRef::new(obj))
                     };
 
                     let result_err = |error_type: &str, message: &str| {
                         let obj = JsObject::new(Value::null(), mm_result.clone());
-                        obj.set(PropertyKey::string("ok"), Value::boolean(false));
-                        obj.set(
+                        let _ = obj.set(PropertyKey::string("ok"), Value::boolean(false));
+                        let _ = obj.set(
                             PropertyKey::string("errorType"),
                             Value::string(JsString::intern(error_type)),
                         );
-                        obj.set(
+                        let _ = obj.set(
                             PropertyKey::string("message"),
                             Value::string(JsString::intern(message)),
                         );
@@ -720,7 +720,7 @@ impl Otter {
         let fn_proto_realm = fn_proto;
         let realms_for_create = Arc::clone(&realms_store);
         let mm_realm_for_create = mm_realm.clone();
-        global.set(
+        let _ = global.set(
             PropertyKey::string("__otter_create_realm"),
             Value::native_function_with_proto(
                 move |_this: &Value, _args: &[Value], _mm| {
@@ -776,8 +776,8 @@ impl Otter {
 
                         let realm_obj =
                             GcRef::new(JsObject::new(Value::null(), mm_realm_for_create.clone()));
-                        realm_obj.set(PropertyKey::string("global"), Value::object(realm_global));
-                        realm_obj.set(PropertyKey::string("evalScript"), eval_fn);
+                        let _ = realm_obj.set(PropertyKey::string("global"), Value::object(realm_global));
+                        let _ = realm_obj.set(PropertyKey::string("evalScript"), eval_fn);
                         Ok(Value::object(realm_obj))
                     }
                 },
@@ -792,7 +792,7 @@ impl Otter {
         // Helper to wire console methods from global __console_* functions
         let wire_console = |method_name: &str, global_name: &str| {
             if let Some(func) = global.get(&PropertyKey::string(global_name)) {
-                console_obj.set(PropertyKey::string(method_name), func);
+                let _ = console_obj.set(PropertyKey::string(method_name), func);
             }
         };
 
@@ -815,13 +815,13 @@ impl Otter {
 
         // group/groupCollapsed/groupEnd alias to log
         if let Some(log_fn) = global.get(&PropertyKey::string("__console_log")) {
-            console_obj.set(PropertyKey::string("group"), log_fn.clone());
-            console_obj.set(PropertyKey::string("groupCollapsed"), log_fn.clone());
-            console_obj.set(PropertyKey::string("groupEnd"), log_fn);
+            let _ = console_obj.set(PropertyKey::string("group"), log_fn.clone());
+            let _ = console_obj.set(PropertyKey::string("groupCollapsed"), log_fn.clone());
+            let _ = console_obj.set(PropertyKey::string("groupEnd"), log_fn);
         }
 
         // Install console on global
-        global.set(PropertyKey::string("console"), Value::object(console_obj));
+        let _ = global.set(PropertyKey::string("console"), Value::object(console_obj));
 
         // NOTE: Temporal namespace creation moved to intrinsics.rs install_on_global()
     }
@@ -922,7 +922,7 @@ impl Otter {
         let env_store_get = Arc::clone(&env_store);
         let caps_get = caps.clone();
         let mm_env = self.vm.memory_manager().clone();
-        global.set(
+        let _ = global.set(
             PropertyKey::string("__env_get"),
             Value::native_function_with_proto(
                 move |_this: &Value, args: &[Value], _mm| {
@@ -951,14 +951,14 @@ impl Otter {
         let env_store_keys = Arc::clone(&env_store);
         let mm_keys = mm_env.clone();
         let mm_keys_closure = mm_keys.clone();
-        global.set(
+        let _ = global.set(
             PropertyKey::string("__env_keys"),
             Value::native_function_with_proto(
                 move |_this: &Value, _args: &[Value], _mm| {
                     let keys = env_store_keys.keys();
                     let arr = JsObject::array(keys.len(), mm_keys_closure.clone());
                     for (i, key) in keys.into_iter().enumerate() {
-                        arr.set(
+                        let _ = arr.set(
                             PropertyKey::Index(i as u32),
                             Value::string(otter_vm_core::string::JsString::intern(&key)),
                         );
@@ -974,7 +974,7 @@ impl Otter {
         let env_store_has = Arc::clone(&env_store);
         let caps_has = caps.clone();
         let mm_has = self.vm.memory_manager().clone();
-        global.set(
+        let _ = global.set(
             PropertyKey::string("__env_has"),
             Value::native_function_with_proto(
                 move |_this: &Value, args: &[Value], _mm| {
@@ -1204,7 +1204,7 @@ impl Otter {
                 JsPromise::resolve_with_js_jobs(result_promise, value, make_js_enqueuer());
             };
 
-        let mut call_thenable = |interpreter: &mut Interpreter,
+        let call_thenable = |interpreter: &mut Interpreter,
                                  ctx: &mut VmContext,
                                  then_fn: Value,
                                  then_this: Value,
@@ -1883,7 +1883,7 @@ fn json_to_value(json: &serde_json::Value, mm: Arc<otter_vm_core::MemoryManager>
         serde_json::Value::Array(arr) => {
             let js_arr = JsObject::array(arr.len(), mm.clone());
             for (i, elem) in arr.iter().enumerate() {
-                js_arr.set(
+                let _ = js_arr.set(
                     PropertyKey::Index(i as u32),
                     json_to_value(elem, mm.clone()),
                 );
@@ -1893,7 +1893,7 @@ fn json_to_value(json: &serde_json::Value, mm: Arc<otter_vm_core::MemoryManager>
         serde_json::Value::Object(obj) => {
             let js_obj = JsObject::new(Value::null(), mm.clone());
             for (key, val) in obj {
-                js_obj.set(PropertyKey::string(key), json_to_value(val, mm.clone()));
+                let _ = js_obj.set(PropertyKey::string(key), json_to_value(val, mm.clone()));
             }
             Value::object(GcRef::new(js_obj))
         }
@@ -1909,11 +1909,11 @@ fn make_error_value(ctx: &VmContext, name: &str, message: &str) -> Value {
         .unwrap_or_else(Value::null);
 
     let obj = GcRef::new(JsObject::new(proto, ctx.memory_manager().clone()));
-    obj.set(
+    let _ = obj.set(
         PropertyKey::string("name"),
         Value::string(JsString::intern(name)),
     );
-    obj.set(
+    let _ = obj.set(
         PropertyKey::string("message"),
         Value::string(JsString::intern(message)),
     );

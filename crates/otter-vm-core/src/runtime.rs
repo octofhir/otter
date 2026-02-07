@@ -222,7 +222,7 @@ impl VmRuntime {
     /// Execute a module
     pub fn execute_module(&self, module: &Module) -> VmResult<Value> {
         let mut ctx = self.create_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(module, &mut ctx);
         ctx.teardown();
         result
@@ -234,7 +234,7 @@ impl VmRuntime {
         module: &Module,
         ctx: &mut VmContext,
     ) -> VmResult<Value> {
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         interpreter.execute(module, ctx)
     }
 

@@ -229,21 +229,21 @@ fn native_promise_state(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Res
     match promise.state() {
         otter_vm_core::promise::PromiseState::Pending
         | otter_vm_core::promise::PromiseState::PendingThenable(_) => {
-            result.set("state".into(), VmValue::string(JsString::intern("pending")));
+            let _ = result.set("state".into(), VmValue::string(JsString::intern("pending")));
         }
         otter_vm_core::promise::PromiseState::Fulfilled(v) => {
-            result.set(
+            let _ = result.set(
                 "state".into(),
                 VmValue::string(JsString::intern("fulfilled")),
             );
-            result.set("value".into(), v);
+            let _ = result.set("value".into(), v);
         }
         otter_vm_core::promise::PromiseState::Rejected(e) => {
-            result.set(
+            let _ = result.set(
                 "state".into(),
                 VmValue::string(JsString::intern("rejected")),
             );
-            result.set("reason".into(), e);
+            let _ = result.set("reason".into(), e);
         }
     }
 
@@ -297,7 +297,7 @@ fn native_promise_all(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
                     if let Ok(locked) = results.lock() {
                         for (i, v) in locked.iter().enumerate() {
                             if let Some(val) = v {
-                                arr.set(PropertyKey::Index(i as u32), val.clone());
+                                let _ = arr.set(PropertyKey::Index(i as u32), val.clone());
                             }
                         }
                     }
@@ -320,7 +320,7 @@ fn native_promise_all(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
                 if let Ok(locked) = results.lock() {
                     for (i, v) in locked.iter().enumerate() {
                         if let Some(val) = v {
-                            arr.set(PropertyKey::Index(i as u32), val.clone());
+                            let _ = arr.set(PropertyKey::Index(i as u32), val.clone());
                         }
                     }
                 }
@@ -404,11 +404,11 @@ fn native_promise_all_settled(args: &[VmValue], mm: Arc<memory::MemoryManager>) 
         if let Some(promise) = item.as_promise() {
             promise.then(move |value| {
                 let obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm_for_then)));
-                obj.set(
+                let _ = obj.set(
                     "status".into(),
                     VmValue::string(JsString::intern("fulfilled")),
                 );
-                obj.set("value".into(), value);
+                let _ = obj.set("value".into(), value);
                 if let Ok(mut locked) = results.lock() {
                     locked[index] = Some(VmValue::object(obj));
                 }
@@ -418,7 +418,7 @@ fn native_promise_all_settled(args: &[VmValue], mm: Arc<memory::MemoryManager>) 
                     if let Ok(locked) = results.lock() {
                         for (i, v) in locked.iter().enumerate() {
                             if let Some(val) = v {
-                                arr.set(PropertyKey::Index(i as u32), val.clone());
+                                let _ = arr.set(PropertyKey::Index(i as u32), val.clone());
                             }
                         }
                     }
@@ -428,11 +428,11 @@ fn native_promise_all_settled(args: &[VmValue], mm: Arc<memory::MemoryManager>) 
 
             promise.catch(move |error| {
                 let obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm_for_catch)));
-                obj.set(
+                let _ = obj.set(
                     "status".into(),
                     VmValue::string(JsString::intern("rejected")),
                 );
-                obj.set("reason".into(), error);
+                let _ = obj.set("reason".into(), error);
                 if let Ok(mut locked) = results2.lock() {
                     locked[index] = Some(VmValue::object(obj));
                 }
@@ -442,7 +442,7 @@ fn native_promise_all_settled(args: &[VmValue], mm: Arc<memory::MemoryManager>) 
                     if let Ok(locked) = results2.lock() {
                         for (i, v) in locked.iter().enumerate() {
                             if let Some(val) = v {
-                                arr.set(PropertyKey::Index(i as u32), val.clone());
+                                let _ = arr.set(PropertyKey::Index(i as u32), val.clone());
                             }
                         }
                     }
@@ -452,11 +452,11 @@ fn native_promise_all_settled(args: &[VmValue], mm: Arc<memory::MemoryManager>) 
         } else {
             // Non-promise is treated as fulfilled
             let obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-            obj.set(
+            let _ = obj.set(
                 "status".into(),
                 VmValue::string(JsString::intern("fulfilled")),
             );
-            obj.set("value".into(), item);
+            let _ = obj.set("value".into(), item);
             if let Ok(mut locked) = results.lock() {
                 locked[index] = Some(VmValue::object(obj));
             }
@@ -466,7 +466,7 @@ fn native_promise_all_settled(args: &[VmValue], mm: Arc<memory::MemoryManager>) 
                 if let Ok(locked) = results.lock() {
                     for (i, v) in locked.iter().enumerate() {
                         if let Some(val) = v {
-                            arr.set(PropertyKey::Index(i as u32), val.clone());
+                            let _ = arr.set(PropertyKey::Index(i as u32), val.clone());
                         }
                     }
                 }
@@ -551,11 +551,11 @@ fn native_promise_with_resolvers(
     let resolvers = JsPromise::with_resolvers(Arc::clone(&mm), |_, _| {});
 
     let result = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-    result.set("promise".into(), VmValue::promise(resolvers.promise));
+    let _ = result.set("promise".into(), VmValue::promise(resolvers.promise));
 
     // Create native functions for resolve/reject
     let resolve_fn = resolvers.resolve;
-    result.set(
+    let _ = result.set(
         "resolve".into(),
         VmValue::native_function(
             move |_this: &VmValue, args: &[VmValue], _ncx: &mut otter_vm_core::context::NativeContext<'_>| {
@@ -568,7 +568,7 @@ fn native_promise_with_resolvers(
     );
 
     let reject_fn = resolvers.reject;
-    result.set(
+    let _ = result.set(
         "reject".into(),
         VmValue::native_function(
             move |_this: &VmValue, args: &[VmValue], _ncx: &mut otter_vm_core::context::NativeContext<'_>| {
@@ -629,17 +629,17 @@ fn create_aggregate_error(
     mm: Arc<memory::MemoryManager>,
 ) -> VmValue {
     let obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
-    obj.set(
+    let _ = obj.set(
         "name".into(),
         VmValue::string(JsString::intern("AggregateError")),
     );
-    obj.set("message".into(), VmValue::string(JsString::intern(message)));
+    let _ = obj.set("message".into(), VmValue::string(JsString::intern(message)));
 
     let errors_arr = GcRef::new(JsObject::array(errors.len(), Arc::clone(&mm)));
     for (i, e) in errors.into_iter().enumerate() {
-        errors_arr.set(PropertyKey::Index(i as u32), e);
+        let _ = errors_arr.set(PropertyKey::Index(i as u32), e);
     }
-    obj.set("errors".into(), VmValue::array(errors_arr));
+    let _ = obj.set("errors".into(), VmValue::array(errors_arr));
 
     VmValue::object(obj)
 }

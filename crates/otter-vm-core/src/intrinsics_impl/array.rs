@@ -49,7 +49,7 @@ fn value_to_sort_string(val: &Value) -> String {
 
 /// Helper: set array length
 fn set_len(obj: &GcRef<JsObject>, len: usize) {
-    obj.set(PropertyKey::string("length"), Value::number(len as f64));
+    let _ = obj.set(PropertyKey::string("length"), Value::number(len as f64));
 }
 
 /// Create an array iterator object with the given kind ("value", "key", or "entry").
@@ -65,9 +65,9 @@ fn make_array_iterator(
     }
     let iter = GcRef::new(JsObject::new(Value::object(iter_proto), mm.clone()));
     // Store the array reference, current index, length, and kind
-    iter.set(PropertyKey::string("__array_ref__"), this_val.clone());
-    iter.set(PropertyKey::string("__array_index__"), Value::number(0.0));
-    iter.set(
+    let _ = iter.set(PropertyKey::string("__array_ref__"), this_val.clone());
+    let _ = iter.set(PropertyKey::string("__array_index__"), Value::number(0.0));
+    let _ = iter.set(
         PropertyKey::string("__iter_kind__"),
         Value::string(JsString::intern(kind)),
     );
@@ -113,13 +113,13 @@ fn make_array_iterator(
                 if idx >= len {
                     // Done
                     let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                    result.set(PropertyKey::string("value"), Value::undefined());
-                    result.set(PropertyKey::string("done"), Value::boolean(true));
+                    let _ = result.set(PropertyKey::string("value"), Value::undefined());
+                    let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
                     return Ok(Value::object(result));
                 }
 
                 // Advance index
-                iter_obj.set(
+                let _ = iter_obj.set(
                     PropertyKey::string("__array_index__"),
                     Value::number((idx + 1) as f64),
                 );
@@ -127,11 +127,11 @@ fn make_array_iterator(
                 let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 match kind.as_str() {
                     "key" => {
-                        result.set(PropertyKey::string("value"), Value::number(idx as f64));
+                        let _ = result.set(PropertyKey::string("value"), Value::number(idx as f64));
                     }
                     "entry" => {
                         let entry = GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
-                        entry.set(PropertyKey::Index(0), Value::number(idx as f64));
+                        let _ = entry.set(PropertyKey::Index(0), Value::number(idx as f64));
                         let val = if let Some(proxy) = arr_val.as_proxy() {
                             let key = PropertyKey::Index(idx as u32);
                             let key_value = Value::string(JsString::intern(&idx.to_string()));
@@ -147,8 +147,8 @@ fn make_array_iterator(
                         } else {
                             Value::undefined()
                         };
-                        entry.set(PropertyKey::Index(1), val);
-                        result.set(PropertyKey::string("value"), Value::array(entry));
+                        let _ = entry.set(PropertyKey::Index(1), val);
+                        let _ = result.set(PropertyKey::string("value"), Value::array(entry));
                     }
                     _ => {
                         // "value"
@@ -167,10 +167,10 @@ fn make_array_iterator(
                         } else {
                             Value::undefined()
                         };
-                        result.set(PropertyKey::string("value"), val);
+                        let _ = result.set(PropertyKey::string("value"), val);
                     }
                 }
-                result.set(PropertyKey::string("done"), Value::boolean(false));
+                let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
                 Ok(Value::object(result))
             },
             mm.clone(),
@@ -198,7 +198,7 @@ pub fn init_array_prototype(
                         .ok_or_else(|| "Array.prototype.push: this is not an object".to_string())?;
                     let mut len = get_len(&obj);
                     for arg in args {
-                        obj.set(PropertyKey::Index(len as u32), arg.clone());
+                        let _ = obj.set(PropertyKey::Index(len as u32), arg.clone());
                         len += 1;
                     }
                     set_len(&obj, len);
@@ -251,7 +251,7 @@ pub fn init_array_prototype(
                         let val = obj
                             .get(&PropertyKey::Index(i as u32))
                             .unwrap_or(Value::undefined());
-                        obj.set(PropertyKey::Index((i - 1) as u32), val);
+                        let _ = obj.set(PropertyKey::Index((i - 1) as u32), val);
                     }
                     obj.delete(&PropertyKey::Index((len - 1) as u32));
                     set_len(&obj, len - 1);
@@ -277,11 +277,11 @@ pub fn init_array_prototype(
                         let val = obj
                             .get(&PropertyKey::Index(i as u32))
                             .unwrap_or(Value::undefined());
-                        obj.set(PropertyKey::Index((i + arg_count) as u32), val);
+                        let _ = obj.set(PropertyKey::Index((i + arg_count) as u32), val);
                     }
                     // Insert new elements at front
                     for (i, arg) in args.iter().enumerate() {
-                        obj.set(PropertyKey::Index(i as u32), arg.clone());
+                        let _ = obj.set(PropertyKey::Index(i as u32), arg.clone());
                     }
                     let new_len = len + arg_count;
                     set_len(&obj, new_len);
@@ -504,7 +504,7 @@ pub fn init_array_prototype(
                             let val = obj
                                 .get(&PropertyKey::Index((from + i) as u32))
                                 .unwrap_or(Value::undefined());
-                            result.set(PropertyKey::Index(i as u32), val);
+                            let _ = result.set(PropertyKey::Index(i as u32), val);
                         }
                     }
                     Ok(Value::array(result))
@@ -527,7 +527,7 @@ pub fn init_array_prototype(
                         for i in 0..len {
                             if obj.has_own(&PropertyKey::Index(i as u32)) {
                                 let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                                result.set(PropertyKey::Index(idx), val);
+                                let _ = result.set(PropertyKey::Index(idx), val);
                             }
                             // else: hole — leave result[idx] as hole
                             idx += 1;
@@ -544,7 +544,7 @@ pub fn init_array_prototype(
                                         let val = arr
                                             .get(&PropertyKey::Index(i as u32))
                                             .unwrap_or(Value::undefined());
-                                        result.set(PropertyKey::Index(idx), val);
+                                        let _ = result.set(PropertyKey::Index(idx), val);
                                     }
                                     idx += 1;
                                 }
@@ -552,7 +552,7 @@ pub fn init_array_prototype(
                             }
                         }
                         // Non-array: push as single element
-                        result.set(PropertyKey::Index(idx), arg.clone());
+                        let _ = result.set(PropertyKey::Index(idx), arg.clone());
                         idx += 1;
                     }
                     set_len(&result, idx as usize);
@@ -581,8 +581,8 @@ pub fn init_array_prototype(
                         let hi_val = obj
                             .get(&PropertyKey::Index(hi as u32))
                             .unwrap_or(Value::undefined());
-                        obj.set(PropertyKey::Index(lo as u32), hi_val);
-                        obj.set(PropertyKey::Index(hi as u32), lo_val);
+                        let _ = obj.set(PropertyKey::Index(lo as u32), hi_val);
+                        let _ = obj.set(PropertyKey::Index(hi as u32), lo_val);
                         lo += 1;
                         hi -= 1;
                     }
@@ -642,7 +642,7 @@ pub fn init_array_prototype(
                     let from = if start < 0 { (len + start).max(0) } else { start.min(len) } as usize;
                     let to = if end < 0 { (len + end).max(0) } else { end.min(len) } as usize;
                     for i in from..to {
-                        obj.set(PropertyKey::Index(i as u32), value.clone());
+                        let _ = obj.set(PropertyKey::Index(i as u32), value.clone());
                     }
                     Ok(this_val.clone())
                 },
@@ -682,7 +682,7 @@ pub fn init_array_prototype(
                         let val = obj
                             .get(&PropertyKey::Index((actual_start + i) as u32))
                             .unwrap_or(Value::undefined());
-                        removed.set(PropertyKey::Index(i as u32), val);
+                        let _ = removed.set(PropertyKey::Index(i as u32), val);
                     }
 
                     let item_count = items.len();
@@ -695,7 +695,7 @@ pub fn init_array_prototype(
                             let val = obj
                                 .get(&PropertyKey::Index(i as u32))
                                 .unwrap_or(Value::undefined());
-                            obj.set(PropertyKey::Index((i - diff) as u32), val);
+                            let _ = obj.set(PropertyKey::Index((i - diff) as u32), val);
                         }
                         for i in (ulen - diff)..ulen {
                             obj.delete(&PropertyKey::Index(i as u32));
@@ -707,13 +707,13 @@ pub fn init_array_prototype(
                             let val = obj
                                 .get(&PropertyKey::Index(i as u32))
                                 .unwrap_or(Value::undefined());
-                            obj.set(PropertyKey::Index((i + diff) as u32), val);
+                            let _ = obj.set(PropertyKey::Index((i + diff) as u32), val);
                         }
                     }
 
                     // Insert new items
                     for (i, item) in items.iter().enumerate() {
-                        obj.set(
+                        let _ = obj.set(
                             PropertyKey::Index((actual_start + i) as u32),
                             item.clone(),
                         );
@@ -774,7 +774,7 @@ pub fn init_array_prototype(
                     let result_arr =
                         GcRef::new(JsObject::array(items.len(), ncx.memory_manager().clone()));
                     for (i, item) in items.into_iter().enumerate() {
-                        result_arr.set(PropertyKey::Index(i as u32), item);
+                        let _ = result_arr.set(PropertyKey::Index(i as u32), item);
                     }
                     Ok(Value::array(result_arr))
                 },
@@ -851,7 +851,7 @@ pub fn init_array_prototype(
                         }
                         let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
                         let mapped = ncx.call_function(&callback, this_arg.clone(), &[val, Value::number(i as f64), this_val.clone()])?;
-                        result.set(PropertyKey::Index(i as u32), mapped);
+                        let _ = result.set(PropertyKey::Index(i as u32), mapped);
                     }
                     Ok(Value::array(result))
                 },
@@ -885,7 +885,7 @@ pub fn init_array_prototype(
                         let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
                         let keep = ncx.call_function(&callback, this_arg.clone(), &[val.clone(), Value::number(i as f64), this_val.clone()])?;
                         if keep.to_boolean() {
-                            result.set(PropertyKey::Index(out_idx), val);
+                            let _ = result.set(PropertyKey::Index(out_idx), val);
                             out_idx += 1;
                         }
                     }
@@ -1221,13 +1221,13 @@ pub fn init_array_prototype(
                                 let inner_len = get_len(&inner);
                                 for j in 0..inner_len {
                                     let item = inner.get(&PropertyKey::Index(j as u32)).unwrap_or(Value::undefined());
-                                    result.set(PropertyKey::Index(out_idx), item);
+                                    let _ = result.set(PropertyKey::Index(out_idx), item);
                                     out_idx += 1;
                                 }
                                 continue;
                             }
                         }
-                        result.set(PropertyKey::Index(out_idx), mapped);
+                        let _ = result.set(PropertyKey::Index(out_idx), mapped);
                         out_idx += 1;
                     }
                     set_len(&result, out_idx as usize);
@@ -1295,7 +1295,7 @@ pub fn init_array_prototype(
 
                     // Write sorted elements back
                     for (i, val) in elements.into_iter().enumerate() {
-                        obj.set(PropertyKey::Index(i as u32), val);
+                        let _ = obj.set(PropertyKey::Index(i as u32), val);
                     }
                     Ok(this_val.clone())
                 },
@@ -1328,12 +1328,12 @@ pub fn init_array_prototype(
                     if from < to && to < from + count {
                         for i in (0..count).rev() {
                             let val = obj.get(&PropertyKey::Index((from + i) as u32)).unwrap_or(Value::undefined());
-                            obj.set(PropertyKey::Index((to + i) as u32), val);
+                            let _ = obj.set(PropertyKey::Index((to + i) as u32), val);
                         }
                     } else {
                         for i in 0..count {
                             let val = obj.get(&PropertyKey::Index((from + i) as u32)).unwrap_or(Value::undefined());
-                            obj.set(PropertyKey::Index((to + i) as u32), val);
+                            let _ = obj.set(PropertyKey::Index((to + i) as u32), val);
                         }
                     }
                     Ok(this_val.clone())
@@ -1424,7 +1424,7 @@ pub fn init_array_prototype(
                     for i in 0..len {
                         let from_idx = len - 1 - i;
                         let val = obj.get(&PropertyKey::Index(from_idx as u32)).unwrap_or(Value::undefined());
-                        result.set(PropertyKey::Index(i as u32), val);
+                        let _ = result.set(PropertyKey::Index(i as u32), val);
                     }
                     Ok(Value::array(result))
                 },
@@ -1489,7 +1489,7 @@ pub fn init_array_prototype(
 
                     let result = GcRef::new(JsObject::array(len, ncx.memory_manager().clone()));
                     for (i, val) in elements.into_iter().enumerate() {
-                        result.set(PropertyKey::Index(i as u32), val);
+                        let _ = result.set(PropertyKey::Index(i as u32), val);
                     }
                     Ok(Value::array(result))
                 },
@@ -1536,20 +1536,20 @@ pub fn init_array_prototype(
                     // Copy elements before start
                     for i in 0..actual_start {
                         let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                        result.set(PropertyKey::Index(r), val);
+                        let _ = result.set(PropertyKey::Index(r), val);
                         r += 1;
                     }
                     // Insert new items
                     if args.len() > 2 {
                         for item in &args[2..] {
-                            result.set(PropertyKey::Index(r), item.clone());
+                            let _ = result.set(PropertyKey::Index(r), item.clone());
                             r += 1;
                         }
                     }
                     // Copy elements after deleted section
                     for i in (actual_start + delete_count)..(len as usize) {
                         let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                        result.set(PropertyKey::Index(r), val);
+                        let _ = result.set(PropertyKey::Index(r), val);
                         r += 1;
                     }
                     Ok(Value::array(result))
@@ -1580,10 +1580,10 @@ pub fn init_array_prototype(
                     let result = GcRef::new(JsObject::array(len as usize, ncx.memory_manager().clone()));
                     for i in 0..len {
                         if i == actual_index {
-                            result.set(PropertyKey::Index(i as u32), value.clone());
+                            let _ = result.set(PropertyKey::Index(i as u32), value.clone());
                         } else {
                             let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
-                            result.set(PropertyKey::Index(i as u32), val);
+                            let _ = result.set(PropertyKey::Index(i as u32), val);
                         }
                     }
                     Ok(Value::array(result))
@@ -1708,7 +1708,7 @@ pub fn install_array_statics(
                                 val
                             };
 
-                            result.set(PropertyKey::Index(k), mapped);
+                            let _ = result.set(PropertyKey::Index(k), mapped);
                             k += 1;
                         }
                     }
@@ -1728,7 +1728,7 @@ pub fn install_array_statics(
                             } else {
                                 val
                             };
-                            result.set(PropertyKey::Index(i as u32), mapped);
+                            let _ = result.set(PropertyKey::Index(i as u32), mapped);
                         }
                         return Ok(Value::array(result));
                     }
@@ -1746,7 +1746,7 @@ pub fn install_array_statics(
                         } else {
                             val
                         };
-                        result.set(PropertyKey::Index(i as u32), mapped);
+                        let _ = result.set(PropertyKey::Index(i as u32), mapped);
                     }
                     return Ok(Value::array(result));
                 }
@@ -1765,7 +1765,7 @@ pub fn install_array_statics(
             |_this, args, ncx| {
                 let result = GcRef::new(JsObject::array(args.len(), ncx.memory_manager().clone()));
                 for (i, arg) in args.iter().enumerate() {
-                    result.set(PropertyKey::Index(i as u32), arg.clone());
+                    let _ = result.set(PropertyKey::Index(i as u32), arg.clone());
                 }
                 Ok(Value::array(result))
             },

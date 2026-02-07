@@ -13,17 +13,17 @@ fn bench_shape_based_access(c: &mut Criterion) {
 
     c.bench_function("shape_based_set_20_props", |b| {
         b.iter(|| {
-            let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
+            let obj = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
             for i in 0..20 {
                 let key = PropertyKey::string(&format!("prop{}", i));
-                obj.set(key, Value::int32(i as i32));
+                let _ = obj.set(key, Value::int32(i as i32));
             }
             black_box(obj)
         });
     });
 
     c.bench_function("shape_based_get_20_props", |b| {
-        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         for i in 0..20 {
             let key = PropertyKey::string(&format!("prop{}", i));
             obj.set(key, Value::int32(i as i32));
@@ -48,17 +48,17 @@ fn bench_dictionary_mode_access(c: &mut Criterion) {
 
     c.bench_function("dictionary_set_50_props", |b| {
         b.iter(|| {
-            let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
+            let obj = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
             for i in 0..50 {
                 let key = PropertyKey::string(&format!("prop{}", i));
-                obj.set(key, Value::int32(i as i32));
+                let _ = obj.set(key, Value::int32(i as i32));
             }
             black_box(obj)
         });
     });
 
     c.bench_function("dictionary_get_50_props", |b| {
-        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         // Create 50 properties to trigger dictionary mode
         for i in 0..50 {
             let key = PropertyKey::string(&format!("prop{}", i));
@@ -86,7 +86,7 @@ fn bench_delete_triggered_dictionary(c: &mut Criterion) {
     let memory_manager = Arc::new(MemoryManager::test());
 
     c.bench_function("post_delete_get_10_props", |b| {
-        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         // Create 10 properties
         for i in 0..10 {
             let key = PropertyKey::string(&format!("prop{}", i));
@@ -117,7 +117,7 @@ fn bench_compare_storage_modes(c: &mut Criterion) {
 
     // Shape-based: 25 properties (under threshold)
     c.bench_function("compare_shape_25_get", |b| {
-        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         for i in 0..25 {
             let key = PropertyKey::string(&format!("p{}", i));
             obj.set(key, Value::int32(i as i32));
@@ -138,7 +138,7 @@ fn bench_compare_storage_modes(c: &mut Criterion) {
 
     // Dictionary mode: 25 properties (forced via delete)
     c.bench_function("compare_dict_25_get", |b| {
-        let obj = GcRef::new(JsObject::new(None, memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         for i in 0..26 {
             let key = PropertyKey::string(&format!("p{}", i));
             obj.set(key, Value::int32(i as i32));

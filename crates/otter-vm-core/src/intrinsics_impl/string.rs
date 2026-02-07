@@ -90,8 +90,8 @@ fn make_string_iterator(
     let iter = GcRef::new(JsObject::new(Value::object(iter_proto), mm.clone()));
 
     // Store the string reference and current index
-    iter.set(PropertyKey::string("__string_ref__"), Value::string(string));
-    iter.set(PropertyKey::string("__string_index__"), Value::number(0.0));
+    let _ = iter.set(PropertyKey::string("__string_ref__"), Value::string(string));
+    let _ = iter.set(PropertyKey::string("__string_index__"), Value::number(0.0));
 
     // Define next() method
     let fn_proto_for_next = fn_proto;
@@ -118,8 +118,8 @@ fn make_string_iterator(
                 if idx >= len {
                     // Done
                     let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                    result.set(PropertyKey::string("value"), Value::undefined());
-                    result.set(PropertyKey::string("done"), Value::boolean(true));
+                    let _ = result.set(PropertyKey::string("value"), Value::undefined());
+                    let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
                     return Ok(Value::object(result));
                 }
 
@@ -140,14 +140,14 @@ fn make_string_iterator(
                 };
 
                 // Advance index
-                iter_obj.set(
+                let _ = iter_obj.set(
                     PropertyKey::string("__string_index__"),
                     Value::number(next_idx as f64),
                 );
 
                 let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                result.set(PropertyKey::string("value"), Value::string(char_string));
-                result.set(PropertyKey::string("done"), Value::boolean(false));
+                let _ = result.set(PropertyKey::string("value"), Value::string(char_string));
+                let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
                 Ok(Value::object(result))
             },
             mm,
@@ -741,7 +741,7 @@ pub fn init_string_prototype(
                     let result_len = limit.unwrap_or(parts.len()).min(parts.len());
                     let result = GcRef::new(JsObject::array(result_len, ncx.memory_manager().clone()));
                     for (i, part) in parts.iter().take(result_len).enumerate() {
-                        result.set(
+                        let _ = result.set(
                             PropertyKey::Index(i as u32),
                             Value::string(JsString::intern(part)),
                         );
@@ -927,10 +927,10 @@ pub fn init_string_prototype(
                     match str_val.find(&search) {
                         Some(pos) => {
                             let arr = GcRef::new(JsObject::array(1, ncx.memory_manager().clone()));
-                            arr.set(PropertyKey::Index(0), Value::string(JsString::intern(&search)));
-                            arr.set(PropertyKey::string("index"), Value::number(pos as f64));
-                            arr.set(PropertyKey::string("input"), Value::string(s.clone()));
-                            arr.set(PropertyKey::string("groups"), Value::undefined());
+                            let _ = arr.set(PropertyKey::Index(0), Value::string(JsString::intern(&search)));
+                            let _ = arr.set(PropertyKey::string("index"), Value::number(pos as f64));
+                            let _ = arr.set(PropertyKey::string("input"), Value::string(s.clone()));
+                            let _ = arr.set(PropertyKey::string("groups"), Value::undefined());
                             Ok(Value::array(arr))
                         }
                         None => Ok(Value::null()),
@@ -979,16 +979,16 @@ pub fn init_string_prototype(
                     while let Some(pos) = str_val[start..].find(&search) {
                         let abs_pos = start + pos;
                         let match_arr = GcRef::new(JsObject::array(1, ncx.memory_manager().clone()));
-                        match_arr.set(PropertyKey::Index(0), Value::string(JsString::intern(&search)));
-                        match_arr.set(PropertyKey::string("index"), Value::number(abs_pos as f64));
-                        match_arr.set(PropertyKey::string("input"), Value::string(s.clone()));
-                        match_arr.set(PropertyKey::string("groups"), Value::undefined());
+                        let _ = match_arr.set(PropertyKey::Index(0), Value::string(JsString::intern(&search)));
+                        let _ = match_arr.set(PropertyKey::string("index"), Value::number(abs_pos as f64));
+                        let _ = match_arr.set(PropertyKey::string("input"), Value::string(s.clone()));
+                        let _ = match_arr.set(PropertyKey::string("groups"), Value::undefined());
                         results.push(Value::array(match_arr));
                         start = abs_pos + search.len().max(1);
                     }
                     let arr = GcRef::new(JsObject::array(results.len(), ncx.memory_manager().clone()));
                     for (i, val) in results.into_iter().enumerate() {
-                        arr.set(PropertyKey::Index(i as u32), val);
+                        let _ = arr.set(PropertyKey::Index(i as u32), val);
                     }
                     Ok(Value::array(arr))
                 },

@@ -193,32 +193,32 @@ pub fn init_function_prototype(
                 let bound = GcRef::new(JsObject::new(Value::object(fn_proto_for_bind.clone()), ncx.memory_manager().clone()));
 
                 // Store the original function
-                bound.set(
+                let _ = bound.set(
                     PropertyKey::string("__boundFunction__"),
                     this_val.clone(),
                 );
 
                 // Store the thisArg
-                bound.set(PropertyKey::string("__boundThis__"), this_arg);
+                let _ = bound.set(PropertyKey::string("__boundThis__"), this_arg);
 
                 // Store bound arguments (if any)
                 if args.len() > 1 {
                     let arr = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                     for (i, arg) in args[1..].iter().enumerate() {
-                        arr.set(PropertyKey::Index(i as u32), arg.clone());
+                        let _ = arr.set(PropertyKey::Index(i as u32), arg.clone());
                     }
-                    arr.set(
+                    let _ = arr.set(
                         PropertyKey::string("length"),
                         Value::int32((args.len() - 1) as i32),
                     );
-                    bound.set(
+                    let _ = bound.set(
                         PropertyKey::string("__boundArgs__"),
                         Value::object(arr),
                     );
                 }
 
                 // Set name
-                bound.set(
+                let _ = bound.set(
                     PropertyKey::string("__boundName__"),
                     Value::string(JsString::intern("bound ")),
                 );
@@ -226,13 +226,13 @@ pub fn init_function_prototype(
                 // Set length (original length - bound args count, min 0)
                 let bound_args_len = if args.len() > 1 { args.len() - 1 } else { 0 };
                 let new_length = 0i32.saturating_sub(bound_args_len as i32).max(0);
-                bound.set(
+                let _ = bound.set(
                     PropertyKey::string("__boundLength__"),
                     Value::int32(new_length),
                 );
 
                 // Mark as callable
-                bound.set(
+                let _ = bound.set(
                     PropertyKey::string("__isCallable__"),
                     Value::boolean(true),
                 );

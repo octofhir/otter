@@ -5,12 +5,12 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use otter_vm_bytecode::{ConstantIndex, Function, Instruction, Module, Register};
-use otter_vm_core::{GcRef, Interpreter, JsObject, MemoryManager, VmContext};
+use otter_vm_core::{GcRef, Interpreter, JsObject, MemoryManager, VmContext, value::Value};
 use std::sync::Arc;
 
 fn create_test_context() -> VmContext {
     let memory_manager = Arc::new(MemoryManager::test());
-    let global = GcRef::new(JsObject::new(None, memory_manager.clone()));
+    let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
     VmContext::new(global, memory_manager)
 }
 
@@ -56,6 +56,7 @@ fn bench_monomorphic_property_access(c: &mut Criterion) {
             dst: Register(1),
             lhs: Register(1),
             rhs: Register(4),
+            feedback_index: 0,
         })
         .instruction(Instruction::Lt {
             dst: Register(5),
@@ -163,6 +164,7 @@ fn bench_polymorphic_property_access(c: &mut Criterion) {
             dst: Register(7),
             lhs: Register(7),
             rhs: Register(8),
+            feedback_index: 0,
         })
         .instruction(Instruction::GetPropConst {
             dst: Register(8),
@@ -174,6 +176,7 @@ fn bench_polymorphic_property_access(c: &mut Criterion) {
             dst: Register(7),
             lhs: Register(7),
             rhs: Register(8),
+            feedback_index: 0,
         })
         .instruction(Instruction::GetPropConst {
             dst: Register(8),
@@ -185,12 +188,14 @@ fn bench_polymorphic_property_access(c: &mut Criterion) {
             dst: Register(7),
             lhs: Register(7),
             rhs: Register(8),
+            feedback_index: 0,
         })
         .instruction(Instruction::LoadInt32 { dst: Register(9), value: 1 })
         .instruction(Instruction::Add {
             dst: Register(5),
             lhs: Register(5),
             rhs: Register(9),
+            feedback_index: 0,
         })
         .instruction(Instruction::Lt {
             dst: Register(9),
@@ -246,6 +251,7 @@ fn bench_property_set(c: &mut Criterion) {
             dst: Register(1),
             lhs: Register(1),
             rhs: Register(3),
+            feedback_index: 0,
         })
         .instruction(Instruction::Lt {
             dst: Register(4),

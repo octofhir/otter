@@ -187,7 +187,7 @@ impl Compiler {
     ///
     /// `strict_context`: If true, code is compiled in strict mode context (e.g., direct eval in strict mode).
     pub fn compile(
-        mut self,
+        self,
         source: &str,
         source_url: &str,
         strict_context: bool,
@@ -200,7 +200,7 @@ impl Compiler {
     /// Module mode enables top-level await and implicit strict mode.
     /// Top-level `this` should be `undefined` (handled by the runtime, not the compiler).
     pub fn compile_as_module(
-        mut self,
+        self,
         source: &str,
         source_url: &str,
     ) -> CompileResult<otter_vm_bytecode::Module> {
@@ -386,7 +386,7 @@ impl Compiler {
 
     /// Recursively collect var-declared names from a single statement.
     fn hoist_var_declarations_from_stmt(&mut self, stmt: &Statement) -> CompileResult<()> {
-        use crate::scope::VariableKind;
+        
         match stmt {
             Statement::VariableDeclaration(decl) => {
                 if decl.kind == VariableDeclarationKind::Var {
@@ -917,6 +917,10 @@ impl Compiler {
                         _ => return Err(CompileError::unsupported("Complex parameter patterns")),
                     }
                 }
+
+                // Per ES2024 §15.1.1: simple params = no rest, no defaults, no destructuring
+                self.codegen.current.flags.has_simple_parameters =
+                    param_defaults.is_empty() && !self.codegen.current.flags.has_rest;
 
                 // Emit default parameter initializers (if arg === undefined).
                 for (local_idx, default_expr) in param_defaults {
@@ -3433,6 +3437,7 @@ impl Compiler {
 
         // Declare parameters and collect defaults
         let mut param_defaults: Vec<(u16, &Expression)> = Vec::new();
+        let mut has_non_simple_param = false;
         for param in &func.params.items {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
@@ -3445,6 +3450,7 @@ impl Compiler {
                 }
                 // Legacy / non-standard representation; keep for forward-compat.
                 BindingPattern::AssignmentPattern(assign) => {
+                    has_non_simple_param = true;
                     if let BindingPattern::BindingIdentifier(ident) = &assign.left {
                         self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                         let local_idx = self.codegen.declare_variable(&ident.name, false)?;
@@ -3459,6 +3465,7 @@ impl Compiler {
                 }
                 _ => {
                     // Pattern: [x], {a}
+                    has_non_simple_param = true;
                     let param_reg = self.codegen.alloc_reg();
                     self.codegen.current.param_count += 1;
                     self.compile_binding_init(&param.pattern, param_reg, false)?;
@@ -3476,6 +3483,10 @@ impl Compiler {
                 return Err(CompileError::unsupported("Complex rest parameter pattern"));
             }
         }
+
+        // Per ES2024 §15.1.1: simple params = no rest, no defaults, no destructuring
+        self.codegen.current.flags.has_simple_parameters =
+            !has_non_simple_param && param_defaults.is_empty() && !self.codegen.current.flags.has_rest;
 
         // Emit default parameter initializers (if arg === undefined).
         for (local_idx, default_expr) in param_defaults {
@@ -3629,6 +3640,7 @@ impl Compiler {
 
         // Declare parameters and collect defaults
         let mut param_defaults: Vec<(u16, &Expression)> = Vec::new();
+        let mut has_non_simple_param = false;
         for param in &func.params.items {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
@@ -3640,6 +3652,7 @@ impl Compiler {
                     }
                 }
                 BindingPattern::AssignmentPattern(assign) => {
+                    has_non_simple_param = true;
                     if let BindingPattern::BindingIdentifier(ident) = &assign.left {
                         self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                         let local_idx = self.codegen.declare_variable(&ident.name, false)?;
@@ -3652,6 +3665,7 @@ impl Compiler {
                     }
                 }
                 _ => {
+                    has_non_simple_param = true;
                     let param_reg = self.codegen.alloc_reg();
                     self.codegen.current.param_count += 1;
                     self.compile_binding_init(&param.pattern, param_reg, false)?;
@@ -3669,6 +3683,10 @@ impl Compiler {
                 return Err(CompileError::unsupported("Complex rest parameter pattern"));
             }
         }
+
+        // Per ES2024 §15.1.1: simple params = no rest, no defaults, no destructuring
+        self.codegen.current.flags.has_simple_parameters =
+            !has_non_simple_param && param_defaults.is_empty() && !self.codegen.current.flags.has_rest;
 
         // Emit default parameter initializers
         for (local_idx, default_expr) in param_defaults {
@@ -3826,6 +3844,7 @@ impl Compiler {
 
         // Declare parameters and collect defaults
         let mut param_defaults: Vec<(u16, &Expression)> = Vec::new();
+        let mut has_non_simple_param = false;
         for param in &func.params.items {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
@@ -3838,6 +3857,7 @@ impl Compiler {
                 }
                 // Legacy / non-standard representation; keep for forward-compat.
                 BindingPattern::AssignmentPattern(assign) => {
+                    has_non_simple_param = true;
                     if let BindingPattern::BindingIdentifier(ident) = &assign.left {
                         self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                         let local_idx = self.codegen.declare_variable(&ident.name, false)?;
@@ -3852,6 +3872,7 @@ impl Compiler {
                 }
                 _ => {
                     // Pattern: [x], {a}
+                    has_non_simple_param = true;
                     let param_reg = self.codegen.alloc_reg();
                     self.codegen.current.param_count += 1;
                     self.compile_binding_init(&param.pattern, param_reg, false)?;
@@ -3869,6 +3890,10 @@ impl Compiler {
                 return Err(CompileError::unsupported("Complex rest parameter pattern"));
             }
         }
+
+        // Per ES2024 §15.1.1: simple params = no rest, no defaults, no destructuring
+        self.codegen.current.flags.has_simple_parameters =
+            !has_non_simple_param && param_defaults.is_empty() && !self.codegen.current.flags.has_rest;
 
         // Emit default parameter initializers (if arg === undefined).
         for (local_idx, default_expr) in param_defaults {
@@ -3995,6 +4020,7 @@ impl Compiler {
 
         // Declare parameters and collect defaults
         let mut param_defaults: Vec<(u16, &Expression)> = Vec::new();
+        let mut has_non_simple_param = false;
         for param in &arrow.params.items {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
@@ -4007,6 +4033,7 @@ impl Compiler {
                 }
                 // Legacy / non-standard representation; keep for forward-compat.
                 BindingPattern::AssignmentPattern(assign) => {
+                    has_non_simple_param = true;
                     if let BindingPattern::BindingIdentifier(ident) = &assign.left {
                         self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
                         let local_idx = self.codegen.declare_variable(&ident.name, false)?;
@@ -4021,6 +4048,7 @@ impl Compiler {
                 }
                 _ => {
                     // Pattern: [x], {a}
+                    has_non_simple_param = true;
                     let param_reg = self.codegen.alloc_reg();
                     self.codegen.current.param_count += 1;
                     self.compile_binding_init(&param.pattern, param_reg, false)?;
@@ -4038,6 +4066,10 @@ impl Compiler {
                 return Err(CompileError::unsupported("Complex rest parameter pattern"));
             }
         }
+
+        // Per ES2024 §15.1.1: simple params = no rest, no defaults, no destructuring
+        self.codegen.current.flags.has_simple_parameters =
+            !has_non_simple_param && param_defaults.is_empty() && !self.codegen.current.flags.has_rest;
 
         // Emit default parameter initializers (if arg === undefined).
         for (local_idx, default_expr) in param_defaults {
@@ -4701,13 +4733,26 @@ impl Compiler {
                     // in the function that owns these arguments.
                     // TODO: Handle arrow functions/nested scopes properly
                     if !self.codegen.current.flags.is_arrow {
-                        if let Some(reg) = self.codegen.current.arguments_register {
-                            self.codegen.emit(Instruction::Move { dst, src: reg });
+                        if let Some(local_idx) = self.codegen.current.arguments_local {
+                            // Already created — load from local
+                            self.codegen.emit(Instruction::GetLocal {
+                                dst,
+                                idx: LocalIndex(local_idx),
+                            });
                             return Ok(dst);
                         } else {
-                            let dst = self.codegen.alloc_reg();
-                            self.codegen.emit(Instruction::CreateArguments { dst });
-                            self.codegen.current.arguments_register = Some(dst);
+                            // First access: allocate an anonymous local for arguments
+                            let local_idx = self.codegen.current.scopes
+                                .alloc_anonymous_local()
+                                .expect("no function scope for arguments");
+                            let tmp = self.codegen.alloc_reg();
+                            self.codegen.emit(Instruction::CreateArguments { dst: tmp });
+                            self.codegen.emit(Instruction::SetLocal {
+                                idx: LocalIndex(local_idx),
+                                src: tmp,
+                            });
+                            self.codegen.emit(Instruction::Move { dst, src: tmp });
+                            self.codegen.current.arguments_local = Some(local_idx);
                             return Ok(dst);
                         }
                     }
@@ -4739,13 +4784,26 @@ impl Compiler {
                     // in the function that owns these arguments.
                     // TODO: Handle arrow functions/nested scopes properly
                     if !self.codegen.current.flags.is_arrow {
-                        if let Some(reg) = self.codegen.current.arguments_register {
-                            self.codegen.emit(Instruction::Move { dst, src: reg });
+                        if let Some(local_idx) = self.codegen.current.arguments_local {
+                            // Already created — load from local
+                            self.codegen.emit(Instruction::GetLocal {
+                                dst,
+                                idx: LocalIndex(local_idx),
+                            });
                             return Ok(dst);
                         } else {
-                            let dst = self.codegen.alloc_reg();
-                            self.codegen.emit(Instruction::CreateArguments { dst });
-                            self.codegen.current.arguments_register = Some(dst);
+                            // First access: allocate an anonymous local for arguments
+                            let local_idx = self.codegen.current.scopes
+                                .alloc_anonymous_local()
+                                .expect("no function scope for arguments");
+                            let tmp = self.codegen.alloc_reg();
+                            self.codegen.emit(Instruction::CreateArguments { dst: tmp });
+                            self.codegen.emit(Instruction::SetLocal {
+                                idx: LocalIndex(local_idx),
+                                src: tmp,
+                            });
+                            self.codegen.emit(Instruction::Move { dst, src: tmp });
+                            self.codegen.current.arguments_local = Some(local_idx);
                             return Ok(dst);
                         }
                     }

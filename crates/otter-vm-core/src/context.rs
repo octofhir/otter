@@ -277,6 +277,8 @@ pub struct CallFrame {
     pub this_initialized: bool,
     /// Whether this is a derived constructor (class extends)
     pub is_derived: bool,
+    /// The callee function value (for arguments.callee in sloppy mode)
+    pub callee_value: Option<Value>,
 }
 
 /// Source location for error reporting
@@ -320,6 +322,8 @@ pub struct VmContext {
     pending_is_derived: bool,
     /// Pending new_target_proto for multi-level super() chain
     pending_new_target_proto: Option<GcRef<JsObject>>,
+    /// Pending callee value for next call (for arguments.callee)
+    pending_callee_value: Option<Value>,
     /// Pending realm id for next call frame
     pending_realm_id: Option<RealmId>,
     /// Open upvalues: maps (frame_id, local_idx) to the cell.
@@ -481,6 +485,7 @@ impl VmContext {
             pending_home_object: None,
             pending_is_derived: false,
             pending_new_target_proto: None,
+            pending_callee_value: None,
             pending_realm_id: None,
             open_upvalues: HashMap::new(),
             next_frame_id: 0,
@@ -1004,7 +1009,7 @@ impl VmContext {
             // If this local has been captured, update the cell too
             let frame_id = frame.frame_id;
             if let Some(cell) = self.open_upvalues.get(&(frame_id, index)) {
-                cell.set(value);
+                let _ = cell.set(value);
             }
             Ok(())
         } else {
@@ -1217,14 +1222,14 @@ impl VmContext {
     /// Set global variable
     pub fn set_global(&self, name: &str, value: Value) {
         use crate::object::PropertyKey;
-        self.global.set(PropertyKey::string(name), value);
+        let _ = self.global.set(PropertyKey::string(name), value);
     }
 
     /// Set global variable by UTF-16 code units
     pub fn set_global_utf16(&self, units: &[u16], value: Value) {
         use crate::object::PropertyKey;
         let key = PropertyKey::from_js_string(JsString::intern_utf16(units));
-        self.global.set(key, value);
+        let _ = self.global.set(key, value);
     }
 
     /// Push a new call frame
@@ -1324,6 +1329,7 @@ impl VmContext {
         // Take pending home object and derived flag
         let home_object = self.pending_home_object.take();
         let is_derived = std::mem::take(&mut self.pending_is_derived);
+        let callee_value = self.pending_callee_value.take();
 
         // Assign a unique frame ID
         let frame_id = self.next_frame_id;
@@ -1349,6 +1355,7 @@ impl VmContext {
             // In derived constructors, this is NOT initialized until super() is called
             this_initialized: !is_derived,
             is_derived,
+            callee_value,
         });
         self.switch_realm(frame_realm_id);
         Ok(())
@@ -1486,6 +1493,11 @@ impl VmContext {
         self.pending_is_derived = is_derived;
     }
 
+    /// Set pending callee value for next function call (for arguments.callee)
+    pub fn set_pending_callee_value(&mut self, callee: Value) {
+        self.pending_callee_value = Some(callee);
+    }
+
     pub fn set_pending_new_target_proto(&mut self, proto: GcRef<JsObject>) {
         self.pending_new_target_proto = Some(proto);
     }
@@ -1529,7 +1541,7 @@ impl VmContext {
             .upvalues
             .get(index as usize)
             .ok_or_else(|| VmError::internal(format!("upvalue index {} out of bounds", index)))?;
-        cell.set(value);
+        let _ = cell.set(value);
         Ok(())
     }
 
@@ -1566,7 +1578,7 @@ impl VmContext {
         if let Some(cell) = self.open_upvalues.get(&key) {
             // Sync the current local value into the cell
             let value = self.get_local(local_idx)?;
-            cell.set(value);
+            let _ = cell.set(value);
         }
         // Remove from open upvalues (the closures keep their own clones of the cell)
         self.open_upvalues.remove(&key);
@@ -1711,6 +1723,7 @@ impl VmContext {
                 new_target_proto: None,
                 this_initialized: true,
                 is_derived: false,
+                callee_value: None,
             });
 
             // Update next_frame_id to be greater than any restored frame
@@ -1893,7 +1906,7 @@ impl VmContext {
         // Break the globalThis cycle first
         use crate::object::PropertyKey;
 
-        self.global
+        let _ = self.global
             .set(PropertyKey::string("globalThis"), Value::undefined());
 
         // FORCE clear all properties to break reference cycles.
@@ -1903,7 +1916,7 @@ impl VmContext {
 
         // Clear inline properties
         {
-            let mut inline = self.global.get_inline_properties_storage().write();
+            let mut inline = self.global.get_inline_properties_storage().borrow_mut();
             for slot in inline.iter_mut() {
                 if let Some(entry) = slot.take() {
                     match entry.desc {
@@ -1932,7 +1945,7 @@ impl VmContext {
 
         // Clear overflow properties
         {
-            let mut overflow = self.global.get_overflow_properties_storage().write();
+            let mut overflow = self.global.get_overflow_properties_storage().borrow_mut();
             for entry in overflow.iter_mut() {
                 // Determine if we can modify the value in place
                 if let Some(val) = entry.desc.value_mut() {
@@ -1951,7 +1964,7 @@ impl VmContext {
 
         // Clear array elements too if any
         {
-            let mut elements = self.global.get_elements_storage().write();
+            let mut elements = self.global.get_elements_storage().borrow_mut();
             for val in elements.iter_mut() {
                 let mut temp = Value::undefined();
                 std::mem::swap(val, &mut temp);
@@ -2009,7 +2022,7 @@ impl VmContext {
             // We want to capture that old value.
             // UpvalueCell::get() clones.
             let val = cell.get();
-            cell.set(Value::undefined());
+            let _ = cell.set(Value::undefined());
             if val.is_object() {
                 guard.push(val);
             }

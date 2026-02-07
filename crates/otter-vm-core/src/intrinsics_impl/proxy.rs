@@ -65,7 +65,7 @@ pub fn init_proxy_constructor(
 
             // Create result object { proxy, revoke }
             let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-            result.set("proxy".into(), Value::proxy(revocable.proxy));
+            let _ = result.set("proxy".into(), Value::proxy(revocable.proxy));
 
             // Create revoke function
             let revoke_fn = revocable.revoke;
@@ -83,7 +83,7 @@ pub fn init_proxy_constructor(
                     PropertyDescriptor::builtin_data(Value::boolean(true)),
                 );
             }
-            result.set("revoke".into(), revoke_value);
+            let _ = result.set("revoke".into(), revoke_value);
 
             Ok(Value::object(result))
         },

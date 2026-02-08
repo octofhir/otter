@@ -361,9 +361,15 @@ impl Compiler {
             }
         }
 
+        // Phase 1.5: Pre-declare all lexical (let/const) variable names so that
+        // function declarations compiled in Phase 2 can capture them via upvalues.
+        // Without this, function declarations can't reference `let`/`const` variables
+        // because those declarations haven't been processed yet.
+        self.hoist_lexical_declarations(statements)?;
+
         // Phase 2: Compile and assign all functions
-        // Now that all var and function names are declared, function bodies can
-        // reference variables from the enclosing scope via upvalues.
+        // Now that all var, function, and lexical names are declared, function bodies
+        // can reference variables from the enclosing scope via upvalues.
         for stmt in statements.iter() {
             if let Statement::FunctionDeclaration(func) = stmt {
                 // Compile the function (skip the declare step since we already did it)
@@ -372,6 +378,60 @@ impl Compiler {
         }
 
         Ok(hoisted_indices)
+    }
+
+    /// Pre-declare all `let`/`const` variable names from a statement list (top-level only).
+    /// This allows function declarations to capture these variables via upvalues.
+    /// Only declares names, NOT values — initialization happens during normal compilation.
+    fn hoist_lexical_declarations(&mut self, statements: &[Statement]) -> CompileResult<()> {
+        use crate::scope::VariableKind;
+        for stmt in statements {
+            if let Statement::VariableDeclaration(decl) = stmt {
+                let kind = match decl.kind {
+                    VariableDeclarationKind::Let => VariableKind::Let,
+                    VariableDeclarationKind::Const => VariableKind::Const,
+                    _ => continue, // Skip var (already hoisted)
+                };
+                for declarator in &decl.declarations {
+                    self.hoist_lexical_names_from_binding(&declarator.id, kind)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Extract and pre-declare variable names from a binding pattern for lexical hoisting.
+    fn hoist_lexical_names_from_binding(
+        &mut self,
+        pattern: &BindingPattern,
+        kind: crate::scope::VariableKind,
+    ) -> CompileResult<()> {
+        match pattern {
+            BindingPattern::BindingIdentifier(ident) => {
+                // Pre-declare the name; ignore errors from already-declared names
+                let _ = self.codegen.declare_variable_with_kind(&ident.name, kind);
+            }
+            BindingPattern::ObjectPattern(obj) => {
+                for prop in &obj.properties {
+                    self.hoist_lexical_names_from_binding(&prop.value, kind)?;
+                }
+                if let Some(rest) = &obj.rest {
+                    self.hoist_lexical_names_from_binding(&rest.argument, kind)?;
+                }
+            }
+            BindingPattern::ArrayPattern(arr) => {
+                for elem in arr.elements.iter().flatten() {
+                    self.hoist_lexical_names_from_binding(elem, kind)?;
+                }
+                if let Some(rest) = &arr.rest {
+                    self.hoist_lexical_names_from_binding(&rest.argument, kind)?;
+                }
+            }
+            BindingPattern::AssignmentPattern(assign) => {
+                self.hoist_lexical_names_from_binding(&assign.left, kind)?;
+            }
+        }
+        Ok(())
     }
 
     /// Collect and declare all `var`-declared names from a statement list.
@@ -1223,8 +1283,7 @@ impl Compiler {
             self.compile_function_expression_internal(func, Some(&instance_fields))?
         } else if has_super {
             // Default derived constructor: constructor(...args) { super(...args); }
-            // For now, compile an empty constructor; DefineClass will handle the default behavior
-            self.compile_empty_function_internal(Some(&instance_fields))?
+            self.compile_default_derived_constructor(Some(&instance_fields))?
         } else {
             self.compile_empty_function_internal(Some(&instance_fields))?
         };
@@ -1418,6 +1477,46 @@ impl Compiler {
 
         self.codegen.enter_function(inferred_name);
 
+        if let Some(fields) = field_initializers {
+            for field in fields {
+                self.compile_field_initialization(field)?;
+            }
+        }
+
+        self.codegen.emit(Instruction::ReturnUndefined);
+        let func_idx = self.codegen.exit_function();
+
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::Closure {
+            dst,
+            func: otter_vm_bytecode::FunctionIndex(func_idx),
+        });
+
+        self.loop_stack = saved_loop_stack;
+        Ok(dst)
+    }
+
+    /// Compile the default constructor for a derived class.
+    /// Generates: constructor(...args) { super(...args); }
+    /// Uses CallSuperForward instruction to forward all arguments to the super constructor.
+    fn compile_default_derived_constructor(
+        &mut self,
+        field_initializers: Option<&[&PropertyDefinition]>,
+    ) -> CompileResult<Register> {
+        let saved_loop_stack = std::mem::take(&mut self.loop_stack);
+        let inferred_name = self.pending_inferred_name.take();
+
+        self.codegen.enter_function(inferred_name);
+        // Mark as derived constructor so the runtime sets up home_object
+        self.codegen.current.flags.is_derived = true;
+
+        // Emit CallSuperForward to forward all arguments to super constructor
+        let super_dst = self.codegen.alloc_reg();
+        self.codegen
+            .emit(Instruction::CallSuperForward { dst: super_dst });
+        self.codegen.free_reg(super_dst);
+
+        // Compile field initializers (if any)
         if let Some(fields) = field_initializers {
             for field in fields {
                 self.compile_field_initialization(field)?;
@@ -1751,8 +1850,30 @@ impl Compiler {
                         is_declaration: true,
                     });
                 } else {
-                    let local_idx =
-                        self.codegen.declare_variable_with_kind(&ident.name, kind)?;
+                    // Try to declare; if already pre-declared (e.g., by hoist_lexical_declarations),
+                    // resolve the existing binding instead.
+                    let local_idx = match self
+                        .codegen
+                        .declare_variable_with_kind(&ident.name, kind)
+                    {
+                        Ok(idx) => idx,
+                        Err(_) => {
+                            // Variable was pre-declared during lexical hoisting — resolve it
+                            match self.codegen.resolve_variable(&ident.name) {
+                                Some(crate::scope::ResolvedBinding::Local(idx)) => idx,
+                                _ => {
+                                    return Err(CompileError::syntax(
+                                        format!(
+                                            "Identifier '{}' has already been declared",
+                                            ident.name
+                                        ),
+                                        0,
+                                        0,
+                                    ));
+                                }
+                            }
+                        }
+                    };
 
                     self.codegen.emit(Instruction::SetLocal {
                         idx: LocalIndex(local_idx),

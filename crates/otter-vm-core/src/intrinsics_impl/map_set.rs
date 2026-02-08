@@ -106,7 +106,17 @@ fn get_set_data(obj: &GcRef<JsObject>) -> Option<GcRef<SetData>> {
 }
 
 fn is_valid_weak_key(value: &Value) -> bool {
-    value.is_object() || value.is_symbol() || value.is_function()
+    if value.is_object() || value.is_function() {
+        return true;
+    }
+    // Symbols are valid weak keys UNLESS they are registered (Symbol.for).
+    // Registered symbols are globally shared and never garbage collected.
+    if let Some(sym) = value.as_symbol() {
+        return crate::symbol_registry::global_symbol_registry()
+            .key_for(&sym)
+            .is_none();
+    }
+    false
 }
 
 /// Get a stable pointer key for WeakMap/WeakSet (object identity).
@@ -125,6 +135,160 @@ fn weak_key_id(value: &Value) -> Option<usize> {
     } else {
         value.as_promise().map(|p| p.as_ptr() as usize)
     }
+}
+
+/// Get GC header pointer from a weak key value
+fn weak_key_header(value: &Value) -> Option<*const otter_vm_gc::GcHeader> {
+    value.gc_header()
+}
+
+/// Convert Value to bytes for ephemeron storage
+fn value_to_bytes(value: &Value) -> Vec<u8> {
+    // Value is 16 bytes (8 bytes for bits + 8 bytes for Option<HeapRef>)
+    // We serialize it directly as bytes
+    unsafe {
+        let ptr = value as *const Value as *const u8;
+        std::slice::from_raw_parts(ptr, std::mem::size_of::<Value>()).to_vec()
+    }
+}
+
+/// Convert bytes back to Value from ephemeron storage
+unsafe fn bytes_to_value(bytes: &[u8]) -> Value {
+    assert_eq!(bytes.len(), std::mem::size_of::<Value>());
+    unsafe {
+        std::ptr::read(bytes.as_ptr() as *const Value)
+    }
+}
+
+/// JavaScript-style property Get that triggers accessor getters.
+/// Unlike `obj.get()`, this properly calls getter functions.
+fn js_get(
+    obj: &GcRef<JsObject>,
+    key: &PropertyKey,
+    this_val: &Value,
+    ncx: &mut crate::context::NativeContext<'_>,
+) -> Result<Value, VmError> {
+    if let Some(desc) = obj.lookup_property_descriptor(key) {
+        match desc {
+            PropertyDescriptor::Data { value, .. } => Ok(value),
+            PropertyDescriptor::Accessor { get, .. } => {
+                if let Some(getter) = get {
+                    if getter.is_callable() {
+                        ncx.call_function(&getter, this_val.clone(), &[])
+                    } else {
+                        Ok(Value::undefined())
+                    }
+                } else {
+                    Ok(Value::undefined())
+                }
+            }
+            PropertyDescriptor::Deleted => Ok(Value::undefined()),
+        }
+    } else {
+        Ok(Value::undefined())
+    }
+}
+
+/// Get a property value from an object, properly triggering accessor getters.
+/// Unlike `obj.get()`, this calls getter functions when the property is an accessor.
+fn js_get_value(
+    obj: &GcRef<JsObject>,
+    key: &PropertyKey,
+    receiver: &Value,
+    ncx: &mut crate::context::NativeContext<'_>,
+) -> Result<Value, VmError> {
+    if let Some(desc) = obj.lookup_property_descriptor(key) {
+        match desc {
+            PropertyDescriptor::Data { value, .. } => Ok(value),
+            PropertyDescriptor::Accessor { get, .. } => {
+                if let Some(getter) = get {
+                    if getter.is_callable() {
+                        ncx.call_function(&getter, receiver.clone(), &[])
+                    } else {
+                        Ok(Value::undefined())
+                    }
+                } else {
+                    Ok(Value::undefined())
+                }
+            }
+            PropertyDescriptor::Deleted => Ok(Value::undefined()),
+        }
+    } else {
+        Ok(Value::undefined())
+    }
+}
+
+/// Close an iterator by calling its `return` method (IteratorClose).
+/// Ignores errors from `return()` — the original error takes precedence.
+fn iterator_close(
+    iterator: &Value,
+    iterator_obj: &GcRef<JsObject>,
+    ncx: &mut crate::context::NativeContext<'_>,
+) {
+    if let Some(ret_fn) = iterator_obj.get(&pk("return")) {
+        if ret_fn.is_callable() {
+            let _ = ncx.call_function(&ret_fn, iterator.clone(), &[]);
+        }
+    }
+}
+
+/// Iterate an iterable using the Symbol.iterator protocol.
+/// Calls `callback(value)` for each yielded value.
+/// Implements IteratorClose: if callback returns an error, calls `iterator.return()` before propagating.
+fn iterate_with_protocol(
+    iterable: &Value,
+    ncx: &mut crate::context::NativeContext<'_>,
+    mut callback: impl FnMut(Value, &mut crate::context::NativeContext<'_>) -> Result<(), VmError>,
+) -> Result<(), VmError> {
+    let iter_sym = crate::intrinsics::well_known::iterator_symbol();
+    let iter_key = PropertyKey::Symbol(iter_sym);
+
+    // Get the @@iterator method
+    let iter_obj = iterable.as_object().or_else(|| iterable.as_array());
+    let iter_fn = if let Some(obj) = &iter_obj {
+        obj.get(&iter_key).unwrap_or(Value::undefined())
+    } else {
+        Value::undefined()
+    };
+
+    if !iter_fn.is_callable() {
+        return Err(VmError::type_error("object is not iterable"));
+    }
+
+    // Call @@iterator to get the iterator
+    let iterator = ncx.call_function(&iter_fn, iterable.clone(), &[])?;
+    let iterator_obj = iterator.as_object()
+        .ok_or_else(|| VmError::type_error("Iterator result is not an object"))?;
+
+    // Get the `next` method
+    let next_fn = iterator_obj.get(&pk("next")).unwrap_or(Value::undefined());
+    if !next_fn.is_callable() {
+        return Err(VmError::type_error("Iterator .next is not a function"));
+    }
+
+    // Iterate
+    loop {
+        let result = ncx.call_function(&next_fn, iterator.clone(), &[])?;
+        let result_obj = result.as_object()
+            .ok_or_else(|| VmError::type_error("Iterator result is not an object"))?;
+
+        // Check .done - must use js_get_value to trigger accessor getters
+        let done = js_get_value(&result_obj, &pk("done"), &result, ncx)?;
+        if done.to_boolean() {
+            break;
+        }
+
+        // Get .value - must use js_get_value to trigger accessor getters (spec: IteratorValue calls Get)
+        let value = js_get_value(&result_obj, &pk("value"), &result, ncx)?;
+
+        // Call the callback; on error, close the iterator (IfAbruptCloseIterator)
+        if let Err(err) = callback(value, ncx) {
+            iterator_close(&iterator, &iterator_obj, ncx);
+            return Err(err);
+        }
+    }
+
+    Ok(())
 }
 
 fn init_map_slots(obj: &GcRef<JsObject>) {
@@ -1097,11 +1261,11 @@ pub fn init_set_prototype(
 // WeakMap.prototype (pointer-identity keys, no iteration)
 // ============================================================================
 
-/// WeakMap uses a HashMap<usize, Value> keyed by object pointer.
-/// NOT actually weak yet (requires GC ephemeron support), but uses proper
-/// pointer identity instead of string serialization.
-fn get_weakmap_entries(obj: &GcRef<JsObject>) -> Option<GcRef<JsObject>> {
-    obj.get(&pk(WEAKMAP_ENTRIES_KEY)).and_then(|v| v.as_object())
+/// WeakMap uses EphemeronTable for proper weak semantics with GC integration.
+/// Keys are tracked by pointer identity and entries are automatically collected
+/// when keys become unreachable.
+fn get_weakmap_entries(obj: &GcRef<JsObject>) -> Option<GcRef<otter_vm_gc::EphemeronTable>> {
+    obj.get(&pk(WEAKMAP_ENTRIES_KEY)).and_then(|v| v.as_ephemeron_table())
 }
 
 /// Initialize WeakMap.prototype with all ES2023 methods.
@@ -1124,13 +1288,22 @@ pub fn init_weak_map_prototype(
                     return Err(VmError::type_error("Method WeakMap.prototype.get called on incompatible receiver"));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
+                // Return undefined if key cannot be held weakly (spec step 4)
                 if !is_valid_weak_key(&key) {
                     return Ok(Value::undefined());
                 }
-                let id = weak_key_id(&key).ok_or_else(|| VmError::type_error("Invalid weak key"))?;
+                let Some(key_header) = weak_key_header(&key) else {
+                    return Ok(Value::undefined());
+                };
                 let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
-                let pk_id = PropertyKey::string(&format!("__wk_{}", id));
-                Ok(entries.get(&pk_id).unwrap_or(Value::undefined()))
+
+                unsafe {
+                    if let Some(value_bytes) = entries.get_raw(key_header) {
+                        Ok(bytes_to_value(&value_bytes))
+                    } else {
+                        Ok(Value::undefined())
+                    }
+                }
             },
             mm.clone(),
             fn_proto,
@@ -1155,10 +1328,13 @@ pub fn init_weak_map_prototype(
                     return Err(VmError::type_error("Invalid value used as weak map key"));
                 }
                 let value = args.get(1).cloned().unwrap_or(Value::undefined());
-                let id = weak_key_id(&key).ok_or_else(|| VmError::type_error("Invalid weak key"))?;
+                let key_header = weak_key_header(&key).ok_or_else(|| VmError::type_error("Invalid weak key"))?;
                 let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
-                let pk_id = PropertyKey::string(&format!("__wk_{}", id));
-                let _ = entries.set(pk_id, value);
+
+                let value_bytes = value_to_bytes(&value);
+                unsafe {
+                    entries.set_raw(key_header, value_bytes, None);
+                }
                 Ok(this_val.clone())
             },
             mm.clone(),
@@ -1183,13 +1359,15 @@ pub fn init_weak_map_prototype(
                 if !is_valid_weak_key(&key) {
                     return Ok(Value::boolean(false));
                 }
-                let id = match weak_key_id(&key) {
-                    Some(id) => id,
+                let key_header = match weak_key_header(&key) {
+                    Some(h) => h,
                     None => return Ok(Value::boolean(false)),
                 };
                 let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
-                let pk_id = PropertyKey::string(&format!("__wk_{}", id));
-                Ok(Value::boolean(entries.get(&pk_id).is_some()))
+
+                unsafe {
+                    Ok(Value::boolean(entries.has(key_header)))
+                }
             },
             mm.clone(),
             fn_proto,
@@ -1213,17 +1391,102 @@ pub fn init_weak_map_prototype(
                 if !is_valid_weak_key(&key) {
                     return Ok(Value::boolean(false));
                 }
-                let id = match weak_key_id(&key) {
-                    Some(id) => id,
+                let key_header = match weak_key_header(&key) {
+                    Some(h) => h,
                     None => return Ok(Value::boolean(false)),
                 };
                 let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
-                let pk_id = PropertyKey::string(&format!("__wk_{}", id));
-                if entries.get(&pk_id).is_none() {
-                    return Ok(Value::boolean(false));
+
+                unsafe {
+                    Ok(Value::boolean(entries.delete(key_header)))
                 }
-                entries.delete(&pk_id);
-                Ok(Value::boolean(true))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // WeakMap.prototype.getOrInsert(key, value)
+    wm_proto.define_property(
+        PropertyKey::string("getOrInsert"),
+        PropertyDescriptor::builtin_method(make_builtin(
+            "getOrInsert",
+            2,
+            |this_val, args, _ncx| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.getOrInsert called on incompatible receiver"))?;
+                if !is_weakmap(&obj) {
+                    return Err(VmError::type_error("Method WeakMap.prototype.getOrInsert called on incompatible receiver"));
+                }
+                let key = args.first().cloned().unwrap_or(Value::undefined());
+                if !is_valid_weak_key(&key) {
+                    return Err(VmError::type_error("Invalid value used as weak map key"));
+                }
+                let default_value = args.get(1).cloned().unwrap_or(Value::undefined());
+                let Some(key_header) = weak_key_header(&key) else {
+                    return Err(VmError::type_error("Invalid weak key"));
+                };
+                let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
+
+                unsafe {
+                    // If key exists, return existing value
+                    if let Some(value_bytes) = entries.get_raw(key_header) {
+                        return Ok(bytes_to_value(&value_bytes));
+                    }
+                    // Otherwise insert and return default_value
+                    let value_bytes = value_to_bytes(&default_value);
+                    entries.set_raw(key_header, value_bytes, None);
+                    Ok(default_value)
+                }
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // WeakMap.prototype.getOrInsertComputed(key, callbackfn)
+    wm_proto.define_property(
+        PropertyKey::string("getOrInsertComputed"),
+        PropertyDescriptor::builtin_method(make_builtin(
+            "getOrInsertComputed",
+            2,
+            |this_val, args, ncx| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.getOrInsertComputed called on incompatible receiver"))?;
+                if !is_weakmap(&obj) {
+                    return Err(VmError::type_error("Method WeakMap.prototype.getOrInsertComputed called on incompatible receiver"));
+                }
+                let key = args.first().cloned().unwrap_or(Value::undefined());
+                if !is_valid_weak_key(&key) {
+                    return Err(VmError::type_error("Invalid value used as weak map key"));
+                }
+                let callback = args.get(1).cloned().unwrap_or(Value::undefined());
+                if !callback.is_callable() {
+                    return Err(VmError::type_error("WeakMap.prototype.getOrInsertComputed: callback is not a function"));
+                }
+                let Some(key_header) = weak_key_header(&key) else {
+                    return Err(VmError::type_error("Invalid weak key"));
+                };
+                let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
+
+                unsafe {
+                    // If key exists, return existing value
+                    if let Some(value_bytes) = entries.get_raw(key_header) {
+                        return Ok(bytes_to_value(&value_bytes));
+                    }
+                    // Otherwise compute, insert, and return
+                    let computed = ncx.call_function(&callback, Value::undefined(), &[key.clone()])?;
+                    // Re-get entries in case callback triggered GC
+                    let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
+                    let Some(key_header) = weak_key_header(&key) else {
+                        return Err(VmError::type_error("Invalid weak key"));
+                    };
+                    let value_bytes = value_to_bytes(&computed);
+                    entries.set_raw(key_header, value_bytes, None);
+                    Ok(computed)
+                }
             },
             mm.clone(),
             fn_proto,
@@ -1248,8 +1511,8 @@ pub fn init_weak_map_prototype(
 // WeakSet.prototype
 // ============================================================================
 
-fn get_weakset_entries(obj: &GcRef<JsObject>) -> Option<GcRef<JsObject>> {
-    obj.get(&pk(WEAKSET_ENTRIES_KEY)).and_then(|v| v.as_object())
+fn get_weakset_entries(obj: &GcRef<JsObject>) -> Option<GcRef<otter_vm_gc::EphemeronTable>> {
+    obj.get(&pk(WEAKSET_ENTRIES_KEY)).and_then(|v| v.as_ephemeron_table())
 }
 
 /// Initialize WeakSet.prototype with all ES2023 methods.
@@ -1275,10 +1538,15 @@ pub fn init_weak_set_prototype(
                 if !is_valid_weak_key(&value) {
                     return Err(VmError::type_error("Invalid value used in weak set"));
                 }
-                let id = weak_key_id(&value).ok_or_else(|| VmError::type_error("Invalid weak key"))?;
+                let key_header = weak_key_header(&value).ok_or_else(|| VmError::type_error("Invalid weak key"))?;
                 let entries = get_weakset_entries(&obj).ok_or("Internal error: missing entries")?;
-                let pk_id = PropertyKey::string(&format!("__wk_{}", id));
-                let _ = entries.set(pk_id, Value::boolean(true));
+
+                // For WeakSet, we just store a boolean true marker
+                let marker = Value::boolean(true);
+                let value_bytes = value_to_bytes(&marker);
+                unsafe {
+                    entries.set_raw(key_header, value_bytes, None);
+                }
                 Ok(this_val.clone())
             },
             mm.clone(),
@@ -1303,13 +1571,15 @@ pub fn init_weak_set_prototype(
                 if !is_valid_weak_key(&value) {
                     return Ok(Value::boolean(false));
                 }
-                let id = match weak_key_id(&value) {
-                    Some(id) => id,
+                let key_header = match weak_key_header(&value) {
+                    Some(h) => h,
                     None => return Ok(Value::boolean(false)),
                 };
                 let entries = get_weakset_entries(&obj).ok_or("Internal error: missing entries")?;
-                let pk_id = PropertyKey::string(&format!("__wk_{}", id));
-                Ok(Value::boolean(entries.get(&pk_id).is_some()))
+
+                unsafe {
+                    Ok(Value::boolean(entries.has(key_header)))
+                }
             },
             mm.clone(),
             fn_proto,
@@ -1333,17 +1603,15 @@ pub fn init_weak_set_prototype(
                 if !is_valid_weak_key(&value) {
                     return Ok(Value::boolean(false));
                 }
-                let id = match weak_key_id(&value) {
-                    Some(id) => id,
+                let key_header = match weak_key_header(&value) {
+                    Some(h) => h,
                     None => return Ok(Value::boolean(false)),
                 };
                 let entries = get_weakset_entries(&obj).ok_or("Internal error: missing entries")?;
-                let pk_id = PropertyKey::string(&format!("__wk_{}", id));
-                if entries.get(&pk_id).is_none() {
-                    return Ok(Value::boolean(false));
+
+                unsafe {
+                    Ok(Value::boolean(entries.delete(key_header)))
                 }
-                entries.delete(&pk_id);
-                Ok(Value::boolean(true))
             },
             mm.clone(),
             fn_proto,
@@ -1448,19 +1716,50 @@ pub fn create_set_constructor() -> Box<
 }
 
 /// Create WeakMap constructor function.
+/// Supports `new WeakMap()` and `new WeakMap(iterable)`.
 pub fn create_weak_map_constructor() -> Box<
     dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
         + Send
         + Sync,
 > {
-    Box::new(|this_val, _args, ncx| {
+    Box::new(|this_val, args, ncx| {
         if this_val.is_undefined() {
             return Err(VmError::type_error("Constructor WeakMap requires 'new'"));
         }
         if let Some(obj) = this_val.as_object() {
-            let entries = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-            let _ = obj.set(pk(WEAKMAP_ENTRIES_KEY), Value::object(entries));
+            let ephemeron_table = GcRef::new(otter_vm_gc::EphemeronTable::new());
+            let _ = obj.set(pk(WEAKMAP_ENTRIES_KEY), Value::ephemeron_table(ephemeron_table));
             let _ = obj.set(pk(IS_WEAKMAP_KEY), Value::boolean(true));
+
+            // Handle iterable argument: new WeakMap([[k1, v1], [k2, v2], ...])
+            let iterable = args.first().cloned().unwrap_or(Value::undefined());
+            if !iterable.is_undefined() && !iterable.is_null() {
+                // Get the "set" adder method via JS Get (triggers accessor getters) (spec step 5)
+                let adder = js_get_value(&obj, &pk("set"), this_val, ncx)?;
+
+                // Check if adder is callable (spec step 6)
+                if !adder.is_callable() {
+                    return Err(VmError::type_error("WeakMap.prototype.set is not callable"));
+                }
+
+                // Use proper iterator protocol (spec step 7: AddEntriesFromIterable)
+                let this_clone = this_val.clone();
+                iterate_with_protocol(&iterable, ncx, |entry, ncx| {
+                    // Each entry must be an object [key, value] (spec step 9.f)
+                    let entry_obj = entry.as_array().or_else(|| entry.as_object())
+                        .ok_or_else(|| VmError::type_error("Iterator value is not an entry object"))?;
+
+                    // Use js_get_value to trigger accessor getters (spec: Get(nextItem, "0") / Get(nextItem, "1"))
+                    let entry_val = entry.clone();
+                    let key = js_get_value(&entry_obj, &PropertyKey::Index(0), &entry_val, ncx)?;
+                    let value = js_get_value(&entry_obj, &PropertyKey::Index(1), &entry_val, ncx)?;
+
+                    // Call adder (this.set(key, value))
+                    ncx.call_function(&adder, this_clone.clone(), &[key, value])?;
+                    Ok(())
+                })?;
+            }
+
             Ok(this_val.clone())
         } else {
             Err(VmError::type_error("Constructor WeakMap requires 'new'"))
@@ -1469,19 +1768,41 @@ pub fn create_weak_map_constructor() -> Box<
 }
 
 /// Create WeakSet constructor function.
+/// Supports `new WeakSet()` and `new WeakSet(iterable)`.
 pub fn create_weak_set_constructor() -> Box<
     dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
         + Send
         + Sync,
 > {
-    Box::new(|this_val, _args, ncx| {
+    Box::new(|this_val, args, ncx| {
         if this_val.is_undefined() {
             return Err(VmError::type_error("Constructor WeakSet requires 'new'"));
         }
         if let Some(obj) = this_val.as_object() {
-            let entries = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-            let _ = obj.set(pk(WEAKSET_ENTRIES_KEY), Value::object(entries));
+            let ephemeron_table = GcRef::new(otter_vm_gc::EphemeronTable::new());
+            let _ = obj.set(pk(WEAKSET_ENTRIES_KEY), Value::ephemeron_table(ephemeron_table));
             let _ = obj.set(pk(IS_WEAKSET_KEY), Value::boolean(true));
+
+            // Handle iterable argument: new WeakSet([v1, v2, ...])
+            let iterable = args.first().cloned().unwrap_or(Value::undefined());
+            if !iterable.is_undefined() && !iterable.is_null() {
+                // Get the "add" adder method via JS Get (triggers accessor getters) (spec step 5)
+                let adder = js_get_value(&obj, &pk("add"), this_val, ncx)?;
+
+                // Check if adder is callable (spec step 6)
+                if !adder.is_callable() {
+                    return Err(VmError::type_error("WeakSet.prototype.add is not callable"));
+                }
+
+                // Use proper iterator protocol
+                let this_clone = this_val.clone();
+                iterate_with_protocol(&iterable, ncx, |value, ncx| {
+                    // Call adder (this.add(value))
+                    ncx.call_function(&adder, this_clone.clone(), &[value])?;
+                    Ok(())
+                })?;
+            }
+
             Ok(this_val.clone())
         } else {
             Err(VmError::type_error("Constructor WeakSet requires 'new'"))

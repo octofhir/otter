@@ -6939,6 +6939,84 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
+            Instruction::CallSuperForward { dst } => {
+                // Default derived constructor: forward all arguments to super constructor.
+                // Arguments are stored in locals (see push_frame extra_args handling).
+                let frame = ctx
+                    .current_frame()
+                    .ok_or_else(|| VmError::internal("no frame for CallSuperForward"))?;
+
+                let home_object = frame.home_object.clone().ok_or_else(|| {
+                    VmError::ReferenceError("'super' keyword unexpected here".to_string())
+                })?;
+                let new_target_proto = frame
+                    .new_target_proto
+                    .clone()
+                    .unwrap_or_else(|| home_object.clone());
+                let argc = frame.argc;
+
+                // Collect arguments from locals (for empty default constructor, all args are extras at locals[0..argc])
+                let mut args = Vec::with_capacity(argc);
+                for i in 0..argc {
+                    args.push(ctx.get_local(i as u16)?);
+                }
+
+                // Get the superclass constructor
+                let super_proto = home_object.prototype().as_object().ok_or_else(|| {
+                    VmError::TypeError("Super constructor is not a constructor".to_string())
+                })?;
+                let ctor_key = PropertyKey::string("constructor");
+                let super_ctor_val = super_proto.get(&ctor_key).unwrap_or_else(Value::undefined);
+                let mm = ctx.memory_manager().clone();
+
+                let super_is_derived = super_ctor_val
+                    .as_function()
+                    .and_then(|c| {
+                        c.module
+                            .function(c.function_index)
+                            .map(|f| f.flags.is_derived)
+                    })
+                    .unwrap_or(false);
+
+                let this_value = if super_is_derived {
+                    if let Some(super_closure) = super_ctor_val.as_function() {
+                        ctx.set_pending_is_derived(true);
+                        ctx.set_pending_new_target_proto(new_target_proto);
+                        let proto_key = PropertyKey::string("prototype");
+                        if let Some(proto_val) = super_closure.object.get(&proto_key) {
+                            if let Some(proto_obj) = proto_val.as_object() {
+                                ctx.set_pending_home_object(proto_obj);
+                            }
+                        }
+                    }
+                    let result =
+                        self.call_function(ctx, &super_ctor_val, Value::undefined(), &args)?;
+                    if result.is_object() {
+                        result
+                    } else {
+                        Value::undefined()
+                    }
+                } else {
+                    let new_obj =
+                        GcRef::new(JsObject::new(Value::object(new_target_proto), mm.clone()));
+                    let new_obj_value = Value::object(new_obj);
+                    let result =
+                        self.call_function(ctx, &super_ctor_val, new_obj_value.clone(), &args)?;
+                    if result.is_object() {
+                        result
+                    } else {
+                        new_obj_value
+                    }
+                };
+
+                if let Some(frame) = ctx.current_frame_mut() {
+                    frame.this_value = this_value.clone();
+                    frame.this_initialized = true;
+                }
+                ctx.set_register(dst.0, this_value);
+                Ok(InstructionResult::Continue)
+            }
+
             Instruction::GetSuper { dst } => {
                 let frame = ctx
                     .current_frame()

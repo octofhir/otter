@@ -218,6 +218,8 @@ pub enum Opcode {
     GetSuperProp = 0xC3,
     /// Set [[HomeObject]] on a closure for super resolution
     SetHomeObject = 0xC4,
+    /// Forward all arguments from current frame to super constructor (default derived constructor)
+    CallSuperForward = 0xC5,
 
     // ==================== Generators/Async ====================
     /// Yield value
@@ -358,6 +360,7 @@ impl Opcode {
             0xC2 => Some(Self::CallSuper),
             0xC3 => Some(Self::GetSuperProp),
             0xC4 => Some(Self::SetHomeObject),
+            0xC5 => Some(Self::CallSuperForward),
 
             0xD0 => Some(Self::Yield),
             0xD1 => Some(Self::Await),
@@ -491,6 +494,7 @@ impl Opcode {
             Self::CallSuper => "CallSuper",
             Self::GetSuperProp => "GetSuperProp",
             Self::SetHomeObject => "SetHomeObject",
+            Self::CallSuperForward => "CallSuperForward",
             // Generators/Async
             Self::Yield => "Yield",
             Self::Await => "Await",
@@ -1048,6 +1052,11 @@ pub enum Instruction {
     SetHomeObject {
         func: Register,
         obj: Register,
+    },
+    /// Forward all arguments from current frame to super constructor.
+    /// Used for default derived constructors: constructor(...args) { super(...args); }
+    CallSuperForward {
+        dst: Register,
     },
 
     // Generators/Async

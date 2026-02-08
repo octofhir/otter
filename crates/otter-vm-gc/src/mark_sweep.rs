@@ -221,6 +221,150 @@ impl AllocationRegistry {
         reclaimed
     }
 
+    /// Perform a full mark/sweep collection with ephemeron support
+    ///
+    /// # Arguments
+    /// - `roots`: Pointers to GcHeaders that are roots (live references)
+    /// - `ephemeron_tables`: Ephemeron tables to trace (for WeakMap/WeakSet)
+    ///
+    /// # Returns
+    /// Number of bytes reclaimed
+    ///
+    /// # Safety
+    /// - Ephemeron tables must contain valid GC pointers
+    /// - Must be called during GC pause (no concurrent mutations)
+    pub fn collect_with_ephemerons(
+        &self,
+        roots: &[*const GcHeader],
+        ephemeron_tables: &[&crate::ephemeron::EphemeronTable],
+    ) -> usize {
+        let start = Instant::now();
+
+        #[cfg(feature = "gc_logging")]
+        let initial_bytes = self.total_bytes.load(Ordering::Relaxed);
+        #[cfg(feature = "gc_logging")]
+        let initial_count = self.allocations.read().len();
+
+        #[cfg(feature = "gc_logging")]
+        tracing::debug!(
+            target: "otter::gc",
+            roots = roots.len(),
+            heap_bytes = initial_bytes,
+            objects = initial_count,
+            ephemeron_tables = ephemeron_tables.len(),
+            "GC cycle starting"
+        );
+
+        // Phase 1: Reset all marks to white
+        self.reset_marks();
+
+        // Phase 2: Mark from roots (standard marking)
+        self.mark(roots);
+
+        // Phase 3: Ephemeron fixpoint iteration
+        // Continue marking ephemeron values until no new values are marked
+        if !ephemeron_tables.is_empty() {
+            let mut iterations = 0;
+            loop {
+                let mut newly_marked = 0;
+
+                // Trace each ephemeron table
+                for table in ephemeron_tables {
+                    unsafe {
+                        newly_marked += table.trace_live_entries(&mut |header| {
+                            // Mark the value's header (this will be picked up by next iteration if needed)
+                            if !header.is_null() {
+                                let h = &*header;
+                                if h.mark() == MarkColor::White {
+                                    h.set_mark(MarkColor::Gray);
+                                    // Need to trace this value's children too
+                                    self.mark(&[header]);
+                                }
+                            }
+                        });
+                    }
+                }
+
+                iterations += 1;
+
+                #[cfg(feature = "gc_logging")]
+                tracing::debug!(
+                    target: "otter::gc",
+                    iteration = iterations,
+                    newly_marked,
+                    "Ephemeron fixpoint iteration"
+                );
+
+                // Fixpoint reached when no new values were marked
+                if newly_marked == 0 {
+                    break;
+                }
+
+                // Safety limit to prevent infinite loops
+                if iterations > 1000 {
+                    #[cfg(feature = "gc_logging")]
+                    tracing::warn!(
+                        target: "otter::gc",
+                        "Ephemeron fixpoint iteration limit reached (1000 iterations)"
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Phase 4: Sweep dead ephemeron entries (BEFORE object sweep, while marks are still valid)
+        for table in ephemeron_tables {
+            unsafe {
+                let _removed = table.sweep();
+                #[cfg(feature = "gc_logging")]
+                if _removed > 0 {
+                    tracing::debug!(
+                        target: "otter::gc",
+                        removed_entries = _removed,
+                        "Swept dead ephemeron entries"
+                    );
+                }
+            }
+        }
+
+        // Phase 5: Sweep unmarked objects (this resets marks to white)
+        let reclaimed = self.sweep();
+
+        // Measure pause time
+        let elapsed = start.elapsed();
+        let elapsed_nanos = elapsed.as_nanos() as u64;
+
+        // Update stats
+        #[cfg(feature = "gc_logging")]
+        let collection_num = self.collection_count.fetch_add(1, Ordering::Relaxed) + 1;
+        #[cfg(not(feature = "gc_logging"))]
+        self.collection_count.fetch_add(1, Ordering::Relaxed);
+
+        self.last_reclaimed.store(reclaimed, Ordering::Relaxed);
+        self.total_pause_nanos
+            .fetch_add(elapsed_nanos, Ordering::Relaxed);
+        self.last_pause_nanos.store(elapsed_nanos, Ordering::Relaxed);
+
+        #[cfg(feature = "gc_logging")]
+        {
+            let final_bytes = self.total_bytes.load(Ordering::Relaxed);
+            let final_count = self.allocations.read().len();
+
+            tracing::info!(
+                target: "otter::gc",
+                collection = collection_num,
+                reclaimed_bytes = reclaimed,
+                pause_us = elapsed.as_micros() as u64,
+                live_bytes = final_bytes,
+                live_objects = final_count,
+                freed_objects = initial_count.saturating_sub(final_count),
+                "GC cycle complete"
+            );
+        }
+
+        reclaimed
+    }
+
     /// Reset all marks to white (preparation for marking)
     fn reset_marks(&self) {
         let allocations = self.allocations.read();

@@ -8,8 +8,8 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tracing_subscriber::filter::EnvFilter;
 
 use otter_test262::{
-    FeatureReport, PersistedReport, Test262Runner, TestOutcome, TestReport,
-    compare, config::Test262Config, editions, report::FailureInfo,
+    FeatureReport, PersistedReport, Test262Runner, TestOutcome, TestReport, compare,
+    config::Test262Config, editions, report::FailureInfo,
 };
 
 // ---------------------------------------------------------------------------
@@ -271,10 +271,7 @@ impl RunSummary {
 
         // For tests with no features, classify as ES5
         if result.features.is_empty() {
-            let edition_report = self
-                .by_edition
-                .entry(editions::EsEdition::ES5)
-                .or_default();
+            let edition_report = self.by_edition.entry(editions::EsEdition::ES5).or_default();
             edition_report.total += 1;
             match result.outcome {
                 TestOutcome::Pass => edition_report.passed += 1,
@@ -316,6 +313,12 @@ impl RunSummary {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Force UTC timezone for consistent test results (avoids failures due to local/historical offsets)
+    // SAFETY: This is safe because it's the very first thing called in main, before any threads are spawned.
+    unsafe {
+        std::env::set_var("TZ", "UTC");
+    }
+
     // Suppress default panic output — panics are caught by catch_unwind
     // in the runner and reported as Crash/Fail outcomes.
     std::panic::set_hook(Box::new(|_| {}));
@@ -388,17 +391,13 @@ fn run_compare(base: &std::path::Path, current: &std::path::Path) {
 async fn run_tests(cli: Cli) {
     let config = Test262Config::load_or_default(cli.config.as_deref());
     let save_results = cli.save.is_some();
-    let save_path = cli
-        .save
-        .as_ref()
-        .and_then(|opt| opt.clone())
-        .or_else(|| {
-            if save_results {
-                Some(PathBuf::from("test262_results/latest.json"))
-            } else {
-                None
-            }
-        });
+    let save_path = cli.save.as_ref().and_then(|opt| opt.clone()).or_else(|| {
+        if save_results {
+            Some(PathBuf::from("test262_results/latest.json"))
+        } else {
+            None
+        }
+    });
 
     if !cli.json {
         eprintln!("{}", "Otter Test262 Runner".bold().cyan());
@@ -484,9 +483,7 @@ async fn run_tests(cli: Cli) {
         let pb = ProgressBar::new(test_count as u64);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}",
-                )
+                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}")
                 .unwrap()
                 .progress_chars("#>-"),
         );
@@ -594,9 +591,10 @@ async fn run_tests(cli: Cli) {
 
         // Update memory tracker
         if let Some(ref mut tracker) = memory_tracker
-            && summary.total.is_multiple_of(100) {
-                tracker.update();
-            }
+            && summary.total.is_multiple_of(100)
+        {
+            tracker.update();
+        }
     }
 
     // Finish progress

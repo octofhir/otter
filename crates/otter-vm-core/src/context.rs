@@ -1795,13 +1795,100 @@ impl VmContext {
     /// Returns the number of bytes reclaimed.
     pub fn collect_garbage(&self) -> usize {
         let roots = self.collect_gc_roots();
-        let reclaimed = otter_vm_gc::global_registry().collect(&roots);
+        let ephemeron_tables = self.collect_ephemeron_tables();
+
+        let reclaimed = if ephemeron_tables.is_empty() {
+            otter_vm_gc::global_registry().collect(&roots)
+        } else {
+            let table_refs: Vec<_> = ephemeron_tables.iter().map(|t| t.as_ref()).collect();
+            otter_vm_gc::global_registry().collect_with_ephemerons(&roots, &table_refs)
+        };
 
         // Update memory manager with post-GC state
         let live_bytes = otter_vm_gc::global_registry().total_bytes();
         self.memory_manager.on_gc_complete(live_bytes);
 
         reclaimed
+    }
+
+    /// Collect all ephemeron tables from WeakMap/WeakSet objects
+    ///
+    /// This traverses all root values and collects any ephemeron tables
+    /// for proper weak collection semantics during GC.
+    fn collect_ephemeron_tables(&self) -> Vec<crate::gc::GcRef<otter_vm_gc::EphemeronTable>> {
+        let mut tables = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+
+        // Helper to check a value for ephemeron tables
+        let mut check_value = |value: &Value| {
+            // Direct ephemeron table value
+            if let Some(table) = value.as_ephemeron_table() {
+                let ptr = table.as_ptr() as usize;
+                if visited.insert(ptr) {
+                    tables.push(table);
+                }
+            }
+
+            // WeakMap/WeakSet object containing ephemeron table
+            if let Some(obj) = value.as_object() {
+                // Check for __weakmap_entries__
+                if let Some(entries_value) = obj.get(&crate::object::PropertyKey::string("__weakmap_entries__")) {
+                    if let Some(table) = entries_value.as_ephemeron_table() {
+                        let ptr = table.as_ptr() as usize;
+                        if visited.insert(ptr) {
+                            tables.push(table);
+                        }
+                    }
+                }
+                // Check for __weakset_entries__
+                if let Some(entries_value) = obj.get(&crate::object::PropertyKey::string("__weakset_entries__")) {
+                    if let Some(table) = entries_value.as_ephemeron_table() {
+                        let ptr = table.as_ptr() as usize;
+                        if visited.insert(ptr) {
+                            tables.push(table);
+                        }
+                    }
+                }
+            }
+        };
+
+        // Check global object
+        check_value(&Value::object(self.global));
+
+        // Check registers
+        for value in self.registers.iter() {
+            check_value(value);
+        }
+
+        // Check call stack locals
+        for frame in self.call_stack.iter() {
+            for value in frame.locals.iter() {
+                check_value(value);
+            }
+            check_value(&frame.this_value);
+        }
+
+        // Check root slots
+        for value in self.root_slots.iter() {
+            check_value(value);
+        }
+
+        // Check exception
+        if let Some(exc) = &self.exception {
+            check_value(exc);
+        }
+
+        // Check pending args
+        for value in self.pending_args.iter() {
+            check_value(value);
+        }
+
+        // Check pending this
+        if let Some(this) = &self.pending_this {
+            check_value(this);
+        }
+
+        tables
     }
 
     /// Trigger GC if allocation threshold is exceeded

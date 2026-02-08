@@ -54,8 +54,6 @@ skip_features = [
     "json-modules",
     # Iterator helpers
     "iterator-helpers",
-    # Symbols as WeakMap keys
-    "symbols-as-weakmap-keys",
     # Hashbang
     "hashbang",
     # Class features

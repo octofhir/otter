@@ -591,9 +591,7 @@ impl Intrinsics {
     /// with their spec-required methods and properties. Must be called after
     /// `wire_prototype_chains()`.
     pub fn init_core(&self, mm: &Arc<MemoryManager>) {
-        
         use crate::object::{PropertyDescriptor, PropertyKey};
-        
 
         // ====================================================================
         // Object.prototype methods (extracted to intrinsics_impl/object.rs)
@@ -672,7 +670,12 @@ impl Intrinsics {
         // ===================================================================
         // Date.prototype methods (extracted to intrinsics_impl/date.rs)
         // ===================================================================
-        crate::intrinsics_impl::date::init_date_prototype(self.date_prototype, fn_proto, mm);
+        crate::intrinsics_impl::date::init_date_prototype(
+            self.date_prototype,
+            fn_proto,
+            mm,
+            well_known::to_string_tag_symbol(),
+        );
 
         // ====================================================================
         // Iterator prototype: [Symbol.iterator]() { return this; }
@@ -965,9 +968,11 @@ impl Intrinsics {
             "AsyncGeneratorFunction",
             async_gen_fn_ctor,
             self.async_generator_function_prototype,
-            Some(crate::intrinsics_impl::function::create_async_generator_function_constructor(
-                realm_id,
-            )),
+            Some(
+                crate::intrinsics_impl::function::create_async_generator_function_constructor(
+                    realm_id,
+                ),
+            ),
         );
 
         // Internal globals used by the interpreter for function prototype lookups.
@@ -1260,6 +1265,11 @@ impl Intrinsics {
             self.weak_map_prototype,
             Some(weak_map_ctor_fn),
         );
+        // WeakMap constructor.length should be 0 (iterable parameter is optional)
+        weak_map_ctor.define_property(
+            PropertyKey::string("length"),
+            PropertyDescriptor::function_length(Value::number(0.0)),
+        );
 
         let weak_set_ctor = alloc_ctor();
         let weak_set_ctor_fn = crate::intrinsics_impl::map_set::create_weak_set_constructor();
@@ -1268,6 +1278,11 @@ impl Intrinsics {
             weak_set_ctor,
             self.weak_set_prototype,
             Some(weak_set_ctor_fn),
+        );
+        // WeakSet constructor.length should be 0 (iterable parameter is optional)
+        weak_set_ctor.define_property(
+            PropertyKey::string("length"),
+            PropertyDescriptor::function_length(Value::number(0.0)),
         );
 
         // ====================================================================
@@ -1394,27 +1409,141 @@ impl Intrinsics {
                 + Send
                 + Sync,
         > = Box::new(|this, args, ncx| {
+            use chrono::{Local, NaiveDate, TimeZone};
             use std::time::{SystemTime, UNIX_EPOCH};
+
+            // Per ES spec: Date() called without `new` returns a string
+            // When called with new, `this` is a new object with Date.prototype
+            // When called without new, `this` is undefined or global
+            let is_constructor_call = this.as_object().map_or(false, |obj| {
+                let proto = obj.prototype();
+                !proto.is_null() && !proto.is_undefined()
+            });
+
+            if !is_constructor_call {
+                // Return current date as string per ES spec 20.3.2.2
+                let now = Local::now();
+                let date_str = now.format("%a %b %d %Y %H:%M:%S GMT%z").to_string();
+                return Ok(Value::string(JsString::intern(&date_str)));
+            }
+
             let timestamp = if args.is_empty() {
+                // No args: current time
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_millis() as f64)
                     .unwrap_or(0.0)
-            } else {
-                let prim = ncx.to_primitive(&args[0], crate::interpreter::PreferredType::Number)?;
-                if prim.as_string().is_some() {
-                    f64::NAN // TODO: proper date parsing
+            } else if args.len() == 1 {
+                // Single arg: string or timestamp
+                // Per ES spec, use "default" hint for ToPrimitive, not "number"
+                let prim =
+                    ncx.to_primitive(&args[0], crate::interpreter::PreferredType::Default)?;
+                if let Some(date_str) = prim.as_string() {
+                    // Parse date string
+                    parse_date_string(date_str.as_str())
                 } else {
                     ncx.to_number_value(&prim)?
                 }
+            } else {
+                // Multi-arg: Date(year, month, day?, hours?, minutes?, seconds?, ms?)
+                // Per ES spec 20.3.1.1, ToNumber each argument in order
+                let year = ncx.to_number_value(&args[0])? as i32;
+                let month = args
+                    .get(1)
+                    .map(|v| ncx.to_number_value(v))
+                    .transpose()?
+                    .unwrap_or(0.0) as u32
+                    + 1; // JS months are 0-indexed
+                let day = args
+                    .get(2)
+                    .map(|v| ncx.to_number_value(v))
+                    .transpose()?
+                    .unwrap_or(1.0) as u32;
+                let hour = args
+                    .get(3)
+                    .map(|v| ncx.to_number_value(v))
+                    .transpose()?
+                    .unwrap_or(0.0) as u32;
+                let min = args
+                    .get(4)
+                    .map(|v| ncx.to_number_value(v))
+                    .transpose()?
+                    .unwrap_or(0.0) as u32;
+                let sec = args
+                    .get(5)
+                    .map(|v| ncx.to_number_value(v))
+                    .transpose()?
+                    .unwrap_or(0.0) as u32;
+                let ms = args
+                    .get(6)
+                    .map(|v| ncx.to_number_value(v))
+                    .transpose()?
+                    .unwrap_or(0.0) as u32;
+
+                // 2-digit years (0-99) → 1900-1999 per ES spec
+                let adjusted_year = if year >= 0 && year <= 99 {
+                    1900 + year
+                } else {
+                    year
+                };
+
+                NaiveDate::from_ymd_opt(adjusted_year, month, day)
+                    .and_then(|d| d.and_hms_milli_opt(hour, min, sec, ms))
+                    .and_then(|dt| Local.from_local_datetime(&dt).single())
+                    .map(|ldt| ldt.timestamp_millis() as f64)
+                    .unwrap_or(f64::NAN)
             };
+
             // Set timestamp on `this` (created by Construct with Date.prototype)
             if let Some(obj) = this.as_object() {
-                let _ = obj.set(PropertyKey::string("__timestamp__"), Value::number(timestamp));
+                let _ = obj.set(
+                    PropertyKey::string("__timestamp__"),
+                    Value::number(timestamp),
+                );
             }
             Ok(Value::undefined())
         });
+
+        // Helper for date string parsing
+        fn parse_date_string(s: &str) -> f64 {
+            use chrono::{NaiveDate, NaiveDateTime};
+            let s = s.trim();
+
+            // Try RFC3339/ISO8601
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                return dt.timestamp_millis() as f64;
+            }
+
+            // Try date-only (YYYY-MM-DD) - interpreted as UTC per ES spec
+            if s.len() == 10 && s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-') {
+                if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                    if let Some(dt) = d.and_hms_opt(0, 0, 0) {
+                        return dt.and_utc().timestamp_millis() as f64;
+                    }
+                }
+            }
+
+            // Try datetime without timezone
+            if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+                return dt.and_utc().timestamp_millis() as f64;
+            }
+            if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+                return dt.and_utc().timestamp_millis() as f64;
+            }
+
+            f64::NAN
+        }
+
         install("Date", date_ctor, self.date_prototype, Some(date_ctor_fn));
+
+        // Date.length = 7 (per ECMAScript spec - Date constructor takes 7 args max)
+        date_ctor.define_property(
+            PropertyKey::string("length"),
+            PropertyDescriptor::data_with_attrs(
+                Value::int32(7),
+                PropertyAttributes::function_length(),
+            ),
+        );
 
         // Date.now() - returns current timestamp in milliseconds
         date_ctor.define_property(

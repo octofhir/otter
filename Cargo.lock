@@ -2077,6 +2077,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-utils",
  "parking_lot",
+ "rustc-hash",
  "tracing",
 ]
 

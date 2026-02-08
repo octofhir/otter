@@ -159,6 +159,8 @@ pub enum HeapRef {
     MapData(GcRef<MapData>),
     /// Set internal data
     SetData(GcRef<SetData>),
+    /// Ephemeron table for WeakMap/WeakSet
+    EphemeronTable(GcRef<otter_vm_gc::EphemeronTable>),
 }
 
 impl std::fmt::Debug for HeapRef {
@@ -181,6 +183,7 @@ impl std::fmt::Debug for HeapRef {
             HeapRef::RegExp(r) => f.debug_tuple("RegExp").field(r).finish(),
             HeapRef::MapData(m) => f.debug_tuple("MapData").field(m).finish(),
             HeapRef::SetData(s) => f.debug_tuple("SetData").field(s).finish(),
+            HeapRef::EphemeronTable(e) => f.debug_tuple("EphemeronTable").field(e).finish(),
         }
     }
 }
@@ -498,6 +501,15 @@ impl Value {
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::SetData(data)),
+        }
+    }
+
+    /// Create ephemeron table value (for WeakMap/WeakSet)
+    pub fn ephemeron_table(table: GcRef<otter_vm_gc::EphemeronTable>) -> Self {
+        let ptr = table.as_ptr() as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::EphemeronTable(table)),
         }
     }
 
@@ -965,6 +977,14 @@ impl Value {
         }
     }
 
+    /// Get as ephemeron table
+    pub fn as_ephemeron_table(&self) -> Option<GcRef<otter_vm_gc::EphemeronTable>> {
+        match &self.heap_ref {
+            Some(HeapRef::EphemeronTable(e)) => Some(*e),
+            _ => None,
+        }
+    }
+
     /// Get the heap reference (for structured clone)
     #[doc(hidden)]
     pub fn heap_ref(&self) -> &Option<HeapRef> {
@@ -984,17 +1004,17 @@ impl Value {
             Some(HeapRef::NativeFunction(n)) => Some(n.object.header() as *const _),
             Some(HeapRef::RegExp(r)) => Some(r.object.header() as *const _),
             Some(HeapRef::Generator(g)) => Some(g.object.header() as *const _),
-            // These types use Arc, not GcRef, so they don't have GcHeaders
-            Some(HeapRef::Symbol(_))
-            | Some(HeapRef::BigInt(_))
-            | Some(HeapRef::Promise(_))
-            | Some(HeapRef::Proxy(_))
-            | Some(HeapRef::ArrayBuffer(_))
-            | Some(HeapRef::TypedArray(_))
-            | Some(HeapRef::DataView(_))
-            | Some(HeapRef::SharedArrayBuffer(_))
-            | Some(HeapRef::MapData(_))
-            | Some(HeapRef::SetData(_)) => None,
+            Some(HeapRef::Symbol(s)) => Some(s.header() as *const _),
+            Some(HeapRef::BigInt(b)) => Some(b.header() as *const _),
+            Some(HeapRef::Promise(p)) => Some(p.header() as *const _),
+            Some(HeapRef::Proxy(p)) => Some(p.header() as *const _),
+            Some(HeapRef::ArrayBuffer(a)) => Some(a.header() as *const _),
+            Some(HeapRef::TypedArray(t)) => Some(t.header() as *const _),
+            Some(HeapRef::DataView(d)) => Some(d.header() as *const _),
+            Some(HeapRef::SharedArrayBuffer(s)) => Some(s.header() as *const _),
+            Some(HeapRef::MapData(m)) => Some(m.header() as *const _),
+            Some(HeapRef::SetData(s)) => Some(s.header() as *const _),
+            Some(HeapRef::EphemeronTable(e)) => Some(e.header() as *const _),
             None => None,
         }
     }
@@ -1057,7 +1077,8 @@ impl Value {
                     | HeapRef::DataView(_)
                     | HeapRef::SharedArrayBuffer(_)
                     | HeapRef::MapData(_)
-                    | HeapRef::SetData(_),
+                    | HeapRef::SetData(_)
+                    | HeapRef::EphemeronTable(_),
                 ) => "object",
                 Some(HeapRef::Proxy(_)) => {
                     if self.is_callable() {
@@ -1120,6 +1141,7 @@ impl std::fmt::Debug for Value {
                 }
                 Some(HeapRef::MapData(m)) => write!(f, "[MapData {:?}]", m),
                 Some(HeapRef::SetData(s)) => write!(f, "[SetData {:?}]", s),
+                Some(HeapRef::EphemeronTable(e)) => write!(f, "[EphemeronTable {:?}]", e),
                 None => write!(f, "<unknown>"),
             },
         }

@@ -148,6 +148,7 @@ impl StructuredCloner {
 
             Some(HeapRef::MapData(_)) => Err(StructuredCloneError::NotCloneable("MapData")),
             Some(HeapRef::SetData(_)) => Err(StructuredCloneError::NotCloneable("SetData")),
+            Some(HeapRef::EphemeronTable(_)) => Err(StructuredCloneError::NotCloneable("EphemeronTable")),
 
             None => Ok(Value::undefined()),
         }

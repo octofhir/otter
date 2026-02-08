@@ -4930,7 +4930,7 @@ impl Interpreter {
                         return Ok(InstructionResult::Continue);
                     }
 
-                    match obj.lookup_property_descriptor(&key) {
+                    match obj.get_own_property_descriptor(&key) {
                         Some(crate::object::PropertyDescriptor::Accessor { set, .. }) => {
                             let Some(setter) = set else {
                                 return Ok(InstructionResult::Continue);
@@ -4955,8 +4955,14 @@ impl Interpreter {
                                 Err(VmError::type_error("setter is not a function"))
                             }
                         }
+                        None => {
+                            // No own property - walk prototype chain (may contain proxy or accessor)
+                            let key_value = Value::string(JsString::intern_utf16(name_str));
+                            self.set_with_proxy_chain(ctx, &obj, &key, key_value, val_val, &object)?;
+                            Ok(InstructionResult::Continue)
+                        }
                         _ => {
-                            // Slow path: update IC
+                            // Own data property: set directly
                             if let Err(e) = obj.set(key, val_val) {
                                 if is_strict {
                                     return Err(VmError::type_error(e.to_string()));
@@ -8162,6 +8168,108 @@ impl Interpreter {
         false
     }
 
+    /// Set a property on an object, walking the prototype chain with proxy trap support.
+    ///
+    /// Per ES2023 §9.1.9 OrdinarySet:
+    /// If the object doesn't have the own property and a proxy is found in the prototype
+    /// chain, the proxy's [[Set]] trap should be invoked with the original receiver.
+    fn set_with_proxy_chain(
+        &self,
+        ctx: &mut VmContext,
+        obj: &GcRef<JsObject>,
+        key: &PropertyKey,
+        key_value: Value,
+        value: Value,
+        receiver: &Value,
+    ) -> VmResult<bool> {
+        // 1. Check for own property descriptor
+        if let Some(desc) = obj.get_own_property_descriptor(key) {
+            match desc {
+                crate::object::PropertyDescriptor::Accessor { set, .. } => {
+                    if let Some(setter) = set {
+                        self.call_function(ctx, &setter, receiver.clone(), &[value])?;
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+                _ => {
+                    // Data property or deleted - set directly on receiver
+                    if let Some(recv_obj) = receiver.as_object() {
+                        let _ = recv_obj.set(*key, value);
+                    }
+                    return Ok(true);
+                }
+            }
+        }
+        // Also check elements for own Index properties
+        if let PropertyKey::Index(i) = key {
+            let elements = obj.get_elements_storage().borrow();
+            let idx = *i as usize;
+            if idx < elements.len() && !elements[idx].is_hole() {
+                drop(elements);
+                if let Some(recv_obj) = receiver.as_object() {
+                    let _ = recv_obj.set(*key, value);
+                }
+                return Ok(true);
+            }
+        }
+        // 2. Walk prototype chain looking for proxy or accessor
+        let mut current = obj.prototype();
+        let mut depth = 0;
+        loop {
+            if current.is_null() || current.is_undefined() {
+                // Not found in chain - set on receiver
+                if let Some(recv_obj) = receiver.as_object() {
+                    let _ = recv_obj.set(*key, value);
+                }
+                return Ok(true);
+            }
+            depth += 1;
+            if depth > 256 {
+                return Ok(false);
+            }
+            if let Some(proxy) = current.as_proxy() {
+                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                return crate::proxy_operations::proxy_set(
+                    &mut ncx,
+                    proxy,
+                    key,
+                    key_value,
+                    value,
+                    receiver.clone(),
+                );
+            }
+            if let Some(proto_obj) = current.as_object() {
+                if let Some(desc) = proto_obj.get_own_property_descriptor(key) {
+                    match desc {
+                        crate::object::PropertyDescriptor::Accessor { set, .. } => {
+                            if let Some(setter) = set {
+                                self.call_function(ctx, &setter, receiver.clone(), &[value])?;
+                                return Ok(true);
+                            }
+                            return Ok(false);
+                        }
+                        _ => {
+                            // Data property found in prototype - set on receiver
+                            if let Some(recv_obj) = receiver.as_object() {
+                                let _ = recv_obj.set(*key, value);
+                            }
+                            return Ok(true);
+                        }
+                    }
+                }
+                current = proto_obj.prototype();
+            } else {
+                break;
+            }
+        }
+        // Fallback: set directly on receiver
+        if let Some(recv_obj) = receiver.as_object() {
+            let _ = recv_obj.set(*key, value);
+        }
+        Ok(true)
+    }
+
     /// Convert value to primitive per ES2023 §7.1.1.
     pub(crate) fn to_primitive(
         &self,
@@ -8172,6 +8280,62 @@ impl Interpreter {
         if !value.is_object() {
             return Ok(value.clone());
         }
+
+        // Handle proxy: use proxy_get for property lookups
+        if let Some(proxy) = value.as_proxy() {
+            // 1. @@toPrimitive
+            let to_prim_key = PropertyKey::Symbol(crate::intrinsics::well_known::to_primitive_symbol());
+            let to_prim_key_value = Value::symbol(crate::intrinsics::well_known::to_primitive_symbol());
+            let method = {
+                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                crate::proxy_operations::proxy_get(
+                    &mut ncx, proxy, &to_prim_key, to_prim_key_value, value.clone(),
+                )?
+            };
+            if !method.is_undefined() && !method.is_null() {
+                if !method.is_callable() {
+                    return Err(VmError::type_error(
+                        "Cannot convert object to primitive value",
+                    ));
+                }
+                let hint_str = match hint {
+                    PreferredType::Default => "default",
+                    PreferredType::Number => "number",
+                    PreferredType::String => "string",
+                };
+                let hint_val = Value::string(JsString::intern(hint_str));
+                let result = self.call_function(ctx, &method, value.clone(), &[hint_val])?;
+                if !result.is_object() {
+                    return Ok(result);
+                }
+                return Err(VmError::type_error("Cannot convert object to primitive value"));
+            }
+
+            // 2. OrdinaryToPrimitive via proxy
+            let (first, second) = match hint {
+                PreferredType::String => ("toString", "valueOf"),
+                _ => ("valueOf", "toString"),
+            };
+            for name in [first, second] {
+                let key = PropertyKey::string(name);
+                let key_value = Value::string(JsString::intern(name));
+                let method = {
+                    let mut ncx = crate::context::NativeContext::new(ctx, self);
+                    crate::proxy_operations::proxy_get(
+                        &mut ncx, proxy, &key, key_value, value.clone(),
+                    )?
+                };
+                if method.is_callable() {
+                    let result = self.call_function(ctx, &method, value.clone(), &[])?;
+                    if !result.is_object() {
+                        return Ok(result);
+                    }
+                }
+            }
+
+            return Err(VmError::type_error("Cannot convert object to primitive value"));
+        }
+
         let Some(obj) = value.as_object() else {
             return Ok(value.clone());
         };

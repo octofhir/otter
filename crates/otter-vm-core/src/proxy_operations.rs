@@ -60,7 +60,10 @@ fn get_property_value(
     key_value: Value,
 ) -> VmResult<Value> {
     if let Some(proxy) = receiver.as_proxy() {
-        return proxy_get(ncx, proxy, key, key_value, receiver.clone());
+        ncx.ctx.enter_native_call()?;
+        let result = proxy_get(ncx, proxy, key, key_value, receiver.clone());
+        ncx.ctx.exit_native_call();
+        return result;
     }
 
     let obj = receiver
@@ -91,7 +94,10 @@ fn target_get_own_property_descriptor(
     key_value: Value,
 ) -> VmResult<Option<PropertyDescriptor>> {
     if let Some(proxy) = target.as_proxy() {
-        return proxy_get_own_property_descriptor(ncx, proxy, key, key_value);
+        ncx.ctx.enter_native_call()?;
+        let result = proxy_get_own_property_descriptor(ncx, proxy, key, key_value);
+        ncx.ctx.exit_native_call();
+        return result;
     }
     let obj = target
         .as_object()
@@ -115,7 +121,10 @@ fn target_has(
     key_value: Value,
 ) -> VmResult<bool> {
     if let Some(proxy) = target.as_proxy() {
-        return proxy_has(ncx, proxy, key, key_value);
+        ncx.ctx.enter_native_call()?;
+        let result = proxy_has(ncx, proxy, key, key_value);
+        ncx.ctx.exit_native_call();
+        return result;
     }
     let obj = target
         .as_object()
@@ -125,7 +134,10 @@ fn target_has(
 
 fn target_is_extensible(ncx: &mut NativeContext, target: &Value) -> VmResult<bool> {
     if let Some(proxy) = target.as_proxy() {
-        return proxy_is_extensible(ncx, proxy);
+        ncx.ctx.enter_native_call()?;
+        let result = proxy_is_extensible(ncx, proxy);
+        ncx.ctx.exit_native_call();
+        return result;
     }
     let obj = target
         .as_object()
@@ -141,7 +153,10 @@ fn target_get(
     receiver: Value,
 ) -> VmResult<Value> {
     if let Some(proxy) = target.as_proxy() {
-        return proxy_get(ncx, proxy, key, key_value, receiver);
+        ncx.ctx.enter_native_call()?;
+        let result = proxy_get(ncx, proxy, key, key_value, receiver);
+        ncx.ctx.exit_native_call();
+        return result;
     }
     let obj = target
         .as_object()
@@ -158,7 +173,10 @@ fn target_set(
     receiver: Value,
 ) -> VmResult<bool> {
     if let Some(proxy) = target.as_proxy() {
-        return proxy_set(ncx, proxy, key, key_value, value, receiver);
+        ncx.ctx.enter_native_call()?;
+        let result = proxy_set(ncx, proxy, key, key_value, value, receiver);
+        ncx.ctx.exit_native_call();
+        return result;
     }
     let obj = target
         .as_object()
@@ -174,7 +192,10 @@ fn target_delete_property(
     key_value: Value,
 ) -> VmResult<bool> {
     if let Some(proxy) = target.as_proxy() {
-        return proxy_delete_property(ncx, proxy, key, key_value);
+        ncx.ctx.enter_native_call()?;
+        let result = proxy_delete_property(ncx, proxy, key, key_value);
+        ncx.ctx.exit_native_call();
+        return result;
     }
     let obj = target
         .as_object()
@@ -184,7 +205,10 @@ fn target_delete_property(
 
 fn target_own_keys(ncx: &mut NativeContext, target: &Value) -> VmResult<Vec<PropertyKey>> {
     if let Some(proxy) = target.as_proxy() {
-        return proxy_own_keys(ncx, proxy);
+        ncx.ctx.enter_native_call()?;
+        let result = proxy_own_keys(ncx, proxy);
+        ncx.ctx.exit_native_call();
+        return result;
     }
     let obj = target
         .as_object()
@@ -200,7 +224,10 @@ fn target_define_property(
     desc: &PropertyDescriptor,
 ) -> VmResult<bool> {
     if let Some(proxy) = target.as_proxy() {
-        return proxy_define_property(ncx, proxy, key, key_value, desc);
+        ncx.ctx.enter_native_call()?;
+        let result = proxy_define_property(ncx, proxy, key, key_value, desc);
+        ncx.ctx.exit_native_call();
+        return result;
     }
     let obj = target
         .as_object()
@@ -214,7 +241,10 @@ fn target_get_prototype_of(
     target: &Value,
 ) -> VmResult<Option<GcRef<JsObject>>> {
     if let Some(proxy) = target.as_proxy() {
-        return proxy_get_prototype_of(ncx, proxy);
+        ncx.ctx.enter_native_call()?;
+        let result = proxy_get_prototype_of(ncx, proxy);
+        ncx.ctx.exit_native_call();
+        return result;
     }
     let obj = target
         .as_object()
@@ -228,7 +258,10 @@ fn target_set_prototype_of(
     proto: Option<GcRef<JsObject>>,
 ) -> VmResult<bool> {
     if let Some(proxy) = target.as_proxy() {
-        return proxy_set_prototype_of(ncx, proxy, proto);
+        ncx.ctx.enter_native_call()?;
+        let result = proxy_set_prototype_of(ncx, proxy, proto);
+        ncx.ctx.exit_native_call();
+        return result;
     }
     let obj = target
         .as_object()
@@ -240,7 +273,10 @@ fn target_set_prototype_of(
 
 fn target_prevent_extensions(ncx: &mut NativeContext, target: &Value) -> VmResult<bool> {
     if let Some(proxy) = target.as_proxy() {
-        return proxy_prevent_extensions(ncx, proxy);
+        ncx.ctx.enter_native_call()?;
+        let result = proxy_prevent_extensions(ncx, proxy);
+        ncx.ctx.exit_native_call();
+        return result;
     }
     let obj = target
         .as_object()
@@ -1175,7 +1211,10 @@ pub fn proxy_apply(
         None => {
             // Default behavior: call target function
             if let Some(proxy) = target.as_proxy() {
-                return proxy_apply(ncx, proxy, this_value, args);
+                ncx.ctx.enter_native_call()?;
+                let result = proxy_apply(ncx, proxy, this_value, args);
+                ncx.ctx.exit_native_call();
+                return result;
             }
             ncx.call_function(&target, this_value, args)
         }
@@ -1208,12 +1247,14 @@ pub fn proxy_construct(
     let result = match trap_result {
         Some(r) => r,
         None => {
-            // Default behavior: construct with target
-            // This requires calling the constructor, which is complex
-            // For now, return an error indicating no default construct
-            return Err(VmError::type_error(
-                "Proxy construct requires a construct trap or direct target call",
-            ));
+            // Default behavior: Construct(target, argumentsList, newTarget)
+            if let Some(proxy) = target.as_proxy() {
+                ncx.ctx.enter_native_call()?;
+                let result = proxy_construct(ncx, proxy, args, new_target);
+                ncx.ctx.exit_native_call();
+                return result;
+            }
+            return ncx.call_function_construct(&target, Value::undefined(), args);
         }
     };
 

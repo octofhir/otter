@@ -127,7 +127,7 @@ impl TestReport {
         if !self.failures.is_empty() {
             println!();
             println!("{}", "=== Failures (first 10) ===".bold().red());
-            for failure in self.failures.iter().take(10) {
+            for failure in self.failures.iter().take(200) {
                 println!(
                     "  {} ({}) - {}",
                     failure.path.yellow(),

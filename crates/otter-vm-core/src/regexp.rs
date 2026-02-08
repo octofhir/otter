@@ -38,11 +38,6 @@ impl JsRegExp {
     ) -> Self {
         let proto_value = proto.map(Value::object).unwrap_or_else(Value::null);
         let object = GcRef::new(JsObject::new(proto_value, memory_manager));
-        let source = if pattern.is_empty() {
-            "(?:)".to_string()
-        } else {
-            pattern.clone()
-        };
         object.define_property(
             PropertyKey::string("lastIndex"),
             PropertyDescriptor::data_with_attrs(
@@ -54,47 +49,10 @@ impl JsRegExp {
                 },
             ),
         );
-        object.define_property(
-            PropertyKey::string("source"),
-            PropertyDescriptor::data_with_attrs(
-                Value::string(JsString::intern(&source)),
-                PropertyAttributes {
-                    writable: false,
-                    enumerable: false,
-                    configurable: false,
-                },
-            ),
-        );
-        object.define_property(
-            PropertyKey::string("flags"),
-            PropertyDescriptor::data_with_attrs(
-                Value::string(JsString::intern(&flags)),
-                PropertyAttributes {
-                    writable: false,
-                    enumerable: false,
-                    configurable: false,
-                },
-            ),
-        );
-        let flag_attrs = PropertyAttributes {
-            writable: false,
-            enumerable: false,
-            configurable: true,
-        };
-        let flag_prop = |name: &str, enabled: bool| {
-            object.define_property(
-                PropertyKey::string(name),
-                PropertyDescriptor::data_with_attrs(Value::boolean(enabled), flag_attrs),
-            );
-        };
-        flag_prop("global", flags.contains('g'));
-        flag_prop("ignoreCase", flags.contains('i'));
-        flag_prop("multiline", flags.contains('m'));
-        flag_prop("dotAll", flags.contains('s'));
-        flag_prop("sticky", flags.contains('y'));
-        flag_prop("unicode", flags.contains('u'));
-        flag_prop("unicodeSets", flags.contains('v'));
-        flag_prop("hasIndices", flags.contains('d'));
+        // Per spec, regex instances do NOT have own properties for flags, source,
+        // global, etc. These are accessor getters on RegExp.prototype that read
+        // from the [[RegExpMatcher]] internal slot (our JsRegExp struct fields).
+        // Only lastIndex is an own data property.
         let parsed_flags = Flags::from(flags.as_str());
         let unicode = parsed_flags.unicode || parsed_flags.unicode_sets;
         let native_regex = Regex::with_flags(&pattern, parsed_flags).ok();

@@ -10,8 +10,8 @@
 //! locality and reduces indirection for common cases where objects have few
 //! properties.
 
-use indexmap::IndexMap;
 use crate::object_cell::ObjectCell;
+use indexmap::IndexMap;
 use std::sync::Arc;
 
 use crate::gc::GcRef;
@@ -86,6 +86,13 @@ impl PropertyKey {
 
     /// Create from a GcRef<JsString>
     pub fn from_js_string(s: GcRef<JsString>) -> Self {
+        // Canonicalize numeric strings to Index for consistent lookup
+        let str_val = s.as_str();
+        if let Ok(n) = str_val.parse::<u32>() {
+            if n <= Self::MAX_ARRAY_INDEX && n.to_string() == str_val {
+                return Self::Index(n);
+            }
+        }
         Self::String(s)
     }
 
@@ -472,7 +479,7 @@ impl PartialDescriptor {
 ///
 /// Unlike `JsObject::get()` which returns `None` for accessor properties,
 /// this function invokes the getter function when the property is an accessor.
-fn get_value_full(
+pub(crate) fn get_value_full(
     obj: &crate::gc::GcRef<JsObject>,
     key: &PropertyKey,
     ncx: &mut crate::context::NativeContext<'_>,
@@ -494,6 +501,46 @@ fn get_value_full(
     } else {
         Ok(Value::undefined())
     }
+}
+
+/// Spec-compliant Set(O, P, V) that invokes JS setter for accessor properties.
+/// Unlike `JsObject::set()` which returns an error for accessors, this calls the setter.
+pub(crate) fn set_value_full(
+    obj: &crate::gc::GcRef<JsObject>,
+    key: &PropertyKey,
+    value: Value,
+    ncx: &mut crate::context::NativeContext<'_>,
+) -> Result<(), crate::error::VmError> {
+    // Check if the property is an accessor (own or inherited)
+    if let Some(desc) = obj.lookup_property_descriptor(key) {
+        match desc {
+            PropertyDescriptor::Accessor { set, .. } => {
+                if let Some(setter) = set {
+                    if !setter.is_undefined() {
+                        let this_val = Value::object(obj.clone());
+                        ncx.call_function(&setter, this_val, &[value])?;
+                        return Ok(());
+                    }
+                }
+                return Err(crate::error::VmError::type_error(
+                    "Cannot set property which has only a getter",
+                ));
+            }
+            PropertyDescriptor::Data { attributes, .. } => {
+                if !attributes.writable {
+                    return Err(crate::error::VmError::type_error(
+                        "Cannot assign to read only property",
+                    ));
+                }
+                let _ = obj.set(key.clone(), value);
+                return Ok(());
+            }
+            PropertyDescriptor::Deleted => {}
+        }
+    }
+    // Property doesn't exist or was deleted — add it
+    let _ = obj.set(key.clone(), value);
+    Ok(())
 }
 
 /// Parse a JS object into a PartialDescriptor (ES2026 §6.2.5.5 ToPropertyDescriptor).
@@ -554,8 +601,8 @@ pub fn to_property_descriptor(
     };
 
     let get = if has_get {
-        let g = get_value_full(attr_obj, &PropertyKey::from("get"), ncx)
-            .map_err(|e| e.to_string())?;
+        let g =
+            get_value_full(attr_obj, &PropertyKey::from("get"), ncx).map_err(|e| e.to_string())?;
         // Step 7.b: If getter is not callable and not undefined, throw TypeError
         if !g.is_undefined() && !g.is_callable() {
             return Err("Getter must be a function".to_string());
@@ -566,8 +613,8 @@ pub fn to_property_descriptor(
     };
 
     let set = if has_set {
-        let s = get_value_full(attr_obj, &PropertyKey::from("set"), ncx)
-            .map_err(|e| e.to_string())?;
+        let s =
+            get_value_full(attr_obj, &PropertyKey::from("set"), ncx).map_err(|e| e.to_string())?;
         // Step 8.b: If setter is not callable and not undefined, throw TypeError
         if !s.is_undefined() && !s.is_callable() {
             return Err("Setter must be a function".to_string());
@@ -617,9 +664,9 @@ pub struct JsObject {
     /// Can be Value::object, Value::proxy, or Value::null
     prototype: ObjectCell<Value>,
     /// Array elements (for array-like objects)
-    elements: ObjectCell<Vec<Value>>,
+    pub elements: ObjectCell<Vec<Value>>,
     /// Object flags (mutable for freeze/seal/preventExtensions)
-    flags: ObjectCell<ObjectFlags>,
+    pub flags: ObjectCell<ObjectFlags>,
     /// Memory manager for accounting
     memory_manager: Arc<crate::memory::MemoryManager>,
     /// Parameter mapping for mapped arguments objects (sloppy mode).
@@ -647,14 +694,13 @@ pub struct ObjectFlags {
     pub sparse_array_length: Option<u32>,
     /// Whether array length is writable (None = true, default)
     pub array_length_writable: Option<bool>,
+    /// String exotic object (new String("...")) — character indices are non-writable/non-configurable
+    pub is_string_exotic: bool,
 }
 
 impl JsObject {
     /// Create a new empty object (prototype can be object, proxy, or null)
-    pub fn new(
-        prototype: Value,
-        memory_manager: Arc<crate::memory::MemoryManager>,
-    ) -> Self {
+    pub fn new(prototype: Value, memory_manager: Arc<crate::memory::MemoryManager>) -> Self {
         // Assume basic object size for now
         let size = std::mem::size_of::<Self>();
         let _ = memory_manager.alloc(size); // ignore err in basic constructor for now or return Result
@@ -673,6 +719,20 @@ impl JsObject {
             memory_manager,
             argument_mapping: ObjectCell::new(None),
         }
+    }
+
+    /// Set up String exotic object: populate elements with characters and set flag.
+    /// ES §10.4.3: String exotic objects expose character-index properties.
+    pub fn setup_string_exotic(&self, s: &str) {
+        let mut elements = self.elements.borrow_mut();
+        elements.clear();
+        for ch in s.chars() {
+            let mut buf = [0u8; 4];
+            let cs = ch.encode_utf8(&mut buf);
+            elements.push(Value::string(JsString::intern(cs)));
+        }
+        drop(elements);
+        self.flags.borrow_mut().is_string_exotic = true;
     }
 
     /// Set the argument mapping for mapped arguments objects
@@ -892,7 +952,11 @@ impl JsObject {
 
     /// Debug: get number of non-None inline property slots
     pub fn get_inline_occupied_count(&self) -> usize {
-        self.inline_properties.borrow().iter().filter(|e| e.is_some()).count()
+        self.inline_properties
+            .borrow()
+            .iter()
+            .filter(|e| e.is_some())
+            .count()
     }
 
     /// Transition object to dictionary mode.
@@ -955,6 +1019,23 @@ impl JsObject {
             }
             drop(flags);
             return Some(Value::int32(self.elements.borrow().len() as i32));
+        }
+
+        // String exotic objects: synthesize "length" and character indices
+        if self.flags.borrow().is_string_exotic {
+            if let PropertyKey::String(s) = key {
+                if s.as_str() == "length" {
+                    return Some(Value::int32(self.elements.borrow().len() as i32));
+                }
+            }
+            if let PropertyKey::Index(i) = key {
+                let elements = self.elements.borrow();
+                let idx = *i as usize;
+                if idx < elements.len() {
+                    return Some(elements[idx].clone());
+                }
+                return None;
+            }
         }
 
         // Dictionary mode: use HashMap lookup
@@ -1024,7 +1105,9 @@ impl JsObject {
                     if let Some(dict) = proto_obj.dictionary_properties.borrow().as_ref() {
                         if let Some(entry) = dict.get(key) {
                             match &entry.desc {
-                                PropertyDescriptor::Data { value, .. } => return Some(value.clone()),
+                                PropertyDescriptor::Data { value, .. } => {
+                                    return Some(value.clone());
+                                }
                                 PropertyDescriptor::Accessor { .. } => return None,
                                 PropertyDescriptor::Deleted => {}
                             }
@@ -1156,6 +1239,39 @@ impl JsObject {
             }
         }
 
+        // ES §10.4.3.1: String exotic [[GetOwnProperty]] — synthesize
+        // character-index descriptors and "length" for String wrapper objects.
+        if self.flags.borrow().is_string_exotic {
+            if let PropertyKey::String(s) = key {
+                if s.as_str() == "length" {
+                    let len = self.elements.borrow().len();
+                    return Some(PropertyDescriptor::Data {
+                        value: Value::number(len as f64),
+                        attributes: PropertyAttributes {
+                            writable: false,
+                            enumerable: false,
+                            configurable: false,
+                        },
+                    });
+                }
+            }
+            if let PropertyKey::Index(i) = key {
+                let elements = self.elements.borrow();
+                let idx = *i as usize;
+                if idx < elements.len() {
+                    return Some(PropertyDescriptor::Data {
+                        value: elements[idx].clone(),
+                        attributes: PropertyAttributes {
+                            writable: false,
+                            enumerable: true,
+                            configurable: false,
+                        },
+                    });
+                }
+                return None;
+            }
+        }
+
         // Dictionary mode: lookup in HashMap first (may contain accessor properties)
         if self.is_dictionary_mode() {
             if let Some(dict) = self.dictionary_properties.borrow().as_ref() {
@@ -1281,6 +1397,21 @@ impl JsObject {
             }
         }
 
+        // String exotic objects: character indices are non-writable
+        if flags.is_string_exotic {
+            if let PropertyKey::Index(i) = &key {
+                let idx = *i as usize;
+                if idx < self.elements.borrow().len() {
+                    return Err(SetPropertyError::NonWritable);
+                }
+            }
+            if let PropertyKey::String(s) = &key {
+                if s.as_str() == "length" {
+                    return Err(SetPropertyError::NonWritable);
+                }
+            }
+        }
+
         // Handle indexed elements for arrays
         if let PropertyKey::Index(i) = &key {
             let idx = *i as usize;
@@ -1330,9 +1461,15 @@ impl JsObject {
                             }
                             // Preserve existing attributes, only update value
                             let attrs = *attributes;
-                            map.insert(key, PropertyEntry {
-                                desc: PropertyDescriptor::Data { value, attributes: attrs },
-                            });
+                            map.insert(
+                                key,
+                                PropertyEntry {
+                                    desc: PropertyDescriptor::Data {
+                                        value,
+                                        attributes: attrs,
+                                    },
+                                },
+                            );
                             return Ok(());
                         }
                         PropertyDescriptor::Accessor { .. } => {
@@ -1452,16 +1589,28 @@ impl JsObject {
                 // Configurable descriptor - proceed with deletion below
             }
 
-            // Array element deletion: set to hole (absent).
-            // This correctly models sparse arrays: `i in arr` will return false
-            // and iteration methods will skip holes per spec.
+            // ES §10.4.2.1 [[Delete]](P): Deleting an indexed property creates
+            // a hole but NEVER changes the array's length. We set the element to
+            // hole, then compact trailing holes to save memory, but preserve the
+            // original length via sparse_array_length so array_length() stays
+            // correct.
             let idx = *i as usize;
             let mut elements = self.elements.borrow_mut();
             if idx < elements.len() {
+                let original_len = elements.len();
                 elements[idx] = Value::hole();
                 // Trim trailing holes to keep elements vec compact
                 while elements.last().map_or(false, |v| v.is_hole()) {
                     elements.pop();
+                }
+                let new_len = elements.len();
+                drop(elements); // Must drop before calling array_length()
+                // If trimming shortened the vec AND this is an array, preserve
+                // the original length so array_length() returns the spec-correct value.
+                // ES §10.4.2.1 [[Delete]](P): delete does NOT change length.
+                if self.is_array() && new_len < original_len {
+                    let len = self.array_length().max(original_len);
+                    self.flags.borrow_mut().sparse_array_length = Some(len as u32);
                 }
             }
             return true;
@@ -1522,6 +1671,28 @@ impl JsObject {
 
     /// Check if object has own property
     pub fn has_own(&self, key: &PropertyKey) -> bool {
+        // Array "length" is a virtual property (synthesized, not stored in shape)
+        if self.is_array() {
+            if let PropertyKey::String(s) = key {
+                if s.as_str() == "length" {
+                    return true;
+                }
+            }
+        }
+
+        // String exotic objects: character indices and "length" are own properties
+        if self.flags.borrow().is_string_exotic {
+            if let PropertyKey::String(s) = key {
+                if s.as_str() == "length" {
+                    return true;
+                }
+            }
+            if let PropertyKey::Index(i) = key {
+                let idx = *i as usize;
+                return idx < self.elements.borrow().len();
+            }
+        }
+
         // Dictionary mode: check HashMap
         if self.is_dictionary_mode() {
             if let Some(dict) = self.dictionary_properties.borrow().as_ref() {
@@ -1687,11 +1858,15 @@ impl JsObject {
             match (current, desc) {
                 // Cannot convert data to accessor on non-configurable property
                 (PropertyDescriptor::Data { .. }, PropertyDescriptor::Accessor { .. }) => {
-                    return Err("Cannot convert data property to accessor on non-configurable property");
+                    return Err(
+                        "Cannot convert data property to accessor on non-configurable property",
+                    );
                 }
                 // Cannot convert accessor to data on non-configurable property
                 (PropertyDescriptor::Accessor { .. }, PropertyDescriptor::Data { .. }) => {
-                    return Err("Cannot convert accessor property to data on non-configurable property");
+                    return Err(
+                        "Cannot convert accessor property to data on non-configurable property",
+                    );
                 }
                 // Data to data: check writable constraints
                 (
@@ -2072,9 +2247,7 @@ impl JsObject {
                 }
 
                 // Step 8: Both accessor descriptors
-                if desc_is_accessor
-                    && matches!(existing, PropertyDescriptor::Accessor { .. })
-                {
+                if desc_is_accessor && matches!(existing, PropertyDescriptor::Accessor { .. }) {
                     if let PropertyDescriptor::Accessor {
                         get: curr_get,
                         set: curr_set,
@@ -2084,16 +2257,14 @@ impl JsObject {
                         if !current_configurable {
                             // Step 8.a.i: Cannot change set
                             if let Some(ref new_set) = desc.set {
-                                let curr_set_val =
-                                    curr_set.clone().unwrap_or(Value::undefined());
+                                let curr_set_val = curr_set.clone().unwrap_or(Value::undefined());
                                 if !same_value(&curr_set_val, new_set) {
                                     return false;
                                 }
                             }
                             // Step 8.a.ii: Cannot change get
                             if let Some(ref new_get) = desc.get {
-                                let curr_get_val =
-                                    curr_get.clone().unwrap_or(Value::undefined());
+                                let curr_get_val = curr_get.clone().unwrap_or(Value::undefined());
                                 if !same_value(&curr_get_val, new_get) {
                                     return false;
                                 }
@@ -2175,8 +2346,16 @@ impl JsObject {
                     let get_val = desc.get.clone().unwrap_or(Value::undefined());
                     let set_val = desc.set.clone().unwrap_or(Value::undefined());
                     PropertyDescriptor::Accessor {
-                        get: if get_val.is_undefined() { None } else { Some(get_val) },
-                        set: if set_val.is_undefined() { None } else { Some(set_val) },
+                        get: if get_val.is_undefined() {
+                            None
+                        } else {
+                            Some(get_val)
+                        },
+                        set: if set_val.is_undefined() {
+                            None
+                        } else {
+                            Some(set_val)
+                        },
                         attributes: PropertyAttributes {
                             writable: false,
                             enumerable: desc.enumerable.unwrap_or(false),
@@ -2367,10 +2546,12 @@ impl JsObject {
         if idx < elements_len {
             // Element exists - check current descriptor from shape first
             let key = PropertyKey::Index(index);
-            if let Some(existing) = {
+            if let Some(_existing) = {
                 // Check shape for non-default attributes
                 let shape = self.shape.borrow();
-                shape.get_offset(&key).and_then(|off| self.get_property_entry_by_offset(off))
+                shape
+                    .get_offset(&key)
+                    .and_then(|off| self.get_property_entry_by_offset(off))
             } {
                 // Has explicit descriptor in shape - use ordinary path
                 return self.ordinary_define_own_property(key, desc);
@@ -2441,8 +2622,16 @@ impl JsObject {
                     let get_val = desc.get.clone().unwrap_or(Value::undefined());
                     let set_val = desc.set.clone().unwrap_or(Value::undefined());
                     PropertyDescriptor::Accessor {
-                        get: if get_val.is_undefined() { None } else { Some(get_val) },
-                        set: if set_val.is_undefined() { None } else { Some(set_val) },
+                        get: if get_val.is_undefined() {
+                            None
+                        } else {
+                            Some(get_val)
+                        },
+                        set: if set_val.is_undefined() {
+                            None
+                        } else {
+                            Some(set_val)
+                        },
                         attributes: PropertyAttributes {
                             writable: false,
                             enumerable: desc.enumerable.unwrap_or(false),
@@ -2494,7 +2683,11 @@ impl JsObject {
                     return true;
                 }
                 if desc_is_data && current_is_data {
-                    if let PropertyDescriptor::Data { value: curr_val, attributes: curr_attrs } = existing {
+                    if let PropertyDescriptor::Data {
+                        value: curr_val,
+                        attributes: curr_attrs,
+                    } = existing
+                    {
                         if !current_configurable && !curr_attrs.writable {
                             if desc.writable == Some(true) {
                                 return false;
@@ -2511,7 +2704,12 @@ impl JsObject {
                     return true;
                 }
                 if desc_is_accessor && matches!(existing, PropertyDescriptor::Accessor { .. }) {
-                    if let PropertyDescriptor::Accessor { get: curr_get, set: curr_set, .. } = &existing {
+                    if let PropertyDescriptor::Accessor {
+                        get: curr_get,
+                        set: curr_set,
+                        ..
+                    } = &existing
+                    {
                         if !current_configurable {
                             if let Some(ref new_set) = desc.set {
                                 let curr_set_val = curr_set.clone().unwrap_or(Value::undefined());
@@ -2777,7 +2975,10 @@ impl JsObject {
 
     /// Pop element from array
     pub fn array_pop(&self) -> Value {
-        self.elements.borrow_mut().pop().unwrap_or_else(Value::undefined)
+        self.elements
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(Value::undefined)
     }
 
     /// Get inline properties storage (for GC tracing)
@@ -2959,11 +3160,17 @@ mod tests {
         assert!(!obj.is_extensible());
 
         // Cannot modify existing property
-        assert!(obj.set(PropertyKey::string("foo"), Value::int32(100)).is_err());
+        assert!(
+            obj.set(PropertyKey::string("foo"), Value::int32(100))
+                .is_err()
+        );
         assert_eq!(obj.get(&PropertyKey::string("foo")), Some(Value::int32(42)));
 
         // Cannot add new property
-        assert!(obj.set(PropertyKey::string("bar"), Value::int32(200)).is_err());
+        assert!(
+            obj.set(PropertyKey::string("bar"), Value::int32(200))
+                .is_err()
+        );
         assert_eq!(obj.get(&PropertyKey::string("bar")), None);
 
         // Cannot delete property
@@ -2986,14 +3193,20 @@ mod tests {
         assert!(!obj.is_extensible());
 
         // CAN modify existing property (seal allows writes, freeze doesn't)
-        assert!(obj.set(PropertyKey::string("foo"), Value::int32(100)).is_ok());
+        assert!(
+            obj.set(PropertyKey::string("foo"), Value::int32(100))
+                .is_ok()
+        );
         assert_eq!(
             obj.get(&PropertyKey::string("foo")),
             Some(Value::int32(100))
         );
 
         // Cannot add new property
-        assert!(obj.set(PropertyKey::string("bar"), Value::int32(200)).is_err());
+        assert!(
+            obj.set(PropertyKey::string("bar"), Value::int32(200))
+                .is_err()
+        );
         assert_eq!(obj.get(&PropertyKey::string("bar")), None);
 
         // Cannot delete property
@@ -3015,10 +3228,16 @@ mod tests {
         assert!(!obj.is_frozen());
 
         // CAN modify existing property
-        assert!(obj.set(PropertyKey::string("foo"), Value::int32(100)).is_ok());
+        assert!(
+            obj.set(PropertyKey::string("foo"), Value::int32(100))
+                .is_ok()
+        );
 
         // Cannot add new property
-        assert!(obj.set(PropertyKey::string("bar"), Value::int32(200)).is_err());
+        assert!(
+            obj.set(PropertyKey::string("bar"), Value::int32(200))
+                .is_err()
+        );
 
         // Can delete existing (configurable) property even if not extensible
         assert!(obj.delete(&PropertyKey::string("foo")));
@@ -3077,8 +3296,14 @@ mod tests {
     fn test_prototype_cycle_prevention() {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         let obj1 = GcRef::new(JsObject::new(Value::null(), Arc::clone(&memory_manager)));
-        let obj2 = GcRef::new(JsObject::new(Value::object(obj1), Arc::clone(&memory_manager)));
-        let obj3 = GcRef::new(JsObject::new(Value::object(obj2), Arc::clone(&memory_manager)));
+        let obj2 = GcRef::new(JsObject::new(
+            Value::object(obj1),
+            Arc::clone(&memory_manager),
+        ));
+        let obj3 = GcRef::new(JsObject::new(
+            Value::object(obj2),
+            Arc::clone(&memory_manager),
+        ));
 
         // Attempting to create a cycle should fail
         // obj1 -> obj2 -> obj3 -> obj1 would be a cycle

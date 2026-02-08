@@ -321,7 +321,7 @@ fn main() {
 
     // Suppress default panic output — panics are caught by catch_unwind
     // in the runner and reported as Crash/Fail outcomes.
-    std::panic::set_hook(Box::new(|_| {}));
+    // std::panic::set_hook(Box::new(|_| {}));
 
     const STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MB
     let builder = std::thread::Builder::new()

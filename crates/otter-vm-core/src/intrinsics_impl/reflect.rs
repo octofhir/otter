@@ -39,7 +39,8 @@ pub fn to_property_key(value: &Value) -> PropertyKey {
         }
     }
     if let Some(s) = value.as_string() {
-        return PropertyKey::String(s);
+        // Use PropertyKey::string() to canonicalize numeric strings like "0" → Index(0)
+        return PropertyKey::string(s.as_str());
     }
     if let Some(sym) = value.as_symbol() {
         return PropertyKey::Symbol(sym);
@@ -348,11 +349,7 @@ pub fn install_reflect_namespace(
 
         let result = GcRef::new(JsObject::array(keys.len(), ncx.memory_manager().clone()));
         for (i, key) in keys.into_iter().enumerate() {
-            let key_val = match key {
-                PropertyKey::String(s) => Value::string(s),
-                PropertyKey::Index(n) => Value::string(JsString::intern(&n.to_string())),
-                PropertyKey::Symbol(_) => continue, // Skip symbols for now
-            };
+            let key_val = crate::proxy_operations::property_key_to_value_pub(&key);
             let _ = result.set(PropertyKey::Index(i as u32), key_val);
         }
 

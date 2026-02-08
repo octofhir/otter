@@ -2,15 +2,15 @@
 //!
 //! All Object methods for ES2026 standard.
 
+use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::intrinsics::well_known;
+use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
-use crate::value::Value;
-use crate::context::NativeContext;
-use crate::memory::MemoryManager;
 use crate::value::Symbol;
+use crate::value::Value;
 use std::sync::Arc;
 
 fn get_builtin_proto(global: &GcRef<JsObject>, name: &str) -> Option<GcRef<JsObject>> {
@@ -21,12 +21,17 @@ fn get_builtin_proto(global: &GcRef<JsObject>, name: &str) -> Option<GcRef<JsObj
         .and_then(|v| v.as_object())
 }
 
-fn to_object_for_builtin(ncx: &mut NativeContext<'_>, value: &Value) -> Result<GcRef<JsObject>, VmError> {
+pub(crate) fn to_object_for_builtin(
+    ncx: &mut NativeContext<'_>,
+    value: &Value,
+) -> Result<GcRef<JsObject>, VmError> {
     if let Some(obj) = value.as_object() {
         return Ok(obj);
     }
     if value.is_null() || value.is_undefined() {
-        return Err(VmError::type_error("Cannot convert undefined or null to object"));
+        return Err(VmError::type_error(
+            "Cannot convert undefined or null to object",
+        ));
     }
 
     let global = ncx.ctx.global();
@@ -47,7 +52,8 @@ fn to_object_for_builtin(ncx: &mut NativeContext<'_>, value: &Value) -> Result<G
         ("Object", "__value__", value.clone())
     };
 
-    let proto = get_builtin_proto(&global, proto_name).or_else(|| get_builtin_proto(&global, "Object"));
+    let proto =
+        get_builtin_proto(&global, proto_name).or_else(|| get_builtin_proto(&global, "Object"));
     let obj = GcRef::new(JsObject::new(
         proto.map(Value::object).unwrap_or_else(Value::null),
         mm,
@@ -92,9 +98,11 @@ pub fn init_object_prototype(
 
                 fn is_array_value(value: &Value) -> Result<bool, VmError> {
                     if let Some(proxy) = value.as_proxy() {
-                        let target = proxy
-                            .target()
-                            .ok_or_else(|| VmError::type_error("Cannot perform 'get' on a proxy that has been revoked"))?;
+                        let target = proxy.target().ok_or_else(|| {
+                            VmError::type_error(
+                                "Cannot perform 'get' on a proxy that has been revoked",
+                            )
+                        })?;
                         return is_array_value(&target);
                     }
                     if let Some(obj) = value.as_object() {
@@ -132,7 +140,13 @@ pub fn init_object_prototype(
                         description: None,
                         id: well_known::TO_STRING_TAG,
                     }));
-                    crate::proxy_operations::proxy_get(ncx, proxy, &key, key_value, this_val.clone())?
+                    crate::proxy_operations::proxy_get(
+                        ncx,
+                        proxy,
+                        &key,
+                        key_value,
+                        this_val.clone(),
+                    )?
                 } else if let Some(obj) = this_val.as_object() {
                     obj.get(&PropertyKey::Symbol(well_known::to_string_tag_symbol()))
                         .unwrap_or(Value::undefined())
@@ -145,7 +159,10 @@ pub fn init_object_prototype(
                     .map(|s| s.as_str().to_string())
                     .unwrap_or_else(|| builtin_tag.to_string());
 
-                Ok(Value::string(JsString::intern(&format!("[object {}]", tag))))
+                Ok(Value::string(JsString::intern(&format!(
+                    "[object {}]",
+                    tag
+                ))))
             },
             mm.clone(),
             fn_proto.clone(),
@@ -170,13 +187,13 @@ pub fn init_object_prototype(
                 let key_val = args.first().cloned().unwrap_or(Value::undefined());
                 use crate::intrinsics_impl::reflect::to_property_key;
 
-                // Handle proxy
+                // Handle proxy: hasOwnProperty uses [[GetOwnProperty]], not [[HasProperty]]
                 if let Some(proxy) = this_val.as_proxy() {
                     let key = to_property_key(&key_val);
-
-                    // Use proxy_has which goes through the 'has' trap
-                    let result = crate::proxy_operations::proxy_has(ncx, proxy, &key, key_val)?;
-                    return Ok(Value::boolean(result));
+                    let desc = crate::proxy_operations::proxy_get_own_property_descriptor(
+                        ncx, proxy, &key, key_val,
+                    )?;
+                    return Ok(Value::boolean(desc.is_some()));
                 }
 
                 let obj = to_object_for_builtin(ncx, this_val)?;
@@ -225,12 +242,11 @@ pub fn init_object_prototype(
                 if let Some(proxy) = this_val.as_proxy() {
                     let key = to_property_key(&key_val);
                     let desc = crate::proxy_operations::proxy_get_own_property_descriptor(
-                        ncx,
-                        proxy,
-                        &key,
-                        key_val,
+                        ncx, proxy, &key, key_val,
                     )?;
-                    return Ok(Value::boolean(desc.map(|d| d.enumerable()).unwrap_or(false)));
+                    return Ok(Value::boolean(
+                        desc.map(|d| d.enumerable()).unwrap_or(false),
+                    ));
                 }
 
                 let obj = to_object_for_builtin(ncx, this_val)?;
@@ -260,8 +276,7 @@ pub fn init_object_constructor(
             |_this, args, ncx| {
                 let target = args.first().cloned().unwrap_or(Value::undefined());
                 if let Some(proxy) = target.as_proxy() {
-                    let proto =
-                        crate::proxy_operations::proxy_get_prototype_of(ncx, proxy)?;
+                    let proto = crate::proxy_operations::proxy_get_prototype_of(ncx, proxy)?;
                     return Ok(proto.map(Value::object).unwrap_or_else(Value::null));
                 }
                 if let Some(obj) = target.as_object() {
@@ -298,20 +313,30 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("setPrototypeOf"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _ncx| {
+            |_this, args, ncx| {
                 let target = args.first().cloned().unwrap_or(Value::undefined());
+                let proto_val = args.get(1).cloned().unwrap_or(Value::undefined());
+                let proto_value = if proto_val.is_null() {
+                    Value::null()
+                } else if proto_val.is_object() {
+                    // is_object() returns true for proxies too
+                    proto_val
+                } else {
+                    return Err(VmError::type_error(
+                        "Object prototype may only be an Object or null",
+                    ));
+                };
+
+                // Handle proxy target
+                if let Some(proxy) = target.as_proxy() {
+                    let new_proto = proto_value.as_object();
+                    crate::proxy_operations::proxy_set_prototype_of(ncx, proxy, new_proto)?;
+                    return Ok(target);
+                }
+
                 if let Some(obj) = target.as_object() {
-                    let proto_val = args.get(1).cloned().unwrap_or(Value::undefined());
-                    let proto = if proto_val.is_null() {
-                        None
-                    } else {
-                        proto_val.as_object()
-                    };
-                    let proto_value = proto.map(Value::object).unwrap_or_else(Value::null);
                     if !obj.set_prototype(proto_value) {
-                        return Err(
-                            VmError::type_error("Object.setPrototypeOf failed")
-                        );
+                        return Err(VmError::type_error("Object.setPrototypeOf failed"));
                     }
                 }
                 Ok(target)
@@ -333,30 +358,60 @@ pub fn init_object_constructor(
                         let key_val = args.get(1).cloned().unwrap_or(Value::undefined());
                         use crate::intrinsics_impl::reflect::to_property_key;
                         let key = to_property_key(&key_val);
-                        let result_desc = crate::proxy_operations::proxy_get_own_property_descriptor(
-                            ncx_inner,
-                            proxy,
-                            &key,
-                            key_val.clone(),
-                        )?;
+                        let result_desc =
+                            crate::proxy_operations::proxy_get_own_property_descriptor(
+                                ncx_inner,
+                                proxy,
+                                &key,
+                                key_val.clone(),
+                            )?;
 
                         if let Some(desc) = result_desc {
                             let obj_proto = get_builtin_proto(&ncx_inner.global(), "Object")
                                 .map(Value::object)
                                 .unwrap_or(Value::null());
-                            let desc_obj = GcRef::new(JsObject::new(obj_proto, ncx_inner.memory_manager().clone()));
+                            let desc_obj = GcRef::new(JsObject::new(
+                                obj_proto,
+                                ncx_inner.memory_manager().clone(),
+                            ));
                             match &desc {
                                 PropertyDescriptor::Data { value, attributes } => {
-                                    let _ = desc_obj.set(PropertyKey::string("value"), value.clone());
-                                    let _ = desc_obj.set(PropertyKey::string("writable"), Value::boolean(attributes.writable));
-                                    let _ = desc_obj.set(PropertyKey::string("enumerable"), Value::boolean(attributes.enumerable));
-                                    let _ = desc_obj.set(PropertyKey::string("configurable"), Value::boolean(attributes.configurable));
+                                    let _ =
+                                        desc_obj.set(PropertyKey::string("value"), value.clone());
+                                    let _ = desc_obj.set(
+                                        PropertyKey::string("writable"),
+                                        Value::boolean(attributes.writable),
+                                    );
+                                    let _ = desc_obj.set(
+                                        PropertyKey::string("enumerable"),
+                                        Value::boolean(attributes.enumerable),
+                                    );
+                                    let _ = desc_obj.set(
+                                        PropertyKey::string("configurable"),
+                                        Value::boolean(attributes.configurable),
+                                    );
                                 }
-                                PropertyDescriptor::Accessor { get, set, attributes } => {
-                                    let _ = desc_obj.set(PropertyKey::string("get"), get.clone().unwrap_or(Value::undefined()));
-                                    let _ = desc_obj.set(PropertyKey::string("set"), set.clone().unwrap_or(Value::undefined()));
-                                    let _ = desc_obj.set(PropertyKey::string("enumerable"), Value::boolean(attributes.enumerable));
-                                    let _ = desc_obj.set(PropertyKey::string("configurable"), Value::boolean(attributes.configurable));
+                                PropertyDescriptor::Accessor {
+                                    get,
+                                    set,
+                                    attributes,
+                                } => {
+                                    let _ = desc_obj.set(
+                                        PropertyKey::string("get"),
+                                        get.clone().unwrap_or(Value::undefined()),
+                                    );
+                                    let _ = desc_obj.set(
+                                        PropertyKey::string("set"),
+                                        set.clone().unwrap_or(Value::undefined()),
+                                    );
+                                    let _ = desc_obj.set(
+                                        PropertyKey::string("enumerable"),
+                                        Value::boolean(attributes.enumerable),
+                                    );
+                                    let _ = desc_obj.set(
+                                        PropertyKey::string("configurable"),
+                                        Value::boolean(attributes.configurable),
+                                    );
                                 }
                                 PropertyDescriptor::Deleted => {}
                             }
@@ -396,7 +451,11 @@ pub fn init_object_constructor(
                                 Value::boolean(attributes.configurable),
                             );
                         }
-                        PropertyDescriptor::Accessor { get, set, attributes } => {
+                        PropertyDescriptor::Accessor {
+                            get,
+                            set,
+                            attributes,
+                        } => {
                             let _ = desc_obj.set(
                                 PropertyKey::string("get"),
                                 get.clone().unwrap_or(Value::undefined()),
@@ -528,7 +587,10 @@ pub fn init_object_constructor(
                     };
                     let desc = if let Some(p) = proxy {
                         crate::proxy_operations::proxy_get_own_property_descriptor(
-                            ncx, p, &key, key_value.clone(),
+                            ncx,
+                            p,
+                            &key,
+                            key_value.clone(),
                         )?
                     } else {
                         obj.unwrap().get_own_property_descriptor(&key)
@@ -539,7 +601,11 @@ pub fn init_object_constructor(
                         }
                         let value = if let Some(p) = proxy {
                             crate::proxy_operations::proxy_get(
-                                ncx, p, &key, key_value, receiver.clone(),
+                                ncx,
+                                p,
+                                &key,
+                                key_value,
+                                receiver.clone(),
                             )?
                         } else {
                             obj.unwrap().get(&key).unwrap_or(Value::undefined())
@@ -547,7 +613,8 @@ pub fn init_object_constructor(
                         values.push(value);
                     }
                 }
-                let result = GcRef::new(JsObject::array(values.len(), ncx.memory_manager().clone()));
+                let result =
+                    GcRef::new(JsObject::array(values.len(), ncx.memory_manager().clone()));
                 if let Some(array_ctor) = ncx.global().get(&PropertyKey::string("Array")) {
                     if let Some(array_obj) = array_ctor.as_object() {
                         if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
@@ -595,7 +662,10 @@ pub fn init_object_constructor(
                     };
                     let desc = if let Some(p) = proxy {
                         crate::proxy_operations::proxy_get_own_property_descriptor(
-                            ncx_inner, p, &key, key_value.clone(),
+                            ncx_inner,
+                            p,
+                            &key,
+                            key_value.clone(),
                         )?
                     } else {
                         obj.unwrap().get_own_property_descriptor(&key)
@@ -606,7 +676,11 @@ pub fn init_object_constructor(
                         }
                         let value = if let Some(p) = proxy {
                             crate::proxy_operations::proxy_get(
-                                ncx_inner, p, &key, key_value, receiver.clone(),
+                                ncx_inner,
+                                p,
+                                &key,
+                                key_value,
+                                receiver.clone(),
                             )?
                         } else {
                             obj.unwrap().get(&key).unwrap_or(Value::undefined())
@@ -618,10 +692,8 @@ pub fn init_object_constructor(
                             }
                             _ => continue,
                         };
-                        let entry = GcRef::new(JsObject::array(
-                            2,
-                            ncx_inner.memory_manager().clone(),
-                        ));
+                        let entry =
+                            GcRef::new(JsObject::array(2, ncx_inner.memory_manager().clone()));
                         if let Some(array_ctor) =
                             ncx_inner.global().get(&PropertyKey::string("Array"))
                         {
@@ -670,9 +742,7 @@ pub fn init_object_constructor(
             |_this, args, _ncx| {
                 let target_val = args
                     .first()
-                    .ok_or_else(|| {
-                        "Object.assign requires at least one argument".to_string()
-                    })?;
+                    .ok_or_else(|| "Object.assign requires at least one argument".to_string())?;
                 let target = target_val
                     .as_object()
                     .ok_or_else(|| "Object.assign target must be an object".to_string())?;
@@ -708,9 +778,9 @@ pub fn init_object_constructor(
                     .first()
                     .and_then(|v| v.as_object())
                     .ok_or_else(|| "Object.hasOwn requires an object".to_string())?;
-                let prop = args.get(1).ok_or_else(|| {
-                    "Object.hasOwn requires a property key".to_string()
-                })?;
+                let prop = args
+                    .get(1)
+                    .ok_or_else(|| "Object.hasOwn requires a property key".to_string())?;
                 let key = crate::intrinsics_impl::reflect::to_property_key(prop);
                 Ok(Value::boolean(obj.has_own(&key)))
             },
@@ -731,28 +801,47 @@ pub fn init_object_constructor(
                     let keys = crate::proxy_operations::proxy_own_keys(ncx, proxy)?;
                     for key in &keys {
                         let key_value = crate::proxy_operations::property_key_to_value_pub(key);
-                        if let Some(desc) = crate::proxy_operations::proxy_get_own_property_descriptor(ncx, proxy, key, key_value.clone())? {
+                        if let Some(desc) =
+                            crate::proxy_operations::proxy_get_own_property_descriptor(
+                                ncx,
+                                proxy,
+                                key,
+                                key_value.clone(),
+                            )?
+                        {
                             let frozen_desc = match desc {
                                 PropertyDescriptor::Data { value, attributes } => {
-                                    PropertyDescriptor::data_with_attrs(value, PropertyAttributes {
-                                        writable: false,
-                                        enumerable: attributes.enumerable,
-                                        configurable: false,
-                                    })
-                                }
-                                PropertyDescriptor::Accessor { get, set, attributes } => {
-                                    PropertyDescriptor::Accessor {
-                                        get, set,
-                                        attributes: PropertyAttributes {
+                                    PropertyDescriptor::data_with_attrs(
+                                        value,
+                                        PropertyAttributes {
                                             writable: false,
                                             enumerable: attributes.enumerable,
                                             configurable: false,
                                         },
-                                    }
+                                    )
                                 }
+                                PropertyDescriptor::Accessor {
+                                    get,
+                                    set,
+                                    attributes,
+                                } => PropertyDescriptor::Accessor {
+                                    get,
+                                    set,
+                                    attributes: PropertyAttributes {
+                                        writable: false,
+                                        enumerable: attributes.enumerable,
+                                        configurable: false,
+                                    },
+                                },
                                 PropertyDescriptor::Deleted => continue,
                             };
-                            let _ = crate::proxy_operations::proxy_define_property(ncx, proxy, key, key_value, &frozen_desc)?;
+                            let _ = crate::proxy_operations::proxy_define_property(
+                                ncx,
+                                proxy,
+                                key,
+                                key_value,
+                                &frozen_desc,
+                            )?;
                         }
                     }
                 } else if let Some(obj) = obj_val.as_object() {
@@ -778,7 +867,11 @@ pub fn init_object_constructor(
                     let keys = crate::proxy_operations::proxy_own_keys(ncx, proxy)?;
                     for key in &keys {
                         let key_value = crate::proxy_operations::property_key_to_value_pub(key);
-                        if let Some(desc) = crate::proxy_operations::proxy_get_own_property_descriptor(ncx, proxy, key, key_value)? {
+                        if let Some(desc) =
+                            crate::proxy_operations::proxy_get_own_property_descriptor(
+                                ncx, proxy, key, key_value,
+                            )?
+                        {
                             if desc.is_configurable() {
                                 return Ok(Value::boolean(false));
                             }
@@ -791,10 +884,7 @@ pub fn init_object_constructor(
                     }
                     return Ok(Value::boolean(true));
                 }
-                let is_frozen = arg
-                    .as_object()
-                    .map(|o| o.is_frozen())
-                    .unwrap_or(true);
+                let is_frozen = arg.as_object().map(|o| o.is_frozen()).unwrap_or(true);
                 Ok(Value::boolean(is_frozen))
             },
             mm.clone(),
@@ -814,28 +904,47 @@ pub fn init_object_constructor(
                     let keys = crate::proxy_operations::proxy_own_keys(ncx, proxy)?;
                     for key in &keys {
                         let key_value = crate::proxy_operations::property_key_to_value_pub(key);
-                        if let Some(desc) = crate::proxy_operations::proxy_get_own_property_descriptor(ncx, proxy, key, key_value.clone())? {
+                        if let Some(desc) =
+                            crate::proxy_operations::proxy_get_own_property_descriptor(
+                                ncx,
+                                proxy,
+                                key,
+                                key_value.clone(),
+                            )?
+                        {
                             let sealed_desc = match desc {
                                 PropertyDescriptor::Data { value, attributes } => {
-                                    PropertyDescriptor::data_with_attrs(value, PropertyAttributes {
-                                        writable: attributes.writable,
-                                        enumerable: attributes.enumerable,
-                                        configurable: false,
-                                    })
-                                }
-                                PropertyDescriptor::Accessor { get, set, attributes } => {
-                                    PropertyDescriptor::Accessor {
-                                        get, set,
-                                        attributes: PropertyAttributes {
-                                            writable: false,
+                                    PropertyDescriptor::data_with_attrs(
+                                        value,
+                                        PropertyAttributes {
+                                            writable: attributes.writable,
                                             enumerable: attributes.enumerable,
                                             configurable: false,
                                         },
-                                    }
+                                    )
                                 }
+                                PropertyDescriptor::Accessor {
+                                    get,
+                                    set,
+                                    attributes,
+                                } => PropertyDescriptor::Accessor {
+                                    get,
+                                    set,
+                                    attributes: PropertyAttributes {
+                                        writable: false,
+                                        enumerable: attributes.enumerable,
+                                        configurable: false,
+                                    },
+                                },
                                 PropertyDescriptor::Deleted => continue,
                             };
-                            let _ = crate::proxy_operations::proxy_define_property(ncx, proxy, key, key_value, &sealed_desc)?;
+                            let _ = crate::proxy_operations::proxy_define_property(
+                                ncx,
+                                proxy,
+                                key,
+                                key_value,
+                                &sealed_desc,
+                            )?;
                         }
                     }
                 } else if let Some(obj) = obj_val.as_object() {
@@ -861,7 +970,11 @@ pub fn init_object_constructor(
                     let keys = crate::proxy_operations::proxy_own_keys(ncx, proxy)?;
                     for key in &keys {
                         let key_value = crate::proxy_operations::property_key_to_value_pub(key);
-                        if let Some(desc) = crate::proxy_operations::proxy_get_own_property_descriptor(ncx, proxy, key, key_value)? {
+                        if let Some(desc) =
+                            crate::proxy_operations::proxy_get_own_property_descriptor(
+                                ncx, proxy, key, key_value,
+                            )?
+                        {
                             if desc.is_configurable() {
                                 return Ok(Value::boolean(false));
                             }
@@ -869,10 +982,7 @@ pub fn init_object_constructor(
                     }
                     return Ok(Value::boolean(true));
                 }
-                let is_sealed = arg
-                    .as_object()
-                    .map(|o| o.is_sealed())
-                    .unwrap_or(true);
+                let is_sealed = arg.as_object().map(|o| o.is_sealed()).unwrap_or(true);
                 Ok(Value::boolean(is_sealed))
             },
             mm.clone(),
@@ -908,10 +1018,7 @@ pub fn init_object_constructor(
                     let is_extensible = crate::proxy_operations::proxy_is_extensible(ncx, proxy)?;
                     return Ok(Value::boolean(is_extensible));
                 }
-                let is_extensible = arg
-                    .as_object()
-                    .map(|o| o.is_extensible())
-                    .unwrap_or(false);
+                let is_extensible = arg.as_object().map(|o| o.is_extensible()).unwrap_or(false);
                 Ok(Value::boolean(is_extensible))
             },
             mm.clone(),
@@ -921,86 +1028,90 @@ pub fn init_object_constructor(
 
     // Object.defineProperty
     let define_property_fn = Value::native_function_with_proto(
-            |_this, args, ncx| {
-                let obj_val = args
-                    .first()
-                    .ok_or_else(|| "Object.defineProperty requires an object".to_string())?;
-                let key_val = args
-                    .get(1)
-                    .ok_or_else(|| {
-                        "Object.defineProperty requires a property key".to_string()
-                    })?;
-                let descriptor = args
-                    .get(2)
-                    .ok_or_else(|| {
-                        "Object.defineProperty requires a descriptor".to_string()
-                    })?;
+        |_this, args, ncx| {
+            let obj_val = args
+                .first()
+                .ok_or_else(|| "Object.defineProperty requires an object".to_string())?;
+            let key_val = args
+                .get(1)
+                .ok_or_else(|| "Object.defineProperty requires a property key".to_string())?;
+            let descriptor = args
+                .get(2)
+                .ok_or_else(|| "Object.defineProperty requires a descriptor".to_string())?;
 
-                // Convert key via ToPropertyKey (ES2026 §7.1.14)
-                let key = crate::intrinsics_impl::reflect::to_property_key(key_val);
+            // Convert key via ToPropertyKey (ES2026 §7.1.14)
+            let key = crate::intrinsics_impl::reflect::to_property_key(key_val);
 
-                let attr_obj = descriptor.as_object().ok_or_else(|| {
-                    "Property descriptor must be an object".to_string()
-                })?;
+            let attr_obj = descriptor
+                .as_object()
+                .ok_or_else(|| "Property descriptor must be an object".to_string())?;
 
-                // Parse JS object into PartialDescriptor (ToPropertyDescriptor)
-                let desc = crate::object::to_property_descriptor(&attr_obj, ncx)
-                    .map_err(|e| VmError::type_error(&e))?;
+            // Parse JS object into PartialDescriptor (ToPropertyDescriptor)
+            let desc = crate::object::to_property_descriptor(&attr_obj, ncx)
+                .map_err(|e| VmError::type_error(&e))?;
 
-                // Proxy path
-                if let Some(proxy) = obj_val.as_proxy() {
-                    // Convert PartialDescriptor to full for proxy trap
-                    let full_desc = if desc.is_accessor_descriptor() {
-                        let get_val = desc.get.clone().unwrap_or(Value::undefined());
-                        let set_val = desc.set.clone().unwrap_or(Value::undefined());
-                        PropertyDescriptor::Accessor {
-                            get: if get_val.is_undefined() { None } else { Some(get_val) },
-                            set: if set_val.is_undefined() { None } else { Some(set_val) },
-                            attributes: PropertyAttributes {
-                                writable: false,
-                                enumerable: desc.enumerable.unwrap_or(false),
-                                configurable: desc.configurable.unwrap_or(false),
-                            },
-                        }
-                    } else {
-                        PropertyDescriptor::data_with_attrs(
-                            desc.value.clone().unwrap_or(Value::undefined()),
-                            PropertyAttributes {
-                                writable: desc.writable.unwrap_or(false),
-                                enumerable: desc.enumerable.unwrap_or(false),
-                                configurable: desc.configurable.unwrap_or(false),
-                            },
-                        )
-                    };
-                    let key_value = crate::proxy_operations::property_key_to_value_pub(&key);
-                    let success = crate::proxy_operations::proxy_define_property(
-                        ncx, proxy, &key, key_value, &full_desc,
-                    )?;
-                    if !success {
-                        return Err(VmError::type_error(
-                            "Cannot define property: proxy rejected the operation",
-                        ));
+            // Proxy path
+            if let Some(proxy) = obj_val.as_proxy() {
+                // Convert PartialDescriptor to full for proxy trap
+                let full_desc = if desc.is_accessor_descriptor() {
+                    let get_val = desc.get.clone().unwrap_or(Value::undefined());
+                    let set_val = desc.set.clone().unwrap_or(Value::undefined());
+                    PropertyDescriptor::Accessor {
+                        get: if get_val.is_undefined() {
+                            None
+                        } else {
+                            Some(get_val)
+                        },
+                        set: if set_val.is_undefined() {
+                            None
+                        } else {
+                            Some(set_val)
+                        },
+                        attributes: PropertyAttributes {
+                            writable: false,
+                            enumerable: desc.enumerable.unwrap_or(false),
+                            configurable: desc.configurable.unwrap_or(false),
+                        },
                     }
-                    return Ok(obj_val.clone());
-                }
-
-                let obj = obj_val.as_object().ok_or_else(|| {
-                    "Object.defineProperty first argument must be an object".to_string()
-                })?;
-
-                let success = obj.define_own_property(key, &desc);
-
+                } else {
+                    PropertyDescriptor::data_with_attrs(
+                        desc.value.clone().unwrap_or(Value::undefined()),
+                        PropertyAttributes {
+                            writable: desc.writable.unwrap_or(false),
+                            enumerable: desc.enumerable.unwrap_or(false),
+                            configurable: desc.configurable.unwrap_or(false),
+                        },
+                    )
+                };
+                let key_value = crate::proxy_operations::property_key_to_value_pub(&key);
+                let success = crate::proxy_operations::proxy_define_property(
+                    ncx, proxy, &key, key_value, &full_desc,
+                )?;
                 if !success {
                     return Err(VmError::type_error(
-                        "Cannot define property: object is not extensible or property is non-configurable",
+                        "Cannot define property: proxy rejected the operation",
                     ));
                 }
+                return Ok(obj_val.clone());
+            }
 
-                Ok(obj_val.clone())
-            },
-            mm.clone(),
-            fn_proto.clone(),
-        );
+            let obj = obj_val.as_object().ok_or_else(|| {
+                "Object.defineProperty first argument must be an object".to_string()
+            })?;
+
+            let success = obj.define_own_property(key, &desc);
+
+            if !success {
+                return Err(VmError::type_error(
+                    "Cannot define property: object is not extensible or property is non-configurable",
+                ));
+            }
+
+            Ok(obj_val.clone())
+        },
+        mm.clone(),
+        fn_proto.clone(),
+    );
     if let Some(obj) = define_property_fn.as_object() {
         obj.define_property(
             PropertyKey::string("length"),
@@ -1021,9 +1132,9 @@ pub fn init_object_constructor(
         PropertyKey::string("create"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |_this, args, ncx_inner| {
-                let proto_val = args.first().ok_or_else(|| {
-                    "Object.create requires a prototype argument".to_string()
-                })?;
+                let proto_val = args
+                    .first()
+                    .ok_or_else(|| "Object.create requires a prototype argument".to_string())?;
 
                 // Prototype can be null, object, or proxy
                 let prototype = if proto_val.is_null() {
@@ -1031,24 +1142,26 @@ pub fn init_object_constructor(
                 } else if proto_val.as_object().is_some() || proto_val.as_proxy().is_some() {
                     proto_val.clone()
                 } else {
-                    return Err(
-                        VmError::type_error("Object prototype may only be an Object or null")
-                    );
+                    return Err(VmError::type_error(
+                        "Object prototype may only be an Object or null",
+                    ));
                 };
 
-                let new_obj = GcRef::new(JsObject::new(prototype, ncx_inner.memory_manager().clone()));
+                let new_obj =
+                    GcRef::new(JsObject::new(prototype, ncx_inner.memory_manager().clone()));
 
                 // Handle optional properties object (second argument)
                 if let Some(props_val) = args.get(1) {
                     if !props_val.is_undefined() {
-                        let props = props_val.as_object().ok_or_else(|| {
-                            "Properties argument must be an object".to_string()
-                        })?;
+                        let props = props_val
+                            .as_object()
+                            .ok_or_else(|| "Properties argument must be an object".to_string())?;
                         for key in props.own_keys() {
                             if let Some(descriptor) = props.get(&key) {
                                 if let Some(attr_obj) = descriptor.as_object() {
-                                    let desc = crate::object::to_property_descriptor(&attr_obj, ncx_inner)
-                                        .map_err(|e| VmError::type_error(&e))?;
+                                    let desc =
+                                        crate::object::to_property_descriptor(&attr_obj, ncx_inner)
+                                            .map_err(|e| VmError::type_error(&e))?;
                                     new_obj.define_own_property(key, &desc);
                                 }
                             }
@@ -1070,39 +1183,29 @@ pub fn init_object_constructor(
             |_this, args, _ncx| {
                 let v1 = args.first().cloned().unwrap_or(Value::undefined());
                 let v2 = args.get(1).cloned().unwrap_or(Value::undefined());
-                let result =
-                    if let (Some(n1), Some(n2)) = (v1.as_number(), v2.as_number()) {
-                        if n1.is_nan() && n2.is_nan() {
-                            true
-                        } else if n1 == 0.0 && n2 == 0.0 {
-                            (1.0_f64 / n1).is_sign_positive()
-                                == (1.0_f64 / n2).is_sign_positive()
-                        } else {
-                            n1 == n2
-                        }
-                    } else if v1.is_undefined() && v2.is_undefined() {
+                let result = if let (Some(n1), Some(n2)) = (v1.as_number(), v2.as_number()) {
+                    if n1.is_nan() && n2.is_nan() {
                         true
-                    } else if v1.is_null() && v2.is_null() {
-                        true
-                    } else if let (Some(b1), Some(b2)) =
-                        (v1.as_boolean(), v2.as_boolean())
-                    {
-                        b1 == b2
-                    } else if let (Some(s1), Some(s2)) =
-                        (v1.as_string(), v2.as_string())
-                    {
-                        s1.as_str() == s2.as_str()
-                    } else if let (Some(sym1), Some(sym2)) =
-                        (v1.as_symbol(), v2.as_symbol())
-                    {
-                        sym1.id == sym2.id
-                    } else if let (Some(o1), Some(o2)) =
-                        (v1.as_object(), v2.as_object())
-                    {
-                        o1.as_ptr() == o2.as_ptr()
+                    } else if n1 == 0.0 && n2 == 0.0 {
+                        (1.0_f64 / n1).is_sign_positive() == (1.0_f64 / n2).is_sign_positive()
                     } else {
-                        false
-                    };
+                        n1 == n2
+                    }
+                } else if v1.is_undefined() && v2.is_undefined() {
+                    true
+                } else if v1.is_null() && v2.is_null() {
+                    true
+                } else if let (Some(b1), Some(b2)) = (v1.as_boolean(), v2.as_boolean()) {
+                    b1 == b2
+                } else if let (Some(s1), Some(s2)) = (v1.as_string(), v2.as_string()) {
+                    s1.as_str() == s2.as_str()
+                } else if let (Some(sym1), Some(sym2)) = (v1.as_symbol(), v2.as_symbol()) {
+                    sym1.id == sym2.id
+                } else if let (Some(o1), Some(o2)) = (v1.as_object(), v2.as_object()) {
+                    o1.as_ptr() == o2.as_ptr()
+                } else {
+                    false
+                };
                 Ok(Value::boolean(result))
             },
             mm.clone(),
@@ -1123,11 +1226,13 @@ pub fn init_object_constructor(
                 } else if let Some(obj) = arg.as_object() {
                     obj.own_keys()
                 } else {
-                    let arr =
-                        GcRef::new(JsObject::array(0, ncx_inner.memory_manager().clone()));
-                    if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array")) {
+                    let arr = GcRef::new(JsObject::array(0, ncx_inner.memory_manager().clone()));
+                    if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array"))
+                    {
                         if let Some(array_obj) = array_ctor.as_object() {
-                            if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
+                            if let Some(proto_val) =
+                                array_obj.get(&PropertyKey::string("prototype"))
+                            {
                                 if let Some(proto_obj) = proto_val.as_object() {
                                     arr.set_prototype(Value::object(proto_obj));
                                 }
@@ -1141,15 +1246,15 @@ pub fn init_object_constructor(
                     match key {
                         PropertyKey::String(s) => names.push(Value::string(s)),
                         PropertyKey::Index(i) => {
-                            names.push(Value::string(JsString::intern(
-                                &i.to_string(),
-                            )));
+                            names.push(Value::string(JsString::intern(&i.to_string())));
                         }
                         _ => {} // skip symbols
                     }
                 }
-                let result =
-                    GcRef::new(JsObject::array(names.len(), ncx_inner.memory_manager().clone()));
+                let result = GcRef::new(JsObject::array(
+                    names.len(),
+                    ncx_inner.memory_manager().clone(),
+                ));
                 if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array")) {
                     if let Some(array_obj) = array_ctor.as_object() {
                         if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
@@ -1190,11 +1295,13 @@ pub fn init_object_constructor(
                     obj.own_keys()
                 } else {
                     // Primitives (string, number, boolean, symbol) have no own symbol properties
-                    let arr =
-                        GcRef::new(JsObject::array(0, ncx_inner.memory_manager().clone()));
-                    if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array")) {
+                    let arr = GcRef::new(JsObject::array(0, ncx_inner.memory_manager().clone()));
+                    if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array"))
+                    {
                         if let Some(array_obj) = array_ctor.as_object() {
-                            if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
+                            if let Some(proto_val) =
+                                array_obj.get(&PropertyKey::string("prototype"))
+                            {
                                 if let Some(proto_obj) = proto_val.as_object() {
                                     arr.set_prototype(Value::object(proto_obj));
                                 }
@@ -1209,8 +1316,10 @@ pub fn init_object_constructor(
                         symbols.push(Value::symbol(sym));
                     }
                 }
-                let result =
-                    GcRef::new(JsObject::array(symbols.len(), ncx_inner.memory_manager().clone()));
+                let result = GcRef::new(JsObject::array(
+                    symbols.len(),
+                    ncx_inner.memory_manager().clone(),
+                ));
                 if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array")) {
                     if let Some(array_obj) = array_ctor.as_object() {
                         if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
@@ -1239,24 +1348,27 @@ pub fn init_object_constructor(
                     Some(o) => o,
                     None => {
                         return Ok(Value::object(GcRef::new(JsObject::new(
-                            Value::null(), ncx_inner.memory_manager().clone(),
+                            Value::null(),
+                            ncx_inner.memory_manager().clone(),
                         ))));
                     }
                 };
                 let obj_proto = get_builtin_proto(&ncx_inner.global(), "Object")
                     .map(Value::object)
                     .unwrap_or(Value::null());
-                let result = GcRef::new(JsObject::new(obj_proto.clone(), ncx_inner.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(
+                    obj_proto.clone(),
+                    ncx_inner.memory_manager().clone(),
+                ));
                 for key in obj.own_keys() {
                     if let Some(desc) = obj.get_own_property_descriptor(&key) {
-                        let desc_obj =
-                            GcRef::new(JsObject::new(obj_proto.clone(), ncx_inner.memory_manager().clone()));
+                        let desc_obj = GcRef::new(JsObject::new(
+                            obj_proto.clone(),
+                            ncx_inner.memory_manager().clone(),
+                        ));
                         match &desc {
                             PropertyDescriptor::Data { value, attributes } => {
-                                let _ = desc_obj.set(
-                                    PropertyKey::string("value"),
-                                    value.clone(),
-                                );
+                                let _ = desc_obj.set(PropertyKey::string("value"), value.clone());
                                 let _ = desc_obj.set(
                                     PropertyKey::string("writable"),
                                     Value::boolean(attributes.writable),
@@ -1277,13 +1389,11 @@ pub fn init_object_constructor(
                             } => {
                                 let _ = desc_obj.set(
                                     PropertyKey::string("get"),
-                                    get.clone()
-                                        .unwrap_or(Value::undefined()),
+                                    get.clone().unwrap_or(Value::undefined()),
                                 );
                                 let _ = desc_obj.set(
                                     PropertyKey::string("set"),
-                                    set.clone()
-                                        .unwrap_or(Value::undefined()),
+                                    set.clone().unwrap_or(Value::undefined()),
                                 );
                                 let _ = desc_obj.set(
                                     PropertyKey::string("enumerable"),
@@ -1313,24 +1423,20 @@ pub fn init_object_constructor(
             |_this, args, ncx| {
                 let obj_val = args
                     .first()
-                    .ok_or_else(|| {
-                        "Object.defineProperties requires an object".to_string()
-                    })?;
+                    .ok_or_else(|| "Object.defineProperties requires an object".to_string())?;
                 let is_proxy = obj_val.as_proxy().is_some();
                 let obj = if is_proxy {
                     None
                 } else {
                     Some(obj_val.as_object().ok_or_else(|| {
-                        "Object.defineProperties first argument must be an object"
-                            .to_string()
+                        "Object.defineProperties first argument must be an object".to_string()
                     })?)
                 };
-                let props_val = args.get(1).ok_or_else(|| {
-                    "Object.defineProperties requires properties".to_string()
-                })?;
+                let props_val = args
+                    .get(1)
+                    .ok_or_else(|| "Object.defineProperties requires properties".to_string())?;
                 let props = props_val.as_object().ok_or_else(|| {
-                    "Object.defineProperties second argument must be an object"
-                        .to_string()
+                    "Object.defineProperties second argument must be an object".to_string()
                 })?;
 
                 for key in props.own_keys() {
@@ -1344,8 +1450,16 @@ pub fn init_object_constructor(
                                     let get_val = desc.get.clone().unwrap_or(Value::undefined());
                                     let set_val = desc.set.clone().unwrap_or(Value::undefined());
                                     PropertyDescriptor::Accessor {
-                                        get: if get_val.is_undefined() { None } else { Some(get_val) },
-                                        set: if set_val.is_undefined() { None } else { Some(set_val) },
+                                        get: if get_val.is_undefined() {
+                                            None
+                                        } else {
+                                            Some(get_val)
+                                        },
+                                        set: if set_val.is_undefined() {
+                                            None
+                                        } else {
+                                            Some(set_val)
+                                        },
                                         attributes: PropertyAttributes {
                                             writable: false,
                                             enumerable: desc.enumerable.unwrap_or(false),
@@ -1362,8 +1476,11 @@ pub fn init_object_constructor(
                                         },
                                     )
                                 };
-                                let key_value = crate::proxy_operations::property_key_to_value_pub(&key);
-                                let _ = crate::proxy_operations::proxy_define_property(ncx, _proxy, &key, key_value, &full_desc)?;
+                                let key_value =
+                                    crate::proxy_operations::property_key_to_value_pub(&key);
+                                let _ = crate::proxy_operations::proxy_define_property(
+                                    ncx, _proxy, &key, key_value, &full_desc,
+                                )?;
                             } else if let Some(ref obj) = obj {
                                 obj.define_own_property(key, &desc);
                             }
@@ -1382,13 +1499,16 @@ pub fn init_object_constructor(
         PropertyKey::string("fromEntries"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |_this, args, ncx_inner| {
-                let iterable = args.first().ok_or_else(|| {
-                    "Object.fromEntries requires an iterable".to_string()
-                })?;
-                let iter_obj = iterable.as_object().ok_or_else(|| {
-                    "Object.fromEntries argument must be iterable".to_string()
-                })?;
-                let result = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
+                let iterable = args
+                    .first()
+                    .ok_or_else(|| "Object.fromEntries requires an iterable".to_string())?;
+                let iter_obj = iterable
+                    .as_object()
+                    .ok_or_else(|| "Object.fromEntries argument must be iterable".to_string())?;
+                let result = GcRef::new(JsObject::new(
+                    Value::null(),
+                    ncx_inner.memory_manager().clone(),
+                ));
 
                 // Support array-like iterables (check length property)
                 if let Some(len_val) =
@@ -1396,9 +1516,7 @@ pub fn init_object_constructor(
                 {
                     if let Some(len) = len_val.as_number() {
                         for i in 0..(len as u32) {
-                            if let Some(entry) =
-                                iter_obj.get(&PropertyKey::Index(i))
-                            {
+                            if let Some(entry) = iter_obj.get(&PropertyKey::Index(i)) {
                                 if let Some(entry_obj) = entry.as_object() {
                                     let key = entry_obj
                                         .get(&PropertyKey::Index(0))
@@ -1409,13 +1527,9 @@ pub fn init_object_constructor(
                                     let pk = if let Some(s) = key.as_string() {
                                         PropertyKey::String(s)
                                     } else if let Some(n) = key.as_number() {
-                                        PropertyKey::String(JsString::intern(
-                                            &n.to_string(),
-                                        ))
+                                        PropertyKey::String(JsString::intern(&n.to_string()))
                                     } else {
-                                        PropertyKey::String(JsString::intern(
-                                            "undefined",
-                                        ))
+                                        PropertyKey::String(JsString::intern("undefined"))
                                     };
                                     let _ = result.set(pk, value);
                                 }
@@ -1433,7 +1547,9 @@ pub fn init_object_constructor(
 
 /// Create Object constructor function
 pub fn create_object_constructor() -> Box<
-    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync
+    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
+        + Send
+        + Sync,
 > {
     Box::new(|_this, args, ncx| {
         let global = ncx.ctx.global();
@@ -1453,9 +1569,7 @@ pub fn create_object_constructor() -> Box<
             if arg.is_null() || arg.is_undefined() {
                 let obj_proto = get_proto("Object");
                 let obj = GcRef::new(JsObject::new(
-                    obj_proto
-                        .map(Value::object)
-                        .unwrap_or_else(Value::null),
+                    obj_proto.map(Value::object).unwrap_or_else(Value::null),
                     mm,
                 ));
                 return Ok(Value::object(obj));

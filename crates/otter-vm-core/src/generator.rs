@@ -240,9 +240,6 @@ impl GeneratorFrame {
     }
 }
 
-/// Legacy type alias for backward compatibility
-pub type GeneratorContext = GeneratorFrame;
-
 impl Default for GeneratorFrame {
     fn default() -> Self {
         Self {
@@ -300,6 +297,8 @@ pub struct JsGenerator {
     pub(crate) abrupt_return: Mutex<Option<Value>>,
     /// Pending throw value (persists independently of frame, for generator.throw())
     pub(crate) abrupt_throw: Mutex<Option<Value>>,
+    /// The callee function value (for arguments.callee in sloppy mode generators)
+    pub(crate) callee_value: Mutex<Option<Value>>,
 }
 
 impl std::fmt::Debug for JsGenerator {
@@ -345,6 +344,11 @@ impl otter_vm_gc::GcTraceable for JsGenerator {
         if let Some(v) = self.abrupt_throw.lock().as_ref() {
             v.trace(tracer);
         }
+
+        // Trace callee value
+        if let Some(v) = self.callee_value.lock().as_ref() {
+            v.trace(tracer);
+        }
     }
 }
 
@@ -378,30 +382,18 @@ impl JsGenerator {
             is_async,
             abrupt_return: Mutex::new(None),
             abrupt_throw: Mutex::new(None),
+            callee_value: Mutex::new(None),
         })
     }
 
-    /// Create a simple generator (for backward compatibility)
-    pub fn new_simple(
-        function_index: u32,
-        upvalues: Vec<UpvalueCell>,
-        object: GcRef<JsObject>,
-    ) -> GcRef<Self> {
-        GcRef::new(Self {
-            object,
-            realm_id: 0,
-            function_index,
-            module: Arc::new(Module::builder("").build()),
-            upvalues,
-            state: Mutex::new(GeneratorState::SuspendedStart),
-            frame: Mutex::new(None),
-            initial_args: Mutex::new(Vec::new()),
-            initial_this: Mutex::new(Value::undefined()),
-            is_construct: false,
-            is_async: false,
-            abrupt_return: Mutex::new(None),
-            abrupt_throw: Mutex::new(None),
-        })
+    /// Set the callee function value (for arguments.callee in sloppy mode)
+    pub fn set_callee_value(&self, value: Value) {
+        *self.callee_value.lock() = Some(value);
+    }
+
+    /// Take the callee function value
+    pub fn take_callee_value(&self) -> Option<Value> {
+        self.callee_value.lock().take()
     }
 
     /// Get the current state
@@ -450,28 +442,6 @@ impl JsGenerator {
         *self.frame.lock() = Some(frame);
     }
 
-    /// Legacy suspend method for backward compatibility
-    pub fn suspend(&self, pc: usize, locals: Vec<Value>, registers: Vec<Value>) {
-        let frame = GeneratorFrame {
-            pc,
-            function_index: self.function_index,
-            module: Arc::clone(&self.module),
-            locals,
-            registers,
-            upvalues: self.upvalues.clone(),
-            try_stack: Vec::new(),
-            this_value: Value::undefined(),
-            is_construct: false,
-            frame_id: 0,
-            argc: 0,
-            received_value: None,
-            pending_throw: None,
-            completion_type: CompletionType::Normal,
-            yield_dst: None,
-        };
-        self.suspend_with_frame(frame);
-    }
-
     /// Complete the generator
     pub fn complete(&self) {
         *self.state.lock() = GeneratorState::Completed;
@@ -486,11 +456,6 @@ impl JsGenerator {
     /// Take the saved frame (returns None if not set)
     pub fn take_frame(&self) -> Option<GeneratorFrame> {
         self.frame.lock().take()
-    }
-
-    /// Get the saved context (legacy compatibility)
-    pub fn get_context(&self) -> GeneratorContext {
-        self.frame.lock().clone().unwrap_or_default()
     }
 
     /// Set the value to be sent to the generator on next resume
@@ -701,8 +666,8 @@ mod tests {
         generator.suspend_with_frame(frame);
         assert!(generator.is_suspended());
         assert!(generator.is_suspended_yield());
-        let ctx = generator.get_context();
-        assert_eq!(ctx.pc, 10);
+        let saved_frame = generator.get_frame().expect("should have frame");
+        assert_eq!(saved_frame.pc, 10);
 
         // Complete
         generator.complete();

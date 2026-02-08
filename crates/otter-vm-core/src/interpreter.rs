@@ -3124,9 +3124,6 @@ impl Interpreter {
                     let is_special = [
                         "__Function_call",
                         "__Function_apply",
-                        "__Generator_next",
-                        "__Generator_return",
-                        "__Generator_throw",
                         "eval",
                     ]
                     .iter()
@@ -7663,174 +7660,9 @@ impl Interpreter {
             }
         }
 
-        // 2. Handle native functions (including interception for call/apply/Generator)
+        // 2. Handle native functions
         if let Some(native_fn) = current_func.as_native_function() {
-            let is_same_native = |candidate: &Value| -> bool {
-                match (current_func.heap_ref(), candidate.heap_ref()) {
-                    (Some(HeapRef::NativeFunction(a)), Some(HeapRef::NativeFunction(b))) => {
-                        std::ptr::eq(a.as_ptr(), b.as_ptr())
-                    }
-                    _ => false,
-                }
-            };
-
-            // OLD interception code removed - now using error-based interception in native functions
-
-            // Intercept Generator ops
-            let gen_op = if let Some(value) = ctx.get_global("__Generator_next")
-                && is_same_native(&value)
-            {
-                Some("next")
-            } else if let Some(value) = ctx.get_global("__Generator_return")
-                && is_same_native(&value)
-            {
-                Some("return")
-            } else if let Some(value) = ctx.get_global("__Generator_throw")
-                && is_same_native(&value)
-            {
-                Some("throw")
-            } else {
-                None
-            };
-
-            if let Some(op) = gen_op {
-                let (generator, sent_value) = if let Some(generator_ref) =
-                    current_args.first().and_then(|v| v.as_generator())
-                {
-                    let value = if current_args.len() > 1 {
-                        Some(current_args[1].clone())
-                    } else {
-                        None
-                    };
-                    (generator_ref, value)
-                } else if let Some(generator_ref) = current_this.as_generator() {
-                    let value = current_args.first().cloned();
-                    (generator_ref, value)
-                } else {
-                    return Err(VmError::type_error("First argument must be a generator"));
-                };
-
-                let gen_result = match op {
-                    "next" => self.execute_generator(generator, ctx, sent_value),
-                    "return" => {
-                        let return_value = sent_value.unwrap_or_else(Value::undefined);
-                        if generator.is_completed() {
-                            GeneratorResult::Returned(return_value)
-                        } else if !generator.has_try_handlers() {
-                            generator.complete();
-                            GeneratorResult::Returned(return_value)
-                        } else {
-                            generator.set_pending_return(return_value);
-                            self.execute_generator(generator, ctx, None)
-                        }
-                    }
-                    "throw" => {
-                        let error_value = sent_value.unwrap_or_else(Value::undefined);
-                        if generator.is_completed() {
-                            GeneratorResult::Error(VmError::exception(error_value))
-                        } else {
-                            generator.set_pending_throw(error_value.clone());
-                            self.execute_generator(generator, ctx, None)
-                        }
-                    }
-                    _ => unreachable!(),
-                };
-
-                if generator.is_async() {
-                    let promise = JsPromise::new();
-                    let js_queue = ctx.js_job_queue();
-                    match gen_result {
-                        GeneratorResult::Yielded(v) => {
-                            let iter_result = GcRef::new(JsObject::new(
-                                Value::null(),
-                                ctx.memory_manager().clone(),
-                            ));
-                            let _ = iter_result.set(PropertyKey::string("value"), v);
-                            let _ = iter_result.set(PropertyKey::string("done"), Value::boolean(false));
-                            let js_queue = js_queue.clone();
-                            JsPromise::resolve_with_js_jobs(promise, 
-                                Value::object(iter_result),
-                                move |job, args| {
-                                    if let Some(queue) = &js_queue {
-                                        queue.enqueue(job, args);
-                                    }
-                                },
-                            );
-                        }
-                        GeneratorResult::Returned(v) => {
-                            let iter_result = GcRef::new(JsObject::new(
-                                Value::null(),
-                                ctx.memory_manager().clone(),
-                            ));
-                            let _ = iter_result.set(PropertyKey::string("value"), v);
-                            let _ = iter_result.set(PropertyKey::string("done"), Value::boolean(true));
-                            let js_queue = js_queue.clone();
-                            JsPromise::resolve_with_js_jobs(promise, 
-                                Value::object(iter_result),
-                                move |job, args| {
-                                    if let Some(queue) = &js_queue {
-                                        queue.enqueue(job, args);
-                                    }
-                                },
-                            );
-                        }
-                        GeneratorResult::Error(e) => {
-                            let error_msg = e.to_string();
-                            let js_queue = js_queue.clone();
-                            JsPromise::reject_with_js_jobs(promise, 
-                                Value::string(JsString::intern(&error_msg)),
-                                move |job, args| {
-                                    if let Some(queue) = &js_queue {
-                                        queue.enqueue(job, args);
-                                    }
-                                },
-                            );
-                        }
-                        GeneratorResult::Suspended {
-                            promise: awaited_promise,
-                            ..
-                        } => {
-                            let result_promise = promise.clone();
-                            let mm = ctx.memory_manager().clone();
-                            let js_queue = js_queue.clone();
-                            awaited_promise.then(move |resolved_value| {
-                                let iter_result =
-                                    GcRef::new(JsObject::new(Value::null(), mm.clone()));
-                                let _ = iter_result.set(PropertyKey::string("value"), resolved_value);
-                                let _ = iter_result.set(PropertyKey::string("done"), Value::boolean(false));
-                                let js_queue = js_queue.clone();
-                                JsPromise::resolve_with_js_jobs(result_promise, 
-                                    Value::object(iter_result),
-                                    move |job, args| {
-                                        if let Some(queue) = &js_queue {
-                                            queue.enqueue(job, args);
-                                        }
-                                    },
-                                );
-                            });
-                        }
-                    }
-                    ctx.set_register(return_reg, Value::promise(promise));
-                    return Ok(InstructionResult::Continue);
-                }
-
-                let (result_value, is_done) = match gen_result {
-                    GeneratorResult::Yielded(v) => (v, false),
-                    GeneratorResult::Returned(v) => (v, true),
-                    GeneratorResult::Error(e) => return Err(e),
-                    GeneratorResult::Suspended { .. } => {
-                        return Err(VmError::internal("Sync generator cannot suspend"));
-                    }
-                };
-
-                let result = GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
-                let _ = result.set(PropertyKey::string("value"), result_value);
-                let _ = result.set(PropertyKey::string("done"), Value::boolean(is_done));
-                ctx.set_register(return_reg, Value::object(result));
-                return Ok(InstructionResult::Continue);
-            }
-
-            // Normal native function execution
+            // Native function execution
             match self.call_native_fn(ctx, native_fn, &current_this, &current_args) {
                 Ok(result) => {
                     ctx.set_register(return_reg, result);
@@ -7884,6 +7716,8 @@ impl Interpreter {
                     realm_id,
                     gen_obj,
                 );
+                // Store callee value for arguments.callee in sloppy mode generators
+                generator.set_callee_value(current_func.clone());
                 ctx.set_register(return_reg, Value::generator(generator));
                 return Ok(InstructionResult::Continue);
             }
@@ -9153,6 +8987,10 @@ impl Interpreter {
         ctx.set_pending_args(args);
         ctx.set_pending_this(this_value);
         ctx.set_pending_upvalues(generator.upvalues.clone());
+        // Set callee value for arguments.callee in sloppy mode
+        if let Some(callee) = generator.take_callee_value() {
+            ctx.set_pending_callee_value(callee);
+        }
 
         // Remember the stack depth before pushing the generator frame
         let initial_depth = ctx.stack_depth();

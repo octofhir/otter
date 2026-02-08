@@ -33,6 +33,22 @@ pub fn strict_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// SameValue comparison (ES2026 §6.1.6.1.14).
+/// Like strict equality but NaN === NaN and +0 !== -0.
+pub fn same_value(a: &Value, b: &Value) -> bool {
+    if let (Some(n1), Some(n2)) = (a.as_number(), b.as_number()) {
+        if n1.is_nan() && n2.is_nan() {
+            return true;
+        }
+        if n1 == 0.0 && n2 == 0.0 {
+            return n1.is_sign_positive() == n2.is_sign_positive();
+        }
+        n1 == n2
+    } else {
+        strict_equal(a, b)
+    }
+}
+
 /// SameValueZero comparison (used by Array.prototype.includes, Set, Map).
 /// Like strict equality but NaN === NaN.
 pub fn same_value_zero(a: &Value, b: &Value) -> bool {

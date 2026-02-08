@@ -202,6 +202,18 @@ impl<'a> NativeContext<'a> {
         self.interpreter
     }
 
+    /// Execute a generator operation (next/return/throw) via the interpreter.
+    ///
+    /// This bridges from NativeContext-based generator prototype methods to the
+    /// interpreter's generator execution machinery.
+    pub fn execute_generator(
+        &mut self,
+        generator: GcRef<crate::generator::JsGenerator>,
+        sent_value: Option<Value>,
+    ) -> crate::interpreter::GeneratorResult {
+        self.interpreter.execute_generator(generator, self.ctx, sent_value)
+    }
+
     /// Execute an eval-compiled module within this context.
     pub fn execute_eval_module(&mut self, module: &Module) -> VmResult<Value> {
         let interpreter = self.interpreter;

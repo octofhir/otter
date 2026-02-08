@@ -376,6 +376,217 @@ impl std::fmt::Display for SetPropertyError {
     }
 }
 
+/// A property descriptor from ToPropertyDescriptor (ES2026 §6.2.5.5)
+/// where fields can be absent. Used as input to [[DefineOwnProperty]].
+///
+/// Unlike `PropertyDescriptor` (which is always fully specified for storage),
+/// this type distinguishes "absent" (None) from "present" for each field.
+#[derive(Clone, Debug)]
+pub struct PartialDescriptor {
+    /// [[Value]] — present only if this is (or should become) a data descriptor
+    pub value: Option<Value>,
+    /// [[Writable]] — present only if this is (or should become) a data descriptor
+    pub writable: Option<bool>,
+    /// [[Get]] — present only if this is (or should become) an accessor descriptor.
+    /// `Some(Value::undefined())` means explicitly "no getter".
+    pub get: Option<Value>,
+    /// [[Set]] — present only if this is (or should become) an accessor descriptor.
+    /// `Some(Value::undefined())` means explicitly "no setter".
+    pub set: Option<Value>,
+    /// [[Enumerable]]
+    pub enumerable: Option<bool>,
+    /// [[Configurable]]
+    pub configurable: Option<bool>,
+}
+
+impl PartialDescriptor {
+    /// ES2026 §6.2.5.1 IsAccessorDescriptor
+    pub fn is_accessor_descriptor(&self) -> bool {
+        self.get.is_some() || self.set.is_some()
+    }
+
+    /// ES2026 §6.2.5.2 IsDataDescriptor
+    pub fn is_data_descriptor(&self) -> bool {
+        self.value.is_some() || self.writable.is_some()
+    }
+
+    /// ES2026 §6.2.5.3 IsGenericDescriptor
+    pub fn is_generic_descriptor(&self) -> bool {
+        !self.is_accessor_descriptor() && !self.is_data_descriptor()
+    }
+
+    /// Check if all fields are absent (empty descriptor)
+    pub fn is_empty(&self) -> bool {
+        self.value.is_none()
+            && self.writable.is_none()
+            && self.get.is_none()
+            && self.set.is_none()
+            && self.enumerable.is_none()
+            && self.configurable.is_none()
+    }
+
+    /// Check if this data descriptor has any non-default attributes.
+    /// Default data property attributes are: writable=true, enumerable=true, configurable=true.
+    pub fn has_non_default_data_attributes(&self) -> bool {
+        matches!(self.writable, Some(false))
+            || matches!(self.enumerable, Some(false))
+            || matches!(self.configurable, Some(false))
+    }
+
+    /// Create from a fully-specified PropertyDescriptor (all fields present).
+    pub fn from_full(desc: &PropertyDescriptor) -> Self {
+        match desc {
+            PropertyDescriptor::Data { value, attributes } => PartialDescriptor {
+                value: Some(value.clone()),
+                writable: Some(attributes.writable),
+                get: None,
+                set: None,
+                enumerable: Some(attributes.enumerable),
+                configurable: Some(attributes.configurable),
+            },
+            PropertyDescriptor::Accessor {
+                get,
+                set,
+                attributes,
+            } => PartialDescriptor {
+                value: None,
+                writable: None,
+                get: Some(get.clone().unwrap_or(Value::undefined())),
+                set: Some(set.clone().unwrap_or(Value::undefined())),
+                enumerable: Some(attributes.enumerable),
+                configurable: Some(attributes.configurable),
+            },
+            PropertyDescriptor::Deleted => PartialDescriptor {
+                value: None,
+                writable: None,
+                get: None,
+                set: None,
+                enumerable: None,
+                configurable: None,
+            },
+        }
+    }
+}
+
+/// Get a property value from an object, properly invoking accessor getters.
+///
+/// Unlike `JsObject::get()` which returns `None` for accessor properties,
+/// this function invokes the getter function when the property is an accessor.
+fn get_value_full(
+    obj: &crate::gc::GcRef<JsObject>,
+    key: &PropertyKey,
+    ncx: &mut crate::context::NativeContext<'_>,
+) -> Result<Value, crate::error::VmError> {
+    if let Some(desc) = obj.lookup_property_descriptor(key) {
+        match desc {
+            PropertyDescriptor::Data { value, .. } => Ok(value),
+            PropertyDescriptor::Accessor { get, .. } => {
+                if let Some(getter) = get {
+                    if !getter.is_undefined() {
+                        let this_val = Value::object(obj.clone());
+                        return ncx.call_function(&getter, this_val, &[]);
+                    }
+                }
+                Ok(Value::undefined())
+            }
+            PropertyDescriptor::Deleted => Ok(Value::undefined()),
+        }
+    } else {
+        Ok(Value::undefined())
+    }
+}
+
+/// Parse a JS object into a PartialDescriptor (ES2026 §6.2.5.5 ToPropertyDescriptor).
+///
+/// Uses `.has()` to distinguish absent fields from present-but-undefined fields.
+/// Validates accessor callability: get/set must be callable or undefined.
+/// Takes NativeContext to properly invoke accessor getters on the descriptor object.
+pub fn to_property_descriptor(
+    attr_obj: &crate::gc::GcRef<JsObject>,
+    ncx: &mut crate::context::NativeContext<'_>,
+) -> Result<PartialDescriptor, String> {
+    let has_value = attr_obj.has(&PropertyKey::from("value"));
+    let has_writable = attr_obj.has(&PropertyKey::from("writable"));
+    let has_get = attr_obj.has(&PropertyKey::from("get"));
+    let has_set = attr_obj.has(&PropertyKey::from("set"));
+    let has_enumerable = attr_obj.has(&PropertyKey::from("enumerable"));
+    let has_configurable = attr_obj.has(&PropertyKey::from("configurable"));
+
+    // Step 3-4: Check for conflicting data + accessor fields
+    if (has_value || has_writable) && (has_get || has_set) {
+        return Err(
+            "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute"
+                .to_string(),
+        );
+    }
+
+    let enumerable = if has_enumerable {
+        let v = get_value_full(attr_obj, &PropertyKey::from("enumerable"), ncx)
+            .map_err(|e| e.to_string())?;
+        Some(v.to_boolean())
+    } else {
+        None
+    };
+
+    let configurable = if has_configurable {
+        let v = get_value_full(attr_obj, &PropertyKey::from("configurable"), ncx)
+            .map_err(|e| e.to_string())?;
+        Some(v.to_boolean())
+    } else {
+        None
+    };
+
+    let value = if has_value {
+        Some(
+            get_value_full(attr_obj, &PropertyKey::from("value"), ncx)
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+
+    let writable = if has_writable {
+        let v = get_value_full(attr_obj, &PropertyKey::from("writable"), ncx)
+            .map_err(|e| e.to_string())?;
+        Some(v.to_boolean())
+    } else {
+        None
+    };
+
+    let get = if has_get {
+        let g = get_value_full(attr_obj, &PropertyKey::from("get"), ncx)
+            .map_err(|e| e.to_string())?;
+        // Step 7.b: If getter is not callable and not undefined, throw TypeError
+        if !g.is_undefined() && !g.is_callable() {
+            return Err("Getter must be a function".to_string());
+        }
+        Some(g)
+    } else {
+        None
+    };
+
+    let set = if has_set {
+        let s = get_value_full(attr_obj, &PropertyKey::from("set"), ncx)
+            .map_err(|e| e.to_string())?;
+        // Step 8.b: If setter is not callable and not undefined, throw TypeError
+        if !s.is_undefined() && !s.is_callable() {
+            return Err("Setter must be a function".to_string());
+        }
+        Some(s)
+    } else {
+        None
+    };
+
+    Ok(PartialDescriptor {
+        value,
+        writable,
+        get,
+        set,
+        enumerable,
+        configurable,
+    })
+}
+
 /// Parameter mapping for mapped arguments objects (ES2024 §10.4.4).
 /// Each cell aliases a formal parameter's local variable slot via UpvalueCell.
 pub struct ArgumentMapping {
@@ -434,6 +645,8 @@ pub struct ObjectFlags {
     /// Explicit array length, used when the array is sparse and elements.len()
     /// doesn't represent the true JS `.length`. `None` means use elements.len().
     pub sparse_array_length: Option<u32>,
+    /// Whether array length is writable (None = true, default)
+    pub array_length_writable: Option<bool>,
 }
 
 impl JsObject {
@@ -927,6 +1140,22 @@ impl JsObject {
 
     /// Get own property descriptor (does not walk prototype chain).
     pub fn get_own_property_descriptor(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        // Array "length" property: synthesize as non-configurable, non-enumerable, writable
+        if self.is_array() {
+            if let PropertyKey::String(s) = key {
+                if s.as_str() == "length" {
+                    return Some(PropertyDescriptor::Data {
+                        value: Value::number(self.array_length() as f64),
+                        attributes: PropertyAttributes {
+                            writable: self.flags.borrow().array_length_writable.unwrap_or(true),
+                            enumerable: false,
+                            configurable: false,
+                        },
+                    });
+                }
+            }
+        }
+
         // Dictionary mode: lookup in HashMap first (may contain accessor properties)
         if self.is_dictionary_mode() {
             if let Some(dict) = self.dictionary_properties.borrow().as_ref() {
@@ -1621,6 +1850,695 @@ impl JsObject {
             overflow[overflow_idx] = entry;
         }
         true
+    }
+
+    /// Store a property without validation checks.
+    /// Used by `define_own_property` after it has already validated the operation.
+    fn store_property(&self, key: PropertyKey, desc: PropertyDescriptor) {
+        // Dictionary mode: store directly in HashMap
+        if self.flags.borrow().is_dictionary {
+            let mut dict = self.dictionary_properties.borrow_mut();
+            if let Some(map) = dict.as_mut() {
+                map.insert(key, PropertyEntry { desc });
+            }
+            return;
+        }
+
+        let offset = self.shape.borrow().get_offset(&key);
+
+        if let Some(off) = offset {
+            // Update existing slot
+            let entry = PropertyEntry { desc };
+            if off < INLINE_PROPERTY_COUNT {
+                let mut inline = self.inline_properties.borrow_mut();
+                inline[off] = Some(entry);
+            } else {
+                let mut overflow = self.overflow_properties.borrow_mut();
+                let overflow_idx = off - INLINE_PROPERTY_COUNT;
+                if overflow_idx < overflow.len() {
+                    overflow[overflow_idx] = entry;
+                }
+            }
+            return;
+        }
+
+        // New property: transition shape
+        let mut shape_write = self.shape.borrow_mut();
+        let next_shape = shape_write.transition(key.clone());
+        let offset = next_shape
+            .offset
+            .expect("Shape transition should have an offset");
+
+        if offset >= DICTIONARY_THRESHOLD {
+            drop(shape_write);
+            self.transition_to_dictionary();
+            let mut dict = self.dictionary_properties.borrow_mut();
+            if let Some(map) = dict.as_mut() {
+                map.insert(key, PropertyEntry { desc });
+            }
+            return;
+        }
+
+        *shape_write = next_shape;
+        let entry = PropertyEntry { desc };
+        if offset < INLINE_PROPERTY_COUNT {
+            let mut inline = self.inline_properties.borrow_mut();
+            inline[offset] = Some(entry);
+        } else {
+            let mut overflow = self.overflow_properties.borrow_mut();
+            let overflow_idx = offset - INLINE_PROPERTY_COUNT;
+            if overflow_idx >= overflow.len() {
+                overflow.resize(
+                    overflow_idx + 1,
+                    PropertyEntry {
+                        desc: PropertyDescriptor::Deleted,
+                    },
+                );
+            }
+            overflow[overflow_idx] = entry;
+        }
+    }
+
+    /// [[DefineOwnProperty]] per ES2026 §10.1.6.1 / §10.1.6.3 (ValidateAndApplyPropertyDescriptor).
+    ///
+    /// Takes a `PartialDescriptor` where fields can be absent, and properly merges
+    /// with the existing property descriptor. Returns false if the operation is rejected.
+    pub fn define_own_property(&self, key: PropertyKey, desc: &PartialDescriptor) -> bool {
+        use crate::intrinsics_impl::helpers::same_value;
+
+        // Array exotic [[DefineOwnProperty]] (ES2026 §10.4.2.1)
+        if self.is_array() {
+            if let PropertyKey::String(ref s) = key {
+                if s.as_str() == "length" {
+                    return self.array_define_own_length(desc);
+                }
+            }
+            // Check if key is an array index
+            if let Some(index) = Self::to_array_index(&key) {
+                return self.array_define_own_index(index, desc);
+            }
+        }
+
+        // Handle mapped arguments: if defining an accessor on a mapped index, unmap it
+        if let PropertyKey::Index(i) = &key {
+            let idx = *i as usize;
+            if self.get_argument_cell(idx).is_some() {
+                if desc.is_accessor_descriptor() {
+                    self.unmap_argument(idx);
+                } else if let Some(ref val) = desc.value {
+                    if let Some(cell) = self.get_argument_cell(idx) {
+                        cell.set(val.clone());
+                    }
+                }
+            }
+        }
+
+        let extensible = self.flags.borrow().extensible;
+        let current = self.get_own_property_descriptor(&key);
+
+        // Step 1-2: If property doesn't exist
+        match current {
+            None | Some(PropertyDescriptor::Deleted) => {
+                // Step 2.a: If not extensible, return false
+                if !extensible {
+                    return false;
+                }
+                // Step 2.c-d: Create new property from partial with defaults
+                let new_desc = if desc.is_accessor_descriptor() {
+                    let get_val = desc.get.clone().unwrap_or(Value::undefined());
+                    let set_val = desc.set.clone().unwrap_or(Value::undefined());
+                    PropertyDescriptor::Accessor {
+                        get: if get_val.is_undefined() {
+                            None
+                        } else {
+                            Some(get_val)
+                        },
+                        set: if set_val.is_undefined() {
+                            None
+                        } else {
+                            Some(set_val)
+                        },
+                        attributes: PropertyAttributes {
+                            writable: false,
+                            enumerable: desc.enumerable.unwrap_or(false),
+                            configurable: desc.configurable.unwrap_or(false),
+                        },
+                    }
+                } else {
+                    PropertyDescriptor::Data {
+                        value: desc.value.clone().unwrap_or(Value::undefined()),
+                        attributes: PropertyAttributes {
+                            writable: desc.writable.unwrap_or(false),
+                            enumerable: desc.enumerable.unwrap_or(false),
+                            configurable: desc.configurable.unwrap_or(false),
+                        },
+                    }
+                };
+                self.store_property(key, new_desc);
+                return true;
+            }
+            Some(ref existing) => {
+                // Step 3: If every field in desc is absent, return true
+                if desc.is_empty() {
+                    return true;
+                }
+
+                let current_configurable = existing.is_configurable();
+                let current_enumerable = existing.enumerable();
+
+                // Step 4: If current is non-configurable...
+                if !current_configurable {
+                    // 4.a: Cannot make it configurable
+                    if desc.configurable == Some(true) {
+                        return false;
+                    }
+                    // 4.b: Cannot change enumerable
+                    if let Some(new_enum) = desc.enumerable {
+                        if new_enum != current_enumerable {
+                            return false;
+                        }
+                    }
+                }
+
+                // Step 5: IsGenericDescriptor(desc) → just update attributes, valid for any type
+                if desc.is_generic_descriptor() {
+                    // Just merge enumerable/configurable, keep existing type
+                    let merged = Self::merge_partial_with_current(existing, desc);
+                    self.store_property(key, merged);
+                    return true;
+                }
+
+                // Step 6: Type mismatch (data vs accessor)
+                let current_is_data = matches!(existing, PropertyDescriptor::Data { .. });
+                let desc_is_data = desc.is_data_descriptor();
+                let desc_is_accessor = desc.is_accessor_descriptor();
+
+                if current_is_data != desc_is_data && current_is_data != !desc_is_accessor {
+                    // Type conversion: data ↔ accessor
+                    if !current_configurable {
+                        return false;
+                    }
+                    // Convert, preserving configurable and enumerable from current
+                    let merged = Self::merge_partial_with_current_converting(existing, desc);
+                    self.store_property(key, merged);
+                    return true;
+                }
+
+                // Step 7: Both data descriptors
+                if desc_is_data && current_is_data {
+                    if let PropertyDescriptor::Data {
+                        value: curr_val,
+                        attributes: curr_attrs,
+                    } = existing
+                    {
+                        if !current_configurable {
+                            if !curr_attrs.writable {
+                                // Step 7.a.i: Cannot make writable
+                                if desc.writable == Some(true) {
+                                    return false;
+                                }
+                                // Step 7.a.ii: Cannot change value (SameValue check)
+                                if let Some(ref new_val) = desc.value {
+                                    if !same_value(&curr_val, new_val) {
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let merged = Self::merge_partial_with_current(existing, desc);
+                    self.store_property(key, merged);
+                    return true;
+                }
+
+                // Step 8: Both accessor descriptors
+                if desc_is_accessor
+                    && matches!(existing, PropertyDescriptor::Accessor { .. })
+                {
+                    if let PropertyDescriptor::Accessor {
+                        get: curr_get,
+                        set: curr_set,
+                        ..
+                    } = &existing
+                    {
+                        if !current_configurable {
+                            // Step 8.a.i: Cannot change set
+                            if let Some(ref new_set) = desc.set {
+                                let curr_set_val =
+                                    curr_set.clone().unwrap_or(Value::undefined());
+                                if !same_value(&curr_set_val, new_set) {
+                                    return false;
+                                }
+                            }
+                            // Step 8.a.ii: Cannot change get
+                            if let Some(ref new_get) = desc.get {
+                                let curr_get_val =
+                                    curr_get.clone().unwrap_or(Value::undefined());
+                                if !same_value(&curr_get_val, new_get) {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    let merged = Self::merge_partial_with_current(existing, desc);
+                    self.store_property(key, merged);
+                    return true;
+                }
+
+                // Type conversion needed (data → accessor or accessor → data)
+                if !current_configurable {
+                    return false;
+                }
+                let merged = Self::merge_partial_with_current_converting(existing, desc);
+                self.store_property(key, merged);
+                true
+            }
+        }
+    }
+
+    /// Merge a PartialDescriptor into an existing PropertyDescriptor, preserving
+    /// current values for absent fields. Both are same type (data/data or accessor/accessor).
+    fn merge_partial_with_current(
+        current: &PropertyDescriptor,
+        desc: &PartialDescriptor,
+    ) -> PropertyDescriptor {
+        match current {
+            PropertyDescriptor::Data {
+                value: curr_val,
+                attributes: curr_attrs,
+            } => {
+                let new_value = desc.value.clone().unwrap_or_else(|| curr_val.clone());
+                let new_writable = desc.writable.unwrap_or(curr_attrs.writable);
+                let new_enumerable = desc.enumerable.unwrap_or(curr_attrs.enumerable);
+                let new_configurable = desc.configurable.unwrap_or(curr_attrs.configurable);
+                PropertyDescriptor::Data {
+                    value: new_value,
+                    attributes: PropertyAttributes {
+                        writable: new_writable,
+                        enumerable: new_enumerable,
+                        configurable: new_configurable,
+                    },
+                }
+            }
+            PropertyDescriptor::Accessor {
+                get: curr_get,
+                set: curr_set,
+                attributes: curr_attrs,
+            } => {
+                // For get/set: None in partial = absent (preserve current),
+                // Some(undefined) = explicitly clear, Some(fn) = set to fn.
+                let new_get = match &desc.get {
+                    None => curr_get.clone(),
+                    Some(v) if v.is_undefined() => None,
+                    Some(v) => Some(v.clone()),
+                };
+                let new_set = match &desc.set {
+                    None => curr_set.clone(),
+                    Some(v) if v.is_undefined() => None,
+                    Some(v) => Some(v.clone()),
+                };
+                let new_enumerable = desc.enumerable.unwrap_or(curr_attrs.enumerable);
+                let new_configurable = desc.configurable.unwrap_or(curr_attrs.configurable);
+                PropertyDescriptor::Accessor {
+                    get: new_get,
+                    set: new_set,
+                    attributes: PropertyAttributes {
+                        writable: false,
+                        enumerable: new_enumerable,
+                        configurable: new_configurable,
+                    },
+                }
+            }
+            PropertyDescriptor::Deleted => {
+                // Shouldn't happen (caller checks), but handle gracefully
+                if desc.is_accessor_descriptor() {
+                    let get_val = desc.get.clone().unwrap_or(Value::undefined());
+                    let set_val = desc.set.clone().unwrap_or(Value::undefined());
+                    PropertyDescriptor::Accessor {
+                        get: if get_val.is_undefined() { None } else { Some(get_val) },
+                        set: if set_val.is_undefined() { None } else { Some(set_val) },
+                        attributes: PropertyAttributes {
+                            writable: false,
+                            enumerable: desc.enumerable.unwrap_or(false),
+                            configurable: desc.configurable.unwrap_or(false),
+                        },
+                    }
+                } else {
+                    PropertyDescriptor::Data {
+                        value: desc.value.clone().unwrap_or(Value::undefined()),
+                        attributes: PropertyAttributes {
+                            writable: desc.writable.unwrap_or(false),
+                            enumerable: desc.enumerable.unwrap_or(false),
+                            configurable: desc.configurable.unwrap_or(false),
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    /// Merge with type conversion (data → accessor or accessor → data).
+    /// Preserves enumerable/configurable from current, resets other fields to defaults.
+    fn merge_partial_with_current_converting(
+        current: &PropertyDescriptor,
+        desc: &PartialDescriptor,
+    ) -> PropertyDescriptor {
+        let curr_enumerable = current.enumerable();
+        let curr_configurable = current.is_configurable();
+
+        if desc.is_accessor_descriptor() {
+            // Converting to accessor
+            let get_val = desc.get.clone().unwrap_or(Value::undefined());
+            let set_val = desc.set.clone().unwrap_or(Value::undefined());
+            PropertyDescriptor::Accessor {
+                get: if get_val.is_undefined() {
+                    None
+                } else {
+                    Some(get_val)
+                },
+                set: if set_val.is_undefined() {
+                    None
+                } else {
+                    Some(set_val)
+                },
+                attributes: PropertyAttributes {
+                    writable: false,
+                    enumerable: desc.enumerable.unwrap_or(curr_enumerable),
+                    configurable: desc.configurable.unwrap_or(curr_configurable),
+                },
+            }
+        } else {
+            // Converting to data
+            PropertyDescriptor::Data {
+                value: desc.value.clone().unwrap_or(Value::undefined()),
+                attributes: PropertyAttributes {
+                    writable: desc.writable.unwrap_or(false),
+                    enumerable: desc.enumerable.unwrap_or(curr_enumerable),
+                    configurable: desc.configurable.unwrap_or(curr_configurable),
+                },
+            }
+        }
+    }
+
+    /// Convert a PropertyKey to an array index (u32), if it represents one.
+    /// Per ES2026 §6.1.7: An array index is a String property key that is a
+    /// canonical numeric string in the range 0..2^32-2.
+    fn to_array_index(key: &PropertyKey) -> Option<u32> {
+        match key {
+            PropertyKey::Index(i) => {
+                if *i <= 0xFFFF_FFFE {
+                    Some(*i)
+                } else {
+                    None
+                }
+            }
+            PropertyKey::String(s) => {
+                let str = s.as_str();
+                if let Ok(n) = str.parse::<u32>() {
+                    // Must be canonical: no leading zeros, and in range
+                    if n <= 0xFFFF_FFFE && n.to_string() == str {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            PropertyKey::Symbol(_) => None,
+        }
+    }
+
+    /// Array [[DefineOwnProperty]] for "length" (ES2026 §10.4.2.4)
+    fn array_define_own_length(&self, desc: &PartialDescriptor) -> bool {
+        use crate::intrinsics_impl::helpers::same_value;
+
+        let old_len = self.array_length() as u32;
+        let old_len_writable = self.flags.borrow().array_length_writable.unwrap_or(true);
+
+        // If desc has no value, treat as ordinary defineOwnProperty on length
+        let new_len_val = match &desc.value {
+            None => {
+                // Just updating attributes on length
+                if let Some(false) = desc.writable {
+                    self.flags.borrow_mut().array_length_writable = Some(false);
+                }
+                return true;
+            }
+            Some(v) => v.clone(),
+        };
+
+        // ToUint32
+        let new_len = if let Some(n) = new_len_val.as_number() {
+            let uint32 = n as u32;
+            if (uint32 as f64) != n {
+                return false; // Would be RangeError in calling code
+            }
+            uint32
+        } else if new_len_val.is_undefined() {
+            0
+        } else {
+            return false;
+        };
+
+        // Build a new PartialDescriptor with the uint32 value
+        let new_desc = PartialDescriptor {
+            value: Some(Value::number(new_len as f64)),
+            writable: desc.writable,
+            enumerable: desc.enumerable,
+            configurable: desc.configurable,
+            get: None,
+            set: None,
+        };
+
+        if new_len >= old_len {
+            // Growing or same: just validate and set
+            if !old_len_writable {
+                // Non-writable length: can only succeed if value is same
+                if let Some(ref v) = new_desc.value {
+                    if !same_value(&Value::number(old_len as f64), v) {
+                        return false;
+                    }
+                }
+            }
+            self.set_array_length(new_len);
+            if let Some(false) = new_desc.writable {
+                self.flags.borrow_mut().array_length_writable = Some(false);
+            }
+            return true;
+        }
+
+        // Shrinking
+        if !old_len_writable {
+            return false;
+        }
+        let new_writable = new_desc.writable.unwrap_or(true);
+        self.set_array_length(new_len);
+        if !new_writable {
+            self.flags.borrow_mut().array_length_writable = Some(false);
+        }
+        true
+    }
+
+    /// Array [[DefineOwnProperty]] for an array index (ES2026 §10.4.2.1 step 3)
+    fn array_define_own_index(&self, index: u32, desc: &PartialDescriptor) -> bool {
+        let old_len = self.array_length() as u32;
+        let length_writable = self.flags.borrow().array_length_writable.unwrap_or(true);
+
+        // Step 3.b: If index >= oldLen and length is not writable, return false
+        if index >= old_len && !length_writable {
+            return false;
+        }
+
+        // For accessor descriptors on indexed properties, store via shape (not elements)
+        if desc.is_accessor_descriptor() {
+            let key = PropertyKey::Index(index);
+            // Delegate to ordinary [[DefineOwnProperty]] on this key
+            // but bypass our array check (already handled)
+            return self.ordinary_define_own_property(key, desc);
+        }
+
+        // For simple data properties on arrays, store in elements array
+        let idx = index as usize;
+        let value = desc.value.clone().unwrap_or(Value::undefined());
+
+        // Check if element already exists in elements
+        let elements_len = self.elements.borrow().len();
+        if idx < elements_len {
+            // Element exists - check current descriptor from shape first
+            let key = PropertyKey::Index(index);
+            if let Some(existing) = {
+                // Check shape for non-default attributes
+                let shape = self.shape.borrow();
+                shape.get_offset(&key).and_then(|off| self.get_property_entry_by_offset(off))
+            } {
+                // Has explicit descriptor in shape - use ordinary path
+                return self.ordinary_define_own_property(key, desc);
+            }
+            // Default data property in elements - just update value
+            if !self.elements.borrow()[idx].is_hole() {
+                // Existing element with default attributes
+                // Check if desc specifies non-default attributes
+                if desc.has_non_default_data_attributes() {
+                    // Need to store in shape for custom attributes
+                    return self.ordinary_define_own_property(key, desc);
+                }
+                self.elements.borrow_mut()[idx] = value;
+            } else {
+                // Hole - create new element
+                if !self.flags.borrow().extensible {
+                    return false;
+                }
+                if desc.has_non_default_data_attributes() {
+                    return self.ordinary_define_own_property(key, desc);
+                }
+                self.elements.borrow_mut()[idx] = value;
+            }
+        } else {
+            // Beyond current elements
+            if !self.flags.borrow().extensible {
+                return false;
+            }
+            // Sparse threshold: avoid allocating billions of holes for large indices
+            const MAX_DENSE_PREALLOC: usize = 1 << 24; // 16M elements
+            if desc.has_non_default_data_attributes() || idx >= MAX_DENSE_PREALLOC {
+                let key = PropertyKey::Index(index);
+                let result = self.ordinary_define_own_property(key, desc);
+                if result && index >= old_len {
+                    self.set_array_length(index + 1);
+                }
+                return result;
+            }
+            // Extend elements array (dense path)
+            let mut elements = self.elements.borrow_mut();
+            if idx > elements.len() {
+                elements.resize(idx, Value::hole());
+            }
+            elements.push(value);
+        }
+
+        // Step 3.f: If index >= oldLen, update length
+        if index >= old_len {
+            self.set_array_length(index + 1);
+        }
+        true
+    }
+
+    /// Ordinary [[DefineOwnProperty]] without array special handling.
+    /// Used by array_define_own_index when it needs to fall through to the base algorithm.
+    fn ordinary_define_own_property(&self, key: PropertyKey, desc: &PartialDescriptor) -> bool {
+        use crate::intrinsics_impl::helpers::same_value;
+
+        let extensible = self.flags.borrow().extensible;
+        let current = self.get_own_property_descriptor(&key);
+
+        match current {
+            None | Some(PropertyDescriptor::Deleted) => {
+                if !extensible {
+                    return false;
+                }
+                let new_desc = if desc.is_accessor_descriptor() {
+                    let get_val = desc.get.clone().unwrap_or(Value::undefined());
+                    let set_val = desc.set.clone().unwrap_or(Value::undefined());
+                    PropertyDescriptor::Accessor {
+                        get: if get_val.is_undefined() { None } else { Some(get_val) },
+                        set: if set_val.is_undefined() { None } else { Some(set_val) },
+                        attributes: PropertyAttributes {
+                            writable: false,
+                            enumerable: desc.enumerable.unwrap_or(false),
+                            configurable: desc.configurable.unwrap_or(false),
+                        },
+                    }
+                } else {
+                    PropertyDescriptor::Data {
+                        value: desc.value.clone().unwrap_or(Value::undefined()),
+                        attributes: PropertyAttributes {
+                            writable: desc.writable.unwrap_or(false),
+                            enumerable: desc.enumerable.unwrap_or(false),
+                            configurable: desc.configurable.unwrap_or(false),
+                        },
+                    }
+                };
+                self.store_property(key, new_desc);
+                true
+            }
+            Some(ref existing) => {
+                if desc.is_empty() {
+                    return true;
+                }
+                let current_configurable = existing.is_configurable();
+                if !current_configurable {
+                    if desc.configurable == Some(true) {
+                        return false;
+                    }
+                    if let Some(new_enum) = desc.enumerable {
+                        if new_enum != existing.enumerable() {
+                            return false;
+                        }
+                    }
+                }
+                if desc.is_generic_descriptor() {
+                    let merged = Self::merge_partial_with_current(existing, desc);
+                    self.store_property(key, merged);
+                    return true;
+                }
+                let current_is_data = matches!(existing, PropertyDescriptor::Data { .. });
+                let desc_is_data = desc.is_data_descriptor();
+                let desc_is_accessor = desc.is_accessor_descriptor();
+                if current_is_data != desc_is_data && current_is_data != !desc_is_accessor {
+                    if !current_configurable {
+                        return false;
+                    }
+                    let merged = Self::merge_partial_with_current_converting(existing, desc);
+                    self.store_property(key, merged);
+                    return true;
+                }
+                if desc_is_data && current_is_data {
+                    if let PropertyDescriptor::Data { value: curr_val, attributes: curr_attrs } = existing {
+                        if !current_configurable && !curr_attrs.writable {
+                            if desc.writable == Some(true) {
+                                return false;
+                            }
+                            if let Some(ref new_val) = desc.value {
+                                if !same_value(&curr_val, new_val) {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    let merged = Self::merge_partial_with_current(existing, desc);
+                    self.store_property(key, merged);
+                    return true;
+                }
+                if desc_is_accessor && matches!(existing, PropertyDescriptor::Accessor { .. }) {
+                    if let PropertyDescriptor::Accessor { get: curr_get, set: curr_set, .. } = &existing {
+                        if !current_configurable {
+                            if let Some(ref new_set) = desc.set {
+                                let curr_set_val = curr_set.clone().unwrap_or(Value::undefined());
+                                if !same_value(&curr_set_val, new_set) {
+                                    return false;
+                                }
+                            }
+                            if let Some(ref new_get) = desc.get {
+                                let curr_get_val = curr_get.clone().unwrap_or(Value::undefined());
+                                if !same_value(&curr_get_val, new_get) {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    let merged = Self::merge_partial_with_current(existing, desc);
+                    self.store_property(key, merged);
+                    return true;
+                }
+                if !current_configurable {
+                    return false;
+                }
+                let merged = Self::merge_partial_with_current_converting(existing, desc);
+                self.store_property(key, merged);
+                true
+            }
+        }
     }
 
     /// Get prototype

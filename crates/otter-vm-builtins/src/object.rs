@@ -8,7 +8,7 @@
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory::{self, MemoryManager};
-use otter_vm_core::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
+use otter_vm_core::object::{JsObject, PropertyDescriptor, PropertyKey};
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value as VmValue;
 use otter_vm_runtime::{Op, op_native_with_mm as op_native};
@@ -36,8 +36,6 @@ pub fn ops() -> Vec<Op> {
             native_object_prevent_extensions,
         ),
         op_native("__Object_isExtensible", native_object_is_extensible),
-        op_native("__Object_defineProperty", native_object_define_property),
-        op_native("__Object_create", native_object_create),
         op_native("__Object_is", native_object_is),
         op_native("__Object_rest", native_object_rest),
         op_native(
@@ -161,184 +159,6 @@ fn to_property_key(value: &VmValue) -> PropertyKey {
     PropertyKey::String(JsString::intern(s))
 }
 
-/// Object.defineProperty(obj, prop, descriptor) - native implementation
-fn native_object_define_property(
-    args: &[VmValue],
-    _mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, VmError> {
-    let obj_val = args
-        .first()
-        .ok_or("Object.defineProperty requires an object")?;
-    let key_val = args
-        .get(1)
-        .ok_or("Object.defineProperty requires a property key")?;
-    let descriptor = args
-        .get(2)
-        .ok_or("Object.defineProperty requires a descriptor")?;
-
-    // First argument must be an object
-    let obj = obj_val
-        .as_object()
-        .ok_or("Object.defineProperty requires the first argument to be an object")?;
-
-    let key = to_property_key(key_val);
-
-    let Some(attr_obj) = descriptor.as_object() else {
-        return Err(VmError::type_error("Property descriptor must be an object"));
-    };
-
-    // Helper to read boolean fields
-    let read_bool = |name: &str, default: bool| -> bool {
-        attr_obj
-            .get(&name.into())
-            .and_then(|v| v.as_boolean())
-            .unwrap_or(default)
-    };
-
-    // Check for accessor descriptor (get/set)
-    let get = attr_obj.get(&"get".into());
-    let set = attr_obj.get(&"set".into());
-
-    if get.is_some() || set.is_some() {
-        // Accessor descriptor
-        let enumerable = read_bool("enumerable", false);
-        let configurable = read_bool("configurable", false);
-
-        // Get existing accessor if any (for partial updates)
-        let existing = obj.get_own_property_descriptor(&key);
-        let (mut existing_get, mut existing_set) = match existing {
-            Some(PropertyDescriptor::Accessor { get, set, .. }) => (get, set),
-            _ => (None, None),
-        };
-
-        let get = get
-            .filter(|v| !v.is_undefined())
-            .or_else(|| existing_get.take());
-        let set = set
-            .filter(|v| !v.is_undefined())
-            .or_else(|| existing_set.take());
-
-        let attrs = PropertyAttributes {
-            writable: false,
-            enumerable,
-            configurable,
-        };
-
-        obj.define_property(
-            key,
-            PropertyDescriptor::Accessor {
-                get,
-                set,
-                attributes: attrs,
-            },
-        );
-    } else {
-        // Data descriptor
-        let value = attr_obj
-            .get(&"value".into())
-            .unwrap_or(VmValue::undefined());
-        let writable = read_bool("writable", false);
-        let enumerable = read_bool("enumerable", false);
-        let configurable = read_bool("configurable", false);
-
-        let attrs = PropertyAttributes {
-            writable,
-            enumerable,
-            configurable,
-        };
-
-        obj.define_property(key, PropertyDescriptor::data_with_attrs(value, attrs));
-    }
-
-    // Return the object (per spec)
-    Ok(obj_val.clone())
-}
-
-/// Object.create(proto, propertiesObject?) - native implementation
-fn native_object_create(
-    args: &[VmValue],
-    mm: Arc<memory::MemoryManager>,
-) -> Result<VmValue, VmError> {
-    let proto_val = args
-        .first()
-        .ok_or("Object.create requires a prototype argument")?;
-
-    // Prototype must be object or null
-    let prototype = if proto_val.is_null() || proto_val.as_object().is_some() {
-        proto_val.clone()
-    } else {
-        return Err(VmError::type_error("Object prototype may only be an Object or null"));
-    };
-
-    let new_obj = GcRef::new(JsObject::new(prototype, mm));
-
-    // Handle optional properties object (second argument)
-    if let Some(props_val) = args.get(1) {
-        if !props_val.is_undefined() {
-            let props = props_val
-                .as_object()
-                .ok_or("Properties argument must be an object")?;
-
-            // For each enumerable own property of props, call defineProperty
-            for key in props.own_keys() {
-                if let Some(descriptor) = props.get(&key) {
-                    if let Some(attr_obj) = descriptor.as_object() {
-                        // Helper to read boolean fields
-                        let read_bool = |name: &str, default: bool| -> bool {
-                            attr_obj
-                                .get(&name.into())
-                                .and_then(|v| v.as_boolean())
-                                .unwrap_or(default)
-                        };
-
-                        let get = attr_obj.get(&"get".into());
-                        let set = attr_obj.get(&"set".into());
-
-                        if get.is_some() || set.is_some() {
-                            let enumerable = read_bool("enumerable", false);
-                            let configurable = read_bool("configurable", false);
-
-                            let attrs = PropertyAttributes {
-                                writable: false,
-                                enumerable,
-                                configurable,
-                            };
-
-                            new_obj.define_property(
-                                key,
-                                PropertyDescriptor::Accessor {
-                                    get: get.filter(|v| !v.is_undefined()),
-                                    set: set.filter(|v| !v.is_undefined()),
-                                    attributes: attrs,
-                                },
-                            );
-                        } else {
-                            let value = attr_obj
-                                .get(&"value".into())
-                                .unwrap_or(VmValue::undefined());
-                            let writable = read_bool("writable", false);
-                            let enumerable = read_bool("enumerable", false);
-                            let configurable = read_bool("configurable", false);
-
-                            let attrs = PropertyAttributes {
-                                writable,
-                                enumerable,
-                                configurable,
-                            };
-
-                            new_obj.define_property(
-                                key,
-                                PropertyDescriptor::data_with_attrs(value, attrs),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(VmValue::object(new_obj))
-}
 
 /// Object.is(value1, value2) - SameValue algorithm
 fn native_object_is(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {

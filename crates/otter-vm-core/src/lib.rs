@@ -58,8 +58,7 @@ pub use context::{
 pub use error::{VmError, VmResult};
 pub use gc::GcRef;
 pub use generator::{
-    CompletionType, GeneratorContext, GeneratorFrame, GeneratorState, IteratorResult, JsGenerator,
-    TryEntry,
+    CompletionType, GeneratorFrame, GeneratorState, IteratorResult, JsGenerator, TryEntry,
 };
 pub use interpreter::{GeneratorResult, Interpreter};
 pub use memory::MemoryManager;

@@ -103,7 +103,6 @@ pub use otter_vm_core::{
     // GC types
     GcRef,
     // Generator
-    GeneratorContext,
     GeneratorState,
     // Context and runtime
     Interpreter,

@@ -167,9 +167,14 @@ fn descriptor_from_attributes(attr_obj: &GcRef<JsObject>) -> PropertyDescriptor 
 }
 
 fn descriptor_to_value(desc: PropertyDescriptor, ncx: &NativeContext) -> Value {
+    let obj_proto = ncx.global()
+        .get(&crate::object::PropertyKey::string("Object"))
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get(&crate::object::PropertyKey::string("prototype")))
+        .unwrap_or(Value::null());
     match desc {
         PropertyDescriptor::Data { value, attributes } => {
-            let desc_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+            let desc_obj = GcRef::new(JsObject::new(obj_proto, ncx.memory_manager().clone()));
             let _ = desc_obj.set("value".into(), value);
             let _ = desc_obj.set("writable".into(), Value::boolean(attributes.writable));
             let _ = desc_obj.set("enumerable".into(), Value::boolean(attributes.enumerable));
@@ -177,7 +182,7 @@ fn descriptor_to_value(desc: PropertyDescriptor, ncx: &NativeContext) -> Value {
             Value::object(desc_obj)
         }
         PropertyDescriptor::Accessor { get, set, attributes } => {
-            let desc_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+            let desc_obj = GcRef::new(JsObject::new(obj_proto, ncx.memory_manager().clone()));
             let _ = desc_obj.set("get".into(), get.unwrap_or(Value::undefined()));
             let _ = desc_obj.set("set".into(), set.unwrap_or(Value::undefined()));
             let _ = desc_obj.set("enumerable".into(), Value::boolean(attributes.enumerable));
@@ -417,60 +422,46 @@ pub fn install_reflect_namespace(
         };
         let key = to_property_key(property_key);
 
+        let desc = crate::object::to_property_descriptor(&attr_obj, ncx)
+            .map_err(|e| VmError::type_error(&e))?;
+
         if let Some(proxy) = target.as_proxy() {
-            let desc = descriptor_from_attributes(&attr_obj);
+            // Convert partial to full for proxy trap
+            let full_desc = if desc.is_accessor_descriptor() {
+                let get_val = desc.get.clone().unwrap_or(Value::undefined());
+                let set_val = desc.set.clone().unwrap_or(Value::undefined());
+                PropertyDescriptor::Accessor {
+                    get: if get_val.is_undefined() { None } else { Some(get_val) },
+                    set: if set_val.is_undefined() { None } else { Some(set_val) },
+                    attributes: PropertyAttributes {
+                        writable: false,
+                        enumerable: desc.enumerable.unwrap_or(false),
+                        configurable: desc.configurable.unwrap_or(false),
+                    },
+                }
+            } else {
+                PropertyDescriptor::data_with_attrs(
+                    desc.value.clone().unwrap_or(Value::undefined()),
+                    PropertyAttributes {
+                        writable: desc.writable.unwrap_or(false),
+                        enumerable: desc.enumerable.unwrap_or(false),
+                        configurable: desc.configurable.unwrap_or(false),
+                    },
+                )
+            };
             let result = crate::proxy_operations::proxy_define_property(
                 ncx,
                 proxy,
                 &key,
                 property_key.clone(),
-                &desc,
+                &full_desc,
             )?;
             return Ok(Value::boolean(result));
         }
 
         let obj = get_target_object(target)?;
-
-        let read_bool = |name: &str, default: bool| -> bool {
-            attr_obj.get(&name.into()).and_then(|v| v.as_boolean()).unwrap_or(default)
-        };
-
-        let enumerable = read_bool("enumerable", true);
-        let configurable = read_bool("configurable", true);
-        let writable = read_bool("writable", true);
-
-        // Check if it's an accessor descriptor
-        let get = attr_obj.get(&"get".into());
-        let set = attr_obj.get(&"set".into());
-        if get.is_some() || set.is_some() {
-            let attrs = PropertyAttributes {
-                writable: false,
-                enumerable,
-                configurable,
-            };
-            let ok = obj.define_property(
-                key,
-                PropertyDescriptor::Accessor {
-                    get: get.filter(|v| !v.is_undefined()),
-                    set: set.filter(|v| !v.is_undefined()),
-                    attributes: attrs,
-                },
-            );
-            return Ok(Value::boolean(ok));
-        }
-
-        // Data descriptor
-        if let Some(value) = attr_obj.get(&"value".into()) {
-            let attrs = PropertyAttributes {
-                writable,
-                enumerable,
-                configurable,
-            };
-            let ok = obj.define_property(key, PropertyDescriptor::data_with_attrs(value, attrs));
-            return Ok(Value::boolean(ok));
-        }
-
-        Ok(Value::boolean(true))
+        let ok = obj.define_own_property(key, &desc);
+        Ok(Value::boolean(ok))
     });
 
     // === Prototype Chain ===

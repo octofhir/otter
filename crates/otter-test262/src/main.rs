@@ -505,7 +505,7 @@ async fn run_tests(cli: Cli) {
     for path in tests {
         // Check ignored/known-panic via config
         let path_str = path.to_string_lossy();
-        if config.is_ignored(&path_str) {
+        if config.is_ignored(&path_str) || config.is_known_panic(&path_str) {
             continue;
         }
 

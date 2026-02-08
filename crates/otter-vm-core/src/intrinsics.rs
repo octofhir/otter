@@ -739,7 +739,7 @@ impl Intrinsics {
         // ===================================================================
         // RegExp.prototype methods (extracted to intrinsics_impl/regexp.rs)
         // ===================================================================
-        crate::intrinsics_impl::regexp::init_regexp_prototype(self.regexp_prototype, fn_proto, mm);
+        crate::intrinsics_impl::regexp::init_regexp_prototype(self.regexp_prototype, fn_proto, mm, self.iterator_prototype);
 
         // ===================================================================
         // Promise.prototype methods (extracted to intrinsics_impl/promise.rs)

@@ -967,29 +967,33 @@ pub fn init_string_prototype(
                         }
                     }
 
-                    // String-based matchAll: find all occurrences of string
-                    let str_val = s.as_str();
-                    let search = args
-                        .first()
-                        .and_then(|v| v.as_string())
-                        .map(|s| s.as_str().to_string())
-                        .unwrap_or_default();
-                    let mut results = Vec::new();
-                    let mut start = 0;
-                    while let Some(pos) = str_val[start..].find(&search) {
-                        let abs_pos = start + pos;
-                        let match_arr = GcRef::new(JsObject::array(1, ncx.memory_manager().clone()));
-                        let _ = match_arr.set(PropertyKey::Index(0), Value::string(JsString::intern(&search)));
-                        let _ = match_arr.set(PropertyKey::string("index"), Value::number(abs_pos as f64));
-                        let _ = match_arr.set(PropertyKey::string("input"), Value::string(s.clone()));
-                        let _ = match_arr.set(PropertyKey::string("groups"), Value::undefined());
-                        results.push(Value::array(match_arr));
-                        start = abs_pos + search.len().max(1);
+                    // Per spec §22.1.3.13: if argument is not a RegExp, create
+                    // a new RegExp from ToString(regexp) with "g" flag and
+                    // call its [@@matchAll]
+                    let search_val = args.first().cloned().unwrap_or(Value::undefined());
+                    let search_str = ncx.to_string_value(&search_val)?;
+                    // Create a new global regex from the string
+                    let regexp_ctor = ncx.ctx.get_global("RegExp");
+                    if let Some(ctor) = regexp_ctor {
+                        let ctor_args = [
+                            Value::string(JsString::intern(&search_str)),
+                            Value::string(JsString::intern("g")),
+                        ];
+                        let regex_val = ncx.call_function_construct(&ctor, Value::undefined(), &ctor_args)?;
+                        // Call [@@matchAll] on the new regex
+                        let rx_obj = regex_val.as_regex().map(|r| r.object.clone())
+                            .or_else(|| regex_val.as_object());
+                        if let Some(obj) = rx_obj {
+                            let method = obj
+                                .get(&PropertyKey::Symbol(crate::intrinsics::well_known::match_all_symbol()))
+                                .unwrap_or_else(Value::undefined);
+                            if method.is_callable() {
+                                return ncx.call_function(&method, regex_val, &[Value::string(s.clone())]);
+                            }
+                        }
                     }
-                    let arr = GcRef::new(JsObject::array(results.len(), ncx.memory_manager().clone()));
-                    for (i, val) in results.into_iter().enumerate() {
-                        let _ = arr.set(PropertyKey::Index(i as u32), val);
-                    }
+                    // Fallback: return empty iterator
+                    let arr = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
                     Ok(Value::array(arr))
                 },
                 mm.clone(),

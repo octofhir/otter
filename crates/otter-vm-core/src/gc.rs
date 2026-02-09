@@ -331,6 +331,12 @@ impl<T> GcRef<T> {
     where
         T: otter_vm_gc::GcTraceable + 'static,
     {
+        // Notify thread-local MemoryManager about this allocation
+        let alloc_size = std::mem::size_of::<GcBox<T>>();
+        if let Some(mm) = crate::memory::MemoryManager::current() {
+            let _ = mm.alloc(alloc_size);
+        }
+
         // Allocate and register with GC
         // gc_alloc returns *mut T (pointer to value after header)
         let value_ptr = unsafe { otter_vm_gc::gc_alloc(value) };

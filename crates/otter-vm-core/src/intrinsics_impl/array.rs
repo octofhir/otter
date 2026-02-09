@@ -8,6 +8,7 @@
 //!   slice, concat, reverse, at, fill, splice, flat, forEach, map, filter,
 //!   reduce, reduceRight, find, findIndex, every, some, sort, entries, keys, values, copyWithin
 
+use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::memory::MemoryManager;
@@ -50,6 +51,121 @@ fn value_to_sort_string(val: &Value) -> String {
 /// Helper: set array length
 fn set_len(obj: &GcRef<JsObject>, len: usize) {
     let _ = obj.set(PropertyKey::string("length"), Value::number(len as f64));
+}
+
+/// Helper: get a property value from an object, invoking getters if it's an accessor.
+/// This is the spec-compliant [[Get]] that calls accessor getters via NativeContext.
+fn js_get(
+    obj: &GcRef<JsObject>,
+    key: &PropertyKey,
+    ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    use crate::object::PropertyDescriptor;
+    let desc_opt = obj.lookup_property_descriptor(key);
+    if let Some(desc) = desc_opt {
+        match desc {
+            PropertyDescriptor::Data { value, .. } => Ok(value),
+            PropertyDescriptor::Accessor { get, .. } => {
+                if let Some(getter) = get {
+                    if !getter.is_undefined() {
+                        return ncx.call_function(&getter, Value::object(obj.clone()), &[]);
+                    }
+                }
+                Ok(Value::undefined())
+            }
+            PropertyDescriptor::Deleted => Ok(Value::undefined()),
+        }
+    } else {
+        Ok(Value::undefined())
+    }
+}
+
+/// Create a new array with the correct Array.prototype from the global.
+fn create_default_array(length: usize, ncx: &mut NativeContext<'_>) -> GcRef<JsObject> {
+    let arr = GcRef::new(JsObject::array(length, ncx.memory_manager().clone()));
+    // Set Array.prototype so methods like .map(), .filter() work on the result
+    if let Some(array_ctor) = ncx.global().get(&PropertyKey::string("Array")) {
+        if let Some(array_obj) = array_ctor.as_object().or_else(|| array_ctor.native_function_object()) {
+            if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
+                if let Some(proto_obj) = proto_val.as_object() {
+                    arr.set_prototype(Value::object(proto_obj));
+                }
+            }
+        }
+    }
+    arr
+}
+
+/// ArraySpeciesCreate(originalArray, length) — ES2024 §9.4.2.3
+/// Creates a new array using the species constructor of the original array,
+/// or falls back to the default Array constructor.
+fn array_species_create(
+    original_array: &GcRef<JsObject>,
+    length: usize,
+    ncx: &mut NativeContext<'_>,
+) -> Result<GcRef<JsObject>, VmError> {
+    // 2. If IsArray(originalArray) is false, return ArrayCreate(length)
+    if !original_array.is_array() {
+        return Ok(create_default_array(length, ncx));
+    }
+    // 3. Let C = Get(originalArray, "constructor")
+    let c = original_array.get(&PropertyKey::string("constructor"))
+        .unwrap_or(Value::undefined());
+    // 4. If C is undefined, return ArrayCreate(length)
+    if c.is_undefined() {
+        return Ok(create_default_array(length, ncx));
+    }
+    // 5. If Type(C) is Object, let S = Get(C, @@species)
+    if let Some(c_obj) = c.as_object().or_else(|| c.native_function_object()) {
+        let species_symbol = crate::intrinsics::well_known::species_symbol();
+        let species_key = PropertyKey::Symbol(species_symbol);
+        // Use lookup_property_descriptor to handle accessor (getter) for @@species
+        let s = if let Some(desc) = c_obj.lookup_property_descriptor(&species_key) {
+            match desc {
+                PropertyDescriptor::Data { value, .. } => value,
+                PropertyDescriptor::Accessor { get, .. } => {
+                    if let Some(getter) = get {
+                        if !getter.is_undefined() {
+                            ncx.call_function(&getter, c.clone(), &[])?
+                        } else {
+                            Value::undefined()
+                        }
+                    } else {
+                        Value::undefined()
+                    }
+                }
+                PropertyDescriptor::Deleted => Value::undefined(),
+            }
+        } else {
+            Value::undefined()
+        };
+        // 6. If S is undefined or null, return ArrayCreate(length)
+        if s.is_undefined() || s.is_null() {
+            return Ok(create_default_array(length, ncx));
+        }
+        // 7. If IsConstructor(S), return Construct(S, [length])
+        if s.is_callable() {
+            let result = ncx.call_function_construct(
+                &s, Value::undefined(), &[Value::number(length as f64)]
+            )?;
+            if let Some(obj) = result.as_object() {
+                return Ok(obj);
+            }
+            return Err(VmError::type_error("Species constructor did not return an object"));
+        }
+        // 8. Throw a TypeError
+        return Err(VmError::type_error("Species constructor is not a constructor"));
+    }
+    // C is not an object — if it's callable (e.g. bound function), use as constructor
+    if c.is_callable() {
+        let result = ncx.call_function_construct(
+            &c, Value::undefined(), &[Value::number(length as f64)]
+        )?;
+        return result.as_object()
+            .ok_or_else(|| VmError::type_error("Constructor did not return an object"));
+    }
+    // C is not an object and not callable — throw TypeError
+    Err(VmError::type_error("Constructor is not a constructor"))
 }
 
 /// Create an array iterator object with the given kind ("value", "key", or "entry").
@@ -143,7 +259,7 @@ fn make_array_iterator(
                                 arr_val.clone(),
                             )?
                         } else if let Some(arr_obj) = arr_val.as_object() {
-                            arr_obj.get(&PropertyKey::Index(idx as u32)).unwrap_or(Value::undefined())
+                            js_get(&arr_obj, &PropertyKey::Index(idx as u32), ncx)?
                         } else {
                             Value::undefined()
                         };
@@ -163,7 +279,7 @@ fn make_array_iterator(
                                 arr_val.clone(),
                             )?
                         } else if let Some(arr_obj) = arr_val.as_object() {
-                            arr_obj.get(&PropertyKey::Index(idx as u32)).unwrap_or(Value::undefined())
+                            js_get(&arr_obj, &PropertyKey::Index(idx as u32), ncx)?
                         } else {
                             Value::undefined()
                         };
@@ -266,7 +382,7 @@ pub fn init_array_prototype(
         arr_proto.define_property(
             PropertyKey::string("unshift"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _ncx| {
+                |this_val, args, ncx| {
                     let obj = this_val
                         .as_object()
                         .ok_or_else(|| "Array.prototype.unshift: not an object".to_string())?;
@@ -274,6 +390,7 @@ pub fn init_array_prototype(
                     let arg_count = args.len();
                     // Shift existing elements right
                     for i in (0..len).rev() {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         let val = obj
                             .get(&PropertyKey::Index(i as u32))
                             .unwrap_or(Value::undefined());
@@ -296,7 +413,7 @@ pub fn init_array_prototype(
         arr_proto.define_property(
             PropertyKey::string("indexOf"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _ncx| {
+                |this_val, args, ncx| {
                     let obj = this_val
                         .as_object()
                         .ok_or_else(|| "Array.prototype.indexOf: not an object".to_string())?;
@@ -312,8 +429,9 @@ pub fn init_array_prototype(
                         from as usize
                     };
                     for i in start..len {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         // Per spec, skip holes
-                        if !obj.has_own(&PropertyKey::Index(i as u32)) {
+                        if !obj.has(&PropertyKey::Index(i as u32)) {
                             continue;
                         }
                         if let Some(val) = obj.get(&PropertyKey::Index(i as u32)) {
@@ -333,7 +451,7 @@ pub fn init_array_prototype(
         arr_proto.define_property(
             PropertyKey::string("lastIndexOf"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _ncx| {
+                |this_val, args, ncx| {
                     let obj = this_val
                         .as_object()
                         .ok_or_else(|| "Array.prototype.lastIndexOf: not an object".to_string())?;
@@ -352,8 +470,9 @@ pub fn init_array_prototype(
                         from.min((len as i64) - 1) as usize
                     };
                     for i in (0..=start).rev() {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         // Per spec, skip holes
-                        if !obj.has_own(&PropertyKey::Index(i as u32)) {
+                        if !obj.has(&PropertyKey::Index(i as u32)) {
                             continue;
                         }
                         if let Some(val) = obj.get(&PropertyKey::Index(i as u32)) {
@@ -373,7 +492,7 @@ pub fn init_array_prototype(
         arr_proto.define_property(
             PropertyKey::string("includes"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _ncx| {
+                |this_val, args, ncx| {
                     let obj = this_val
                         .as_object()
                         .ok_or_else(|| "Array.prototype.includes: not an object".to_string())?;
@@ -389,6 +508,7 @@ pub fn init_array_prototype(
                         from as usize
                     };
                     for i in start..len {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         // Note: includes does NOT skip holes when searching for undefined
                         // Per ES2023 §23.1.3.16, includes uses Get which returns undefined
                         // for holes, then SameValueZero(undefined, searchElement).
@@ -427,6 +547,7 @@ pub fn init_array_prototype(
                     // length up to 2^32-1 but only a few actual elements).
                     let mut parts = Vec::with_capacity(len.min(1024));
                     for i in 0..len {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         let val = obj
                             .get(&PropertyKey::Index(i as u32))
                             .unwrap_or(Value::undefined());
@@ -455,6 +576,7 @@ pub fn init_array_prototype(
                     let len = get_len(&obj);
                     let mut parts = Vec::with_capacity(len.min(1024));
                     for i in 0..len {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         let val = obj
                             .get(&PropertyKey::Index(i as u32))
                             .unwrap_or(Value::undefined());
@@ -497,17 +619,19 @@ pub fn init_array_prototype(
                     let from = if start < 0 { (len + start).max(0) } else { start.min(len) } as usize;
                     let to = if end < 0 { (len + end).max(0) } else { end.min(len) } as usize;
                     let count = if to > from { to - from } else { 0 };
-                    let result = GcRef::new(JsObject::array(count, ncx.memory_manager().clone()));
+                    let result = array_species_create(&obj, count, ncx)?;
                     for i in 0..count {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         // Per spec, preserve holes: only set if present in source
-                        if obj.has_own(&PropertyKey::Index((from + i) as u32)) {
+                        if obj.has(&PropertyKey::Index((from + i) as u32)) {
                             let val = obj
                                 .get(&PropertyKey::Index((from + i) as u32))
                                 .unwrap_or(Value::undefined());
                             let _ = result.set(PropertyKey::Index(i as u32), val);
                         }
                     }
-                    Ok(Value::array(result))
+                    set_len(&result, count);
+                    Ok(if result.is_array() { Value::array(result) } else { Value::object(result) })
                 },
                 mm.clone(),
                 fn_proto,
@@ -519,14 +643,17 @@ pub fn init_array_prototype(
             PropertyKey::string("concat"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 |this_val, args, ncx| {
-                    let result = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+                    let this_obj = this_val.as_object()
+                        .ok_or_else(|| "Array.prototype.concat: this is not an object".to_string())?;
+                    let result = array_species_create(&this_obj, 0, ncx)?;
                     let mut idx: u32 = 0;
                     // Copy elements from this (preserve holes)
-                    if let Some(obj) = this_val.as_object() {
-                        let len = get_len(&obj);
+                    {
+                        let len = get_len(&this_obj);
                         for i in 0..len {
-                            if obj.has_own(&PropertyKey::Index(i as u32)) {
-                                let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
+                            if this_obj.has(&PropertyKey::Index(i as u32)) {
+                                let val = js_get(&this_obj, &PropertyKey::Index(i as u32), ncx)?;
                                 let _ = result.set(PropertyKey::Index(idx), val);
                             }
                             // else: hole — leave result[idx] as hole
@@ -540,7 +667,8 @@ pub fn init_array_prototype(
                             if arr.get(&PropertyKey::string("length")).is_some() {
                                 let len = get_len(&arr);
                                 for i in 0..len {
-                                    if arr.has_own(&PropertyKey::Index(i as u32)) {
+                                    if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
+                                    if arr.has(&PropertyKey::Index(i as u32)) {
                                         let val = arr
                                             .get(&PropertyKey::Index(i as u32))
                                             .unwrap_or(Value::undefined());
@@ -556,7 +684,7 @@ pub fn init_array_prototype(
                         idx += 1;
                     }
                     set_len(&result, idx as usize);
-                    Ok(Value::array(result))
+                    Ok(if result.is_array() { Value::array(result) } else { Value::object(result) })
                 },
                 mm.clone(),
                 fn_proto,
@@ -567,7 +695,7 @@ pub fn init_array_prototype(
         arr_proto.define_property(
             PropertyKey::string("reverse"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, _args, _ncx| {
+                |this_val, _args, ncx| {
                     let obj = this_val
                         .as_object()
                         .ok_or_else(|| "Array.prototype.reverse: not an object".to_string())?;
@@ -575,6 +703,7 @@ pub fn init_array_prototype(
                     let mut lo = 0usize;
                     let mut hi = if len > 0 { len - 1 } else { 0 };
                     while lo < hi {
+                        if lo & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         let lo_val = obj
                             .get(&PropertyKey::Index(lo as u32))
                             .unwrap_or(Value::undefined());
@@ -623,7 +752,7 @@ pub fn init_array_prototype(
         arr_proto.define_property(
             PropertyKey::string("fill"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _ncx| {
+                |this_val, args, ncx| {
                     let obj = this_val
                         .as_object()
                         .ok_or_else(|| "Array.prototype.fill: not an object".to_string())?;
@@ -642,6 +771,7 @@ pub fn init_array_prototype(
                     let from = if start < 0 { (len + start).max(0) } else { start.min(len) } as usize;
                     let to = if end < 0 { (len + end).max(0) } else { end.min(len) } as usize;
                     for i in from..to {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         let _ = obj.set(PropertyKey::Index(i as u32), value.clone());
                     }
                     Ok(this_val.clone())
@@ -677,13 +807,15 @@ pub fn init_array_prototype(
                     let items = if args.len() > 2 { &args[2..] } else { &[] };
 
                     // Collect removed elements
-                    let removed = GcRef::new(JsObject::array(delete_count, ncx.memory_manager().clone()));
+                    let removed = array_species_create(&obj, delete_count, ncx)?;
                     for i in 0..delete_count {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         let val = obj
                             .get(&PropertyKey::Index((actual_start + i) as u32))
                             .unwrap_or(Value::undefined());
                         let _ = removed.set(PropertyKey::Index(i as u32), val);
                     }
+                    set_len(&removed, delete_count);
 
                     let item_count = items.len();
                     let ulen = len as usize;
@@ -692,6 +824,7 @@ pub fn init_array_prototype(
                         // Shift elements left
                         let diff = delete_count - item_count;
                         for i in actual_start + delete_count..ulen {
+                            if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                             let val = obj
                                 .get(&PropertyKey::Index(i as u32))
                                 .unwrap_or(Value::undefined());
@@ -704,6 +837,7 @@ pub fn init_array_prototype(
                         // Shift elements right
                         let diff = item_count - delete_count;
                         for i in (actual_start + delete_count..ulen).rev() {
+                            if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                             let val = obj
                                 .get(&PropertyKey::Index(i as u32))
                                 .unwrap_or(Value::undefined());
@@ -721,7 +855,7 @@ pub fn init_array_prototype(
 
                     let new_len = ulen - delete_count + item_count;
                     set_len(&obj, new_len);
-                    Ok(Value::array(removed))
+                    Ok(if removed.is_array() { Value::array(removed) } else { Value::object(removed) })
                 },
                 mm.clone(),
                 fn_proto,
@@ -749,7 +883,7 @@ pub fn init_array_prototype(
                         let len = get_len(source);
                         for i in 0..len {
                             // Per spec, skip holes
-                            if !source.has_own(&PropertyKey::Index(i as u32)) {
+                            if !source.has(&PropertyKey::Index(i as u32)) {
                                 continue;
                             }
                             if let Some(val) = source.get(&PropertyKey::Index(i as u32)) {
@@ -771,12 +905,13 @@ pub fn init_array_prototype(
 
                     let mut items = Vec::new();
                     flatten(&obj, depth, &mut items);
-                    let result_arr =
-                        GcRef::new(JsObject::array(items.len(), ncx.memory_manager().clone()));
+                    let items_len = items.len();
+                    let result_arr = array_species_create(&obj, 0, ncx)?;
                     for (i, item) in items.into_iter().enumerate() {
                         let _ = result_arr.set(PropertyKey::Index(i as u32), item);
                     }
-                    Ok(Value::array(result_arr))
+                    set_len(&result_arr, items_len);
+                    Ok(if result_arr.is_array() { Value::array(result_arr) } else { Value::object(result_arr) })
                 },
                 mm.clone(),
                 fn_proto,
@@ -805,11 +940,12 @@ pub fn init_array_prototype(
                     }
                     let len = get_len(&obj);
                     for i in 0..len {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         // Per spec, skip holes (absent elements)
-                        if !obj.has_own(&PropertyKey::Index(i as u32)) {
+                        if !obj.has(&PropertyKey::Index(i as u32)) {
                             continue;
                         }
-                        let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         ncx.call_function(&callback, this_arg.clone(), &[val, Value::number(i as f64), this_val.clone()])?;
                     }
                     Ok(Value::undefined())
@@ -834,26 +970,18 @@ pub fn init_array_prototype(
                         return Err(VmError::type_error("Array.prototype.map: callback is not a function"));
                     }
                     let len = get_len(&obj);
-                    let result = GcRef::new(JsObject::array(len, ncx.memory_manager().clone()));
-                    if let Some(array_ctor) = ncx.global().get(&PropertyKey::string("Array")) {
-                        if let Some(array_obj) = array_ctor.as_object() {
-                            if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
-                                if let Some(proto_obj) = proto_val.as_object() {
-                                    result.set_prototype(Value::object(proto_obj));
-                                }
-                            }
-                        }
-                    }
+                    let result = array_species_create(&obj, len, ncx)?;
                     for i in 0..len {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         // Per spec, skip holes (absent elements) — hole stays in result
-                        if !obj.has_own(&PropertyKey::Index(i as u32)) {
+                        if !obj.has(&PropertyKey::Index(i as u32)) {
                             continue;
                         }
-                        let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         let mapped = ncx.call_function(&callback, this_arg.clone(), &[val, Value::number(i as f64), this_val.clone()])?;
                         let _ = result.set(PropertyKey::Index(i as u32), mapped);
                     }
-                    Ok(Value::array(result))
+                    Ok(if result.is_array() { Value::array(result) } else { Value::object(result) })
                 },
                 mm.clone(),
                 fn_proto,
@@ -875,14 +1003,15 @@ pub fn init_array_prototype(
                         return Err(VmError::type_error("Array.prototype.filter: callback is not a function"));
                     }
                     let len = get_len(&obj);
-                    let result = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+                    let result = array_species_create(&obj, 0, ncx)?;
                     let mut out_idx = 0u32;
                     for i in 0..len {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         // Per spec, skip holes
-                        if !obj.has_own(&PropertyKey::Index(i as u32)) {
+                        if !obj.has(&PropertyKey::Index(i as u32)) {
                             continue;
                         }
-                        let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         let keep = ncx.call_function(&callback, this_arg.clone(), &[val.clone(), Value::number(i as f64), this_val.clone()])?;
                         if keep.to_boolean() {
                             let _ = result.set(PropertyKey::Index(out_idx), val);
@@ -890,7 +1019,7 @@ pub fn init_array_prototype(
                         }
                     }
                     set_len(&result, out_idx as usize);
-                    Ok(Value::array(result))
+                    Ok(if result.is_array() { Value::array(result) } else { Value::object(result) })
                 },
                 mm.clone(),
                 fn_proto,
@@ -913,7 +1042,8 @@ pub fn init_array_prototype(
                     }
                     let len = get_len(&obj);
                     for i in 0..len {
-                        let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         let test = ncx.call_function(&callback, this_arg.clone(), &[val.clone(), Value::number(i as f64), this_val.clone()])?;
                         if test.to_boolean() {
                             return Ok(val);
@@ -942,7 +1072,8 @@ pub fn init_array_prototype(
                     }
                     let len = get_len(&obj);
                     for i in 0..len {
-                        let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         let test = ncx.call_function(&callback, this_arg.clone(), &[val, Value::number(i as f64), this_val.clone()])?;
                         if test.to_boolean() {
                             return Ok(Value::number(i as f64));
@@ -971,7 +1102,8 @@ pub fn init_array_prototype(
                     }
                     let len = get_len(&obj);
                     for i in (0..len).rev() {
-                        let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         let test = ncx.call_function(&callback, this_arg.clone(), &[val.clone(), Value::number(i as f64), this_val.clone()])?;
                         if test.to_boolean() {
                             return Ok(val);
@@ -1000,7 +1132,8 @@ pub fn init_array_prototype(
                     }
                     let len = get_len(&obj);
                     for i in (0..len).rev() {
-                        let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         let test = ncx.call_function(&callback, this_arg.clone(), &[val, Value::number(i as f64), this_val.clone()])?;
                         if test.to_boolean() {
                             return Ok(Value::number(i as f64));
@@ -1029,11 +1162,12 @@ pub fn init_array_prototype(
                     }
                     let len = get_len(&obj);
                     for i in 0..len {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         // Per spec, skip holes
-                        if !obj.has_own(&PropertyKey::Index(i as u32)) {
+                        if !obj.has(&PropertyKey::Index(i as u32)) {
                             continue;
                         }
-                        let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         let test = ncx.call_function(&callback, this_arg.clone(), &[val, Value::number(i as f64), this_val.clone()])?;
                         if !test.to_boolean() {
                             return Ok(Value::boolean(false));
@@ -1062,11 +1196,12 @@ pub fn init_array_prototype(
                     }
                     let len = get_len(&obj);
                     for i in 0..len {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         // Per spec, skip holes
-                        if !obj.has_own(&PropertyKey::Index(i as u32)) {
+                        if !obj.has(&PropertyKey::Index(i as u32)) {
                             continue;
                         }
-                        let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         let test = ncx.call_function(&callback, this_arg.clone(), &[val, Value::number(i as f64), this_val.clone()])?;
                         if test.to_boolean() {
                             return Ok(Value::boolean(true));
@@ -1105,8 +1240,9 @@ pub fn init_array_prototype(
                         accumulator = Value::undefined();
                         let mut found = false;
                         for i in 0..len {
-                            if obj.has_own(&PropertyKey::Index(i as u32)) {
-                                accumulator = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
+                            if obj.has(&PropertyKey::Index(i as u32)) {
+                                accumulator = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                                 start = i + 1;
                                 found = true;
                                 break;
@@ -1117,11 +1253,12 @@ pub fn init_array_prototype(
                         }
                     }
                     for i in start..len {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         // Per spec, skip holes
-                        if !obj.has_own(&PropertyKey::Index(i as u32)) {
+                        if !obj.has(&PropertyKey::Index(i as u32)) {
                             continue;
                         }
-                        let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         accumulator = ncx.call_function(
                             &callback,
                             Value::undefined(),
@@ -1161,8 +1298,9 @@ pub fn init_array_prototype(
                         accumulator = Value::undefined();
                         let mut found = false;
                         for i in (0..len).rev() {
-                            if obj.has_own(&PropertyKey::Index(i as u32)) {
-                                accumulator = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
+                            if obj.has(&PropertyKey::Index(i as u32)) {
+                                accumulator = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                                 end = i;
                                 found = true;
                                 break;
@@ -1173,11 +1311,12 @@ pub fn init_array_prototype(
                         }
                     }
                     for i in (0..end).rev() {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         // Per spec, skip holes
-                        if !obj.has_own(&PropertyKey::Index(i as u32)) {
+                        if !obj.has(&PropertyKey::Index(i as u32)) {
                             continue;
                         }
-                        let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         accumulator = ncx.call_function(
                             &callback,
                             Value::undefined(),
@@ -1206,21 +1345,22 @@ pub fn init_array_prototype(
                         return Err(VmError::type_error("Array.prototype.flatMap: callback is not a function"));
                     }
                     let len = get_len(&obj);
-                    let result = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+                    let result = array_species_create(&obj, 0, ncx)?;
                     let mut out_idx = 0u32;
                     for i in 0..len {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         // Per spec, skip holes
-                        if !obj.has_own(&PropertyKey::Index(i as u32)) {
+                        if !obj.has(&PropertyKey::Index(i as u32)) {
                             continue;
                         }
-                        let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         let mapped = ncx.call_function(&callback, this_arg.clone(), &[val, Value::number(i as f64), this_val.clone()])?;
                         // Flatten one level
                         if let Some(inner) = mapped.as_object() {
                             if inner.get(&PropertyKey::string("length")).is_some() {
                                 let inner_len = get_len(&inner);
                                 for j in 0..inner_len {
-                                    let item = inner.get(&PropertyKey::Index(j as u32)).unwrap_or(Value::undefined());
+                                    let item = js_get(&inner, &PropertyKey::Index(j as u32), ncx)?;
                                     let _ = result.set(PropertyKey::Index(out_idx), item);
                                     out_idx += 1;
                                 }
@@ -1231,7 +1371,7 @@ pub fn init_array_prototype(
                         out_idx += 1;
                     }
                     set_len(&result, out_idx as usize);
-                    Ok(Value::array(result))
+                    Ok(if result.is_array() { Value::array(result) } else { Value::object(result) })
                 },
                 mm.clone(),
                 fn_proto,
@@ -1252,7 +1392,8 @@ pub fn init_array_prototype(
                     // Collect elements
                     let mut elements: Vec<Value> = Vec::with_capacity(len.min(1024));
                     for i in 0..len {
-                        elements.push(obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined()));
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
+                        elements.push(js_get(&obj, &PropertyKey::Index(i as u32), ncx)?);
                     }
 
                     if compare_fn.is_undefined() {
@@ -1308,7 +1449,7 @@ pub fn init_array_prototype(
         arr_proto.define_property(
             PropertyKey::string("copyWithin"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |this_val, args, _ncx| {
+                |this_val, args, ncx| {
                     let obj = this_val
                         .as_object()
                         .ok_or_else(|| VmError::type_error("Array.prototype.copyWithin: this is not an object"))?;
@@ -1327,11 +1468,13 @@ pub fn init_array_prototype(
                     // Copy in correct direction to handle overlapping
                     if from < to && to < from + count {
                         for i in (0..count).rev() {
+                            if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                             let val = obj.get(&PropertyKey::Index((from + i) as u32)).unwrap_or(Value::undefined());
                             let _ = obj.set(PropertyKey::Index((to + i) as u32), val);
                         }
                     } else {
                         for i in 0..count {
+                            if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                             let val = obj.get(&PropertyKey::Index((from + i) as u32)).unwrap_or(Value::undefined());
                             let _ = obj.set(PropertyKey::Index((to + i) as u32), val);
                         }
@@ -1422,8 +1565,9 @@ pub fn init_array_prototype(
                     let len = get_len(&obj);
                     let result = GcRef::new(JsObject::array(len, ncx.memory_manager().clone()));
                     for i in 0..len {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         let from_idx = len - 1 - i;
-                        let val = obj.get(&PropertyKey::Index(from_idx as u32)).unwrap_or(Value::undefined());
+                        let val = js_get(&obj, &PropertyKey::Index(from_idx as u32), ncx)?;
                         let _ = result.set(PropertyKey::Index(i as u32), val);
                     }
                     Ok(Value::array(result))
@@ -1450,7 +1594,8 @@ pub fn init_array_prototype(
                     // Collect elements
                     let mut elements: Vec<Value> = Vec::with_capacity(len.min(1024));
                     for i in 0..len {
-                        elements.push(obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined()));
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
+                        elements.push(js_get(&obj, &PropertyKey::Index(i as u32), ncx)?);
                     }
 
                     if compare_fn.is_undefined() {
@@ -1535,7 +1680,8 @@ pub fn init_array_prototype(
 
                     // Copy elements before start
                     for i in 0..actual_start {
-                        let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         let _ = result.set(PropertyKey::Index(r), val);
                         r += 1;
                     }
@@ -1548,7 +1694,8 @@ pub fn init_array_prototype(
                     }
                     // Copy elements after deleted section
                     for i in (actual_start + delete_count)..(len as usize) {
-                        let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         let _ = result.set(PropertyKey::Index(r), val);
                         r += 1;
                     }
@@ -1579,10 +1726,11 @@ pub fn init_array_prototype(
                     let value = args.get(1).cloned().unwrap_or(Value::undefined());
                     let result = GcRef::new(JsObject::array(len as usize, ncx.memory_manager().clone()));
                     for i in 0..len {
+                        if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                         if i == actual_index {
                             let _ = result.set(PropertyKey::Index(i as u32), value.clone());
                         } else {
-                            let val = obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                            let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                             let _ = result.set(PropertyKey::Index(i as u32), val);
                         }
                     }
@@ -1679,6 +1827,7 @@ pub fn install_array_statics(
                         let mut k: u32 = 0;
 
                         loop {
+                            if k & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                             // Call iterator.next()
                             let iter_obj = iterator.as_object().ok_or_else(|| {
                                 VmError::type_error("Array.from: iterator is not an object")
@@ -1720,6 +1869,7 @@ pub fn install_array_statics(
                         let len = len_val.as_number().unwrap_or(0.0).max(0.0) as usize;
                         let result = GcRef::new(JsObject::array(len, ncx.memory_manager().clone()));
                         for i in 0..len {
+                            if i & 0x3FF == 0 { ncx.check_for_interrupt()?; }
                             let val = obj
                                 .get(&PropertyKey::Index(i as u32))
                                 .unwrap_or(Value::undefined());

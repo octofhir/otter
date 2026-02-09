@@ -77,6 +77,10 @@ use crate::error::{VmError, VmResult};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+thread_local! {
+    static THREAD_MEMORY_MANAGER: std::cell::RefCell<Option<Arc<MemoryManager>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Minimum GC threshold (1MB)
 const MIN_GC_THRESHOLD: usize = 1024 * 1024;
 
@@ -218,11 +222,14 @@ impl MemoryManager {
         self.gc_requested.store(false, Ordering::Relaxed);
     }
 
-    /// Called after a GC cycle completes to update state
+    /// Called after a GC cycle completes to update state.
+    /// Reconciles allocated bytes with actual GC live set size.
     pub fn on_gc_complete(&self, live_bytes: usize) {
         self.reset_allocation_count();
         self.set_last_live_size(live_bytes);
         self.clear_gc_request();
+        // Reconcile: sync allocated with actual live bytes from GC
+        self.allocated.store(live_bytes, Ordering::Relaxed);
         // Update cached threshold
         let new_threshold = usize::max(MIN_GC_THRESHOLD, live_bytes.saturating_mul(2));
         self.cached_gc_threshold.store(new_threshold, Ordering::Relaxed);
@@ -232,6 +239,27 @@ impl MemoryManager {
     pub fn set_allocation_count_threshold(&self, threshold: usize) {
         self.allocation_count_threshold
             .store(threshold, Ordering::Relaxed);
+    }
+
+    /// Set the thread-local default MemoryManager.
+    /// Called by VmContext::with_config() when a VM is created.
+    pub fn set_thread_default(mm: Arc<MemoryManager>) {
+        THREAD_MEMORY_MANAGER.with(|cell| {
+            *cell.borrow_mut() = Some(mm);
+        });
+    }
+
+    /// Get the thread-local MemoryManager, if one is set.
+    pub fn current() -> Option<Arc<MemoryManager>> {
+        THREAD_MEMORY_MANAGER.with(|cell| cell.borrow().clone())
+    }
+
+    /// Clear the thread-local MemoryManager.
+    /// Called by VmContext::drop().
+    pub fn clear_thread_default() {
+        THREAD_MEMORY_MANAGER.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
     }
 }
 

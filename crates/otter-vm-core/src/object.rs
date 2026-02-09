@@ -1312,16 +1312,15 @@ impl JsObject {
             }
         }
 
-        // For arrays and array-like objects, fall back to indexed elements as own data properties
-        // (only if not found in shape - shape takes precedence for accessor properties)
+        // Fall back to indexed elements as own data properties for ALL objects.
+        // set() stores Index keys in elements for any object, so get_own_property_descriptor
+        // must check elements for any object too (not just arrays).
         // Holes are treated as absent (return None).
-        if self.is_array() || self.has_argument_mapping() {
-            if let PropertyKey::Index(i) = key {
-                let elements = self.elements.borrow();
-                let idx = *i as usize;
-                if idx < elements.len() && !elements[idx].is_hole() {
-                    return Some(PropertyDescriptor::data(elements[idx].clone()));
-                }
+        if let PropertyKey::Index(i) = key {
+            let elements = self.elements.borrow();
+            let idx = *i as usize;
+            if idx < elements.len() && !elements[idx].is_hole() {
+                return Some(PropertyDescriptor::data(elements[idx].clone()));
             }
         }
 
@@ -1347,6 +1346,16 @@ impl JsObject {
 
                 if let Some(desc) = proto_obj.get_own_property_descriptor(key) {
                     return Some(desc);
+                }
+                // Also check elements for Index keys on any object
+                // (set() stores Index values in elements for arrays, and has_own checks them,
+                // but get_own_property_descriptor may miss them for non-array objects)
+                if let PropertyKey::Index(i) = key {
+                    let idx = *i as usize;
+                    let elements = proto_obj.elements.borrow();
+                    if idx < elements.len() && !elements[idx].is_hole() {
+                        return Some(PropertyDescriptor::data(elements[idx].clone()));
+                    }
                 }
 
                 current_proto = proto_obj.prototype.borrow().clone();
@@ -1699,10 +1708,30 @@ impl JsObject {
                 if dict.contains_key(key) {
                     return true;
                 }
+                // For Index keys, also try as String
+                if let PropertyKey::Index(i) = key {
+                    let str_key = PropertyKey::string(&i.to_string());
+                    if dict.contains_key(&str_key) {
+                        return true;
+                    }
+                }
             }
-        } else if let Some(offset) = self.shape.borrow().get_offset(key) {
-            if self.get_property_entry_by_offset(offset).is_some() {
-                return true;
+        } else {
+            let shape = self.shape.borrow();
+            if let Some(offset) = shape.get_offset(key) {
+                if self.get_property_entry_by_offset(offset).is_some() {
+                    return true;
+                }
+            }
+            // For Index keys, also try as String (e.g., Index(1) -> String("1"))
+            // because set() converts non-array Index keys to String for shape storage
+            if let PropertyKey::Index(i) = key {
+                let str_key = PropertyKey::String(JsString::intern(&i.to_string()));
+                if let Some(offset) = shape.get_offset(&str_key) {
+                    if self.get_property_entry_by_offset(offset).is_some() {
+                        return true;
+                    }
+                }
             }
         }
 

@@ -1215,6 +1215,7 @@ impl Intrinsics {
         // Collection constructors
         // ====================================================================
         let array_ctor = alloc_ctor();
+        let array_proto = self.array_prototype;
         let array_ctor_fn: Box<
             dyn Fn(
                     &Value,
@@ -1223,24 +1224,41 @@ impl Intrinsics {
                 ) -> Result<Value, VmError>
                 + Send
                 + Sync,
-        > = Box::new(|_this, args, ncx| {
+        > = Box::new(move |_this, args, ncx| {
+            let make_array = |len: usize| -> GcRef<JsObject> {
+                let arr = GcRef::new(JsObject::array(len, ncx.memory_manager().clone()));
+                arr.set_prototype(Value::object(array_proto));
+                arr
+            };
+
+            if args.is_empty() {
+                return Ok(Value::array(make_array(0)));
+            }
             if args.len() == 1 {
                 if let Some(n) = args[0].as_number() {
                     let len = n as u32;
                     if (len as f64) != n || n < 0.0 {
-                        return Err(VmError::type_error("Invalid array length"));
+                        return Err(VmError::range_error("Invalid array length"));
                     }
-                    let arr =
-                        GcRef::new(JsObject::array(len as usize, ncx.memory_manager().clone()));
-                    return Ok(Value::object(arr));
+                    return Ok(Value::array(make_array(len as usize)));
                 }
+                if let Some(n) = args[0].as_int32() {
+                    if n < 0 {
+                        return Err(VmError::range_error("Invalid array length"));
+                    }
+                    return Ok(Value::array(make_array(n as usize)));
+                }
+                // Single non-numeric argument: Array(x) => [x]
+                let arr = make_array(1);
+                let _ = arr.set(PropertyKey::index(0), args[0].clone());
+                return Ok(Value::array(arr));
             }
             // Array(...items) — populate the array
-            let arr = GcRef::new(JsObject::array(args.len(), ncx.memory_manager().clone()));
+            let arr = make_array(args.len());
             for (i, arg) in args.iter().enumerate() {
                 let _ = arr.set(PropertyKey::index(i as u32), arg.clone());
             }
-            Ok(Value::object(arr))
+            Ok(Value::array(arr))
         });
         install(
             "Array",

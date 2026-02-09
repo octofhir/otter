@@ -236,6 +236,26 @@ impl<'a> NativeContext<'a> {
             self.execute_eval_module(module)
         }
     }
+
+    /// Check for interrupt (timeout) during long-running native functions.
+    ///
+    /// Native functions that run long loops (e.g., Array.prototype.map iterating
+    /// over large sparse arrays) should call this periodically so that
+    /// timeouts/interrupts are respected (the interpreter loop can't check).
+    ///
+    /// **Note:** This intentionally does NOT trigger GC. Running GC from inside
+    /// a native function is unsafe because `GcRef` values on the Rust call stack
+    /// are not visible to the GC root collector and would be freed (use-after-free).
+    /// GC runs safely at interpreter safepoints during `ncx.call_function()` calls.
+    ///
+    /// Returns `Err(VmError::interrupted())` if execution should stop.
+    #[inline]
+    pub fn check_for_interrupt(&mut self) -> VmResult<()> {
+        if self.ctx.is_interrupted() {
+            return Err(VmError::interrupted());
+        }
+        Ok(())
+    }
 }
 
 /// Default maximum native call depth to prevent Rust stack overflow
@@ -484,6 +504,9 @@ impl VmContext {
         max_native_depth: usize,
         memory_manager: Arc<crate::memory::MemoryManager>,
     ) -> Self {
+        // Set thread-local MemoryManager for GcRef::new() tracking
+        crate::memory::MemoryManager::set_thread_default(memory_manager.clone());
+
         Self {
             registers: vec![Value::undefined(); MAX_REGISTERS],
             call_stack: Vec::with_capacity(64),
@@ -2134,6 +2157,9 @@ impl VmContext {
 
 impl Drop for VmContext {
     fn drop(&mut self) {
+        // Clear thread-local MemoryManager
+        crate::memory::MemoryManager::clear_thread_default();
+
         // During dealloc_all, GC objects are freed in arbitrary order.
         // Teardown accesses self.global (a GcRef) which may already be freed.
         // Skip teardown entirely — all memory will be reclaimed by dealloc_all anyway.

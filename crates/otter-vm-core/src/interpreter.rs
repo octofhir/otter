@@ -5700,7 +5700,7 @@ impl Interpreter {
                 {
                     arr.set_prototype(Value::object(array_proto));
                 }
-                ctx.set_register(dst.0, Value::object(arr));
+                ctx.set_register(dst.0, Value::array(arr));
                 Ok(InstructionResult::Continue)
             }
 

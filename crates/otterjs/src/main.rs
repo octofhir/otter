@@ -306,6 +306,7 @@ async fn run_code(source: &str, source_url: &str, cli: &Cli) -> Result<()> {
     let mut engine = EngineBuilder::new()
         .capabilities(caps)
         .with_http() // Enable Otter.serve()
+        .with_nodejs() // Enable Node.js APIs
         .build();
 
     // Configure trace (either for full trace or timeout dumps)
@@ -438,7 +439,11 @@ async fn run_repl(cli: &Cli) -> Result<()> {
     println!("Type .help for help, .exit to exit\n");
 
     let caps = build_capabilities(cli);
-    let mut engine = EngineBuilder::new().capabilities(caps).with_http().build();
+    let mut engine = EngineBuilder::new()
+        .capabilities(caps)
+        .with_http()
+        .with_nodejs()
+        .build();
 
     // Configure trace (though REPL usually doesn't timeout or use full trace)
     if cli.trace {
@@ -681,7 +686,11 @@ async fn run_test_file(
     let source = std::fs::read_to_string(path)?;
     let caps = build_capabilities(cli);
 
-    let mut engine = EngineBuilder::new().capabilities(caps).with_http().build();
+    let mut engine = EngineBuilder::new()
+        .capabilities(caps)
+        .with_http()
+        .with_nodejs()
+        .build();
 
     // Configure trace (either for full trace or timeout dumps)
     if cli.trace {

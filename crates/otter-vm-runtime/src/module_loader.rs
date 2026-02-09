@@ -280,6 +280,8 @@ pub mod interop {
 pub struct ModuleLoader {
     /// Loaded modules by resolved URL
     modules: RwLock<HashMap<String, Arc<RwLock<LoadedModule>>>>,
+    /// Module providers for custom protocols (node:, otter:, etc.)
+    providers: RwLock<Vec<Arc<dyn crate::module_provider::ModuleProvider>>>,
     /// Base directory for resolution
     base_dir: PathBuf,
     /// oxc resolver
@@ -314,23 +316,141 @@ impl ModuleLoader {
 
         Self {
             modules: RwLock::new(HashMap::new()),
+            providers: RwLock::new(Vec::new()),
             base_dir,
             resolver: Resolver::new(options),
         }
     }
 
+    /// Compile source code directly as a module and cache it.
+    pub fn compile_source(
+        &self,
+        source: &str,
+        url: &str,
+        eval_mode: bool,
+    ) -> Result<Arc<otter_vm_bytecode::Module>, ModuleError> {
+        let mut compiler = Compiler::new();
+        let bytecode = if eval_mode {
+            compiler.compile_eval(source, url, false)
+        } else {
+            compiler.compile(source, url, false)
+        }
+        .map_err(|e| ModuleError::CompileError(e.to_string()))?;
+
+        let bytecode_arc = Arc::new(bytecode.clone());
+        let loaded = LoadedModule::new(url.to_string(), bytecode);
+        let module = Arc::new(RwLock::new(loaded));
+
+        if let Ok(mut modules) = self.modules.write() {
+            modules.insert(url.to_string(), module);
+        }
+
+        Ok(bytecode_arc)
+    }
+
+    /// Update a module's namespace after execution.
+    pub fn update_namespace(&self, url: &str, ctx: &otter_vm_core::context::VmContext) {
+        if let Some(module) = self.get(url) {
+            if let Ok(mut guard) = module.write() {
+                let exports = guard.exports().to_vec();
+                let global = ctx.global();
+                let captured = ctx.captured_exports();
+
+                println!(
+                    "Updating namespace for {}. Export count: {}. Captured: {}",
+                    url,
+                    exports.len(),
+                    captured.is_some()
+                );
+
+                for export_record in exports {
+                    match export_record {
+                        otter_vm_bytecode::module::ExportRecord::Named { local: _, exported } => {
+                            // First check captured exports (for ESM)
+                            if let Some(val) = captured.and_then(|c| c.get(&exported)) {
+                                println!(
+                                    "  Captured named export (from context): {} = {:?}",
+                                    exported, val
+                                );
+                                guard.namespace.set(&exported, val.clone());
+                            } else if let Some(val) = global.get(&exported.as_str().into()) {
+                                println!(
+                                    "  Captured named export (from global): {} = {:?}",
+                                    exported, val
+                                );
+                                guard.namespace.set(&exported, val);
+                            } else {
+                                // Fallback: try to see if it's in the realm's global
+                                if let Some(val) = ctx
+                                    .realm_global(ctx.realm_id())
+                                    .and_then(|g| g.get(&exported.as_str().into()))
+                                {
+                                    println!(
+                                        "  Captured named export (from realm global): {} = {:?}",
+                                        exported, val
+                                    );
+                                    guard.namespace.set(&exported, val);
+                                } else {
+                                    println!("  FAILED to capture named export: {}", exported);
+                                }
+                            }
+                        }
+                        otter_vm_bytecode::module::ExportRecord::Default { local: _ } => {
+                            // First check captured exports (for ESM)
+                            if let Some(val) = captured.and_then(|c| c.get("default")) {
+                                println!("  Captured default export (from context)");
+                                guard.namespace.set("default", val.clone());
+                            } else if let Some(val) = global.get(&"default".into()) {
+                                println!("  Captured default export (from global)");
+                                guard.namespace.set("default", val);
+                            } else if let Some(val) = ctx
+                                .realm_global(ctx.realm_id())
+                                .and_then(|g| g.get(&"default".into()))
+                            {
+                                println!("  Captured default export (from realm global)");
+                                guard.namespace.set("default", val);
+                            } else {
+                                println!("  FAILED to capture default export");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Register a module provider for custom protocols.
+    ///
+    /// Providers are checked in order of registration during resolve/load.
+    /// Use this to add support for `node:`, `otter:`, or custom URL schemes.
+    pub fn register_provider(&self, provider: Arc<dyn crate::module_provider::ModuleProvider>) {
+        if let Ok(mut providers) = self.providers.write() {
+            providers.push(provider);
+        }
+    }
+
     /// Resolve a module specifier to an absolute path
     pub fn resolve(&self, specifier: &str, referrer: &str) -> Result<String, ModuleError> {
-        // Handle absolute paths
+        // 1. Check registered providers first (node:, otter:, etc.)
+        if let Ok(providers) = self.providers.read() {
+            for provider in providers.iter() {
+                if let Some(resolution) = provider.resolve(specifier, referrer) {
+                    return Ok(resolution.url);
+                }
+            }
+        }
+
+        // 2. Handle absolute paths
         if specifier.starts_with('/') {
             return Ok(specifier.to_string());
         }
 
-        // Get the directory of the referrer
+        // 3. Get the directory of the referrer
         let referrer_path = Path::new(referrer);
         let referrer_dir = referrer_path.parent().unwrap_or(&self.base_dir);
 
-        // Use oxc resolver
+        // 4. Use oxc resolver for filesystem modules
         match self.resolver.resolve(referrer_dir, specifier) {
             Ok(resolution) => Ok(resolution.path().to_string_lossy().to_string()),
             Err(e) => Err(ModuleError::ResolveError(format!(
@@ -347,7 +467,31 @@ impl ModuleLoader {
             return Ok(module);
         }
 
-        // Read file
+        // 1. Try to load from providers (handles builtin://, custom protocols)
+        if let Ok(providers) = self.providers.read() {
+            for provider in providers.iter() {
+                if let Some(source) = provider.load(url) {
+                    // Compile the source from provider
+                    let compiler = Compiler::new();
+                    let bytecode = compiler
+                        .compile(&source.code, url, false)
+                        .map_err(|e| ModuleError::CompileError(e.to_string()))?;
+
+                    // Create loaded module
+                    let loaded = LoadedModule::new(url.to_string(), bytecode);
+                    let module = Arc::new(RwLock::new(loaded));
+
+                    // Store in cache
+                    if let Ok(mut modules) = self.modules.write() {
+                        modules.insert(url.to_string(), Arc::clone(&module));
+                    }
+
+                    return Ok(module);
+                }
+            }
+        }
+
+        // 2. Read from filesystem
         let source =
             std::fs::read_to_string(url).map_err(|e| ModuleError::IoError(e.to_string()))?;
 

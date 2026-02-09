@@ -149,6 +149,12 @@ pub use otter_vm_builtins::{
     create_builtins_extension_with_console, create_http_extension,
 };
 
+// Re-export Node.js compatibility
+pub use otter_nodejs::{
+    builtin_modules as nodejs_builtin_modules, create_nodejs_extension,
+    get_builtin_source as nodejs_get_builtin_source, is_builtin as nodejs_is_builtin,
+};
+
 // ============================================================================
 // High-level Engine Builder (includes builtins automatically)
 // ============================================================================
@@ -190,6 +196,7 @@ pub use otter_vm_builtins::{
 pub struct EngineBuilder {
     inner: OtterBuilder,
     with_http: bool,
+    with_nodejs: bool,
 }
 
 impl EngineBuilder {
@@ -198,6 +205,7 @@ impl EngineBuilder {
         Self {
             inner: OtterBuilder::new(),
             with_http: false,
+            with_nodejs: false,
         }
     }
 
@@ -206,6 +214,16 @@ impl EngineBuilder {
     /// Note: fetch() is always available. This only enables the server API.
     pub fn with_http(mut self) -> Self {
         self.with_http = true;
+        self
+    }
+
+    /// Enable Node.js API compatibility (Buffer, process, fs, path, etc.).
+    ///
+    /// This registers the Node.js extension which provides:
+    /// - `node:fs`, `node:path`, `node:buffer`, `node:events`
+    /// - `node:process`, `node:util`, `node:stream`, `node:assert`, `node:os`
+    pub fn with_nodejs(mut self) -> Self {
+        self.with_nodejs = true;
         self
     }
 
@@ -266,6 +284,16 @@ impl EngineBuilder {
             runtime
                 .register_extension(http_ext)
                 .expect("Failed to register HTTP extension");
+        }
+
+        // Register Node.js compatibility if enabled
+        if self.with_nodejs {
+            runtime
+                .register_extension(create_nodejs_extension())
+                .expect("Failed to register Node.js extension");
+
+            // Register the module provider for node: and bare specifiers
+            runtime.register_module_provider(otter_nodejs::create_nodejs_provider());
         }
 
         // Pre-compile extensions to speed up every eval()

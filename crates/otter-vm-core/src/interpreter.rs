@@ -14,8 +14,8 @@ use crate::object::{
     get_proto_epoch,
 };
 use crate::promise::{JsPromise, PromiseState};
-use crate::regexp::JsRegExp;
 use crate::realm::RealmId;
+use crate::regexp::JsRegExp;
 use crate::string::JsString;
 use crate::value::{Closure, HeapRef, UpvalueCell, Value};
 
@@ -66,6 +66,20 @@ impl Interpreter {
 
     /// Execute a module with Arc (for internal use and pre-created Arcs)
     pub fn execute_arc(&self, module: Arc<Module>, ctx: &mut VmContext) -> VmResult<Value> {
+        self.execute_arc_with_locals(module, ctx, None)
+    }
+
+    /// Execute a module with Arc and initial local variables.
+    ///
+    /// The `initial_locals` map allows pre-populating local variables in the entry
+    /// function. This is essential for ES modules where imported bindings are
+    /// mapped to local variables that must be populated before execution.
+    pub fn execute_arc_with_locals(
+        &self,
+        module: Arc<Module>,
+        ctx: &mut VmContext,
+        initial_locals: Option<std::collections::HashMap<u16, Value>>,
+    ) -> VmResult<Value> {
         // Get entry function
         let entry_func = module
             .entry_function()
@@ -87,16 +101,56 @@ impl Interpreter {
             entry_func.is_async(),
             0,
         )?;
+
+        // Populate initial locals if provided
+        if let Some(locals) = initial_locals {
+            for (idx, value) in locals {
+                ctx.set_local(idx, value)?;
+            }
+        }
+
         ctx.set_running(true);
 
         // Execute loop
         let result = self.run_loop(ctx);
+
+        // Capture exports from the current frame before popping it
+        if result.is_ok() {
+            let mut exports = std::collections::HashMap::new();
+            if let Some(entry_func) = module.entry_function() {
+                for export in &module.exports {
+                    match export {
+                        otter_vm_bytecode::module::ExportRecord::Named { local, exported } => {
+                            if let Some(idx) =
+                                entry_func.local_names.iter().position(|n| n == local)
+                            {
+                                if let Ok(val) = ctx.get_local(idx as u16) {
+                                    exports.insert(exported.clone(), val);
+                                }
+                            }
+                        }
+                        otter_vm_bytecode::module::ExportRecord::Default { local } => {
+                            if let Some(idx) =
+                                entry_func.local_names.iter().position(|n| n == local)
+                            {
+                                if let Ok(val) = ctx.get_local(idx as u16) {
+                                    exports.insert("default".to_string(), val);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ctx.set_captured_exports(exports);
+        }
 
         // Pop the entry frame that we pushed above.
         // run_loop returns without popping at stack_depth==1.
         ctx.pop_frame();
 
         ctx.set_running(false);
+        println!("Module execution finished. Result: {:?}", result);
         result
     }
 
@@ -1536,7 +1590,10 @@ impl Interpreter {
                             {
                                 if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr
                                 {
-                                    if global_obj.set_by_offset(*offset as usize, val_val.clone()).is_ok() {
+                                    if global_obj
+                                        .set_by_offset(*offset as usize, val_val.clone())
+                                        .is_ok()
+                                    {
                                         return Ok(InstructionResult::Continue);
                                     }
                                 }
@@ -2302,17 +2359,17 @@ impl Interpreter {
                 // Use get_property_value to properly call getters
                 let has_instance_key =
                     PropertyKey::Symbol(crate::intrinsics::well_known::has_instance_symbol());
-                let handler = self.get_property_value(ctx, &right_obj, &has_instance_key, &right)?;
+                let handler =
+                    self.get_property_value(ctx, &right_obj, &has_instance_key, &right)?;
 
                 if !handler.is_undefined() && !handler.is_null() {
                     // Step 2a: If handler is not callable, throw TypeError
                     if !handler.is_callable() {
-                        return Err(VmError::type_error(
-                            "@@hasInstance is not callable",
-                        ));
+                        return Err(VmError::type_error("@@hasInstance is not callable"));
                     }
                     // Step 2b: Call handler with this=right, args=[left]
-                    let result = self.call_function(ctx, &handler, right.clone(), &[left.clone()])?;
+                    let result =
+                        self.call_function(ctx, &handler, right.clone(), &[left.clone()])?;
                     // Step 2c: Return ToBoolean(result)
                     ctx.set_register(dst.0, Value::boolean(result.to_boolean()));
                     return Ok(InstructionResult::Continue);
@@ -2558,7 +2615,8 @@ impl Interpreter {
                     }
 
                     // Slow path with IC update (proxy-aware)
-                    let has_property = self.has_with_proxy_chain(ctx, &right_obj, &key, left.clone())?;
+                    let has_property =
+                        self.has_with_proxy_chain(ctx, &right_obj, &key, left.clone())?;
                     {
                         let frame = ctx
                             .current_frame()
@@ -3121,13 +3179,9 @@ impl Interpreter {
                             _ => false,
                         }
                     };
-                    let is_special = [
-                        "__Function_call",
-                        "__Function_apply",
-                        "eval",
-                    ]
-                    .iter()
-                    .any(|name| ctx.get_global(name).is_some_and(|v| is_same_native(&v)));
+                    let is_special = ["__Function_call", "__Function_apply", "eval"]
+                        .iter()
+                        .any(|name| ctx.get_global(name).is_some_and(|v| is_same_native(&v)));
 
                     if is_special {
                         return self.handle_call_value(
@@ -3327,7 +3381,9 @@ impl Interpreter {
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
                         .and_then(|v| v.as_object())
-                        .or_else(|| self.default_object_prototype_for_constructor(ctx, &func_value));
+                        .or_else(|| {
+                            self.default_object_prototype_for_constructor(ctx, &func_value)
+                        });
                     let new_obj = GcRef::new(JsObject::new(
                         ctor_proto
                             .clone()
@@ -3410,7 +3466,9 @@ impl Interpreter {
                             .as_object()
                             .and_then(|o| o.get(&PropertyKey::string("prototype")))
                             .and_then(|v| v.as_object())
-                            .or_else(|| self.default_object_prototype_for_constructor(ctx, &func_value));
+                            .or_else(|| {
+                                self.default_object_prototype_for_constructor(ctx, &func_value)
+                            });
                         let new_obj = GcRef::new(JsObject::new(
                             ctor_proto
                                 .clone()
@@ -3705,7 +3763,8 @@ impl Interpreter {
                                     let _ = iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(false));
                                     let js_queue = js_queue.clone();
-                                    JsPromise::resolve_with_js_jobs(promise, 
+                                    JsPromise::resolve_with_js_jobs(
+                                        promise,
                                         Value::object(iter_result),
                                         move |job, args| {
                                             if let Some(queue) = &js_queue {
@@ -3723,7 +3782,8 @@ impl Interpreter {
                                     let _ = iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(true));
                                     let js_queue = js_queue.clone();
-                                    JsPromise::resolve_with_js_jobs(promise, 
+                                    JsPromise::resolve_with_js_jobs(
+                                        promise,
                                         Value::object(iter_result),
                                         move |job, args| {
                                             if let Some(queue) = &js_queue {
@@ -3735,7 +3795,8 @@ impl Interpreter {
                                 GeneratorResult::Error(e) => {
                                     let error_msg = e.to_string();
                                     let js_queue = js_queue.clone();
-                                    JsPromise::reject_with_js_jobs(promise, 
+                                    JsPromise::reject_with_js_jobs(
+                                        promise,
                                         Value::string(JsString::intern(&error_msg)),
                                         move |job, args| {
                                             if let Some(queue) = &js_queue {
@@ -3767,7 +3828,8 @@ impl Interpreter {
                                             Value::boolean(false),
                                         );
                                         let js_queue = js_queue.clone();
-                                        JsPromise::resolve_with_js_jobs(result_promise, 
+                                        JsPromise::resolve_with_js_jobs(
+                                            result_promise,
                                             Value::object(iter_result),
                                             move |job, args| {
                                                 if let Some(queue) = &js_queue {
@@ -4099,7 +4161,9 @@ impl Interpreter {
                         .as_object()
                         .and_then(|o| o.get(&PropertyKey::string("prototype")))
                         .and_then(|v| v.as_object())
-                        .or_else(|| self.default_object_prototype_for_constructor(ctx, &func_value));
+                        .or_else(|| {
+                            self.default_object_prototype_for_constructor(ctx, &func_value)
+                        });
                     let new_obj = GcRef::new(JsObject::new(
                         ctor_proto.map(Value::object).unwrap_or_else(Value::null),
                         ctx.memory_manager().clone(),
@@ -4762,7 +4826,8 @@ impl Interpreter {
                             }
 
                             let key_value = Value::string(JsString::intern_utf16(name_str));
-                            let value = self.get_with_proxy_chain(ctx, &obj, &key, key_value, &object)?;
+                            let value =
+                                self.get_with_proxy_chain(ctx, &obj, &key, key_value, &object)?;
                             if trace_array
                                 && (Self::utf16_eq_ascii(name_str, "Array")
                                     || Self::utf16_eq_ascii(name_str, "prototype")
@@ -4814,8 +4879,7 @@ impl Interpreter {
                 } else if object.is_symbol() {
                     // Autobox symbol -> Symbol.prototype
                     let key = Self::utf16_key(name_str);
-                    if let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object())
-                    {
+                    if let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object()) {
                         if let Some(proto) = symbol_obj
                             .get(&PropertyKey::string("prototype"))
                             .and_then(|v| v.as_object())
@@ -4890,7 +4954,9 @@ impl Interpreter {
                                 match &ic.ic_state {
                                     InlineCacheState::Monomorphic { shape_id, offset } => {
                                         if obj_shape_ptr == *shape_id {
-                                            match obj.set_by_offset(*offset as usize, val_val.clone()) {
+                                            match obj
+                                                .set_by_offset(*offset as usize, val_val.clone())
+                                            {
                                                 Ok(()) => cached = true,
                                                 // Accessor: fall through to slow path to call setter
                                                 Err(SetPropertyError::AccessorWithoutSetter) => {}
@@ -4910,9 +4976,13 @@ impl Interpreter {
                                                 ) {
                                                     Ok(()) => cached = true,
                                                     // Accessor: fall through to slow path to call setter
-                                                    Err(SetPropertyError::AccessorWithoutSetter) => {}
+                                                    Err(
+                                                        SetPropertyError::AccessorWithoutSetter,
+                                                    ) => {}
                                                     Err(e) if is_strict => {
-                                                        return Err(VmError::type_error(e.to_string()));
+                                                        return Err(VmError::type_error(
+                                                            e.to_string(),
+                                                        ));
                                                     }
                                                     Err(_) => {}
                                                 }
@@ -4958,7 +5028,9 @@ impl Interpreter {
                         None => {
                             // No own property - walk prototype chain (may contain proxy or accessor)
                             let key_value = Value::string(JsString::intern_utf16(name_str));
-                            self.set_with_proxy_chain(ctx, &obj, &key, key_value, val_val, &object)?;
+                            self.set_with_proxy_chain(
+                                ctx, &obj, &key, key_value, val_val, &object,
+                            )?;
                             Ok(InstructionResult::Continue)
                         }
                         _ => {
@@ -5051,7 +5123,11 @@ impl Interpreter {
                 // TypeError for null/undefined base
                 if object.is_null() || object.is_undefined() {
                     let key_str = self.to_string(&key_value);
-                    let base = if object.is_null() { "null" } else { "undefined" };
+                    let base = if object.is_null() {
+                        "null"
+                    } else {
+                        "undefined"
+                    };
                     return Err(VmError::type_error(format!(
                         "Cannot delete property '{}' of {}",
                         key_str, base
@@ -5377,7 +5453,13 @@ impl Interpreter {
                                 }
                             }
 
-                            let value = self.get_with_proxy_chain(ctx, &obj, &key, key_value.clone(), &receiver)?;
+                            let value = self.get_with_proxy_chain(
+                                ctx,
+                                &obj,
+                                &key,
+                                key_value.clone(),
+                                &receiver,
+                            )?;
                             ctx.set_register(dst.0, value);
                             Ok(InstructionResult::Continue)
                         }
@@ -5416,8 +5498,7 @@ impl Interpreter {
                 } else if object.is_symbol() {
                     // Autobox symbol -> Symbol.prototype
                     let key = self.value_to_property_key(ctx, &key_value)?;
-                    if let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object())
-                    {
+                    if let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object()) {
                         if let Some(proto) = symbol_obj
                             .get(&PropertyKey::string("prototype"))
                             .and_then(|v| v.as_object())
@@ -5490,7 +5571,9 @@ impl Interpreter {
                                 match &ic.ic_state {
                                     InlineCacheState::Monomorphic { shape_id, offset } => {
                                         if obj_shape_ptr == *shape_id {
-                                            match obj.set_by_offset(*offset as usize, val_val.clone()) {
+                                            match obj
+                                                .set_by_offset(*offset as usize, val_val.clone())
+                                            {
                                                 Ok(()) => cached = true,
                                                 // Accessor: fall through to slow path to call setter
                                                 Err(SetPropertyError::AccessorWithoutSetter) => {}
@@ -5510,9 +5593,13 @@ impl Interpreter {
                                                 ) {
                                                     Ok(()) => cached = true,
                                                     // Accessor: fall through to slow path to call setter
-                                                    Err(SetPropertyError::AccessorWithoutSetter) => {}
+                                                    Err(
+                                                        SetPropertyError::AccessorWithoutSetter,
+                                                    ) => {}
                                                     Err(e) if is_strict => {
-                                                        return Err(VmError::type_error(e.to_string()));
+                                                        return Err(VmError::type_error(
+                                                            e.to_string(),
+                                                        ));
                                                     }
                                                     Err(_) => {}
                                                 }
@@ -5931,9 +6018,13 @@ impl Interpreter {
                                                 ) {
                                                     Ok(()) => cached = true,
                                                     // Accessor: fall through to slow path to call setter
-                                                    Err(SetPropertyError::AccessorWithoutSetter) => {}
+                                                    Err(
+                                                        SetPropertyError::AccessorWithoutSetter,
+                                                    ) => {}
                                                     Err(e) if is_strict => {
-                                                        return Err(VmError::type_error(e.to_string()));
+                                                        return Err(VmError::type_error(
+                                                            e.to_string(),
+                                                        ));
                                                     }
                                                     Err(_) => {}
                                                 }
@@ -5948,9 +6039,13 @@ impl Interpreter {
                                                     ) {
                                                         Ok(()) => cached = true,
                                                         // Accessor: fall through to slow path to call setter
-                                                        Err(SetPropertyError::AccessorWithoutSetter) => {}
+                                                        Err(
+                                                            SetPropertyError::AccessorWithoutSetter,
+                                                        ) => {}
                                                         Err(e) if is_strict => {
-                                                            return Err(VmError::type_error(e.to_string()));
+                                                            return Err(VmError::type_error(
+                                                                e.to_string(),
+                                                            ));
                                                         }
                                                         Err(_) => {}
                                                     }
@@ -6210,7 +6305,8 @@ impl Interpreter {
                                     let _ = iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(false));
                                     let js_queue = js_queue.clone();
-                                    JsPromise::resolve_with_js_jobs(promise, 
+                                    JsPromise::resolve_with_js_jobs(
+                                        promise,
                                         Value::object(iter_result),
                                         move |job, args| {
                                             if let Some(queue) = &js_queue {
@@ -6228,7 +6324,8 @@ impl Interpreter {
                                     let _ = iter_result
                                         .set(PropertyKey::string("done"), Value::boolean(true));
                                     let js_queue = js_queue.clone();
-                                    JsPromise::resolve_with_js_jobs(promise, 
+                                    JsPromise::resolve_with_js_jobs(
+                                        promise,
                                         Value::object(iter_result),
                                         move |job, args| {
                                             if let Some(queue) = &js_queue {
@@ -6240,7 +6337,8 @@ impl Interpreter {
                                 GeneratorResult::Error(e) => {
                                     let error_msg = e.to_string();
                                     let js_queue = js_queue.clone();
-                                    JsPromise::reject_with_js_jobs(promise, 
+                                    JsPromise::reject_with_js_jobs(
+                                        promise,
                                         Value::string(JsString::intern(&error_msg)),
                                         move |job, args| {
                                             if let Some(queue) = &js_queue {
@@ -6267,7 +6365,8 @@ impl Interpreter {
                                             Value::boolean(false),
                                         );
                                         let js_queue = js_queue.clone();
-                                        JsPromise::resolve_with_js_jobs(result_promise, 
+                                        JsPromise::resolve_with_js_jobs(
+                                            result_promise,
                                             Value::object(iter_result),
                                             move |job, args| {
                                                 if let Some(queue) = &js_queue {
@@ -7234,7 +7333,11 @@ impl Interpreter {
     /// stack depth and returns when the eval frame finishes, without
     /// consuming outer call frames. This is the same pattern used by
     /// `call_function`.
-    pub(crate) fn execute_eval_module(&self, ctx: &mut VmContext, module: &Module) -> VmResult<Value> {
+    pub(crate) fn execute_eval_module(
+        &self,
+        ctx: &mut VmContext,
+        module: &Module,
+    ) -> VmResult<Value> {
         let module = Arc::new(module.clone());
         let entry_func = module
             .entry_function()
@@ -8284,12 +8387,18 @@ impl Interpreter {
         // Handle proxy: use proxy_get for property lookups
         if let Some(proxy) = value.as_proxy() {
             // 1. @@toPrimitive
-            let to_prim_key = PropertyKey::Symbol(crate::intrinsics::well_known::to_primitive_symbol());
-            let to_prim_key_value = Value::symbol(crate::intrinsics::well_known::to_primitive_symbol());
+            let to_prim_key =
+                PropertyKey::Symbol(crate::intrinsics::well_known::to_primitive_symbol());
+            let to_prim_key_value =
+                Value::symbol(crate::intrinsics::well_known::to_primitive_symbol());
             let method = {
                 let mut ncx = crate::context::NativeContext::new(ctx, self);
                 crate::proxy_operations::proxy_get(
-                    &mut ncx, proxy, &to_prim_key, to_prim_key_value, value.clone(),
+                    &mut ncx,
+                    proxy,
+                    &to_prim_key,
+                    to_prim_key_value,
+                    value.clone(),
                 )?
             };
             if !method.is_undefined() && !method.is_null() {
@@ -8308,7 +8417,9 @@ impl Interpreter {
                 if !result.is_object() {
                     return Ok(result);
                 }
-                return Err(VmError::type_error("Cannot convert object to primitive value"));
+                return Err(VmError::type_error(
+                    "Cannot convert object to primitive value",
+                ));
             }
 
             // 2. OrdinaryToPrimitive via proxy
@@ -8322,7 +8433,11 @@ impl Interpreter {
                 let method = {
                     let mut ncx = crate::context::NativeContext::new(ctx, self);
                     crate::proxy_operations::proxy_get(
-                        &mut ncx, proxy, &key, key_value, value.clone(),
+                        &mut ncx,
+                        proxy,
+                        &key,
+                        key_value,
+                        value.clone(),
                     )?
                 };
                 if method.is_callable() {
@@ -8333,7 +8448,9 @@ impl Interpreter {
                 }
             }
 
-            return Err(VmError::type_error("Cannot convert object to primitive value"));
+            return Err(VmError::type_error(
+                "Cannot convert object to primitive value",
+            ));
         }
 
         let Some(obj) = value.as_object() else {
@@ -8359,7 +8476,9 @@ impl Interpreter {
             if !result.is_object() {
                 return Ok(result);
             }
-            return Err(VmError::type_error("Cannot convert object to primitive value"));
+            return Err(VmError::type_error(
+                "Cannot convert object to primitive value",
+            ));
         }
 
         // 2. OrdinaryToPrimitive.
@@ -8377,7 +8496,9 @@ impl Interpreter {
             }
         }
 
-        Err(VmError::type_error("Cannot convert object to primitive value"))
+        Err(VmError::type_error(
+            "Cannot convert object to primitive value",
+        ))
     }
 
     /// Convert value to string per ES2023 §7.1.17.
@@ -8414,7 +8535,9 @@ impl Interpreter {
             return Ok(b.value.clone());
         }
         if value.is_symbol() {
-            return Err(VmError::type_error("Cannot convert a Symbol value to a string"));
+            return Err(VmError::type_error(
+                "Cannot convert a Symbol value to a string",
+            ));
         }
         if value.is_object() {
             let prim = self.to_primitive(ctx, value, PreferredType::String)?;
@@ -8772,11 +8895,7 @@ impl Interpreter {
     }
 
     /// Convert a Value to a PropertyKey for object property access
-    fn value_to_property_key(
-        &self,
-        ctx: &mut VmContext,
-        value: &Value,
-    ) -> VmResult<PropertyKey> {
+    fn value_to_property_key(&self, ctx: &mut VmContext, value: &Value) -> VmResult<PropertyKey> {
         if let Some(sym) = value.as_symbol() {
             return Ok(PropertyKey::Symbol(sym));
         }

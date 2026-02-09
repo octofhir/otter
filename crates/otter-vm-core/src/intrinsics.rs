@@ -685,7 +685,7 @@ impl Intrinsics {
             self.iterator_prototype.define_property(
                 PropertyKey::Symbol(sym),
                 PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                    |this_val, _args, _ncx| Ok(this_val.clone()),
+                    |this_val, _args, _ncx| std::result::Result::Ok(this_val.clone()),
                     mm.clone(),
                     fn_proto,
                 )),
@@ -739,7 +739,12 @@ impl Intrinsics {
         // ===================================================================
         // RegExp.prototype methods (extracted to intrinsics_impl/regexp.rs)
         // ===================================================================
-        crate::intrinsics_impl::regexp::init_regexp_prototype(self.regexp_prototype, fn_proto, mm, self.iterator_prototype);
+        crate::intrinsics_impl::regexp::init_regexp_prototype(
+            self.regexp_prototype,
+            fn_proto,
+            mm,
+            self.iterator_prototype,
+        );
 
         // ===================================================================
         // Promise.prototype methods (extracted to intrinsics_impl/promise.rs)
@@ -865,7 +870,7 @@ impl Intrinsics {
                         &Value,
                         &[Value],
                         &mut crate::context::NativeContext<'_>,
-                    ) -> Result<Value, VmError>
+                    ) -> std::result::Result<Value, VmError>
                     + Send
                     + Sync,
             >,
@@ -1024,7 +1029,7 @@ impl Intrinsics {
                     &Value,
                     &[Value],
                     &mut crate::context::NativeContext<'_>,
-                ) -> Result<Value, VmError>
+                ) -> std::result::Result<Value, VmError>
                 + Send
                 + Sync,
         > = Box::new(|this, args, ncx| {
@@ -1155,7 +1160,7 @@ impl Intrinsics {
                     &Value,
                     &[Value],
                     &mut crate::context::NativeContext<'_>,
-                ) -> Result<Value, VmError>
+                ) -> std::result::Result<Value, VmError>
                 + Send
                 + Sync,
         > = Box::new(|this, args, ncx| {
@@ -1221,7 +1226,7 @@ impl Intrinsics {
                     &Value,
                     &[Value],
                     &mut crate::context::NativeContext<'_>,
-                ) -> Result<Value, VmError>
+                ) -> std::result::Result<Value, VmError>
                 + Send
                 + Sync,
         > = Box::new(move |_this, args, ncx| {

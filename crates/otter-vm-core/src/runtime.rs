@@ -13,8 +13,8 @@ use crate::gc::GcRef;
 use crate::globals;
 use crate::interpreter::Interpreter;
 use crate::intrinsics::Intrinsics;
-use crate::realm::{RealmId, RealmRecord, RealmRegistry};
 use crate::object::JsObject;
+use crate::realm::{RealmId, RealmRecord, RealmRegistry};
 use crate::value::Value;
 
 /// The VM runtime
@@ -234,8 +234,18 @@ impl VmRuntime {
         module: &Module,
         ctx: &mut VmContext,
     ) -> VmResult<Value> {
+        self.execute_module_with_context_and_locals(module, ctx, None)
+    }
+
+    /// Execute a module with an existing context and initial local variables
+    pub fn execute_module_with_context_and_locals(
+        &self,
+        module: &Module,
+        ctx: &mut VmContext,
+        initial_locals: Option<std::collections::HashMap<u16, Value>>,
+    ) -> VmResult<Value> {
         let interpreter = Interpreter::new();
-        interpreter.execute(module, ctx)
+        interpreter.execute_arc_with_locals(Arc::new(module.clone()), ctx, initial_locals)
     }
 
     /// Get runtime configuration

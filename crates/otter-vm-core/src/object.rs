@@ -2233,11 +2233,12 @@ impl JsObject {
                 }
 
                 // Step 6: Type mismatch (data vs accessor)
+                // By this point, generic descriptors have been handled (step 5).
+                // Desc must be either data or accessor.
                 let current_is_data = matches!(existing, PropertyDescriptor::Data { .. });
                 let desc_is_data = desc.is_data_descriptor();
-                let desc_is_accessor = desc.is_accessor_descriptor();
 
-                if current_is_data != desc_is_data && current_is_data != !desc_is_accessor {
+                if current_is_data != desc_is_data {
                     // Type conversion: data ↔ accessor
                     if !current_configurable {
                         return false;
@@ -2249,7 +2250,7 @@ impl JsObject {
                 }
 
                 // Step 7: Both data descriptors
-                if desc_is_data && current_is_data {
+                if current_is_data {
                     if let PropertyDescriptor::Data {
                         value: curr_val,
                         attributes: curr_attrs,
@@ -2275,41 +2276,31 @@ impl JsObject {
                     return true;
                 }
 
-                // Step 8: Both accessor descriptors
-                if desc_is_accessor && matches!(existing, PropertyDescriptor::Accessor { .. }) {
-                    if let PropertyDescriptor::Accessor {
-                        get: curr_get,
-                        set: curr_set,
-                        ..
-                    } = &existing
-                    {
-                        if !current_configurable {
-                            // Step 8.a.i: Cannot change set
-                            if let Some(ref new_set) = desc.set {
-                                let curr_set_val = curr_set.clone().unwrap_or(Value::undefined());
-                                if !same_value(&curr_set_val, new_set) {
-                                    return false;
-                                }
+                // Step 8: Both accessor descriptors (the only remaining case)
+                if let PropertyDescriptor::Accessor {
+                    get: curr_get,
+                    set: curr_set,
+                    ..
+                } = &existing
+                {
+                    if !current_configurable {
+                        // Step 8.a.i: Cannot change set
+                        if let Some(ref new_set) = desc.set {
+                            let curr_set_val = curr_set.clone().unwrap_or(Value::undefined());
+                            if !same_value(&curr_set_val, new_set) {
+                                return false;
                             }
-                            // Step 8.a.ii: Cannot change get
-                            if let Some(ref new_get) = desc.get {
-                                let curr_get_val = curr_get.clone().unwrap_or(Value::undefined());
-                                if !same_value(&curr_get_val, new_get) {
-                                    return false;
-                                }
+                        }
+                        // Step 8.a.ii: Cannot change get
+                        if let Some(ref new_get) = desc.get {
+                            let curr_get_val = curr_get.clone().unwrap_or(Value::undefined());
+                            if !same_value(&curr_get_val, new_get) {
+                                return false;
                             }
                         }
                     }
-                    let merged = Self::merge_partial_with_current(existing, desc);
-                    self.store_property(key, merged);
-                    return true;
                 }
-
-                // Type conversion needed (data → accessor or accessor → data)
-                if !current_configurable {
-                    return false;
-                }
-                let merged = Self::merge_partial_with_current_converting(existing, desc);
+                let merged = Self::merge_partial_with_current(existing, desc);
                 self.store_property(key, merged);
                 true
             }
@@ -2702,8 +2693,7 @@ impl JsObject {
                 }
                 let current_is_data = matches!(existing, PropertyDescriptor::Data { .. });
                 let desc_is_data = desc.is_data_descriptor();
-                let desc_is_accessor = desc.is_accessor_descriptor();
-                if current_is_data != desc_is_data && current_is_data != !desc_is_accessor {
+                if current_is_data != desc_is_data {
                     if !current_configurable {
                         return false;
                     }
@@ -2711,7 +2701,7 @@ impl JsObject {
                     self.store_property(key, merged);
                     return true;
                 }
-                if desc_is_data && current_is_data {
+                if current_is_data {
                     if let PropertyDescriptor::Data {
                         value: curr_val,
                         attributes: curr_attrs,
@@ -2732,36 +2722,29 @@ impl JsObject {
                     self.store_property(key, merged);
                     return true;
                 }
-                if desc_is_accessor && matches!(existing, PropertyDescriptor::Accessor { .. }) {
-                    if let PropertyDescriptor::Accessor {
-                        get: curr_get,
-                        set: curr_set,
-                        ..
-                    } = &existing
-                    {
-                        if !current_configurable {
-                            if let Some(ref new_set) = desc.set {
-                                let curr_set_val = curr_set.clone().unwrap_or(Value::undefined());
-                                if !same_value(&curr_set_val, new_set) {
-                                    return false;
-                                }
+                // Both accessor descriptors
+                if let PropertyDescriptor::Accessor {
+                    get: curr_get,
+                    set: curr_set,
+                    ..
+                } = &existing
+                {
+                    if !current_configurable {
+                        if let Some(ref new_set) = desc.set {
+                            let curr_set_val = curr_set.clone().unwrap_or(Value::undefined());
+                            if !same_value(&curr_set_val, new_set) {
+                                return false;
                             }
-                            if let Some(ref new_get) = desc.get {
-                                let curr_get_val = curr_get.clone().unwrap_or(Value::undefined());
-                                if !same_value(&curr_get_val, new_get) {
-                                    return false;
-                                }
+                        }
+                        if let Some(ref new_get) = desc.get {
+                            let curr_get_val = curr_get.clone().unwrap_or(Value::undefined());
+                            if !same_value(&curr_get_val, new_get) {
+                                return false;
                             }
                         }
                     }
-                    let merged = Self::merge_partial_with_current(existing, desc);
-                    self.store_property(key, merged);
-                    return true;
                 }
-                if !current_configurable {
-                    return false;
-                }
-                let merged = Self::merge_partial_with_current_converting(existing, desc);
+                let merged = Self::merge_partial_with_current(existing, desc);
                 self.store_property(key, merged);
                 true
             }
@@ -2877,11 +2860,52 @@ impl JsObject {
                 PropertyDescriptor::Deleted => {}
             }
         }
+        drop(overflow);
+
+        // Make all dictionary-mode properties non-writable and non-configurable
+        if let Some(dict) = self.dictionary_properties.borrow_mut().as_mut() {
+            for entry in dict.values_mut() {
+                match &mut entry.desc {
+                    PropertyDescriptor::Data { attributes, .. } => {
+                        attributes.writable = false;
+                        attributes.configurable = false;
+                    }
+                    PropertyDescriptor::Accessor { attributes, .. } => {
+                        attributes.configurable = false;
+                    }
+                    PropertyDescriptor::Deleted => {}
+                }
+            }
+        }
     }
 
-    /// Check if object is frozen
+    /// Check if object is frozen per ES2024 §20.1.2.13:
+    /// Not extensible AND all own properties non-configurable AND all data properties non-writable.
     pub fn is_frozen(&self) -> bool {
-        self.flags.borrow().frozen
+        let flags = self.flags.borrow();
+        // Fast path: if freeze() was called, all properties were already modified
+        if flags.frozen {
+            return true;
+        }
+        // If extensible, cannot be frozen
+        if flags.extensible {
+            return false;
+        }
+        drop(flags);
+        // Slow path: check every own property
+        for key in self.own_keys() {
+            if let Some(desc) = self.get_own_property_descriptor(&key) {
+                if desc.is_configurable() {
+                    return false;
+                }
+                if let PropertyDescriptor::Data { attributes, .. } = &desc {
+                    if attributes.writable {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Seal the object - prevents adding new properties and makes all existing
@@ -2922,11 +2946,46 @@ impl JsObject {
                 PropertyDescriptor::Deleted => {}
             };
         }
+        drop(overflow);
+
+        // Make all dictionary-mode properties non-configurable
+        if let Some(dict) = self.dictionary_properties.borrow_mut().as_mut() {
+            for entry in dict.values_mut() {
+                match &mut entry.desc {
+                    PropertyDescriptor::Data { attributes, .. } => {
+                        attributes.configurable = false;
+                    }
+                    PropertyDescriptor::Accessor { attributes, .. } => {
+                        attributes.configurable = false;
+                    }
+                    PropertyDescriptor::Deleted => {}
+                }
+            }
+        }
     }
 
-    /// Check if object is sealed
+    /// Check if object is sealed per ES2024 §20.1.2.15:
+    /// Not extensible AND all own properties non-configurable.
     pub fn is_sealed(&self) -> bool {
-        self.flags.borrow().sealed
+        let flags = self.flags.borrow();
+        // Fast path: if seal() was called, all properties were already modified
+        if flags.sealed {
+            return true;
+        }
+        // If extensible, cannot be sealed
+        if flags.extensible {
+            return false;
+        }
+        drop(flags);
+        // Slow path: check every own property
+        for key in self.own_keys() {
+            if let Some(desc) = self.get_own_property_descriptor(&key) {
+                if desc.is_configurable() {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Prevent extensions - prevents adding new properties

@@ -697,21 +697,21 @@ impl Trace for crate::generator::JsGenerator {
         }
 
         // Trace initial arguments and this
-        for val in &*self.initial_args.lock() {
+        for val in self.initial_args.borrow().iter() {
             tracer.mark_value(val);
         }
-        tracer.mark_value(&*self.initial_this.lock());
+        tracer.mark_value(&*self.initial_this.borrow());
 
         // Trace abrupt return/throw
-        if let Some(val) = &*self.abrupt_return.lock() {
+        if let Some(val) = self.abrupt_return.borrow().as_ref() {
             tracer.mark_value(val);
         }
-        if let Some(val) = &*self.abrupt_throw.lock() {
+        if let Some(val) = self.abrupt_throw.borrow().as_ref() {
             tracer.mark_value(val);
         }
 
         // Trace saved frame
-        if let Some(frame) = &*self.frame.lock() {
+        if let Some(frame) = self.frame.borrow().as_ref() {
             frame.trace(tracer);
         }
     }

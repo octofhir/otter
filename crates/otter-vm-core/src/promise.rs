@@ -18,6 +18,7 @@ use crate::gc::GcRef;
 use crate::string::JsString;
 use crate::value::Value;
 use parking_lot::Mutex;
+use std::cell::RefCell;
 use std::sync::Arc;
 
 /// Promise state
@@ -78,20 +79,31 @@ pub struct JsPromiseJob {
 }
 
 /// A JavaScript Promise
+///
+/// The `state` field uses a `Mutex` because it is the cross-thread settlement
+/// gate: tokio workers resolve/reject promises via `with_resolvers` closures.
+/// The 5 callback lists use `RefCell` (cheaper) and are always accessed while
+/// the state Mutex is held, ensuring thread safety.
 pub struct JsPromise {
-    /// Current state
+    /// Current state (Mutex: cross-thread settlement gate)
     pub(crate) state: Mutex<PromiseState>,
     /// Rust callbacks to run on fulfillment (for internal use)
-    on_fulfilled: Mutex<Vec<ResolveCallback>>,
+    on_fulfilled: RefCell<Vec<ResolveCallback>>,
     /// Rust callbacks to run on rejection (for internal use)
-    on_rejected: Mutex<Vec<ResolveCallback>>,
+    on_rejected: RefCell<Vec<ResolveCallback>>,
     /// Callbacks to run on settlement (finally)
-    on_finally: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+    on_finally: RefCell<Vec<Box<dyn FnOnce() + Send>>>,
     /// JS callback jobs for fulfillment (Promise.then onFulfilled)
-    js_fulfill_jobs: Mutex<Vec<JsPromiseJob>>,
+    js_fulfill_jobs: RefCell<Vec<JsPromiseJob>>,
     /// JS callback jobs for rejection (Promise.then/catch onRejected)
-    js_reject_jobs: Mutex<Vec<JsPromiseJob>>,
+    js_reject_jobs: RefCell<Vec<JsPromiseJob>>,
 }
+
+// SAFETY: JsPromise callback RefCells are only accessed while the state Mutex
+// is held, which serializes all access. The state Mutex handles cross-thread
+// settlement from tokio workers.
+unsafe impl Send for JsPromise {}
+unsafe impl Sync for JsPromise {}
 
 impl otter_vm_gc::GcTraceable for JsPromise {
     const NEEDS_TRACE: bool = true;
@@ -130,11 +142,11 @@ impl JsPromise {
     pub fn new() -> GcRef<Self> {
         GcRef::new(Self {
             state: Mutex::new(PromiseState::Pending),
-            on_fulfilled: Mutex::new(Vec::new()),
-            on_rejected: Mutex::new(Vec::new()),
-            on_finally: Mutex::new(Vec::new()),
-            js_fulfill_jobs: Mutex::new(Vec::new()),
-            js_reject_jobs: Mutex::new(Vec::new()),
+            on_fulfilled: RefCell::new(Vec::new()),
+            on_rejected: RefCell::new(Vec::new()),
+            on_finally: RefCell::new(Vec::new()),
+            js_fulfill_jobs: RefCell::new(Vec::new()),
+            js_reject_jobs: RefCell::new(Vec::new()),
         })
     }
 
@@ -211,11 +223,11 @@ impl JsPromise {
     pub fn resolved(value: Value) -> GcRef<Self> {
         GcRef::new(Self {
             state: Mutex::new(PromiseState::Fulfilled(value)),
-            on_fulfilled: Mutex::new(Vec::new()),
-            on_rejected: Mutex::new(Vec::new()),
-            on_finally: Mutex::new(Vec::new()),
-            js_fulfill_jobs: Mutex::new(Vec::new()),
-            js_reject_jobs: Mutex::new(Vec::new()),
+            on_fulfilled: RefCell::new(Vec::new()),
+            on_rejected: RefCell::new(Vec::new()),
+            on_finally: RefCell::new(Vec::new()),
+            js_fulfill_jobs: RefCell::new(Vec::new()),
+            js_reject_jobs: RefCell::new(Vec::new()),
         })
     }
 
@@ -223,11 +235,11 @@ impl JsPromise {
     pub fn rejected(error: Value) -> GcRef<Self> {
         GcRef::new(Self {
             state: Mutex::new(PromiseState::Rejected(error)),
-            on_fulfilled: Mutex::new(Vec::new()),
-            on_rejected: Mutex::new(Vec::new()),
-            on_finally: Mutex::new(Vec::new()),
-            js_fulfill_jobs: Mutex::new(Vec::new()),
-            js_reject_jobs: Mutex::new(Vec::new()),
+            on_fulfilled: RefCell::new(Vec::new()),
+            on_rejected: RefCell::new(Vec::new()),
+            on_finally: RefCell::new(Vec::new()),
+            js_fulfill_jobs: RefCell::new(Vec::new()),
+            js_reject_jobs: RefCell::new(Vec::new()),
         })
     }
 
@@ -240,16 +252,17 @@ impl JsPromise {
         let mut state = self.state.lock();
         if matches!(*state, PromiseState::Pending) {
             *state = PromiseState::Fulfilled(value.clone());
+            // Take callbacks while holding state lock (prevents TOCTOU races)
+            let callbacks = std::mem::take(&mut *self.on_fulfilled.borrow_mut());
+            let finally_callbacks = std::mem::take(&mut *self.on_finally.borrow_mut());
             drop(state);
 
             // Run fulfillment callbacks
-            let callbacks = std::mem::take(&mut *self.on_fulfilled.lock());
             for callback in callbacks {
                 callback(value.clone());
             }
 
             // Run finally callbacks
-            let finally_callbacks = std::mem::take(&mut *self.on_finally.lock());
             for callback in finally_callbacks {
                 callback();
             }
@@ -266,17 +279,17 @@ impl JsPromise {
         let mut state = self.state.lock();
         if matches!(*state, PromiseState::Pending) {
             *state = PromiseState::Fulfilled(value.clone());
+            let callbacks = std::mem::take(&mut *self.on_fulfilled.borrow_mut());
+            let finally_callbacks = std::mem::take(&mut *self.on_finally.borrow_mut());
             drop(state);
 
             // Enqueue fulfillment callbacks as microtasks
-            let callbacks = std::mem::take(&mut *self.on_fulfilled.lock());
             for callback in callbacks {
                 let v = value.clone();
                 enqueue(Box::new(move || callback(v)));
             }
 
             // Enqueue finally callbacks
-            let finally_callbacks = std::mem::take(&mut *self.on_finally.lock());
             for callback in finally_callbacks {
                 enqueue(Box::new(callback));
             }
@@ -292,16 +305,16 @@ impl JsPromise {
         let mut state = self.state.lock();
         if matches!(*state, PromiseState::Pending) {
             *state = PromiseState::Rejected(error.clone());
+            let callbacks = std::mem::take(&mut *self.on_rejected.borrow_mut());
+            let finally_callbacks = std::mem::take(&mut *self.on_finally.borrow_mut());
             drop(state);
 
             // Run rejection callbacks
-            let callbacks = std::mem::take(&mut *self.on_rejected.lock());
             for callback in callbacks {
                 callback(error.clone());
             }
 
             // Run finally callbacks
-            let finally_callbacks = std::mem::take(&mut *self.on_finally.lock());
             for callback in finally_callbacks {
                 callback();
             }
@@ -318,17 +331,17 @@ impl JsPromise {
         let mut state = self.state.lock();
         if matches!(*state, PromiseState::Pending) {
             *state = PromiseState::Rejected(error.clone());
+            let callbacks = std::mem::take(&mut *self.on_rejected.borrow_mut());
+            let finally_callbacks = std::mem::take(&mut *self.on_finally.borrow_mut());
             drop(state);
 
             // Enqueue rejection callbacks as microtasks
-            let callbacks = std::mem::take(&mut *self.on_rejected.lock());
             for callback in callbacks {
                 let e = error.clone();
                 enqueue(Box::new(move || callback(e)));
             }
 
             // Enqueue finally callbacks
-            let finally_callbacks = std::mem::take(&mut *self.on_finally.lock());
             for callback in finally_callbacks {
                 enqueue(Box::new(callback));
             }
@@ -342,11 +355,15 @@ impl JsPromise {
     where
         F: FnOnce(Value) + Send + 'static,
     {
-        let state = self.state.lock().clone();
-        match state {
-            PromiseState::Fulfilled(value) => callback(value),
+        let state = self.state.lock();
+        match &*state {
+            PromiseState::Fulfilled(value) => {
+                let value = value.clone();
+                drop(state);
+                callback(value);
+            }
             PromiseState::Pending | PromiseState::PendingThenable(_) => {
-                self.on_fulfilled.lock().push(Box::new(callback));
+                self.on_fulfilled.borrow_mut().push(Box::new(callback));
             }
             PromiseState::Rejected(_) => {}
         }
@@ -360,13 +377,15 @@ impl JsPromise {
         F: FnOnce(Value) + Send + 'static,
         E: Fn(Box<dyn FnOnce() + Send>),
     {
-        let state = self.state.lock().clone();
-        match state {
+        let state = self.state.lock();
+        match &*state {
             PromiseState::Fulfilled(value) => {
+                let value = value.clone();
+                drop(state);
                 enqueue(Box::new(move || callback(value)));
             }
             PromiseState::Pending | PromiseState::PendingThenable(_) => {
-                self.on_fulfilled.lock().push(Box::new(callback));
+                self.on_fulfilled.borrow_mut().push(Box::new(callback));
             }
             PromiseState::Rejected(_) => {}
         }
@@ -379,11 +398,15 @@ impl JsPromise {
     where
         F: FnOnce(Value) + Send + 'static,
     {
-        let state = self.state.lock().clone();
-        match state {
-            PromiseState::Rejected(error) => callback(error),
+        let state = self.state.lock();
+        match &*state {
+            PromiseState::Rejected(error) => {
+                let error = error.clone();
+                drop(state);
+                callback(error);
+            }
             PromiseState::Pending | PromiseState::PendingThenable(_) => {
-                self.on_rejected.lock().push(Box::new(callback));
+                self.on_rejected.borrow_mut().push(Box::new(callback));
             }
             PromiseState::Fulfilled(_) => {}
         }
@@ -397,13 +420,15 @@ impl JsPromise {
         F: FnOnce(Value) + Send + 'static,
         E: Fn(Box<dyn FnOnce() + Send>),
     {
-        let state = self.state.lock().clone();
-        match state {
+        let state = self.state.lock();
+        match &*state {
             PromiseState::Rejected(error) => {
+                let error = error.clone();
+                drop(state);
                 enqueue(Box::new(move || callback(error)));
             }
             PromiseState::Pending | PromiseState::PendingThenable(_) => {
-                self.on_rejected.lock().push(Box::new(callback));
+                self.on_rejected.borrow_mut().push(Box::new(callback));
             }
             PromiseState::Fulfilled(_) => {}
         }
@@ -416,11 +441,14 @@ impl JsPromise {
     where
         F: FnOnce() + Send + 'static,
     {
-        let state = self.state.lock().clone();
-        match state {
-            PromiseState::Fulfilled(_) | PromiseState::Rejected(_) => callback(),
+        let state = self.state.lock();
+        match &*state {
+            PromiseState::Fulfilled(_) | PromiseState::Rejected(_) => {
+                drop(state);
+                callback();
+            }
             PromiseState::Pending | PromiseState::PendingThenable(_) => {
-                self.on_finally.lock().push(Box::new(callback));
+                self.on_finally.borrow_mut().push(Box::new(callback));
             }
         }
     }
@@ -431,13 +459,14 @@ impl JsPromise {
         F: FnOnce() + Send + 'static,
         E: Fn(Box<dyn FnOnce() + Send>),
     {
-        let state = self.state.lock().clone();
-        match state {
+        let state = self.state.lock();
+        match &*state {
             PromiseState::Fulfilled(_) | PromiseState::Rejected(_) => {
+                drop(state);
                 enqueue(Box::new(callback));
             }
             PromiseState::Pending | PromiseState::PendingThenable(_) => {
-                self.on_finally.lock().push(Box::new(callback));
+                self.on_finally.borrow_mut().push(Box::new(callback));
             }
         }
     }
@@ -471,6 +500,9 @@ impl JsPromise {
     }
 
     /// Trace GC roots held by this promise (state + JS callback jobs).
+    ///
+    /// Called during STW GC mark phase. Holds state lock to serialize with
+    /// any concurrent settlement.
     pub fn trace_roots(&self, tracer: &mut dyn FnMut(*const crate::gc::GcHeader)) {
         let state = self.state.lock();
         match &*state {
@@ -482,27 +514,25 @@ impl JsPromise {
             }
             PromiseState::Pending => {}
         }
-        drop(state);
 
         // Trace JS fulfillment jobs
-        for job in self.js_fulfill_jobs.lock().iter() {
+        for job in self.js_fulfill_jobs.borrow().iter() {
             job.callback.trace(tracer);
             job.this_arg.trace(tracer);
             if let Some(promise) = &job.result_promise {
-                // Trace the GcRef header (GC will handle recursive tracing)
                 tracer(promise.header() as *const _);
             }
         }
 
         // Trace JS rejection jobs
-        for job in self.js_reject_jobs.lock().iter() {
+        for job in self.js_reject_jobs.borrow().iter() {
             job.callback.trace(tracer);
             job.this_arg.trace(tracer);
             if let Some(promise) = &job.result_promise {
-                // Trace the GcRef header (GC will handle recursive tracing)
                 tracer(promise.header() as *const _);
             }
         }
+        drop(state);
     }
 
     /// Register a JS callback for fulfillment
@@ -513,17 +543,16 @@ impl JsPromise {
     where
         E: Fn(JsPromiseJob, Vec<Value>),
     {
-        // eprintln!("DEBUG: then_js called, callback is_function: {}", job.callback.is_function());
-        let state = self.state.lock().clone();
-        match state {
+        let state = self.state.lock();
+        match &*state {
             PromiseState::Fulfilled(value) => {
-                // eprintln!("DEBUG: Promise already fulfilled, enqueueing job immediately");
-                // Promise already fulfilled - enqueue job immediately
+                let value = value.clone();
+                drop(state);
                 enqueue(job, vec![value]);
             }
             PromiseState::Pending | PromiseState::PendingThenable(_) => {
-                // Promise pending - store job for later
-                self.js_fulfill_jobs.lock().push(job);
+                // Push while holding state lock — prevents TOCTOU with resolve
+                self.js_fulfill_jobs.borrow_mut().push(job);
             }
             PromiseState::Rejected(_) => {
                 // Promise rejected - don't run fulfillment handler
@@ -539,15 +568,16 @@ impl JsPromise {
     where
         E: Fn(JsPromiseJob, Vec<Value>),
     {
-        let state = self.state.lock().clone();
-        match state {
+        let state = self.state.lock();
+        match &*state {
             PromiseState::Rejected(error) => {
-                // Promise already rejected - enqueue job immediately
+                let error = error.clone();
+                drop(state);
                 enqueue(job, vec![error]);
             }
             PromiseState::Pending | PromiseState::PendingThenable(_) => {
-                // Promise pending - store job for later
-                self.js_reject_jobs.lock().push(job);
+                // Push while holding state lock — prevents TOCTOU with reject
+                self.js_reject_jobs.borrow_mut().push(job);
             }
             PromiseState::Fulfilled(_) => {
                 // Promise fulfilled - don't run rejection handler
@@ -623,22 +653,23 @@ impl JsPromise {
         }
 
         *state = PromiseState::Fulfilled(value.clone());
+        // Take all callbacks while holding state lock (prevents TOCTOU)
+        let js_jobs = std::mem::take(&mut *promise.js_fulfill_jobs.borrow_mut());
+        let callbacks = std::mem::take(&mut *promise.on_fulfilled.borrow_mut());
+        let finally_callbacks = std::mem::take(&mut *promise.on_finally.borrow_mut());
         drop(state);
 
         // Enqueue JS callback jobs
-        let js_jobs = std::mem::take(&mut *promise.js_fulfill_jobs.lock());
         for job in js_jobs {
             enqueue(job, vec![value.clone()]);
         }
 
         // Run Rust closure callbacks
-        let callbacks = std::mem::take(&mut *promise.on_fulfilled.lock());
         for callback in callbacks {
             callback(value.clone());
         }
 
         // Run finally callbacks
-        let finally_callbacks = std::mem::take(&mut *promise.on_finally.lock());
         for callback in finally_callbacks {
             callback();
         }
@@ -678,22 +709,23 @@ impl JsPromise {
         }
 
         *state = PromiseState::Rejected(error.clone());
+        // Take all callbacks while holding state lock (prevents TOCTOU)
+        let js_jobs = std::mem::take(&mut *promise.js_reject_jobs.borrow_mut());
+        let callbacks = std::mem::take(&mut *promise.on_rejected.borrow_mut());
+        let finally_callbacks = std::mem::take(&mut *promise.on_finally.borrow_mut());
         drop(state);
 
         // Enqueue JS callback jobs
-        let js_jobs = std::mem::take(&mut *promise.js_reject_jobs.lock());
         for job in js_jobs {
             enqueue(job, vec![error.clone()]);
         }
 
         // Run Rust closure callbacks
-        let callbacks = std::mem::take(&mut *promise.on_rejected.lock());
         for callback in callbacks {
             callback(error.clone());
         }
 
         // Run finally callbacks
-        let finally_callbacks = std::mem::take(&mut *promise.on_finally.lock());
         for callback in finally_callbacks {
             callback();
         }
@@ -704,7 +736,7 @@ impl JsPromise {
     pub fn clear_and_extract_values(&self) -> Vec<Value> {
         let mut values = Vec::new();
 
-        // Clear state and extract value
+        // Hold state lock while clearing everything
         let mut state = self.state.lock();
         let old_state = std::mem::replace(&mut *state, PromiseState::Pending);
         match old_state {
@@ -713,16 +745,14 @@ impl JsPromise {
             PromiseState::PendingThenable(v) => values.push(v),
             _ => {}
         }
-        drop(state);
 
-        // Clear callbacks to break references.
-        // NOTE: We cannot easily extract values from within the boxed closures,
-        // but clearing the vectors will at least prevent further reference accumulation.
-        self.on_fulfilled.lock().clear();
-        self.on_rejected.lock().clear();
-        self.on_finally.lock().clear();
-        self.js_fulfill_jobs.lock().clear();
-        self.js_reject_jobs.lock().clear();
+        // Clear callbacks to break references
+        self.on_fulfilled.borrow_mut().clear();
+        self.on_rejected.borrow_mut().clear();
+        self.on_finally.borrow_mut().clear();
+        self.js_fulfill_jobs.borrow_mut().clear();
+        self.js_reject_jobs.borrow_mut().clear();
+        drop(state);
 
         values
     }
@@ -732,11 +762,11 @@ impl Default for JsPromise {
     fn default() -> Self {
         Self {
             state: Mutex::new(PromiseState::Pending),
-            on_fulfilled: Mutex::new(Vec::new()),
-            on_rejected: Mutex::new(Vec::new()),
-            on_finally: Mutex::new(Vec::new()),
-            js_fulfill_jobs: Mutex::new(Vec::new()),
-            js_reject_jobs: Mutex::new(Vec::new()),
+            on_fulfilled: RefCell::new(Vec::new()),
+            on_rejected: RefCell::new(Vec::new()),
+            on_finally: RefCell::new(Vec::new()),
+            js_fulfill_jobs: RefCell::new(Vec::new()),
+            js_reject_jobs: RefCell::new(Vec::new()),
         }
     }
 }

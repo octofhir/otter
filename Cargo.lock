@@ -1867,6 +1867,7 @@ version = "0.1.3"
 dependencies = [
  "dirs",
  "md5",
+ "otter-nodejs",
  "otter-vm-builtins",
  "otter-vm-bytecode",
  "otter-vm-compiler",
@@ -1904,6 +1905,21 @@ dependencies = [
  "serde",
  "serde_json",
  "syn",
+ "tokio",
+]
+
+[[package]]
+name = "otter-nodejs"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "dunce",
+ "otter-macros",
+ "otter-vm-core",
+ "otter-vm-runtime",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -2010,6 +2026,7 @@ dependencies = [
  "otter-vm-runtime",
  "regress",
  "reqwest 0.12.28",
+ "rustc-hash",
  "rustls",
  "rustls-pemfile",
  "serde",

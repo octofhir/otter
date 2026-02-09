@@ -38,7 +38,7 @@ use crate::regexp::JsRegExp;
 use crate::shared_buffer::SharedArrayBuffer;
 use crate::string::JsString;
 use crate::typed_array::JsTypedArray;
-use parking_lot::Mutex;
+use std::cell::RefCell;
 use std::sync::Arc;
 
 /// Heap-allocated cell for mutable upvalues (closures)
@@ -54,28 +54,33 @@ use std::sync::Arc;
 /// }
 /// ```
 #[derive(Clone)]
-pub struct UpvalueCell(Arc<Mutex<Value>>);
+pub struct UpvalueCell(Arc<RefCell<Value>>);
+
+// SAFETY: UpvalueCell is only accessed from the single VM thread.
+// Thread confinement is enforced at the VmRuntime/VmContext level.
+unsafe impl Send for UpvalueCell {}
+unsafe impl Sync for UpvalueCell {}
 
 impl UpvalueCell {
     /// Create a new upvalue cell with the given value
     pub fn new(value: Value) -> Self {
-        Self(Arc::new(Mutex::new(value)))
+        Self(Arc::new(RefCell::new(value)))
     }
 
     /// Get the current value from the cell
     pub fn get(&self) -> Value {
-        self.0.lock().clone()
+        self.0.borrow().clone()
     }
 
     /// Set a new value in the cell
     pub fn set(&self, value: Value) {
-        *self.0.lock() = value;
+        *self.0.borrow_mut() = value;
     }
 }
 
 impl std::fmt::Debug for UpvalueCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "UpvalueCell({:?})", *self.0.lock())
+        write!(f, "UpvalueCell({:?})", *self.0.borrow())
     }
 }
 
@@ -117,7 +122,11 @@ unsafe impl Sync for Value {}
 /// to call JavaScript functions (closures or other natives) via
 /// `ncx.call_function()`.
 pub type NativeFn = Arc<
-    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, crate::error::VmError>
+    dyn Fn(
+            &Value,
+            &[Value],
+            &mut crate::context::NativeContext<'_>,
+        ) -> std::result::Result<Value, crate::error::VmError>
         + Send
         + Sync,
 >;
@@ -215,13 +224,11 @@ impl otter_vm_gc::GcTraceable for Closure {
         // Trace function object
         tracer(self.object.header() as *const _);
 
-        // CRITICAL FIX: Trace home_object for super keyword support
         if let Some(home) = &self.home_object {
             tracer(home.header() as *const _);
         }
 
-        // CRITICAL FIX: Trace upvalue values
-        // Each UpvalueCell contains Arc<Mutex<Value>>, trace the Value inside
+        // Each UpvalueCell contains Arc<RefCell<Value>>, trace the Value inside
         for upvalue in &self.upvalues {
             let value = upvalue.get(); // Locks and clones the Value
             value.trace(tracer);
@@ -544,7 +551,11 @@ impl Value {
     /// Create native function value
     pub fn native_function<F>(f: F, memory_manager: Arc<crate::memory::MemoryManager>) -> Self
     where
-        F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, crate::error::VmError>
+        F: Fn(
+                &Value,
+                &[Value],
+                &mut crate::context::NativeContext<'_>,
+            ) -> Result<Value, crate::error::VmError>
             + Send
             + Sync
             + 'static,
@@ -570,7 +581,11 @@ impl Value {
         prototype: GcRef<JsObject>,
     ) -> Self
     where
-        F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, crate::error::VmError>
+        F: Fn(
+                &Value,
+                &[Value],
+                &mut crate::context::NativeContext<'_>,
+            ) -> Result<Value, crate::error::VmError>
             + Send
             + Sync
             + 'static,
@@ -765,7 +780,10 @@ impl Value {
         }
         // Bound functions are plain objects with __boundFunction__ property
         if let Some(obj) = self.as_object() {
-            if obj.get(&crate::object::PropertyKey::string("__boundFunction__")).is_some() {
+            if obj
+                .get(&crate::object::PropertyKey::string("__boundFunction__"))
+                .is_some()
+            {
                 return true;
             }
         }

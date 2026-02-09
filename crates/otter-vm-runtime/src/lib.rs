@@ -18,6 +18,7 @@ pub mod event_loop;
 pub mod extension;
 pub mod microtask;
 pub mod module_loader;
+pub mod module_provider;
 pub mod otter_runtime;
 pub mod promise;
 pub mod timer;
@@ -26,14 +27,17 @@ pub mod worker;
 // Re-export main types
 pub use builder::OtterBuilder;
 pub use event_loop::{ActiveServerCount, EventLoop, HttpEvent, WsEvent};
-pub use microtask::MicrotaskQueue;
 pub use extension::{
     Extension, ExtensionRegistry, NativeOpResult, Op, OpHandler, op_async, op_native,
     op_native_with_mm, op_sync,
 };
+pub use microtask::MicrotaskQueue;
 pub use module_loader::{
     LoadedModule, ModuleError, ModuleLoader, ModuleNamespace, ModuleState, ModuleType,
     module_extension,
+};
+pub use module_provider::{
+    MediaType, ModuleProvider, ModuleResolution, ModuleSource, ProviderRegistry,
 };
 pub use otter_runtime::{Otter, OtterError};
 

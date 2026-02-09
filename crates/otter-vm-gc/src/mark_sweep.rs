@@ -10,8 +10,7 @@
 //! - **Iterative Marking**: Uses a gray worklist to avoid stack overflow
 //! - **Sweep**: Frees all white (unreachable) objects after marking
 
-use parking_lot::RwLock;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -50,14 +49,14 @@ struct AllocationEntry {
 }
 
 // SAFETY: AllocationEntry contains raw pointers but they are managed exclusively
-// by the AllocationRegistry which is protected by RwLock
+// by the AllocationRegistry on a single thread (thread_local storage).
 unsafe impl Send for AllocationEntry {}
 unsafe impl Sync for AllocationEntry {}
 
 /// Central registry tracking all GC-managed allocations
 pub struct AllocationRegistry {
-    /// All tracked allocations
-    allocations: RwLock<Vec<AllocationEntry>>,
+    /// All tracked allocations (RefCell: thread-confined, no cross-thread access)
+    allocations: RefCell<Vec<AllocationEntry>>,
     /// Total bytes allocated
     total_bytes: AtomicUsize,
     /// Threshold for triggering GC (default 1MB)
@@ -76,7 +75,7 @@ impl AllocationRegistry {
     /// Create a new allocation registry
     pub fn new() -> Self {
         Self {
-            allocations: RwLock::new(Vec::with_capacity(1024)),
+            allocations: RefCell::new(Vec::with_capacity(1024)),
             total_bytes: AtomicUsize::new(0),
             gc_threshold: AtomicUsize::new(1024 * 1024), // 1MB default
             collection_count: AtomicUsize::new(0),
@@ -112,7 +111,7 @@ impl AllocationRegistry {
             drop_fn,
             trace_fn,
         };
-        self.allocations.write().push(entry);
+        self.allocations.borrow_mut().push(entry);
         self.total_bytes.fetch_add(size, Ordering::Relaxed);
     }
 
@@ -138,7 +137,7 @@ impl AllocationRegistry {
 
     /// Get the number of allocations
     pub fn allocation_count(&self) -> usize {
-        self.allocations.read().len()
+        self.allocations.borrow().len()
     }
 
     /// Get collection statistics
@@ -166,7 +165,7 @@ impl AllocationRegistry {
         #[cfg(feature = "gc_logging")]
         let initial_bytes = self.total_bytes.load(Ordering::Relaxed);
         #[cfg(feature = "gc_logging")]
-        let initial_count = self.allocations.read().len();
+        let initial_count = self.allocations.borrow().len();
 
         #[cfg(feature = "gc_logging")]
         tracing::debug!(
@@ -204,7 +203,7 @@ impl AllocationRegistry {
         #[cfg(feature = "gc_logging")]
         {
             let final_bytes = self.total_bytes.load(Ordering::Relaxed);
-            let final_count = self.allocations.read().len();
+            let final_count = self.allocations.borrow().len();
 
             tracing::info!(
                 target: "otter::gc",
@@ -243,7 +242,7 @@ impl AllocationRegistry {
         #[cfg(feature = "gc_logging")]
         let initial_bytes = self.total_bytes.load(Ordering::Relaxed);
         #[cfg(feature = "gc_logging")]
-        let initial_count = self.allocations.read().len();
+        let initial_count = self.allocations.borrow().len();
 
         #[cfg(feature = "gc_logging")]
         tracing::debug!(
@@ -348,7 +347,7 @@ impl AllocationRegistry {
         #[cfg(feature = "gc_logging")]
         {
             let final_bytes = self.total_bytes.load(Ordering::Relaxed);
-            let final_count = self.allocations.read().len();
+            let final_count = self.allocations.borrow().len();
 
             tracing::info!(
                 target: "otter::gc",
@@ -367,7 +366,7 @@ impl AllocationRegistry {
 
     /// Reset all marks to white (preparation for marking)
     fn reset_marks(&self) {
-        let allocations = self.allocations.read();
+        let allocations = self.allocations.borrow();
         for entry in allocations.iter() {
             unsafe {
                 (*entry.header).set_mark(MarkColor::White);
@@ -394,7 +393,7 @@ impl AllocationRegistry {
         }
 
         // Process the worklist until empty
-        let allocations = self.allocations.read();
+        let allocations = self.allocations.borrow();
         while let Some(ptr) = worklist.pop_front() {
             unsafe {
                 let header = &*ptr;
@@ -430,7 +429,7 @@ impl AllocationRegistry {
 
     /// Sweep phase: free all white (unreachable) objects
     fn sweep(&self) -> usize {
-        let mut allocations = self.allocations.write();
+        let mut allocations = self.allocations.borrow_mut();
         let mut reclaimed: usize = 0;
 
         // Partition: keep marked objects, collect unmarked for freeing
@@ -457,9 +456,9 @@ impl AllocationRegistry {
         // Update total bytes
         self.total_bytes.fetch_sub(reclaimed, Ordering::Relaxed);
 
-        // Drop the write lock before deallocation.
-        // This is safe because collect_lock serializes entire GC cycles,
-        // so no other thread can be marking headers while we deallocate.
+        // Drop the borrow before deallocation.
+        // This avoids holding the RefCell borrow while drop_fn runs
+        // (drop_fn might trigger operations that need to borrow allocations).
         drop(allocations);
 
         for entry in dead_allocations {
@@ -476,7 +475,7 @@ impl AllocationRegistry {
     /// Use this when tearing down an engine/isolate to reclaim all memory.
     /// After calling this, no GcRef pointers from this registry are valid.
     pub fn dealloc_all(&self) -> usize {
-        let mut allocations = self.allocations.write();
+        let mut allocations = self.allocations.borrow_mut();
         let mut reclaimed: usize = 0;
 
         let entries: Vec<AllocationEntry> = allocations.drain(..).collect();
@@ -526,16 +525,16 @@ pub struct RegistryStats {
     pub last_pause_time: Duration,
 }
 
-/// Thread-local allocation registry for the GC.
-///
-/// Each thread gets its own registry so that GC collections in one thread
-/// (with that thread's roots) don't sweep objects belonging to another thread.
-/// This prevents use-after-free when multiple VmContexts run in parallel
-/// (e.g. in test suites).
-///
-/// The registry is leaked (Box::leak) to produce a `&'static` reference that
-/// matches the existing API. Each thread leaks exactly one AllocationRegistry
-/// for the lifetime of the process — a bounded, negligible leak.
+// Thread-local allocation registry for the GC.
+//
+// Each thread gets its own registry so that GC collections in one thread
+// (with that thread's roots) don't sweep objects belonging to another thread.
+// This prevents use-after-free when multiple VmContexts run in parallel
+// (e.g. in test suites).
+//
+// The registry is leaked (Box::leak) to produce a `&'static` reference that
+// matches the existing API. Each thread leaks exactly one AllocationRegistry
+// for the lifetime of the process — a bounded, negligible leak.
 thread_local! {
     static THREAD_REGISTRY: &'static AllocationRegistry = Box::leak(Box::new(AllocationRegistry::new()));
 }

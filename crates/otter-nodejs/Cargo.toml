@@ -1,0 +1,19 @@
+[package]
+name = "otter-nodejs"
+version = "0.1.0"
+edition = "2024"
+description = "Node.js API compatibility for Otter VM"
+license = "MIT"
+
+[dependencies]
+otter-vm-core = { path = "../otter-vm-core" }
+otter-vm-runtime = { path = "../otter-vm-runtime" }
+otter-macros = { path = "../otter-macros" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+dunce = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tempfile = "3"

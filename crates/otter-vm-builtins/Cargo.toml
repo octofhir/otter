@@ -24,6 +24,7 @@ http-body-util = "0.1"
 bytes = "1.10"
 tokio = { version = "1.49", features = ["rt", "sync", "net", "time", "macros"] }
 dashmap = "6.1"
+rustc-hash = "2"
 http = "1.3"
 tokio-tungstenite = "0.28"
 rustls = "0.23"

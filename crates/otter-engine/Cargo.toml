@@ -17,6 +17,7 @@ otter-vm-core = { path = "../otter-vm-core" }
 otter-vm-compiler = { path = "../otter-vm-compiler" }
 otter-vm-bytecode = { path = "../otter-vm-bytecode" }
 otter-vm-builtins = { path = "../otter-vm-builtins" }
+otter-nodejs = { path = "../otter-nodejs" }
 
 # Own dependencies
 tokio = { version = "1", features = ["rt", "sync", "fs"] }

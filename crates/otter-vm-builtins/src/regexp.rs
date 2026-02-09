@@ -6,18 +6,20 @@
 //! - Methods: test, exec, toString
 //! - Symbol methods: match, matchAll, replace, search, split
 
-use dashmap::DashMap;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
 use otter_vm_core::{VmError, memory};
 use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use regress::{Flags, Regex, escape};
-use std::sync::{Arc, OnceLock};
+use rustc_hash::FxHashMap;
+use std::cell::RefCell;
+use std::sync::Arc;
 
-static REGEX_CACHE: OnceLock<DashMap<(String, String), Arc<Regex>>> = OnceLock::new();
-
-fn get_regex_cache() -> &'static DashMap<(String, String), Arc<Regex>> {
-    REGEX_CACHE.get_or_init(DashMap::new)
+// Per-thread regex cache (one isolate = one thread, no cross-thread sharing).
+// Uses RefCell<FxHashMap> instead of DashMap for zero-lock overhead.
+thread_local! {
+    static REGEX_CACHE: RefCell<FxHashMap<(String, String), Arc<Regex>>> =
+        RefCell::new(FxHashMap::default());
 }
 
 /// Get RegExp ops for extension registration
@@ -71,20 +73,21 @@ fn flags_use_unicode(flags: &str) -> bool {
 
 /// Build JS regex from pattern and flags using regress.
 fn build_regex(pattern: &str, flags: &str) -> Result<Arc<Regex>, VmError> {
-    let cache = get_regex_cache();
-    let key = (pattern.to_string(), flags.to_string());
+    REGEX_CACHE.with(|cache| {
+        let key = (pattern.to_string(), flags.to_string());
 
-    if let Some(re) = cache.get(&key) {
-        return Ok(re.clone());
-    }
+        if let Some(re) = cache.borrow().get(&key) {
+            return Ok(re.clone());
+        }
 
-    let re = Arc::new(
-        Regex::with_flags(pattern, Flags::from(flags))
-            .map_err(|e| format!("Invalid regular expression: {}", e))?,
-    );
+        let re = Arc::new(
+            Regex::with_flags(pattern, Flags::from(flags))
+                .map_err(|e| format!("Invalid regular expression: {}", e))?,
+        );
 
-    cache.insert(key, re.clone());
-    Ok(re)
+        cache.borrow_mut().insert(key, re.clone());
+        Ok(re)
+    })
 }
 
 fn find_first(

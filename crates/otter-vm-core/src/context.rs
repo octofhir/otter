@@ -10,12 +10,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::async_context::SavedFrame;
 use crate::error::{VmError, VmResult};
 use crate::gc::GcRef;
+use crate::interpreter::PreferredType;
 use crate::object::JsObject;
 use crate::realm::{RealmId, RealmRegistry};
-use crate::symbol_registry::{SymbolRegistry, global_symbol_registry};
 use crate::string::JsString;
+use crate::symbol_registry::SymbolRegistry;
 use crate::value::{UpvalueCell, Value};
-use crate::interpreter::PreferredType;
 use num_bigint::BigInt as NumBigInt;
 use otter_vm_bytecode::Module;
 
@@ -27,7 +27,6 @@ pub const DEFAULT_MAX_STACK_DEPTH: usize = 10000;
 
 /// Context passed to native functions, enabling VM re-entry.
 ///
-/// This replaces the old `Arc<MemoryManager>` parameter in `NativeFn`.
 /// Native functions can now call JavaScript functions (closures or other
 /// natives) through `call_function`, access the memory manager, global
 /// object, and enqueue microtask jobs — all without interception signals.
@@ -43,12 +42,23 @@ pub struct NativeContext<'a> {
 impl<'a> NativeContext<'a> {
     /// Create a new `NativeContext` for a regular function call.
     pub fn new(ctx: &'a mut VmContext, interpreter: &'a crate::interpreter::Interpreter) -> Self {
-        Self { ctx, interpreter, is_construct: false }
+        Self {
+            ctx,
+            interpreter,
+            is_construct: false,
+        }
     }
 
     /// Create a new `NativeContext` for a constructor call (via `new`).
-    pub fn new_construct(ctx: &'a mut VmContext, interpreter: &'a crate::interpreter::Interpreter) -> Self {
-        Self { ctx, interpreter, is_construct: true }
+    pub fn new_construct(
+        ctx: &'a mut VmContext,
+        interpreter: &'a crate::interpreter::Interpreter,
+    ) -> Self {
+        Self {
+            ctx,
+            interpreter,
+            is_construct: true,
+        }
     }
 
     /// Returns true if this function is being called as a constructor (via `new`).
@@ -72,7 +82,9 @@ impl<'a> NativeContext<'a> {
 
         // Unwrap bound functions (stored as objects)
         while let Some(obj) = current_func.as_object() {
-            if let Some(bound_fn) = obj.get(&crate::object::PropertyKey::string("__boundFunction__")) {
+            if let Some(bound_fn) =
+                obj.get(&crate::object::PropertyKey::string("__boundFunction__"))
+            {
                 let raw_this_arg = obj
                     .get(&crate::object::PropertyKey::string("__boundThis__"))
                     .unwrap_or_else(crate::value::Value::undefined);
@@ -82,7 +94,9 @@ impl<'a> NativeContext<'a> {
                     current_this = raw_this_arg;
                 }
 
-                if let Some(bound_args_val) = obj.get(&crate::object::PropertyKey::string("__boundArgs__")) {
+                if let Some(bound_args_val) =
+                    obj.get(&crate::object::PropertyKey::string("__boundArgs__"))
+                {
                     if let Some(args_obj) = bound_args_val.as_object() {
                         let len = args_obj
                             .get(&crate::object::PropertyKey::string("length"))
@@ -183,7 +197,11 @@ impl<'a> NativeContext<'a> {
     }
 
     /// Enqueue a JS microtask job (for Promise callbacks).
-    pub fn enqueue_js_job(&self, job: crate::promise::JsPromiseJob, args: Vec<crate::value::Value>) -> bool {
+    pub fn enqueue_js_job(
+        &self,
+        job: crate::promise::JsPromiseJob,
+        args: Vec<crate::value::Value>,
+    ) -> bool {
         self.ctx.enqueue_js_job(job, args)
     }
 
@@ -211,7 +229,8 @@ impl<'a> NativeContext<'a> {
         generator: GcRef<crate::generator::JsGenerator>,
         sent_value: Option<Value>,
     ) -> crate::interpreter::GeneratorResult {
-        self.interpreter.execute_generator(generator, self.ctx, sent_value)
+        self.interpreter
+            .execute_generator(generator, self.ctx, sent_value)
     }
 
     /// Execute an eval-compiled module within this context.
@@ -398,7 +417,8 @@ pub struct VmContext {
     /// Set by otter-vm-runtime to bridge the compiler (which otter-vm-core
     /// cannot depend on directly). The interpreter handles execution.
     /// The boolean parameter indicates whether the caller is in strict mode context.
-    eval_fn: Option<Arc<dyn Fn(&str, bool) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync>>,
+    eval_fn:
+        Option<Arc<dyn Fn(&str, bool) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync>>,
     /// Microtask enqueue function for Promise callbacks.
     /// Set by otter-vm-runtime to enable proper microtask queuing from intrinsics.
     microtask_enqueue: Option<Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>>,
@@ -416,6 +436,9 @@ pub struct VmContext {
     realm_registry: Option<Arc<RealmRegistry>>,
     /// Trace state (if tracing is enabled)
     pub(crate) trace_state: Option<crate::trace::TraceState>,
+    /// Captured exports from the last executed module.
+    /// Used by ModuleLoader to populate namespaces.
+    captured_module_exports: Option<HashMap<String, Value>>,
 }
 
 /// Trait for JS job queue access (allows runtime to inject the queue)
@@ -542,11 +565,27 @@ impl VmContext {
             microtask_enqueue: None,
             js_job_queue: None,
             external_root_sets: Vec::new(),
-            symbol_registry: global_symbol_registry(),
+            symbol_registry: Arc::new(SymbolRegistry::new()),
             realm_id: 0,
             realm_registry: None,
             trace_state: None,
+            captured_module_exports: None,
         }
+    }
+
+    /// Set captured module exports.
+    pub fn set_captured_exports(&mut self, exports: HashMap<String, Value>) {
+        self.captured_module_exports = Some(exports);
+    }
+
+    /// Get captured module exports.
+    pub fn captured_exports(&self) -> Option<&HashMap<String, Value>> {
+        self.captured_module_exports.as_ref()
+    }
+
+    /// Take captured module exports (clearing them).
+    pub fn take_captured_exports(&mut self) -> Option<HashMap<String, Value>> {
+        self.captured_module_exports.take()
     }
 
     /// Get the memory manager
@@ -571,17 +610,26 @@ impl VmContext {
 
     /// Lookup intrinsics for a realm id.
     pub fn realm_intrinsics(&self, realm_id: RealmId) -> Option<crate::intrinsics::Intrinsics> {
-        self.realm_registry.as_ref().and_then(|registry| registry.get(realm_id)).map(|rec| rec.intrinsics)
+        self.realm_registry
+            .as_ref()
+            .and_then(|registry| registry.get(realm_id))
+            .map(|rec| rec.intrinsics)
     }
 
     /// Lookup global object for a realm id.
     pub fn realm_global(&self, realm_id: RealmId) -> Option<GcRef<JsObject>> {
-        self.realm_registry.as_ref().and_then(|registry| registry.get(realm_id)).map(|rec| rec.global)
+        self.realm_registry
+            .as_ref()
+            .and_then(|registry| registry.get(realm_id))
+            .map(|rec| rec.global)
     }
 
     /// Lookup the realm's Function.prototype for a realm id.
     pub fn realm_function_prototype(&self, realm_id: RealmId) -> Option<GcRef<JsObject>> {
-        self.realm_registry.as_ref().and_then(|registry| registry.get(realm_id)).map(|rec| rec.function_prototype)
+        self.realm_registry
+            .as_ref()
+            .and_then(|registry| registry.get(realm_id))
+            .map(|rec| rec.function_prototype)
     }
 
     /// Temporarily run with a different realm/global, restoring after the closure.
@@ -633,17 +681,16 @@ impl VmContext {
     }
 
     /// Attach a debug snapshot target to update periodically.
-    pub fn set_debug_snapshot_target(
-        &mut self,
-        target: Option<Arc<Mutex<VmContextSnapshot>>>,
-    ) {
+    pub fn set_debug_snapshot_target(&mut self, target: Option<Arc<Mutex<VmContextSnapshot>>>) {
         self.debug_snapshot = target;
         self.update_debug_snapshot();
     }
 
     /// Get the current debug snapshot (if enabled).
     pub fn debug_snapshot(&self) -> Option<VmContextSnapshot> {
-        self.debug_snapshot.as_ref().map(|snapshot| snapshot.lock().clone())
+        self.debug_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.lock().clone())
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -688,10 +735,14 @@ impl VmContext {
             function_index,
             function_name,
             module_url: module.source_url.clone(),
-            opcode: format!("{:?}", instruction).split(' ').next().unwrap_or("Unknown").to_string(),
+            opcode: format!("{:?}", instruction)
+                .split(' ')
+                .next()
+                .unwrap_or("Unknown")
+                .to_string(),
             operands,
             modified_registers: vec![], // TODO: Track register modifications
-            execution_time_ns: None, // TODO: Add timing support
+            execution_time_ns: None,    // TODO: Add timing support
         };
 
         // Check filter
@@ -948,9 +999,7 @@ impl VmContext {
 
         // Add trace buffer entries if available
         if let Some(trace_state) = &self.trace_state {
-            snapshot.recent_instructions = trace_state.ring_buffer.iter()
-                .cloned()
-                .collect();
+            snapshot.recent_instructions = trace_state.ring_buffer.iter().cloned().collect();
         }
 
         *target.lock() = snapshot;
@@ -1168,9 +1217,7 @@ impl VmContext {
     /// and returns a compiled Module.
     pub fn set_eval_fn(
         &mut self,
-        f: Arc<
-            dyn Fn(&str, bool) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync,
-        >,
+        f: Arc<dyn Fn(&str, bool) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync>,
     ) {
         self.eval_fn = Some(f);
     }
@@ -1178,7 +1225,11 @@ impl VmContext {
     /// Compile eval code into a Module using the registered eval compiler.
     /// The strict_context parameter indicates whether the caller is in strict mode.
     /// Returns `VmError::TypeError` if the eval callback is not configured.
-    pub fn compile_eval(&self, code: &str, strict_context: bool) -> Result<otter_vm_bytecode::Module, VmError> {
+    pub fn compile_eval(
+        &self,
+        code: &str,
+        strict_context: bool,
+    ) -> Result<otter_vm_bytecode::Module, VmError> {
         let eval_fn = self
             .eval_fn
             .as_ref()
@@ -1213,10 +1264,7 @@ impl VmContext {
     }
 
     /// Register an external root set for GC (e.g., job queues)
-    pub fn register_external_root_set(
-        &mut self,
-        roots: Arc<dyn ExternalRootSet + Send + Sync>,
-    ) {
+    pub fn register_external_root_set(&mut self, roots: Arc<dyn ExternalRootSet + Send + Sync>) {
         self.external_root_sets.push(roots);
     }
 
@@ -1304,7 +1352,11 @@ impl VmContext {
         // into an array and passes it as the last argument. This rest array should
         // be mapped to the rest parameter's local slot (at index param_count).
         // So effective_param_count is param_count + 1 when has_rest is true.
-        let effective_param_count = if has_rest { param_count + 1 } else { param_count };
+        let effective_param_count = if has_rest {
+            param_count + 1
+        } else {
+            param_count
+        };
 
         let extra_args_count = if args.len() > effective_param_count {
             args.len() - effective_param_count
@@ -1341,8 +1393,7 @@ impl VmContext {
                         .collect();
                     eprintln!(
                         "[OTTER_TRACE_ASSERT_ARGS] params={} types={:?}",
-                        param_count,
-                        arg_types
+                        param_count, arg_types
                     );
                 }
             }
@@ -1855,7 +1906,9 @@ impl VmContext {
             // WeakMap/WeakSet object containing ephemeron table
             if let Some(obj) = value.as_object() {
                 // Check for __weakmap_entries__
-                if let Some(entries_value) = obj.get(&crate::object::PropertyKey::string("__weakmap_entries__")) {
+                if let Some(entries_value) =
+                    obj.get(&crate::object::PropertyKey::string("__weakmap_entries__"))
+                {
                     if let Some(table) = entries_value.as_ephemeron_table() {
                         let ptr = table.as_ptr() as usize;
                         if visited.insert(ptr) {
@@ -1864,7 +1917,9 @@ impl VmContext {
                     }
                 }
                 // Check for __weakset_entries__
-                if let Some(entries_value) = obj.get(&crate::object::PropertyKey::string("__weakset_entries__")) {
+                if let Some(entries_value) =
+                    obj.get(&crate::object::PropertyKey::string("__weakset_entries__"))
+                {
                     if let Some(table) = entries_value.as_ephemeron_table() {
                         let ptr = table.as_ptr() as usize;
                         if visited.insert(ptr) {
@@ -2028,7 +2083,8 @@ impl VmContext {
         // Break the globalThis cycle first
         use crate::object::PropertyKey;
 
-        let _ = self.global
+        let _ = self
+            .global
             .set(PropertyKey::string("globalThis"), Value::undefined());
 
         // FORCE clear all properties to break reference cycles.

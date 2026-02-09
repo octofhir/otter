@@ -105,16 +105,14 @@ fn get_set_data(obj: &GcRef<JsObject>) -> Option<GcRef<SetData>> {
     obj.get(&pk(SET_DATA_KEY)).and_then(|v| v.as_set_data())
 }
 
-fn is_valid_weak_key(value: &Value) -> bool {
+fn is_valid_weak_key(value: &Value, symbol_registry: &crate::symbol_registry::SymbolRegistry) -> bool {
     if value.is_object() || value.is_function() {
         return true;
     }
     // Symbols are valid weak keys UNLESS they are registered (Symbol.for).
     // Registered symbols are globally shared and never garbage collected.
     if let Some(sym) = value.as_symbol() {
-        return crate::symbol_registry::global_symbol_registry()
-            .key_for(&sym)
-            .is_none();
+        return symbol_registry.key_for(&sym).is_none();
     }
     false
 }
@@ -1280,7 +1278,7 @@ pub fn init_weak_map_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "get",
             1,
-            |this_val, args, _ncx| {
+            |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.get called on incompatible receiver"))?;
@@ -1289,7 +1287,7 @@ pub fn init_weak_map_prototype(
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
                 // Return undefined if key cannot be held weakly (spec step 4)
-                if !is_valid_weak_key(&key) {
+                if !is_valid_weak_key(&key, ncx.ctx.symbol_registry()) {
                     return Ok(Value::undefined());
                 }
                 let Some(key_header) = weak_key_header(&key) else {
@@ -1316,7 +1314,7 @@ pub fn init_weak_map_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "set",
             2,
-            |this_val, args, _ncx| {
+            |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.set called on incompatible receiver"))?;
@@ -1324,7 +1322,7 @@ pub fn init_weak_map_prototype(
                     return Err(VmError::type_error("Method WeakMap.prototype.set called on incompatible receiver"));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&key) {
+                if !is_valid_weak_key(&key, ncx.ctx.symbol_registry()) {
                     return Err(VmError::type_error("Invalid value used as weak map key"));
                 }
                 let value = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1348,7 +1346,7 @@ pub fn init_weak_map_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "has",
             1,
-            |this_val, args, _ncx| {
+            |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.has called on incompatible receiver"))?;
@@ -1356,7 +1354,7 @@ pub fn init_weak_map_prototype(
                     return Err(VmError::type_error("Method WeakMap.prototype.has called on incompatible receiver"));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&key) {
+                if !is_valid_weak_key(&key, ncx.ctx.symbol_registry()) {
                     return Ok(Value::boolean(false));
                 }
                 let key_header = match weak_key_header(&key) {
@@ -1380,7 +1378,7 @@ pub fn init_weak_map_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "delete",
             1,
-            |this_val, args, _ncx| {
+            |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.delete called on incompatible receiver"))?;
@@ -1388,7 +1386,7 @@ pub fn init_weak_map_prototype(
                     return Err(VmError::type_error("Method WeakMap.prototype.delete called on incompatible receiver"));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&key) {
+                if !is_valid_weak_key(&key, ncx.ctx.symbol_registry()) {
                     return Ok(Value::boolean(false));
                 }
                 let key_header = match weak_key_header(&key) {
@@ -1412,7 +1410,7 @@ pub fn init_weak_map_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "getOrInsert",
             2,
-            |this_val, args, _ncx| {
+            |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.getOrInsert called on incompatible receiver"))?;
@@ -1420,7 +1418,7 @@ pub fn init_weak_map_prototype(
                     return Err(VmError::type_error("Method WeakMap.prototype.getOrInsert called on incompatible receiver"));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&key) {
+                if !is_valid_weak_key(&key, ncx.ctx.symbol_registry()) {
                     return Err(VmError::type_error("Invalid value used as weak map key"));
                 }
                 let default_value = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1459,7 +1457,7 @@ pub fn init_weak_map_prototype(
                     return Err(VmError::type_error("Method WeakMap.prototype.getOrInsertComputed called on incompatible receiver"));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&key) {
+                if !is_valid_weak_key(&key, ncx.ctx.symbol_registry()) {
                     return Err(VmError::type_error("Invalid value used as weak map key"));
                 }
                 let callback = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1527,7 +1525,7 @@ pub fn init_weak_set_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "add",
             1,
-            |this_val, args, _ncx| {
+            |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| VmError::type_error("Method WeakSet.prototype.add called on incompatible receiver"))?;
@@ -1535,7 +1533,7 @@ pub fn init_weak_set_prototype(
                     return Err(VmError::type_error("Method WeakSet.prototype.add called on incompatible receiver"));
                 }
                 let value = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&value) {
+                if !is_valid_weak_key(&value, ncx.ctx.symbol_registry()) {
                     return Err(VmError::type_error("Invalid value used in weak set"));
                 }
                 let key_header = weak_key_header(&value).ok_or_else(|| VmError::type_error("Invalid weak key"))?;
@@ -1560,7 +1558,7 @@ pub fn init_weak_set_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "has",
             1,
-            |this_val, args, _ncx| {
+            |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| VmError::type_error("Method WeakSet.prototype.has called on incompatible receiver"))?;
@@ -1568,7 +1566,7 @@ pub fn init_weak_set_prototype(
                     return Err(VmError::type_error("Method WeakSet.prototype.has called on incompatible receiver"));
                 }
                 let value = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&value) {
+                if !is_valid_weak_key(&value, ncx.ctx.symbol_registry()) {
                     return Ok(Value::boolean(false));
                 }
                 let key_header = match weak_key_header(&value) {
@@ -1592,7 +1590,7 @@ pub fn init_weak_set_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "delete",
             1,
-            |this_val, args, _ncx| {
+            |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| VmError::type_error("Method WeakSet.prototype.delete called on incompatible receiver"))?;
@@ -1600,7 +1598,7 @@ pub fn init_weak_set_prototype(
                     return Err(VmError::type_error("Method WeakSet.prototype.delete called on incompatible receiver"));
                 }
                 let value = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&value) {
+                if !is_valid_weak_key(&value, ncx.ctx.symbol_registry()) {
                     return Ok(Value::boolean(false));
                 }
                 let key_header = match weak_key_header(&value) {

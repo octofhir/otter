@@ -138,4 +138,4 @@ impl From<&str> for VmError {
 }
 
 /// Result type for VM operations
-pub type VmResult<T> = Result<T, VmError>;
+pub type VmResult<T> = std::result::Result<T, VmError>;

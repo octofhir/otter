@@ -1,7 +1,7 @@
 //! Native `node:os` extension — zero JS shims.
 //!
 //! All os operations implemented in pure Rust via `#[dive]` + `dive_module!`.
-//! Replaces `js/node_os.js` (141 lines) with native code.
+//! Uses `sysinfo` crate for real system data.
 
 use otter_macros::{dive, dive_module};
 use otter_vm_core::context::NativeContext;
@@ -10,10 +10,7 @@ use otter_vm_core::gc::GcRef;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
-use std::sync::OnceLock;
-use std::time::Instant;
-
-static START_INSTANT: OnceLock<Instant> = OnceLock::new();
+use sysinfo::{CpuRefreshKind, MemoryRefreshKind, Networks, RefreshKind, System};
 
 dive_module!(
     node_os,
@@ -51,8 +48,8 @@ fn new_obj(ncx: &mut NativeContext) -> GcRef<JsObject> {
 }
 
 /// Helper: create an array.
-fn new_arr(ncx: &mut NativeContext, capacity: usize) -> GcRef<JsObject> {
-    GcRef::new(JsObject::array(capacity, ncx.memory_manager().clone()))
+fn new_arr(ncx: &mut NativeContext, _capacity: usize) -> GcRef<JsObject> {
+    GcRef::new(JsObject::array(0, ncx.memory_manager().clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -92,29 +89,42 @@ fn os_endianness(_ncx: &mut NativeContext) -> Result<Value, VmError> {
 
 #[dive(name = "cpus", length = 0)]
 fn os_cpus(ncx: &mut NativeContext) -> Result<Value, VmError> {
-    let count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let mut sys =
+        System::new_with_specifics(RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()));
+    // Need a second refresh to get meaningful CPU usage values
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    sys.refresh_cpu_all();
 
-    let arr = new_arr(ncx, count);
+    let cpus = sys.cpus();
+    let arr = new_arr(ncx, cpus.len());
 
-    for _ in 0..count {
-        let cpu = new_obj(ncx);
-        let _ = cpu.set(
+    for cpu in cpus {
+        let cpu_obj = new_obj(ncx);
+        let _ = cpu_obj.set(
             PropertyKey::string("model"),
-            Value::string(JsString::intern("otter-vcpu")),
+            Value::string(JsString::new_gc(cpu.brand())),
         );
-        let _ = cpu.set(PropertyKey::string("speed"), Value::int32(0));
+        let _ = cpu_obj.set(
+            PropertyKey::string("speed"),
+            Value::number(cpu.frequency() as f64),
+        );
 
         let times = new_obj(ncx);
-        let _ = times.set(PropertyKey::string("user"), Value::int32(0));
+        // sysinfo doesn't provide per-CPU user/sys/idle breakdown,
+        // but we can give total usage as user and rest as idle.
+        // Node reports these in milliseconds.
+        let usage = cpu.cpu_usage() as f64;
+        let _ = times.set(PropertyKey::string("user"), Value::number(usage * 10.0));
         let _ = times.set(PropertyKey::string("nice"), Value::int32(0));
         let _ = times.set(PropertyKey::string("sys"), Value::int32(0));
-        let _ = times.set(PropertyKey::string("idle"), Value::int32(0));
+        let _ = times.set(
+            PropertyKey::string("idle"),
+            Value::number((100.0 - usage) * 10.0),
+        );
         let _ = times.set(PropertyKey::string("irq"), Value::int32(0));
-        let _ = cpu.set(PropertyKey::string("times"), Value::object(times));
+        let _ = cpu_obj.set(PropertyKey::string("times"), Value::object(times));
 
-        arr.array_push(Value::object(cpu));
+        arr.array_push(Value::object(cpu_obj));
     }
 
     Ok(Value::object(arr))
@@ -122,14 +132,34 @@ fn os_cpus(ncx: &mut NativeContext) -> Result<Value, VmError> {
 
 #[dive(name = "freemem", length = 0)]
 fn os_freemem(_ncx: &mut NativeContext) -> Result<Value, VmError> {
-    Ok(Value::int32(0))
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+    );
+    sys.refresh_memory();
+    Ok(Value::number(sys.available_memory() as f64))
 }
 
 #[dive(name = "totalmem", length = 0)]
 fn os_totalmem(_ncx: &mut NativeContext) -> Result<Value, VmError> {
-    Ok(Value::int32(0))
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+    );
+    sys.refresh_memory();
+    Ok(Value::number(sys.total_memory() as f64))
 }
 
+#[cfg(unix)]
+#[dive(name = "loadavg", length = 0)]
+fn os_loadavg(ncx: &mut NativeContext) -> Result<Value, VmError> {
+    let arr = new_arr(ncx, 3);
+    let load = System::load_average();
+    arr.array_push(Value::number(load.one));
+    arr.array_push(Value::number(load.five));
+    arr.array_push(Value::number(load.fifteen));
+    Ok(Value::object(arr))
+}
+
+#[cfg(not(unix))]
 #[dive(name = "loadavg", length = 0)]
 fn os_loadavg(ncx: &mut NativeContext) -> Result<Value, VmError> {
     let arr = new_arr(ncx, 3);
@@ -146,7 +176,8 @@ fn os_machine(_ncx: &mut NativeContext) -> Result<Value, VmError> {
 
 #[dive(name = "version", length = 0)]
 fn os_version(_ncx: &mut NativeContext) -> Result<Value, VmError> {
-    Ok(Value::string(JsString::intern("")))
+    let ver = System::os_version().unwrap_or_default();
+    Ok(Value::string(JsString::new_gc(&ver)))
 }
 
 #[dive(name = "homedir", length = 0)]
@@ -165,7 +196,7 @@ fn os_tmpdir(_ncx: &mut NativeContext) -> Result<Value, VmError> {
 
 #[dive(name = "hostname", length = 0)]
 fn os_hostname(_ncx: &mut NativeContext) -> Result<Value, VmError> {
-    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
+    let host = System::host_name().unwrap_or_else(|| "localhost".to_string());
     Ok(Value::string(JsString::new_gc(&host)))
 }
 
@@ -182,24 +213,35 @@ fn os_type(_ncx: &mut NativeContext) -> Result<Value, VmError> {
 
 #[dive(name = "release", length = 0)]
 fn os_release(_ncx: &mut NativeContext) -> Result<Value, VmError> {
-    Ok(Value::string(JsString::intern("")))
+    let ver = System::kernel_version().unwrap_or_default();
+    Ok(Value::string(JsString::new_gc(&ver)))
 }
 
 #[dive(name = "uptime", length = 0)]
 fn os_uptime(_ncx: &mut NativeContext) -> Result<Value, VmError> {
-    let start = START_INSTANT.get_or_init(Instant::now);
-    let secs = start.elapsed().as_secs_f64();
-    Ok(Value::number(secs.max(0.0)))
+    Ok(Value::number(System::uptime() as f64))
 }
 
 #[dive(name = "userInfo", length = 0)]
 fn os_user_info(ncx: &mut NativeContext) -> Result<Value, VmError> {
     let obj = new_obj(ncx);
 
-    let _ = obj.set(PropertyKey::string("uid"), Value::int32(-1));
-    let _ = obj.set(PropertyKey::string("gid"), Value::int32(-1));
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::getuid() } as i32;
+        let gid = unsafe { libc::getgid() } as i32;
+        let _ = obj.set(PropertyKey::string("uid"), Value::int32(uid));
+        let _ = obj.set(PropertyKey::string("gid"), Value::int32(gid));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = obj.set(PropertyKey::string("uid"), Value::int32(-1));
+        let _ = obj.set(PropertyKey::string("gid"), Value::int32(-1));
+    }
 
-    let username = std::env::var("USER").unwrap_or_default();
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
     let _ = obj.set(
         PropertyKey::string("username"),
         Value::string(JsString::new_gc(&username)),
@@ -222,7 +264,32 @@ fn os_user_info(ncx: &mut NativeContext) -> Result<Value, VmError> {
 
 #[dive(name = "networkInterfaces", length = 0)]
 fn os_network_interfaces(ncx: &mut NativeContext) -> Result<Value, VmError> {
-    Ok(Value::object(new_obj(ncx)))
+    let networks = Networks::new_with_refreshed_list();
+    let result = new_obj(ncx);
+
+    for (name, data) in &networks {
+        let iface_arr = new_arr(ncx, 1);
+
+        let entry = new_obj(ncx);
+        // MAC address
+        let mac = data.mac_address().to_string();
+        let _ = entry.set(
+            PropertyKey::string("mac"),
+            Value::string(JsString::new_gc(&mac)),
+        );
+
+        // Network stats — sysinfo doesn't expose IP addresses directly,
+        // but we can provide what's available
+        let _ = entry.set(
+            PropertyKey::string("internal"),
+            Value::boolean(name == "lo" || name == "lo0" || name.starts_with("loopback")),
+        );
+
+        iface_arr.array_push(Value::object(entry));
+        let _ = result.set(PropertyKey::string(name), Value::object(iface_arr));
+    }
+
+    Ok(Value::object(result))
 }
 
 #[dive(name = "availableParallelism", length = 0)]

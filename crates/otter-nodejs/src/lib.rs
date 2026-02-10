@@ -32,6 +32,7 @@ pub mod path_ext;
 pub mod process_ext;
 pub mod provider;
 mod security;
+pub mod stream_ext;
 pub mod util_ext;
 
 pub use module_registry::NodeModuleEntry;
@@ -100,6 +101,7 @@ pub fn nodejs_extensions() -> Vec<Box<dyn OtterExtension>> {
         process_ext::node_process_extension(),
         fs_ext::node_fs_extension(),
         events_ext::node_events_extension(),
+        stream_ext::node_stream_extension(),
         util_ext::node_util_extension(),
         assert_ext::node_assert_extension(),
         buffer_ext::node_buffer_extension(),

@@ -14,6 +14,7 @@ members = [
     "crates/otter-kv",
     "crates/otter-pm",
     "crates/otter-nodejs",
+    "crates/otter-node-compat",
     "crates/otterjs",
 ]
 

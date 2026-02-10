@@ -115,37 +115,48 @@ test262-config config *args:
 
 # === Node.js Compatibility Tests ===
 
-# Run Node.js compatibility test suite (fetches tests if needed)
-node-compat:
-    @echo "=== Node.js Compatibility Tests ==="
-    cd tests/node-compat && ./run.sh --fetch
+# Fetch official Node.js test files (sparse checkout of nodejs/node)
+node-compat-fetch *args:
+    bash scripts/fetch-node-tests.sh {{args}}
 
-# Run Node.js tests (quick, no fetch)
-node-compat-quick:
-    cd tests/node-compat && ./run.sh
+# Run all Node.js compatibility tests (auto-fetches if needed)
+node-compat *args:
+    @if [ ! -d "tests/node-compat/node/test/parallel" ]; then just node-compat-fetch; fi
+    cargo run -p otter-node-compat -- {{args}}
 
-# Run tests for a specific module
-node-compat-module module:
-    cd tests/node-compat && ./run.sh --module {{module}} --verbose
+# Run tests for a specific module (e.g. `just node-compat-module assert -vv`)
+node-compat-module module *args:
+    cargo run -p otter-node-compat -- --module {{module}} {{args}}
 
-# Fetch/update Node.js test suite
-node-compat-fetch:
-    cd tests/node-compat && ./fetch-tests.sh
+# Run and save results to reports/latest.json
+node-compat-save *args:
+    cargo run -p otter-node-compat -- --save {{args}}
 
-# Check for test regressions
+# Run a specific module and save results
+node-compat-save-module module *args:
+    cargo run -p otter-node-compat -- --module {{module}} --save {{args}}
+
+# Compare two result files
+node-compat-compare base current:
+    cargo run -p otter-node-compat -- compare --base {{base}} --current {{current}}
+
+# Check for regressions against baseline
 node-compat-check:
-    cd tests/node-compat && otter run check-regression.ts --allow-read --allow-write
+    cargo run -p otter-node-compat -- compare --base tests/node-compat/reports/baseline.json --current tests/node-compat/reports/latest.json
 
 # Update baseline after intentional changes
 node-compat-baseline:
     cp tests/node-compat/reports/latest.json tests/node-compat/reports/baseline.json
     @echo "Baseline updated from latest results"
 
-# Show Node.js compat summary (requires jq)
+# Show available modules and current status
 node-compat-status:
-    @if [ -f tests/node-compat/reports/latest.json ]; then \
-        echo "=== Node.js Compatibility Status ==="; \
-        cat tests/node-compat/reports/latest.json | jq -r '"Pass Rate: \(.summary.passRate) (\(.summary.passed)/\(.summary.total))"'; \
-    else \
-        echo "No report found. Run 'just node-compat' first."; \
-    fi
+    cargo run -p otter-node-compat -- status
+
+# List tests without running (e.g. `just node-compat-list --module buffer`)
+node-compat-list *args:
+    cargo run -p otter-node-compat -- --list-only {{args}}
+
+# Run with JSON output (for CI)
+node-compat-json *args:
+    cargo run -p otter-node-compat -- --json {{args}}

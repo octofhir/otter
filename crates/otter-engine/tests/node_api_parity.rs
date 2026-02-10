@@ -71,12 +71,157 @@ fn test_fs_promises_extended_api_surface() {
          if (typeof pending?.then !== 'function') throw new Error('readFile promise');\n\
          const openPending = fsp.open(p, 'r');\n\
          if (typeof openPending?.then !== 'function') throw new Error('open promise');\n\
-         for (const name of ['appendFile','mkdtemp','cp','open','rm','access','copyFile','rename','realpath']) {{\n\
+         for (const name of ['appendFile','mkdtemp','cp','open','opendir','rm','access','copyFile','rename','realpath']) {{\n\
              if (typeof fsp[name] !== 'function') throw new Error('missing ' + name);\n\
          }}\n\
          'ok';"
     );
     assert_ok(&mut otter, &code);
+}
+
+#[test]
+fn test_fs_readdir_with_file_types_and_promises_bridge() {
+    let dir = tempdir().unwrap();
+    let mut otter = full_engine_for_parity();
+    let root = js_string(&dir.path().to_string_lossy());
+    let code = format!(
+        "import fs from 'node:fs'; import path from 'node:path';\n\
+         const root = {root};\n\
+         fs.mkdirSync(path.join(root, 'nested'));\n\
+         fs.writeFileSync(path.join(root, 'a.txt'), 'x');\n\
+         const entries = fs.readdirSync(root, {{ withFileTypes: true }});\n\
+         if (!Array.isArray(entries) || entries.length < 2) throw new Error('dirent list');\n\
+         const fileEnt = entries.find((e) => e.name === 'a.txt');\n\
+         const dirEnt = entries.find((e) => e.name === 'nested');\n\
+         if (!fileEnt || typeof fileEnt.isFile !== 'function' || !fileEnt.isFile()) throw new Error('dirent file');\n\
+         if (!dirEnt || typeof dirEnt.isDirectory !== 'function' || !dirEnt.isDirectory()) throw new Error('dirent dir');\n\
+         if (typeof fs.promises !== 'object' || typeof fs.promises.open !== 'function') throw new Error('fs.promises bridge');\n\
+         'ok';"
+    );
+    assert_ok(&mut otter, &code);
+}
+
+#[test]
+fn test_fs_callback_async_api_surface() {
+    let dir = tempdir().unwrap();
+    let mut otter = full_engine_for_parity();
+    let root = js_string(&dir.path().to_string_lossy());
+    let code = format!(
+        "import fs from 'node:fs'; import path from 'node:path';\n\
+         const p = path.join({root}, 'cb.txt');\n\
+         fs.writeFileSync(p, 'cb');\n\
+         const cb = () => {{}};\n\
+         for (const name of ['readFile','writeFile','appendFile','stat','lstat','readdir','mkdir','mkdtemp','rm','unlink','cp','copyFile','rename','realpath','access','chmod','symlink','readlink','open','opendir']) {{\n\
+             if (typeof fs[name] !== 'function') throw new Error('missing callback api ' + name);\n\
+         }}\n\
+         if (fs.readFile(p, 'utf8', cb) !== undefined) throw new Error('readFile callback return');\n\
+         if (fs.writeFile(p, 'x', cb) !== undefined) throw new Error('writeFile callback return');\n\
+         if (fs.readdir({root}, cb) !== undefined) throw new Error('readdir callback return');\n\
+         if (fs.open(p, 'r', cb) !== undefined) throw new Error('open callback return');\n\
+         if (fs.opendir({root}, cb) !== undefined) throw new Error('opendir callback return');\n\
+         'ok';"
+    );
+    assert_ok(&mut otter, &code);
+}
+
+#[test]
+fn test_fs_cp_options_and_symlink_behavior() {
+    let dir = tempdir().unwrap();
+    let mut otter = full_engine_for_parity();
+    let root = js_string(&dir.path().to_string_lossy());
+    let code = format!(
+        "import fs from 'node:fs'; import path from 'node:path';\n\
+         const root = {root};\n\
+         const src = path.join(root, 'src.txt');\n\
+         const dst = path.join(root, 'dst.txt');\n\
+         fs.writeFileSync(src, 'source');\n\
+         fs.writeFileSync(dst, 'existing');\n\
+         fs.cpSync(src, dst, {{ force: false }});\n\
+         if (fs.readFileSync(dst, 'utf8') !== 'existing') throw new Error('cp force false');\n\
+         let threw = false;\n\
+         try {{ fs.cpSync(src, dst, {{ force: false, errorOnExist: true }}); }} catch (_e) {{ threw = true; }}\n\
+         if (!threw) throw new Error('cp errorOnExist');\n\
+         fs.cpSync(src, dst);\n\
+         if (fs.readFileSync(dst, 'utf8') !== 'source') throw new Error('cp default force');\n\
+         const target = path.join(root, 'target.txt');\n\
+         const linkSrc = path.join(root, 'link-src');\n\
+         const linkDst = path.join(root, 'link-dst');\n\
+         const derefDst = path.join(root, 'deref.txt');\n\
+         fs.writeFileSync(target, 'linkdata');\n\
+         let symlinkOk = true;\n\
+         try {{ fs.symlinkSync(target, linkSrc); }} catch (_e) {{ symlinkOk = false; }}\n\
+         if (symlinkOk) {{\n\
+             fs.cpSync(linkSrc, linkDst, {{ dereference: false, force: true }});\n\
+             if (!fs.lstatSync(linkDst).isSymbolicLink()) throw new Error('cp symlink preserve');\n\
+             fs.cpSync(linkSrc, derefDst, {{ dereference: true, force: true }});\n\
+             if (fs.lstatSync(derefDst).isSymbolicLink()) throw new Error('cp dereference type');\n\
+             if (fs.readFileSync(derefDst, 'utf8') !== 'linkdata') throw new Error('cp dereference content');\n\
+         }}\n\
+         const treeSrc = path.join(root, 'tree-src');\n\
+         const treeDst = path.join(root, 'tree-dst');\n\
+         fs.mkdirSync(treeSrc, {{ recursive: true }});\n\
+         fs.writeFileSync(path.join(treeSrc, 'keep.txt'), 'k');\n\
+         fs.writeFileSync(path.join(treeSrc, 'skip.txt'), 's');\n\
+         fs.cpSync(treeSrc, treeDst, {{ recursive: true, filter: (srcPath, _dstPath) => !String(srcPath).endsWith('skip.txt') }});\n\
+         if (!fs.existsSync(path.join(treeDst, 'keep.txt'))) throw new Error('cp filter keep');\n\
+         if (fs.existsSync(path.join(treeDst, 'skip.txt'))) throw new Error('cp filter skip');\n\
+         let modeThrew = false;\n\
+         try {{ fs.cpSync(src, dst, {{ mode: 1 }}); }} catch (_e) {{ modeThrew = true; }}\n\
+         if (!modeThrew) throw new Error('cp mode excl');\n\
+         'ok';"
+    );
+    assert_ok(&mut otter, &code);
+}
+
+#[test]
+fn test_fs_opendir_sync_and_abort_signal_surface() {
+    let dir = tempdir().unwrap();
+    let mut otter = full_engine_for_parity();
+    let root = dir.path().to_string_lossy().to_string();
+    let root_js = js_string(&root);
+
+    let code = format!(
+        "import fs from 'node:fs'; import fsp from 'node:fs/promises'; import path from 'node:path';\n\
+         const root = {root_js};\n\
+         fs.writeFileSync(path.join(root, 'a.txt'), 'a');\n\
+         fs.writeFileSync(path.join(root, 'b.txt'), 'b');\n\
+         const dirh = fs.opendirSync(root);\n\
+         const names = [];\n\
+         for (;;) {{\n\
+             const ent = dirh.readSync();\n\
+             if (ent === null) break;\n\
+             names.push(ent.name);\n\
+         }}\n\
+         dirh.closeSync();\n\
+         names.sort();\n\
+         if (names.join(',') !== 'a.txt,b.txt') throw new Error('opendir async iterator');\n\
+         const pending = fsp.readFile(path.join(root, 'a.txt'), {{ signal: {{ aborted: true }} }});\n\
+         if (typeof pending?.then !== 'function') throw new Error('abort promise surface');\n\
+         'ok';"
+    );
+
+    assert_ok(&mut otter, &code);
+}
+
+#[tokio::test]
+async fn test_eval_waits_for_detached_fs_async_ops() {
+    let dir = tempdir().unwrap();
+    let mut otter = full_engine_for_parity();
+    let file = dir.path().join("detached.txt");
+    let file_js = js_string(&file.to_string_lossy());
+
+    let code = format!(
+        "import fs from 'node:fs'; import fsp from 'node:fs/promises';\n\
+         const p = {file_js};\n\
+         fs.writeFileSync(p, 'seed');\n\
+         fsp.writeFile(p, 'promises-done');\n\
+         'ok';"
+    );
+
+    let _value = otter.eval(&code, None).await.expect("eval");
+
+    let written = std::fs::read_to_string(&file).expect("read file");
+    assert_eq!(written, "promises-done");
 }
 
 #[test]

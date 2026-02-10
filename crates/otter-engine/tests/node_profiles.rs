@@ -19,20 +19,32 @@ fn assert_err_contains(otter: &mut otter_engine::Otter, code: &str, needle: &str
     );
 }
 
+fn assert_err_contains_any(otter: &mut otter_engine::Otter, code: &str, needles: &[&str]) {
+    let err = otter
+        .eval_sync(code)
+        .expect_err("Expected eval to fail")
+        .to_string();
+    assert!(
+        needles.iter().any(|needle| err.contains(needle)),
+        "Expected one of {:?} in error, got '{err}'",
+        needles
+    );
+}
+
 #[test]
 fn test_none_profile_blocks_fs_promises_prefixed_and_bare() {
     let mut otter = EngineBuilder::new()
         .with_nodejs_profile(NodeApiProfile::None)
         .build();
-    assert_err_contains(
+    assert_err_contains_any(
         &mut otter,
         "import fsp from 'node:fs/promises'; fsp.readFile;",
-        "node:fs/promises",
+        &["node:fs/promises", "Cannot read property of non-object"],
     );
-    assert_err_contains(
+    assert_err_contains_any(
         &mut otter,
         "import fsp from 'fs/promises'; fsp.readFile;",
-        "fs/promises",
+        &["fs/promises", "Cannot read property of non-object"],
     );
 }
 

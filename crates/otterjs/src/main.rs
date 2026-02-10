@@ -419,7 +419,7 @@ async fn run_code(source: &str, source_url: &str, cli: &Cli) -> Result<()> {
     };
 
     // Execute code
-    let result = engine.eval(source).await;
+    let result = engine.eval(source, None).await;
 
     // Cancel timeout task if still running
     if let Some(handle) = timeout_handle {
@@ -626,7 +626,7 @@ async fn run_repl(cli: &Cli) -> Result<()> {
 }
 
 async fn eval_repl_line(engine: &mut otter_engine::Otter, line: &str) {
-    match engine.eval(line).await {
+    match engine.eval(line, None).await {
         Ok(value) => {
             if !value.is_undefined() {
                 println!("{}", format_value(&value));
@@ -881,7 +881,7 @@ globalThis.__otter_results;
 "#
     );
 
-    match engine.eval(&test_harness).await {
+    match engine.eval(&test_harness, None).await {
         Ok(result) => {
             // Try to extract results from the returned object
             if let Some(obj) = result.as_object() {

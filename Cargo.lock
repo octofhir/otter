@@ -1835,16 +1835,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "otter-node-compat"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "colored",
+ "futures",
+ "indicatif",
+ "otter-engine",
+ "otter-vm-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "otter-nodejs"
 version = "0.1.0"
 dependencies = [
  "base64",
  "dunce",
+ "filetime",
+ "libc",
  "otter-macros",
  "otter-vm-core",
  "otter-vm-runtime",
  "serde",
  "serde_json",
+ "sysinfo 0.35.2",
  "tempfile",
  "tokio",
 ]

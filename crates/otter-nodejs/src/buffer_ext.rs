@@ -8,14 +8,14 @@
 use std::sync::Arc;
 
 use otter_macros::{js_class, js_method, js_static};
+use otter_vm_core::builtin_builder::BuiltInBuilder;
 use otter_vm_core::context::NativeContext;
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
-use otter_vm_core::object::{JsObject, PropertyKey};
+use otter_vm_core::object::{JsObject, PropertyAttributes, PropertyKey};
 use otter_vm_core::string::JsString;
 use otter_vm_core::typed_array::{JsTypedArray, TypedArrayKind};
 use otter_vm_core::value::Value;
-use otter_vm_core::builtin_builder::BuiltInBuilder;
 use otter_vm_runtime::extension_v2::{OtterExtension, Profile};
 use otter_vm_runtime::registration::RegistrationContext;
 
@@ -136,10 +136,9 @@ fn create_buffer_from_bytes(bytes: &[u8], ncx: &NativeContext) -> Value {
     }
 
     // Mark as Buffer for isBuffer() detection
-    let _ = ta.object.set(
-        PropertyKey::string("__is_buffer"),
-        Value::boolean(true),
-    );
+    let _ = ta
+        .object
+        .set(PropertyKey::string("__is_buffer"), Value::boolean(true));
 
     Value::typed_array(GcRef::new(ta))
 }
@@ -156,11 +155,7 @@ impl Buffer {
     // --- Static methods ---
 
     #[js_static(name = "alloc", length = 1)]
-    pub fn alloc(
-        _this: &Value,
-        args: &[Value],
-        ncx: &mut NativeContext,
-    ) -> Result<Value, VmError> {
+    pub fn alloc(_this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let size = args
             .first()
             .and_then(|v| v.as_number())
@@ -198,11 +193,7 @@ impl Buffer {
     }
 
     #[js_static(name = "from", length = 1)]
-    pub fn from(
-        _this: &Value,
-        args: &[Value],
-        ncx: &mut NativeContext,
-    ) -> Result<Value, VmError> {
+    pub fn from(_this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let source = args.first().cloned().unwrap_or(Value::undefined());
 
         // Buffer.from(string, encoding?)
@@ -263,10 +254,7 @@ impl Buffer {
         // A Buffer is a Uint8Array with our marker
         let is_buf = val.as_typed_array().is_some_and(|ta| {
             ta.kind() == TypedArrayKind::Uint8
-                && ta
-                    .object
-                    .get(&PropertyKey::string("__is_buffer"))
-                    .is_some()
+                && ta.object.get(&PropertyKey::string("__is_buffer")).is_some()
         });
         Ok(Value::boolean(is_buf))
     }
@@ -358,6 +346,29 @@ impl Buffer {
         Ok(Value::boolean(is_valid))
     }
 
+    #[js_static(name = "compare", length = 2)]
+    pub fn compare_static(
+        _this: &Value,
+        args: &[Value],
+        _ncx: &mut NativeContext,
+    ) -> Result<Value, VmError> {
+        let a = args.first().cloned().unwrap_or(Value::undefined());
+        let b = args.get(1).cloned().unwrap_or(Value::undefined());
+        let a_bytes = get_buffer_bytes(&a).ok_or_else(|| {
+            VmError::type_error("Buffer.compare: first argument must be a Buffer")
+        })?;
+        let b_bytes = get_buffer_bytes(&b).ok_or_else(|| {
+            VmError::type_error("Buffer.compare: second argument must be a Buffer")
+        })?;
+
+        let result = a_bytes.cmp(&b_bytes);
+        Ok(Value::number(match result {
+            std::cmp::Ordering::Less => -1.0,
+            std::cmp::Ordering::Equal => 0.0,
+            std::cmp::Ordering::Greater => 1.0,
+        }))
+    }
+
     // --- Instance methods ---
 
     #[js_method(name = "toString", length = 0)]
@@ -370,10 +381,7 @@ impl Buffer {
             .ok_or_else(|| VmError::type_error("Buffer.prototype.toString: not a Buffer"))?;
 
         let encoding = parse_encoding(args.first());
-        let start = args
-            .get(1)
-            .and_then(|v| v.as_number())
-            .unwrap_or(0.0) as usize;
+        let start = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
         let end = args
             .get(2)
             .and_then(|v| v.as_number())
@@ -389,11 +397,7 @@ impl Buffer {
     }
 
     #[js_method(name = "write", length = 1)]
-    pub fn write(
-        this: &Value,
-        args: &[Value],
-        _ncx: &mut NativeContext,
-    ) -> Result<Value, VmError> {
+    pub fn write(this: &Value, args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
         let ta = this
             .as_typed_array()
             .ok_or_else(|| VmError::type_error("Buffer.prototype.write: not a Buffer"))?;
@@ -403,10 +407,7 @@ impl Buffer {
             .and_then(|v| v.as_string())
             .ok_or_else(|| VmError::type_error("Buffer.prototype.write: string required"))?;
 
-        let offset = args
-            .get(1)
-            .and_then(|v| v.as_number())
-            .unwrap_or(0.0) as usize;
+        let offset = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
         let encoding = parse_encoding(args.get(3));
         let src_bytes = decode_string(string.as_str(), &encoding);
 
@@ -417,7 +418,10 @@ impl Buffer {
             .map(|n| n as usize)
             .unwrap_or(buf_len.saturating_sub(offset));
 
-        let write_len = src_bytes.len().min(max_write).min(buf_len.saturating_sub(offset));
+        let write_len = src_bytes
+            .len()
+            .min(max_write)
+            .min(buf_len.saturating_sub(offset));
 
         for i in 0..write_len {
             ta.set(offset + i, src_bytes[i] as f64);
@@ -427,11 +431,7 @@ impl Buffer {
     }
 
     #[js_method(name = "copy", length = 1)]
-    pub fn copy(
-        this: &Value,
-        args: &[Value],
-        _ncx: &mut NativeContext,
-    ) -> Result<Value, VmError> {
+    pub fn copy(this: &Value, args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
         let src = this
             .as_typed_array()
             .ok_or_else(|| VmError::type_error("Buffer.prototype.copy: not a Buffer"))?;
@@ -478,11 +478,7 @@ impl Buffer {
 
         if let Some(n) = fill_val.as_number() {
             let byte_val = n as u8 as f64;
-            ta.fill(
-                byte_val,
-                offset.map(|n| n as i64),
-                end.map(|n| n as i64),
-            );
+            ta.fill(byte_val, offset.map(|n| n as i64), end.map(|n| n as i64));
         } else if let Some(s) = fill_val.as_string() {
             let encoding = parse_encoding(args.get(3));
             let fill_bytes = decode_string(s.as_str(), &encoding);
@@ -503,27 +499,28 @@ impl Buffer {
     }
 
     #[js_method(name = "slice", length = 0)]
-    pub fn slice(
-        this: &Value,
-        args: &[Value],
-        ncx: &mut NativeContext,
-    ) -> Result<Value, VmError> {
+    pub fn slice(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let bytes = get_buffer_bytes(this)
             .ok_or_else(|| VmError::type_error("Buffer.prototype.slice: not a Buffer"))?;
 
         let len = bytes.len() as i64;
-        let start = args
-            .first()
-            .and_then(|v| v.as_number())
-            .unwrap_or(0.0) as i64;
+        let start = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i64;
         let end = args
             .get(1)
             .and_then(|v| v.as_number())
             .map(|n| n as i64)
             .unwrap_or(len);
 
-        let start = if start < 0 { (len + start).max(0) } else { start.min(len) } as usize;
-        let end = if end < 0 { (len + end).max(0) } else { end.min(len) } as usize;
+        let start = if start < 0 {
+            (len + start).max(0)
+        } else {
+            start.min(len)
+        } as usize;
+        let end = if end < 0 {
+            (len + end).max(0)
+        } else {
+            end.min(len)
+        } as usize;
         let end = end.max(start);
 
         let slice_bytes = &bytes[start..end];
@@ -573,6 +570,97 @@ impl Buffer {
         Ok(Value::number(-1.0))
     }
 
+    #[js_method(name = "lastIndexOf", length = 1)]
+    pub fn last_index_of(
+        this: &Value,
+        args: &[Value],
+        _ncx: &mut NativeContext,
+    ) -> Result<Value, VmError> {
+        let bytes = get_buffer_bytes(this)
+            .ok_or_else(|| VmError::type_error("Buffer.prototype.lastIndexOf: not a Buffer"))?;
+        if bytes.is_empty() {
+            return Ok(Value::number(-1.0));
+        }
+
+        let search = args.first().cloned().unwrap_or(Value::undefined());
+        let offset = args
+            .get(1)
+            .and_then(|v| v.as_number())
+            .map(|n| n as i64)
+            .unwrap_or((bytes.len() - 1) as i64);
+        let encoding = parse_encoding(args.get(2));
+
+        let mut start = if offset < 0 {
+            (bytes.len() as i64 + offset).max(0) as usize
+        } else {
+            (offset as usize).min(bytes.len() - 1)
+        };
+
+        let needle = if let Some(n) = search.as_number() {
+            vec![n as u8]
+        } else if let Some(s) = search.as_string() {
+            decode_string(s.as_str(), &encoding)
+        } else if let Some(buf) = get_buffer_bytes(&search) {
+            buf
+        } else {
+            Vec::new()
+        };
+
+        if needle.is_empty() || needle.len() > bytes.len() {
+            return Ok(Value::number(-1.0));
+        }
+
+        if start + 1 < needle.len() {
+            start = needle.len() - 1;
+        }
+
+        let max_start = bytes.len() - needle.len();
+        let start = start.min(max_start);
+        for i in (0..=start).rev() {
+            if bytes[i..i + needle.len()] == needle[..] {
+                return Ok(Value::number(i as f64));
+            }
+        }
+
+        Ok(Value::number(-1.0))
+    }
+
+    #[js_method(name = "includes", length = 1)]
+    pub fn includes(
+        this: &Value,
+        args: &[Value],
+        _ncx: &mut NativeContext,
+    ) -> Result<Value, VmError> {
+        let bytes = get_buffer_bytes(this)
+            .ok_or_else(|| VmError::type_error("Buffer.prototype.includes: not a Buffer"))?;
+        let search = args.first().cloned().unwrap_or(Value::undefined());
+        let byte_offset = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+        let byte_offset = byte_offset.min(bytes.len());
+        let encoding = parse_encoding(args.get(2));
+
+        let needle = if let Some(n) = search.as_number() {
+            vec![n as u8]
+        } else if let Some(s) = search.as_string() {
+            decode_string(s.as_str(), &encoding)
+        } else if let Some(buf) = get_buffer_bytes(&search) {
+            buf
+        } else {
+            Vec::new()
+        };
+
+        if needle.is_empty() || needle.len() > bytes.len().saturating_sub(byte_offset) {
+            return Ok(Value::boolean(false));
+        }
+
+        for i in byte_offset..=bytes.len() - needle.len() {
+            if bytes[i..i + needle.len()] == needle[..] {
+                return Ok(Value::boolean(true));
+            }
+        }
+
+        Ok(Value::boolean(false))
+    }
+
     #[js_method(name = "compare", length = 1)]
     pub fn compare(
         this: &Value,
@@ -582,8 +670,9 @@ impl Buffer {
         let a = get_buffer_bytes(this)
             .ok_or_else(|| VmError::type_error("Buffer.prototype.compare: not a Buffer"))?;
         let b_val = args.first().cloned().unwrap_or(Value::undefined());
-        let b = get_buffer_bytes(&b_val)
-            .ok_or_else(|| VmError::type_error("Buffer.prototype.compare: argument must be a Buffer"))?;
+        let b = get_buffer_bytes(&b_val).ok_or_else(|| {
+            VmError::type_error("Buffer.prototype.compare: argument must be a Buffer")
+        })?;
 
         let result = a.cmp(&b);
         Ok(Value::number(match result {
@@ -602,8 +691,9 @@ impl Buffer {
         let a = get_buffer_bytes(this)
             .ok_or_else(|| VmError::type_error("Buffer.prototype.equals: not a Buffer"))?;
         let b_val = args.first().cloned().unwrap_or(Value::undefined());
-        let b = get_buffer_bytes(&b_val)
-            .ok_or_else(|| VmError::type_error("Buffer.prototype.equals: argument must be a Buffer"))?;
+        let b = get_buffer_bytes(&b_val).ok_or_else(|| {
+            VmError::type_error("Buffer.prototype.equals: argument must be a Buffer")
+        })?;
 
         Ok(Value::boolean(a == b))
     }
@@ -694,9 +784,7 @@ pub fn node_buffer_extension() -> Box<dyn OtterExtension> {
 fn build_buffer_class(ctx: &RegistrationContext) -> Value {
     type DeclFn = fn() -> (
         &'static str,
-        Arc<
-            dyn Fn(&Value, &[Value], &mut NativeContext) -> Result<Value, VmError> + Send + Sync,
-        >,
+        Arc<dyn Fn(&Value, &[Value], &mut NativeContext) -> Result<Value, VmError> + Send + Sync>,
         u32,
     );
 
@@ -709,6 +797,7 @@ fn build_buffer_class(ctx: &RegistrationContext) -> Value {
         Buffer::byte_length_static_decl,
         Buffer::concat_decl,
         Buffer::is_encoding_decl,
+        Buffer::compare_static_decl,
     ];
 
     // Prototype (instance) methods
@@ -719,6 +808,8 @@ fn build_buffer_class(ctx: &RegistrationContext) -> Value {
         Buffer::fill_method_decl,
         Buffer::slice_decl,
         Buffer::index_of_decl,
+        Buffer::last_index_of_decl,
+        Buffer::includes_decl,
         Buffer::compare_decl,
         Buffer::equals_decl,
         Buffer::to_json_decl,
@@ -744,10 +835,7 @@ fn build_buffer_class(ctx: &RegistrationContext) -> Value {
                         return Err(VmError::range_error("Buffer size exceeds maximum"));
                     }
                     if let Some(obj) = this.as_object() {
-                        let _ = obj.set(
-                            PropertyKey::string("__is_buffer"),
-                            Value::boolean(true),
-                        );
+                        let _ = obj.set(PropertyKey::string("__is_buffer"), Value::boolean(true));
                     }
                 }
                 Ok(Value::undefined())
@@ -764,6 +852,12 @@ fn build_buffer_class(ctx: &RegistrationContext) -> Value {
         let (name, func, length) = decl();
         builder = builder.static_method_native(name, func, length);
     }
+
+    builder = builder.static_property(
+        PropertyKey::string("poolSize"),
+        Value::number(8192.0),
+        PropertyAttributes::builtin_method(),
+    );
 
     builder.build()
 }

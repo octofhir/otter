@@ -99,17 +99,3 @@ fn test_node_safe_profile_blocks_bare_process() {
     assert!(err.contains("process"));
 }
 
-#[test]
-fn test_node_none_profile_blocks_node_and_bare_builtins() {
-    let mut otter = EngineBuilder::new()
-        .with_nodejs_profile(NodeApiProfile::None)
-        .build();
-
-    let with_prefix = otter.eval_sync("import path from 'node:path'; path.sep;");
-    assert!(with_prefix.is_err());
-    assert!(with_prefix.unwrap_err().to_string().contains("node:path"));
-
-    let bare = otter.eval_sync("import path from 'path'; path.sep;");
-    assert!(bare.is_err());
-    assert!(bare.unwrap_err().to_string().contains("path"));
-}

@@ -33,15 +33,15 @@
 //! ```
 
 // Own modules (ESM loader, graph)
+mod console;
 pub mod error;
 pub mod graph;
-mod console;
 mod http;
 pub mod loader;
 
 // Re-export own types
-pub use error::{EngineError, EngineResult};
 pub use console::{ConsoleAdapter, LogLevel, StdConsole};
+pub use error::{EngineError, EngineResult};
 pub use graph::{ImportRecord, ModuleGraph, ModuleNode, parse_imports};
 pub use http::create_http_extension;
 pub use loader::{

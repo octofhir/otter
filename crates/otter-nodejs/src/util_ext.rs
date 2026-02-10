@@ -291,7 +291,7 @@ impl UtilTypes {
     ) -> Result<Value, VmError> {
         let val = args.first().cloned().unwrap_or(Value::undefined());
         Ok(Value::boolean(val.as_object().is_some_and(|o| {
-            o.get(&PropertyKey::string("__date_value")).is_some()
+            o.get(&PropertyKey::string("__timestamp__")).is_some()
         })))
     }
 
@@ -303,7 +303,9 @@ impl UtilTypes {
     ) -> Result<Value, VmError> {
         let val = args.first().cloned().unwrap_or(Value::undefined());
         Ok(Value::boolean(val.as_object().is_some_and(|o| {
-            o.get(&PropertyKey::string("__map_data")).is_some()
+            o.get(&PropertyKey::string("__map_data__"))
+                .and_then(|v| v.as_map_data())
+                .is_some()
         })))
     }
 
@@ -315,7 +317,9 @@ impl UtilTypes {
     ) -> Result<Value, VmError> {
         let val = args.first().cloned().unwrap_or(Value::undefined());
         Ok(Value::boolean(val.as_object().is_some_and(|o| {
-            o.get(&PropertyKey::string("__set_data")).is_some()
+            o.get(&PropertyKey::string("__set_data__"))
+                .and_then(|v| v.as_set_data())
+                .is_some()
         })))
     }
 
@@ -327,7 +331,7 @@ impl UtilTypes {
     ) -> Result<Value, VmError> {
         let val = args.first().cloned().unwrap_or(Value::undefined());
         Ok(Value::boolean(val.as_object().is_some_and(|o| {
-            o.get(&PropertyKey::string("__weakmap_data")).is_some()
+            o.get(&PropertyKey::string("__weakmap_entries__")).is_some()
         })))
     }
 
@@ -339,7 +343,7 @@ impl UtilTypes {
     ) -> Result<Value, VmError> {
         let val = args.first().cloned().unwrap_or(Value::undefined());
         Ok(Value::boolean(val.as_object().is_some_and(|o| {
-            o.get(&PropertyKey::string("__weakset_data")).is_some()
+            o.get(&PropertyKey::string("__weakset_entries__")).is_some()
         })))
     }
 
@@ -380,9 +384,7 @@ impl UtilTypes {
         _ncx: &mut NativeContext,
     ) -> Result<Value, VmError> {
         let val = args.first().cloned().unwrap_or(Value::undefined());
-        Ok(Value::boolean(val.as_object().is_some_and(|o| {
-            o.get(&PropertyKey::string("__typed_array_data")).is_some()
-        })))
+        Ok(Value::boolean(val.is_typed_array()))
     }
 
     #[js_static(name = "isArrayBuffer", length = 1)]
@@ -392,9 +394,7 @@ impl UtilTypes {
         _ncx: &mut NativeContext,
     ) -> Result<Value, VmError> {
         let val = args.first().cloned().unwrap_or(Value::undefined());
-        Ok(Value::boolean(val.as_object().is_some_and(|o| {
-            o.get(&PropertyKey::string("__arraybuffer_data")).is_some()
-        })))
+        Ok(Value::boolean(val.is_array_buffer()))
     }
 
     #[js_static(name = "isNativeError", length = 1)]

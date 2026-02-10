@@ -326,7 +326,18 @@ impl Otter {
     /// - `function` declarations creating global properties
     /// - Correct `this` binding (global object for scripts)
     /// - Top-level `await` via the interpreter's suspension machinery
-    pub async fn eval(&mut self, code: &str) -> Result<Value, OtterError> {
+    /// Compile and execute JavaScript/TypeScript code.
+    ///
+    /// When `source_url` is `Some`, relative `require()` / `import` paths
+    /// resolve from that file location. Pass an absolute file path
+    /// (e.g. `/app/src/main.js`) so that `require('./util')` works.
+    /// When `None`, defaults to `"main.js"`.
+    pub async fn eval(
+        &mut self,
+        code: &str,
+        source_url: Option<&str>,
+    ) -> Result<Value, OtterError> {
+        let source_url = source_url.unwrap_or("main.js");
         // 0. Clear interrupt flag before starting (in case of re-use)
         self.clear_interrupt();
 
@@ -385,11 +396,22 @@ impl Otter {
         // ES spec: Drain microtasks after extension setup JS execution
         self.drain_microtasks(&mut ctx)?;
 
+        // 5b. If source_url is a real file path, re-scope global require
+        if source_url != "main.js" {
+            let referrer_lit =
+                serde_json::to_string(source_url).unwrap_or_else(|_| "\"main.js\"".to_string());
+            let rescope = format!(
+                "globalThis.require = globalThis.__createRequire({});",
+                referrer_lit
+            );
+            let _ = self.execute_js(&mut ctx, &rescope, "<require-scope>");
+        }
+
         // 6. Set top-level `this` to the global object per ES2023 §19.2.1.
         ctx.set_pending_this(Value::object(ctx.global().clone()));
 
         // 7. Load, link and execute as module
-        let main_url = "main.js";
+        let main_url = source_url;
 
         let bytecode = match self.loader.compile_source(code, main_url, false) {
             Ok(b) => b,
@@ -514,6 +536,16 @@ impl Otter {
                 }
             }
         };
+
+        if self.interrupt_flag.load(Ordering::Relaxed) {
+            return Err(OtterError::Runtime(
+                "Execution interrupted (timeout)".to_string(),
+            ));
+        }
+
+        // Keep runtime alive for detached async work (e.g. fs callbacks/promises
+        // started without top-level await) until the event loop reaches quiescence.
+        self.run_event_loop_with_http(&mut ctx).await;
 
         if self.interrupt_flag.load(Ordering::Relaxed) {
             return Err(OtterError::Runtime(
@@ -691,6 +723,7 @@ impl Otter {
         Self::configure_eval(&mut ctx);
         Self::configure_js_job_queue(&mut ctx, &self.event_loop);
         Self::configure_next_tick_queue(&mut ctx, &self.event_loop);
+        Self::configure_pending_async_ops(&mut ctx, &self.event_loop);
 
         // Register extension ops as global native functions
         self.register_ops_in_context(&mut ctx);
@@ -923,7 +956,10 @@ impl Otter {
         }
 
         // Also register environment access if capabilities allow
-        self.register_env_access(global, fn_proto);
+        self.register_env_access(global.clone(), fn_proto);
+
+        // Register __module_require with bytecode execution via NativeContext (safe)
+        self.register_module_require(global.clone(), fn_proto);
 
         let ctx_ptr = ctx as *mut VmContext as usize;
         let vm_ptr = &self.vm as *const VmRuntime as usize;
@@ -1303,6 +1339,120 @@ impl Otter {
                     Ok(Value::boolean(env_store_has.contains(&key)))
                 },
                 mm_has,
+                fn_proto,
+            ),
+        );
+    }
+
+    /// Register `__module_require` as a NativeFn with bytecode execution capability.
+    ///
+    /// Unlike extension ops (which only get `&[Value], Arc<MemoryManager>`),
+    /// this uses `NativeContext::execute_module()` to synchronously execute
+    /// CJS module bytecode — enabling `require()` for local files.
+    fn register_module_require(&self, global: GcRef<JsObject>, fn_proto: GcRef<JsObject>) {
+        let loader = Arc::clone(&self.loader);
+        let mm = self.vm.memory_manager().clone();
+
+        let _ = global.set(
+            PropertyKey::string("__module_require"),
+            Value::native_function_with_proto(
+                move |_this: &Value,
+                      args: &[Value],
+                      ncx: &mut otter_vm_core::context::NativeContext<'_>| {
+                    let specifier = args
+                        .first()
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string())
+                        .ok_or_else(|| VmError::type_error("require: missing specifier"))?;
+                    let referrer = args
+                        .get(1)
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string())
+                        .ok_or_else(|| VmError::type_error("require: missing referrer"))?;
+
+                    // 1. Resolve specifier
+                    let resolution = loader
+                        .resolve_require(&specifier, &referrer)
+                        .map_err(|e| VmError::type_error(e.to_string()))?;
+
+                    // 2. Check if already evaluated or currently evaluating (cycle)
+                    if let Some(m) = loader.get(&resolution.url) {
+                        let guard = m
+                            .read()
+                            .map_err(|_| VmError::type_error("require: lock poisoned"))?;
+                        let state = guard.state;
+                        drop(guard);
+                        if state == crate::module_loader::ModuleState::Evaluated
+                            || state == crate::module_loader::ModuleState::Evaluating
+                        {
+                            // For cycles (Evaluating) return partial module.exports — Node.js semantics
+                            return loader
+                                .require_value(&specifier, &referrer, ncx.memory_manager().clone())
+                                .map_err(|e| VmError::type_error(e.to_string()));
+                        }
+                    }
+
+                    // 3. Load & compile (CJS wrapper applied automatically for CJS modules)
+                    loader
+                        .load(&resolution.url, resolution.module_type)
+                        .map_err(|e| VmError::type_error(e.to_string()))?;
+
+                    // 4. Build dependency graph & link
+                    let order = loader
+                        .build_graph(&resolution.url)
+                        .map_err(|e| VmError::type_error(e.to_string()))?;
+                    for url in &order {
+                        loader
+                            .link(url)
+                            .map_err(|e| VmError::type_error(e.to_string()))?;
+                    }
+
+                    // 5. Execute all unexecuted modules in dependency order
+                    for url in &order {
+                        let m = loader.get(url).ok_or_else(|| {
+                            VmError::type_error(format!("require: module not found: {}", url))
+                        })?;
+
+                        let (bytecode, state) = {
+                            let guard = m
+                                .read()
+                                .map_err(|_| VmError::type_error("require: lock poisoned"))?;
+                            (Arc::clone(&guard.bytecode), guard.state)
+                        };
+
+                        // Skip already-evaluated or currently-evaluating (cycle) modules
+                        if state == crate::module_loader::ModuleState::Evaluated
+                            || state == crate::module_loader::ModuleState::Evaluating
+                        {
+                            continue;
+                        }
+
+                        // Mark as evaluating
+                        if let Ok(mut g) = m.write() {
+                            g.state = crate::module_loader::ModuleState::Evaluating;
+                        }
+
+                        // Execute bytecode — CJS wrapper calls __module_commit automatically
+                        match ncx.execute_module(&bytecode) {
+                            Ok(_) => {
+                                // Update namespace (for ESM modules with export declarations)
+                                loader.update_namespace(url, ncx.ctx);
+                            }
+                            Err(e) => {
+                                if let Ok(mut g) = m.write() {
+                                    g.state = crate::module_loader::ModuleState::Error;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+
+                    // 6. Return module.exports
+                    loader
+                        .require_value(&specifier, &referrer, ncx.memory_manager().clone())
+                        .map_err(|e| VmError::type_error(e.to_string()))
+                },
+                mm,
                 fn_proto,
             ),
         );

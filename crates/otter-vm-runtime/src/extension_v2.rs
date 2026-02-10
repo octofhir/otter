@@ -16,7 +16,6 @@
 //! ```
 
 use std::fmt;
-use std::sync::Arc;
 
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;

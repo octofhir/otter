@@ -722,7 +722,7 @@ impl Test262Runner {
                 flag.store(true, Ordering::Relaxed);
             });
 
-            let result = AssertUnwindSafe(self.engine_mut().eval(source))
+            let result = AssertUnwindSafe(self.engine_mut().eval(source, None))
                 .catch_unwind()
                 .await;
 
@@ -731,7 +731,7 @@ impl Test262Runner {
 
             result
         } else {
-            AssertUnwindSafe(self.engine_mut().eval(source))
+            AssertUnwindSafe(self.engine_mut().eval(source, None))
                 .catch_unwind()
                 .await
         };

@@ -658,8 +658,13 @@ impl ModuleLoader {
         }
 
         // 5. Get the directory of the referrer
-        let referrer_path = Path::new(referrer);
-        let referrer_dir = referrer_path.parent().unwrap_or(&self.base_dir);
+        let referrer_clean = referrer.strip_prefix("file://").unwrap_or(referrer);
+        let referrer_path = Path::new(referrer_clean);
+        let referrer_dir = if referrer_path.is_dir() {
+            referrer_path
+        } else {
+            referrer_path.parent().unwrap_or(&self.base_dir)
+        };
 
         // 6. Use context-aware oxc resolver for filesystem modules
         let resolver = match context {
@@ -672,8 +677,14 @@ impl ModuleLoader {
                 let normalized = self.normalize_url_key(&resolution.path().to_string_lossy());
                 let module_type = if normalized.ends_with(".mjs") || normalized.ends_with(".mts") {
                     ModuleType::ESM
-                } else {
+                } else if normalized.ends_with(".cjs") || normalized.ends_with(".cts") {
                     ModuleType::CommonJS
+                } else {
+                    // .js/.ts/.json: use import context to determine type
+                    match context {
+                        ImportContext::ESM => ModuleType::ESM,
+                        ImportContext::CJS => ModuleType::CommonJS,
+                    }
                 };
                 Ok(ModuleResolution {
                     url: normalized,
@@ -772,12 +783,20 @@ impl ModuleLoader {
         let source = std::fs::read_to_string(&normalized_url)
             .map_err(|e| ModuleError::IoError(e.to_string()))?;
 
-        // Compile
-        let compile_source = if module_type == ModuleType::CommonJS {
-            self.wrap_commonjs_source(&normalized_url, &source)?
+        // 4. Handle JSON files: wrap as `module.exports = <json>;`
+        let source = if normalized_url.ends_with(".json") {
+            format!("module.exports = {};", source)
         } else {
             source
         };
+
+        // Compile
+        let compile_source =
+            if normalized_url.ends_with(".json") || module_type == ModuleType::CommonJS {
+                self.wrap_commonjs_source(&normalized_url, &source)?
+            } else {
+                source
+            };
         let compiler = Compiler::new();
         let bytecode = compiler
             .compile(
@@ -1241,7 +1260,6 @@ pub fn module_extension(loader: Arc<ModuleLoader>) -> crate::Extension {
 
     let loader_resolve = Arc::clone(&loader);
     let loader_load = Arc::clone(&loader);
-    let loader_require = Arc::clone(&loader);
     let loader_commit = Arc::clone(&loader);
     let loader_dirname = Arc::clone(&loader);
     let loader_filename = Arc::clone(&loader);
@@ -1292,23 +1310,8 @@ pub fn module_extension(loader: Arc<ModuleLoader>) -> crate::Extension {
                     }))
                 }
             }),
-            // Synchronous require for CommonJS
-            op_native_with_mm("__module_require", move |args, mm| {
-                let specifier = args
-                    .first()
-                    .and_then(|v| v.as_string())
-                    .map(|s| s.as_str().to_string())
-                    .ok_or_else(|| VmError::type_error("Missing specifier argument"))?;
-                let referrer = args
-                    .get(1)
-                    .and_then(|v| v.as_string())
-                    .map(|s| s.as_str().to_string())
-                    .ok_or_else(|| VmError::type_error("Missing referrer argument"))?;
-
-                loader_require
-                    .require_value(&specifier, &referrer, mm)
-                    .map_err(|e| VmError::type_error(e.to_string()))
-            }),
+            // NOTE: __module_require is registered directly in otter_runtime.rs
+            // with bytecode execution capability (not as an extension op).
             // Commit CommonJS `module.exports` to shared loader cache namespace.
             op_native_with_mm("__module_commit", move |args, _mm| {
                 let url = args
@@ -1354,45 +1357,59 @@ pub fn module_extension(loader: Arc<ModuleLoader>) -> crate::Extension {
                 Ok(json!(wrapper.filename()))
             }),
         ])
-        .with_js(
+        .with_js(&format!(
             r#"
 // Dynamic import helper
-globalThis.__dynamicImport = async function(specifier, referrer) {
+globalThis.__dynamicImport = async function(specifier, referrer) {{
     const resolved = __module_resolve(specifier, referrer, "esm");
     const result = await __module_load(resolved.url);
     return result;
-};
+}};
 
 // CommonJS require (synchronous)
 // Note: In real usage, require is created per-module with correct referrer
-globalThis.__createRequire = function(referrer) {
-    function require(specifier) {
+globalThis.__createRequire = function(referrer) {{
+    function require(specifier) {{
         return __module_require(specifier, referrer);
-    }
+    }}
 
-    require.resolve = function(specifier) {
+    require.resolve = function(specifier) {{
         const resolved = __module_resolve(specifier, referrer, "cjs");
         return resolved.url;
-    };
+    }};
 
-    require.cache = {};
+    require.cache = {{}};
     require.filename = __module_filename(referrer);
     require.dirname = __module_dirname(referrer);
 
     return require;
-};
+}};
+
+// Default global `require` so that eval() and scripts can use require()
+// without an explicit CJS wrapper. Uses loader base directory as referrer.
+if (typeof globalThis.require === 'undefined') {{
+    globalThis.require = globalThis.__createRequire({base_dir_lit});
+}}
+
+// Default CJS globals for scripts run via eval().
+if (typeof globalThis.module === 'undefined') {{
+    globalThis.module = {{ exports: {{}} }};
+    globalThis.exports = globalThis.module.exports;
+}}
 
 // Get __dirname for a module
-globalThis.__getDirname = function(url) {
+globalThis.__getDirname = function(url) {{
     return __module_dirname(url);
-};
+}};
 
 // Get __filename for a module
-globalThis.__getFilename = function(url) {
+globalThis.__getFilename = function(url) {{
     return __module_filename(url);
-};
+}};
 "#,
-        )
+            base_dir_lit = serde_json::to_string(&loader.base_dir().to_string_lossy().to_string())
+                .unwrap_or_else(|_| "\"file:///\"".to_string()),
+        ))
 }
 
 #[cfg(test)]

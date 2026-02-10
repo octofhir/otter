@@ -290,20 +290,18 @@ impl Assert {
         args: &[Value],
         ncx: &mut NativeContext,
     ) -> Result<Value, VmError> {
-        let string_val = args
-            .first()
-            .cloned()
-            .unwrap_or(Value::undefined());
-        let regexp_val = args
-            .get(1)
-            .cloned()
-            .unwrap_or(Value::undefined());
+        let string_val = args.first().cloned().unwrap_or(Value::undefined());
+        let regexp_val = args.get(1).cloned().unwrap_or(Value::undefined());
 
         if string_val.as_string().is_none() {
-            return Err(VmError::type_error("assert.match: first argument must be a string"));
+            return Err(VmError::type_error(
+                "assert.match: first argument must be a string",
+            ));
         }
         if regexp_val.as_regex().is_none() {
-            return Err(VmError::type_error("assert.match: second argument must be a RegExp"));
+            return Err(VmError::type_error(
+                "assert.match: second argument must be a RegExp",
+            ));
         }
 
         // Call RegExp.prototype.test via ncx
@@ -312,7 +310,9 @@ impl Assert {
             .and_then(|r| r.object.get(&PropertyKey::string("test")))
             .or_else(|| {
                 // Fall back to prototype lookup
-                regexp_val.as_object().and_then(|o| o.get(&PropertyKey::string("test")))
+                regexp_val
+                    .as_object()
+                    .and_then(|o| o.get(&PropertyKey::string("test")))
             });
 
         let matches = if let Some(test_fn) = test_method {
@@ -328,12 +328,16 @@ impl Assert {
         if matches {
             Ok(Value::undefined())
         } else {
-            let pattern = regexp_val.as_regex().map(|r| r.pattern.clone()).unwrap_or_default();
-            let s = string_val.as_string().map(|s| s.as_str().to_string()).unwrap_or_default();
+            let pattern = regexp_val
+                .as_regex()
+                .map(|r| r.pattern.clone())
+                .unwrap_or_default();
+            let s = string_val
+                .as_string()
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_default();
             let msg = get_message(args, 2).unwrap_or_else(|| {
-                format!(
-                    "The input did not match the regular expression /{pattern}/. Input: '{s}'"
-                )
+                format!("The input did not match the regular expression /{pattern}/. Input: '{s}'")
             });
             Err(VmError::type_error(&format!("AssertionError: {msg}")))
         }
@@ -345,20 +349,18 @@ impl Assert {
         args: &[Value],
         ncx: &mut NativeContext,
     ) -> Result<Value, VmError> {
-        let string_val = args
-            .first()
-            .cloned()
-            .unwrap_or(Value::undefined());
-        let regexp_val = args
-            .get(1)
-            .cloned()
-            .unwrap_or(Value::undefined());
+        let string_val = args.first().cloned().unwrap_or(Value::undefined());
+        let regexp_val = args.get(1).cloned().unwrap_or(Value::undefined());
 
         if string_val.as_string().is_none() {
-            return Err(VmError::type_error("assert.doesNotMatch: first argument must be a string"));
+            return Err(VmError::type_error(
+                "assert.doesNotMatch: first argument must be a string",
+            ));
         }
         if regexp_val.as_regex().is_none() {
-            return Err(VmError::type_error("assert.doesNotMatch: second argument must be a RegExp"));
+            return Err(VmError::type_error(
+                "assert.doesNotMatch: second argument must be a RegExp",
+            ));
         }
 
         // Call RegExp.prototype.test via ncx
@@ -366,7 +368,9 @@ impl Assert {
             .as_regex()
             .and_then(|r| r.object.get(&PropertyKey::string("test")))
             .or_else(|| {
-                regexp_val.as_object().and_then(|o| o.get(&PropertyKey::string("test")))
+                regexp_val
+                    .as_object()
+                    .and_then(|o| o.get(&PropertyKey::string("test")))
             });
 
         let matches = if let Some(test_fn) = test_method {
@@ -381,8 +385,14 @@ impl Assert {
         if !matches {
             Ok(Value::undefined())
         } else {
-            let pattern = regexp_val.as_regex().map(|r| r.pattern.clone()).unwrap_or_default();
-            let s = string_val.as_string().map(|s| s.as_str().to_string()).unwrap_or_default();
+            let pattern = regexp_val
+                .as_regex()
+                .map(|r| r.pattern.clone())
+                .unwrap_or_default();
+            let s = string_val
+                .as_string()
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_default();
             let msg = get_message(args, 2).unwrap_or_else(|| {
                 format!(
                     "The input was expected to not match the regular expression /{pattern}/. Input: '{s}'"
@@ -536,7 +546,16 @@ fn build_assert_function(ctx: &RegistrationContext, is_strict: bool) -> Value {
             let _ = fn_obj.set(PropertyKey::string("strict"), assert_fn_val.clone());
         } else {
             let strict_fn = build_assert_function(ctx, true);
-            let _ = fn_obj.set(PropertyKey::string("strict"), strict_fn);
+            let strict_ns = ctx.new_object();
+            let _ = strict_ns.set(PropertyKey::string("default"), strict_fn.clone());
+            if let Some(strict_obj) = strict_fn.as_object() {
+                for key in strict_obj.own_keys() {
+                    if let Some(val) = strict_obj.get(&key) {
+                        let _ = strict_ns.set(key, val);
+                    }
+                }
+            }
+            let _ = fn_obj.set(PropertyKey::string("strict"), Value::object(strict_ns));
         }
     }
 

@@ -248,6 +248,15 @@ impl<'a> NativeContext<'a> {
             .execute_generator(generator, self.ctx, sent_value)
     }
 
+    /// Execute a compiled module within this context.
+    ///
+    /// Used by `require()` to synchronously execute CJS modules.
+    /// Pushes a new frame, runs until completion, returns without
+    /// consuming outer call frames.
+    pub fn execute_module(&mut self, module: &Module) -> VmResult<Value> {
+        self.interpreter.execute_eval_module(self.ctx, module)
+    }
+
     /// Execute an eval-compiled module within this context.
     pub fn execute_eval_module(&mut self, module: &Module) -> VmResult<Value> {
         let interpreter = self.interpreter;

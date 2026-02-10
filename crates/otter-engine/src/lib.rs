@@ -151,8 +151,7 @@ pub use otter_vm_builtins::{
 
 // Re-export Node.js compatibility
 pub use otter_nodejs::{
-    NodeApiProfile, builtin_modules as nodejs_builtin_modules, create_nodejs_extension,
-    get_builtin_source as nodejs_get_builtin_source, is_builtin as nodejs_is_builtin,
+    NodeApiProfile, builtin_modules as nodejs_builtin_modules, is_builtin as nodejs_is_builtin,
 };
 
 // ============================================================================
@@ -311,16 +310,19 @@ impl EngineBuilder {
         match self.nodejs_profile {
             NodeApiProfile::None => {}
             NodeApiProfile::SafeCore => {
-                runtime
-                    .register_extension(otter_nodejs::create_nodejs_safe_extension())
-                    .expect("Failed to register Node.js safe extension");
                 runtime.register_module_provider(otter_nodejs::create_nodejs_safe_provider());
             }
             NodeApiProfile::Full => {
-                runtime
-                    .register_extension(create_nodejs_extension())
-                    .expect("Failed to register Node.js extension");
                 runtime.register_module_provider(otter_nodejs::create_nodejs_provider());
+            }
+        }
+
+        // Register native extensions for Node.js modules
+        if self.nodejs_profile != NodeApiProfile::None {
+            for ext in otter_nodejs::nodejs_extensions() {
+                runtime
+                    .register_native_extension(ext)
+                    .expect("Failed to register native extension");
             }
         }
 

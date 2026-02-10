@@ -165,6 +165,16 @@ impl Interpreter {
         ctx: &mut VmContext,
         result_promise: GcRef<JsPromise>,
     ) -> VmExecutionResult {
+        self.execute_with_suspension_and_locals(module, ctx, result_promise, None)
+    }
+
+    pub fn execute_with_suspension_and_locals(
+        &self,
+        module: Arc<Module>,
+        ctx: &mut VmContext,
+        result_promise: GcRef<JsPromise>,
+        initial_locals: Option<std::collections::HashMap<u16, Value>>,
+    ) -> VmExecutionResult {
         // Get entry function
         let entry_func = match module.entry_function() {
             Some(f) => f,
@@ -188,6 +198,13 @@ impl Interpreter {
             0,
         ) {
             return VmExecutionResult::Error(e.to_string());
+        }
+
+        // Populate initial locals if provided (import bindings)
+        if let Some(locals) = initial_locals {
+            for (idx, value) in locals {
+                let _ = ctx.set_local(idx, value);
+            }
         }
 
         ctx.set_running(true);
@@ -239,6 +256,49 @@ impl Interpreter {
         let closure = func
             .as_function()
             .ok_or_else(|| VmError::type_error("not a function"))?;
+
+        // Generator functions: create a generator object, don't execute the body
+        if closure.is_generator {
+            let realm_id = closure
+                .object
+                .get(&PropertyKey::string("__realm_id__"))
+                .and_then(|v| v.as_int32())
+                .map(|id| id as u32)
+                .unwrap_or_else(|| ctx.realm_id());
+            let proto = ctx
+                .realm_intrinsics(realm_id)
+                .map(|intrinsics| {
+                    if closure.is_async {
+                        intrinsics.async_generator_prototype
+                    } else {
+                        intrinsics.generator_prototype
+                    }
+                })
+                .or_else(|| {
+                    if closure.is_async {
+                        ctx.async_generator_prototype_intrinsic()
+                    } else {
+                        ctx.generator_prototype_intrinsic()
+                    }
+                });
+            let gen_obj = GcRef::new(JsObject::new(
+                proto.map(Value::object).unwrap_or_else(Value::null),
+                ctx.memory_manager().clone(),
+            ));
+            let generator = JsGenerator::new(
+                closure.function_index,
+                Arc::clone(&closure.module),
+                closure.upvalues.clone(),
+                args.to_vec(),
+                this_value,
+                false,
+                closure.is_async,
+                realm_id,
+                gen_obj,
+            );
+            generator.set_callee_value(func.clone());
+            return Ok(Value::generator(generator));
+        }
 
         // Save current state
         let was_running = ctx.is_running();
@@ -1274,6 +1334,8 @@ impl Interpreter {
             // ==================== Variables ====================
             Instruction::GetLocal { dst, idx } => {
                 let value = ctx.get_local(idx.0)?;
+
+
                 if std::env::var("OTTER_TRACE_ASSERT_GETLOCAL").is_ok() {
                     if let Some(frame) = ctx.current_frame() {
                         if let Some(func) = frame.module.function(frame.function_index) {
@@ -7549,6 +7611,17 @@ impl Interpreter {
         this_value: Value,
         args: &[Value],
     ) -> VmResult<Value> {
+        // Check __non_constructor flag (ES2023 §17: built-in methods are not constructors)
+        if let Some(func_obj) = func.as_object() {
+            if func_obj
+                .get(&crate::object::PropertyKey::string("__non_constructor"))
+                .and_then(|v| v.as_boolean())
+                == Some(true)
+            {
+                return Err(VmError::type_error("not a constructor"));
+            }
+        }
+
         // Check if it's a native function
         if let Some(native_fn) = func.as_native_function() {
             return self.call_native_fn_construct(ctx, native_fn, &this_value, args);
@@ -8050,19 +8123,7 @@ impl Interpreter {
             }
             "number" => {
                 if let Some(n) = value.as_number() {
-                    if n.is_nan() {
-                        "NaN".to_string()
-                    } else if n.is_infinite() {
-                        if n > 0.0 {
-                            "Infinity".to_string()
-                        } else {
-                            "-Infinity".to_string()
-                        }
-                    } else if n.fract() == 0.0 {
-                        format!("{}", n as i64)
-                    } else {
-                        format!("{}", n)
-                    }
+                    crate::globals::js_number_to_string(n)
                 } else {
                     "NaN".to_string()
                 }
@@ -8513,20 +8574,7 @@ impl Interpreter {
             return Ok(if b { "true" } else { "false" }.to_string());
         }
         if let Some(n) = value.as_number() {
-            if n.is_nan() {
-                return Ok("NaN".to_string());
-            }
-            if n.is_infinite() {
-                return Ok(if n > 0.0 {
-                    "Infinity".to_string()
-                } else {
-                    "-Infinity".to_string()
-                });
-            }
-            if n.fract() == 0.0 {
-                return Ok(format!("{}", n as i64));
-            }
-            return Ok(format!("{}", n));
+            return Ok(crate::globals::js_number_to_string(n));
         }
         if let Some(s) = value.as_string() {
             return Ok(s.as_str().to_string());

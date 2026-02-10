@@ -149,7 +149,7 @@ impl ModuleNamespace {
     }
 }
 
-fn namespace_to_object(namespace: &ModuleNamespace, mm: Arc<MemoryManager>) -> Value {
+pub fn namespace_to_object(namespace: &ModuleNamespace, mm: Arc<MemoryManager>) -> Value {
     let obj = GcRef::new(JsObject::new(Value::null(), mm));
     for (key, value) in namespace.entries() {
         let _ = obj.set(PropertyKey::string(&key), value);
@@ -188,6 +188,37 @@ impl LoadedModule {
             module_type,
             state: ModuleState::Unlinked,
             namespace: Arc::new(ModuleNamespace::new()),
+            import_bindings: HashMap::new(),
+        }
+    }
+
+    /// Create a pre-evaluated native module from a `GcRef<JsObject>` namespace.
+    ///
+    /// The module is immediately in `Evaluated` state — no bytecode execution needed.
+    /// Used by v2 extensions that provide fully native module implementations.
+    pub fn native(url: String, namespace_obj: GcRef<JsObject>) -> Self {
+        let namespace = ModuleNamespace::new();
+        // Copy all enumerable own properties from the namespace object into ModuleNamespace
+        for key in namespace_obj.own_keys() {
+            if let PropertyKey::String(s) = &key {
+                if let Some(val) = namespace_obj.get(&key) {
+                    namespace.set(s.as_str(), val);
+                }
+            }
+        }
+
+        // Also set "default" to the entire namespace object
+        namespace.set("default", Value::object(namespace_obj));
+
+        // Create a minimal empty bytecode module (never executed)
+        let bytecode = Module::builder(&url).is_esm(true).build();
+
+        Self {
+            url,
+            bytecode: Arc::new(bytecode),
+            module_type: ModuleType::ESM,
+            state: ModuleState::Evaluated,
+            namespace: Arc::new(namespace),
             import_bindings: HashMap::new(),
         }
     }
@@ -368,6 +399,9 @@ pub struct ModuleLoader {
     esm_resolver: Resolver,
     /// Resolver for CJS require() (uses require conditions)
     cjs_resolver: Resolver,
+    /// Native module namespaces from v2 extensions (specifier -> namespace object).
+    /// Checked first during load — instant, no compilation.
+    native_modules: RwLock<HashMap<String, GcRef<JsObject>>>,
 }
 
 impl ModuleLoader {
@@ -413,6 +447,7 @@ impl ModuleLoader {
             base_dir,
             esm_resolver: Resolver::new(esm_options),
             cjs_resolver: Resolver::new(cjs_options),
+            native_modules: RwLock::new(HashMap::new()),
         }
     }
 
@@ -449,13 +484,6 @@ impl ModuleLoader {
                 let global = ctx.global();
                 let captured = ctx.captured_exports();
 
-                println!(
-                    "Updating namespace for {}. Export count: {}. Captured: {}",
-                    url,
-                    exports.len(),
-                    captured.is_some()
-                );
-
                 for export_record in exports {
                     match export_record {
                         otter_vm_bytecode::module::ExportRecord::Named { local: _, exported } => {
@@ -491,20 +519,15 @@ impl ModuleLoader {
                         otter_vm_bytecode::module::ExportRecord::Default { local: _ } => {
                             // First check captured exports (for ESM)
                             if let Some(val) = captured.and_then(|c| c.get("default")) {
-                                println!("  Captured default export (from context)");
                                 guard.namespace.set("default", val.clone());
                             } else if let Some(val) = global.get(&"default".into()) {
-                                println!("  Captured default export (from global)");
                                 guard.namespace.set("default", val);
                             } else if let Some(val) = ctx
                                 .realm_global(ctx.realm_id())
                                 .and_then(|g| g.get(&"default".into()))
                             {
-                                println!("  Captured default export (from realm global)");
                                 guard.namespace.set("default", val);
-                            } else {
-                                println!("  FAILED to capture default export");
-                            }
+                            } 
                         }
                         _ => {}
                     }
@@ -521,6 +544,33 @@ impl ModuleLoader {
         if let Ok(mut providers) = self.providers.write() {
             providers.push(provider);
         }
+    }
+
+    /// Register a native module namespace from a v2 extension.
+    ///
+    /// Native modules are checked first during `load()` — they return a
+    /// pre-built `GcRef<JsObject>` namespace instantly, with no JS compilation.
+    pub fn register_native_module(&self, specifier: &str, namespace: GcRef<JsObject>) {
+        if let Ok(mut native) = self.native_modules.write() {
+            native.insert(specifier.to_string(), namespace);
+        }
+    }
+
+    /// Get a native module namespace, if one is registered for this specifier.
+    pub fn get_native_module(&self, specifier: &str) -> Option<GcRef<JsObject>> {
+        self.native_modules
+            .read()
+            .ok()
+            .and_then(|m| m.get(specifier).cloned())
+    }
+
+    /// Check if a specifier has a native module registered.
+    pub fn has_native_module(&self, specifier: &str) -> bool {
+        self.native_modules
+            .read()
+            .ok()
+            .map(|m| m.contains_key(specifier))
+            .unwrap_or(false)
     }
 
     /// Resolve a module specifier to an absolute path
@@ -652,6 +702,16 @@ impl ModuleLoader {
             .ok()
             .and_then(|m| m.get(&normalized_url).cloned())
         {
+            return Ok(module);
+        }
+
+        // 0. Check v2 native modules first — instant, no JS compilation
+        if let Some(namespace_obj) = self.get_native_module(&normalized_url) {
+            let loaded = LoadedModule::native(normalized_url.clone(), namespace_obj);
+            let module = Arc::new(RwLock::new(loaded));
+            if let Ok(mut modules) = self.modules.write() {
+                modules.insert(normalized_url.clone(), Arc::clone(&module));
+            }
             return Ok(module);
         }
 
@@ -1080,6 +1140,11 @@ try {{
     }
 
     /// Normalize URL/cache key so ESM/CJS graphs share one module instance.
+    /// Get the normalized URL key for a given URL.
+    pub fn normalize_url(&self, url: &str) -> String {
+        self.normalize_url_key(url)
+    }
+
     fn normalize_url_key(&self, url: &str) -> String {
         if url.starts_with("builtin://")
             || url.starts_with("otter:")

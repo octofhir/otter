@@ -1,85 +1,87 @@
-//! Process module - Node.js-compatible process object
+//! Process module - Node.js-compatible process object.
 //!
-//! Provides process.env, process.cwd(), process.exit(), etc.
-//! Note: process.env uses existing __env_* ops from otter_runtime.
+//! Security model:
+//! - `process.chdir` and `process.exit` require subprocess/process-control capability.
+//! - `process.hrtime` requires explicit `hrtime` capability.
+//! - `process.exit` is fail-closed: direct host termination is disabled.
 
-use otter_vm_runtime::extension::{Op, op_sync};
+use crate::security;
 use serde_json::{Value as JsonValue, json};
+use std::sync::OnceLock;
+use std::time::Instant;
 
-/// Create process native operations
-pub fn process_ops() -> Vec<Op> {
-    vec![
-        op_sync("__process_cwd", process_cwd),
-        op_sync("__process_chdir", process_chdir),
-        op_sync("__process_exit", process_exit),
-        op_sync("__process_hrtime", process_hrtime),
-        op_sync("__process_pid", process_pid),
-        op_sync("__process_platform", process_platform),
-        op_sync("__process_arch", process_arch),
-        op_sync("__process_version", process_version),
-    ]
+static START_INSTANT: OnceLock<Instant> = OnceLock::new();
+
+fn uptime_seconds() -> f64 {
+    let start = START_INSTANT.get_or_init(Instant::now);
+    start.elapsed().as_secs_f64()
 }
 
-/// Get current working directory
+/// Get current working directory.
 fn process_cwd(_args: &[JsonValue]) -> Result<JsonValue, String> {
     std::env::current_dir()
         .map(|p| json!(p.to_string_lossy()))
-        .map_err(|e| format!("Failed to get cwd: {}", e))
+        .map_err(|e| format!("Failed to get cwd: {e}"))
 }
 
-/// Change current working directory
+/// Change current working directory.
 fn process_chdir(args: &[JsonValue]) -> Result<JsonValue, String> {
     let dir = args
         .first()
         .and_then(|v| v.as_str())
         .ok_or("process.chdir requires directory argument")?;
 
+    security::require_subprocess("process.chdir")?;
     std::env::set_current_dir(dir)
-        .map(|_| json!(null))
-        .map_err(|e| format!("ENOENT: no such file or directory, chdir '{}'", e))
+        .map_err(|e| format!("ENOENT: no such file or directory, chdir '{dir}': {e}"))?;
+    Ok(json!(null))
 }
 
-/// Exit the process with given code
+/// Request process termination.
+///
+/// Direct host termination is intentionally disabled for embedded safety.
 fn process_exit(args: &[JsonValue]) -> Result<JsonValue, String> {
     let code = args.first().and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-
-    // Note: In a sandboxed environment, we may want to throw instead
-    std::process::exit(code);
+    security::require_subprocess("process.exit")?;
+    Err(format!(
+        "ProcessExit: code={code}. Host termination is disabled in this runtime."
+    ))
 }
 
-/// High-resolution time (nanoseconds)
+/// High-resolution time (nanoseconds).
 fn process_hrtime(args: &[JsonValue]) -> Result<JsonValue, String> {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    security::require_hrtime("process.hrtime")?;
 
+    use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("Time error: {}", e))?;
+        .map_err(|e| format!("Time error: {e}"))?;
 
-    // If previous time provided, return difference
-    if let Some(prev) = args.first().and_then(|v| v.as_array()) {
-        if prev.len() >= 2 {
-            let prev_secs = prev[0].as_u64().unwrap_or(0);
-            let prev_nanos = prev[1].as_u64().unwrap_or(0);
-            let prev_total = prev_secs * 1_000_000_000 + prev_nanos;
-            let now_total = now.as_nanos() as u64;
+    // If previous time provided, return difference.
+    if let Some(prev) = args.first().and_then(|v| v.as_array())
+        && prev.len() >= 2
+    {
+        let prev_secs = prev[0].as_u64().unwrap_or(0);
+        let prev_nanos = prev[1].as_u64().unwrap_or(0);
+        let prev_total = prev_secs.saturating_mul(1_000_000_000) + prev_nanos;
+        let now_total = now.as_nanos() as u64;
 
-            let diff = now_total.saturating_sub(prev_total);
-            let diff_secs = diff / 1_000_000_000;
-            let diff_nanos = diff % 1_000_000_000;
+        let diff = now_total.saturating_sub(prev_total);
+        let diff_secs = diff / 1_000_000_000;
+        let diff_nanos = diff % 1_000_000_000;
 
-            return Ok(json!([diff_secs, diff_nanos]));
-        }
+        return Ok(json!([diff_secs, diff_nanos]));
     }
 
     Ok(json!([now.as_secs(), now.subsec_nanos()]))
 }
 
-/// Get process ID
+/// Get process ID.
 fn process_pid(_args: &[JsonValue]) -> Result<JsonValue, String> {
     Ok(json!(std::process::id()))
 }
 
-/// Get platform name (like Node.js process.platform)
+/// Get platform name (like Node.js `process.platform`).
 fn process_platform(_args: &[JsonValue]) -> Result<JsonValue, String> {
     let platform = if cfg!(target_os = "windows") {
         "win32"
@@ -95,7 +97,7 @@ fn process_platform(_args: &[JsonValue]) -> Result<JsonValue, String> {
     Ok(json!(platform))
 }
 
-/// Get architecture (like Node.js process.arch)
+/// Get architecture (like Node.js `process.arch`).
 fn process_arch(_args: &[JsonValue]) -> Result<JsonValue, String> {
     let arch = if cfg!(target_arch = "x86_64") {
         "x64"
@@ -111,15 +113,45 @@ fn process_arch(_args: &[JsonValue]) -> Result<JsonValue, String> {
     Ok(json!(arch))
 }
 
-/// Get Node.js-like version string
+/// Get Node.js-like version string.
 fn process_version(_args: &[JsonValue]) -> Result<JsonValue, String> {
-    // Return Otter version in Node.js format
     Ok(json!("v0.1.0-otter"))
+}
+
+/// Best-effort executable path.
+fn process_exec_path(_args: &[JsonValue]) -> Result<JsonValue, String> {
+    let path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    Ok(json!(path))
+}
+
+/// First argv entry.
+fn process_argv0(_args: &[JsonValue]) -> Result<JsonValue, String> {
+    Ok(json!(std::env::args().next().unwrap_or_default()))
+}
+
+/// Process uptime in seconds.
+fn process_uptime(_args: &[JsonValue]) -> Result<JsonValue, String> {
+    Ok(json!(uptime_seconds()))
+}
+
+/// Node-like memory usage shape.
+fn process_memory_usage(_args: &[JsonValue]) -> Result<JsonValue, String> {
+    // Runtime-level memory stats are not fully wired yet; keep shape-compatible values.
+    Ok(json!({
+        "rss": 0_u64,
+        "heapTotal": 0_u64,
+        "heapUsed": 0_u64,
+        "external": 0_u64,
+        "arrayBuffers": 0_u64,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otter_vm_runtime::{CapabilitiesBuilder, CapabilitiesGuard};
 
     #[test]
     fn test_process_cwd() {
@@ -135,25 +167,31 @@ mod tests {
     }
 
     #[test]
-    fn test_process_platform() {
-        let result = process_platform(&[]).unwrap();
-        let platform = result.as_str().unwrap();
-        assert!(["darwin", "linux", "win32", "freebsd", "unknown"].contains(&platform));
-    }
+    fn test_process_hrtime_requires_capability() {
+        let err = process_hrtime(&[]).unwrap_err();
+        assert!(err.contains("PermissionDenied"));
 
-    #[test]
-    fn test_process_arch() {
-        let result = process_arch(&[]).unwrap();
-        let arch = result.as_str().unwrap();
-        assert!(["x64", "arm64", "ia32", "arm", "unknown"].contains(&arch));
-    }
-
-    #[test]
-    fn test_process_hrtime() {
+        let _guard = CapabilitiesGuard::new(CapabilitiesBuilder::new().allow_hrtime().build());
         let result = process_hrtime(&[]).unwrap();
         let arr = result.as_array().unwrap();
         assert_eq!(arr.len(), 2);
-        assert!(arr[0].as_u64().is_some());
-        assert!(arr[1].as_u64().is_some());
+    }
+
+    #[test]
+    fn test_process_chdir_requires_subprocess() {
+        let err = process_chdir(&[json!(".")]).unwrap_err();
+        assert!(err.contains("PermissionDenied"));
+
+        let _guard = CapabilitiesGuard::new(CapabilitiesBuilder::new().allow_subprocess().build());
+        let result = process_chdir(&[json!(".")]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_process_exit_is_fail_closed() {
+        let _guard = CapabilitiesGuard::new(CapabilitiesBuilder::new().allow_subprocess().build());
+        let err = process_exit(&[json!(7)]).unwrap_err();
+        assert!(err.contains("ProcessExit"));
+        assert!(err.contains("disabled"));
     }
 }

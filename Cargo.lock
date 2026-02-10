@@ -1900,12 +1900,11 @@ dependencies = [
 name = "otter-macros"
 version = "0.1.0"
 dependencies = [
+ "otter-vm-core",
+ "otter-vm-runtime",
  "proc-macro2",
  "quote",
- "serde",
- "serde_json",
  "syn",
- "tokio",
 ]
 
 [[package]]
@@ -2077,6 +2076,7 @@ dependencies = [
  "indexmap",
  "num-bigint",
  "num-traits",
+ "otter-macros",
  "otter-profiler",
  "otter-vm-bytecode",
  "otter-vm-gc",

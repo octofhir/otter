@@ -1484,7 +1484,7 @@ impl Intrinsics {
         // Math namespace (extracted to intrinsics_impl/math.rs)
         // All Math methods are implemented natively in Rust using std::f64
         // ====================================================================
-        crate::intrinsics_impl::math::install_math_namespace(global, mm);
+        crate::intrinsics_impl::math::install_math_namespace(global, mm, self.object_prototype);
 
         // ====================================================================
         // Reflect namespace (extracted to intrinsics_impl/reflect.rs)

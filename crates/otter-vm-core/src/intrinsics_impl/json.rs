@@ -208,37 +208,13 @@ fn format_number(n: f64) -> String {
     if n.is_nan() || n.is_infinite() {
         return "null".to_string();
     }
-    // Check if it's a whole number within safe integer range
-    if n.fract() == 0.0 && n.abs() < 9007199254740992.0 {
-        format!("{}", n as i64)
-    } else {
-        format!("{}", n)
-    }
+    // JSON uses JS Number::toString for number serialization
+    crate::globals::js_number_to_string(n)
 }
 
 /// Format a number as a property key (JavaScript ToString semantics)
-/// Unlike JSON serialization, ToString preserves NaN, Infinity, -Infinity
 fn number_to_property_key(n: f64) -> String {
-    if n.is_nan() {
-        return "NaN".to_string();
-    }
-    if n.is_infinite() {
-        return if n.is_sign_positive() {
-            "Infinity".to_string()
-        } else {
-            "-Infinity".to_string()
-        };
-    }
-    // Handle -0 specially (becomes "0")
-    if n == 0.0 {
-        return "0".to_string();
-    }
-    // Check if it's a whole number within safe integer range
-    if n.fract() == 0.0 && n.abs() < 9007199254740992.0 {
-        format!("{}", n as i64)
-    } else {
-        format!("{}", n)
-    }
+    crate::globals::js_number_to_string(n)
 }
 
 /// Format an array with optional indentation

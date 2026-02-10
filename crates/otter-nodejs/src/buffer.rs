@@ -2,21 +2,10 @@
 //!
 //! Provides the Buffer class wrapping Uint8Array with encoding support.
 
-use otter_vm_runtime::extension::{Op, op_sync};
 use serde_json::{Value as JsonValue, json};
 
-/// Create Buffer native operations
-pub fn buffer_ops() -> Vec<Op> {
-    vec![
-        op_sync("__buffer_alloc", buffer_alloc),
-        op_sync("__buffer_from_string", buffer_from_string),
-        op_sync("__buffer_to_string", buffer_to_string),
-        op_sync("__buffer_byte_length", buffer_byte_length),
-    ]
-}
-
 /// Allocate a new buffer of given size, optionally filled with a value
-fn buffer_alloc(args: &[JsonValue]) -> Result<JsonValue, String> {
+pub fn buffer_alloc(args: &[JsonValue]) -> Result<JsonValue, String> {
     let size = args
         .first()
         .and_then(|v| v.as_u64())
@@ -24,13 +13,12 @@ fn buffer_alloc(args: &[JsonValue]) -> Result<JsonValue, String> {
 
     let fill = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u8;
 
-    // Return array of bytes
     let bytes: Vec<u8> = vec![fill; size as usize];
     Ok(json!(bytes))
 }
 
 /// Create buffer from string with encoding
-fn buffer_from_string(args: &[JsonValue]) -> Result<JsonValue, String> {
+pub fn buffer_from_string(args: &[JsonValue]) -> Result<JsonValue, String> {
     let string = args
         .first()
         .and_then(|v| v.as_str())
@@ -52,7 +40,7 @@ fn buffer_from_string(args: &[JsonValue]) -> Result<JsonValue, String> {
 }
 
 /// Convert buffer to string with encoding
-fn buffer_to_string(args: &[JsonValue]) -> Result<JsonValue, String> {
+pub fn buffer_to_string(args: &[JsonValue]) -> Result<JsonValue, String> {
     let bytes: Vec<u8> = args
         .first()
         .and_then(|v| v.as_array())
@@ -78,7 +66,7 @@ fn buffer_to_string(args: &[JsonValue]) -> Result<JsonValue, String> {
 }
 
 /// Get byte length of string in given encoding
-fn buffer_byte_length(args: &[JsonValue]) -> Result<JsonValue, String> {
+pub fn buffer_byte_length(args: &[JsonValue]) -> Result<JsonValue, String> {
     let string = args
         .first()
         .and_then(|v| v.as_str())
@@ -89,7 +77,7 @@ fn buffer_byte_length(args: &[JsonValue]) -> Result<JsonValue, String> {
     let len = match encoding {
         "utf8" | "utf-8" => string.len(),
         "hex" => string.len() / 2,
-        "base64" => (string.len() * 3) / 4, // Approximate
+        "base64" => (string.len() * 3) / 4,
         "latin1" | "binary" | "ascii" => string.len(),
         _ => return Err(format!("Unknown encoding: {}", encoding)),
     };
@@ -139,7 +127,7 @@ mod tests {
     #[test]
     fn test_buffer_from_string_hex() {
         let result = buffer_from_string(&[json!("48656c6c6f"), json!("hex")]).unwrap();
-        assert_eq!(result, json!([72, 101, 108, 108, 111])); // "Hello"
+        assert_eq!(result, json!([72, 101, 108, 108, 111]));
     }
 
     #[test]

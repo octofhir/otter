@@ -2,27 +2,8 @@
 //!
 //! Pure path utilities, no I/O.
 
-use otter_vm_runtime::extension::{Op, op_sync};
 use serde_json::{Value as JsonValue, json};
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
-
-/// Create path native operations
-pub fn path_ops() -> Vec<Op> {
-    vec![
-        op_sync("__path_join", path_join),
-        op_sync("__path_resolve", path_resolve),
-        op_sync("__path_dirname", path_dirname),
-        op_sync("__path_basename", path_basename),
-        op_sync("__path_extname", path_extname),
-        op_sync("__path_normalize", path_normalize),
-        op_sync("__path_is_absolute", path_is_absolute),
-        op_sync("__path_parse", path_parse),
-        op_sync("__path_format", path_format),
-        op_sync("__path_relative", path_relative),
-        op_sync("__path_sep", path_sep),
-        op_sync("__path_delimiter", path_delimiter),
-    ]
-}
 
 /// Join path segments
 fn path_join(args: &[JsonValue]) -> Result<JsonValue, String> {
@@ -201,23 +182,23 @@ fn path_format(args: &[JsonValue]) -> Result<JsonValue, String> {
     let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let ext = obj.get("ext").and_then(|v| v.as_str()).unwrap_or("");
 
-    let base_part = base.unwrap_or_else(|| {
-        if ext.is_empty() {
-            name
-        } else {
-            // name + ext
-            return "";
-        }
-    });
+    let base_part = base
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{name}{ext}"));
 
     let result = if let Some(dir) = dir {
         if dir.is_empty() {
-            base_part.to_string()
+            base_part
         } else {
-            format!("{}{}{}", dir, MAIN_SEPARATOR, base_part)
+            let ends_with_sep = dir.ends_with(MAIN_SEPARATOR);
+            if ends_with_sep {
+                format!("{dir}{base_part}")
+            } else {
+                format!("{dir}{MAIN_SEPARATOR}{base_part}")
+            }
         }
     } else {
-        format!("{}{}", root, base_part)
+        format!("{root}{base_part}")
     };
 
     Ok(json!(result))
@@ -235,17 +216,49 @@ fn path_relative(args: &[JsonValue]) -> Result<JsonValue, String> {
         .and_then(|v| v.as_str())
         .ok_or("relative requires to argument")?;
 
-    let from_path = Path::new(from);
-    let to_path = Path::new(to);
+    let normalize = |p: &str| -> PathBuf {
+        let input = Path::new(p);
+        let base = if input.is_absolute() {
+            input.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(input)
+        };
+        dunce::canonicalize(&base).unwrap_or(base)
+    };
 
-    // Simple relative path calculation
-    if let Ok(rel) = to_path.strip_prefix(from_path) {
-        return Ok(json!(rel.to_string_lossy()));
+    let from_path = normalize(from);
+    let to_path = normalize(to);
+
+    let from_components: Vec<_> = from_path.components().collect();
+    let to_components: Vec<_> = to_path.components().collect();
+
+    let mut common = 0usize;
+    while common < from_components.len()
+        && common < to_components.len()
+        && from_components[common] == to_components[common]
+    {
+        common += 1;
     }
 
-    // More complex: need to go up and then down
-    // For now, just return the 'to' path
-    Ok(json!(to))
+    if common == 0 {
+        return Ok(json!(to));
+    }
+
+    let mut rel = PathBuf::new();
+    for _ in common..from_components.len() {
+        rel.push("..");
+    }
+    for component in to_components.iter().skip(common) {
+        rel.push(component.as_os_str());
+    }
+
+    if rel.as_os_str().is_empty() {
+        Ok(json!(""))
+    } else {
+        Ok(json!(rel.to_string_lossy()))
+    }
 }
 
 /// Get path separator

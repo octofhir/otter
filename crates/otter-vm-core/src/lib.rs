@@ -13,10 +13,15 @@
 // Allow unsafe for NaN-boxing and GC operations
 // All unsafe code must have SAFETY comments
 
+// Self-import so that proc macros (e.g. #[dive]) can use `otter_vm_core::` paths
+// when invoked inside this crate.
+extern crate self as otter_vm_core;
+
 pub mod array_buffer;
 pub mod async_context;
 pub mod builtin_builder;
 pub mod context;
+pub mod convert;
 pub mod data_view;
 pub mod drop_guard;
 pub mod error;
@@ -74,3 +79,5 @@ pub use structured_clone::{StructuredCloneError, StructuredCloner, structured_cl
 pub use trace::{TraceConfig, TraceEntry, TraceMode, TraceRingBuffer, TraceState};
 pub use typed_array::{JsTypedArray, TypedArrayKind};
 pub use value::{NativeFn, Symbol, Value};
+
+pub use convert::{FromValue, IntoValue};

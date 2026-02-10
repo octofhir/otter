@@ -3,11 +3,9 @@
 #![allow(dead_code)]
 
 use otter_macros::{js_class, js_constructor, js_getter, js_method};
-use serde::{Deserialize, Serialize};
 
 // Test struct with custom name and field attributes
 #[js_class(name = "Counter")]
-#[derive(Serialize, Deserialize)]
 pub struct Counter {
     #[js_readonly]
     pub value: i32,
@@ -89,23 +87,6 @@ fn test_js_getters() {
 }
 
 #[test]
-fn test_generated_getters() {
-    let counter = Counter::new(10);
-    let value = counter.js_get_value();
-    assert_eq!(value, serde_json::json!(10));
-
-    let multiplier = counter.js_get_multiplier();
-    assert_eq!(multiplier, serde_json::json!(1));
-}
-
-#[test]
-fn test_generated_setters() {
-    let mut counter = Counter::new(10);
-    counter.js_set_multiplier(serde_json::json!(5));
-    assert_eq!(counter.multiplier, 5);
-}
-
-#[test]
 fn test_original_methods_work() {
     let mut counter = Counter::new(0);
     counter.increment();
@@ -117,7 +98,6 @@ fn test_original_methods_work() {
 
 // Test struct with default name (struct name)
 #[js_class]
-#[derive(Serialize, Deserialize)]
 pub struct Point {
     pub x: f64,
     pub y: f64,

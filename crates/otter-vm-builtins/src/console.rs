@@ -335,17 +335,7 @@ fn format_value(value: &Value) -> String {
     } else if let Some(b) = value.as_boolean() {
         b.to_string()
     } else if let Some(n) = value.as_number() {
-        if n.is_nan() {
-            "NaN".to_string()
-        } else if n.is_infinite() {
-            if n.is_sign_positive() {
-                "Infinity".to_string()
-            } else {
-                "-Infinity".to_string()
-            }
-        } else {
-            n.to_string()
-        }
+        otter_vm_core::globals::js_number_to_string(n)
     } else if let Some(n) = value.as_int32() {
         n.to_string()
     } else if let Some(s) = value.as_string() {

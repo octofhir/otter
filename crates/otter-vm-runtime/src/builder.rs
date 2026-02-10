@@ -43,6 +43,7 @@ use crate::otter_runtime::Otter;
 /// ```
 pub struct OtterBuilder {
     extensions: Vec<Extension>,
+    native_extensions: Vec<Box<dyn crate::extension_v2::OtterExtension>>,
     with_http: bool,
     env_store: Option<Arc<IsolatedEnvStore>>,
     capabilities: Option<Capabilities>,
@@ -53,6 +54,7 @@ impl OtterBuilder {
     pub fn new() -> Self {
         Self {
             extensions: Vec::new(),
+            native_extensions: Vec::new(),
             with_http: false,
             env_store: None,
             capabilities: None,
@@ -115,11 +117,17 @@ impl OtterBuilder {
         self
     }
 
-    /// Add a custom extension
+    /// Add a custom extension (v1 — JSON ops + JS shims).
     ///
     /// Extensions allow adding native Rust functionality callable from JavaScript.
     pub fn extension(mut self, ext: Extension) -> Self {
         self.extensions.push(ext);
+        self
+    }
+
+    /// Add a native extension.
+    pub fn native_extension(mut self, ext: Box<dyn crate::extension_v2::OtterExtension>) -> Self {
+        self.native_extensions.push(ext);
         self
     }
 
@@ -142,11 +150,18 @@ impl OtterBuilder {
         // or manually register via:
         //   runtime.register_extension(otter_vm_builtins::create_builtins_extension())
 
-        // Register custom extensions
+        // Register custom extensions (v1)
         for ext in self.extensions {
             runtime
                 .register_extension(ext)
                 .expect("Failed to register extension");
+        }
+
+        // Register v2 native extensions
+        for ext in self.native_extensions {
+            runtime
+                .register_native_extension(ext)
+                .expect("Failed to register v2 extension");
         }
 
         runtime

@@ -34,10 +34,7 @@ fn value_to_sort_string(val: &Value) -> String {
         return s.as_str().to_string();
     }
     if let Some(n) = val.as_number() {
-        if n.fract() == 0.0 && n.abs() < 1e15 {
-            return format!("{}", n as i64);
-        }
-        return format!("{}", n);
+        return crate::globals::js_number_to_string(n);
     }
     if let Some(b) = val.as_boolean() {
         return if b { "true" } else { "false" }.to_string();

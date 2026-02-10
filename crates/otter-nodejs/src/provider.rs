@@ -3,13 +3,14 @@
 //! Implements [`ModuleProvider`] to handle `node:` protocol imports
 //! and bare Node.js module specifiers (e.g., `fs`, `path`).
 
-use crate::{NodeApiProfile, get_builtin_source_for_profile, is_builtin_for_profile};
+use crate::{NodeApiProfile, is_builtin_for_profile};
 use otter_vm_runtime::module_provider::ModuleType;
-use otter_vm_runtime::{MediaType, ModuleProvider, ModuleResolution, ModuleSource};
+use otter_vm_runtime::{ModuleProvider, ModuleResolution};
 
 /// Provider for Node.js built-in modules.
 ///
 /// Handles both prefixed (`node:fs`) and bare (`fs`) specifiers.
+/// All modules are now native — no JS source loading.
 pub struct NodeModuleProvider {
     profile: NodeApiProfile,
 }
@@ -26,10 +27,8 @@ impl ModuleProvider for NodeModuleProvider {
     }
 
     fn resolve(&self, specifier: &str, _referrer: &str) -> Option<ModuleResolution> {
-        // Handle "node:fs" -> "fs"
         let name = specifier.strip_prefix("node:").unwrap_or(specifier);
 
-        // Check if it's a known Node.js builtin
         if is_builtin_for_profile(name, self.profile) {
             return Some(ModuleResolution {
                 url: format!("builtin://node:{}", name),
@@ -37,31 +36,16 @@ impl ModuleProvider for NodeModuleProvider {
             });
         }
 
-        None // Not a Node builtin, delegate to next provider
+        None
     }
 
-    fn load(&self, url: &str) -> Option<ModuleSource> {
-        // Handle "builtin://node:fs" -> "fs"
-        let name = url.strip_prefix("builtin://node:")?;
-
-        // Get the source code for this builtin
-        let code = get_builtin_source_for_profile(name, self.profile)?;
-
-        Some(ModuleSource {
-            code: code.to_string(),
-            media_type: MediaType::JavaScript,
-        })
+    fn load(&self, _url: &str) -> Option<otter_vm_runtime::ModuleSource> {
+        // All Node.js modules are now native extensions — no JS source to load.
+        None
     }
 }
 
 /// Create a Node.js module provider.
-///
-/// Use this to register Node.js built-in module support with the module loader:
-///
-/// ```ignore
-/// let provider = create_nodejs_provider();
-/// module_loader.register_provider(provider);
-/// ```
 pub fn create_nodejs_provider() -> std::sync::Arc<dyn ModuleProvider> {
     create_nodejs_provider_for_profile(NodeApiProfile::Full)
 }
@@ -85,8 +69,6 @@ mod tests {
     #[test]
     fn test_resolve_prefixed() {
         let provider = NodeModuleProvider::new(NodeApiProfile::Full);
-
-        // Should resolve "node:fs"
         let res = provider.resolve("node:fs", "");
         assert!(res.is_some());
         assert_eq!(res.unwrap().url, "builtin://node:fs");
@@ -95,8 +77,6 @@ mod tests {
     #[test]
     fn test_resolve_bare() {
         let provider = NodeModuleProvider::new(NodeApiProfile::Full);
-
-        // Should resolve "path" (bare specifier)
         let res = provider.resolve("path", "");
         assert!(res.is_some());
         assert_eq!(res.unwrap().url, "builtin://node:path");
@@ -106,7 +86,6 @@ mod tests {
     fn test_resolve_unknown() {
         let provider = NodeModuleProvider::new(NodeApiProfile::Full);
 
-        // Should NOT resolve unknown modules
         let res = provider.resolve("./local_file.js", "");
         assert!(res.is_none());
 
@@ -115,13 +94,11 @@ mod tests {
     }
 
     #[test]
-    fn test_load() {
+    fn test_load_returns_none_for_native_modules() {
         let provider = NodeModuleProvider::new(NodeApiProfile::Full);
-
-        // Should load "builtin://node:path"
-        let source = provider.load("builtin://node:path");
-        assert!(source.is_some());
-        assert!(source.unwrap().code.contains("export"));
+        // All modules are native now — load always returns None
+        assert!(provider.load("builtin://node:path").is_none());
+        assert!(provider.load("builtin://node:fs").is_none());
     }
 
     #[test]

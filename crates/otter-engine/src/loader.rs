@@ -5,7 +5,7 @@
 //! - `https://` URLs for remote modules (with allowlist-based security)
 
 use crate::error::{EngineError, EngineResult};
-use otter_nodejs::{NodeApiProfile, get_builtin_source_for_profile, is_builtin_for_profile};
+use otter_nodejs::{NodeApiProfile, get_builtin_entry_for_profile, is_builtin_for_profile};
 use oxc_resolver::{ResolveOptions, Resolver};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -436,10 +436,13 @@ impl ModuleLoader {
         })
     }
 
-    /// Load a Node.js built-in module source from otter-nodejs.
+    /// Load a Node.js built-in module.
+    ///
+    /// All Node.js modules are now native extensions — returns empty source
+    /// so the module loader knows the specifier is valid.
     fn load_node_builtin(&self, name: &str) -> EngineResult<ResolvedModule> {
-        let source = get_builtin_source_for_profile(name, self.config.node_api_profile)
-            .ok_or_else(|| {
+        let _entry =
+            get_builtin_entry_for_profile(name, self.config.node_api_profile).ok_or_else(|| {
                 EngineError::ModuleError(format!(
                     "Node.js built-in module '{}' is unavailable for profile {:?}",
                     name, self.config.node_api_profile
@@ -449,7 +452,7 @@ impl ModuleLoader {
         Ok(ResolvedModule {
             specifier: format!("node:{}", name),
             url: format!("builtin://node:{}", name),
-            source: source.to_string(),
+            source: String::new(),
             source_type: SourceType::JavaScript,
             module_type: ModuleType::ESM,
         })

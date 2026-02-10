@@ -1,93 +1,140 @@
-//! Integration tests for the #[dive] macro
+//! Integration tests for the #[dive] macro (native-first)
 
 #![allow(dead_code)]
 
 use otter_macros::dive;
+use otter_vm_core::context::NativeContext;
+use otter_vm_core::error::VmError;
+use otter_vm_core::value::Value;
+use std::sync::Arc;
 
-// Test basic sync dive
-#[dive(swift)]
-fn add(a: i32, b: i32) -> i32 {
+// ---------------------------------------------------------------------------
+// Pattern C: Typed params via FromValue/IntoValue
+// ---------------------------------------------------------------------------
+
+#[dive(name = "abs", length = 1)]
+fn math_abs(x: f64) -> f64 {
+    x.abs()
+}
+
+#[dive(name = "add", length = 2)]
+fn math_add(a: i32, b: i32) -> i32 {
     a + b
 }
 
-// Test custom name
-#[dive(swift, name = "custom_multiply")]
-fn multiply(a: i32, b: i32) -> i32 {
-    a * b
-}
-
-// Test Result return type
-#[dive(swift)]
-fn divide(a: f64, b: f64) -> Result<f64, String> {
-    if b == 0.0 {
-        Err("Division by zero".to_string())
-    } else {
-        Ok(a / b)
-    }
-}
-
-// Test no arguments
-#[dive(swift)]
-fn get_answer() -> i32 {
-    42
-}
-
-// Test string arguments
-#[dive(swift)]
+#[dive(name = "greet", length = 1)]
 fn greet(name: String) -> String {
     format!("Hello, {}!", name)
 }
 
+#[dive(name = "isPositive", length = 1)]
+fn is_positive(x: f64) -> bool {
+    x > 0.0
+}
+
+#[dive(name = "noop", length = 0)]
+fn noop() {}
+
+// ---------------------------------------------------------------------------
+// Pattern A: Full native signature
+// ---------------------------------------------------------------------------
+
+#[dive(name = "fullNative", length = 1)]
+fn full_native(
+    _this: &Value,
+    args: &[Value],
+    _ncx: &mut NativeContext,
+) -> Result<Value, VmError> {
+    let x = args
+        .first()
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
+    Ok(Value::number(x * 2.0))
+}
+
+// ---------------------------------------------------------------------------
+// Pattern B: Args + NativeContext
+// ---------------------------------------------------------------------------
+
+#[dive(name = "sumArgs", length = 0)]
+fn sum_args(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
+    let sum: f64 = args
+        .iter()
+        .filter_map(|v| v.as_number())
+        .sum();
+    Ok(Value::number(sum))
+}
+
+// ---------------------------------------------------------------------------
+// Tests: generated constants
+// ---------------------------------------------------------------------------
+
 #[test]
-fn test_dive_add() {
-    let result = __otter_dive_add(&[serde_json::json!(5), serde_json::json!(3)]).unwrap();
-    assert_eq!(result, serde_json::json!(8));
+fn test_name_constants() {
+    assert_eq!(MATH_ABS_NAME, "abs");
+    assert_eq!(MATH_ADD_NAME, "add");
+    assert_eq!(GREET_NAME, "greet");
+    assert_eq!(FULL_NATIVE_NAME, "fullNative");
+    assert_eq!(SUM_ARGS_NAME, "sumArgs");
+    assert_eq!(IS_POSITIVE_NAME, "isPositive");
+    assert_eq!(NOOP_NAME, "noop");
 }
 
 #[test]
-fn test_dive_custom_name() {
-    assert_eq!(add::NAME, "add");
-    const { assert!(!add::IS_ASYNC) };
+fn test_length_constants() {
+    assert_eq!(MATH_ABS_LENGTH, 1);
+    assert_eq!(MATH_ADD_LENGTH, 2);
+    assert_eq!(GREET_LENGTH, 1);
+    assert_eq!(FULL_NATIVE_LENGTH, 1);
+    assert_eq!(SUM_ARGS_LENGTH, 0);
+    assert_eq!(IS_POSITIVE_LENGTH, 1);
+    assert_eq!(NOOP_LENGTH, 0);
+}
 
-    assert_eq!(multiply::NAME, "custom_multiply");
-    const { assert!(!multiply::IS_ASYNC) };
+// ---------------------------------------------------------------------------
+// Tests: generated functions exist and return correct types
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_native_fn_returns_arc() {
+    // Just verify these compile and return the right type
+    let _: Arc<
+        dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+    > = math_abs_native_fn();
+
+    let _: Arc<
+        dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+    > = full_native_native_fn();
+
+    let _: Arc<
+        dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
+    > = sum_args_native_fn();
 }
 
 #[test]
-fn test_dive_multiply() {
-    let result = __otter_dive_multiply(&[serde_json::json!(4), serde_json::json!(7)]).unwrap();
-    assert_eq!(result, serde_json::json!(28));
+fn test_decl_fn_returns_tuple() {
+    let (name, _native_fn, length) = math_abs_decl();
+    assert_eq!(name, "abs");
+    assert_eq!(length, 1);
+
+    let (name, _native_fn, length) = math_add_decl();
+    assert_eq!(name, "add");
+    assert_eq!(length, 2);
+
+    let (name, _native_fn, length) = full_native_decl();
+    assert_eq!(name, "fullNative");
+    assert_eq!(length, 1);
 }
 
-#[test]
-fn test_dive_result_ok() {
-    let result = __otter_dive_divide(&[serde_json::json!(10.0), serde_json::json!(2.0)]).unwrap();
-    assert_eq!(result, serde_json::json!(5.0));
-}
+// ---------------------------------------------------------------------------
+// Tests: original functions still work
+// ---------------------------------------------------------------------------
 
 #[test]
-fn test_dive_result_err() {
-    let result = __otter_dive_divide(&[serde_json::json!(10.0), serde_json::json!(0.0)]);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("Division by zero"));
-}
-
-#[test]
-fn test_dive_no_args() {
-    let result = __otter_dive_get_answer(&[]).unwrap();
-    assert_eq!(result, serde_json::json!(42));
-}
-
-#[test]
-fn test_dive_string() {
-    let result = __otter_dive_greet(&[serde_json::json!("World")]).unwrap();
-    assert_eq!(result, serde_json::json!("Hello, World!"));
-}
-
-#[test]
-fn test_original_function_still_works() {
-    // The original function should still be callable
-    assert_eq!(add(2, 3), 5);
-    assert_eq!(multiply(3, 4), 12);
-    assert_eq!(divide(10.0, 2.0).unwrap(), 5.0);
+fn test_original_functions() {
+    assert_eq!(math_abs(-5.0), 5.0);
+    assert_eq!(math_add(2, 3), 5);
+    assert_eq!(greet("World".to_string()), "Hello, World!");
+    assert!(is_positive(1.0));
+    assert!(!is_positive(-1.0));
 }

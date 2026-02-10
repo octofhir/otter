@@ -48,12 +48,7 @@ fn this_string_value(this_val: &Value) -> Result<GcRef<JsString>, String> {
     }
     // Number/boolean coercion
     if let Some(n) = this_val.as_number() {
-        let s = if n.fract() == 0.0 && n.abs() < 1e15 {
-            format!("{}", n as i64)
-        } else {
-            format!("{}", n)
-        };
-        return Ok(JsString::intern(&s));
+        return Ok(JsString::intern(&crate::globals::js_number_to_string(n)));
     }
     if let Some(b) = this_val.as_boolean() {
         return Ok(JsString::intern(if b { "true" } else { "false" }));

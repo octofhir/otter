@@ -16,11 +16,14 @@ pub mod capabilities_context;
 pub mod env_store;
 pub mod event_loop;
 pub mod extension;
+pub mod extension_state;
+pub mod extension_v2;
 pub mod microtask;
 pub mod module_loader;
 pub mod module_provider;
 pub mod otter_runtime;
 pub mod promise;
+pub mod registration;
 pub mod timer;
 pub mod worker;
 
@@ -39,6 +42,11 @@ pub use module_provider::{
     MediaType, ModuleProvider, ModuleResolution, ModuleSource, ModuleType, ProviderRegistry,
 };
 pub use otter_runtime::{Otter, OtterError};
+
+// Native extension system
+pub use extension_state::ExtensionState;
+pub use extension_v2::{NativeExtensionRegistry, OtterExtension, Profile};
+pub use registration::{ModuleNamespaceBuilder, RegistrationContext};
 
 // Legacy alias for backwards compatibility
 #[deprecated(since = "0.2.0", note = "Renamed to Otter")]

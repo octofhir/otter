@@ -77,8 +77,12 @@ pub struct Otter {
     event_loop: Arc<EventLoop>,
     /// Module loader for resolving and loading ES modules
     loader: Arc<crate::module_loader::ModuleLoader>,
-    /// Extension registry
+    /// Extension registry (v1 — JSON ops + JS shims)
     extensions: ExtensionRegistry,
+    /// Extension registry (v2 — native-first, no JS shims)
+    native_extensions: crate::extension_v2::NativeExtensionRegistry,
+    /// Per-extension typed state storage
+    extension_state: crate::extension_state::ExtensionState,
     /// HTTP events sender (for HTTP extension to use)
     http_tx: mpsc::UnboundedSender<HttpEvent>,
     /// HTTP events receiver (moves to event loop on first eval)
@@ -124,6 +128,8 @@ impl Otter {
                 std::env::current_dir().unwrap_or_default(),
             )),
             extensions: ExtensionRegistry::new(),
+            native_extensions: crate::extension_v2::NativeExtensionRegistry::new(),
+            extension_state: crate::extension_state::ExtensionState::new(),
             http_tx,
             http_rx: Some(http_rx),
             ws_tx,
@@ -228,6 +234,32 @@ impl Otter {
         self.extensions.register(ext)
     }
 
+    /// Register a v2 native extension.
+    ///
+    /// V2 extensions use `OtterExtension` trait and register native functions
+    /// directly without JS shims or JSON serde.
+    pub fn register_native_extension(
+        &mut self,
+        ext: Box<dyn crate::extension_v2::OtterExtension>,
+    ) -> Result<(), String> {
+        self.native_extensions.register(ext)
+    }
+
+    /// Get the v2 extension registry.
+    pub fn native_extensions(&self) -> &crate::extension_v2::NativeExtensionRegistry {
+        &self.native_extensions
+    }
+
+    /// Get the extension state.
+    pub fn extension_state(&self) -> &crate::extension_state::ExtensionState {
+        &self.extension_state
+    }
+
+    /// Get the extension state mutably.
+    pub fn extension_state_mut(&mut self) -> &mut crate::extension_state::ExtensionState {
+        &mut self.extension_state
+    }
+
     /// Pre-compile all registered extensions to speed up initialization
     pub fn compile_extensions(&mut self) -> Result<(), String> {
         self.extensions.pre_compile_all()
@@ -326,6 +358,9 @@ impl Otter {
         // 4. Register extension ops as global native functions
         self.register_ops_in_context(&mut ctx);
 
+        // 4b. Bootstrap v2 native extensions (no JS compilation needed)
+        self.bootstrap_native_extensions(&ctx)?;
+
         // 5. Execute setup JS from extensions (using pre-compiled modules if available)
         let compiled_modules = self.extensions.all_compiled_js();
         if !compiled_modules.is_empty() {
@@ -371,15 +406,24 @@ impl Otter {
         };
 
         // Execute all dependencies first (excluding main)
+        let normalized_main_url = self.loader.normalize_url(main_url);
         for url in &order {
-            if url == main_url {
+            if url == main_url || url == &normalized_main_url {
                 continue;
             }
             let m = self.loader.get(url).unwrap();
-            let bytecode = {
+            let (bytecode, already_evaluated) = {
                 let guard = m.read().unwrap();
-                Arc::clone(&guard.bytecode)
+                (
+                    Arc::clone(&guard.bytecode),
+                    guard.state == crate::module_loader::ModuleState::Evaluated,
+                )
             };
+
+            // Skip native modules that are already evaluated (v2 extensions)
+            if already_evaluated {
+                continue;
+            }
 
             // Execute dependency module
             if let Err(e) = self.vm.execute_module_with_context(&bytecode, &mut ctx) {
@@ -390,9 +434,17 @@ impl Otter {
             self.loader.update_namespace(url, &ctx);
         }
 
+        // Resolve imports for the main module
+        let initial_locals = self.resolve_module_imports(&bytecode, main_url)?;
+        let locals_opt = if initial_locals.is_empty() {
+            None
+        } else {
+            Some(initial_locals)
+        };
+
         // Now execute the main module with suspension support
         let result_promise = JsPromise::new();
-        let mut exec_result = self.execute_with_suspension(&mut ctx, bytecode, result_promise)?;
+        let mut exec_result = self.execute_with_suspension(&mut ctx, bytecode, result_promise, locals_opt)?;
 
         // After main execution starts, we might need a way to update its namespace too if it's imported elsewhere,
         // but for high-level eval it's usually the end of the chain.
@@ -574,9 +626,10 @@ impl Otter {
         ctx: &mut VmContext,
         module: Arc<otter_vm_bytecode::Module>,
         result_promise: GcRef<JsPromise>,
+        initial_locals: Option<HashMap<u16, Value>>,
     ) -> Result<VmExecutionResult, OtterError> {
         let interpreter = Interpreter::new();
-        Ok(interpreter.execute_with_suspension(module, ctx, result_promise))
+        Ok(interpreter.execute_with_suspension_and_locals(module, ctx, result_promise, initial_locals))
     }
 
     /// Register a signal on a promise to be notified when it resolves/rejects
@@ -633,6 +686,9 @@ impl Otter {
         // Register extension ops as global native functions
         self.register_ops_in_context(&mut ctx);
 
+        // Bootstrap v2 native extensions (no JS compilation needed)
+        self.bootstrap_native_extensions(&ctx)?;
+
         // Execute setup JS from extensions
         for js in self.extensions.all_js() {
             self.execute_js(&mut ctx, js, "setup.js")?;
@@ -643,7 +699,6 @@ impl Otter {
         ctx.set_pending_this(Value::object(ctx.global().clone()));
 
         // Load, link and execute
-        // Simple heuristic to detect if code is a module (needs ESM semantics)
         let is_module =
             code.contains("import ") || code.contains("export ") || code.contains("await ");
         let main_url = if is_module { "main.mjs" } else { "main.js" };
@@ -651,14 +706,6 @@ impl Otter {
             Ok(b) => b,
             Err(e) => return Err(OtterError::Compile(e.to_string())),
         };
-        println!(
-            "Compiled {} to bytecode. Imports: {}",
-            main_url,
-            bytecode.imports.len()
-        );
-        for imp in &bytecode.imports {
-            println!("  Import: {}", imp.specifier);
-        }
 
         if let Err(e) = self.loader.link(main_url) {
             return Err(OtterError::Runtime(format!("Module linking failed: {}", e)));
@@ -670,107 +717,45 @@ impl Otter {
             Err(e) => return Err(OtterError::Runtime(e.to_string())),
         };
 
+        let normalized_main_url = self.loader.normalize_url(main_url);
         for url in &order {
-            if url == main_url {
+            if url == main_url || url == &normalized_main_url {
                 continue;
             }
             let m = self.loader.get(url).unwrap();
-            let module_bytecode = {
+            let (module_bytecode, already_evaluated) = {
                 let guard = m.read().unwrap();
-                Arc::clone(&guard.bytecode)
+                (
+                    Arc::clone(&guard.bytecode),
+                    guard.state == crate::module_loader::ModuleState::Evaluated,
+                )
             };
 
-            // Resolve imports for this dependency
-            let mut initial_locals = std::collections::HashMap::new();
-            if let Some(entry_func) = module_bytecode.entry_function() {
-                for import in &module_bytecode.imports {
-                    for binding in &import.bindings {
-                        let local_name = match binding {
-                            otter_vm_bytecode::module::ImportBinding::Named { local, .. } => local,
-                            otter_vm_bytecode::module::ImportBinding::Default { local } => local,
-                            otter_vm_bytecode::module::ImportBinding::Namespace { local } => local,
-                        };
-
-                        // Map local name to local index
-                        if let Some(idx) =
-                            entry_func.local_names.iter().position(|n| n == local_name)
-                        {
-                            if let Ok(val) = self.loader.get_import_value(url, local_name) {
-                                initial_locals.insert(idx as u16, val);
-                            }
-                        }
-                    }
-                }
+            // Skip native modules that are already evaluated (v2 extensions)
+            if already_evaluated {
+                continue;
             }
 
-            println!("Executing dependency: {}", url);
+            // Resolve imports for this dependency
+            let dep_locals = self.resolve_module_imports(&module_bytecode, url)?;
+
             self.vm
                 .execute_module_with_context_and_locals(
                     &module_bytecode,
                     &mut ctx,
-                    if initial_locals.is_empty() {
+                    if dep_locals.is_empty() {
                         None
                     } else {
-                        Some(initial_locals)
+                        Some(dep_locals)
                     },
                 )
                 .map_err(|e: otter_vm_core::VmError| OtterError::Runtime(e.to_string()))?;
 
             self.loader.update_namespace(url, &ctx);
-            {
-                let guard = m.read().unwrap();
-            }
         }
 
         // Resolve imports for main module
-        let mut initial_locals = std::collections::HashMap::new();
-        if let Some(entry_func) = bytecode.entry_function() {
-            for import in &bytecode.imports {
-                let resolved = self
-                    .loader
-                    .resolve(&import.specifier, main_url)
-                    .map_err(|e| OtterError::Runtime(format!("Import resolution failed: {}", e)))?;
-
-                if let Some(module_arc) = self.loader.get(&resolved.url) {
-                    let module_lock = module_arc.read().map_err(|e| {
-                        OtterError::Runtime(format!("Failed to read module: {}", e))
-                    })?;
-                    for binding in &import.bindings {
-                        let (imported_name, local_name) = match binding {
-                            ImportBinding::Named { imported, local } => {
-                                (imported.as_str(), local.as_str())
-                            }
-                            ImportBinding::Default { local } => ("default", local.as_str()),
-                            ImportBinding::Namespace { local } => {
-                                println!(
-                                    "  Namespace import {} - NOT IMPLEMENTED IN eval_sync",
-                                    local
-                                );
-                                continue;
-                            }
-                        };
-
-                        if let Some(val) = module_lock.get_export(imported_name) {
-                            if let Some(idx) =
-                                entry_func.local_names.iter().position(|n| n == local_name)
-                            {
-                                println!("  Resolved {} -> register {}", local_name, idx);
-                                initial_locals.insert(idx as u16, val);
-                            }
-                        } else {
-                            println!(
-                                "  FAILED to resolve export {} from {:?}",
-                                imported_name, resolved
-                            );
-                        }
-                    }
-                } else {
-                    println!("  FAILED to find module {:?}", resolved);
-                }
-            }
-        }
-
-        println!("Executing main module");
+        let initial_locals = self.resolve_module_imports(&bytecode, main_url)?;
         let result = self
             .vm
             .execute_module_with_context_and_locals(
@@ -787,6 +772,128 @@ impl Otter {
         self.loader.update_namespace(main_url, &ctx);
 
         Ok(result)
+    }
+
+    /// Resolve import bindings for a module into initial locals map.
+    ///
+    /// Walks the module's import records, resolves each to its source module,
+    /// and maps imported values to local variable indices.
+    /// Used by both `eval()` and `eval_sync()`.
+    fn resolve_module_imports(
+        &self,
+        bytecode: &otter_vm_bytecode::Module,
+        module_url: &str,
+    ) -> Result<HashMap<u16, Value>, OtterError> {
+        let mut initial_locals = HashMap::new();
+        let entry_func = match bytecode.entry_function() {
+            Some(f) => f,
+            None => return Ok(initial_locals),
+        };
+
+        let mm = self.vm.memory_manager().clone();
+
+        for import in &bytecode.imports {
+            let resolved = self
+                .loader
+                .resolve(&import.specifier, module_url)
+                .map_err(|e| OtterError::Runtime(format!("Import resolution failed: {}", e)))?;
+
+            let module_arc = match self.loader.get(&resolved.url) {
+                Some(m) => m,
+                None => continue,
+            };
+            let module_lock = module_arc.read().map_err(|e| {
+                OtterError::Runtime(format!("Failed to read module: {}", e))
+            })?;
+
+            for binding in &import.bindings {
+                let (imported_name, local_name, is_namespace) = match binding {
+                    ImportBinding::Named { imported, local } => {
+                        (imported.as_str(), local.as_str(), false)
+                    }
+                    ImportBinding::Default { local } => ("default", local.as_str(), false),
+                    ImportBinding::Namespace { local } => ("*", local.as_str(), true),
+                };
+
+                let value = if is_namespace {
+                    // Build namespace object from all exports
+                    crate::module_loader::namespace_to_object(
+                        &module_lock.namespace,
+                        mm.clone(),
+                    )
+                } else {
+                    match module_lock.get_export(imported_name) {
+                        Some(val) => val,
+                        None => continue,
+                    }
+                };
+
+                if let Some(idx) =
+                    entry_func.local_names.iter().position(|n| n == local_name)
+                {
+                    initial_locals.insert(idx as u16, value);
+                }
+            }
+        }
+
+        Ok(initial_locals)
+    }
+
+    /// Bootstrap v2 native extensions (no JS compilation needed).
+    ///
+    /// Creates a `RegistrationContext` and runs the full bootstrap sequence
+    /// (init_state → allocate → install) for all registered v2 extensions.
+    /// Then builds native module namespaces and registers them with the loader.
+    fn bootstrap_native_extensions(&mut self, ctx: &VmContext) -> Result<(), OtterError> {
+        if self.native_extensions.extension_count() == 0 {
+            return Ok(());
+        }
+
+        let intrinsics = self.vm.intrinsics();
+        let global = ctx.global().clone();
+        let mm = self.vm.memory_manager().clone();
+
+        // Determine profile — for now default to Full, will be configurable later
+        let profile = crate::extension_v2::Profile::Full;
+
+        let mut reg_ctx = crate::registration::RegistrationContext::new(
+            intrinsics,
+            global,
+            mm.clone(),
+            &mut self.extension_state,
+        );
+
+        // Phase 1: bootstrap (init_state → allocate → install)
+        self.native_extensions
+            .bootstrap(&mut reg_ctx, profile)
+            .map_err(|e| OtterError::Runtime(e.to_string()))?;
+
+        // Phase 2: build native module namespaces and register with loader
+        // Collect specifiers from all extensions, then load each module
+        let mut specifier_map: Vec<(String, usize)> = Vec::new();
+        for (idx, ext) in self.native_extensions.extensions().iter().enumerate() {
+            for &spec in ext.module_specifiers() {
+                specifier_map.push((spec.to_string(), idx));
+            }
+        }
+
+        for (specifier, idx) in &specifier_map {
+            let ext = &self.native_extensions.extensions()[*idx];
+            let mut load_ctx = crate::registration::RegistrationContext::new(
+                intrinsics,
+                ctx.global().clone(),
+                mm.clone(),
+                &mut self.extension_state,
+            );
+            if let Some(namespace_obj) = ext.load_module(specifier, &mut load_ctx) {
+                // Register with the loader using the builtin:// URL format
+                // that NodeModuleProvider produces: "builtin://node:path"
+                let builtin_url = format!("builtin://{}", specifier);
+                self.loader.register_native_module(&builtin_url, namespace_obj);
+            }
+        }
+
+        Ok(())
     }
 
     /// Register extension ops as global native functions in context

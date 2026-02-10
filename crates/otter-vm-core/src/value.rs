@@ -570,6 +570,57 @@ impl Value {
         }
     }
 
+    /// Create a native function value from a pre-built `NativeFn` Arc.
+    ///
+    /// This avoids re-wrapping closures when the `NativeFn` is already available
+    /// (e.g., from `#[dive]` macro-generated `_native_fn()` getters).
+    pub fn native_function_from_arc(
+        func: NativeFn,
+        memory_manager: Arc<crate::memory::MemoryManager>,
+    ) -> Self {
+        let object = GcRef::new(JsObject::new(Value::null(), memory_manager));
+        let native = GcRef::new(NativeFunctionObject { func, object });
+        let ptr = native.as_ptr() as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::NativeFunction(native)),
+        }
+    }
+
+    /// Create a native function value from a `#[dive]` decl tuple `(name, fn, length)`.
+    ///
+    /// Sets `name` and `length` properties per ES2023 §10.2.8:
+    /// `{ writable: false, enumerable: false, configurable: true }`.
+    pub fn native_function_from_decl(
+        name: &str,
+        func: NativeFn,
+        length: u32,
+        memory_manager: Arc<crate::memory::MemoryManager>,
+    ) -> Self {
+        let object = GcRef::new(JsObject::new(Value::null(), memory_manager));
+        object.define_property(
+            crate::object::PropertyKey::string("length"),
+            crate::object::PropertyDescriptor::function_length(Value::int32(length as i32)),
+        );
+        object.define_property(
+            crate::object::PropertyKey::string("name"),
+            crate::object::PropertyDescriptor::function_length(Value::string(
+                crate::string::JsString::intern(name),
+            )),
+        );
+        // Built-in methods are not constructors (ES2023 §17)
+        let _ = object.set(
+            crate::object::PropertyKey::string("__non_constructor"),
+            Value::boolean(true),
+        );
+        let native = GcRef::new(NativeFunctionObject { func, object });
+        let ptr = native.as_ptr() as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::NativeFunction(native)),
+        }
+    }
+
     /// Create a native function value with a specific [[Prototype]].
     ///
     /// Per ES2023 §10.3.1, built-in function objects must have

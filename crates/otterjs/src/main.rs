@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use tracing_subscriber::filter::EnvFilter;
 
 // Use otter-engine as the single entry point
-use otter_engine::{CapabilitiesBuilder, EngineBuilder, PropertyKey, Value};
+use otter_engine::{CapabilitiesBuilder, EngineBuilder, NodeApiProfile, PropertyKey, Value};
 
 mod commands;
 mod config;
@@ -64,6 +64,10 @@ struct Cli {
     #[arg(long = "allow-run", global = true)]
     allow_run: bool,
 
+    /// Node.js API profile (`none`, `safe-core`, `full`)
+    #[arg(long = "node-api", value_enum, global = true, default_value_t = NodeApiMode::Full)]
+    node_api: NodeApiMode,
+
     /// Execution timeout in seconds (0 = no timeout)
     #[arg(long, global = true, default_value = "30")]
     timeout: u64,
@@ -99,6 +103,23 @@ struct Cli {
     /// Capture timing information in trace (adds overhead)
     #[arg(long, global = true)]
     trace_timing: bool,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum NodeApiMode {
+    None,
+    SafeCore,
+    Full,
+}
+
+impl NodeApiMode {
+    fn to_profile(self) -> NodeApiProfile {
+        match self {
+            Self::None => NodeApiProfile::None,
+            Self::SafeCore => NodeApiProfile::SafeCore,
+            Self::Full => NodeApiProfile::Full,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -264,6 +285,14 @@ fn build_capabilities(cli: &Cli) -> otter_engine::Capabilities {
     }
 }
 
+fn build_engine(cli: &Cli, caps: otter_engine::Capabilities) -> otter_engine::Otter {
+    EngineBuilder::new()
+        .capabilities(caps)
+        .with_http()
+        .with_nodejs_profile(cli.node_api.to_profile())
+        .build()
+}
+
 /// Run a JavaScript file
 async fn run_file(path: &PathBuf, cli: &Cli) -> Result<()> {
     let source = std::fs::read_to_string(path)
@@ -303,11 +332,7 @@ async fn run_code(source: &str, source_url: &str, cli: &Cli) -> Result<()> {
     let caps = build_capabilities(cli);
 
     // Create engine with builtins (EngineBuilder handles all setup)
-    let mut engine = EngineBuilder::new()
-        .capabilities(caps)
-        .with_http() // Enable Otter.serve()
-        .with_nodejs() // Enable Node.js APIs
-        .build();
+    let mut engine = build_engine(cli, caps);
 
     // Configure trace (either for full trace or timeout dumps)
     if cli.trace {
@@ -439,11 +464,7 @@ async fn run_repl(cli: &Cli) -> Result<()> {
     println!("Type .help for help, .exit to exit\n");
 
     let caps = build_capabilities(cli);
-    let mut engine = EngineBuilder::new()
-        .capabilities(caps)
-        .with_http()
-        .with_nodejs()
-        .build();
+    let mut engine = build_engine(cli, caps);
 
     // Configure trace (though REPL usually doesn't timeout or use full trace)
     if cli.trace {
@@ -686,11 +707,7 @@ async fn run_test_file(
     let source = std::fs::read_to_string(path)?;
     let caps = build_capabilities(cli);
 
-    let mut engine = EngineBuilder::new()
-        .capabilities(caps)
-        .with_http()
-        .with_nodejs()
-        .build();
+    let mut engine = build_engine(cli, caps);
 
     // Configure trace (either for full trace or timeout dumps)
     if cli.trace {
@@ -933,5 +950,24 @@ fn dump_timeout_info(engine: &otter_engine::Otter, cli: &Cli, source_path: Optio
         // Write to stderr
         eprint!("{}", header);
         let _ = engine.dump_snapshot(&mut std::io::stderr());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn node_api_default_is_full() {
+        let cli = Cli::try_parse_from(["otter", "repl"]).expect("cli parse");
+        assert!(matches!(cli.node_api, NodeApiMode::Full));
+    }
+
+    #[test]
+    fn node_api_safe_core_parses() {
+        let cli =
+            Cli::try_parse_from(["otter", "--node-api", "safe-core", "repl"]).expect("cli parse");
+        assert!(matches!(cli.node_api, NodeApiMode::SafeCore));
     }
 }

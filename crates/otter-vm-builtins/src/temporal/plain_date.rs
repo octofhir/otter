@@ -24,7 +24,10 @@ pub fn ops() -> Vec<Op> {
         op_native("__Temporal_PlainDate_equals", plain_date_equals),
         op_native("__Temporal_PlainDate_toString", plain_date_to_string),
         op_native("__Temporal_PlainDate_toJSON", plain_date_to_json),
-        op_native("__Temporal_PlainDate_toPlainDateTime", plain_date_to_plain_date_time),
+        op_native(
+            "__Temporal_PlainDate_toPlainDateTime",
+            plain_date_to_plain_date_time,
+        ),
     ]
 }
 
@@ -50,20 +53,22 @@ fn plain_date_from(args: &[Value]) -> Result<Value, VmError> {
 
     match parse_date(s.as_str()) {
         Some(d) => Ok(Value::string(JsString::intern(&format_date(&d)))),
-        None => Err(VmError::type_error(format!("Invalid PlainDate string: {}", s))),
+        None => Err(VmError::type_error(format!(
+            "Invalid PlainDate string: {}",
+            s
+        ))),
     }
 }
 
 fn plain_date_compare(args: &[Value]) -> Result<Value, VmError> {
     let d1 = get_date(args);
-    let d2 = args.get(1)
+    let d2 = args
+        .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_date(s.as_str()));
 
     match (d1, d2) {
-        (Some(a), Some(b)) => {
-            Ok(Value::int32(a.compare_iso(&b) as i8 as i32))
-        }
+        (Some(a), Some(b)) => Ok(Value::int32(a.compare_iso(&b) as i8 as i32)),
         _ => Err(VmError::type_error("Invalid PlainDate for comparison")),
     }
 }
@@ -124,14 +129,16 @@ fn plain_date_in_leap_year(args: &[Value]) -> Result<Value, VmError> {
 
 fn plain_date_add(args: &[Value]) -> Result<Value, VmError> {
     let d = get_date(args).ok_or(VmError::type_error("Invalid PlainDate"))?;
-    let duration_str = args.get(1)
+    let duration_str = args
+        .get(1)
         .and_then(|v| v.as_string())
         .ok_or(VmError::type_error("Duration required"))?;
 
     let duration = temporal_rs::Duration::from_utf8(duration_str.as_str().as_bytes())
         .map_err(|e| VmError::type_error(format!("Invalid duration: {:?}", e)))?;
 
-    let new_d = d.add(&duration, None)
+    let new_d = d
+        .add(&duration, None)
         .map_err(|e| VmError::type_error(format!("Add failed: {:?}", e)))?;
 
     Ok(Value::string(JsString::intern(&format_date(&new_d))))
@@ -139,14 +146,16 @@ fn plain_date_add(args: &[Value]) -> Result<Value, VmError> {
 
 fn plain_date_subtract(args: &[Value]) -> Result<Value, VmError> {
     let d = get_date(args).ok_or(VmError::type_error("Invalid PlainDate"))?;
-    let duration_str = args.get(1)
+    let duration_str = args
+        .get(1)
         .and_then(|v| v.as_string())
         .ok_or(VmError::type_error("Duration required"))?;
 
     let duration = temporal_rs::Duration::from_utf8(duration_str.as_str().as_bytes())
         .map_err(|e| VmError::type_error(format!("Invalid duration: {:?}", e)))?;
 
-    let new_d = d.subtract(&duration, None)
+    let new_d = d
+        .subtract(&duration, None)
         .map_err(|e| VmError::type_error(format!("Subtract failed: {:?}", e)))?;
 
     Ok(Value::string(JsString::intern(&format_date(&new_d))))
@@ -154,7 +163,8 @@ fn plain_date_subtract(args: &[Value]) -> Result<Value, VmError> {
 
 fn plain_date_equals(args: &[Value]) -> Result<Value, VmError> {
     let d1 = get_date(args);
-    let d2 = args.get(1)
+    let d2 = args
+        .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_date(s.as_str()));
 
@@ -185,10 +195,15 @@ fn plain_date_to_plain_date_time(args: &[Value]) -> Result<Value, VmError> {
         temporal_rs::PlainTime::default()
     };
 
-    let dt = d.to_plain_date_time(Some(time))
+    let dt = d
+        .to_plain_date_time(Some(time))
         .map_err(|e| VmError::type_error(format!("toPlainDateTime failed: {:?}", e)))?;
 
-    let s = dt.to_ixdtf_string(temporal_rs::options::ToStringRoundingOptions::default(), DisplayCalendar::Auto)
+    let s = dt
+        .to_ixdtf_string(
+            temporal_rs::options::ToStringRoundingOptions::default(),
+            DisplayCalendar::Auto,
+        )
         .map_err(|e| VmError::type_error(format!("toString failed: {:?}", e)))?;
 
     Ok(Value::string(JsString::intern(&s)))

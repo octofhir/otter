@@ -9,20 +9,47 @@ use temporal_rs::options::DisplayCalendar;
 pub fn ops() -> Vec<Op> {
     vec![
         op_native("__Temporal_PlainYearMonth_from", plain_year_month_from),
-        op_native("__Temporal_PlainYearMonth_compare", plain_year_month_compare),
+        op_native(
+            "__Temporal_PlainYearMonth_compare",
+            plain_year_month_compare,
+        ),
         op_native("__Temporal_PlainYearMonth_year", plain_year_month_year),
         op_native("__Temporal_PlainYearMonth_month", plain_year_month_month),
-        op_native("__Temporal_PlainYearMonth_monthCode", plain_year_month_month_code),
-        op_native("__Temporal_PlainYearMonth_daysInMonth", plain_year_month_days_in_month),
-        op_native("__Temporal_PlainYearMonth_daysInYear", plain_year_month_days_in_year),
-        op_native("__Temporal_PlainYearMonth_monthsInYear", plain_year_month_months_in_year),
-        op_native("__Temporal_PlainYearMonth_inLeapYear", plain_year_month_in_leap_year),
+        op_native(
+            "__Temporal_PlainYearMonth_monthCode",
+            plain_year_month_month_code,
+        ),
+        op_native(
+            "__Temporal_PlainYearMonth_daysInMonth",
+            plain_year_month_days_in_month,
+        ),
+        op_native(
+            "__Temporal_PlainYearMonth_daysInYear",
+            plain_year_month_days_in_year,
+        ),
+        op_native(
+            "__Temporal_PlainYearMonth_monthsInYear",
+            plain_year_month_months_in_year,
+        ),
+        op_native(
+            "__Temporal_PlainYearMonth_inLeapYear",
+            plain_year_month_in_leap_year,
+        ),
         op_native("__Temporal_PlainYearMonth_add", plain_year_month_add),
-        op_native("__Temporal_PlainYearMonth_subtract", plain_year_month_subtract),
+        op_native(
+            "__Temporal_PlainYearMonth_subtract",
+            plain_year_month_subtract,
+        ),
         op_native("__Temporal_PlainYearMonth_equals", plain_year_month_equals),
-        op_native("__Temporal_PlainYearMonth_toString", plain_year_month_to_string),
+        op_native(
+            "__Temporal_PlainYearMonth_toString",
+            plain_year_month_to_string,
+        ),
         op_native("__Temporal_PlainYearMonth_toJSON", plain_year_month_to_json),
-        op_native("__Temporal_PlainYearMonth_toPlainDate", plain_year_month_to_plain_date),
+        op_native(
+            "__Temporal_PlainYearMonth_toPlainDate",
+            plain_year_month_to_plain_date,
+        ),
     ]
 }
 
@@ -48,13 +75,17 @@ fn plain_year_month_from(args: &[Value]) -> Result<Value, VmError> {
 
     match parse_year_month(s.as_str()) {
         Some(ym) => Ok(Value::string(JsString::intern(&format_year_month(&ym)))),
-        None => Err(VmError::type_error(format!("Invalid PlainYearMonth string: {}", s))),
+        None => Err(VmError::type_error(format!(
+            "Invalid PlainYearMonth string: {}",
+            s
+        ))),
     }
 }
 
 fn plain_year_month_compare(args: &[Value]) -> Result<Value, VmError> {
     let ym1 = get_year_month(args);
-    let ym2 = args.get(1)
+    let ym2 = args
+        .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_year_month(s.as_str()));
 
@@ -113,14 +144,16 @@ fn plain_year_month_add(args: &[Value]) -> Result<Value, VmError> {
     use temporal_rs::options::Overflow;
 
     let ym = get_year_month(args).ok_or(VmError::type_error("Invalid PlainYearMonth"))?;
-    let duration_str = args.get(1)
+    let duration_str = args
+        .get(1)
         .and_then(|v| v.as_string())
         .ok_or(VmError::type_error("Duration required"))?;
 
     let duration = temporal_rs::Duration::from_utf8(duration_str.as_str().as_bytes())
         .map_err(|e| VmError::type_error(format!("Invalid duration: {:?}", e)))?;
 
-    let new_ym = ym.add(&duration, Overflow::Constrain)
+    let new_ym = ym
+        .add(&duration, Overflow::Constrain)
         .map_err(|e| VmError::type_error(format!("Add failed: {:?}", e)))?;
 
     Ok(Value::string(JsString::intern(&format_year_month(&new_ym))))
@@ -130,14 +163,16 @@ fn plain_year_month_subtract(args: &[Value]) -> Result<Value, VmError> {
     use temporal_rs::options::Overflow;
 
     let ym = get_year_month(args).ok_or(VmError::type_error("Invalid PlainYearMonth"))?;
-    let duration_str = args.get(1)
+    let duration_str = args
+        .get(1)
         .and_then(|v| v.as_string())
         .ok_or(VmError::type_error("Duration required"))?;
 
     let duration = temporal_rs::Duration::from_utf8(duration_str.as_str().as_bytes())
         .map_err(|e| VmError::type_error(format!("Invalid duration: {:?}", e)))?;
 
-    let new_ym = ym.subtract(&duration, Overflow::Constrain)
+    let new_ym = ym
+        .subtract(&duration, Overflow::Constrain)
         .map_err(|e| VmError::type_error(format!("Subtract failed: {:?}", e)))?;
 
     Ok(Value::string(JsString::intern(&format_year_month(&new_ym))))
@@ -145,7 +180,8 @@ fn plain_year_month_subtract(args: &[Value]) -> Result<Value, VmError> {
 
 fn plain_year_month_equals(args: &[Value]) -> Result<Value, VmError> {
     let ym1 = get_year_month(args);
-    let ym2 = args.get(1)
+    let ym2 = args
+        .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_year_month(s.as_str()));
 
@@ -173,7 +209,8 @@ fn plain_year_month_to_plain_date(args: &[Value]) -> Result<Value, VmError> {
 
     let fields = CalendarFields::new().with_day(day);
 
-    let date = ym.to_plain_date(Some(fields))
+    let date = ym
+        .to_plain_date(Some(fields))
         .map_err(|e| VmError::type_error(format!("toPlainDate failed: {:?}", e)))?;
 
     let s = date.to_ixdtf_string(DisplayCalendar::Auto);

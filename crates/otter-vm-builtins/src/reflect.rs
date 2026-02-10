@@ -17,10 +17,10 @@
 
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
+use otter_vm_core::memory;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value as VmValue;
-use otter_vm_core::memory;
 use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::sync::Arc;
 
@@ -226,10 +226,7 @@ fn native_reflect_own_keys(
 
     // Handle native functions
     if target.as_native_function().is_some() {
-        let keys = vec![
-            JsString::intern("length"),
-            JsString::intern("name"),
-        ];
+        let keys = vec![JsString::intern("length"), JsString::intern("name")];
         let result = GcRef::new(JsObject::array(keys.len(), Arc::clone(&mm)));
         for (i, key) in keys.into_iter().enumerate() {
             let _ = result.set(PropertyKey::Index(i as u32), VmValue::string(key));
@@ -292,15 +289,25 @@ fn native_reflect_get_own_property_descriptor(
                 let _ = desc.set("value".into(), value);
                 let _ = desc.set("writable".into(), VmValue::boolean(attributes.writable));
                 let _ = desc.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
-                let _ = desc.set("configurable".into(), VmValue::boolean(attributes.configurable));
+                let _ = desc.set(
+                    "configurable".into(),
+                    VmValue::boolean(attributes.configurable),
+                );
                 return Ok(VmValue::object(desc));
             }
-            PropertyDescriptor::Accessor { get, set, attributes } => {
+            PropertyDescriptor::Accessor {
+                get,
+                set,
+                attributes,
+            } => {
                 let desc = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
                 let _ = desc.set("get".into(), get.unwrap_or(VmValue::undefined()));
                 let _ = desc.set("set".into(), set.unwrap_or(VmValue::undefined()));
                 let _ = desc.set("enumerable".into(), VmValue::boolean(attributes.enumerable));
-                let _ = desc.set("configurable".into(), VmValue::boolean(attributes.configurable));
+                let _ = desc.set(
+                    "configurable".into(),
+                    VmValue::boolean(attributes.configurable),
+                );
                 return Ok(VmValue::object(desc));
             }
             PropertyDescriptor::Deleted => {
@@ -343,7 +350,9 @@ fn native_reflect_define_property(
     let key = to_property_key(property_key);
 
     let Some(attr_obj) = attributes.as_object() else {
-        return Err(VmError::type_error("Reflect.defineProperty requires attributes to be an object"));
+        return Err(VmError::type_error(
+            "Reflect.defineProperty requires attributes to be an object",
+        ));
     };
 
     // Helper to read boolean fields with default true (the common case for builtins)
@@ -541,10 +550,7 @@ mod tests {
         let _ = obj.set("x".into(), VmValue::number(1.0));
 
         let result = native_reflect_has(
-            &[
-                VmValue::object(obj),
-                VmValue::string(JsString::intern("x")),
-            ],
+            &[VmValue::object(obj), VmValue::string(JsString::intern("x"))],
             Arc::clone(&mm),
         )
         .unwrap();
@@ -565,10 +571,7 @@ mod tests {
         let _ = obj.set("x".into(), VmValue::number(1.0));
 
         let result = native_reflect_delete_property(
-            &[
-                VmValue::object(obj),
-                VmValue::string(JsString::intern("x")),
-            ],
+            &[VmValue::object(obj), VmValue::string(JsString::intern("x"))],
             Arc::clone(&mm),
         )
         .unwrap();
@@ -609,12 +612,12 @@ mod tests {
         let obj = GcRef::new(JsObject::new(VmValue::null(), Arc::clone(&mm)));
 
         let result =
-            native_reflect_is_extensible(&[VmValue::object(obj)], Arc::clone(&mm))
-                .unwrap();
+            native_reflect_is_extensible(&[VmValue::object(obj)], Arc::clone(&mm)).unwrap();
         assert_eq!(result.as_boolean(), Some(true));
 
         obj.prevent_extensions();
-        let result = native_reflect_is_extensible(&[VmValue::object(obj)], Arc::clone(&mm)).unwrap();
+        let result =
+            native_reflect_is_extensible(&[VmValue::object(obj)], Arc::clone(&mm)).unwrap();
         assert_eq!(result.as_boolean(), Some(false));
     }
 }

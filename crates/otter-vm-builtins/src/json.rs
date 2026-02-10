@@ -121,7 +121,8 @@ fn json_stringify(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Val
         let indent_str = " ".repeat(indent);
         format_json_pretty(&parsed, &indent_str)
     } else {
-        serde_json::to_string(&parsed).map_err(|e| VmError::type_error(format!("TypeError: {}", e)))?
+        serde_json::to_string(&parsed)
+            .map_err(|e| VmError::type_error(format!("TypeError: {}", e)))?
     };
 
     Ok(Value::string(JsString::intern(&result)))
@@ -157,7 +158,9 @@ fn json_raw_json(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Valu
     // rawJSON only accepts primitives (string, number, boolean, null)
     match &parsed {
         JsonValue::Object(_) | JsonValue::Array(_) => {
-            return Err(VmError::SyntaxError("JSON.rawJSON only accepts JSON primitives".to_string()));
+            return Err(VmError::SyntaxError(
+                "JSON.rawJSON only accepts JSON primitives".to_string(),
+            ));
         }
         _ => {}
     }

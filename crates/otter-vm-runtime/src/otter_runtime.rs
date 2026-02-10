@@ -14,6 +14,9 @@ use tokio::sync::mpsc;
 
 use crate::capabilities::Capabilities;
 use crate::env_store::IsolatedEnvStore;
+use crate::module_provider::ModuleType;
+use otter_vm_bytecode::module::{ImportBinding, ImportRecord};
+use otter_vm_bytecode::{Instruction, Module, Register, TypeFlags, UpvalueCapture};
 use otter_vm_compiler::Compiler;
 use otter_vm_core::async_context::VmExecutionResult;
 use otter_vm_core::context::{VmContext, VmContextSnapshot};
@@ -640,11 +643,22 @@ impl Otter {
         ctx.set_pending_this(Value::object(ctx.global().clone()));
 
         // Load, link and execute
-        let main_url = "main.js";
+        // Simple heuristic to detect if code is a module (needs ESM semantics)
+        let is_module =
+            code.contains("import ") || code.contains("export ") || code.contains("await ");
+        let main_url = if is_module { "main.mjs" } else { "main.js" };
         let bytecode = match self.loader.compile_source(code, main_url, true) {
             Ok(b) => b,
             Err(e) => return Err(OtterError::Compile(e.to_string())),
         };
+        println!(
+            "Compiled {} to bytecode. Imports: {}",
+            main_url,
+            bytecode.imports.len()
+        );
+        for imp in &bytecode.imports {
+            println!("  Import: {}", imp.specifier);
+        }
 
         if let Err(e) = self.loader.link(main_url) {
             return Err(OtterError::Runtime(format!("Module linking failed: {}", e)));
@@ -705,11 +719,6 @@ impl Otter {
             self.loader.update_namespace(url, &ctx);
             {
                 let guard = m.read().unwrap();
-                println!(
-                    "Namespace for {} after update keys: {:?}",
-                    url,
-                    guard.namespace.keys()
-                );
             }
         }
 
@@ -717,18 +726,46 @@ impl Otter {
         let mut initial_locals = std::collections::HashMap::new();
         if let Some(entry_func) = bytecode.entry_function() {
             for import in &bytecode.imports {
-                for binding in &import.bindings {
-                    let local_name = match binding {
-                        otter_vm_bytecode::module::ImportBinding::Named { local, .. } => local,
-                        otter_vm_bytecode::module::ImportBinding::Default { local } => local,
-                        otter_vm_bytecode::module::ImportBinding::Namespace { local } => local,
-                    };
+                let resolved = self
+                    .loader
+                    .resolve(&import.specifier, main_url)
+                    .map_err(|e| OtterError::Runtime(format!("Import resolution failed: {}", e)))?;
 
-                    if let Some(idx) = entry_func.local_names.iter().position(|n| n == local_name) {
-                        if let Ok(val) = self.loader.get_import_value(main_url, local_name) {
-                            initial_locals.insert(idx as u16, val);
+                if let Some(module_arc) = self.loader.get(&resolved.url) {
+                    let module_lock = module_arc.read().map_err(|e| {
+                        OtterError::Runtime(format!("Failed to read module: {}", e))
+                    })?;
+                    for binding in &import.bindings {
+                        let (imported_name, local_name) = match binding {
+                            ImportBinding::Named { imported, local } => {
+                                (imported.as_str(), local.as_str())
+                            }
+                            ImportBinding::Default { local } => ("default", local.as_str()),
+                            ImportBinding::Namespace { local } => {
+                                println!(
+                                    "  Namespace import {} - NOT IMPLEMENTED IN eval_sync",
+                                    local
+                                );
+                                continue;
+                            }
+                        };
+
+                        if let Some(val) = module_lock.get_export(imported_name) {
+                            if let Some(idx) =
+                                entry_func.local_names.iter().position(|n| n == local_name)
+                            {
+                                println!("  Resolved {} -> register {}", local_name, idx);
+                                initial_locals.insert(idx as u16, val);
+                            }
+                        } else {
+                            println!(
+                                "  FAILED to resolve export {} from {:?}",
+                                imported_name, resolved
+                            );
                         }
                     }
+                } else {
+                    println!("  FAILED to find module {:?}", resolved);
                 }
             }
         }
@@ -1963,17 +2000,15 @@ impl Otter {
         otter_profiler::MemoryProfiler::new()
     }
 
-    /// Create a MemoryProfiler connected to a GcHeap
+    /// Create a MemoryProfiler connected to the global GC registry
     #[cfg(feature = "profiling")]
-    pub fn create_memory_profiler_with_heap(
-        heap: std::sync::Arc<otter_vm_gc::GcHeap>,
-    ) -> otter_profiler::MemoryProfiler {
+    pub fn create_memory_profiler_with_gc() -> otter_profiler::MemoryProfiler {
         use otter_profiler::{HeapInfo, MemoryProfiler};
 
-        let provider = std::sync::Arc::new(move || HeapInfo {
-            total_allocated: heap.allocated(),
+        let provider = std::sync::Arc::new(|| HeapInfo {
+            total_allocated: otter_vm_gc::global_registry().total_bytes(),
             objects_by_type: std::collections::HashMap::new(),
-            object_count: 0,
+            object_count: otter_vm_gc::global_registry().allocation_count(),
         });
 
         MemoryProfiler::with_heap_provider(provider)

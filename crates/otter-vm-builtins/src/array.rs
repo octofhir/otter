@@ -267,10 +267,7 @@ fn native_array_splice(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmVal
         .ok_or("Array.splice called on non-object")?;
 
     let len = get_array_length(&arr) as i32;
-    let start = args
-        .get(1)
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0) as i32;
+    let start = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
     let delete_count = args
         .get(2)
         .and_then(|v| v.as_number())
@@ -436,14 +433,8 @@ fn native_array_copy_within(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result
         .ok_or("Array.copyWithin called on non-object")?;
 
     let len = get_array_length(&arr) as i32;
-    let target = args
-        .get(1)
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0) as i32;
-    let start = args
-        .get(2)
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0) as i32;
+    let target = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let start = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
     let end = args
         .get(3)
         .and_then(|v| v.as_number())
@@ -499,10 +490,7 @@ fn native_array_slice(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValu
         .ok_or("Array.slice called on non-object")?;
 
     let len = get_array_length(&arr) as i32;
-    let start = args
-        .get(1)
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0) as i32;
+    let start = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
     let end = args
         .get(2)
         .and_then(|v| v.as_number())
@@ -580,10 +568,7 @@ fn native_array_flat(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue
         .as_object()
         .ok_or("Array.flat called on non-object")?;
 
-    let depth = args
-        .get(1)
-        .and_then(|v| v.as_number())
-        .unwrap_or(1.0) as usize;
+    let depth = args.get(1).and_then(|v| v.as_number()).unwrap_or(1.0) as usize;
 
     let new_arr = GcRef::new(JsObject::array(0, Arc::clone(&mm)));
     let mut new_len = 0;
@@ -618,7 +603,9 @@ fn native_array_flat(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue
 
 fn native_array_flat_map(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     // Simplified: flatMap requires callback, which is handled in builtins.js
-    Err(VmError::type_error("Array.flatMap not yet implemented in native ops"))
+    Err(VmError::type_error(
+        "Array.flatMap not yet implemented in native ops",
+    ))
 }
 
 // =============================================================================
@@ -632,10 +619,7 @@ fn native_array_index_of(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<Vm
         .ok_or("Array.indexOf called on non-object")?;
 
     let search_element = args.get(1).cloned().unwrap_or(VmValue::undefined());
-    let from_index = args
-        .get(2)
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0) as i32;
+    let from_index = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
 
     let len = get_array_length(&arr) as i32;
     let start = if from_index < 0 {
@@ -656,7 +640,10 @@ fn native_array_index_of(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<Vm
     Ok(VmValue::int32(-1))
 }
 
-fn native_array_last_index_of(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_array_last_index_of(
+    args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.lastIndexOf requires a target")?;
     let arr = arr_val
         .as_object()
@@ -694,10 +681,7 @@ fn native_array_includes(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<Vm
         .ok_or("Array.includes called on non-object")?;
 
     let search_element = args.get(1).cloned().unwrap_or(VmValue::undefined());
-    let from_index = args
-        .get(2)
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0) as i32;
+    let from_index = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
 
     let len = get_array_length(&arr) as i32;
     let start = if from_index < 0 {
@@ -720,41 +704,43 @@ fn native_array_includes(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<Vm
 
 fn native_array_find(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     // Requires callback, handled in builtins.js
-    Err(VmError::type_error("Array.find not yet implemented in native ops"))
+    Err(VmError::type_error(
+        "Array.find not yet implemented in native ops",
+    ))
 }
 
 fn native_array_find_index(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     // Requires callback, handled in builtins.js
-    Err(VmError::type_error("Array.findIndex not yet implemented in native ops"))
+    Err(VmError::type_error(
+        "Array.findIndex not yet implemented in native ops",
+    ))
 }
 
 fn native_array_find_last(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     // Requires callback, handled in builtins.js
-    Err(VmError::type_error("Array.findLast not yet implemented in native ops"))
+    Err(VmError::type_error(
+        "Array.findLast not yet implemented in native ops",
+    ))
 }
 
-fn native_array_find_last_index(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_array_find_last_index(
+    _args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     // Requires callback, handled in builtins.js
-    Err(VmError::type_error("Array.findLastIndex not yet implemented in native ops"))
+    Err(VmError::type_error(
+        "Array.findLastIndex not yet implemented in native ops",
+    ))
 }
 
 fn native_array_at(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let arr_val = args.get(0).ok_or("Array.at requires a target")?;
-    let arr = arr_val
-        .as_object()
-        .ok_or("Array.at called on non-object")?;
+    let arr = arr_val.as_object().ok_or("Array.at called on non-object")?;
 
-    let index = args
-        .get(1)
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0) as i32;
+    let index = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
 
     let len = get_array_length(&arr) as i32;
-    let actual_index = if index < 0 {
-        len + index
-    } else {
-        index
-    };
+    let actual_index = if index < 0 { len + index } else { index };
 
     if actual_index < 0 || actual_index >= len {
         return Ok(VmValue::undefined());
@@ -770,31 +756,48 @@ fn native_array_at(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue,
 // =============================================================================
 
 fn native_array_for_each(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
-    Err(VmError::type_error("Array.forEach not yet implemented in native ops"))
+    Err(VmError::type_error(
+        "Array.forEach not yet implemented in native ops",
+    ))
 }
 
 fn native_array_map(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
-    Err(VmError::type_error("Array.map not yet implemented in native ops"))
+    Err(VmError::type_error(
+        "Array.map not yet implemented in native ops",
+    ))
 }
 
 fn native_array_filter(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
-    Err(VmError::type_error("Array.filter not yet implemented in native ops"))
+    Err(VmError::type_error(
+        "Array.filter not yet implemented in native ops",
+    ))
 }
 
 fn native_array_reduce(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
-    Err(VmError::type_error("Array.reduce not yet implemented in native ops"))
+    Err(VmError::type_error(
+        "Array.reduce not yet implemented in native ops",
+    ))
 }
 
-fn native_array_reduce_right(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
-    Err(VmError::type_error("Array.reduceRight not yet implemented in native ops"))
+fn native_array_reduce_right(
+    _args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
+    Err(VmError::type_error(
+        "Array.reduceRight not yet implemented in native ops",
+    ))
 }
 
 fn native_array_every(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
-    Err(VmError::type_error("Array.every not yet implemented in native ops"))
+    Err(VmError::type_error(
+        "Array.every not yet implemented in native ops",
+    ))
 }
 
 fn native_array_some(_args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
-    Err(VmError::type_error("Array.some not yet implemented in native ops"))
+    Err(VmError::type_error(
+        "Array.some not yet implemented in native ops",
+    ))
 }
 
 // =============================================================================
@@ -912,14 +915,8 @@ fn native_array_to_spliced(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<V
         .ok_or("Array.toSpliced called on non-object")?;
 
     let len = get_array_length(&arr) as i32;
-    let start = args
-        .get(1)
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0) as i32;
-    let delete_count = args
-        .get(2)
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0) as usize;
+    let start = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let delete_count = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
 
     let start = if start < 0 {
         (len + start).max(0) as usize
@@ -964,17 +961,17 @@ fn native_array_with(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmValue
         .as_object()
         .ok_or("Array.with called on non-object")?;
 
-    let index = args
-        .get(1)
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0) as i32;
+    let index = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
     let value = args.get(2).cloned().unwrap_or(VmValue::undefined());
 
     let len = get_array_length(&arr) as i32;
     let actual_index = if index < 0 { len + index } else { index };
 
     if actual_index < 0 || actual_index >= len {
-        return Err(VmError::range_error(format!("Index {} out of bounds for array of length {}", index, len)));
+        return Err(VmError::range_error(format!(
+            "Index {} out of bounds for array of length {}",
+            index, len
+        )));
     }
 
     let new_arr = GcRef::new(JsObject::array(len as usize, Arc::clone(&mm)));

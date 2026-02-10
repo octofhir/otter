@@ -11,7 +11,7 @@ use otter_vm_core::object::JsObject;
 use otter_vm_core::string::JsString;
 use otter_vm_core::typed_array::{JsTypedArray, TypedArrayKind};
 use otter_vm_core::value::{BigInt, HeapRef, Value as VmValue};
-use otter_vm_runtime::{op_native_with_mm as op_native, Op};
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::sync::Arc;
 
 /// Get TypedArray ops for extension registration

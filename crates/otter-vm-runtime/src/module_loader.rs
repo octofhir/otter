@@ -11,6 +11,7 @@ use otter_vm_bytecode::module::{ExportRecord, ImportBinding, ImportRecord};
 use otter_vm_compiler::Compiler;
 use otter_vm_core::value::Value;
 
+use crate::module_provider::{MediaType, ModuleResolution, ModuleType};
 use oxc_resolver::{ResolveOptions, Resolver};
 
 /// Module loading error
@@ -67,15 +68,6 @@ pub enum ModuleState {
     Evaluated,
     /// Error during evaluation
     Error,
-}
-
-/// Module type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModuleType {
-    /// ECMAScript module (import/export)
-    ESM,
-    /// CommonJS module (require/module.exports)
-    CommonJS,
 }
 
 /// Module namespace object that holds exports
@@ -166,6 +158,11 @@ impl LoadedModule {
     /// Get import records
     pub fn imports(&self) -> &[ImportRecord] {
         &self.bytecode.imports
+    }
+
+    /// Get an export by name
+    pub fn get_export(&self, name: &str) -> Option<Value> {
+        self.namespace.get(name)
     }
 
     /// Get export records
@@ -329,13 +326,11 @@ impl ModuleLoader {
         url: &str,
         eval_mode: bool,
     ) -> Result<Arc<otter_vm_bytecode::Module>, ModuleError> {
-        let mut compiler = Compiler::new();
-        let bytecode = if eval_mode {
-            compiler.compile_eval(source, url, false)
-        } else {
-            compiler.compile(source, url, false)
-        }
-        .map_err(|e| ModuleError::CompileError(e.to_string()))?;
+        let is_esm = url.ends_with(".mjs") || url.ends_with(".mts");
+        let compiler = Compiler::new();
+        let bytecode = compiler
+            .compile_ext(source, url, eval_mode, is_esm, false)
+            .map_err(|e| ModuleError::CompileError(e.to_string()))?;
 
         let bytecode_arc = Arc::new(bytecode.clone());
         let loaded = LoadedModule::new(url.to_string(), bytecode);
@@ -431,19 +426,30 @@ impl ModuleLoader {
     }
 
     /// Resolve a module specifier to an absolute path
-    pub fn resolve(&self, specifier: &str, referrer: &str) -> Result<String, ModuleError> {
+    pub fn resolve(
+        &self,
+        specifier: &str,
+        referrer: &str,
+    ) -> Result<ModuleResolution, ModuleError> {
         // 1. Check registered providers first (node:, otter:, etc.)
         if let Ok(providers) = self.providers.read() {
             for provider in providers.iter() {
                 if let Some(resolution) = provider.resolve(specifier, referrer) {
-                    return Ok(resolution.url);
+                    return Ok(resolution);
                 }
             }
         }
 
         // 2. Handle absolute paths
         if specifier.starts_with('/') {
-            return Ok(specifier.to_string());
+            return Ok(ModuleResolution {
+                url: specifier.to_string(),
+                module_type: if specifier.ends_with(".mjs") || specifier.ends_with(".mts") {
+                    ModuleType::ESM
+                } else {
+                    ModuleType::CommonJS
+                },
+            });
         }
 
         // 3. Get the directory of the referrer
@@ -452,7 +458,15 @@ impl ModuleLoader {
 
         // 4. Use oxc resolver for filesystem modules
         match self.resolver.resolve(referrer_dir, specifier) {
-            Ok(resolution) => Ok(resolution.path().to_string_lossy().to_string()),
+            Ok(resolution) => {
+                let url = resolution.path().to_string_lossy().to_string();
+                let module_type = if url.ends_with(".mjs") || url.ends_with(".mts") {
+                    ModuleType::ESM
+                } else {
+                    ModuleType::CommonJS
+                };
+                Ok(ModuleResolution { url, module_type })
+            }
             Err(e) => Err(ModuleError::ResolveError(format!(
                 "Cannot resolve '{}' from '{}': {}",
                 specifier, referrer, e
@@ -461,7 +475,11 @@ impl ModuleLoader {
     }
 
     /// Load a module from a file
-    pub fn load(&self, url: &str) -> Result<Arc<RwLock<LoadedModule>>, ModuleError> {
+    pub fn load(
+        &self,
+        url: &str,
+        module_type: ModuleType,
+    ) -> Result<Arc<RwLock<LoadedModule>>, ModuleError> {
         // Check if already loaded
         if let Some(module) = self.modules.read().ok().and_then(|m| m.get(url).cloned()) {
             return Ok(module);
@@ -474,7 +492,7 @@ impl ModuleLoader {
                     // Compile the source from provider
                     let compiler = Compiler::new();
                     let bytecode = compiler
-                        .compile(&source.code, url, false)
+                        .compile(&source.code, url, module_type == ModuleType::ESM)
                         .map_err(|e| ModuleError::CompileError(e.to_string()))?;
 
                     // Create loaded module
@@ -498,7 +516,7 @@ impl ModuleLoader {
         // Compile
         let compiler = Compiler::new();
         let bytecode = compiler
-            .compile(&source, url, false)
+            .compile(&source, url, module_type == ModuleType::ESM)
             .map_err(|e| ModuleError::CompileError(e.to_string()))?;
 
         // Create loaded module
@@ -544,7 +562,10 @@ impl ModuleLoader {
         visited.insert(url.to_string(), true);
 
         // Load the module
-        let module = self.load(url)?;
+        // All modules should be loaded/compiled by now via link()
+        let module = self
+            .get(url)
+            .ok_or_else(|| ModuleError::NotFound(url.to_string()))?;
         let imports = {
             let m = module
                 .read()
@@ -554,8 +575,8 @@ impl ModuleLoader {
 
         // Visit dependencies
         for import in imports {
-            let resolved = self.resolve(&import.specifier, url)?;
-            self.visit_module(&resolved, visited, order)?;
+            let resolution = self.resolve(&import.specifier, url)?;
+            self.visit_module(&resolution.url, visited, order)?;
         }
 
         // Mark as complete
@@ -588,8 +609,13 @@ impl ModuleLoader {
 
         // Process imports
         let imports = module_guard.imports().to_vec();
+
         for import in imports {
-            let resolved = self.resolve(&import.specifier, url)?;
+            let resolution = self.resolve(&import.specifier, url)?;
+            let resolved = resolution.url;
+
+            // Ensure dependency is loaded
+            self.load(&resolved, resolution.module_type)?;
 
             // Build import bindings
             for binding in &import.bindings {
@@ -707,13 +733,13 @@ impl ModuleLoader {
         referrer: &str,
     ) -> Result<Arc<RwLock<LoadedModule>>, ModuleError> {
         // Resolve the specifier
-        let url = self.resolve(specifier, referrer)?;
+        let resolution = self.resolve(specifier, referrer)?;
 
         // Load the module
-        let module = self.load(&url)?;
+        let module = self.load(&resolution.url, resolution.module_type)?;
 
         // Build graph and link
-        let order = self.build_graph(&url)?;
+        let order = self.build_graph(&resolution.url)?;
         for module_url in &order {
             self.link(module_url)?;
         }
@@ -917,7 +943,7 @@ mod tests {
         writeln!(file, "export const x = 42;").unwrap();
 
         let url = module_path.to_string_lossy().to_string();
-        let module = loader.load(&url).unwrap();
+        let module = loader.load(&url, ModuleType::ESM).unwrap();
 
         let module_guard = module.read().unwrap();
         assert_eq!(module_guard.state, ModuleState::Unlinked);
@@ -940,27 +966,35 @@ mod tests {
         writeln!(file, "export const foo = 1;").unwrap();
 
         let main_url = main_path.to_string_lossy().to_string();
-        let resolved = loader.resolve("./util.js", &main_url).unwrap();
+        let resolution = loader.resolve("./util.js", &main_url).unwrap();
 
-        assert!(resolved.ends_with("util.js"));
+        assert!(resolution.url.ends_with("util.js"));
     }
 
     #[test]
     fn test_build_graph() {
         let dir = tempdir().unwrap();
-        let loader = ModuleLoader::new(dir.path());
+        // Canonicalize to handle macOS /var -> /private/var symlinks
+        let canon_dir = dir.path().canonicalize().unwrap();
+        let loader = ModuleLoader::new(&canon_dir);
 
         // Create a.js -> imports b.js
-        let a_path = dir.path().join("a.js");
+        let a_path = canon_dir.join("a.js");
         let mut file = std::fs::File::create(&a_path).unwrap();
         writeln!(file, "import {{ x }} from './b.js';\nexport const y = x;").unwrap();
 
         // Create b.js
-        let b_path = dir.path().join("b.js");
+        let b_path = canon_dir.join("b.js");
         let mut file = std::fs::File::create(&b_path).unwrap();
         writeln!(file, "export const x = 42;").unwrap();
 
         let a_url = a_path.to_string_lossy().to_string();
+        let b_url = b_path.to_string_lossy().to_string();
+
+        // Load modules into the loader first (build_graph expects them to be loaded)
+        loader.load(&b_url, ModuleType::ESM).unwrap();
+        loader.load(&a_url, ModuleType::ESM).unwrap();
+
         let order = loader.build_graph(&a_url).unwrap();
 
         // b.js should come before a.js in topological order

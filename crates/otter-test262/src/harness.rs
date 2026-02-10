@@ -1,4 +1,6 @@
-use otter_engine::{Extension, GcRef, JsObject, Op, OpHandler, PropertyKey, Value, VmContext, VmError};
+use otter_engine::{
+    Extension, GcRef, JsObject, Op, OpHandler, PropertyKey, Value, VmContext, VmError,
+};
 use std::sync::{Arc, Mutex};
 
 /// JS bootstrap executed by the extension to set up `print`, `$262`, etc.
@@ -185,13 +187,15 @@ pub fn create_harness_extension_with_state() -> (Extension, TestHarnessState) {
             otter_engine::op_native("__test262_done", move |args| {
                 let mut inner = done_state.lock().unwrap();
                 if let Some(err) = args.first()
-                    && !err.is_undefined() && !err.is_null() {
-                        let msg = format_value(err);
-                        inner.done_result = Some(Err(msg));
-                        // Don't return Err — that would abort the VM.
-                        // Instead, store the failure for the runner to read.
-                        return Ok(Value::undefined());
-                    }
+                    && !err.is_undefined()
+                    && !err.is_null()
+                {
+                    let msg = format_value(err);
+                    inner.done_result = Some(Err(msg));
+                    // Don't return Err — that would abort the VM.
+                    // Instead, store the failure for the runner to read.
+                    return Ok(Value::undefined());
+                }
                 inner.done_result = Some(Ok(()));
                 Ok(Value::undefined())
             }),
@@ -279,10 +283,15 @@ pub fn setup_harness(ctx: &mut VmContext) {
         Value::native_function(
             |_this: &Value, args: &[Value], _mm| {
                 if let Some(err) = args.first()
-                    && !err.is_undefined() && !err.is_null() {
-                        // Test failed
-                        return Err(VmError::type_error(format!("Test failed via $DONE: {:?}", err)));
-                    }
+                    && !err.is_undefined()
+                    && !err.is_null()
+                {
+                    // Test failed
+                    return Err(VmError::type_error(format!(
+                        "Test failed via $DONE: {:?}",
+                        err
+                    )));
+                }
                 // Test passed
                 Ok(Value::undefined())
             },

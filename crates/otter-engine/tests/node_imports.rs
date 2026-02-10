@@ -1,5 +1,4 @@
-use otter_engine::EngineBuilder;
-use std::sync::Arc;
+use otter_engine::{EngineBuilder, NodeApiProfile};
 
 #[test]
 fn test_node_imports() {
@@ -26,4 +25,91 @@ fn test_node_imports() {
         }
         Err(e) => panic!("Eval failed: {}", e),
     }
+}
+
+#[test]
+fn test_node_safe_profile_allows_path() {
+    let mut otter = EngineBuilder::new()
+        .with_nodejs_profile(NodeApiProfile::SafeCore)
+        .build();
+
+    let code = r#"
+        import path from 'node:path';
+        path.join('foo', 'bar');
+    "#;
+
+    match otter.eval_sync(code) {
+        Ok(val) => {
+            assert_eq!(val.as_string().map(|s| s.to_string()).unwrap(), "foo/bar");
+        }
+        Err(e) => panic!("Eval failed: {}", e),
+    }
+}
+
+#[test]
+fn test_node_safe_profile_allows_bare_path() {
+    let mut otter = EngineBuilder::new()
+        .with_nodejs_profile(NodeApiProfile::SafeCore)
+        .build();
+
+    let code = r#"
+        import path from 'path';
+        path.join('foo', 'bar');
+    "#;
+
+    match otter.eval_sync(code) {
+        Ok(val) => {
+            assert_eq!(val.as_string().map(|s| s.to_string()).unwrap(), "foo/bar");
+        }
+        Err(e) => panic!("Eval failed: {}", e),
+    }
+}
+
+#[test]
+fn test_node_safe_profile_blocks_process() {
+    let mut otter = EngineBuilder::new()
+        .with_nodejs_profile(NodeApiProfile::SafeCore)
+        .build();
+
+    let code = r#"
+        import process from 'node:process';
+        process.version;
+    "#;
+
+    let result = otter.eval_sync(code);
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("node:process"));
+}
+
+#[test]
+fn test_node_safe_profile_blocks_bare_process() {
+    let mut otter = EngineBuilder::new()
+        .with_nodejs_profile(NodeApiProfile::SafeCore)
+        .build();
+
+    let code = r#"
+        import process from 'process';
+        process.version;
+    "#;
+
+    let result = otter.eval_sync(code);
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("process"));
+}
+
+#[test]
+fn test_node_none_profile_blocks_node_and_bare_builtins() {
+    let mut otter = EngineBuilder::new()
+        .with_nodejs_profile(NodeApiProfile::None)
+        .build();
+
+    let with_prefix = otter.eval_sync("import path from 'node:path'; path.sep;");
+    assert!(with_prefix.is_err());
+    assert!(with_prefix.unwrap_err().to_string().contains("node:path"));
+
+    let bare = otter.eval_sync("import path from 'path'; path.sep;");
+    assert!(bare.is_err());
+    assert!(bare.unwrap_err().to_string().contains("path"));
 }

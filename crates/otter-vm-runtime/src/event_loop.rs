@@ -5,12 +5,12 @@
 use crate::microtask::{JsJobQueue, MicrotaskQueue, MicrotaskSequencer};
 use crate::timer::{Immediate, ImmediateId, Timer, TimerCallback, TimerHeapEntry, TimerId};
 use parking_lot::Mutex;
+use serde_json::Value as JsonValue;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use serde_json::Value as JsonValue;
 use tokio::task::JoinHandle;
 
 /// HTTP event for server request dispatch
@@ -25,13 +25,43 @@ pub struct HttpEvent {
 /// WebSocket event for server dispatch
 #[derive(Debug, Clone)]
 pub enum WsEvent {
-    Open { server_id: u64, socket_id: u64, data: Option<JsonValue>, remote_addr: Option<String> },
-    Message { server_id: u64, socket_id: u64, data: Vec<u8>, is_text: bool },
-    Close { server_id: u64, socket_id: u64, code: u16, reason: String },
-    Drain { server_id: u64, socket_id: u64 },
-    Ping { server_id: u64, socket_id: u64, data: Vec<u8> },
-    Pong { server_id: u64, socket_id: u64, data: Vec<u8> },
-    Error { server_id: u64, socket_id: u64, message: String },
+    Open {
+        server_id: u64,
+        socket_id: u64,
+        data: Option<JsonValue>,
+        remote_addr: Option<String>,
+    },
+    Message {
+        server_id: u64,
+        socket_id: u64,
+        data: Vec<u8>,
+        is_text: bool,
+    },
+    Close {
+        server_id: u64,
+        socket_id: u64,
+        code: u16,
+        reason: String,
+    },
+    Drain {
+        server_id: u64,
+        socket_id: u64,
+    },
+    Ping {
+        server_id: u64,
+        socket_id: u64,
+        data: Vec<u8>,
+    },
+    Pong {
+        server_id: u64,
+        socket_id: u64,
+        data: Vec<u8>,
+    },
+    Error {
+        server_id: u64,
+        socket_id: u64,
+        message: String,
+    },
 }
 
 /// Active server count - shared between event loop and HTTP extension
@@ -378,8 +408,6 @@ impl EventLoop {
     pub fn js_job_queue(&self) -> &Arc<JsJobQueue> {
         &self.js_jobs
     }
-
-
 
     /// Check if there are pending tasks that keep the loop alive
     pub fn has_pending_tasks(&self) -> bool {

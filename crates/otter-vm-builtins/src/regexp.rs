@@ -368,7 +368,9 @@ fn regexp_match_all(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<V
 
     // matchAll requires global flag
     if !flags.contains('g') {
-        return Err(VmError::type_error("matchAll must be called with a global RegExp"));
+        return Err(VmError::type_error(
+            "matchAll must be called with a global RegExp",
+        ));
     }
 
     let regex = build_regex(&pattern, &flags)?;

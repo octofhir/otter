@@ -7,12 +7,12 @@
 //! - `.transfer()`, `.transferToFixedLength(newLength)`, `.resize(newLength)` (ES2024)
 //! - `ArrayBuffer.isView(arg)` (static)
 
-use otter_vm_core::error::VmError;
 use otter_vm_core::array_buffer::JsArrayBuffer;
+use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
 use otter_vm_core::value::Value as VmValue;
-use otter_vm_runtime::{op_native_with_mm as op_native, Op};
+use otter_vm_runtime::{Op, op_native_with_mm as op_native};
 use std::sync::Arc;
 
 /// Get ArrayBuffer ops for extension registration

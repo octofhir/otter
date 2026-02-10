@@ -23,24 +23,24 @@
 //! - `object` - Object.prototype methods and Object static methods (ES2026)
 //! - `error` - Error.prototype and all error type prototypes with stack trace support (ES2026)
 
-pub mod helpers;
-pub mod date;
-pub mod string;
-pub mod number;
 pub mod array;
-pub mod function;
-pub mod boolean;
-pub mod symbol;
 pub mod bigint;
-pub mod temporal;
-pub mod math;
-pub mod json;
-pub mod reflect;
-pub mod map_set;
-pub mod regexp;
-pub mod promise;
-pub mod generator;
-pub mod typed_array;
-pub mod proxy;
-pub mod object;
+pub mod boolean;
+pub mod date;
 pub mod error;
+pub mod function;
+pub mod generator;
+pub mod helpers;
+pub mod json;
+pub mod map_set;
+pub mod math;
+pub mod number;
+pub mod object;
+pub mod promise;
+pub mod proxy;
+pub mod reflect;
+pub mod regexp;
+pub mod string;
+pub mod symbol;
+pub mod temporal;
+pub mod typed_array;

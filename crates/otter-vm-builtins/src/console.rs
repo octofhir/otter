@@ -423,7 +423,9 @@ fn format_object(obj: GcRef<JsObject>) -> String {
             let key_str = match key {
                 PropertyKey::String(s) => s.as_str().to_string(),
                 PropertyKey::Index(i) => i.to_string(),
-                PropertyKey::Symbol(s) => format!("[Symbol({})]", s.description.as_deref().unwrap_or("")),
+                PropertyKey::Symbol(s) => {
+                    format!("[Symbol({})]", s.description.as_deref().unwrap_or(""))
+                }
             };
             obj.get(key).map(|v| {
                 let value_str = if v.is_object() && !v.is_function() && !v.is_native_function() {

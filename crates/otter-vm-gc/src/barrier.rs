@@ -7,7 +7,7 @@
 //! - Card marking for generational GC
 
 use crate::object::{GcHeader, MarkColor};
-use parking_lot::Mutex;
+use std::cell::RefCell;
 use std::collections::HashSet;
 
 /// Size of a card in bytes (typically 512 bytes)
@@ -52,7 +52,7 @@ impl CardTable {
         if addr >= self.base && addr < self.base + self.size {
             let card_index = (addr - self.base) / CARD_SIZE;
             if card_index < self.cards.len() {
-                // Use atomic store for thread safety
+                // Use volatile store for visibility
                 // SAFETY: We're writing a single byte within bounds
                 unsafe {
                     let ptr = self.cards.as_ptr().add(card_index) as *mut u8;
@@ -106,7 +106,7 @@ impl CardTable {
 /// them and process during GC.
 pub struct WriteBarrierBuffer {
     /// Buffered objects that need to be re-scanned
-    entries: Mutex<Vec<*const GcHeader>>,
+    entries: RefCell<Vec<*const GcHeader>>,
     /// Maximum buffer size before flush
     max_size: usize,
 }
@@ -120,7 +120,7 @@ impl WriteBarrierBuffer {
     /// Create a new buffer with specific capacity
     pub fn with_capacity(max_size: usize) -> Self {
         Self {
-            entries: Mutex::new(Vec::with_capacity(max_size)),
+            entries: RefCell::new(Vec::with_capacity(max_size)),
             max_size,
         }
     }
@@ -129,25 +129,25 @@ impl WriteBarrierBuffer {
     ///
     /// Returns true if buffer is full and should be flushed
     pub fn push(&self, ptr: *const GcHeader) -> bool {
-        let mut entries = self.entries.lock();
+        let mut entries = self.entries.borrow_mut();
         entries.push(ptr);
         entries.len() >= self.max_size
     }
 
     /// Take all entries from the buffer
     pub fn drain(&self) -> Vec<*const GcHeader> {
-        let mut entries = self.entries.lock();
+        let mut entries = self.entries.borrow_mut();
         std::mem::take(&mut *entries)
     }
 
     /// Check if buffer is empty
     pub fn is_empty(&self) -> bool {
-        self.entries.lock().is_empty()
+        self.entries.borrow().is_empty()
     }
 
     /// Get number of entries
     pub fn len(&self) -> usize {
-        self.entries.lock().len()
+        self.entries.borrow().len()
     }
 }
 
@@ -157,7 +157,8 @@ impl Default for WriteBarrierBuffer {
     }
 }
 
-// SAFETY: WriteBarrierBuffer uses Mutex for internal synchronization
+// SAFETY: WriteBarrierBuffer is only accessed from the single VM thread.
+// Thread confinement is enforced at the VmRuntime/VmContext level.
 unsafe impl Send for WriteBarrierBuffer {}
 unsafe impl Sync for WriteBarrierBuffer {}
 
@@ -167,50 +168,50 @@ unsafe impl Sync for WriteBarrierBuffer {}
 /// during young generation collection.
 pub struct RememberedSet {
     /// Set of old-gen objects pointing to young-gen objects
-    entries: Mutex<HashSet<*const GcHeader>>,
+    entries: RefCell<HashSet<*const GcHeader>>,
 }
 
 impl RememberedSet {
     /// Create a new remembered set
     pub fn new() -> Self {
         Self {
-            entries: Mutex::new(HashSet::new()),
+            entries: RefCell::new(HashSet::new()),
         }
     }
 
     /// Add an entry to the remembered set
     pub fn add(&self, ptr: *const GcHeader) {
-        self.entries.lock().insert(ptr);
+        self.entries.borrow_mut().insert(ptr);
     }
 
     /// Remove an entry
     pub fn remove(&self, ptr: *const GcHeader) {
-        self.entries.lock().remove(&ptr);
+        self.entries.borrow_mut().remove(&ptr);
     }
 
     /// Check if contains entry
     pub fn contains(&self, ptr: *const GcHeader) -> bool {
-        self.entries.lock().contains(&ptr)
+        self.entries.borrow().contains(&ptr)
     }
 
     /// Get all entries as roots
     pub fn roots(&self) -> Vec<*const GcHeader> {
-        self.entries.lock().iter().copied().collect()
+        self.entries.borrow().iter().copied().collect()
     }
 
     /// Clear the set
     pub fn clear(&self) {
-        self.entries.lock().clear();
+        self.entries.borrow_mut().clear();
     }
 
     /// Number of entries
     pub fn len(&self) -> usize {
-        self.entries.lock().len()
+        self.entries.borrow().len()
     }
 
     /// Check if empty
     pub fn is_empty(&self) -> bool {
-        self.entries.lock().is_empty()
+        self.entries.borrow().is_empty()
     }
 }
 
@@ -220,7 +221,8 @@ impl Default for RememberedSet {
     }
 }
 
-// SAFETY: RememberedSet uses Mutex for internal synchronization
+// SAFETY: RememberedSet is only accessed from the single VM thread.
+// Thread confinement is enforced at the VmRuntime/VmContext level.
 unsafe impl Send for RememberedSet {}
 unsafe impl Sync for RememberedSet {}
 

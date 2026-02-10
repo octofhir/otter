@@ -111,18 +111,25 @@ impl Compiler {
         }
     }
 
-    fn check_identifier_early_error(&self, name: &str, context: IdentifierContext) -> CompileResult<()> {
+    fn check_identifier_early_error(
+        &self,
+        name: &str,
+        context: IdentifierContext,
+    ) -> CompileResult<()> {
         let is_strict =
             self.codegen.current.flags.is_strict || self.literal_validator.is_strict_mode();
         if is_strict {
             if name == "eval" || name == "arguments" {
                 let msg = match context {
-                    IdentifierContext::Declaration =>
-                        format!("Declaration of '{}' is not allowed in strict mode", name),
-                    IdentifierContext::Assignment =>
-                        format!("Assignment to '{}' is not allowed in strict mode", name),
-                    IdentifierContext::Parameter =>
-                        format!("Parameter name '{}' is not allowed in strict mode", name),
+                    IdentifierContext::Declaration => {
+                        format!("Declaration of '{}' is not allowed in strict mode", name)
+                    }
+                    IdentifierContext::Assignment => {
+                        format!("Assignment to '{}' is not allowed in strict mode", name)
+                    }
+                    IdentifierContext::Parameter => {
+                        format!("Parameter name '{}' is not allowed in strict mode", name)
+                    }
                 };
                 return Err(CompileError::Parse(msg));
             }
@@ -195,17 +202,17 @@ impl Compiler {
         self.compile_inner(source, source_url, false, strict_context)
     }
 
-    /// Compile source code as an ES module.
-    ///
-    /// Module mode enables top-level await and implicit strict mode.
-    /// Top-level `this` should be `undefined` (handled by the runtime, not the compiler).
-    pub fn compile_as_module(
-        self,
+    /// Comprehensive compilation method with all options.
+    pub fn compile_ext(
+        mut self,
         source: &str,
         source_url: &str,
+        eval_mode: bool,
+        is_esm: bool,
+        strict_context: bool,
     ) -> CompileResult<otter_vm_bytecode::Module> {
-        // Modules are always strict mode
-        self.compile_inner(source, source_url, true, true)
+        self.eval_mode = eval_mode;
+        self.compile_inner(source, source_url, is_esm, strict_context)
     }
 
     fn compile_inner(
@@ -446,7 +453,6 @@ impl Compiler {
 
     /// Recursively collect var-declared names from a single statement.
     fn hoist_var_declarations_from_stmt(&mut self, stmt: &Statement) -> CompileResult<()> {
-        
         match stmt {
             Statement::VariableDeclaration(decl) => {
                 if decl.kind == VariableDeclarationKind::Var {
@@ -955,7 +961,10 @@ impl Compiler {
                 for param in &func.params.items {
                     match &param.pattern {
                         BindingPattern::BindingIdentifier(ident) => {
-                            self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
+                            self.check_identifier_early_error(
+                                &ident.name,
+                                IdentifierContext::Parameter,
+                            )?;
                             let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                             self.codegen.current.param_count += 1;
                             if let Some(init) = &param.initializer {
@@ -969,7 +978,10 @@ impl Compiler {
                                     "Complex parameter patterns",
                                 ));
                             };
-                            self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
+                            self.check_identifier_early_error(
+                                &ident.name,
+                                IdentifierContext::Parameter,
+                            )?;
                             let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                             self.codegen.current.param_count += 1;
                             param_defaults.push((local_idx, &assign.right));
@@ -1852,9 +1864,7 @@ impl Compiler {
                 } else {
                     // Try to declare; if already pre-declared (e.g., by hoist_lexical_declarations),
                     // resolve the existing binding instead.
-                    let local_idx = match self
-                        .codegen
-                        .declare_variable_with_kind(&ident.name, kind)
+                    let local_idx = match self.codegen.declare_variable_with_kind(&ident.name, kind)
                     {
                         Ok(idx) => idx,
                         Err(_) => {
@@ -1883,7 +1893,8 @@ impl Compiler {
             }
             BindingPattern::ObjectPattern(obj_pattern) => {
                 // RequireObjectCoercible: throw if value is null or undefined
-                self.codegen.emit(Instruction::RequireCoercible { src: value_reg });
+                self.codegen
+                    .emit(Instruction::RequireCoercible { src: value_reg });
 
                 let has_rest = obj_pattern.rest.is_some();
                 let mut excluded_keys: Vec<Register> = Vec::new();
@@ -2022,7 +2033,8 @@ impl Compiler {
             }
             BindingPattern::ArrayPattern(arr_pattern) => {
                 // RequireObjectCoercible: throw if value is null or undefined
-                self.codegen.emit(Instruction::RequireCoercible { src: value_reg });
+                self.codegen
+                    .emit(Instruction::RequireCoercible { src: value_reg });
 
                 // Array destructuring via indexed access (GetElem).
                 // Per ES2023 §13.3.3.6 IteratorBindingInitialization.
@@ -2078,8 +2090,7 @@ impl Compiler {
                             });
                             self.codegen.free_reg(default_val);
 
-                            let patch_off =
-                                self.codegen.current_index() as i32 - jump_skip as i32;
+                            let patch_off = self.codegen.current_index() as i32 - jump_skip as i32;
                             self.codegen.patch_jump(jump_skip, patch_off);
 
                             // Bind the inner pattern
@@ -2122,11 +2133,7 @@ impl Compiler {
                     });
                     self.codegen.free_reg(frame);
 
-                    self.compile_binding_pattern(
-                        &rest_elem.argument,
-                        rest_reg,
-                        kind,
-                    )?;
+                    self.compile_binding_pattern(&rest_elem.argument, rest_reg, kind)?;
                     self.codegen.free_reg(rest_reg);
                 }
             }
@@ -3011,7 +3018,10 @@ impl Compiler {
                 for prop in &obj_target.properties {
                     match prop {
                         AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(ident) => {
-                            self.check_identifier_early_error(&ident.binding.name, IdentifierContext::Assignment)?;
+                            self.check_identifier_early_error(
+                                &ident.binding.name,
+                                IdentifierContext::Assignment,
+                            )?;
                             let key_idx = self.codegen.add_string(&ident.binding.name);
                             let prop_reg = self.codegen.alloc_reg();
                             let ic_index = self.codegen.alloc_ic();
@@ -3361,7 +3371,8 @@ impl Compiler {
                 if let Some(declarator) = decl.declarations.first() {
                     if declarator.init.is_some() {
                         return Err(CompileError::Parse(
-                            "for-in loop variable declaration may not have an initializer".to_string(),
+                            "for-in loop variable declaration may not have an initializer"
+                                .to_string(),
                         ));
                     }
                     self.compile_binding_init(&declarator.id, value_reg, is_const)?;
@@ -3371,7 +3382,9 @@ impl Compiler {
                 if let Some(target) = left.as_assignment_target() {
                     self.compile_assignment_target_init(target, value_reg)?;
                 } else {
-                    return Err(CompileError::unsupported("Unsupported for-in left-hand side"));
+                    return Err(CompileError::unsupported(
+                        "Unsupported for-in left-hand side",
+                    ));
                 }
             }
         }
@@ -3445,7 +3458,10 @@ impl Compiler {
             if let Some(param) = &handler.param {
                 match &param.pattern {
                     BindingPattern::BindingIdentifier(ident) => {
-                        self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
+                        self.check_identifier_early_error(
+                            &ident.name,
+                            IdentifierContext::Parameter,
+                        )?;
                         let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                         self.codegen.emit(Instruction::SetLocal {
                             idx: LocalIndex(local_idx),
@@ -3573,7 +3589,10 @@ impl Compiler {
                 BindingPattern::AssignmentPattern(assign) => {
                     has_non_simple_param = true;
                     if let BindingPattern::BindingIdentifier(ident) = &assign.left {
-                        self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
+                        self.check_identifier_early_error(
+                            &ident.name,
+                            IdentifierContext::Parameter,
+                        )?;
                         let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                         self.codegen.current.param_count += 1;
                         param_defaults.push((local_idx, &assign.right));
@@ -3606,8 +3625,9 @@ impl Compiler {
         }
 
         // Per ES2024 §15.1.1: simple params = no rest, no defaults, no destructuring
-        self.codegen.current.flags.has_simple_parameters =
-            !has_non_simple_param && param_defaults.is_empty() && !self.codegen.current.flags.has_rest;
+        self.codegen.current.flags.has_simple_parameters = !has_non_simple_param
+            && param_defaults.is_empty()
+            && !self.codegen.current.flags.has_rest;
 
         // Emit default parameter initializers (if arg === undefined).
         for (local_idx, default_expr) in param_defaults {
@@ -3775,7 +3795,10 @@ impl Compiler {
                 BindingPattern::AssignmentPattern(assign) => {
                     has_non_simple_param = true;
                     if let BindingPattern::BindingIdentifier(ident) = &assign.left {
-                        self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
+                        self.check_identifier_early_error(
+                            &ident.name,
+                            IdentifierContext::Parameter,
+                        )?;
                         let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                         self.codegen.current.param_count += 1;
                         param_defaults.push((local_idx, &assign.right));
@@ -3806,8 +3829,9 @@ impl Compiler {
         }
 
         // Per ES2024 §15.1.1: simple params = no rest, no defaults, no destructuring
-        self.codegen.current.flags.has_simple_parameters =
-            !has_non_simple_param && param_defaults.is_empty() && !self.codegen.current.flags.has_rest;
+        self.codegen.current.flags.has_simple_parameters = !has_non_simple_param
+            && param_defaults.is_empty()
+            && !self.codegen.current.flags.has_rest;
 
         // Emit default parameter initializers
         for (local_idx, default_expr) in param_defaults {
@@ -3980,7 +4004,10 @@ impl Compiler {
                 BindingPattern::AssignmentPattern(assign) => {
                     has_non_simple_param = true;
                     if let BindingPattern::BindingIdentifier(ident) = &assign.left {
-                        self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
+                        self.check_identifier_early_error(
+                            &ident.name,
+                            IdentifierContext::Parameter,
+                        )?;
                         let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                         self.codegen.current.param_count += 1;
                         param_defaults.push((local_idx, &assign.right));
@@ -4013,8 +4040,9 @@ impl Compiler {
         }
 
         // Per ES2024 §15.1.1: simple params = no rest, no defaults, no destructuring
-        self.codegen.current.flags.has_simple_parameters =
-            !has_non_simple_param && param_defaults.is_empty() && !self.codegen.current.flags.has_rest;
+        self.codegen.current.flags.has_simple_parameters = !has_non_simple_param
+            && param_defaults.is_empty()
+            && !self.codegen.current.flags.has_rest;
 
         // Emit default parameter initializers (if arg === undefined).
         for (local_idx, default_expr) in param_defaults {
@@ -4156,7 +4184,10 @@ impl Compiler {
                 BindingPattern::AssignmentPattern(assign) => {
                     has_non_simple_param = true;
                     if let BindingPattern::BindingIdentifier(ident) = &assign.left {
-                        self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
+                        self.check_identifier_early_error(
+                            &ident.name,
+                            IdentifierContext::Parameter,
+                        )?;
                         let local_idx = self.codegen.declare_variable(&ident.name, false)?;
                         self.codegen.current.param_count += 1;
                         param_defaults.push((local_idx, &assign.right));
@@ -4189,8 +4220,9 @@ impl Compiler {
         }
 
         // Per ES2024 §15.1.1: simple params = no rest, no defaults, no destructuring
-        self.codegen.current.flags.has_simple_parameters =
-            !has_non_simple_param && param_defaults.is_empty() && !self.codegen.current.flags.has_rest;
+        self.codegen.current.flags.has_simple_parameters = !has_non_simple_param
+            && param_defaults.is_empty()
+            && !self.codegen.current.flags.has_rest;
 
         // Emit default parameter initializers (if arg === undefined).
         for (local_idx, default_expr) in param_defaults {
@@ -4863,7 +4895,10 @@ impl Compiler {
                             return Ok(dst);
                         } else {
                             // First access: allocate an anonymous local for arguments
-                            let local_idx = self.codegen.current.scopes
+                            let local_idx = self
+                                .codegen
+                                .current
+                                .scopes
                                 .alloc_anonymous_local()
                                 .expect("no function scope for arguments");
                             let tmp = self.codegen.alloc_reg();
@@ -4914,7 +4949,10 @@ impl Compiler {
                             return Ok(dst);
                         } else {
                             // First access: allocate an anonymous local for arguments
-                            let local_idx = self.codegen.current.scopes
+                            let local_idx = self
+                                .codegen
+                                .current
+                                .scopes
                                 .alloc_anonymous_local()
                                 .expect("no function scope for arguments");
                             let tmp = self.codegen.alloc_reg();
@@ -5589,8 +5627,10 @@ impl Compiler {
                     r
                 };
                 let dst = self.codegen.alloc_reg();
-                self.codegen
-                    .emit(Instruction::CallEval { dst, code: code_reg });
+                self.codegen.emit(Instruction::CallEval {
+                    dst,
+                    code: code_reg,
+                });
                 self.codegen.free_reg(code_reg);
                 return Ok(dst);
             }
@@ -6995,7 +7035,9 @@ mod tests {
     #[test]
     fn test_compile_variable() {
         let compiler = Compiler::new();
-        let module = compiler.compile("let x = 10; x + 5", "test.js", false).unwrap();
+        let module = compiler
+            .compile("let x = 10; x + 5", "test.js", false)
+            .unwrap();
 
         assert_eq!(module.functions.len(), 1);
     }
@@ -7023,7 +7065,9 @@ mod tests {
     #[test]
     fn test_compile_const() {
         let compiler = Compiler::new();
-        let module = compiler.compile("const PI = 3.15;", "test.js", false).unwrap();
+        let module = compiler
+            .compile("const PI = 3.15;", "test.js", false)
+            .unwrap();
 
         assert_eq!(module.functions.len(), 1);
     }
@@ -7170,7 +7214,9 @@ mod tests {
     #[test]
     fn test_compile_array_literal() {
         let compiler = Compiler::new();
-        let module = compiler.compile("let arr = [1, 2, 3];", "test.js", false).unwrap();
+        let module = compiler
+            .compile("let arr = [1, 2, 3];", "test.js", false)
+            .unwrap();
 
         assert_eq!(module.functions.len(), 1);
     }
@@ -7219,7 +7265,11 @@ mod tests {
     fn test_compile_async_function() {
         let compiler = Compiler::new();
         let module = compiler
-            .compile("async function fetchData() { return 42; }", "test.js", false)
+            .compile(
+                "async function fetchData() { return 42; }",
+                "test.js",
+                false,
+            )
             .unwrap();
 
         assert_eq!(module.functions.len(), 2);
@@ -7296,7 +7346,11 @@ mod tests {
     fn test_compile_export_function() {
         let compiler = Compiler::new();
         let module = compiler
-            .compile("export function add(a, b) { return a + b; }", "test.js", false)
+            .compile(
+                "export function add(a, b) { return a + b; }",
+                "test.js",
+                false,
+            )
             .unwrap();
 
         assert!(module.is_esm);
@@ -7452,7 +7506,11 @@ mod tests {
     fn test_compile_ts_string_enum() {
         let compiler = Compiler::new();
         let module = compiler
-            .compile(r#"enum Direction { Up = "UP", Down = "DOWN" }"#, "test.ts", false)
+            .compile(
+                r#"enum Direction { Up = "UP", Down = "DOWN" }"#,
+                "test.ts",
+                false,
+            )
             .unwrap();
 
         assert_eq!(module.functions.len(), 1);
@@ -7476,7 +7534,11 @@ mod tests {
     fn test_compile_ts_generic_function() {
         let compiler = Compiler::new();
         let module = compiler
-            .compile("function identity<T>(x: T): T { return x; }", "test.ts", false)
+            .compile(
+                "function identity<T>(x: T): T { return x; }",
+                "test.ts",
+                false,
+            )
             .unwrap();
 
         assert_eq!(module.functions.len(), 2);
@@ -7500,7 +7562,11 @@ mod tests {
     fn test_compile_ts_namespace() {
         let compiler = Compiler::new();
         let module = compiler
-            .compile("namespace Utils { export const PI = 3.14; }", "test.ts", false)
+            .compile(
+                "namespace Utils { export const PI = 3.14; }",
+                "test.ts",
+                false,
+            )
             .unwrap();
 
         assert_eq!(module.functions.len(), 1);

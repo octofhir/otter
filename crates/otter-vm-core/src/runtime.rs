@@ -79,7 +79,7 @@ impl VmRuntime {
         // Create intrinsic %Function.prototype% FIRST, before any other objects.
         // Per ES2023 §10.3.1, every built-in function object must have this
         // as its [[Prototype]]. By creating it up-front, all native functions
-        // can receive it at construction time (BOA/V8/SpiderMonkey pattern).
+        // can receive it at construction time
         let function_prototype = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         function_prototype.mark_as_intrinsic();
         // Realm id for the default realm.

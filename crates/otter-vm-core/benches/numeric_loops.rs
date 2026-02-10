@@ -3,9 +3,9 @@
 //! Measures arithmetic operation performance with type feedback and quickening.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use otter_vm_bytecode::{Function, Instruction, Module, Register};
 use otter_vm_core::{GcRef, Interpreter, JsObject, MemoryManager, VmContext, value::Value};
+use std::hint::black_box;
 use std::sync::Arc;
 
 fn create_test_context() -> VmContext {
@@ -26,24 +26,39 @@ fn bench_int32_addition_loop(c: &mut Criterion) {
         .name("main")
         .feedback_vector_size(2)
         // r0 = sum, r1 = counter, r2 = limit, r3 = increment
-        .instruction(Instruction::LoadInt32 { dst: Register(0), value: 0 })  // sum = 0
-        .instruction(Instruction::LoadInt32 { dst: Register(1), value: 0 })  // i = 0
-        .instruction(Instruction::LoadInt32 { dst: Register(2), value: iterations as i32 })  // limit
-        .instruction(Instruction::LoadInt32 { dst: Register(3), value: 1 })  // increment
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(0),
+            value: 0,
+        }) // sum = 0
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(1),
+            value: 0,
+        }) // i = 0
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(2),
+            value: iterations as i32,
+        }) // limit
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(3),
+            value: 1,
+        }) // increment
         // Loop start (offset 4):
-        .instruction(Instruction::Add {  // sum += 1
+        .instruction(Instruction::Add {
+            // sum += 1
             dst: Register(0),
             lhs: Register(0),
             rhs: Register(3),
             feedback_index: 0,
         })
-        .instruction(Instruction::Add {  // i += 1
+        .instruction(Instruction::Add {
+            // i += 1
             dst: Register(1),
             lhs: Register(1),
             rhs: Register(3),
             feedback_index: 1,
         })
-        .instruction(Instruction::Lt {  // i < limit
+        .instruction(Instruction::Lt {
+            // i < limit
             dst: Register(4),
             lhs: Register(1),
             rhs: Register(2),
@@ -79,25 +94,46 @@ fn bench_int32_multiplication_loop(c: &mut Criterion) {
     let func = Function::builder()
         .name("main")
         .feedback_vector_size(3)
-        .instruction(Instruction::LoadInt32 { dst: Register(0), value: 1 })  // val = 1
-        .instruction(Instruction::LoadInt32 { dst: Register(1), value: 0 })  // i = 0
-        .instruction(Instruction::LoadInt32 { dst: Register(2), value: iterations as i32 })  // limit
-        .instruction(Instruction::LoadInt32 { dst: Register(3), value: 2 })  // multiplier
-        .instruction(Instruction::LoadInt32 { dst: Register(4), value: 1 })  // increment
-        .instruction(Instruction::LoadInt32 { dst: Register(5), value: 1000 })  // modulo
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(0),
+            value: 1,
+        }) // val = 1
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(1),
+            value: 0,
+        }) // i = 0
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(2),
+            value: iterations as i32,
+        }) // limit
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(3),
+            value: 2,
+        }) // multiplier
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(4),
+            value: 1,
+        }) // increment
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(5),
+            value: 1000,
+        }) // modulo
         // Loop start (offset 6):
-        .instruction(Instruction::Mul {  // val *= 2
+        .instruction(Instruction::Mul {
+            // val *= 2
             dst: Register(0),
             lhs: Register(0),
             rhs: Register(3),
             feedback_index: 0,
         })
-        .instruction(Instruction::Mod {  // val %= 1000 (keep it bounded)
+        .instruction(Instruction::Mod {
+            // val %= 1000 (keep it bounded)
             dst: Register(0),
             lhs: Register(0),
             rhs: Register(5),
         })
-        .instruction(Instruction::Add {  // i += 1
+        .instruction(Instruction::Add {
+            // i += 1
             dst: Register(1),
             lhs: Register(1),
             rhs: Register(4),
@@ -137,41 +173,61 @@ fn bench_mixed_arithmetic(c: &mut Criterion) {
     let func = Function::builder()
         .name("main")
         .feedback_vector_size(4)
-        .instruction(Instruction::LoadInt32 { dst: Register(0), value: 0 })  // sum
-        .instruction(Instruction::LoadInt32 { dst: Register(1), value: 0 })  // i
-        .instruction(Instruction::LoadInt32 { dst: Register(2), value: iterations as i32 })  // limit
-        .instruction(Instruction::LoadInt32 { dst: Register(3), value: 1 })  // 1
-        .instruction(Instruction::LoadInt32 { dst: Register(4), value: 2 })  // 2
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(0),
+            value: 0,
+        }) // sum
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(1),
+            value: 0,
+        }) // i
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(2),
+            value: iterations as i32,
+        }) // limit
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(3),
+            value: 1,
+        }) // 1
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(4),
+            value: 2,
+        }) // 2
         // Loop start (offset 5):
-        .instruction(Instruction::Add {  // temp = i + 1
+        .instruction(Instruction::Add {
+            // temp = i + 1
             dst: Register(5),
             lhs: Register(1),
             rhs: Register(3),
             feedback_index: 0,
         })
-        .instruction(Instruction::Mul {  // temp = temp * 2
+        .instruction(Instruction::Mul {
+            // temp = temp * 2
             dst: Register(5),
             lhs: Register(5),
             rhs: Register(4),
             feedback_index: 1,
         })
-        .instruction(Instruction::Sub {  // temp = temp - 1
+        .instruction(Instruction::Sub {
+            // temp = temp - 1
             dst: Register(5),
             lhs: Register(5),
             rhs: Register(3),
             feedback_index: 2,
         })
-        .instruction(Instruction::Add {  // sum += temp
+        .instruction(Instruction::Add {
+            // sum += temp
             dst: Register(0),
             lhs: Register(0),
             rhs: Register(5),
             feedback_index: 3,
         })
-        .instruction(Instruction::Add {  // i += 1
+        .instruction(Instruction::Add {
+            // i += 1
             dst: Register(1),
             lhs: Register(1),
             rhs: Register(3),
-            feedback_index: 0,  // Reuse slot
+            feedback_index: 0, // Reuse slot
         })
         .instruction(Instruction::Lt {
             dst: Register(6),
@@ -208,10 +264,22 @@ fn bench_quickened_add_i32(c: &mut Criterion) {
     let func = Function::builder()
         .name("main")
         .feedback_vector_size(2)
-        .instruction(Instruction::LoadInt32 { dst: Register(0), value: 0 })
-        .instruction(Instruction::LoadInt32 { dst: Register(1), value: 0 })
-        .instruction(Instruction::LoadInt32 { dst: Register(2), value: iterations as i32 })
-        .instruction(Instruction::LoadInt32 { dst: Register(3), value: 1 })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(0),
+            value: 0,
+        })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(1),
+            value: 0,
+        })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(2),
+            value: iterations as i32,
+        })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(3),
+            value: 1,
+        })
         // Loop using quickened AddI32:
         .instruction(Instruction::AddI32 {
             dst: Register(0),

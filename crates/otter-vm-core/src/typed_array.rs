@@ -138,7 +138,11 @@ impl JsTypedArray {
         memory_manager: Arc<MemoryManager>,
     ) -> Self {
         let byte_length = length * kind.element_size();
-        let buffer = GcRef::new(JsArrayBuffer::new(byte_length, None, memory_manager.clone()));
+        let buffer = GcRef::new(JsArrayBuffer::new(
+            byte_length,
+            None,
+            memory_manager.clone(),
+        ));
         let proto_value = prototype.map(Value::object).unwrap_or_else(Value::null);
         let object = GcRef::new(JsObject::new(proto_value, memory_manager));
         Self {

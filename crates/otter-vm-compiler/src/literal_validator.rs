@@ -1,8 +1,8 @@
 //! Literal validation for ECMAScript compliance
 
 use crate::error::{CompileError, CompileResult};
-use oxc_ast::ast::{NumericLiteral, RegExpLiteral, StringLiteral, TemplateLiteral};
 use oxc_allocator::Allocator;
+use oxc_ast::ast::{NumericLiteral, RegExpLiteral, StringLiteral, TemplateLiteral};
 use oxc_regular_expression::{LiteralParser, Options as RegExpOptions};
 
 /// ECMAScript version for validation
@@ -462,8 +462,9 @@ impl LiteralValidator {
                                 position += 2; // two hex digits
                             }
                             'u' => {
-                                let consumed = self.validate_unicode_escape_sequence(&mut chars).map_err(|e| {
-                                    match e {
+                                let consumed = self
+                                    .validate_unicode_escape_sequence(&mut chars)
+                                    .map_err(|e| match e {
                                         CompileError::InvalidLiteral { message, .. } => {
                                             CompileError::invalid_literal(
                                                 message,
@@ -472,8 +473,7 @@ impl LiteralValidator {
                                             )
                                         }
                                         other => other,
-                                    }
-                                })?;
+                                    })?;
                                 position += consumed;
                             }
                             '0'..='7' => {
@@ -499,7 +499,7 @@ impl LiteralValidator {
                                         start_pos + position as u32,
                                         start_pos + position as u32 + 1,
                                     ));
-                                } 
+                                }
                                 // In non-strict mode, consume the octal digits
                                 self.consume_octal_digits(&mut chars);
                             }

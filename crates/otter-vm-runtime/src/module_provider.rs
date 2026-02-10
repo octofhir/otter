@@ -8,8 +8,10 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 /// Module type for resolution
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModuleType {
     /// ECMAScript module (import/export)
     ESM,
@@ -31,7 +33,7 @@ pub enum MediaType {
 }
 
 /// Resolution result from a module provider
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleResolution {
     /// Canonical URL for the module (e.g., "builtin://node:fs")
     pub url: String,

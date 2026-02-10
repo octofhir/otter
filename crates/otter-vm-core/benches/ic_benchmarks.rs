@@ -3,9 +3,9 @@
 //! Measures property access performance across different IC states.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use otter_vm_bytecode::{ConstantIndex, Function, Instruction, Module, Register};
 use otter_vm_core::{GcRef, Interpreter, JsObject, MemoryManager, VmContext, value::Value};
+use std::hint::black_box;
 use std::sync::Arc;
 
 fn create_test_context() -> VmContext {
@@ -25,22 +25,29 @@ fn bench_monomorphic_property_access(c: &mut Criterion) {
 
     let iterations = 1000u32;
 
-    let mut func_builder = Function::builder()
-        .name("main")
-        .feedback_vector_size(2);
+    let mut func_builder = Function::builder().name("main").feedback_vector_size(2);
 
     // r0 = new object, r1 = counter, r2 = limit, r3 = temp value
     func_builder = func_builder
         .instruction(Instruction::NewObject { dst: Register(0) })
-        .instruction(Instruction::LoadInt32 { dst: Register(1), value: 42 })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(1),
+            value: 42,
+        })
         .instruction(Instruction::SetPropConst {
             obj: Register(0),
             name: ConstantIndex(0),
             val: Register(1),
             ic_index: 0,
         })
-        .instruction(Instruction::LoadInt32 { dst: Register(1), value: 0 }) // counter
-        .instruction(Instruction::LoadInt32 { dst: Register(2), value: iterations as i32 }); // limit
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(1),
+            value: 0,
+        }) // counter
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(2),
+            value: iterations as i32,
+        }); // limit
 
     // Loop: get property and increment counter
     // offset 5: loop start
@@ -51,7 +58,10 @@ fn bench_monomorphic_property_access(c: &mut Criterion) {
             name: ConstantIndex(0),
             ic_index: 1,
         })
-        .instruction(Instruction::LoadInt32 { dst: Register(4), value: 1 })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(4),
+            value: 1,
+        })
         .instruction(Instruction::Add {
             dst: Register(1),
             lhs: Register(1),
@@ -94,9 +104,7 @@ fn bench_polymorphic_property_access(c: &mut Criterion) {
     builder.constants_mut().add_string("a");
     builder.constants_mut().add_string("b");
 
-    let mut func_builder = Function::builder()
-        .name("main")
-        .feedback_vector_size(5);
+    let mut func_builder = Function::builder().name("main").feedback_vector_size(5);
 
     // Create 3 objects with different shapes
     // obj1: {x: 1}
@@ -105,7 +113,10 @@ fn bench_polymorphic_property_access(c: &mut Criterion) {
     func_builder = func_builder
         // obj1 = {x: 1}
         .instruction(Instruction::NewObject { dst: Register(0) })
-        .instruction(Instruction::LoadInt32 { dst: Register(10), value: 1 })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(10),
+            value: 1,
+        })
         .instruction(Instruction::SetPropConst {
             obj: Register(0),
             name: ConstantIndex(0), // x
@@ -114,14 +125,20 @@ fn bench_polymorphic_property_access(c: &mut Criterion) {
         })
         // obj2 = {a: 0, x: 2}
         .instruction(Instruction::NewObject { dst: Register(1) })
-        .instruction(Instruction::LoadInt32 { dst: Register(10), value: 0 })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(10),
+            value: 0,
+        })
         .instruction(Instruction::SetPropConst {
             obj: Register(1),
             name: ConstantIndex(1), // a
             val: Register(10),
             ic_index: 1,
         })
-        .instruction(Instruction::LoadInt32 { dst: Register(10), value: 2 })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(10),
+            value: 2,
+        })
         .instruction(Instruction::SetPropConst {
             obj: Register(1),
             name: ConstantIndex(0), // x
@@ -130,14 +147,20 @@ fn bench_polymorphic_property_access(c: &mut Criterion) {
         })
         // obj3 = {b: 0, x: 3}
         .instruction(Instruction::NewObject { dst: Register(2) })
-        .instruction(Instruction::LoadInt32 { dst: Register(10), value: 0 })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(10),
+            value: 0,
+        })
         .instruction(Instruction::SetPropConst {
             obj: Register(2),
             name: ConstantIndex(2), // b
             val: Register(10),
             ic_index: 3,
         })
-        .instruction(Instruction::LoadInt32 { dst: Register(10), value: 3 })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(10),
+            value: 3,
+        })
         .instruction(Instruction::SetPropConst {
             obj: Register(2),
             name: ConstantIndex(0), // x
@@ -148,9 +171,18 @@ fn bench_polymorphic_property_access(c: &mut Criterion) {
     // Now read x from all three objects 100 times
     // This forces polymorphic IC state
     func_builder = func_builder
-        .instruction(Instruction::LoadInt32 { dst: Register(5), value: 0 })  // counter
-        .instruction(Instruction::LoadInt32 { dst: Register(6), value: 100 }) // limit
-        .instruction(Instruction::LoadInt32 { dst: Register(7), value: 0 });  // accumulator
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(5),
+            value: 0,
+        }) // counter
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(6),
+            value: 100,
+        }) // limit
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(7),
+            value: 0,
+        }); // accumulator
 
     // Loop start at offset 18
     func_builder = func_builder
@@ -190,7 +222,10 @@ fn bench_polymorphic_property_access(c: &mut Criterion) {
             rhs: Register(8),
             feedback_index: 0,
         })
-        .instruction(Instruction::LoadInt32 { dst: Register(9), value: 1 })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(9),
+            value: 1,
+        })
         .instruction(Instruction::Add {
             dst: Register(5),
             lhs: Register(5),
@@ -229,14 +264,18 @@ fn bench_property_set(c: &mut Criterion) {
 
     let iterations = 100u32;
 
-    let mut func_builder = Function::builder()
-        .name("main")
-        .feedback_vector_size(1);
+    let mut func_builder = Function::builder().name("main").feedback_vector_size(1);
 
     func_builder = func_builder
         .instruction(Instruction::NewObject { dst: Register(0) })
-        .instruction(Instruction::LoadInt32 { dst: Register(1), value: 0 })
-        .instruction(Instruction::LoadInt32 { dst: Register(2), value: iterations as i32 });
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(1),
+            value: 0,
+        })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(2),
+            value: iterations as i32,
+        });
 
     // Loop: set property
     func_builder = func_builder
@@ -246,7 +285,10 @@ fn bench_property_set(c: &mut Criterion) {
             val: Register(1),
             ic_index: 0,
         })
-        .instruction(Instruction::LoadInt32 { dst: Register(3), value: 1 })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(3),
+            value: 1,
+        })
         .instruction(Instruction::Add {
             dst: Register(1),
             lhs: Register(1),

@@ -48,10 +48,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 // Re-export GC types from otter-vm-gc
-pub use otter_vm_gc::{
-    Allocator as GcAllocator, Collector as GcCollector, GcConfig, GcHeader, GcHeap, GcObject,
-    GcStats,
-};
+pub use otter_vm_gc::{GcHeader, GcObject};
 
 /// Trait for types that can be traced by the GC
 pub trait Trace {
@@ -924,7 +921,10 @@ mod tests {
             let scope = HandleScope::new(&mut ctx);
             let handle = scope.root_value(Value::int32(42));
             assert_eq!(
-                scope.context().get_root_slot(handle.slot_index()).as_int32(),
+                scope
+                    .context()
+                    .get_root_slot(handle.slot_index())
+                    .as_int32(),
                 Some(42)
             );
         }
@@ -1191,7 +1191,11 @@ mod tests {
         // The handle ensures the object stays alive
 
         // Verify the object is still accessible through the handle
-        if let Some(val) = scope.context().get_root_slot(handle.slot_index()).as_object() {
+        if let Some(val) = scope
+            .context()
+            .get_root_slot(handle.slot_index())
+            .as_object()
+        {
             assert_eq!(val.get(&"important".into()), Some(Value::int32(999)));
         } else {
             panic!("Expected object value in handle");

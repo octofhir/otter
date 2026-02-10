@@ -3,14 +3,22 @@
 //! Implements [`ModuleProvider`] to handle `node:` protocol imports
 //! and bare Node.js module specifiers (e.g., `fs`, `path`).
 
-use crate::{get_builtin_source, is_builtin};
+use crate::{NodeApiProfile, get_builtin_source_for_profile, is_builtin_for_profile};
 use otter_vm_runtime::module_provider::ModuleType;
 use otter_vm_runtime::{MediaType, ModuleProvider, ModuleResolution, ModuleSource};
 
 /// Provider for Node.js built-in modules.
 ///
 /// Handles both prefixed (`node:fs`) and bare (`fs`) specifiers.
-pub struct NodeModuleProvider;
+pub struct NodeModuleProvider {
+    profile: NodeApiProfile,
+}
+
+impl NodeModuleProvider {
+    fn new(profile: NodeApiProfile) -> Self {
+        Self { profile }
+    }
+}
 
 impl ModuleProvider for NodeModuleProvider {
     fn protocol(&self) -> &str {
@@ -22,7 +30,7 @@ impl ModuleProvider for NodeModuleProvider {
         let name = specifier.strip_prefix("node:").unwrap_or(specifier);
 
         // Check if it's a known Node.js builtin
-        if is_builtin(name) {
+        if is_builtin_for_profile(name, self.profile) {
             return Some(ModuleResolution {
                 url: format!("builtin://node:{}", name),
                 module_type: ModuleType::ESM,
@@ -37,7 +45,7 @@ impl ModuleProvider for NodeModuleProvider {
         let name = url.strip_prefix("builtin://node:")?;
 
         // Get the source code for this builtin
-        let code = get_builtin_source(name)?;
+        let code = get_builtin_source_for_profile(name, self.profile)?;
 
         Some(ModuleSource {
             code: code.to_string(),
@@ -55,7 +63,19 @@ impl ModuleProvider for NodeModuleProvider {
 /// module_loader.register_provider(provider);
 /// ```
 pub fn create_nodejs_provider() -> std::sync::Arc<dyn ModuleProvider> {
-    std::sync::Arc::new(NodeModuleProvider)
+    create_nodejs_provider_for_profile(NodeApiProfile::Full)
+}
+
+/// Create a Node.js module provider for the embedded-safe profile.
+pub fn create_nodejs_safe_provider() -> std::sync::Arc<dyn ModuleProvider> {
+    create_nodejs_provider_for_profile(NodeApiProfile::SafeCore)
+}
+
+/// Create a Node.js module provider for a specific profile.
+pub fn create_nodejs_provider_for_profile(
+    profile: NodeApiProfile,
+) -> std::sync::Arc<dyn ModuleProvider> {
+    std::sync::Arc::new(NodeModuleProvider::new(profile))
 }
 
 #[cfg(test)]
@@ -64,7 +84,7 @@ mod tests {
 
     #[test]
     fn test_resolve_prefixed() {
-        let provider = NodeModuleProvider;
+        let provider = NodeModuleProvider::new(NodeApiProfile::Full);
 
         // Should resolve "node:fs"
         let res = provider.resolve("node:fs", "");
@@ -74,7 +94,7 @@ mod tests {
 
     #[test]
     fn test_resolve_bare() {
-        let provider = NodeModuleProvider;
+        let provider = NodeModuleProvider::new(NodeApiProfile::Full);
 
         // Should resolve "path" (bare specifier)
         let res = provider.resolve("path", "");
@@ -84,7 +104,7 @@ mod tests {
 
     #[test]
     fn test_resolve_unknown() {
-        let provider = NodeModuleProvider;
+        let provider = NodeModuleProvider::new(NodeApiProfile::Full);
 
         // Should NOT resolve unknown modules
         let res = provider.resolve("./local_file.js", "");
@@ -96,11 +116,18 @@ mod tests {
 
     #[test]
     fn test_load() {
-        let provider = NodeModuleProvider;
+        let provider = NodeModuleProvider::new(NodeApiProfile::Full);
 
         // Should load "builtin://node:path"
         let source = provider.load("builtin://node:path");
         assert!(source.is_some());
         assert!(source.unwrap().code.contains("export"));
+    }
+
+    #[test]
+    fn test_safe_profile_blocks_process() {
+        let provider = NodeModuleProvider::new(NodeApiProfile::SafeCore);
+        let res = provider.resolve("node:process", "");
+        assert!(res.is_none());
     }
 }

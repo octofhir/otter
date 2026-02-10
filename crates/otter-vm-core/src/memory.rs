@@ -232,7 +232,8 @@ impl MemoryManager {
         self.allocated.store(live_bytes, Ordering::Relaxed);
         // Update cached threshold
         let new_threshold = usize::max(MIN_GC_THRESHOLD, live_bytes.saturating_mul(2));
-        self.cached_gc_threshold.store(new_threshold, Ordering::Relaxed);
+        self.cached_gc_threshold
+            .store(new_threshold, Ordering::Relaxed);
     }
 
     /// Set the allocation count threshold

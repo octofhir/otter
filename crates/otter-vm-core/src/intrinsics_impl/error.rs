@@ -4,10 +4,10 @@
 
 use crate::error::VmError;
 use crate::gc::GcRef;
+use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
-use crate::memory::MemoryManager;
 use std::sync::Arc;
 
 /// Initialize Error.prototype and all error type prototypes
@@ -39,10 +39,7 @@ pub fn init_error_prototypes(
     );
 
     // Mark as Error prototype for stack trace capture
-    let _ = error_proto.set(
-        PropertyKey::string("__is_error__"),
-        Value::boolean(true),
-    );
+    let _ = error_proto.set(PropertyKey::string("__is_error__"), Value::boolean(true));
 
     // Error.prototype.toString
     error_proto.define_property(
@@ -111,17 +108,23 @@ pub fn init_error_prototypes(
                         if let Some(frames_val) = frames {
                             if let Some(frames_arr) = frames_val.as_object() {
                                 // Get array length
-                                if let Some(len_val) = frames_arr.get(&PropertyKey::string("length")) {
+                                if let Some(len_val) =
+                                    frames_arr.get(&PropertyKey::string("length"))
+                                {
                                     if let Some(len) = len_val.as_number() {
                                         for i in 0..(len as u32) {
-                                            if let Some(frame_val) = frames_arr.get(&PropertyKey::Index(i)) {
+                                            if let Some(frame_val) =
+                                                frames_arr.get(&PropertyKey::Index(i))
+                                            {
                                                 if let Some(frame) = frame_val.as_object() {
                                                     // Extract frame details
                                                     let func = frame
                                                         .get(&PropertyKey::string("function"))
                                                         .and_then(|v| v.as_string())
                                                         .map(|s| s.as_str().to_string())
-                                                        .unwrap_or_else(|| "<anonymous>".to_string());
+                                                        .unwrap_or_else(|| {
+                                                            "<anonymous>".to_string()
+                                                        });
                                                     let file = frame
                                                         .get(&PropertyKey::string("file"))
                                                         .and_then(|v| v.as_string())
@@ -199,17 +202,18 @@ pub fn init_error_prototypes(
             ),
         );
         // Mark as Error prototype for stack trace capture
-        let _ = proto.set(
-            PropertyKey::string("__is_error__"),
-            Value::boolean(true),
-        );
+        let _ = proto.set(PropertyKey::string("__is_error__"), Value::boolean(true));
     }
 }
 
 /// Create Error constructor function
 pub fn create_error_constructor(
     error_name: &'static str,
-) -> Box<dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync> {
+) -> Box<
+    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
+        + Send
+        + Sync,
+> {
     Box::new(move |this, args, _ncx_inner| {
         // Set properties on `this` (the new object created by Construct
         // which already has the correct ErrorType.prototype)

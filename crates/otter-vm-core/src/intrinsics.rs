@@ -4,7 +4,7 @@
 //! intrinsic objects (constructors, prototypes) and well-known symbols.
 //! It is created once per `VmRuntime` and shared across contexts.
 //!
-//! The initialization follows a two-stage pattern (inspired by Boa):
+//! The initialization follows a two-stage pattern:
 //! 1. **Stage 1**: Allocate empty prototype/constructor objects to break circular deps
 //! 2. **Stage 2**: Initialize properties in dependency order using `BuiltInBuilder`
 

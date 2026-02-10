@@ -7,7 +7,9 @@ use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
 use otter_vm_runtime::{Op, op_native};
 use temporal_rs::Instant;
-use temporal_rs::options::{DisplayCalendar, DisplayOffset, DisplayTimeZone, ToStringRoundingOptions};
+use temporal_rs::options::{
+    DisplayCalendar, DisplayOffset, DisplayTimeZone, ToStringRoundingOptions,
+};
 use temporal_rs::provider::COMPILED_TZ_PROVIDER;
 
 pub fn ops() -> Vec<Op> {
@@ -25,10 +27,7 @@ pub fn ops() -> Vec<Op> {
             "__Temporal_Instant_fromEpochNanoseconds",
             instant_from_epoch_nanoseconds,
         ),
-        op_native(
-            "__Temporal_Instant_epochSeconds",
-            instant_epoch_seconds,
-        ),
+        op_native("__Temporal_Instant_epochSeconds", instant_epoch_seconds),
         op_native(
             "__Temporal_Instant_epochMilliseconds",
             instant_epoch_milliseconds,
@@ -253,7 +252,11 @@ fn instant_equals(args: &[Value]) -> Result<Value, VmError> {
 fn instant_to_string(args: &[Value]) -> Result<Value, VmError> {
     let instant = parse_instant(args)?;
     let s = instant
-        .to_ixdtf_string_with_provider(None, ToStringRoundingOptions::default(), &*COMPILED_TZ_PROVIDER)
+        .to_ixdtf_string_with_provider(
+            None,
+            ToStringRoundingOptions::default(),
+            &*COMPILED_TZ_PROVIDER,
+        )
         .map_err(|e| VmError::type_error(format!("Instant toString error: {e}")))?;
     Ok(Value::string(JsString::intern(&s)))
 }
@@ -265,8 +268,11 @@ fn instant_to_json(args: &[Value]) -> Result<Value, VmError> {
 fn instant_to_zoned_date_time_iso(args: &[Value]) -> Result<Value, VmError> {
     let instant = parse_instant(args)?;
     let tz = if let Some(tz_str) = args.get(1).and_then(|v| v.as_string()) {
-        temporal_rs::TimeZone::try_from_identifier_str_with_provider(tz_str.as_str(), &*COMPILED_TZ_PROVIDER)
-            .map_err(|e| VmError::type_error(format!("Invalid timezone: {e}")))?
+        temporal_rs::TimeZone::try_from_identifier_str_with_provider(
+            tz_str.as_str(),
+            &*COMPILED_TZ_PROVIDER,
+        )
+        .map_err(|e| VmError::type_error(format!("Invalid timezone: {e}")))?
     } else {
         temporal_rs::Temporal::now()
             .time_zone_with_provider(&*COMPILED_TZ_PROVIDER)

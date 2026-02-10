@@ -1969,16 +1969,56 @@ impl VmContext {
         tables
     }
 
-    /// Trigger GC if allocation threshold is exceeded
+    /// Trigger GC if allocation threshold is exceeded.
     ///
-    /// Returns true if a collection was performed.
+    /// Uses incremental marking when possible: starts marking, then processes
+    /// a budget of gray objects per safepoint. Falls back to full STW collection
+    /// when ephemeron tables are present (fixpoint requires complete worklist).
+    ///
+    /// Returns true if GC work was performed.
     pub fn maybe_collect_garbage(&self) -> bool {
-        if self.memory_manager.should_collect_garbage() {
-            self.collect_garbage();
-            true
-        } else {
-            false
+        /// Budget: number of objects to mark per incremental step (~50-100μs)
+        const MARKING_BUDGET: usize = 1000;
+
+        let registry = otter_vm_gc::global_registry();
+
+        // If incremental marking is in progress, do a step
+        if registry.is_marking() {
+            let done = registry.incremental_mark_step(MARKING_BUDGET);
+            if done {
+                let _reclaimed = registry.finish_gc();
+                let live_bytes = registry.total_bytes();
+                self.memory_manager.on_gc_complete(live_bytes);
+            }
+            return true;
         }
+
+        // Check if we should start a new GC cycle
+        if self.memory_manager.should_collect_garbage() {
+            let roots = self.collect_gc_roots();
+            let ephemeron_tables = self.collect_ephemeron_tables();
+
+            if ephemeron_tables.is_empty() {
+                // Start incremental marking
+                registry.start_incremental_gc(&roots);
+                // Do first step immediately
+                let done = registry.incremental_mark_step(MARKING_BUDGET);
+                if done {
+                    let _reclaimed = registry.finish_gc();
+                    let live_bytes = registry.total_bytes();
+                    self.memory_manager.on_gc_complete(live_bytes);
+                }
+            } else {
+                // Ephemerons: full STW (fixpoint needs complete worklist)
+                let table_refs: Vec<_> = ephemeron_tables.iter().map(|t| t.as_ref()).collect();
+                registry.collect_with_ephemerons(&roots, &table_refs);
+                let live_bytes = registry.total_bytes();
+                self.memory_manager.on_gc_complete(live_bytes);
+            }
+            return true;
+        }
+
+        false
     }
 
     /// Request an explicit GC cycle

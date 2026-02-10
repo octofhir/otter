@@ -84,7 +84,9 @@ fn native_proxy_revocable(
     let _ = result.set(
         "revoke".into(),
         VmValue::native_function(
-            move |_this: &VmValue, _args: &[VmValue], _ncx: &mut otter_vm_core::context::NativeContext<'_>| {
+            move |_this: &VmValue,
+                  _args: &[VmValue],
+                  _ncx: &mut otter_vm_core::context::NativeContext<'_>| {
                 revoke_fn();
                 Ok(VmValue::undefined())
             },
@@ -108,7 +110,9 @@ fn native_proxy_get_target(
 
     match proxy.target() {
         Some(target) => Ok(target),
-        None => Err(VmError::type_error("Cannot perform operation on a revoked proxy")),
+        None => Err(VmError::type_error(
+            "Cannot perform operation on a revoked proxy",
+        )),
     }
 }
 
@@ -125,7 +129,9 @@ fn native_proxy_get_handler(
 
     match proxy.handler() {
         Some(handler) => Ok(handler),
-        None => Err(VmError::type_error("Cannot perform operation on a revoked proxy")),
+        None => Err(VmError::type_error(
+            "Cannot perform operation on a revoked proxy",
+        )),
     }
 }
 

@@ -3,8 +3,8 @@
 //! Provides DataView constructor and methods for arbitrary byte-order access
 //! to ArrayBuffer data.
 
-use otter_vm_core::error::VmError;
 use otter_vm_core::data_view::JsDataView;
+use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory;
 use otter_vm_core::value::{BigInt, HeapRef, Value as VmValue};
@@ -81,8 +81,8 @@ fn native_data_view_create(
         }
     });
 
-    let dv = JsDataView::new(ab, byte_offset, byte_length)
-        .map_err(|e| format!("RangeError: {}", e))?;
+    let dv =
+        JsDataView::new(ab, byte_offset, byte_length).map_err(|e| format!("RangeError: {}", e))?;
 
     Ok(VmValue::data_view(GcRef::new(dv)))
 }
@@ -151,7 +151,9 @@ fn native_data_view_get_int8(
 
     let byte_offset = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
 
-    let value = dv.get_int8(byte_offset).map_err(|e| format!("RangeError: {}", e))?;
+    let value = dv
+        .get_int8(byte_offset)
+        .map_err(|e| format!("RangeError: {}", e))?;
     Ok(VmValue::number(value as f64))
 }
 
@@ -167,7 +169,9 @@ fn native_data_view_get_uint8(
 
     let byte_offset = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
 
-    let value = dv.get_uint8(byte_offset).map_err(|e| format!("RangeError: {}", e))?;
+    let value = dv
+        .get_uint8(byte_offset)
+        .map_err(|e| format!("RangeError: {}", e))?;
     Ok(VmValue::number(value as f64))
 }
 

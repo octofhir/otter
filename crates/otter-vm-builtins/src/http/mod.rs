@@ -11,7 +11,7 @@ mod request;
 mod server;
 mod service;
 
-use otter_vm_runtime::{ActiveServerCount, HttpEvent, WsEvent, Op, op_async, op_sync};
+use otter_vm_runtime::{ActiveServerCount, HttpEvent, Op, WsEvent, op_async, op_sync};
 use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,7 +32,11 @@ pub fn ops(
     ws_event_tx: mpsc::UnboundedSender<WsEvent>,
     active_count: ActiveServerCount,
 ) -> Vec<Op> {
-    let manager = Arc::new(HttpServerManager::new(event_tx.clone(), ws_event_tx.clone(), active_count));
+    let manager = Arc::new(HttpServerManager::new(
+        event_tx.clone(),
+        ws_event_tx.clone(),
+        active_count,
+    ));
     let manager_create = Arc::clone(&manager);
     let manager_stop = Arc::clone(&manager);
     let manager_info = Arc::clone(&manager);
@@ -150,7 +154,9 @@ pub fn ops(
             async move {
                 match request::read_request_body(req_id).await {
                     Some(body) => Ok(JsonValue::Array(
-                        body.into_iter().map(|b| JsonValue::Number(b.into())).collect(),
+                        body.into_iter()
+                            .map(|b| JsonValue::Number(b.into()))
+                            .collect(),
                     )),
                     None => Err(format!("Request {} not found", req_id)),
                 }
@@ -219,13 +225,9 @@ pub fn ops(
                 .and_then(|v| v.as_object())
                 .map(json_headers_to_map)
                 .unwrap_or_default();
-            let data = args
-                .get(3)
-                .filter(|v| !v.is_null())
-                .cloned();
+            let data = args.get(3).filter(|v| !v.is_null()).cloned();
 
-            let success = manager_ws_upgrade
-                .upgrade_websocket(server_id, req_id, headers, data)?;
+            let success = manager_ws_upgrade.upgrade_websocket(server_id, req_id, headers, data)?;
             Ok(json!(success))
         }),
         // __http_ws_send(socketId, data, isText) -> status
@@ -356,10 +358,7 @@ fn parse_server_options(args: &[JsonValue]) -> Result<ServerOptions, String> {
         });
     }
 
-    let port = args
-        .first()
-        .and_then(|v| v.as_u64())
-        .unwrap_or(3000) as u16;
+    let port = args.first().and_then(|v| v.as_u64()).unwrap_or(3000) as u16;
     let hostname = args
         .get(1)
         .and_then(|v| v.as_str())
@@ -452,8 +451,7 @@ fn parse_pem_value(value: &JsonValue) -> Result<String, String> {
                     .iter()
                     .filter_map(|v| v.as_u64().map(|b| b as u8))
                     .collect();
-                let text = String::from_utf8(bytes)
-                    .map_err(|_| "Invalid PEM bytes".to_string())?;
+                let text = String::from_utf8(bytes).map_err(|_| "Invalid PEM bytes".to_string())?;
                 return Ok(text);
             }
 

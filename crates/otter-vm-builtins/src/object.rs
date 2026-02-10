@@ -159,7 +159,6 @@ fn to_property_key(value: &VmValue) -> PropertyKey {
     PropertyKey::String(JsString::intern(s))
 }
 
-
 /// Object.is(value1, value2) - SameValue algorithm
 fn native_object_is(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
     let v1 = args.first().cloned().unwrap_or(VmValue::undefined());
@@ -310,7 +309,10 @@ mod tests {
 }
 
 /// Object rest helper: copy own enumerable properties from source excluding keys in excluded_keys_array
-fn native_object_rest(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
+fn native_object_rest(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, VmError> {
     let source = args.first().ok_or("Object rest requires a source object")?;
     let excluded_keys_val = args
         .get(1)
@@ -497,7 +499,9 @@ fn native_object_entries(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmV
 
 /// Object.assign(target, ...sources) - native implementation
 fn native_object_assign(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
-    let target_val = args.get(0).ok_or("Object.assign requires at least one argument")?;
+    let target_val = args
+        .get(0)
+        .ok_or("Object.assign requires at least one argument")?;
     let target = target_val
         .as_object()
         .ok_or("Object.assign target must be an object")?;

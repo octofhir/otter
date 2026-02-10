@@ -33,11 +33,10 @@ pub use extension::{
 };
 pub use microtask::MicrotaskQueue;
 pub use module_loader::{
-    LoadedModule, ModuleError, ModuleLoader, ModuleNamespace, ModuleState, ModuleType,
-    module_extension,
+    LoadedModule, ModuleError, ModuleLoader, ModuleNamespace, ModuleState, module_extension,
 };
 pub use module_provider::{
-    MediaType, ModuleProvider, ModuleResolution, ModuleSource, ProviderRegistry,
+    MediaType, ModuleProvider, ModuleResolution, ModuleSource, ModuleType, ProviderRegistry,
 };
 pub use otter_runtime::{Otter, OtterError};
 

@@ -4,7 +4,9 @@ use otter_vm_core::value::Value;
 use otter_vm_core::{VmError, string::JsString};
 use otter_vm_runtime::{Op, op_native};
 use temporal_rs::Temporal;
-use temporal_rs::options::{DisplayCalendar, DisplayOffset, DisplayTimeZone, ToStringRoundingOptions};
+use temporal_rs::options::{
+    DisplayCalendar, DisplayOffset, DisplayTimeZone, ToStringRoundingOptions,
+};
 use temporal_rs::provider::COMPILED_TZ_PROVIDER;
 
 pub fn ops() -> Vec<Op> {
@@ -84,7 +86,8 @@ fn now_plain_time_iso(_args: &[Value]) -> Result<Value, VmError> {
         .plain_time_with_provider(None, &*COMPILED_TZ_PROVIDER)
         .map_err(|e| VmError::type_error(format!("Failed to get time: {:?}", e)))?;
 
-    let s = time.to_ixdtf_string(ToStringRoundingOptions::default())
+    let s = time
+        .to_ixdtf_string(ToStringRoundingOptions::default())
         .map_err(|e| VmError::type_error(format!("Failed to format: {:?}", e)))?;
 
     Ok(Value::string(JsString::intern(&s)))

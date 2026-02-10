@@ -7,11 +7,11 @@
 //! Target: GC pause < 10ms for 1MB heap
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use otter_vm_core::VmContext;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::memory::MemoryManager;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::value::Value;
-use otter_vm_core::VmContext;
 use std::hint::black_box;
 use std::sync::Arc;
 

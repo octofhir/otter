@@ -3,8 +3,8 @@
 //! Provides process.env, process.cwd(), process.exit(), etc.
 //! Note: process.env uses existing __env_* ops from otter_runtime.
 
-use otter_vm_runtime::extension::{op_sync, Op};
-use serde_json::{json, Value as JsonValue};
+use otter_vm_runtime::extension::{Op, op_sync};
+use serde_json::{Value as JsonValue, json};
 
 /// Create process native operations
 pub fn process_ops() -> Vec<Op> {

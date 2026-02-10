@@ -1,6 +1,9 @@
 //! Symbol constructor and prototype implementation
 
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use crate::context::NativeContext;
 use crate::error::VmError;
@@ -215,9 +218,8 @@ pub fn install_symbol_statics(
 }
 
 /// Create Symbol constructor function (callable, not constructable).
-pub fn create_symbol_constructor(
-) -> Box<dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync>
-{
+pub fn create_symbol_constructor()
+-> Box<dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync> {
     Box::new(|_this, args, ncx| {
         if ncx.is_construct() {
             return Err(VmError::type_error("Symbol is not a constructor"));

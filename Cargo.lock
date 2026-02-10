@@ -2110,6 +2110,7 @@ dependencies = [
  "otter-vm-gc",
  "oxc_resolver",
  "parking_lot",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

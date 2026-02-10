@@ -65,7 +65,9 @@ fn test_multiple_promise_chains() {
 fn test_microtask_in_eval_in_context() {
     // eval_in_context should also drain microtasks
     let mut otter = Otter::new();
-    let mut ctx = otter.create_test_context().expect("Failed to create context");
+    let mut ctx = otter
+        .create_test_context()
+        .expect("Failed to create context");
 
     // Set up a variable in the context
     let setup = otter.eval_in_context(&mut ctx, "let result = 0;");
@@ -79,12 +81,20 @@ fn test_microtask_in_eval_in_context() {
         "#,
     );
 
-    assert!(exec.is_ok(), "Promise setup should succeed: {:?}", exec.as_ref().err());
+    assert!(
+        exec.is_ok(),
+        "Promise setup should succeed: {:?}",
+        exec.as_ref().err()
+    );
 
     // Check the value after microtasks have been drained
     let check = otter.eval_in_context(&mut ctx, "result;");
 
-    assert!(check.is_ok(), "Check should succeed: {:?}", check.as_ref().err());
+    assert!(
+        check.is_ok(),
+        "Check should succeed: {:?}",
+        check.as_ref().err()
+    );
     let value = check.unwrap();
     assert_eq!(
         value.as_number(),
@@ -153,7 +163,10 @@ fn test_empty_microtask_queue() {
     let mut otter = Otter::new();
     let result = otter.eval_sync("let x = 42; x;");
 
-    assert!(result.is_ok(), "eval_sync should succeed without microtasks");
+    assert!(
+        result.is_ok(),
+        "eval_sync should succeed without microtasks"
+    );
     let value = result.unwrap();
     assert_eq!(value.as_number(), Some(42.0));
 }

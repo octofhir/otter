@@ -10,12 +10,21 @@ pub fn ops() -> Vec<Op> {
     vec![
         op_native("__Temporal_PlainMonthDay_from", plain_month_day_from),
         op_native("__Temporal_PlainMonthDay_month", plain_month_day_month),
-        op_native("__Temporal_PlainMonthDay_monthCode", plain_month_day_month_code),
+        op_native(
+            "__Temporal_PlainMonthDay_monthCode",
+            plain_month_day_month_code,
+        ),
         op_native("__Temporal_PlainMonthDay_day", plain_month_day_day),
         op_native("__Temporal_PlainMonthDay_equals", plain_month_day_equals),
-        op_native("__Temporal_PlainMonthDay_toString", plain_month_day_to_string),
+        op_native(
+            "__Temporal_PlainMonthDay_toString",
+            plain_month_day_to_string,
+        ),
         op_native("__Temporal_PlainMonthDay_toJSON", plain_month_day_to_json),
-        op_native("__Temporal_PlainMonthDay_toPlainDate", plain_month_day_to_plain_date),
+        op_native(
+            "__Temporal_PlainMonthDay_toPlainDate",
+            plain_month_day_to_plain_date,
+        ),
     ]
 }
 
@@ -41,7 +50,10 @@ fn plain_month_day_from(args: &[Value]) -> Result<Value, VmError> {
 
     match parse_month_day(s.as_str()) {
         Some(md) => Ok(Value::string(JsString::intern(&format_month_day(&md)))),
-        None => Err(VmError::type_error(format!("Invalid PlainMonthDay string: {}", s))),
+        None => Err(VmError::type_error(format!(
+            "Invalid PlainMonthDay string: {}",
+            s
+        ))),
     }
 }
 
@@ -65,7 +77,8 @@ fn plain_month_day_day(args: &[Value]) -> Result<Value, VmError> {
 
 fn plain_month_day_equals(args: &[Value]) -> Result<Value, VmError> {
     let md1 = get_month_day(args);
-    let md2 = args.get(1)
+    let md2 = args
+        .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_month_day(s.as_str()));
 
@@ -93,7 +106,8 @@ fn plain_month_day_to_plain_date(args: &[Value]) -> Result<Value, VmError> {
 
     let fields = CalendarFields::new().with_year(year);
 
-    let date = md.to_plain_date(Some(fields))
+    let date = md
+        .to_plain_date(Some(fields))
         .map_err(|e| VmError::type_error(format!("toPlainDate failed: {:?}", e)))?;
 
     let s = date.to_ixdtf_string(DisplayCalendar::Auto);

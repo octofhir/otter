@@ -69,8 +69,14 @@ unsafe impl<T: Send + Sync> Sync for ObjectCell<T> {}
 impl<T: std::fmt::Debug> std::fmt::Debug for ObjectCell<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.value.try_borrow() {
-            Ok(value) => f.debug_struct("ObjectCell").field("value", &*value).finish(),
-            Err(_) => f.debug_struct("ObjectCell").field("value", &"<borrowed>").finish(),
+            Ok(value) => f
+                .debug_struct("ObjectCell")
+                .field("value", &*value)
+                .finish(),
+            Err(_) => f
+                .debug_struct("ObjectCell")
+                .field("value", &"<borrowed>")
+                .finish(),
         }
     }
 }

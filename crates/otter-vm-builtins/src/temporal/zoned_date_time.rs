@@ -4,7 +4,10 @@ use otter_vm_core::value::Value;
 use otter_vm_core::{VmError, string::JsString};
 use otter_vm_runtime::{Op, op_native};
 use temporal_rs::ZonedDateTime;
-use temporal_rs::options::{Disambiguation, DisplayCalendar, DisplayOffset, DisplayTimeZone, OffsetDisambiguation, ToStringRoundingOptions};
+use temporal_rs::options::{
+    Disambiguation, DisplayCalendar, DisplayOffset, DisplayTimeZone, OffsetDisambiguation,
+    ToStringRoundingOptions,
+};
 use temporal_rs::provider::COMPILED_TZ_PROVIDER;
 
 pub fn ops() -> Vec<Op> {
@@ -17,24 +20,66 @@ pub fn ops() -> Vec<Op> {
         op_native("__Temporal_ZonedDateTime_hour", zoned_date_time_hour),
         op_native("__Temporal_ZonedDateTime_minute", zoned_date_time_minute),
         op_native("__Temporal_ZonedDateTime_second", zoned_date_time_second),
-        op_native("__Temporal_ZonedDateTime_millisecond", zoned_date_time_millisecond),
-        op_native("__Temporal_ZonedDateTime_microsecond", zoned_date_time_microsecond),
-        op_native("__Temporal_ZonedDateTime_nanosecond", zoned_date_time_nanosecond),
-        op_native("__Temporal_ZonedDateTime_timeZoneId", zoned_date_time_timezone_id),
+        op_native(
+            "__Temporal_ZonedDateTime_millisecond",
+            zoned_date_time_millisecond,
+        ),
+        op_native(
+            "__Temporal_ZonedDateTime_microsecond",
+            zoned_date_time_microsecond,
+        ),
+        op_native(
+            "__Temporal_ZonedDateTime_nanosecond",
+            zoned_date_time_nanosecond,
+        ),
+        op_native(
+            "__Temporal_ZonedDateTime_timeZoneId",
+            zoned_date_time_timezone_id,
+        ),
         op_native("__Temporal_ZonedDateTime_offset", zoned_date_time_offset),
-        op_native("__Temporal_ZonedDateTime_epochSeconds", zoned_date_time_epoch_seconds),
-        op_native("__Temporal_ZonedDateTime_epochMilliseconds", zoned_date_time_epoch_milliseconds),
-        op_native("__Temporal_ZonedDateTime_epochNanoseconds", zoned_date_time_epoch_nanoseconds),
+        op_native(
+            "__Temporal_ZonedDateTime_epochSeconds",
+            zoned_date_time_epoch_seconds,
+        ),
+        op_native(
+            "__Temporal_ZonedDateTime_epochMilliseconds",
+            zoned_date_time_epoch_milliseconds,
+        ),
+        op_native(
+            "__Temporal_ZonedDateTime_epochNanoseconds",
+            zoned_date_time_epoch_nanoseconds,
+        ),
         op_native("__Temporal_ZonedDateTime_add", zoned_date_time_add),
-        op_native("__Temporal_ZonedDateTime_subtract", zoned_date_time_subtract),
-        op_native("__Temporal_ZonedDateTime_withTimeZone", zoned_date_time_with_timezone),
+        op_native(
+            "__Temporal_ZonedDateTime_subtract",
+            zoned_date_time_subtract,
+        ),
+        op_native(
+            "__Temporal_ZonedDateTime_withTimeZone",
+            zoned_date_time_with_timezone,
+        ),
         op_native("__Temporal_ZonedDateTime_equals", zoned_date_time_equals),
-        op_native("__Temporal_ZonedDateTime_toString", zoned_date_time_to_string),
+        op_native(
+            "__Temporal_ZonedDateTime_toString",
+            zoned_date_time_to_string,
+        ),
         op_native("__Temporal_ZonedDateTime_toJSON", zoned_date_time_to_json),
-        op_native("__Temporal_ZonedDateTime_toInstant", zoned_date_time_to_instant),
-        op_native("__Temporal_ZonedDateTime_toPlainDateTime", zoned_date_time_to_plain_date_time),
-        op_native("__Temporal_ZonedDateTime_toPlainDate", zoned_date_time_to_plain_date),
-        op_native("__Temporal_ZonedDateTime_toPlainTime", zoned_date_time_to_plain_time),
+        op_native(
+            "__Temporal_ZonedDateTime_toInstant",
+            zoned_date_time_to_instant,
+        ),
+        op_native(
+            "__Temporal_ZonedDateTime_toPlainDateTime",
+            zoned_date_time_to_plain_date_time,
+        ),
+        op_native(
+            "__Temporal_ZonedDateTime_toPlainDate",
+            zoned_date_time_to_plain_date,
+        ),
+        op_native(
+            "__Temporal_ZonedDateTime_toPlainTime",
+            zoned_date_time_to_plain_time,
+        ),
     ]
 }
 
@@ -43,7 +88,8 @@ fn parse_zoned_date_time(s: &str) -> Option<ZonedDateTime> {
         s.as_bytes(),
         Disambiguation::Compatible,
         OffsetDisambiguation::Reject,
-    ).ok()
+    )
+    .ok()
 }
 
 fn get_zoned_date_time(args: &[Value]) -> Option<ZonedDateTime> {
@@ -59,7 +105,8 @@ fn format_zoned_date_time(zdt: &ZonedDateTime) -> String {
         DisplayCalendar::Auto,
         ToStringRoundingOptions::default(),
         &*COMPILED_TZ_PROVIDER,
-    ).unwrap_or_else(|_| format!("{:?}", zdt))
+    )
+    .unwrap_or_else(|_| format!("{:?}", zdt))
 }
 
 fn zoned_date_time_from(args: &[Value]) -> Result<Value, VmError> {
@@ -69,14 +116,20 @@ fn zoned_date_time_from(args: &[Value]) -> Result<Value, VmError> {
         .ok_or(VmError::type_error("ZonedDateTime.from requires a string"))?;
 
     match parse_zoned_date_time(s.as_str()) {
-        Some(zdt) => Ok(Value::string(JsString::intern(&format_zoned_date_time(&zdt)))),
-        None => Err(VmError::type_error(format!("Invalid ZonedDateTime string: {}", s))),
+        Some(zdt) => Ok(Value::string(JsString::intern(&format_zoned_date_time(
+            &zdt,
+        )))),
+        None => Err(VmError::type_error(format!(
+            "Invalid ZonedDateTime string: {}",
+            s
+        ))),
     }
 }
 
 fn zoned_date_time_compare(args: &[Value]) -> Result<Value, VmError> {
     let zdt1 = get_zoned_date_time(args);
-    let zdt2 = args.get(1)
+    let zdt2 = args
+        .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_zoned_date_time(s.as_str()));
 
@@ -179,63 +232,87 @@ fn zoned_date_time_epoch_milliseconds(args: &[Value]) -> Result<Value, VmError> 
 
 fn zoned_date_time_epoch_nanoseconds(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
-        .map(|zdt| Value::string(JsString::intern(&zdt.epoch_nanoseconds().as_i128().to_string())))
+        .map(|zdt| {
+            Value::string(JsString::intern(
+                &zdt.epoch_nanoseconds().as_i128().to_string(),
+            ))
+        })
         .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
 
 fn zoned_date_time_add(args: &[Value]) -> Result<Value, VmError> {
     let zdt = get_zoned_date_time(args).ok_or(VmError::type_error("Invalid ZonedDateTime"))?;
-    let duration_str = args.get(1)
+    let duration_str = args
+        .get(1)
         .and_then(|v| v.as_string())
         .ok_or(VmError::type_error("Duration required"))?;
 
     let duration = temporal_rs::Duration::from_utf8(duration_str.as_str().as_bytes())
         .map_err(|e| VmError::type_error(format!("Invalid duration: {:?}", e)))?;
 
-    let new_zdt = zdt.add_with_provider(&duration, None, &*COMPILED_TZ_PROVIDER)
+    let new_zdt = zdt
+        .add_with_provider(&duration, None, &*COMPILED_TZ_PROVIDER)
         .map_err(|e| VmError::type_error(format!("Add failed: {:?}", e)))?;
 
-    Ok(Value::string(JsString::intern(&format_zoned_date_time(&new_zdt))))
+    Ok(Value::string(JsString::intern(&format_zoned_date_time(
+        &new_zdt,
+    ))))
 }
 
 fn zoned_date_time_subtract(args: &[Value]) -> Result<Value, VmError> {
     let zdt = get_zoned_date_time(args).ok_or(VmError::type_error("Invalid ZonedDateTime"))?;
-    let duration_str = args.get(1)
+    let duration_str = args
+        .get(1)
         .and_then(|v| v.as_string())
         .ok_or(VmError::type_error("Duration required"))?;
 
     let duration = temporal_rs::Duration::from_utf8(duration_str.as_str().as_bytes())
         .map_err(|e| VmError::type_error(format!("Invalid duration: {:?}", e)))?;
 
-    let new_zdt = zdt.subtract_with_provider(&duration, None, &*COMPILED_TZ_PROVIDER)
+    let new_zdt = zdt
+        .subtract_with_provider(&duration, None, &*COMPILED_TZ_PROVIDER)
         .map_err(|e| VmError::type_error(format!("Subtract failed: {:?}", e)))?;
 
-    Ok(Value::string(JsString::intern(&format_zoned_date_time(&new_zdt))))
+    Ok(Value::string(JsString::intern(&format_zoned_date_time(
+        &new_zdt,
+    ))))
 }
 
 fn zoned_date_time_with_timezone(args: &[Value]) -> Result<Value, VmError> {
     let zdt = get_zoned_date_time(args).ok_or(VmError::type_error("Invalid ZonedDateTime"))?;
-    let new_tz_str = args.get(1)
+    let new_tz_str = args
+        .get(1)
         .and_then(|v| v.as_string())
-        .ok_or(VmError::type_error("withTimeZone requires a timezone string"))?;
+        .ok_or(VmError::type_error(
+            "withTimeZone requires a timezone string",
+        ))?;
 
-    let new_tz = temporal_rs::TimeZone::try_from_str_with_provider(new_tz_str.as_str(), &*COMPILED_TZ_PROVIDER)
-        .map_err(|e| VmError::type_error(format!("Invalid timezone: {:?}", e)))?;
+    let new_tz = temporal_rs::TimeZone::try_from_str_with_provider(
+        new_tz_str.as_str(),
+        &*COMPILED_TZ_PROVIDER,
+    )
+    .map_err(|e| VmError::type_error(format!("Invalid timezone: {:?}", e)))?;
 
-    let new_zdt = zdt.with_timezone(new_tz)
+    let new_zdt = zdt
+        .with_timezone(new_tz)
         .map_err(|e| VmError::type_error(format!("withTimeZone failed: {:?}", e)))?;
 
-    Ok(Value::string(JsString::intern(&format_zoned_date_time(&new_zdt))))
+    Ok(Value::string(JsString::intern(&format_zoned_date_time(
+        &new_zdt,
+    ))))
 }
 
 fn zoned_date_time_equals(args: &[Value]) -> Result<Value, VmError> {
     let zdt1 = get_zoned_date_time(args);
-    let zdt2 = args.get(1)
+    let zdt2 = args
+        .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_zoned_date_time(s.as_str()));
 
     match (zdt1, zdt2) {
-        (Some(a), Some(b)) => Ok(Value::boolean(a.epoch_nanoseconds() == b.epoch_nanoseconds())),
+        (Some(a), Some(b)) => Ok(Value::boolean(
+            a.epoch_nanoseconds() == b.epoch_nanoseconds(),
+        )),
         _ => Ok(Value::boolean(false)),
     }
 }
@@ -254,7 +331,9 @@ fn zoned_date_time_to_instant(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
         .map(|zdt| {
             let instant = zdt.to_instant();
-            Value::string(JsString::intern(&instant.epoch_nanoseconds().as_i128().to_string()))
+            Value::string(JsString::intern(
+                &instant.epoch_nanoseconds().as_i128().to_string(),
+            ))
         })
         .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))
 }
@@ -263,7 +342,8 @@ fn zoned_date_time_to_plain_date_time(args: &[Value]) -> Result<Value, VmError> 
     get_zoned_date_time(args)
         .map(|zdt| {
             let dt = zdt.to_plain_date_time();
-            let s = dt.to_ixdtf_string(ToStringRoundingOptions::default(), DisplayCalendar::Auto)
+            let s = dt
+                .to_ixdtf_string(ToStringRoundingOptions::default(), DisplayCalendar::Auto)
                 .unwrap_or_else(|_| format!("{:?}", dt));
             Value::string(JsString::intern(&s))
         })
@@ -284,7 +364,8 @@ fn zoned_date_time_to_plain_time(args: &[Value]) -> Result<Value, VmError> {
     get_zoned_date_time(args)
         .and_then(|zdt| {
             let time = zdt.to_plain_time();
-            time.to_ixdtf_string(ToStringRoundingOptions::default()).ok()
+            time.to_ixdtf_string(ToStringRoundingOptions::default())
+                .ok()
         })
         .map(|s| Value::string(JsString::intern(&s)))
         .ok_or_else(|| VmError::type_error("Invalid ZonedDateTime"))

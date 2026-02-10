@@ -2,8 +2,8 @@
 //!
 //! All operations are gated by fs_read/fs_write capabilities.
 
-use otter_vm_runtime::extension::{op_async, op_sync, Op};
-use serde_json::{json, Value as JsonValue};
+use otter_vm_runtime::extension::{Op, op_async, op_sync};
+use serde_json::{Value as JsonValue, json};
 use std::fs;
 use std::path::Path;
 

@@ -37,7 +37,10 @@ pub enum PromiseState {
 impl PromiseState {
     /// Check if settled (fulfilled or rejected)
     pub fn is_settled(&self) -> bool {
-        !matches!(self, PromiseState::Pending | PromiseState::PendingThenable(_))
+        !matches!(
+            self,
+            PromiseState::Pending | PromiseState::PendingThenable(_)
+        )
     }
 }
 
@@ -632,9 +635,8 @@ impl JsPromise {
                 let self_ptr = promise.as_ref() as *const JsPromise;
                 if std::ptr::eq(inner.as_ptr(), self_ptr) {
                     drop(state);
-                    let error = Value::string(JsString::intern(
-                        "TypeError: Promise cannot resolve itself",
-                    ));
+                    let error =
+                        Value::string(JsString::intern("TypeError: Promise cannot resolve itself"));
                     Self::reject_from_thenable_with_js_jobs(promise, error, enqueue);
                     return;
                 }
@@ -839,10 +841,8 @@ mod tests {
 
     #[test]
     fn test_with_resolvers() {
-        let resolvers = JsPromise::with_resolvers(
-            Arc::new(crate::memory::MemoryManager::test()),
-            |_, _| {},
-        );
+        let resolvers =
+            JsPromise::with_resolvers(Arc::new(crate::memory::MemoryManager::test()), |_, _| {});
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
 
@@ -858,10 +858,8 @@ mod tests {
 
     #[test]
     fn test_with_resolvers_reject() {
-        let resolvers = JsPromise::with_resolvers(
-            Arc::new(crate::memory::MemoryManager::test()),
-            |_, _| {},
-        );
+        let resolvers =
+            JsPromise::with_resolvers(Arc::new(crate::memory::MemoryManager::test()), |_, _| {});
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
 

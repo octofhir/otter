@@ -310,7 +310,9 @@ fn number_to_fixed(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Va
     let digits = get_arg_int(args, 1).unwrap_or(0) as usize;
 
     if digits > 100 {
-        return Err(VmError::type_error("toFixed() digits argument must be between 0 and 100"));
+        return Err(VmError::type_error(
+            "toFixed() digits argument must be between 0 and 100",
+        ));
     }
 
     if num.is_nan() {
@@ -351,9 +353,9 @@ fn number_to_exponential(
     }
 
     match fraction_digits {
-        Some(digits) if !(0..=100).contains(&digits) => {
-            Err(VmError::range_error("toExponential() argument must be between 0 and 100"))
-        }
+        Some(digits) if !(0..=100).contains(&digits) => Err(VmError::range_error(
+            "toExponential() argument must be between 0 and 100",
+        )),
         Some(digits) => Ok(Value::string(JsString::intern(&format!(
             "{:.precision$e}",
             num,
@@ -381,9 +383,9 @@ fn number_to_precision(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Resul
 
     match precision {
         None => Ok(Value::string(JsString::intern(&num.to_string()))),
-        Some(p) if !(1..=100).contains(&p) => {
-            Err(VmError::range_error("toPrecision() argument must be between 1 and 100"))
-        }
+        Some(p) if !(1..=100).contains(&p) => Err(VmError::range_error(
+            "toPrecision() argument must be between 1 and 100",
+        )),
         Some(p) => {
             let p = p as usize;
             if num == 0.0 {
@@ -422,7 +424,9 @@ fn number_to_string(args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<V
     let radix = get_arg_int(args, 1).unwrap_or(10) as u32;
 
     if !(2..=36).contains(&radix) {
-        return Err(VmError::type_error("toString() radix must be between 2 and 36"));
+        return Err(VmError::type_error(
+            "toString() radix must be between 2 and 36",
+        ));
     }
 
     if num.is_nan() {

@@ -2,9 +2,9 @@
 //!
 //! Pure path utilities, no I/O.
 
-use otter_vm_runtime::extension::{op_sync, Op};
-use serde_json::{json, Value as JsonValue};
-use std::path::{Path, PathBuf, MAIN_SEPARATOR};
+use otter_vm_runtime::extension::{Op, op_sync};
+use serde_json::{Value as JsonValue, json};
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 
 /// Create path native operations
 pub fn path_ops() -> Vec<Op> {

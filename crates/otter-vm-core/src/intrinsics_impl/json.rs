@@ -162,13 +162,13 @@ fn escape_json_string_utf16(units: &[u16]) -> String {
     while i < units.len() {
         let code = units[i];
         match code {
-            0x22 => result.push_str("\\\""),       // "
-            0x5C => result.push_str("\\\\"),       // \
-            0x0A => result.push_str("\\n"),        // \n
-            0x0D => result.push_str("\\r"),        // \r
-            0x09 => result.push_str("\\t"),        // \t
-            0x08 => result.push_str("\\b"),        // \b
-            0x0C => result.push_str("\\f"),        // \f
+            0x22 => result.push_str("\\\""), // "
+            0x5C => result.push_str("\\\\"), // \
+            0x0A => result.push_str("\\n"),  // \n
+            0x0D => result.push_str("\\r"),  // \r
+            0x09 => result.push_str("\\t"),  // \t
+            0x08 => result.push_str("\\b"),  // \b
+            0x0C => result.push_str("\\f"),  // \f
             c if c < 0x20 => result.push_str(&format!("\\u{:04x}", c)),
             // High surrogate
             c if (0xD800..=0xDBFF).contains(&c) => {
@@ -424,7 +424,9 @@ fn unwrap_primitive(value: &Value) -> Value {
         // Check for __value__ (Number and Boolean wrapper - both use __value__)
         if let Some(prim) = obj.get(&PropertyKey::string("__value__")) {
             // Could be Number or Boolean
-            if prim.as_number().is_some() || prim.as_int32().is_some() || prim.as_boolean().is_some()
+            if prim.as_number().is_some()
+                || prim.as_int32().is_some()
+                || prim.as_boolean().is_some()
             {
                 return prim;
             }
@@ -443,7 +445,10 @@ fn unwrap_primitive(value: &Value) -> Value {
 fn unwrap_primitive_with_calls(value: &Value, ncx: &mut NativeContext) -> Result<Value, VmError> {
     if let Some(obj) = value.as_object() {
         // Check for [[StringData]] (String wrapper) - call ToString
-        if obj.get(&PropertyKey::string("__primitiveValue__")).is_some() {
+        if obj
+            .get(&PropertyKey::string("__primitiveValue__"))
+            .is_some()
+        {
             if let Some(to_string) = obj.get(&PropertyKey::string("toString")) {
                 if to_string.is_callable() {
                     return ncx.call_function(&to_string, value.clone(), &[]);
@@ -506,9 +511,7 @@ fn serialize_value_simple(
 
     // BigInt should have been handled by toJSON or should throw
     if value.is_bigint() {
-        return Err(VmError::type_error(
-            "Do not know how to serialize a BigInt",
-        ));
+        return Err(VmError::type_error("Do not know how to serialize a BigInt"));
     }
 
     // Boolean
@@ -526,7 +529,10 @@ fn serialize_value_simple(
 
     // String - use UTF-16 escaping to preserve lone surrogates
     if let Some(s) = value.as_string() {
-        return Ok(Some(format!("\"{}\"", escape_json_string_utf16(s.as_utf16()))));
+        return Ok(Some(format!(
+            "\"{}\"",
+            escape_json_string_utf16(s.as_utf16())
+        )));
     }
 
     // Check for array (including proxy arrays)
@@ -581,7 +587,15 @@ fn serialize_array_simple(
             .unwrap_or(Value::undefined());
         let elem = unwrap_primitive(&elem);
         let elem_key = i.to_string();
-        match serialize_value_simple(&elem, &elem_key, indent, property_list, tracker, depth + 1, ncx)? {
+        match serialize_value_simple(
+            &elem,
+            &elem_key,
+            indent,
+            property_list,
+            tracker,
+            depth + 1,
+            ncx,
+        )? {
             Some(s) => items.push(s),
             None => items.push("null".to_string()),
         }
@@ -682,7 +696,10 @@ fn stringify_with_replacer(
         // For numeric keys, pass as number so Reflect.get works correctly with arrays
         (PropertyKey::Index(idx), Value::int32(idx as i32))
     } else {
-        (PropertyKey::string(key), Value::string(JsString::intern(key)))
+        (
+            PropertyKey::string(key),
+            Value::string(JsString::intern(key)),
+        )
     };
     let value = if let Some(obj) = holder.as_object().or_else(|| holder.as_array()) {
         get_property_value(&obj, &prop_key, holder, ncx)?
@@ -715,9 +732,7 @@ fn stringify_with_replacer(
 
     // BigInt should have been handled by toJSON or should throw
     if value.is_bigint() {
-        return Err(VmError::type_error(
-            "Do not know how to serialize a BigInt",
-        ));
+        return Err(VmError::type_error("Do not know how to serialize a BigInt"));
     }
 
     // Boolean
@@ -735,7 +750,10 @@ fn stringify_with_replacer(
 
     // String - use UTF-16 escaping to preserve lone surrogates
     if let Some(s) = value.as_string() {
-        return Ok(Some(format!("\"{}\"", escape_json_string_utf16(s.as_utf16()))));
+        return Ok(Some(format!(
+            "\"{}\"",
+            escape_json_string_utf16(s.as_utf16())
+        )));
     }
 
     // Check for array (including proxy arrays)
@@ -1067,10 +1085,7 @@ pub fn install_json_namespace(
                 .and_then(|o| o.as_object())
                 .and_then(|o| o.get(&PropertyKey::string("prototype")))
                 .unwrap_or_else(Value::null);
-            let wrapper = GcRef::new(JsObject::new(
-                object_proto,
-                ncx.memory_manager().clone(),
-            ));
+            let wrapper = GcRef::new(JsObject::new(object_proto, ncx.memory_manager().clone()));
             let _ = wrapper.set(PropertyKey::string(""), val.clone());
             let wrapper_val = Value::object(wrapper);
 
@@ -1247,8 +1262,9 @@ fn parse_replacer(
                 Some(number_to_property_key(n))
             } else if let Some(obj) = item.as_object() {
                 // Check if it's a String or Number wrapper object
-                let is_string_wrapper =
-                    obj.get(&PropertyKey::string("__primitiveValue__")).is_some();
+                let is_string_wrapper = obj
+                    .get(&PropertyKey::string("__primitiveValue__"))
+                    .is_some();
                 let is_number_wrapper = obj.get(&PropertyKey::string("__value__")).is_some();
 
                 if is_string_wrapper || is_number_wrapper {
@@ -1335,7 +1351,10 @@ fn parse_space(space: Option<&Value>, ncx: &mut NativeContext) -> Result<Option<
         }
 
         // Check for [[StringData]] - use ToString (calls toString)
-        if obj.get(&PropertyKey::string("__primitiveValue__")).is_some() {
+        if obj
+            .get(&PropertyKey::string("__primitiveValue__"))
+            .is_some()
+        {
             // It's a String wrapper - call toString to get the string
             if let Some(to_string) = obj.get(&PropertyKey::string("toString")) {
                 if to_string.is_callable() {

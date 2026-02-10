@@ -53,7 +53,10 @@ fn native_promise_create(
 /// Resolve a promise with a value
 /// Args: [promise, value] - resolve existing promise
 /// Args: [value] - create new resolved promise (Promise.resolve)
-fn native_promise_resolve(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
+fn native_promise_resolve(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, VmError> {
     match args.len() {
         0 => {
             // Promise.resolve() with no args resolves to undefined
@@ -99,7 +102,10 @@ fn native_promise_resolve(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> 
 /// Reject a promise with a reason
 /// Args: [promise, reason] - reject existing promise
 /// Args: [reason] - create new rejected promise (Promise.reject)
-fn native_promise_reject(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
+fn native_promise_reject(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, VmError> {
     match args.len() {
         0 => {
             // Promise.reject() with no args rejects with undefined
@@ -128,7 +134,10 @@ fn native_promise_reject(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> R
 /// Register a then callback
 /// Args: [promise, onFulfilled, onRejected?]
 /// Returns a new promise that resolves/rejects based on callbacks
-fn native_promise_then(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
+fn native_promise_then(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, VmError> {
     let promise_val = args
         .first()
         .ok_or("Promise.then requires a promise argument")?;
@@ -158,7 +167,10 @@ fn native_promise_then(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Res
 
 /// Register a catch callback
 /// Args: [promise, onRejected]
-fn native_promise_catch(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
+fn native_promise_catch(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, VmError> {
     let promise_val = args
         .first()
         .ok_or("Promise.catch requires a promise argument")?;
@@ -187,7 +199,10 @@ fn native_promise_catch(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Re
 
 /// Register a finally callback
 /// Args: [promise, onFinally]
-fn native_promise_finally(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
+fn native_promise_finally(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, VmError> {
     let promise_val = args
         .first()
         .ok_or("Promise.finally requires a promise argument")?;
@@ -218,7 +233,10 @@ fn native_promise_finally(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> 
 /// Get promise state
 /// Args: [promise]
 /// Returns: { state: "pending"|"fulfilled"|"rejected", value?: any, reason?: any }
-fn native_promise_state(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
+fn native_promise_state(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, VmError> {
     let promise_val = args.first().ok_or("Missing promise argument")?;
     let promise = promise_val
         .as_promise()
@@ -252,7 +270,10 @@ fn native_promise_state(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Res
 
 /// Promise.all - wait for all promises to fulfill
 /// Args: [array of promises/values]
-fn native_promise_all(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
+fn native_promise_all(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, VmError> {
     let iterable = args.first().ok_or("Promise.all requires an iterable")?;
 
     // Get array of values (can be promises or regular values)
@@ -334,7 +355,10 @@ fn native_promise_all(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
 
 /// Promise.race - first promise to settle wins
 /// Args: [array of promises/values]
-fn native_promise_race(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
+fn native_promise_race(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, VmError> {
     let iterable = args.first().ok_or("Promise.race requires an iterable")?;
     let items = get_array_items(iterable)?;
 
@@ -373,7 +397,10 @@ fn native_promise_race(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Res
 
 /// Promise.allSettled - wait for all to settle (fulfill or reject)
 /// Args: [array of promises/values]
-fn native_promise_all_settled(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
+fn native_promise_all_settled(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, VmError> {
     let iterable = args
         .first()
         .ok_or("Promise.allSettled requires an iterable")?;
@@ -480,7 +507,10 @@ fn native_promise_all_settled(args: &[VmValue], mm: Arc<memory::MemoryManager>) 
 
 /// Promise.any - first fulfilled wins, all rejected = AggregateError
 /// Args: [array of promises/values]
-fn native_promise_any(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
+fn native_promise_any(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, VmError> {
     let iterable = args.first().ok_or("Promise.any requires an iterable")?;
     let items = get_array_items(iterable)?;
 
@@ -526,7 +556,11 @@ fn native_promise_any(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Resul
                     } else {
                         vec![]
                     };
-                    let agg_error = create_aggregate_error(errs, "All promises were rejected", Arc::clone(&mm_for_error));
+                    let agg_error = create_aggregate_error(
+                        errs,
+                        "All promises were rejected",
+                        Arc::clone(&mm_for_error),
+                    );
                     result_p2.reject(agg_error);
                 }
             });
@@ -558,7 +592,9 @@ fn native_promise_with_resolvers(
     let _ = result.set(
         "resolve".into(),
         VmValue::native_function(
-            move |_this: &VmValue, args: &[VmValue], _ncx: &mut otter_vm_core::context::NativeContext<'_>| {
+            move |_this: &VmValue,
+                  args: &[VmValue],
+                  _ncx: &mut otter_vm_core::context::NativeContext<'_>| {
                 let value = args.first().cloned().unwrap_or(VmValue::undefined());
                 resolve_fn(value);
                 Ok(VmValue::undefined())
@@ -571,7 +607,9 @@ fn native_promise_with_resolvers(
     let _ = result.set(
         "reject".into(),
         VmValue::native_function(
-            move |_this: &VmValue, args: &[VmValue], _ncx: &mut otter_vm_core::context::NativeContext<'_>| {
+            move |_this: &VmValue,
+                  args: &[VmValue],
+                  _ncx: &mut otter_vm_core::context::NativeContext<'_>| {
                 let reason = args.first().cloned().unwrap_or(VmValue::undefined());
                 reject_fn(reason);
                 Ok(VmValue::undefined())
@@ -674,7 +712,8 @@ mod tests {
     #[test]
     fn test_promise_reject_static() {
         let mm = Arc::new(memory::MemoryManager::test());
-        let result = native_promise_reject(&[VmValue::string(JsString::intern("error"))], mm).unwrap();
+        let result =
+            native_promise_reject(&[VmValue::string(JsString::intern("error"))], mm).unwrap();
         assert!(result.is_promise());
         let promise = result.as_promise().unwrap();
         assert!(promise.is_rejected());
@@ -713,7 +752,8 @@ mod tests {
     fn test_promise_state() {
         let mm = Arc::new(memory::MemoryManager::test());
         let promise = JsPromise::new();
-        let result = native_promise_state(&[VmValue::promise(promise.clone())], Arc::clone(&mm)).unwrap();
+        let result =
+            native_promise_state(&[VmValue::promise(promise.clone())], Arc::clone(&mm)).unwrap();
 
         let obj = result.as_object().unwrap();
         let state = obj.get(&"state".into()).unwrap();

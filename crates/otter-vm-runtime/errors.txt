@@ -1,0 +1,573 @@
+warning: unexpected `cfg` condition value: `jit`
+   --> crates/otter-vm-core/src/interpreter.rs:387:31
+    |
+387 |                         #[cfg(feature = "jit")]
+    |                               ^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default` and `profiling`
+    = help: consider adding `jit` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unexpected `cfg` condition value: `jit`
+    --> crates/otter-vm-core/src/interpreter.rs:7706:31
+     |
+7706 |                         #[cfg(feature = "jit")]
+     |                               ^^^^^^^^^^^^^^^
+     |
+     = note: expected values for `feature` are: `default` and `profiling`
+     = help: consider adding `jit` as a feature in `Cargo.toml`
+     = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unused imports: `NaiveDate` and `TimeZone`
+   --> crates/otter-vm-core/src/intrinsics_impl/date.rs:363:29
+    |
+363 |         use chrono::{Local, NaiveDate, TimeZone};
+    |                             ^^^^^^^^^  ^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `Local`, `NaiveDateTime`, and `NaiveDate`
+   --> crates/otter-vm-core/src/intrinsics_impl/date.rs:618:18
+    |
+618 |     use chrono::{Local, NaiveDate, NaiveDateTime, TimeZo...
+    |                  ^^^^^  ^^^^^^^^^  ^^^^^^^^^^^^^
+
+warning: unused import: `Utc`
+   --> crates/otter-vm-core/src/intrinsics_impl/date.rs:723:61
+    |
+723 | ...NaiveDateTime, TimeZone, Utc};
+    |                             ^^^
+
+warning: use of deprecated associated function `chrono::NaiveDateTime::from_timestamp_opt`: use `DateTime::from_timestamp` instead
+   --> crates/otter-vm-core/src/intrinsics_impl/date.rs:265:40
+    |
+265 | ...::NaiveDateTime::from_timestamp_opt(total_secs, sub_m...
+    |                     ^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: unused import: `TimeZone`
+   --> crates/otter-vm-core/src/intrinsics_impl/date.rs:618:51
+    |
+618 | ...eDate, NaiveDateTime, TimeZone};
+    |                          ^^^^^^^^
+
+warning: unused variable: `cur_y`
+    --> crates/otter-vm-core/src/intrinsics_impl/date.rs:2264:18
+     |
+2264 |             let (cur_y, cur_m, cur_d, h, min, sec, ms) ...
+     |                  ^^^^^ help: if this is intentional, prefix it with an underscore: `_cur_y`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `cur_y`
+    --> crates/otter-vm-core/src/intrinsics_impl/date.rs:2237:18
+     |
+2237 |             let (cur_y, cur_m, cur_d, h, min, sec, ms) ...
+     |                  ^^^^^ help: if this is intentional, prefix it with an underscore: `_cur_y`
+
+warning: unused variable: `named_captures_obj`
+    --> crates/otter-vm-core/src/intrinsics_impl/regexp.rs:1330:21
+     |
+1330 | ...         let named_captures_obj = if named_captures_...
+     |                 ^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_named_captures_obj`
+
+warning: method `get_prototype_from_constructor` is never used
+   --> crates/otter-vm-core/src/context.rs:166:19
+    |
+ 42 | impl<'a> NativeContext<'a> {
+    | -------------------------- method in this implementation
+...
+166 |     pub(crate) fn get_prototype_from_constructor(&self, ...
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `to_js_string` is never used
+    --> crates/otter-vm-core/src/globals.rs:1243:4
+     |
+1243 | fn to_js_string(value: &Value) -> GcRef<JsString> {
+     |    ^^^^^^^^^^^^
+
+warning: method `to_primitive_number` is never used
+    --> crates/otter-vm-core/src/interpreter.rs:8654:8
+     |
+  53 | impl Interpreter {
+     | ---------------- method in this implementation
+...
+8654 |     fn to_primitive_number(&self, ctx: &mut VmContext, ...
+     |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `unwrap_primitive` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/json.rs:422:4
+    |
+422 | fn unwrap_primitive(value: &Value) -> Value {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `serialize_value_simple` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/json.rs:483:4
+    |
+483 | fn serialize_value_simple(
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `serialize_array_simple` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/json.rs:547:4
+    |
+547 | fn serialize_array_simple(
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `serialize_object_simple` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/json.rs:595:4
+    |
+595 | fn serialize_object_simple(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `descriptor_from_attributes` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/reflect.rs:117:4
+    |
+117 | fn descriptor_from_attributes(attr_obj: &GcRef<JsObject>...
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `weak_key_id` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/map_set.rs:121:4
+    |
+121 | fn weak_key_id(value: &Value) -> Option<usize> {
+    |    ^^^^^^^^^^^
+
+warning: function `js_get` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/map_set.rs:163:4
+    |
+163 | fn js_get(
+    |    ^^^^^^
+
+warning: function `obj_set_with_receiver` is never used
+  --> crates/otter-vm-core/src/intrinsics_impl/regexp.rs:87:4
+   |
+87 | fn obj_set_with_receiver(
+   |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `get_prototype_storage` is never used
+    --> crates/otter-vm-core/src/object.rs:3088:19
+     |
+ 701 | impl JsObject {
+     | ------------- method in this implementation
+...
+3088 |     pub(crate) fn get_prototype_storage(&self) -> &Obje...
+     |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a module
+  --> crates/otter-vm-core/src/lib.rs:22:1
+   |
+22 | pub mod drop_guard;
+   | ^^^^^^^^^^^^^^^^^^
+   |
+note: the lint level is defined here
+  --> crates/otter-vm-core/src/lib.rs:13:9
+   |
+13 | #![warn(missing_docs)]
+   |         ^^^^^^^^^^^^
+
+warning: missing documentation for a module
+  --> crates/otter-vm-core/src/lib.rs:39:1
+   |
+39 | pub mod regexp;
+   | ^^^^^^^^^^^^^^
+
+warning: missing documentation for a module
+  --> crates/otter-vm-core/src/lib.rs:46:1
+   |
+46 | pub mod symbol_registry;
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:465:5
+    |
+465 |     pub function_index: u32,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:466:5
+    |
+466 |     pub function_name: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:467:5
+    |
+467 |     pub pc: usize,
+    |     ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:468:5
+    |
+468 |     pub instruction: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:469:5
+    |
+469 |     pub module_url: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:470:5
+    |
+470 |     pub is_async: bool,
+    |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:471:5
+    |
+471 |     pub is_generator: bool,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:472:5
+    |
+472 |     pub is_construct: bool,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:1587:5
+     |
+1587 |     pub fn set_pending_new_target_proto(&mut self, proto: GcRef<JsObject>) {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:1591:5
+     |
+1591 |     pub fn set_pending_realm_id(&mut self, realm_id: RealmId) {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:1838:5
+     |
+1838 |     pub fn registers_to_trace(&self) -> &[Value] {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:1842:5
+     |
+1842 |     pub fn pending_args_to_trace(&self) -> &[Value] {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:1846:5
+     |
+1846 |     pub fn pending_this_to_trace(&self) -> Option<&Value> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:1850:5
+     |
+1850 |     pub fn pending_upvalues_to_trace(&self) -> &[UpvalueCell] {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:1854:5
+     |
+1854 |     pub fn open_upvalues_to_trace(&self) -> &HashMap<(usize, u16), UpvalueCell> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+   --> crates/otter-vm-core/src/generator.rs:273:1
+    |
+273 | pub struct JsGenerator {
+    | ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+    --> crates/otter-vm-core/src/globals.rs:1202:1
+     |
+1202 | pub fn to_string(value: &Value) -> String {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+   --> crates/otter-vm-core/src/intrinsics_impl/function.rs:257:1
+    |
+257 | / pub fn create_generator_function_constructor(
+258 | |     realm_id: RealmId,
+259 | | ) -> Box<
+260 | |     dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -...
+261 | | > {
+    | |_^
+
+warning: missing documentation for a function
+   --> crates/otter-vm-core/src/intrinsics_impl/function.rs:265:1
+    |
+265 | / pub fn create_async_function_constructor(
+266 | |     realm_id: RealmId,
+267 | | ) -> Box<
+268 | |     dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -...
+269 | | > {
+    | |_^
+
+warning: missing documentation for a function
+   --> crates/otter-vm-core/src/intrinsics_impl/function.rs:273:1
+    |
+273 | / pub fn create_async_generator_function_constructor(
+274 | |     realm_id: RealmId,
+275 | | ) -> Box<
+276 | |     dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -...
+277 | | > {
+    | |_^
+
+warning: missing documentation for an associated function
+   --> crates/otter-vm-core/src/memory.rs:274:5
+    |
+274 |     pub fn new(inner: T, size: usize, manager: Arc<MemoryManager>) -> VmResult<Self> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> crates/otter-vm-core/src/memory.rs:283:5
+    |
+283 |     pub fn inner(&self) -> &T {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> crates/otter-vm-core/src/memory.rs:287:5
+    |
+287 |     pub fn inner_mut(&mut self) -> &mut T {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> crates/otter-vm-core/src/object.rs:776:5
+    |
+776 |     pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> crates/otter-vm-core/src/regexp.rs:69:5
+   |
+69 |     pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/otter-vm-core/src/realm.rs:19:5
+   |
+19 |     pub id: RealmId,
+   |     ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/otter-vm-core/src/realm.rs:20:5
+   |
+20 |     pub intrinsics: Intrinsics,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/otter-vm-core/src/realm.rs:21:5
+   |
+21 |     pub function_prototype: GcRef<JsObject>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/otter-vm-core/src/realm.rs:22:5
+   |
+22 |     pub global: GcRef<JsObject>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+  --> crates/otter-vm-core/src/realm.rs:32:5
+   |
+32 |     pub fn new() -> Arc<Self> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+  --> crates/otter-vm-core/src/symbol_registry.rs:21:5
+   |
+21 |     pub fn new() -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> crates/otter-vm-core/src/symbol_registry.rs:27:5
+   |
+27 |     pub fn get(&self, key: &str) -> Option<GcRef<Symbol>> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> crates/otter-vm-core/src/symbol_registry.rs:31:5
+   |
+31 |     pub fn insert(&self, key: String, symbol: GcRef<Symbol>) {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> crates/otter-vm-core/src/symbol_registry.rs:35:5
+   |
+35 |     pub fn key_for(&self, symbol: &GcRef<Symbol>) -> Option<String> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> crates/otter-vm-core/src/symbol_registry.rs:45:5
+   |
+45 |     pub fn trace_roots(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+   --> crates/otter-vm-core/src/value.rs:434:5
+    |
+434 |     pub fn regex(regex: GcRef<JsRegExp>) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `compile_empty_function` is never used
+    --> crates/otter-vm-compiler/src/compiler.rs:1479:8
+     |
+  75 | impl Compiler {
+     | ------------- method in this implementation
+...
+1479 |     fn compile_empty_function(&mut self) -> Register {
+     |        ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: multiple methods are never used
+    --> crates/otter-vm-compiler/src/literal_validator.rs:715:8
+     |
+  98 | impl LiteralValidator {
+     | --------------------- methods in this implementation
+...
+ 715 |     fn validate_regexp_pattern(&self, pattern: &str, st...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 757 |     fn validate_regexp_flags(&self, flags: &str, start_...
+     |        ^^^^^^^^^^^^^^^^^^^^^
+...
+ 800 |     fn is_valid_slash_usage(&self, pattern: &str) -> bo...
+     |        ^^^^^^^^^^^^^^^^^^^^
+...
+ 828 |     fn validate_regexp_escape_sequences(&self, pattern:...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 893 |     fn validate_regexp_character_classes(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 937 |     fn validate_regexp_quantifiers(&self, pattern: &str...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 954 |     fn validate_regexp_groups(&self, pattern: &str, sta...
+     |        ^^^^^^^^^^^^^^^^^^^^^^
+...
+1099 |     fn convert_js_regex_to_rust_regex(&self, pattern: &...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1106 |     fn has_obvious_syntax_errors(&self, pattern: &str) ...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `otter-vm-core` (lib) generated 61 warnings (run `cargo fix --lib -p otter-vm-core` to apply 6 suggestions)
+warning: `otter-vm-compiler` (lib) generated 2 warnings
+    Checking otter-vm-runtime v0.1.0 (/Users/alexanderstreltsov/work/octofhir/otter/crates/otter-vm-runtime)
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `otter_vm_runtime`
+  --> crates/otter-vm-runtime/src/otter_runtime.rs:31:5
+   |
+31 | use otter_vm_runtime::module_provider::ModuleType;
+   |     ^^^^^^^^^^^^^^^^ use of unresolved module or unlinked crate `otter_vm_runtime`
+   |
+   = help: if you wanted to use a crate named `otter_vm_runtime`, use `cargo add otter_vm_runtime` to add it to your `Cargo.toml`
+
+error[E0432]: unresolved import `serde`
+  --> crates/otter-vm-runtime/src/module_provider.rs:11:5
+   |
+11 | use serde::{Deserialize, Serialize};
+   |     ^^^^^ use of unresolved module or unlinked crate `serde`
+   |
+   = help: if you wanted to use a crate named `serde`, use `cargo add serde` to add it to your `Cargo.toml`
+
+error[E0603]: enum import `ModuleType` is private
+  --> crates/otter-vm-runtime/src/lib.rs:36:76
+   |
+36 | ...oduleState, ModuleType,
+   |                ^^^^^^^^^^ private enum import
+   |
+note: the enum import `ModuleType` is defined here...
+  --> crates/otter-vm-runtime/src/module_loader.rs:14:59
+   |
+14 | ...pe, ModuleResolution, ModuleType};
+   |                          ^^^^^^^^^^
+note: ...and refers to the enum `ModuleType` which is defined here
+  --> crates/otter-vm-runtime/src/module_provider.rs:15:1
+   |
+15 | pub enum ModuleType {
+   | ^^^^^^^^^^^^^^^^^^^ you could import this directly
+help: import `ModuleType` directly
+   |
+36 |     LoadedModule, ModuleError, ModuleLoader, ModuleNamespace, ModuleState, module_provider::ModuleType,
+   |                                                                            +++++++++++++++++
+
+warning: unused import: `MediaType`
+  --> crates/otter-vm-runtime/src/module_loader.rs:14:30
+   |
+14 | use crate::module_provider::{MediaType, ModuleResolution,...
+   |                              ^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::collections::HashMap`
+  --> crates/otter-vm-runtime/src/otter_runtime.rs:10:5
+   |
+10 | use std::collections::HashMap;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ImportRecord`
+  --> crates/otter-vm-runtime/src/otter_runtime.rs:17:48
+   |
+17 | ...ule::{ImportBinding, ImportRecord};
+   |                         ^^^^^^^^^^^^
+
+warning: unused imports: `Instruction`, `Module`, `Register`, `TypeFlags`, and `UpvalueCapture`
+  --> crates/otter-vm-runtime/src/otter_runtime.rs:18:25
+   |
+18 | ...::{Instruction, Module, Register, TypeFlags, UpvalueCapture};
+   |       ^^^^^^^^^^^  ^^^^^^  ^^^^^^^^  ^^^^^^^^^  ^^^^^^^^^^^^^^
+
+error[E0277]: the trait bound `ModuleResolution: serde::Serialize` is not satisfied
+   --> crates/otter-vm-runtime/src/module_loader.rs:797:40
+    |
+797 |                     Ok(resolved) => Ok(json!(resolved)),
+    |                                        ^^^^^^^^^^^^^^^
+    |                                        |
+    |                                        unsatisfied trait bound
+    |                                        required by a bound introduced by this call
+    |
+help: the trait `serde_core::ser::Serialize` is not implemented for `ModuleResolution`
+   --> crates/otter-vm-runtime/src/module_provider.rs:37:1
+    |
+ 37 | pub struct ModuleResolution {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: for local types consider adding `#[derive(serde::Serialize)]` to your `ModuleResolution` type
+    = note: for types from other crates check whether the crate offers a `serde` feature flag
+    = help: the following other types implement trait `serde_core::ser::Serialize`:
+              &'a T
+              &'a mut T
+              ()
+              (T,)
+              (T0, T1)
+              (T0, T1, T2)
+              (T0, T1, T2, T3)
+              (T0, T1, T2, T3, T4)
+            and 171 others
+    = note: required for `&ModuleResolution` to implement `serde_core::ser::Serialize`
+note: required by a bound in `to_value`
+   --> /Users/alexanderstreltsov/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.149/src/value/mod.rs:997:8
+    |
+995 | pub fn to_value<T>(value: T) -> Result<Value, Error>
+    |        -------- required by a bound in this function
+996 | where
+997 |     T: Serialize,
+    |        ^^^^^^^^^ required by this bound in `to_value`
+    = note: the full name for the type has been written to '/Users/alexanderstreltsov/work/octofhir/otter/target/debug/deps/otter_vm_runtime-37ede6d7223a8c1e.long-type-1843493646532878711.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+    = note: this error originates in the macro `$crate::json_internal` which comes from the expansion of the macro `json` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: variable does not need to be mutable
+   --> crates/otter-vm-runtime/src/module_loader.rs:349:23
+    |
+349 |             if let Ok(mut guard) = module.write() {
+    |                       ----^^^^^
+    |                       |
+    |                       help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+Some errors have detailed explanations: E0277, E0432, E0433, E0603.
+For more information about an error, try `rustc --explain E0277`.
+warning: `otter-vm-runtime` (lib) generated 5 warnings
+error: could not compile `otter-vm-runtime` (lib) due to 4 previous errors; 5 warnings emitted

@@ -9,10 +9,10 @@
 //! All methods use inline implementations for optimal performance.
 
 use crate::gc::GcRef;
+use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
-use crate::memory::MemoryManager;
 use std::sync::Arc;
 
 /// Convert a value to boolean (ToBoolean abstract operation ES2026 §7.1.2)
@@ -99,7 +99,11 @@ pub fn init_boolean_prototype(
                 } else {
                     to_boolean(this_val)
                 };
-                Ok(Value::string(JsString::intern(if b { "true" } else { "false" })))
+                Ok(Value::string(JsString::intern(if b {
+                    "true"
+                } else {
+                    "false"
+                })))
             },
             mm.clone(),
             fn_proto,
@@ -121,7 +125,15 @@ pub fn init_boolean_prototype(
 /// The constructor checks the `this` value to determine call vs construct form:
 /// - If `this` is undefined (call form), return primitive boolean
 /// - If `this` is object (construct form), set internal [[BooleanData]] and return object
-pub fn create_boolean_constructor() -> Box<dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, crate::error::VmError> + Send + Sync> {
+pub fn create_boolean_constructor() -> Box<
+    dyn Fn(
+            &Value,
+            &[Value],
+            &mut crate::context::NativeContext<'_>,
+        ) -> Result<Value, crate::error::VmError>
+        + Send
+        + Sync,
+> {
     Box::new(|this_val, args, _ncx| {
         let value = args.first().cloned().unwrap_or(Value::undefined());
         let bool_val = Value::boolean(to_boolean(&value));

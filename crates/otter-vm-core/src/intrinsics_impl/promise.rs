@@ -540,9 +540,13 @@ pub fn install_promise_statics(
                 // Empty array resolves immediately with []
                 if items.is_empty() {
                     let arr = GcRef::new(JsObject::array(0, mm));
-                    JsPromise::resolve_with_js_jobs(result_promise, Value::array(arr), |job, args| {
-                        ncx.enqueue_js_job(job, args);
-                    });
+                    JsPromise::resolve_with_js_jobs(
+                        result_promise,
+                        Value::array(arr),
+                        |job, args| {
+                            ncx.enqueue_js_job(job, args);
+                        },
+                    );
                     return Ok(create_js_promise_wrapper(ncx, result_promise));
                 }
 
@@ -594,12 +598,20 @@ pub fn install_promise_statics(
                                     }
                                 }
                             }
-                            JsPromise::resolve_with_js_jobs(result_p, Value::array(arr), enqueue_fulfill.clone());
+                            JsPromise::resolve_with_js_jobs(
+                                result_p,
+                                Value::array(arr),
+                                enqueue_fulfill.clone(),
+                            );
                         }
                     });
                     source_promise.catch(move |error| {
                         if !rejected_check.swap(true, Ordering::AcqRel) {
-                            JsPromise::reject_with_js_jobs(result_p_reject, error, enqueue_reject.clone());
+                            JsPromise::reject_with_js_jobs(
+                                result_p_reject,
+                                error,
+                                enqueue_reject.clone(),
+                            );
                         }
                     });
                 }
@@ -644,12 +656,20 @@ pub fn install_promise_statics(
 
                     source_promise.then(move |value| {
                         if !settled1.swap(true, Ordering::AcqRel) {
-                            JsPromise::resolve_with_js_jobs(result_p, value, enqueue_fulfill.clone());
+                            JsPromise::resolve_with_js_jobs(
+                                result_p,
+                                value,
+                                enqueue_fulfill.clone(),
+                            );
                         }
                     });
                     source_promise.catch(move |error| {
                         if !settled2.swap(true, Ordering::AcqRel) {
-                            JsPromise::reject_with_js_jobs(result_p_reject, error, enqueue_reject.clone());
+                            JsPromise::reject_with_js_jobs(
+                                result_p_reject,
+                                error,
+                                enqueue_reject.clone(),
+                            );
                         }
                     });
                 }
@@ -673,9 +693,13 @@ pub fn install_promise_statics(
                 // Empty array resolves immediately with []
                 if items.is_empty() {
                     let arr = GcRef::new(JsObject::array(0, mm));
-                    JsPromise::resolve_with_js_jobs(result_promise, Value::array(arr), |job, args| {
-                        ncx.enqueue_js_job(job, args);
-                    });
+                    JsPromise::resolve_with_js_jobs(
+                        result_promise,
+                        Value::array(arr),
+                        |job, args| {
+                            ncx.enqueue_js_job(job, args);
+                        },
+                    );
                     return Ok(create_js_promise_wrapper(ncx, result_promise));
                 }
 
@@ -729,12 +753,17 @@ pub fn install_promise_statics(
                                     }
                                 }
                             }
-                            JsPromise::resolve_with_js_jobs(result_p, Value::array(arr), enqueue_fulfill.clone());
+                            JsPromise::resolve_with_js_jobs(
+                                result_p,
+                                Value::array(arr),
+                                enqueue_fulfill.clone(),
+                            );
                         }
                     });
                     source_promise.catch(move |error| {
                         let obj = GcRef::new(JsObject::new(Value::null(), mm_c.clone()));
-                        let _ = obj.set("status".into(), Value::string(JsString::intern("rejected")));
+                        let _ =
+                            obj.set("status".into(), Value::string(JsString::intern("rejected")));
                         let _ = obj.set("reason".into(), error);
                         if let Ok(mut locked) = results2.lock() {
                             locked[index] = Some(Value::object(obj));
@@ -748,7 +777,11 @@ pub fn install_promise_statics(
                                     }
                                 }
                             }
-                            JsPromise::resolve_with_js_jobs(result_p2, Value::array(arr), enqueue_reject.clone());
+                            JsPromise::resolve_with_js_jobs(
+                                result_p2,
+                                Value::array(arr),
+                                enqueue_reject.clone(),
+                            );
                         }
                     });
                 }
@@ -811,7 +844,11 @@ pub fn install_promise_statics(
 
                     source_promise.then(move |value| {
                         if !fulfilled1.swap(true, Ordering::AcqRel) {
-                            JsPromise::resolve_with_js_jobs(result_p, value, enqueue_fulfill.clone());
+                            JsPromise::resolve_with_js_jobs(
+                                result_p,
+                                value,
+                                enqueue_fulfill.clone(),
+                            );
                         }
                     });
                     source_promise.catch(move |error| {
@@ -837,7 +874,11 @@ pub fn install_promise_statics(
                                 Value::string(JsString::intern("All promises were rejected")),
                             );
                             let _ = agg.set("errors".into(), Value::array(arr));
-                            JsPromise::reject_with_js_jobs(result_p2, Value::object(agg), enqueue_reject.clone());
+                            JsPromise::reject_with_js_jobs(
+                                result_p2,
+                                Value::object(agg),
+                                enqueue_reject.clone(),
+                            );
                         }
                     });
                 }

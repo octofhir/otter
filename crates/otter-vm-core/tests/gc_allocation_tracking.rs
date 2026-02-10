@@ -81,8 +81,14 @@ fn test_memorymanager_reconciles_after_gc() {
     let after_gc_allocated = mm.allocated();
     let after_gc_count = mm.allocation_count();
 
-    println!("Before GC: {} bytes, {} allocations", before_gc_allocated, before_gc_count);
-    println!("After GC:  {} bytes, {} allocations", after_gc_allocated, after_gc_count);
+    println!(
+        "Before GC: {} bytes, {} allocations",
+        before_gc_allocated, before_gc_count
+    );
+    println!(
+        "After GC:  {} bytes, {} allocations",
+        after_gc_allocated, after_gc_count
+    );
     println!("Reclaimed: {} bytes", reclaimed);
 
     // After GC, allocation count should be reset
@@ -132,7 +138,10 @@ fn test_memorymanager_gc_accuracy() {
     let mm_allocated_after = mm.allocated();
     let gc_total_bytes_after = otter_vm_gc::global_registry().total_bytes();
 
-    println!("After GC:  MM={}, GC={}", mm_allocated_after, gc_total_bytes_after);
+    println!(
+        "After GC:  MM={}, GC={}",
+        mm_allocated_after, gc_total_bytes_after
+    );
 
     assert_eq!(
         mm_allocated_after, gc_total_bytes_after,
@@ -243,5 +252,8 @@ fn test_stress_allocation_tracking() {
 
     println!("Stress test completed successfully");
     println!("Final MM allocated: {} bytes", mm.allocated());
-    println!("Final GC total: {} bytes", otter_vm_gc::global_registry().total_bytes());
+    println!(
+        "Final GC total: {} bytes",
+        otter_vm_gc::global_registry().total_bytes()
+    );
 }

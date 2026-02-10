@@ -40,8 +40,14 @@ pub fn ops() -> Vec<Op> {
         op_native("__String_split", native_string_split),
         op_native("__String_toLowerCase", native_string_to_lower_case),
         op_native("__String_toUpperCase", native_string_to_upper_case),
-        op_native("__String_toLocaleLowerCase", native_string_to_locale_lower_case),
-        op_native("__String_toLocaleUpperCase", native_string_to_locale_upper_case),
+        op_native(
+            "__String_toLocaleLowerCase",
+            native_string_to_locale_lower_case,
+        ),
+        op_native(
+            "__String_toLocaleUpperCase",
+            native_string_to_locale_upper_case,
+        ),
         op_native("__String_trim", native_string_trim),
         op_native("__String_trimStart", native_string_trim_start),
         op_native("__String_trimEnd", native_string_trim_end),
@@ -92,9 +98,7 @@ fn get_string(args: &[VmValue], index: usize) -> String {
 }
 
 fn get_number(args: &[VmValue], index: usize) -> f64 {
-    args.get(index)
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0)
+    args.get(index).and_then(|v| v.as_number()).unwrap_or(0.0)
 }
 
 // =============================================================================
@@ -104,11 +108,18 @@ fn get_number(args: &[VmValue], index: usize) -> f64 {
 fn native_string_char_at(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let s = get_string(args, 0);
     let index = get_number(args, 1) as usize;
-    let ch = s.chars().nth(index).map(|c| c.to_string()).unwrap_or_default();
+    let ch = s
+        .chars()
+        .nth(index)
+        .map(|c| c.to_string())
+        .unwrap_or_default();
     Ok(VmValue::string(JsString::intern(&ch)))
 }
 
-fn native_string_char_code_at(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_string_char_code_at(
+    args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     let s = get_string(args, 0);
     let index = get_number(args, 1) as usize;
     let utf16: Vec<u16> = s.encode_utf16().collect();
@@ -119,7 +130,10 @@ fn native_string_char_code_at(args: &[VmValue], _mm: Arc<MemoryManager>) -> Resu
     }
 }
 
-fn native_string_code_point_at(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_string_code_point_at(
+    args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     let s = get_string(args, 0);
     let index = get_number(args, 1) as usize;
     match s.chars().nth(index) {
@@ -176,7 +190,10 @@ fn native_string_index_of(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<V
     Ok(VmValue::int32(-1))
 }
 
-fn native_string_last_index_of(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_string_last_index_of(
+    args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     let s = get_string(args, 0);
     let search = get_string(args, 1);
     let position = args.get(2).and_then(|v| v.as_number()).map(|n| n as usize);
@@ -193,7 +210,9 @@ fn native_string_last_index_of(args: &[VmValue], _mm: Arc<MemoryManager>) -> Res
         .unwrap_or_else(|| chars.len().saturating_sub(search_chars.len()));
 
     for i in (0..=max_start).rev() {
-        if i + search_chars.len() <= chars.len() && chars[i..i + search_chars.len()] == search_chars[..] {
+        if i + search_chars.len() <= chars.len()
+            && chars[i..i + search_chars.len()] == search_chars[..]
+        {
             return Ok(VmValue::int32(i as i32));
         }
     }
@@ -227,7 +246,11 @@ fn native_string_slice(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmVa
         None => len as usize,
     };
 
-    let result: String = chars.iter().skip(start).take(end.saturating_sub(start)).collect();
+    let result: String = chars
+        .iter()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect();
     Ok(VmValue::string(JsString::intern(&result)))
 }
 
@@ -237,7 +260,8 @@ fn native_string_substring(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<
     let len = chars.len();
 
     let start = get_number(args, 1).max(0.0) as usize;
-    let end = args.get(2)
+    let end = args
+        .get(2)
         .and_then(|v| v.as_number())
         .map(|e| e.max(0.0) as usize)
         .unwrap_or(len);
@@ -272,27 +296,42 @@ fn native_string_split(args: &[VmValue], mm: Arc<MemoryManager>) -> Result<VmVal
 
     let arr = GcRef::new(JsObject::array(parts.len(), Arc::clone(&mm)));
     for (i, part) in parts.into_iter().enumerate() {
-        let _ = arr.set(PropertyKey::Index(i as u32), VmValue::string(JsString::intern(&part)));
+        let _ = arr.set(
+            PropertyKey::Index(i as u32),
+            VmValue::string(JsString::intern(&part)),
+        );
     }
     Ok(VmValue::array(arr))
 }
 
-fn native_string_to_lower_case(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_string_to_lower_case(
+    args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     let s = get_string(args, 0);
     Ok(VmValue::string(JsString::intern(&s.to_lowercase())))
 }
 
-fn native_string_to_upper_case(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_string_to_upper_case(
+    args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     let s = get_string(args, 0);
     Ok(VmValue::string(JsString::intern(&s.to_uppercase())))
 }
 
-fn native_string_to_locale_lower_case(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_string_to_locale_lower_case(
+    args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     let s = get_string(args, 0);
     Ok(VmValue::string(JsString::intern(&s.to_lowercase())))
 }
 
-fn native_string_to_locale_upper_case(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_string_to_locale_upper_case(
+    args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     let s = get_string(args, 0);
     Ok(VmValue::string(JsString::intern(&s.to_uppercase())))
 }
@@ -321,7 +360,10 @@ fn native_string_replace(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<Vm
     Ok(VmValue::string(JsString::intern(&result)))
 }
 
-fn native_string_replace_all(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_string_replace_all(
+    args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     let s = get_string(args, 0);
     let search = get_string(args, 1);
     let replace = get_string(args, 2);
@@ -330,7 +372,10 @@ fn native_string_replace_all(args: &[VmValue], _mm: Arc<MemoryManager>) -> Resul
     Ok(VmValue::string(JsString::intern(&result)))
 }
 
-fn native_string_starts_with(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_string_starts_with(
+    args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     let s = get_string(args, 0);
     let search = get_string(args, 1);
     let position = get_number(args, 2) as usize;
@@ -342,7 +387,8 @@ fn native_string_starts_with(args: &[VmValue], _mm: Arc<MemoryManager>) -> Resul
 fn native_string_ends_with(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let s = get_string(args, 0);
     let search = get_string(args, 1);
-    let len = args.get(2)
+    let len = args
+        .get(2)
         .and_then(|v| v.as_number())
         .map(|n| n as usize)
         .unwrap_or_else(|| s.chars().count());
@@ -366,7 +412,8 @@ fn native_string_repeat(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmV
 fn native_string_pad_start(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let s = get_string(args, 0);
     let target_len = get_number(args, 1) as usize;
-    let pad_str = args.get(2)
+    let pad_str = args
+        .get(2)
         .and_then(|v| v.as_string())
         .map(|s| s.as_str().to_string())
         .unwrap_or_else(|| " ".to_string());
@@ -389,7 +436,8 @@ fn native_string_pad_start(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<
 fn native_string_pad_end(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
     let s = get_string(args, 0);
     let target_len = get_number(args, 1) as usize;
-    let pad_str = args.get(2)
+    let pad_str = args
+        .get(2)
         .and_then(|v| v.as_string())
         .map(|s| s.as_str().to_string())
         .unwrap_or_else(|| " ".to_string());
@@ -437,7 +485,10 @@ fn native_string_normalize(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<
     Ok(VmValue::string(JsString::intern(&s)))
 }
 
-fn native_string_is_well_formed(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_string_is_well_formed(
+    args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     let s = get_string(args, 0);
     // Check if string contains unpaired surrogates
     let utf16: Vec<u16> = s.encode_utf16().collect();
@@ -460,7 +511,10 @@ fn native_string_is_well_formed(args: &[VmValue], _mm: Arc<MemoryManager>) -> Re
     Ok(VmValue::boolean(true))
 }
 
-fn native_string_to_well_formed(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_string_to_well_formed(
+    args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     let s = get_string(args, 0);
     // Replace unpaired surrogates with U+FFFD
     let utf16: Vec<u16> = s.encode_utf16().collect();
@@ -500,7 +554,10 @@ fn native_string_to_well_formed(args: &[VmValue], _mm: Arc<MemoryManager>) -> Re
     Ok(VmValue::string(JsString::intern(&result)))
 }
 
-fn native_string_locale_compare(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_string_locale_compare(
+    args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     let s1 = get_string(args, 0);
     let s2 = get_string(args, 1);
 
@@ -524,7 +581,9 @@ fn native_string_substr(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmV
         (start as usize).min(chars.len())
     };
 
-    let length = length.unwrap_or(chars.len() - start).min(chars.len() - start);
+    let length = length
+        .unwrap_or(chars.len() - start)
+        .min(chars.len() - start);
     let result: String = chars.iter().skip(start).take(length).collect();
     Ok(VmValue::string(JsString::intern(&result)))
 }
@@ -613,7 +672,10 @@ fn native_string_sup(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValu
 }
 
 // Static methods
-fn native_string_from_char_code(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_string_from_char_code(
+    args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     let mut result = String::new();
     for arg in args {
         if let Some(n) = arg.as_number() {
@@ -626,7 +688,10 @@ fn native_string_from_char_code(args: &[VmValue], _mm: Arc<MemoryManager>) -> Re
     Ok(VmValue::string(JsString::intern(&result)))
 }
 
-fn native_string_from_code_point(args: &[VmValue], _mm: Arc<MemoryManager>) -> Result<VmValue, VmError> {
+fn native_string_from_code_point(
+    args: &[VmValue],
+    _mm: Arc<MemoryManager>,
+) -> Result<VmValue, VmError> {
     let mut result = String::new();
     for arg in args {
         if let Some(n) = arg.as_number() {
@@ -634,7 +699,10 @@ fn native_string_from_code_point(args: &[VmValue], _mm: Arc<MemoryManager>) -> R
             if let Some(ch) = char::from_u32(code) {
                 result.push(ch);
             } else {
-                return Err(VmError::range_error(format!("Invalid code point: {}", code)));
+                return Err(VmError::range_error(format!(
+                    "Invalid code point: {}",
+                    code
+                )));
             }
         }
     }

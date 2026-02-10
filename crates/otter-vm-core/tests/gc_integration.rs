@@ -9,11 +9,11 @@
 //! global GC state. The GC_LOCK mutex ensures serial execution when run
 //! with the default parallel test runner.
 
+use otter_vm_core::VmContext;
 use otter_vm_core::gc::{GcRef, HandleScope};
 use otter_vm_core::memory::MemoryManager;
 use otter_vm_core::object::{JsObject, PropertyKey};
 use otter_vm_core::value::Value;
-use otter_vm_core::VmContext;
 use std::sync::{Arc, Mutex};
 
 /// Global mutex to ensure GC tests run serially.
@@ -210,7 +210,11 @@ fn test_gc_retains_rooted_objects() {
     let root_slot = scope.context().get_root_slot(handle.slot_index());
     if let Some(rooted_obj) = root_slot.as_object() {
         let value = rooted_obj.get(&PropertyKey::string("important"));
-        assert_eq!(value, Some(Value::int32(42)), "Rooted object should survive GC");
+        assert_eq!(
+            value,
+            Some(Value::int32(42)),
+            "Rooted object should survive GC"
+        );
     } else {
         panic!("Rooted object should still be accessible");
     }
@@ -235,9 +239,18 @@ fn test_gc_retains_objects_reachable_from_roots() {
     obj1.set(PropertyKey::string("next"), Value::object(obj2));
     obj1.set(PropertyKey::string("value"), Value::int32(1));
 
-    assert_eq!(obj1.get(&PropertyKey::string("value")), Some(Value::int32(1)));
-    assert_eq!(obj2.get(&PropertyKey::string("value")), Some(Value::int32(2)));
-    assert_eq!(obj3.get(&PropertyKey::string("value")), Some(Value::int32(3)));
+    assert_eq!(
+        obj1.get(&PropertyKey::string("value")),
+        Some(Value::int32(1))
+    );
+    assert_eq!(
+        obj2.get(&PropertyKey::string("value")),
+        Some(Value::int32(2))
+    );
+    assert_eq!(
+        obj3.get(&PropertyKey::string("value")),
+        Some(Value::int32(3))
+    );
 
     let handle = scope.root_value(Value::object(obj1));
 
@@ -248,7 +261,9 @@ fn test_gc_retains_objects_reachable_from_roots() {
     scope.context().collect_garbage();
 
     let root_slot = scope.context().get_root_slot(handle.slot_index());
-    let rooted_obj = root_slot.as_object().expect("Root object should be accessible");
+    let rooted_obj = root_slot
+        .as_object()
+        .expect("Root object should be accessible");
 
     assert_eq!(
         rooted_obj.get(&PropertyKey::string("value")),
@@ -361,7 +376,10 @@ fn test_gc_pause_time_recorded() {
     ctx.collect_garbage();
 
     let stats = ctx.gc_stats();
-    assert!(stats.collection_count > 0, "Collection count should be tracked");
+    assert!(
+        stats.collection_count > 0,
+        "Collection count should be tracked"
+    );
 }
 
 // ============================================================================

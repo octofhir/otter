@@ -151,7 +151,7 @@ pub use otter_vm_builtins::{
 
 // Re-export Node.js compatibility
 pub use otter_nodejs::{
-    builtin_modules as nodejs_builtin_modules, create_nodejs_extension,
+    NodeApiProfile, builtin_modules as nodejs_builtin_modules, create_nodejs_extension,
     get_builtin_source as nodejs_get_builtin_source, is_builtin as nodejs_is_builtin,
 };
 
@@ -196,7 +196,7 @@ pub use otter_nodejs::{
 pub struct EngineBuilder {
     inner: OtterBuilder,
     with_http: bool,
-    with_nodejs: bool,
+    nodejs_profile: NodeApiProfile,
 }
 
 impl EngineBuilder {
@@ -205,7 +205,7 @@ impl EngineBuilder {
         Self {
             inner: OtterBuilder::new(),
             with_http: false,
-            with_nodejs: false,
+            nodejs_profile: NodeApiProfile::None,
         }
     }
 
@@ -223,7 +223,22 @@ impl EngineBuilder {
     /// - `node:fs`, `node:path`, `node:buffer`, `node:events`
     /// - `node:process`, `node:util`, `node:stream`, `node:assert`, `node:os`
     pub fn with_nodejs(mut self) -> Self {
-        self.with_nodejs = true;
+        self.nodejs_profile = NodeApiProfile::Full;
+        self
+    }
+
+    /// Enable embedded-safe Node.js core subset.
+    ///
+    /// This profile excludes dangerous host-control APIs such as `node:process`
+    /// and file-system modules.
+    pub fn with_nodejs_safe(mut self) -> Self {
+        self.nodejs_profile = NodeApiProfile::SafeCore;
+        self
+    }
+
+    /// Set explicit Node.js API profile.
+    pub fn with_nodejs_profile(mut self, profile: NodeApiProfile) -> Self {
+        self.nodejs_profile = profile;
         self
     }
 
@@ -286,14 +301,21 @@ impl EngineBuilder {
                 .expect("Failed to register HTTP extension");
         }
 
-        // Register Node.js compatibility if enabled
-        if self.with_nodejs {
-            runtime
-                .register_extension(create_nodejs_extension())
-                .expect("Failed to register Node.js extension");
-
-            // Register the module provider for node: and bare specifiers
-            runtime.register_module_provider(otter_nodejs::create_nodejs_provider());
+        // Register Node.js compatibility profile
+        match self.nodejs_profile {
+            NodeApiProfile::None => {}
+            NodeApiProfile::SafeCore => {
+                runtime
+                    .register_extension(otter_nodejs::create_nodejs_safe_extension())
+                    .expect("Failed to register Node.js safe extension");
+                runtime.register_module_provider(otter_nodejs::create_nodejs_safe_provider());
+            }
+            NodeApiProfile::Full => {
+                runtime
+                    .register_extension(create_nodejs_extension())
+                    .expect("Failed to register Node.js extension");
+                runtime.register_module_provider(otter_nodejs::create_nodejs_provider());
+            }
         }
 
         // Pre-compile extensions to speed up every eval()
@@ -330,6 +352,7 @@ pub mod prelude {
         // Module loading
         ModuleGraph,
         ModuleLoader,
+        NodeApiProfile,
         Op,
         // Low-level runtime (for advanced use)
         Otter,

@@ -1,9 +1,5 @@
 //! Builder pattern for creating spec-correct builtin constructors and prototypes.
 //!
-//! Inspired by Boa's `BuiltInBuilder`, this ensures that all builtin methods
-//! get the correct property attributes (non-enumerable) and that function
-//! objects have proper `length` and `name` properties.
-//!
 //! ## Usage
 //!
 //! ```ignore

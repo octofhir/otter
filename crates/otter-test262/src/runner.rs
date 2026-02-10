@@ -104,11 +104,8 @@ impl Test262Runner {
         trace_failures_only: bool,
         trace_timeouts_only: bool,
     ) -> Self {
-        let (harness_ext, harness_state) =
-            crate::harness::create_harness_extension_with_state();
-        let mut engine = EngineBuilder::new()
-            .extension(harness_ext)
-            .build();
+        let (harness_ext, harness_state) = crate::harness::create_harness_extension_with_state();
+        let mut engine = EngineBuilder::new().extension(harness_ext).build();
 
         // Configure trace if dump_on_timeout is enabled
         if dump_on_timeout {
@@ -153,11 +150,8 @@ impl Test262Runner {
         Otter::reset_gc();
 
         // Phase 3: Build the real engine from scratch on a clean GC heap.
-        let (harness_ext, harness_state) =
-            crate::harness::create_harness_extension_with_state();
-        let mut engine = EngineBuilder::new()
-            .extension(harness_ext)
-            .build();
+        let (harness_ext, harness_state) = crate::harness::create_harness_extension_with_state();
+        let mut engine = EngineBuilder::new().extension(harness_ext).build();
 
         // Re-apply trace configuration if enabled
         if self.dump_on_timeout {
@@ -177,12 +171,16 @@ impl Test262Runner {
 
     /// Get a reference to the engine (panics if engine is None — only during rebuild).
     fn engine(&self) -> &Otter {
-        self.engine.as_ref().expect("engine not available (mid-rebuild)")
+        self.engine
+            .as_ref()
+            .expect("engine not available (mid-rebuild)")
     }
 
     /// Get a mutable reference to the engine.
     fn engine_mut(&mut self) -> &mut Otter {
-        self.engine.as_mut().expect("engine not available (mid-rebuild)")
+        self.engine
+            .as_mut()
+            .expect("engine not available (mid-rebuild)")
     }
 
     /// Create a new test runner that skips no features (runs everything).
@@ -309,7 +307,6 @@ impl Test262Runner {
         let mut results = Vec::with_capacity(modes.len());
 
         for mode in &modes {
-
             let start = Instant::now();
             let result = self
                 .run_single_mode(path, &content, &metadata, *mode, timeout)
@@ -324,7 +321,7 @@ impl Test262Runner {
                 features: metadata.features.clone(),
             });
 
-            // If non-strict mode fails, skip strict mode (Boa pattern:
+            // If non-strict mode fails, skip strict mode:
             // if the simpler mode fails, the stricter one will too)
             if *mode == ExecutionMode::NonStrict && result.0 == TestOutcome::Fail {
                 break;
@@ -441,10 +438,7 @@ impl Test262Runner {
     ) -> (TestOutcome, Option<String>) {
         let is_async = metadata.is_async();
 
-        let outcome = match self
-            .run_with_timeout(source, timeout, test_name)
-            .await
-        {
+        let outcome = match self.run_with_timeout(source, timeout, test_name).await {
             Ok(value) => {
                 if !value.is_undefined() {
                     // Debug: println!("RESULT {}: {}", test_name, format_value(&value));
@@ -463,7 +457,9 @@ impl Test262Runner {
                             if metadata.expects_runtime_error() {
                                 (
                                     TestOutcome::Fail,
-                                    Some("Expected runtime error but async test passed".to_string()),
+                                    Some(
+                                        "Expected runtime error but async test passed".to_string(),
+                                    ),
                                 )
                             } else {
                                 (TestOutcome::Pass, None)
@@ -479,12 +475,10 @@ impl Test262Runner {
                                 )
                             }
                         }
-                        None => {
-                            (
-                                TestOutcome::Fail,
-                                Some("Async test completed without $DONE or print signal".to_string()),
-                            )
-                        }
+                        None => (
+                            TestOutcome::Fail,
+                            Some("Async test completed without $DONE or print signal".to_string()),
+                        ),
                     }
                 } else if metadata.expects_early_error() {
                     (
@@ -556,14 +550,15 @@ impl Test262Runner {
 
         let buffer_size = self.dump_buffer_size;
         let filter = self.trace_filter.clone();
-        self.engine_mut().set_trace_config(otter_vm_core::TraceConfig {
-            enabled: true,
-            mode,
-            ring_buffer_size: buffer_size,
-            output_path: Some(trace_path),
-            filter,
-            capture_timing: false,
-        });
+        self.engine_mut()
+            .set_trace_config(otter_vm_core::TraceConfig {
+                enabled: true,
+                mode,
+                ring_buffer_size: buffer_size,
+                output_path: Some(trace_path),
+                filter,
+                capture_timing: false,
+            });
     }
 
     /// Save trace for a test that failed/timed out (if configured)
@@ -601,7 +596,8 @@ impl Test262Runner {
             let _ = writeln!(file, "═══════════════════════════════════════════\n");
 
             // Create temporary ring buffer from snapshot
-            let mut buffer = otter_vm_core::TraceRingBuffer::new(snapshot.recent_instructions.len().max(1));
+            let mut buffer =
+                otter_vm_core::TraceRingBuffer::new(snapshot.recent_instructions.len().max(1));
             for entry in &snapshot.recent_instructions {
                 buffer.push(entry.clone());
             }

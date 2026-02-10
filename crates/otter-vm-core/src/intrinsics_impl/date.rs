@@ -165,18 +165,31 @@ fn month_from_time(t: f64) -> f64 {
     let day_in_year = day - day_from_year(y);
     let leap = days_in_year(y) == 366.0;
     let l = if leap { 1.0 } else { 0.0 };
-    if day_in_year < 31.0 { 0.0 }
-    else if day_in_year < 59.0 + l { 1.0 }
-    else if day_in_year < 90.0 + l { 2.0 }
-    else if day_in_year < 120.0 + l { 3.0 }
-    else if day_in_year < 151.0 + l { 4.0 }
-    else if day_in_year < 181.0 + l { 5.0 }
-    else if day_in_year < 212.0 + l { 6.0 }
-    else if day_in_year < 243.0 + l { 7.0 }
-    else if day_in_year < 273.0 + l { 8.0 }
-    else if day_in_year < 304.0 + l { 9.0 }
-    else if day_in_year < 334.0 + l { 10.0 }
-    else { 11.0 }
+    if day_in_year < 31.0 {
+        0.0
+    } else if day_in_year < 59.0 + l {
+        1.0
+    } else if day_in_year < 90.0 + l {
+        2.0
+    } else if day_in_year < 120.0 + l {
+        3.0
+    } else if day_in_year < 151.0 + l {
+        4.0
+    } else if day_in_year < 181.0 + l {
+        5.0
+    } else if day_in_year < 212.0 + l {
+        6.0
+    } else if day_in_year < 243.0 + l {
+        7.0
+    } else if day_in_year < 273.0 + l {
+        8.0
+    } else if day_in_year < 304.0 + l {
+        9.0
+    } else if day_in_year < 334.0 + l {
+        10.0
+    } else {
+        11.0
+    }
 }
 
 /// Compute day of month (1-31) from time value
@@ -205,17 +218,33 @@ fn date_from_time(t: f64) -> f64 {
 }
 
 /// ES spec time-within-day components
-fn hour_from_time(t: f64) -> f64 { ((t / MS_PER_HOUR).floor()).rem_euclid(24.0) }
-fn min_from_time(t: f64) -> f64 { ((t / MS_PER_MINUTE).floor()).rem_euclid(60.0) }
-fn sec_from_time(t: f64) -> f64 { ((t / MS_PER_SECOND).floor()).rem_euclid(60.0) }
-fn ms_from_time(t: f64) -> f64 { t.rem_euclid(1000.0) }
+fn hour_from_time(t: f64) -> f64 {
+    ((t / MS_PER_HOUR).floor()).rem_euclid(24.0)
+}
+fn min_from_time(t: f64) -> f64 {
+    ((t / MS_PER_MINUTE).floor()).rem_euclid(60.0)
+}
+fn sec_from_time(t: f64) -> f64 {
+    ((t / MS_PER_SECOND).floor()).rem_euclid(60.0)
+}
+fn ms_from_time(t: f64) -> f64 {
+    t.rem_euclid(1000.0)
+}
 
 /// Extract UTC time components from a timestamp (ms since epoch).
 /// Returns (year, month0, day, hour, minute, second, ms_within_second)
 /// Uses pure arithmetic — works for all valid JS Date ranges.
 fn utc_components(ts: f64) -> (f64, f64, f64, f64, f64, f64, f64) {
     if !ts.is_finite() {
-        return (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+        return (
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        );
     }
     (
         year_from_time(ts),
@@ -656,7 +685,9 @@ fn parse_extended_year(year: i64, rest: &str) -> f64 {
     } else if rest.starts_with('-') {
         let parts = &rest[1..]; // skip leading '-'
         // Parse MM
-        if parts.len() < 2 { return f64::NAN; }
+        if parts.len() < 2 {
+            return f64::NAN;
+        }
         let month_str = &parts[0..2];
         let month: f64 = match month_str.parse::<u32>() {
             Ok(m) => m as f64,
@@ -677,12 +708,14 @@ fn parse_extended_year(year: i64, rest: &str) -> f64 {
                 // Parse time: HH:MM, HH:MM:SS, or HH:MM:SS.sss, possibly followed by Z
                 let time_part = &parts[6..];
                 let (time_str, utc) = if time_part.ends_with('Z') {
-                    (&time_part[..time_part.len()-1], true)
+                    (&time_part[..time_part.len() - 1], true)
                 } else {
                     (time_part, false) // treat as local time
                 };
                 let tparts: Vec<&str> = time_str.split(':').collect();
-                if tparts.len() < 2 { return f64::NAN; }
+                if tparts.len() < 2 {
+                    return f64::NAN;
+                }
                 let h: f64 = tparts[0].parse().unwrap_or(f64::NAN);
                 let m: f64 = tparts[1].parse().unwrap_or(f64::NAN);
                 let (s_val, ms_val) = if tparts.len() >= 3 {
@@ -764,7 +797,7 @@ fn parse_date_string_internal(s: &str) -> f64 {
         }
     } else if s.ends_with(" GMT") {
         // RFC 1123 / toUTCString format: "Thu, 01 Jan 1970 00:00:00 GMT"
-        if let Ok(dt) = NaiveDateTime::parse_from_str(&s[..s.len()-4], "%a, %d %b %Y %H:%M:%S") {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(&s[..s.len() - 4], "%a, %d %b %Y %H:%M:%S") {
             dt.and_utc().timestamp_millis() as f64
         } else {
             f64::NAN
@@ -937,9 +970,7 @@ pub fn init_date_prototype(
             if ts.is_nan() {
                 return Ok(Value::nan());
             }
-            let dt =
-                ts_to_utc(ts)
-                    .unwrap(); // valid ts should unwrap
+            let dt = ts_to_utc(ts).unwrap(); // valid ts should unwrap
             let local: DateTime<Local> = dt.into();
             Ok(Value::int32(local.year()))
         }),
@@ -954,9 +985,7 @@ pub fn init_date_prototype(
             if ts.is_nan() {
                 return Ok(Value::nan());
             }
-            let dt =
-                ts_to_utc(ts)
-                    .unwrap();
+            let dt = ts_to_utc(ts).unwrap();
             Ok(Value::int32(dt.year()))
         }),
     );
@@ -970,9 +999,7 @@ pub fn init_date_prototype(
             if ts.is_nan() {
                 return Ok(Value::nan());
             }
-            let dt =
-                ts_to_utc(ts)
-                    .unwrap();
+            let dt = ts_to_utc(ts).unwrap();
             let local: DateTime<Local> = dt.into();
             Ok(Value::int32(local.month0() as i32))
         }),
@@ -987,9 +1014,7 @@ pub fn init_date_prototype(
             if ts.is_nan() {
                 return Ok(Value::nan());
             }
-            let dt =
-                ts_to_utc(ts)
-                    .unwrap();
+            let dt = ts_to_utc(ts).unwrap();
             Ok(Value::int32(dt.month0() as i32))
         }),
     );
@@ -1003,9 +1028,7 @@ pub fn init_date_prototype(
             if ts.is_nan() {
                 return Ok(Value::nan());
             }
-            let dt =
-                ts_to_utc(ts)
-                    .unwrap();
+            let dt = ts_to_utc(ts).unwrap();
             let local: DateTime<Local> = dt.into();
             Ok(Value::int32(local.day() as i32))
         }),
@@ -1020,9 +1043,7 @@ pub fn init_date_prototype(
             if ts.is_nan() {
                 return Ok(Value::nan());
             }
-            let dt =
-                ts_to_utc(ts)
-                    .unwrap();
+            let dt = ts_to_utc(ts).unwrap();
             Ok(Value::int32(dt.day() as i32))
         }),
     );
@@ -1036,9 +1057,7 @@ pub fn init_date_prototype(
             if ts.is_nan() {
                 return Ok(Value::nan());
             }
-            let dt =
-                ts_to_utc(ts)
-                    .unwrap();
+            let dt = ts_to_utc(ts).unwrap();
             let local: DateTime<Local> = dt.into();
             Ok(Value::int32(local.weekday().num_days_from_sunday() as i32))
         }),
@@ -1053,9 +1072,7 @@ pub fn init_date_prototype(
             if ts.is_nan() {
                 return Ok(Value::nan());
             }
-            let dt =
-                ts_to_utc(ts)
-                    .unwrap();
+            let dt = ts_to_utc(ts).unwrap();
             Ok(Value::int32(dt.weekday().num_days_from_sunday() as i32))
         }),
     );
@@ -1069,9 +1086,7 @@ pub fn init_date_prototype(
             if ts.is_nan() {
                 return Ok(Value::nan());
             }
-            let dt =
-                ts_to_utc(ts)
-                    .unwrap();
+            let dt = ts_to_utc(ts).unwrap();
             let local: DateTime<Local> = dt.into();
             Ok(Value::int32(local.hour() as i32))
         }),
@@ -1086,9 +1101,7 @@ pub fn init_date_prototype(
             if ts.is_nan() {
                 return Ok(Value::nan());
             }
-            let dt =
-                ts_to_utc(ts)
-                    .unwrap();
+            let dt = ts_to_utc(ts).unwrap();
             Ok(Value::int32(dt.hour() as i32))
         }),
     );
@@ -1102,9 +1115,7 @@ pub fn init_date_prototype(
             if ts.is_nan() {
                 return Ok(Value::nan());
             }
-            let dt =
-                ts_to_utc(ts)
-                    .unwrap();
+            let dt = ts_to_utc(ts).unwrap();
             let local: DateTime<Local> = dt.into();
             Ok(Value::int32(local.minute() as i32))
         }),
@@ -1119,9 +1130,7 @@ pub fn init_date_prototype(
             if ts.is_nan() {
                 return Ok(Value::nan());
             }
-            let dt =
-                ts_to_utc(ts)
-                    .unwrap();
+            let dt = ts_to_utc(ts).unwrap();
             Ok(Value::int32(dt.minute() as i32))
         }),
     );
@@ -1135,9 +1144,7 @@ pub fn init_date_prototype(
             if ts.is_nan() {
                 return Ok(Value::nan());
             }
-            let dt =
-                ts_to_utc(ts)
-                    .unwrap();
+            let dt = ts_to_utc(ts).unwrap();
             let local: DateTime<Local> = dt.into();
             Ok(Value::int32(local.second() as i32))
         }),
@@ -1152,9 +1159,7 @@ pub fn init_date_prototype(
             if ts.is_nan() {
                 return Ok(Value::nan());
             }
-            let dt =
-                ts_to_utc(ts)
-                    .unwrap();
+            let dt = ts_to_utc(ts).unwrap();
             Ok(Value::int32(dt.second() as i32))
         }),
     );
@@ -1367,7 +1372,7 @@ pub fn init_date_prototype(
             let s = format!(
                 "{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
                 year_str,
-                m as u32 + 1,  // month0 → month1
+                m as u32 + 1, // month0 → month1
                 d as u32,
                 h as u32,
                 min as u32,
@@ -2310,9 +2315,7 @@ pub fn init_date_prototype(
             if ts.is_nan() {
                 return Ok(Value::nan());
             }
-            let dt =
-                ts_to_utc(ts)
-                    .unwrap();
+            let dt = ts_to_utc(ts).unwrap();
             let local: DateTime<Local> = dt.into();
             Ok(Value::int32(local.year() - 1900))
         }),
@@ -2347,9 +2350,7 @@ pub fn init_date_prototype(
                 ));
             }
             if ts.fract() != 0.0 {
-                return Err(VmError::range_error(
-                    "Cannot convert non-integer to BigInt",
-                ));
+                return Err(VmError::range_error("Cannot convert non-integer to BigInt"));
             }
 
             // Compute ns = t * 10^6 using i128 to avoid overflow
@@ -2372,9 +2373,7 @@ pub fn init_date_prototype(
                 .and_then(|i| i.get(&PropertyKey::string("prototype")))
                 .and_then(|p| p.as_object());
 
-            let proto = instant_proto
-                .map(Value::object)
-                .unwrap_or_else(Value::null);
+            let proto = instant_proto.map(Value::object).unwrap_or_else(Value::null);
 
             let instant = GcRef::new(JsObject::new(proto, mm));
             let _ = instant.set(
@@ -2385,5 +2384,4 @@ pub fn init_date_prototype(
             Ok(Value::object(instant))
         }),
     );
-
 }

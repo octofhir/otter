@@ -5,8 +5,8 @@
 //! with the same structure using a transition tree.
 
 use crate::object::PropertyKey;
-use std::cell::RefCell;
 use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 use std::sync::{Arc, Weak};
 
 /// A Shape defines the layout of properties in an object.

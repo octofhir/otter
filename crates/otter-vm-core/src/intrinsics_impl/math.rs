@@ -27,9 +27,9 @@
 //!   to sum an iterable. Will be added in a future update.
 
 use crate::gc::GcRef;
-use crate::object::{JsObject, PropertyKey, PropertyDescriptor, PropertyAttributes};
-use crate::value::Value;
 use crate::memory::MemoryManager;
+use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
+use crate::value::Value;
 use std::sync::Arc;
 
 /// Helper to convert Value to f64
@@ -62,10 +62,7 @@ fn to_number(val: &Value) -> f64 {
 ///
 /// * `global` - The global object where Math will be installed
 /// * `mm` - Memory manager for GC allocations
-pub fn install_math_namespace(
-    global: GcRef<JsObject>,
-    mm: &Arc<MemoryManager>,
-) {
+pub fn install_math_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManager>) {
     // Create Math namespace object (plain object, not a constructor)
     let math_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
@@ -79,60 +76,42 @@ pub fn install_math_namespace(
     // The base of natural logarithms
     math_obj.define_property(
         PropertyKey::string("E"),
-        PropertyDescriptor::data_with_attrs(
-            Value::number(std::f64::consts::E),
-            const_attrs,
-        ),
+        PropertyDescriptor::data_with_attrs(Value::number(std::f64::consts::E), const_attrs),
     );
 
     // Math.LN10 (2.302585092994046)
     // The natural logarithm of 10
     math_obj.define_property(
         PropertyKey::string("LN10"),
-        PropertyDescriptor::data_with_attrs(
-            Value::number(std::f64::consts::LN_10),
-            const_attrs,
-        ),
+        PropertyDescriptor::data_with_attrs(Value::number(std::f64::consts::LN_10), const_attrs),
     );
 
     // Math.LN2 (0.6931471805599453)
     // The natural logarithm of 2
     math_obj.define_property(
         PropertyKey::string("LN2"),
-        PropertyDescriptor::data_with_attrs(
-            Value::number(std::f64::consts::LN_2),
-            const_attrs,
-        ),
+        PropertyDescriptor::data_with_attrs(Value::number(std::f64::consts::LN_2), const_attrs),
     );
 
     // Math.LOG10E (0.4342944819032518)
     // The base 10 logarithm of e
     math_obj.define_property(
         PropertyKey::string("LOG10E"),
-        PropertyDescriptor::data_with_attrs(
-            Value::number(std::f64::consts::LOG10_E),
-            const_attrs,
-        ),
+        PropertyDescriptor::data_with_attrs(Value::number(std::f64::consts::LOG10_E), const_attrs),
     );
 
     // Math.LOG2E (1.4426950408889634)
     // The base 2 logarithm of e
     math_obj.define_property(
         PropertyKey::string("LOG2E"),
-        PropertyDescriptor::data_with_attrs(
-            Value::number(std::f64::consts::LOG2_E),
-            const_attrs,
-        ),
+        PropertyDescriptor::data_with_attrs(Value::number(std::f64::consts::LOG2_E), const_attrs),
     );
 
     // Math.PI (3.141592653589793)
     // The ratio of a circle's circumference to its diameter
     math_obj.define_property(
         PropertyKey::string("PI"),
-        PropertyDescriptor::data_with_attrs(
-            Value::number(std::f64::consts::PI),
-            const_attrs,
-        ),
+        PropertyDescriptor::data_with_attrs(Value::number(std::f64::consts::PI), const_attrs),
     );
 
     // Math.SQRT1_2 (0.7071067811865476)
@@ -149,10 +128,7 @@ pub fn install_math_namespace(
     // The square root of 2
     math_obj.define_property(
         PropertyKey::string("SQRT2"),
-        PropertyDescriptor::data_with_attrs(
-            Value::number(std::f64::consts::SQRT_2),
-            const_attrs,
-        ),
+        PropertyDescriptor::data_with_attrs(Value::number(std::f64::consts::SQRT_2), const_attrs),
     );
 
     // ====================================================================
@@ -165,10 +141,7 @@ pub fn install_math_namespace(
         ($name:literal, $body:expr) => {
             let _ = math_obj.set(
                 PropertyKey::string($name),
-                Value::native_function(
-                    $body,
-                    mm.clone(),
-                ),
+                Value::native_function($body, mm.clone()),
             );
         };
     }
@@ -393,10 +366,12 @@ pub fn install_math_namespace(
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hasher};
         let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u64(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64);
+        hasher.write_u64(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64,
+        );
         let hash = hasher.finish();
         let rand = (hash as f64) / (u64::MAX as f64);
         Ok(Value::number(rand))
@@ -425,7 +400,8 @@ pub fn install_math_namespace(
         // If it's an array, sum its elements using Kahan summation
         if let Some(arr_obj) = iterable.as_object() {
             // Try to get length property
-            let length_val = arr_obj.get(&PropertyKey::string("length"))
+            let length_val = arr_obj
+                .get(&PropertyKey::string("length"))
                 .unwrap_or(Value::undefined());
             let length = if let Some(n) = length_val.as_number() {
                 n as usize
@@ -441,7 +417,8 @@ pub fn install_math_namespace(
             let mut compensation = 0.0; // Running compensation for lost low-order bits
 
             for i in 0..length {
-                let elem = arr_obj.get(&PropertyKey::Index(i as u32))
+                let elem = arr_obj
+                    .get(&PropertyKey::Index(i as u32))
                     .unwrap_or(Value::undefined());
                 let value = to_number(&elem);
 
@@ -451,10 +428,10 @@ pub fn install_math_namespace(
                 }
 
                 // Kahan summation step
-                let y = value - compensation;    // Subtract the compensation
-                let t = sum + y;                 // Add to sum
-                compensation = (t - sum) - y;    // Calculate new compensation
-                sum = t;                         // Update sum
+                let y = value - compensation; // Subtract the compensation
+                let t = sum + y; // Add to sum
+                compensation = (t - sum) - y; // Calculate new compensation
+                sum = t; // Update sum
             }
 
             Ok(Value::number(sum))

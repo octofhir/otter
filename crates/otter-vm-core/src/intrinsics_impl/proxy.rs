@@ -50,9 +50,9 @@ pub fn init_proxy_constructor(
             let target = args
                 .first()
                 .ok_or_else(|| VmError::type_error("Proxy.revocable requires a target argument"))?;
-            let handler = args
-                .get(1)
-                .ok_or_else(|| VmError::type_error("Proxy.revocable requires a handler argument"))?;
+            let handler = args.get(1).ok_or_else(|| {
+                VmError::type_error("Proxy.revocable requires a handler argument")
+            })?;
 
             if !is_object_like(target) {
                 return Err(VmError::type_error("Proxy target must be an object"));
@@ -70,7 +70,9 @@ pub fn init_proxy_constructor(
             // Create revoke function
             let revoke_fn = revocable.revoke;
             let revoke_value = Value::native_function_with_proto(
-                move |_this: &Value, _args: &[Value], _ncx: &mut crate::context::NativeContext<'_>| {
+                move |_this: &Value,
+                      _args: &[Value],
+                      _ncx: &mut crate::context::NativeContext<'_>| {
                     revoke_fn();
                     Ok(Value::undefined())
                 },

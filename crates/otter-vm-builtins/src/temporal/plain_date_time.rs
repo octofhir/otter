@@ -17,17 +17,41 @@ pub fn ops() -> Vec<Op> {
         op_native("__Temporal_PlainDateTime_hour", plain_date_time_hour),
         op_native("__Temporal_PlainDateTime_minute", plain_date_time_minute),
         op_native("__Temporal_PlainDateTime_second", plain_date_time_second),
-        op_native("__Temporal_PlainDateTime_millisecond", plain_date_time_millisecond),
-        op_native("__Temporal_PlainDateTime_microsecond", plain_date_time_microsecond),
-        op_native("__Temporal_PlainDateTime_nanosecond", plain_date_time_nanosecond),
+        op_native(
+            "__Temporal_PlainDateTime_millisecond",
+            plain_date_time_millisecond,
+        ),
+        op_native(
+            "__Temporal_PlainDateTime_microsecond",
+            plain_date_time_microsecond,
+        ),
+        op_native(
+            "__Temporal_PlainDateTime_nanosecond",
+            plain_date_time_nanosecond,
+        ),
         op_native("__Temporal_PlainDateTime_add", plain_date_time_add),
-        op_native("__Temporal_PlainDateTime_subtract", plain_date_time_subtract),
+        op_native(
+            "__Temporal_PlainDateTime_subtract",
+            plain_date_time_subtract,
+        ),
         op_native("__Temporal_PlainDateTime_equals", plain_date_time_equals),
-        op_native("__Temporal_PlainDateTime_toString", plain_date_time_to_string),
+        op_native(
+            "__Temporal_PlainDateTime_toString",
+            plain_date_time_to_string,
+        ),
         op_native("__Temporal_PlainDateTime_toJSON", plain_date_time_to_json),
-        op_native("__Temporal_PlainDateTime_toPlainDate", plain_date_time_to_plain_date),
-        op_native("__Temporal_PlainDateTime_toPlainTime", plain_date_time_to_plain_time),
-        op_native("__Temporal_PlainDateTime_toZonedDateTime", plain_date_time_to_zoned_date_time),
+        op_native(
+            "__Temporal_PlainDateTime_toPlainDate",
+            plain_date_time_to_plain_date,
+        ),
+        op_native(
+            "__Temporal_PlainDateTime_toPlainTime",
+            plain_date_time_to_plain_time,
+        ),
+        op_native(
+            "__Temporal_PlainDateTime_toZonedDateTime",
+            plain_date_time_to_zoned_date_time,
+        ),
     ]
 }
 
@@ -43,8 +67,17 @@ fn get_date_time(args: &[Value]) -> Option<PlainDateTime> {
 
 fn format_date_time(dt: &PlainDateTime) -> String {
     dt.to_ixdtf_string(ToStringRoundingOptions::default(), DisplayCalendar::Auto)
-        .unwrap_or_else(|_| format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-            dt.year(), dt.month(), dt.day(), dt.hour(), dt.minute(), dt.second()))
+        .unwrap_or_else(|_| {
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+                dt.year(),
+                dt.month(),
+                dt.day(),
+                dt.hour(),
+                dt.minute(),
+                dt.second()
+            )
+        })
 }
 
 fn plain_date_time_from(args: &[Value]) -> Result<Value, VmError> {
@@ -55,20 +88,22 @@ fn plain_date_time_from(args: &[Value]) -> Result<Value, VmError> {
 
     match parse_date_time(s.as_str()) {
         Some(dt) => Ok(Value::string(JsString::intern(&format_date_time(&dt)))),
-        None => Err(VmError::type_error(format!("Invalid PlainDateTime string: {}", s))),
+        None => Err(VmError::type_error(format!(
+            "Invalid PlainDateTime string: {}",
+            s
+        ))),
     }
 }
 
 fn plain_date_time_compare(args: &[Value]) -> Result<Value, VmError> {
     let dt1 = get_date_time(args);
-    let dt2 = args.get(1)
+    let dt2 = args
+        .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_date_time(s.as_str()));
 
     match (dt1, dt2) {
-        (Some(a), Some(b)) => {
-            Ok(Value::int32(a.compare_iso(&b) as i8 as i32))
-        }
+        (Some(a), Some(b)) => Ok(Value::int32(a.compare_iso(&b) as i8 as i32)),
         _ => Err(VmError::type_error("Invalid PlainDateTime for comparison")),
     }
 }
@@ -129,14 +164,16 @@ fn plain_date_time_nanosecond(args: &[Value]) -> Result<Value, VmError> {
 
 fn plain_date_time_add(args: &[Value]) -> Result<Value, VmError> {
     let dt = get_date_time(args).ok_or(VmError::type_error("Invalid PlainDateTime"))?;
-    let duration_str = args.get(1)
+    let duration_str = args
+        .get(1)
         .and_then(|v| v.as_string())
         .ok_or(VmError::type_error("Duration required"))?;
 
     let duration = temporal_rs::Duration::from_utf8(duration_str.as_str().as_bytes())
         .map_err(|e| VmError::type_error(format!("Invalid duration: {:?}", e)))?;
 
-    let new_dt = dt.add(&duration, None)
+    let new_dt = dt
+        .add(&duration, None)
         .map_err(|e| VmError::type_error(format!("Add failed: {:?}", e)))?;
 
     Ok(Value::string(JsString::intern(&format_date_time(&new_dt))))
@@ -144,14 +181,16 @@ fn plain_date_time_add(args: &[Value]) -> Result<Value, VmError> {
 
 fn plain_date_time_subtract(args: &[Value]) -> Result<Value, VmError> {
     let dt = get_date_time(args).ok_or(VmError::type_error("Invalid PlainDateTime"))?;
-    let duration_str = args.get(1)
+    let duration_str = args
+        .get(1)
         .and_then(|v| v.as_string())
         .ok_or(VmError::type_error("Duration required"))?;
 
     let duration = temporal_rs::Duration::from_utf8(duration_str.as_str().as_bytes())
         .map_err(|e| VmError::type_error(format!("Invalid duration: {:?}", e)))?;
 
-    let new_dt = dt.subtract(&duration, None)
+    let new_dt = dt
+        .subtract(&duration, None)
         .map_err(|e| VmError::type_error(format!("Subtract failed: {:?}", e)))?;
 
     Ok(Value::string(JsString::intern(&format_date_time(&new_dt))))
@@ -159,7 +198,8 @@ fn plain_date_time_subtract(args: &[Value]) -> Result<Value, VmError> {
 
 fn plain_date_time_equals(args: &[Value]) -> Result<Value, VmError> {
     let dt1 = get_date_time(args);
-    let dt2 = args.get(1)
+    let dt2 = args
+        .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_date_time(s.as_str()));
 
@@ -193,7 +233,8 @@ fn plain_date_time_to_plain_time(args: &[Value]) -> Result<Value, VmError> {
     get_date_time(args)
         .and_then(|dt| {
             let time = dt.to_plain_time();
-            time.to_ixdtf_string(ToStringRoundingOptions::default()).ok()
+            time.to_ixdtf_string(ToStringRoundingOptions::default())
+                .ok()
         })
         .map(|s| Value::string(JsString::intern(&s)))
         .ok_or_else(|| VmError::type_error("Invalid PlainDateTime"))
@@ -212,16 +253,23 @@ fn plain_date_time_to_zoned_date_time(args: &[Value]) -> Result<Value, VmError> 
             .map_err(|e| VmError::type_error(format!("Failed to get system timezone: {:?}", e)))?
     };
 
-    let zdt = dt.to_zoned_date_time_with_provider(tz, temporal_rs::options::Disambiguation::Compatible, &*COMPILED_TZ_PROVIDER)
+    let zdt = dt
+        .to_zoned_date_time_with_provider(
+            tz,
+            temporal_rs::options::Disambiguation::Compatible,
+            &*COMPILED_TZ_PROVIDER,
+        )
         .map_err(|e| VmError::type_error(format!("toZonedDateTime failed: {:?}", e)))?;
 
-    let s = zdt.to_ixdtf_string_with_provider(
-        temporal_rs::options::DisplayOffset::Auto,
-        temporal_rs::options::DisplayTimeZone::Auto,
-        DisplayCalendar::Auto,
-        ToStringRoundingOptions::default(),
-        &*COMPILED_TZ_PROVIDER,
-    ).map_err(|e| VmError::type_error(format!("toString failed: {:?}", e)))?;
+    let s = zdt
+        .to_ixdtf_string_with_provider(
+            temporal_rs::options::DisplayOffset::Auto,
+            temporal_rs::options::DisplayTimeZone::Auto,
+            DisplayCalendar::Auto,
+            ToStringRoundingOptions::default(),
+            &*COMPILED_TZ_PROVIDER,
+        )
+        .map_err(|e| VmError::type_error(format!("toString failed: {:?}", e)))?;
 
     Ok(Value::string(JsString::intern(&s)))
 }

@@ -212,7 +212,12 @@ fn symbol_get_well_known(
         "split" => (well_known::SPLIT, "Symbol.split"),
         "species" => (well_known::SPECIES, "Symbol.species"),
         "unscopables" => (well_known::UNSCOPABLES, "Symbol.unscopables"),
-        _ => return Err(VmError::type_error(format!("Unknown well-known symbol: {}", name))),
+        _ => {
+            return Err(VmError::type_error(format!(
+                "Unknown well-known symbol: {}",
+                name
+            )));
+        }
     };
 
     let sym = GcRef::new(Symbol {

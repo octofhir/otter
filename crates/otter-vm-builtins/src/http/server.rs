@@ -15,8 +15,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::mpsc;
@@ -24,8 +24,8 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
-use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig, CloseFrame};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role, WebSocketConfig};
 
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -524,8 +524,12 @@ impl HttpServerManager {
             match upgrade.await {
                 Ok(upgraded) => {
                     let upgraded = TokioIo::new(upgraded);
-                    let ws_stream =
-                        WebSocketStream::from_raw_socket(upgraded, Role::Server, Some(ws_config_to_tungstenite(&ws_config))).await;
+                    let ws_stream = WebSocketStream::from_raw_socket(
+                        upgraded,
+                        Role::Server,
+                        Some(ws_config_to_tungstenite(&ws_config)),
+                    )
+                    .await;
 
                     let _ = ws_event_tx.send(WsEvent::Open {
                         server_id,
@@ -581,12 +585,14 @@ impl HttpServerManager {
             return -1;
         }
 
-        conn.buffered_amount.fetch_add(size as u64, Ordering::Relaxed);
+        conn.buffered_amount
+            .fetch_add(size as u64, Ordering::Relaxed);
         let message = if is_text {
             match String::from_utf8(data) {
                 Ok(text) => Message::Text(text.into()),
                 Err(_) => {
-                    conn.buffered_amount.fetch_sub(size as u64, Ordering::Relaxed);
+                    conn.buffered_amount
+                        .fetch_sub(size as u64, Ordering::Relaxed);
                     return 0;
                 }
             }
@@ -594,8 +600,13 @@ impl HttpServerManager {
             Message::Binary(data.into())
         };
 
-        if conn.sender.send(WsOutgoing::Message { message, size }).is_err() {
-            conn.buffered_amount.fetch_sub(size as u64, Ordering::Relaxed);
+        if conn
+            .sender
+            .send(WsOutgoing::Message { message, size })
+            .is_err()
+        {
+            conn.buffered_amount
+                .fetch_sub(size as u64, Ordering::Relaxed);
             return 0;
         }
 
@@ -629,11 +640,7 @@ impl HttpServerManager {
             return 0;
         };
         let size = data.len();
-        if conn
-            .sender
-            .send(WsOutgoing::Ping { data })
-            .is_err()
-        {
+        if conn.sender.send(WsOutgoing::Ping { data }).is_err() {
             return 0;
         }
         size as i64
@@ -645,11 +652,7 @@ impl HttpServerManager {
             return 0;
         };
         let size = data.len();
-        if conn
-            .sender
-            .send(WsOutgoing::Pong { data })
-            .is_err()
-        {
+        if conn.sender.send(WsOutgoing::Pong { data }).is_err() {
             return 0;
         }
         size as i64
@@ -663,10 +666,7 @@ impl HttpServerManager {
         let mut subs = conn.subscriptions.lock().unwrap();
         if subs.insert(topic.to_string()) {
             let key = topic_key(conn.server_id, topic);
-            let entry = self
-                .ws_topics
-                .entry(key)
-                .or_insert_with(DashSet::new);
+            let entry = self.ws_topics.entry(key).or_insert_with(DashSet::new);
             entry.insert(socket_id);
         }
         true
@@ -761,10 +761,7 @@ impl HttpServerManager {
     /// Get subscriber count for a topic.
     pub fn ws_subscriber_count(&self, server_id: u64, topic: &str) -> usize {
         let key = topic_key(server_id, topic);
-        self.ws_topics
-            .get(&key)
-            .map(|set| set.len())
-            .unwrap_or(0)
+        self.ws_topics.get(&key).map(|set| set.len()).unwrap_or(0)
     }
 
     /// Stop a server by ID
@@ -794,16 +791,16 @@ impl HttpServerManager {
 
     /// Get pending request count for a server.
     pub fn pending_requests(&self, id: u64) -> Option<u64> {
-        self.servers.get(&id).map(|handle| {
-            handle.pending_requests.load(Ordering::Relaxed)
-        })
+        self.servers
+            .get(&id)
+            .map(|handle| handle.pending_requests.load(Ordering::Relaxed))
     }
 
     /// Get pending websocket count for a server.
     pub fn pending_websockets(&self, id: u64) -> Option<u64> {
-        self.servers.get(&id).map(|handle| {
-            handle.pending_websockets.load(Ordering::Relaxed)
-        })
+        self.servers
+            .get(&id)
+            .map(|handle| handle.pending_websockets.load(Ordering::Relaxed))
     }
 
     /// Get the number of active servers
@@ -818,7 +815,11 @@ fn build_tls_acceptor(config: &TlsConfig, enable_http2: bool) -> Result<TlsAccep
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
 
-fn build_server_builder(enable_http2: bool, enable_h2c: bool, is_tls: bool) -> ServerBuilder<TokioExecutor> {
+fn build_server_builder(
+    enable_http2: bool,
+    enable_h2c: bool,
+    is_tls: bool,
+) -> ServerBuilder<TokioExecutor> {
     let mut builder = ServerBuilder::new(TokioExecutor::new());
 
     let allow_http2 = if is_tls { enable_http2 } else { enable_h2c };

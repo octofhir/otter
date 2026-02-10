@@ -47,13 +47,17 @@ fn plain_time_from(args: &[Value]) -> Result<Value, VmError> {
 
     match parse_time(s.as_str()) {
         Some(t) => Ok(Value::string(JsString::intern(&format_time(&t)))),
-        None => Err(VmError::type_error(format!("Invalid PlainTime string: {}", s))),
+        None => Err(VmError::type_error(format!(
+            "Invalid PlainTime string: {}",
+            s
+        ))),
     }
 }
 
 fn plain_time_compare(args: &[Value]) -> Result<Value, VmError> {
     let t1 = get_time(args);
-    let t2 = args.get(1)
+    let t2 = args
+        .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_time(s.as_str()));
 
@@ -108,14 +112,16 @@ fn plain_time_nanosecond(args: &[Value]) -> Result<Value, VmError> {
 
 fn plain_time_add(args: &[Value]) -> Result<Value, VmError> {
     let t = get_time(args).ok_or(VmError::type_error("Invalid PlainTime"))?;
-    let duration_str = args.get(1)
+    let duration_str = args
+        .get(1)
         .and_then(|v| v.as_string())
         .ok_or(VmError::type_error("Duration required"))?;
 
     let duration = temporal_rs::Duration::from_utf8(duration_str.as_str().as_bytes())
         .map_err(|e| VmError::type_error(format!("Invalid duration: {:?}", e)))?;
 
-    let new_t = t.add(&duration)
+    let new_t = t
+        .add(&duration)
         .map_err(|e| VmError::type_error(format!("Add failed: {:?}", e)))?;
 
     Ok(Value::string(JsString::intern(&format_time(&new_t))))
@@ -123,14 +129,16 @@ fn plain_time_add(args: &[Value]) -> Result<Value, VmError> {
 
 fn plain_time_subtract(args: &[Value]) -> Result<Value, VmError> {
     let t = get_time(args).ok_or(VmError::type_error("Invalid PlainTime"))?;
-    let duration_str = args.get(1)
+    let duration_str = args
+        .get(1)
         .and_then(|v| v.as_string())
         .ok_or(VmError::type_error("Duration required"))?;
 
     let duration = temporal_rs::Duration::from_utf8(duration_str.as_str().as_bytes())
         .map_err(|e| VmError::type_error(format!("Invalid duration: {:?}", e)))?;
 
-    let new_t = t.subtract(&duration)
+    let new_t = t
+        .subtract(&duration)
         .map_err(|e| VmError::type_error(format!("Subtract failed: {:?}", e)))?;
 
     Ok(Value::string(JsString::intern(&format_time(&new_t))))
@@ -138,7 +146,8 @@ fn plain_time_subtract(args: &[Value]) -> Result<Value, VmError> {
 
 fn plain_time_equals(args: &[Value]) -> Result<Value, VmError> {
     let t1 = get_time(args);
-    let t2 = args.get(1)
+    let t2 = args
+        .get(1)
         .and_then(|v| v.as_string())
         .and_then(|s| parse_time(s.as_str()));
 

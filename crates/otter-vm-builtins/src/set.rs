@@ -113,7 +113,9 @@ fn native_set_add(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<V
         .get(&str_to_key(IS_SET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_set.as_boolean() != Some(true) {
-        return Err(VmError::type_error("Method Set.prototype.add called on incompatible receiver"));
+        return Err(VmError::type_error(
+            "Method Set.prototype.add called on incompatible receiver",
+        ));
     }
 
     let values = set_obj
@@ -156,7 +158,9 @@ fn native_set_has(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<V
         .get(&str_to_key(IS_SET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_set.as_boolean() != Some(true) {
-        return Err(VmError::type_error("Method Set.prototype.has called on incompatible receiver"));
+        return Err(VmError::type_error(
+            "Method Set.prototype.has called on incompatible receiver",
+        ));
     }
 
     let values = set_obj
@@ -173,7 +177,10 @@ fn native_set_has(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<V
 }
 
 /// Set.prototype.delete(value)
-fn native_set_delete(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
+fn native_set_delete(
+    args: &[VmValue],
+    _mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, VmError> {
     let set = args.first().ok_or("Set.delete requires a Set")?;
     let value = args.get(1).cloned().unwrap_or_else(VmValue::undefined);
 
@@ -183,7 +190,9 @@ fn native_set_delete(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Resul
         .get(&str_to_key(IS_SET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_set.as_boolean() != Some(true) {
-        return Err(VmError::type_error("Method Set.prototype.delete called on incompatible receiver"));
+        return Err(VmError::type_error(
+            "Method Set.prototype.delete called on incompatible receiver",
+        ));
     }
 
     let values = set_obj
@@ -225,7 +234,9 @@ fn native_set_clear(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<
         .get(&str_to_key(IS_SET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_set.as_boolean() != Some(true) {
-        return Err(VmError::type_error("Method Set.prototype.clear called on incompatible receiver"));
+        return Err(VmError::type_error(
+            "Method Set.prototype.clear called on incompatible receiver",
+        ));
     }
 
     // Replace values with new empty object
@@ -246,7 +257,9 @@ fn native_set_size(args: &[VmValue], _mm: Arc<memory::MemoryManager>) -> Result<
         .get(&str_to_key(IS_SET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_set.as_boolean() != Some(true) {
-        return Err(VmError::type_error("get Set.prototype.size called on incompatible receiver"));
+        return Err(VmError::type_error(
+            "get Set.prototype.size called on incompatible receiver",
+        ));
     }
 
     let size = set_obj
@@ -265,7 +278,9 @@ fn native_set_values(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result
         .get(&str_to_key(IS_SET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_set.as_boolean() != Some(true) {
-        return Err(VmError::type_error("Method Set.prototype.values called on incompatible receiver"));
+        return Err(VmError::type_error(
+            "Method Set.prototype.values called on incompatible receiver",
+        ));
     }
 
     let values = set_obj
@@ -309,7 +324,9 @@ fn native_set_entries(
         .get(&str_to_key(IS_SET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_set.as_boolean() != Some(true) {
-        return Err(VmError::type_error("Method Set.prototype.entries called on incompatible receiver"));
+        return Err(VmError::type_error(
+            "Method Set.prototype.entries called on incompatible receiver",
+        ));
     }
 
     let values = set_obj
@@ -342,7 +359,10 @@ fn native_set_entries(
 }
 
 /// Set.prototype.forEach - returns values for JS to iterate
-fn native_set_foreach(args: &[VmValue], mm: Arc<memory::MemoryManager>) -> Result<VmValue, VmError> {
+fn native_set_foreach(
+    args: &[VmValue],
+    mm: Arc<memory::MemoryManager>,
+) -> Result<VmValue, VmError> {
     native_set_values(args, mm)
 }
 
@@ -567,7 +587,9 @@ fn native_weakset_add(
         .get(&str_to_key(IS_WEAKSET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_weakset.as_boolean() != Some(true) {
-        return Err(VmError::type_error("Method WeakSet.prototype.add called on incompatible receiver"));
+        return Err(VmError::type_error(
+            "Method WeakSet.prototype.add called on incompatible receiver",
+        ));
     }
 
     validate_weakset_value(&value)?;
@@ -599,7 +621,9 @@ fn native_weakset_has(
         .get(&str_to_key(IS_WEAKSET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_weakset.as_boolean() != Some(true) {
-        return Err(VmError::type_error("Method WeakSet.prototype.has called on incompatible receiver"));
+        return Err(VmError::type_error(
+            "Method WeakSet.prototype.has called on incompatible receiver",
+        ));
     }
 
     if !value.is_object() && !value.is_symbol() && !value.is_function() {
@@ -633,7 +657,9 @@ fn native_weakset_delete(
         .get(&str_to_key(IS_WEAKSET_KEY))
         .unwrap_or_else(VmValue::undefined);
     if is_weakset.as_boolean() != Some(true) {
-        return Err(VmError::type_error("Method WeakSet.prototype.delete called on incompatible receiver"));
+        return Err(VmError::type_error(
+            "Method WeakSet.prototype.delete called on incompatible receiver",
+        ));
     }
 
     if !value.is_object() && !value.is_symbol() && !value.is_function() {
@@ -689,8 +715,7 @@ mod tests {
 
         let _ = native_set_add(&[set.clone(), value.clone()], Arc::clone(&mm)).unwrap();
 
-        let deleted =
-            native_set_delete(&[set.clone(), value.clone()], Arc::clone(&mm)).unwrap();
+        let deleted = native_set_delete(&[set.clone(), value.clone()], Arc::clone(&mm)).unwrap();
         assert_eq!(deleted.as_boolean(), Some(true));
 
         let has = native_set_has(&[set, value], Arc::clone(&mm)).unwrap();

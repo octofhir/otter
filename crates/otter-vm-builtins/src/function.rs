@@ -41,7 +41,9 @@ pub fn ops() -> Vec<Op> {
 /// This function should NEVER be called - the interpreter handles it specially.
 fn function_call(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     // If this is ever called, it means interpreter interception failed
-    Err(VmError::internal("Function.prototype.call stub was called - interpreter interception failed"))
+    Err(VmError::internal(
+        "Function.prototype.call stub was called - interpreter interception failed",
+    ))
 }
 
 /// Function.prototype.apply(thisArg, argsArray)
@@ -51,7 +53,9 @@ fn function_call(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Val
 /// This function should NEVER be called - the interpreter handles it specially.
 fn function_apply(_args: &[Value], _mm: Arc<memory::MemoryManager>) -> Result<Value, VmError> {
     // If this is ever called, it means interpreter interception failed
-    Err(VmError::internal("Function.prototype.apply stub was called - interpreter interception failed"))
+    Err(VmError::internal(
+        "Function.prototype.apply stub was called - interpreter interception failed",
+    ))
 }
 
 /// Function.prototype.toString() - returns string representation

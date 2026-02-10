@@ -28,8 +28,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use otter_vm_core::value::Value;
 use otter_vm_core::promise::JsPromiseJob;
+use otter_vm_core::value::Value;
 
 /// Microtask callback type (Rust closures)
 pub type Microtask = Box<dyn FnOnce() + Send>;
@@ -139,7 +139,9 @@ impl JsJobQueue {
     /// Enqueue a JS callback job
     pub fn enqueue(&self, job: JsPromiseJob, args: Vec<Value>) {
         let seq = self.sequencer.next();
-        self.queue.lock().push_back((seq, JsCallbackJob { job, args }));
+        self.queue
+            .lock()
+            .push_back((seq, JsCallbackJob { job, args }));
     }
 
     /// Dequeue the next JS callback job

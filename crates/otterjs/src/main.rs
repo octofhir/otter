@@ -293,6 +293,48 @@ fn build_engine(cli: &Cli, caps: otter_engine::Capabilities) -> otter_engine::Ot
         .build()
 }
 
+struct ResolveBaseDirGuard {
+    original_cwd: Option<PathBuf>,
+}
+
+impl ResolveBaseDirGuard {
+    fn from_source_url(source_url: &str) -> Result<Self> {
+        if source_url == "<eval>" {
+            return Ok(Self { original_cwd: None });
+        }
+
+        let source_path = if let Some(raw) = source_url.strip_prefix("file://") {
+            PathBuf::from(raw)
+        } else {
+            PathBuf::from(source_url)
+        };
+
+        let Some(parent) = source_path.parent() else {
+            return Ok(Self { original_cwd: None });
+        };
+
+        if parent.as_os_str().is_empty() {
+            return Ok(Self { original_cwd: None });
+        }
+
+        let original_cwd = std::env::current_dir().context("Failed to get current directory")?;
+        std::env::set_current_dir(parent)
+            .with_context(|| format!("Failed to switch cwd to {}", parent.display()))?;
+
+        Ok(Self {
+            original_cwd: Some(original_cwd),
+        })
+    }
+}
+
+impl Drop for ResolveBaseDirGuard {
+    fn drop(&mut self) {
+        if let Some(original) = self.original_cwd.take() {
+            let _ = std::env::set_current_dir(original);
+        }
+    }
+}
+
 /// Run a JavaScript file
 async fn run_file(path: &PathBuf, cli: &Cli) -> Result<()> {
     let source = std::fs::read_to_string(path)
@@ -332,7 +374,10 @@ async fn run_code(source: &str, source_url: &str, cli: &Cli) -> Result<()> {
     let caps = build_capabilities(cli);
 
     // Create engine with builtins (EngineBuilder handles all setup)
-    let mut engine = build_engine(cli, caps);
+    let mut engine = {
+        let _resolve_guard = ResolveBaseDirGuard::from_source_url(source_url)?;
+        build_engine(cli, caps)
+    };
 
     // Configure trace (either for full trace or timeout dumps)
     if cli.trace {
@@ -707,7 +752,11 @@ async fn run_test_file(
     let source = std::fs::read_to_string(path)?;
     let caps = build_capabilities(cli);
 
-    let mut engine = build_engine(cli, caps);
+    let mut engine = {
+        let source_url = path.to_string_lossy().to_string();
+        let _resolve_guard = ResolveBaseDirGuard::from_source_url(&source_url)?;
+        build_engine(cli, caps)
+    };
 
     // Configure trace (either for full trace or timeout dumps)
     if cli.trace {

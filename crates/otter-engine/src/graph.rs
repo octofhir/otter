@@ -196,48 +196,49 @@ impl ModuleGraph {
         let module_url = module.url.clone();
 
         // Skip parsing dependencies for built-ins (they have no source)
-        let (dependencies, import_records) = if module.url.starts_with("otter:") {
-            (Vec::new(), Vec::new())
-        } else {
-            // Parse dependencies based on module type (ESM or CommonJS)
-            let deps = parse_dependencies(&module.source, module.module_type);
+        let (dependencies, import_records) =
+            if module.url.starts_with("otter:") || module.url.starts_with("builtin://node:") {
+                (Vec::new(), Vec::new())
+            } else {
+                // Parse dependencies based on module type (ESM or CommonJS)
+                let deps = parse_dependencies(&module.source, module.module_type);
 
-            // Create import records with proper context
-            let records: Vec<ImportRecord> = deps
-                .iter()
-                .map(|spec| {
-                    let is_require = module.module_type.is_commonjs();
+                // Create import records with proper context
+                let records: Vec<ImportRecord> = deps
+                    .iter()
+                    .map(|spec| {
+                        let is_require = module.module_type.is_commonjs();
 
-                    // Resolve the dependency to determine its module type
-                    let context = if is_require {
-                        ImportContext::CJS
-                    } else {
-                        ImportContext::ESM
-                    };
+                        // Resolve the dependency to determine its module type
+                        let context = if is_require {
+                            ImportContext::CJS
+                        } else {
+                            ImportContext::ESM
+                        };
 
-                    let resolved = self
-                        .loader
-                        .resolve_with_context(spec, Some(&module.url), context)
-                        .ok();
+                        let resolved = self
+                            .loader
+                            .resolve_with_context(spec, Some(&module.url), context)
+                            .ok();
 
-                    // Determine wrapping flags based on importer and imported module types
-                    // We'll update these after loading the dependency
-                    let mut record = if is_require {
-                        ImportRecord::cjs_require(spec.clone())
-                    } else {
-                        ImportRecord::esm_import(spec.clone())
-                    };
+                        // Determine wrapping flags based on importer and imported module types
+                        // We'll update these after loading the dependency
+                        let mut record = if is_require {
+                            ImportRecord::cjs_require(spec.clone())
+                        } else {
+                            ImportRecord::esm_import(spec.clone())
+                        };
 
-                    if let Some(url) = resolved {
-                        record = record.with_resolved_url(url);
-                    }
+                        if let Some(url) = resolved {
+                            record = record.with_resolved_url(url);
+                        }
 
-                    record
-                })
-                .collect();
+                        record
+                    })
+                    .collect();
 
-            (deps, records)
-        };
+                (deps, records)
+            };
 
         // Compile TypeScript or wrap JSON (do this before recursing to have source ready)
         let compiled = match module.source_type {

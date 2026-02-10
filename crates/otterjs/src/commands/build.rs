@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use clap::Args;
-use otter_engine::{LoaderConfig, ModuleGraph, ModuleLoader, parse_imports};
+use otter_engine::{LoaderConfig, ModuleGraph, ModuleLoader, NodeApiProfile, parse_imports};
 use otter_runtime::{
     ModuleFormat, ModuleInfo, bundle_modules_mixed, needs_transpilation, transpile_typescript,
 };
@@ -129,7 +129,10 @@ impl BuildCommand {
 
             for url in &execution_order {
                 // Skip built-in modules
-                if url.starts_with("node:") || url.starts_with("otter:") {
+                if url.starts_with("node:")
+                    || url.starts_with("builtin://node:")
+                    || url.starts_with("otter:")
+                {
                     continue;
                 }
 
@@ -264,9 +267,9 @@ fn build_loader_config(entry: &Path, modules: &crate::config::ModulesConfig) -> 
         remote_allowlist: if modules.remote_allowlist.is_empty() {
             // Default remote allowlist
             vec![
-                "esm.sh".to_string(),
-                "cdn.skypack.dev".to_string(),
-                "unpkg.com".to_string(),
+                "https://esm.sh/*".to_string(),
+                "https://cdn.skypack.dev/*".to_string(),
+                "https://unpkg.com/*".to_string(),
             ]
         } else {
             modules.remote_allowlist.clone()
@@ -278,6 +281,7 @@ fn build_loader_config(entry: &Path, modules: &crate::config::ModulesConfig) -> 
                 .join("modules")
         }),
         import_map: modules.import_map.clone(),
+        node_api_profile: NodeApiProfile::Full,
         ..Default::default()
     }
 }

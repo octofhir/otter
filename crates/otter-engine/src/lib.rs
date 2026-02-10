@@ -283,6 +283,12 @@ impl EngineBuilder {
     pub fn build(self) -> Otter {
         // Build base runtime (without builtins)
         let mut runtime = self.inner.build();
+        let loader = runtime.loader();
+
+        // Register module interop extension (`__createRequire`, `__module_*` ops).
+        runtime
+            .register_extension(module_extension(loader))
+            .expect("Failed to register module extension");
 
         // Register standard builtins (console, Math, JSON, Date, fetch, etc.)
         runtime

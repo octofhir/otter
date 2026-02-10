@@ -9,9 +9,13 @@ use std::sync::{Arc, RwLock};
 use otter_vm_bytecode::Module;
 use otter_vm_bytecode::module::{ExportRecord, ImportBinding, ImportRecord};
 use otter_vm_compiler::Compiler;
+use otter_vm_core::gc::GcRef;
+use otter_vm_core::memory::MemoryManager;
+use otter_vm_core::object::JsObject;
+use otter_vm_core::object::PropertyKey;
 use otter_vm_core::value::Value;
 
-use crate::module_provider::{MediaType, ModuleResolution, ModuleType};
+use crate::module_provider::{ModuleResolution, ModuleType};
 use oxc_resolver::{ResolveOptions, Resolver};
 
 /// Module loading error
@@ -70,6 +74,16 @@ pub enum ModuleState {
     Error,
 }
 
+/// Import context for condition-aware resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImportContext {
+    /// ESM import()/import declaration context.
+    #[default]
+    ESM,
+    /// CommonJS require() context.
+    CJS,
+}
+
 /// Module namespace object that holds exports
 #[derive(Debug, Default)]
 pub struct ModuleNamespace {
@@ -105,6 +119,14 @@ impl ModuleNamespace {
             .unwrap_or_default()
     }
 
+    /// Snapshot all namespace entries.
+    pub fn entries(&self) -> Vec<(String, Value)> {
+        self.exports
+            .read()
+            .map(|e| e.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
+    }
+
     /// Check if export exists
     pub fn has(&self, name: &str) -> bool {
         self.exports
@@ -113,11 +135,26 @@ impl ModuleNamespace {
             .unwrap_or(false)
     }
 
+    /// Clear all exports in this namespace.
+    pub fn clear(&self) {
+        if let Ok(mut exports) = self.exports.write() {
+            exports.clear();
+        }
+    }
+
     /// Convert to a Value (object)
     pub fn to_value(&self) -> Value {
         // For now return undefined, interpreter will handle this
         Value::undefined()
     }
+}
+
+fn namespace_to_object(namespace: &ModuleNamespace, mm: Arc<MemoryManager>) -> Value {
+    let obj = GcRef::new(JsObject::new(Value::null(), mm));
+    for (key, value) in namespace.entries() {
+        let _ = obj.set(PropertyKey::string(&key), value);
+    }
+    Value::object(obj)
 }
 
 /// A loaded module
@@ -202,7 +239,8 @@ pub struct CjsWrapper {
 impl CjsWrapper {
     /// Create a new CommonJS wrapper for a module
     pub fn new(url: &str) -> Self {
-        let path = Path::new(url);
+        let normalized = url.strip_prefix("file://").unwrap_or(url);
+        let path = Path::new(normalized);
         let dirname = path
             .parent()
             .map(|p| {
@@ -210,7 +248,7 @@ impl CjsWrapper {
                 if s.is_empty() { ".".to_string() } else { s }
             })
             .unwrap_or_else(|| ".".to_string());
-        let filename = url.to_string();
+        let filename = normalized.to_string();
 
         Self {
             url: url.to_string(),
@@ -237,16 +275,56 @@ pub mod interop {
     /// Wrap CJS exports for ESM import
     ///
     /// When ESM imports CJS:
-    /// - `module.exports` becomes the default export
-    /// - Properties of `module.exports` become named exports
+    /// - `default` is the current `module.exports` value
+    /// - named exports are enumerable own properties of `module.exports`
+    ///
+    /// Fallback behavior for this foundation phase:
+    /// - if `module.exports` is not present, we reuse `default` if present,
+    ///   otherwise `undefined`.
+    /// - existing namespace keys are copied as named exports when object-key
+    ///   enumeration is not available.
     pub fn cjs_to_esm(namespace: &ModuleNamespace) -> ModuleNamespace {
-        // The CJS module.exports is already in the namespace as individual exports
-        // For default export, we'd need the whole object - this is handled at runtime
         let result = ModuleNamespace::new();
+        let module_exports = namespace
+            .get("module.exports")
+            .or_else(|| namespace.get("default"))
+            .unwrap_or_else(Value::undefined);
 
-        // Copy all exports
-        for key in namespace.keys() {
-            if let Some(value) = namespace.get(&key) {
+        // ESM default binding always maps to module.exports for CJS modules.
+        result.set("default", module_exports.clone());
+
+        // Named exports come from enumerable own keys of module.exports.
+        if let Some(exports_obj) = module_exports.as_object() {
+            for key in exports_obj.own_keys() {
+                let Some(desc) = exports_obj.get_own_property_descriptor(&key) else {
+                    continue;
+                };
+                if !desc.enumerable() {
+                    continue;
+                }
+
+                let name = match key {
+                    PropertyKey::String(s) => s.as_str().to_string(),
+                    PropertyKey::Index(i) => i.to_string(),
+                    PropertyKey::Symbol(_) => continue,
+                };
+
+                if name == "default" {
+                    continue;
+                }
+
+                if let Some(value) = exports_obj.get(&PropertyKey::string(&name)) {
+                    result.set(&name, value);
+                }
+            }
+        }
+
+        // Fallback and compatibility: preserve existing named keys in namespace.
+        for (key, value) in namespace.entries() {
+            if key == "default" || key == "module.exports" {
+                continue;
+            }
+            if !result.has(&key) {
                 result.set(&key, value);
             }
         }
@@ -257,16 +335,21 @@ pub mod interop {
     /// Wrap ESM exports for CJS require
     ///
     /// When CJS requires ESM:
-    /// - Returns an object with all named exports
-    /// - Default export is available as `.default`
+    /// - return value is a namespace-like object with named exports
+    /// - `.default` is always present (explicit default export or `undefined`)
+    ///
+    /// Limitation for this foundation phase:
+    /// - require() remains synchronous; async ESM loading/evaluation is not
+    ///   supported in this path and must be handled by the async ESM loader.
     pub fn esm_to_cjs(namespace: &ModuleNamespace) -> ModuleNamespace {
-        // Same as above - the namespace already contains all exports
         let result = ModuleNamespace::new();
 
-        for key in namespace.keys() {
-            if let Some(value) = namespace.get(&key) {
-                result.set(&key, value);
-            }
+        for (key, value) in namespace.entries() {
+            result.set(&key, value);
+        }
+
+        if !result.has("default") {
+            result.set("default", Value::undefined());
         }
 
         result
@@ -281,8 +364,10 @@ pub struct ModuleLoader {
     providers: RwLock<Vec<Arc<dyn crate::module_provider::ModuleProvider>>>,
     /// Base directory for resolution
     base_dir: PathBuf,
-    /// oxc resolver
-    resolver: Resolver,
+    /// Resolver for ESM imports (uses import conditions)
+    esm_resolver: Resolver,
+    /// Resolver for CJS require() (uses require conditions)
+    cjs_resolver: Resolver,
 }
 
 impl ModuleLoader {
@@ -290,8 +375,8 @@ impl ModuleLoader {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         let base_dir = base_dir.into();
 
-        // Configure oxc resolver
-        let options = ResolveOptions {
+        // Resolver for ESM imports
+        let esm_options = ResolveOptions {
             extensions: vec![
                 ".js".to_string(),
                 ".mjs".to_string(),
@@ -304,6 +389,17 @@ impl ModuleLoader {
             main_fields: vec!["main".to_string(), "module".to_string()],
             condition_names: vec![
                 "import".to_string(),
+                "module".to_string(),
+                "node".to_string(),
+                "default".to_string(),
+            ],
+            ..Default::default()
+        };
+        // Resolver for CJS require()
+        let cjs_options = ResolveOptions {
+            extensions: esm_options.extensions.clone(),
+            main_fields: esm_options.main_fields.clone(),
+            condition_names: vec![
                 "require".to_string(),
                 "node".to_string(),
                 "default".to_string(),
@@ -315,7 +411,8 @@ impl ModuleLoader {
             modules: RwLock::new(HashMap::new()),
             providers: RwLock::new(Vec::new()),
             base_dir,
-            resolver: Resolver::new(options),
+            esm_resolver: Resolver::new(esm_options),
+            cjs_resolver: Resolver::new(cjs_options),
         }
     }
 
@@ -326,18 +423,19 @@ impl ModuleLoader {
         url: &str,
         eval_mode: bool,
     ) -> Result<Arc<otter_vm_bytecode::Module>, ModuleError> {
-        let is_esm = url.ends_with(".mjs") || url.ends_with(".mts");
+        let normalized_url = self.normalize_url_key(url);
+        let is_esm = normalized_url.ends_with(".mjs") || normalized_url.ends_with(".mts");
         let compiler = Compiler::new();
         let bytecode = compiler
-            .compile_ext(source, url, eval_mode, is_esm, false)
+            .compile_ext(source, &normalized_url, eval_mode, is_esm, false)
             .map_err(|e| ModuleError::CompileError(e.to_string()))?;
 
         let bytecode_arc = Arc::new(bytecode.clone());
-        let loaded = LoadedModule::new(url.to_string(), bytecode);
+        let loaded = LoadedModule::new(normalized_url.clone(), bytecode);
         let module = Arc::new(RwLock::new(loaded));
 
         if let Ok(mut modules) = self.modules.write() {
-            modules.insert(url.to_string(), module);
+            modules.insert(normalized_url, module);
         }
 
         Ok(bytecode_arc)
@@ -346,7 +444,7 @@ impl ModuleLoader {
     /// Update a module's namespace after execution.
     pub fn update_namespace(&self, url: &str, ctx: &otter_vm_core::context::VmContext) {
         if let Some(module) = self.get(url) {
-            if let Ok(mut guard) = module.write() {
+            if let Ok(guard) = module.write() {
                 let exports = guard.exports().to_vec();
                 let global = ctx.global();
                 let captured = ctx.captured_exports();
@@ -431,6 +529,45 @@ impl ModuleLoader {
         specifier: &str,
         referrer: &str,
     ) -> Result<ModuleResolution, ModuleError> {
+        self.resolve_with_context(specifier, referrer, ImportContext::ESM)
+    }
+
+    /// Resolve a specifier in CommonJS require() context.
+    pub fn resolve_require(
+        &self,
+        specifier: &str,
+        referrer: &str,
+    ) -> Result<ModuleResolution, ModuleError> {
+        self.resolve_with_context(specifier, referrer, ImportContext::CJS)
+    }
+
+    /// Resolve a module specifier to an absolute path/URL with context-aware conditions.
+    pub fn resolve_with_context(
+        &self,
+        specifier: &str,
+        referrer: &str,
+        context: ImportContext,
+    ) -> Result<ModuleResolution, ModuleError> {
+        // 0. Handle explicit URL-like namespaces first.
+        if specifier.starts_with("http://") || specifier.starts_with("https://") {
+            return Ok(ModuleResolution {
+                url: specifier.to_string(),
+                module_type: ModuleType::ESM,
+            });
+        }
+        if specifier.starts_with("file://") {
+            let normalized = self.normalize_url_key(specifier);
+            let module_type = if normalized.ends_with(".mjs") || normalized.ends_with(".mts") {
+                ModuleType::ESM
+            } else {
+                ModuleType::CommonJS
+            };
+            return Ok(ModuleResolution {
+                url: format!("file://{}", normalized),
+                module_type,
+            });
+        }
+
         // 1. Check registered providers first (node:, otter:, etc.)
         if let Ok(providers) = self.providers.read() {
             for provider in providers.iter() {
@@ -440,11 +577,29 @@ impl ModuleLoader {
             }
         }
 
-        // 2. Handle absolute paths
-        if specifier.starts_with('/') {
+        // 2. npm namespace support (initial Bun-style path): `npm:pkg` -> resolve as `pkg`
+        // Version tags are normalized (e.g. `npm:lodash@4` -> `lodash`).
+        if let Some(raw) = specifier.strip_prefix("npm:") {
+            let normalized = normalize_npm_specifier(raw).ok_or_else(|| {
+                ModuleError::ResolveError(format!("Invalid npm specifier '{}'", specifier))
+            })?;
+            return self.resolve_with_context(&normalized, referrer, context);
+        }
+
+        // 3. otter namespace without provider remains canonical and load-time handled.
+        if specifier.starts_with("otter:") {
             return Ok(ModuleResolution {
                 url: specifier.to_string(),
-                module_type: if specifier.ends_with(".mjs") || specifier.ends_with(".mts") {
+                module_type: ModuleType::ESM,
+            });
+        }
+
+        // 4. Handle absolute paths
+        if specifier.starts_with('/') {
+            let normalized = self.normalize_url_key(specifier);
+            return Ok(ModuleResolution {
+                url: normalized.clone(),
+                module_type: if normalized.ends_with(".mjs") || normalized.ends_with(".mts") {
                     ModuleType::ESM
                 } else {
                     ModuleType::CommonJS
@@ -452,20 +607,28 @@ impl ModuleLoader {
             });
         }
 
-        // 3. Get the directory of the referrer
+        // 5. Get the directory of the referrer
         let referrer_path = Path::new(referrer);
         let referrer_dir = referrer_path.parent().unwrap_or(&self.base_dir);
 
-        // 4. Use oxc resolver for filesystem modules
-        match self.resolver.resolve(referrer_dir, specifier) {
+        // 6. Use context-aware oxc resolver for filesystem modules
+        let resolver = match context {
+            ImportContext::ESM => &self.esm_resolver,
+            ImportContext::CJS => &self.cjs_resolver,
+        };
+
+        match resolver.resolve(referrer_dir, specifier) {
             Ok(resolution) => {
-                let url = resolution.path().to_string_lossy().to_string();
-                let module_type = if url.ends_with(".mjs") || url.ends_with(".mts") {
+                let normalized = self.normalize_url_key(&resolution.path().to_string_lossy());
+                let module_type = if normalized.ends_with(".mjs") || normalized.ends_with(".mts") {
                     ModuleType::ESM
                 } else {
                     ModuleType::CommonJS
                 };
-                Ok(ModuleResolution { url, module_type })
+                Ok(ModuleResolution {
+                    url: normalized,
+                    module_type,
+                })
             }
             Err(e) => Err(ModuleError::ResolveError(format!(
                 "Cannot resolve '{}' from '{}': {}",
@@ -480,28 +643,44 @@ impl ModuleLoader {
         url: &str,
         module_type: ModuleType,
     ) -> Result<Arc<RwLock<LoadedModule>>, ModuleError> {
+        let normalized_url = self.normalize_url_key(url);
+
         // Check if already loaded
-        if let Some(module) = self.modules.read().ok().and_then(|m| m.get(url).cloned()) {
+        if let Some(module) = self
+            .modules
+            .read()
+            .ok()
+            .and_then(|m| m.get(&normalized_url).cloned())
+        {
             return Ok(module);
         }
 
         // 1. Try to load from providers (handles builtin://, custom protocols)
         if let Ok(providers) = self.providers.read() {
             for provider in providers.iter() {
-                if let Some(source) = provider.load(url) {
+                if let Some(source) = provider.load(&normalized_url) {
                     // Compile the source from provider
+                    let compile_source = if module_type == ModuleType::CommonJS {
+                        self.wrap_commonjs_source(&normalized_url, &source.code)?
+                    } else {
+                        source.code
+                    };
                     let compiler = Compiler::new();
                     let bytecode = compiler
-                        .compile(&source.code, url, module_type == ModuleType::ESM)
+                        .compile(
+                            &compile_source,
+                            &normalized_url,
+                            module_type == ModuleType::ESM,
+                        )
                         .map_err(|e| ModuleError::CompileError(e.to_string()))?;
 
                     // Create loaded module
-                    let loaded = LoadedModule::new(url.to_string(), bytecode);
+                    let loaded = LoadedModule::new(normalized_url.clone(), bytecode);
                     let module = Arc::new(RwLock::new(loaded));
 
                     // Store in cache
                     if let Ok(mut modules) = self.modules.write() {
-                        modules.insert(url.to_string(), Arc::clone(&module));
+                        modules.insert(normalized_url.clone(), Arc::clone(&module));
                     }
 
                     return Ok(module);
@@ -509,23 +688,52 @@ impl ModuleLoader {
             }
         }
 
-        // 2. Read from filesystem
-        let source =
-            std::fs::read_to_string(url).map_err(|e| ModuleError::IoError(e.to_string()))?;
+        // 2. URL namespaces that need dedicated providers/fetchers
+        if normalized_url.starts_with("http://") || normalized_url.starts_with("https://") {
+            return Err(ModuleError::IoError(format!(
+                "Remote module loading is not configured for '{}'. Register an https module provider.",
+                normalized_url
+            )));
+        }
+        if normalized_url.starts_with("npm:") {
+            return Err(ModuleError::IoError(format!(
+                "npm namespace is not configured for '{}'. Register an npm module provider.",
+                normalized_url
+            )));
+        }
+        if normalized_url.starts_with("otter:") {
+            return Err(ModuleError::NotFound(format!(
+                "No provider registered for Otter namespace module '{}'",
+                normalized_url
+            )));
+        }
+
+        // 3. Read from filesystem
+        let source = std::fs::read_to_string(&normalized_url)
+            .map_err(|e| ModuleError::IoError(e.to_string()))?;
 
         // Compile
+        let compile_source = if module_type == ModuleType::CommonJS {
+            self.wrap_commonjs_source(&normalized_url, &source)?
+        } else {
+            source
+        };
         let compiler = Compiler::new();
         let bytecode = compiler
-            .compile(&source, url, module_type == ModuleType::ESM)
+            .compile(
+                &compile_source,
+                &normalized_url,
+                module_type == ModuleType::ESM,
+            )
             .map_err(|e| ModuleError::CompileError(e.to_string()))?;
 
         // Create loaded module
-        let loaded = LoadedModule::new(url.to_string(), bytecode);
+        let loaded = LoadedModule::new(normalized_url.clone(), bytecode);
         let module = Arc::new(RwLock::new(loaded));
 
         // Store in cache
         if let Ok(mut modules) = self.modules.write() {
-            modules.insert(url.to_string(), Arc::clone(&module));
+            modules.insert(normalized_url, Arc::clone(&module));
         }
 
         Ok(module)
@@ -533,10 +741,11 @@ impl ModuleLoader {
 
     /// Build the module dependency graph and return modules in topological order
     pub fn build_graph(&self, entry: &str) -> Result<Vec<String>, ModuleError> {
+        let entry = self.normalize_url_key(entry);
         let mut order = Vec::new();
         let mut visited = HashMap::new();
 
-        self.visit_module(entry, &mut visited, &mut order)?;
+        self.visit_module(&entry, &mut visited, &mut order)?;
 
         Ok(order)
     }
@@ -548,8 +757,10 @@ impl ModuleLoader {
         visited: &mut HashMap<String, bool>,
         order: &mut Vec<String>,
     ) -> Result<(), ModuleError> {
+        let url = self.normalize_url_key(url);
+
         // Check if already visited
-        if let Some(&in_progress) = visited.get(url) {
+        if let Some(&in_progress) = visited.get(&url) {
             if in_progress {
                 // Circular dependency - this is allowed in ESM but needs special handling
                 return Ok(());
@@ -559,47 +770,53 @@ impl ModuleLoader {
         }
 
         // Mark as in progress
-        visited.insert(url.to_string(), true);
+        visited.insert(url.clone(), true);
 
         // Load the module
         // All modules should be loaded/compiled by now via link()
         let module = self
-            .get(url)
-            .ok_or_else(|| ModuleError::NotFound(url.to_string()))?;
-        let imports = {
+            .get(&url)
+            .ok_or_else(|| ModuleError::NotFound(url.clone()))?;
+        let (imports, module_context) = {
             let m = module
                 .read()
-                .map_err(|_| ModuleError::NotFound(url.to_string()))?;
-            m.imports().to_vec()
+                .map_err(|_| ModuleError::NotFound(url.clone()))?;
+            let context = if m.module_type == ModuleType::CommonJS {
+                ImportContext::CJS
+            } else {
+                ImportContext::ESM
+            };
+            (m.imports().to_vec(), context)
         };
 
         // Visit dependencies
         for import in imports {
-            let resolution = self.resolve(&import.specifier, url)?;
+            let resolution = self.resolve_with_context(&import.specifier, &url, module_context)?;
             self.visit_module(&resolution.url, visited, order)?;
         }
 
         // Mark as complete
-        visited.insert(url.to_string(), false);
+        visited.insert(url.clone(), false);
 
         // Add to order
-        order.push(url.to_string());
+        order.push(url);
 
         Ok(())
     }
 
     /// Link a module (resolve all imports)
     pub fn link(&self, url: &str) -> Result<(), ModuleError> {
+        let url = self.normalize_url_key(url);
         let module = self
             .modules
             .read()
             .ok()
-            .and_then(|m| m.get(url).cloned())
-            .ok_or_else(|| ModuleError::NotFound(url.to_string()))?;
+            .and_then(|m| m.get(&url).cloned())
+            .ok_or_else(|| ModuleError::NotFound(url.clone()))?;
 
         let mut module_guard = module
             .write()
-            .map_err(|_| ModuleError::NotFound(url.to_string()))?;
+            .map_err(|_| ModuleError::NotFound(url.clone()))?;
 
         if module_guard.state != ModuleState::Unlinked {
             return Ok(());
@@ -609,9 +826,14 @@ impl ModuleLoader {
 
         // Process imports
         let imports = module_guard.imports().to_vec();
+        let module_context = if module_guard.module_type == ModuleType::CommonJS {
+            ImportContext::CJS
+        } else {
+            ImportContext::ESM
+        };
 
         for import in imports {
-            let resolution = self.resolve(&import.specifier, url)?;
+            let resolution = self.resolve_with_context(&import.specifier, &url, module_context)?;
             let resolved = resolution.url;
 
             // Ensure dependency is loaded
@@ -646,7 +868,8 @@ impl ModuleLoader {
 
     /// Get a loaded module
     pub fn get(&self, url: &str) -> Option<Arc<RwLock<LoadedModule>>> {
-        self.modules.read().ok()?.get(url).cloned()
+        let normalized = self.normalize_url_key(url);
+        self.modules.read().ok()?.get(&normalized).cloned()
     }
 
     /// Get an import value for a module
@@ -724,6 +947,115 @@ impl ModuleLoader {
         CjsWrapper::new(url)
     }
 
+    /// Wrap CommonJS source into a function scope with Node-compatible globals.
+    ///
+    /// Contract:
+    /// - `require`, `module`, `exports`, `__filename`, `__dirname` are provided.
+    /// - module cache identity stays anchored to resolved URL (same `module.exports` object).
+    /// - `__module_commit` publishes final/partial exports to loader namespace.
+    fn wrap_commonjs_source(&self, url: &str, source: &str) -> Result<String, ModuleError> {
+        let wrapper = self.get_cjs_wrapper(url);
+        let url_lit = serde_json::to_string(url).map_err(|e| {
+            ModuleError::CompileError(format!("CJS wrapper url encode failed: {}", e))
+        })?;
+        let filename_lit = serde_json::to_string(wrapper.filename()).map_err(|e| {
+            ModuleError::CompileError(format!("CJS wrapper filename encode failed: {}", e))
+        })?;
+        let dirname_lit = serde_json::to_string(wrapper.dirname()).map_err(|e| {
+            ModuleError::CompileError(format!("CJS wrapper dirname encode failed: {}", e))
+        })?;
+
+        Ok(format!(
+            r#"
+const __otter_cjs_referrer = {url_lit};
+const __otter_cjs_require =
+    (typeof globalThis.__createRequire === "function")
+        ? globalThis.__createRequire(__otter_cjs_referrer)
+        : function() {{
+            throw new Error("CommonJS require() is unavailable (module extension not registered)");
+        }};
+const __otter_cjs_module = {{ exports: {{}} }};
+const __otter_cjs_exports = __otter_cjs_module.exports;
+try {{
+    (function(exports, require, module, __filename, __dirname) {{
+{source}
+    }})(__otter_cjs_exports, __otter_cjs_require, __otter_cjs_module, {filename_lit}, {dirname_lit});
+}} finally {{
+    if (typeof globalThis.__module_commit === "function") {{
+        globalThis.__module_commit(__otter_cjs_referrer, __otter_cjs_module, __otter_cjs_exports);
+    }}
+}}
+"#
+        ))
+    }
+
+    /// Commit CommonJS `module.exports` value into shared module namespace.
+    ///
+    /// This powers:
+    /// - ESM -> CJS interop (`default` and named exports from enumerable keys)
+    /// - CJS cache identity (`require()` returns the same module.exports object)
+    pub fn commit_cjs_exports(&self, url: &str, module_exports: Value) -> Result<(), ModuleError> {
+        let normalized = self.normalize_url_key(url);
+        let module = self
+            .get(&normalized)
+            .ok_or_else(|| ModuleError::NotFound(normalized.clone()))?;
+        let mut guard = module
+            .write()
+            .map_err(|_| ModuleError::NotFound(normalized.clone()))?;
+
+        let tmp = ModuleNamespace::new();
+        tmp.set("module.exports", module_exports.clone());
+        let esm_view = interop::cjs_to_esm(&tmp);
+
+        guard.namespace.clear();
+        guard.namespace.set("module.exports", module_exports);
+        for (name, value) in esm_view.entries() {
+            guard.namespace.set(&name, value);
+        }
+
+        if guard.state != ModuleState::Error {
+            guard.state = ModuleState::Evaluated;
+        }
+
+        Ok(())
+    }
+
+    /// Resolve and load a module for CommonJS `require()` and return runtime value.
+    ///
+    /// Contract:
+    /// - `require(cjs)` returns `module.exports` directly.
+    /// - `require(esm)` returns namespace object with `.default` + named exports.
+    ///
+    /// Limitation:
+    /// - this path is synchronous; if target ESM has not been evaluated yet, exports can be
+    ///   partially initialized (`default` may be `undefined`) until ESM evaluation finishes.
+    pub fn require_value(
+        &self,
+        specifier: &str,
+        referrer: &str,
+        mm: Arc<MemoryManager>,
+    ) -> Result<Value, ModuleError> {
+        let module = self.require(specifier, referrer)?;
+        let guard = module
+            .read()
+            .map_err(|_| ModuleError::NotFound(specifier.to_string()))?;
+
+        if guard.is_esm() {
+            let cjs_view = interop::esm_to_cjs(&guard.namespace);
+            return Ok(namespace_to_object(&cjs_view, mm));
+        }
+
+        if let Some(value) = guard
+            .namespace
+            .get("module.exports")
+            .or_else(|| guard.namespace.get("default"))
+        {
+            return Ok(value);
+        }
+
+        Ok(namespace_to_object(&guard.namespace, mm))
+    }
+
     /// Load a module as CommonJS (with wrapper)
     ///
     /// This is used when require() is called from CJS code
@@ -733,7 +1065,7 @@ impl ModuleLoader {
         referrer: &str,
     ) -> Result<Arc<RwLock<LoadedModule>>, ModuleError> {
         // Resolve the specifier
-        let resolution = self.resolve(specifier, referrer)?;
+        let resolution = self.resolve_require(specifier, referrer)?;
 
         // Load the module
         let module = self.load(&resolution.url, resolution.module_type)?;
@@ -746,6 +1078,32 @@ impl ModuleLoader {
 
         Ok(module)
     }
+
+    /// Normalize URL/cache key so ESM/CJS graphs share one module instance.
+    fn normalize_url_key(&self, url: &str) -> String {
+        if url.starts_with("builtin://")
+            || url.starts_with("otter:")
+            || url.starts_with("http://")
+            || url.starts_with("https://")
+            || url.starts_with("npm:")
+        {
+            return url.to_string();
+        }
+
+        if url.starts_with('<') && url.ends_with('>') {
+            return url.to_string();
+        }
+
+        let raw = url.strip_prefix("file://").unwrap_or(url);
+        let path = Path::new(raw);
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.base_dir.join(path)
+        };
+        let canonical = std::fs::canonicalize(&absolute).unwrap_or(absolute);
+        canonical.to_string_lossy().to_string()
+    }
 }
 
 impl Default for ModuleLoader {
@@ -754,22 +1112,74 @@ impl Default for ModuleLoader {
     }
 }
 
+/// Normalize `npm:` specifier payload to a bare package specifier usable by resolver.
+///
+/// Examples:
+/// - `lodash` -> `lodash`
+/// - `lodash@4` -> `lodash`
+/// - `lodash@4/sub/path` -> `lodash/sub/path`
+/// - `@scope/pkg@1.2.3/sub` -> `@scope/pkg/sub`
+fn normalize_npm_specifier(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+
+    if raw.starts_with('@') {
+        // Scoped package: @scope/pkg[/subpath] with optional @version on pkg segment.
+        let slash = raw.find('/')?;
+        let after_scope = &raw[slash + 1..];
+        let pkg_end_rel = after_scope.find('/').unwrap_or(after_scope.len());
+        let pkg_and_ver = &after_scope[..pkg_end_rel];
+
+        let (pkg_name, rest_after_pkg) = if let Some(ver_at) = pkg_and_ver.find('@') {
+            (&pkg_and_ver[..ver_at], &after_scope[pkg_end_rel..])
+        } else {
+            (pkg_and_ver, &after_scope[pkg_end_rel..])
+        };
+
+        if pkg_name.is_empty() {
+            return None;
+        }
+
+        return Some(format!(
+            "@{}/{}{}",
+            &raw[1..slash],
+            pkg_name,
+            rest_after_pkg
+        ));
+    }
+
+    // Unscoped package: pkg[/subpath] with optional @version.
+    let slash = raw.find('/').unwrap_or(raw.len());
+    let pkg_and_ver = &raw[..slash];
+    let rest = &raw[slash..];
+    let pkg = pkg_and_ver.split('@').next().unwrap_or_default();
+    if pkg.is_empty() {
+        return None;
+    }
+    Some(format!("{}{}", pkg, rest))
+}
+
 /// Create the module extension for dynamic imports and CommonJS require
 ///
 /// This extension provides ops for:
 /// - `__module_resolve`: Resolve a module specifier to absolute path
 /// - `__module_load`: Load and compile a module (async, for ESM dynamic import)
 /// - `__module_require`: Synchronous require for CommonJS
+/// - `__module_commit`: Commit CommonJS `module.exports` into shared namespace cache
 /// - `__module_dirname`: Get __dirname for a module
 /// - `__module_filename`: Get __filename for a module
-pub fn module_extension(loader: Arc<RwLock<ModuleLoader>>) -> crate::Extension {
-    use crate::extension::{op_async, op_sync};
+pub fn module_extension(loader: Arc<ModuleLoader>) -> crate::Extension {
+    use crate::extension::{op_async, op_native_with_mm, op_sync};
+    use otter_vm_core::error::VmError;
     use serde_json::json;
 
     let loader_resolve = Arc::clone(&loader);
     let loader_load = Arc::clone(&loader);
     let loader_require = Arc::clone(&loader);
+    let loader_commit = Arc::clone(&loader);
     let loader_dirname = Arc::clone(&loader);
+    let loader_filename = Arc::clone(&loader);
 
     crate::Extension::new("module")
         .with_ops(vec![
@@ -783,12 +1193,12 @@ pub fn module_extension(loader: Arc<RwLock<ModuleLoader>>) -> crate::Extension {
                     .get(1)
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "Missing referrer argument".to_string())?;
+                let context = match args.get(2).and_then(|v| v.as_str()) {
+                    Some("cjs" | "require") => ImportContext::CJS,
+                    _ => ImportContext::ESM,
+                };
 
-                let loader = loader_resolve
-                    .read()
-                    .map_err(|e| format!("Lock error: {}", e))?;
-
-                match loader.resolve(specifier, referrer) {
+                match loader_resolve.resolve_with_context(specifier, referrer, context) {
                     Ok(resolved) => Ok(json!(resolved)),
                     Err(e) => Err(e.to_string()),
                 }
@@ -803,14 +1213,12 @@ pub fn module_extension(loader: Arc<RwLock<ModuleLoader>>) -> crate::Extension {
                     .to_string();
 
                 async move {
-                    let loader_guard = loader.read().map_err(|e| format!("Lock error: {}", e))?;
-
                     // Build graph to get all dependencies
-                    let order = loader_guard.build_graph(&url).map_err(|e| e.to_string())?;
+                    let order = loader.build_graph(&url).map_err(|e| e.to_string())?;
 
                     // Link all modules
                     for module_url in &order {
-                        loader_guard.link(module_url).map_err(|e| e.to_string())?;
+                        loader.link(module_url).map_err(|e| e.to_string())?;
                     }
 
                     Ok(json!({
@@ -820,31 +1228,45 @@ pub fn module_extension(loader: Arc<RwLock<ModuleLoader>>) -> crate::Extension {
                 }
             }),
             // Synchronous require for CommonJS
-            op_sync("__module_require", move |args| {
+            op_native_with_mm("__module_require", move |args, mm| {
                 let specifier = args
                     .first()
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| "Missing specifier argument".to_string())?;
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.as_str().to_string())
+                    .ok_or_else(|| VmError::type_error("Missing specifier argument"))?;
                 let referrer = args
                     .get(1)
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| "Missing referrer argument".to_string())?;
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.as_str().to_string())
+                    .ok_or_else(|| VmError::type_error("Missing referrer argument"))?;
 
-                let loader = loader_require
-                    .read()
-                    .map_err(|e| format!("Lock error: {}", e))?;
+                loader_require
+                    .require_value(&specifier, &referrer, mm)
+                    .map_err(|e| VmError::type_error(e.to_string()))
+            }),
+            // Commit CommonJS `module.exports` to shared loader cache namespace.
+            op_native_with_mm("__module_commit", move |args, _mm| {
+                let url = args
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.as_str().to_string())
+                    .ok_or_else(|| VmError::type_error("Missing url argument"))?;
 
-                match loader.require(specifier, referrer) {
-                    Ok(module) => {
-                        let guard = module.read().map_err(|e| e.to_string())?;
-                        // Return module info - actual exports are populated by interpreter
-                        Ok(json!({
-                            "url": guard.url,
-                            "type": if guard.is_esm() { "esm" } else { "cjs" },
-                        }))
-                    }
-                    Err(e) => Err(e.to_string()),
-                }
+                let module_exports =
+                    if let Some(module_obj) = args.get(1).and_then(|v| v.as_object()) {
+                        module_obj
+                            .get(&PropertyKey::string("exports"))
+                            .or_else(|| args.get(2).cloned())
+                            .unwrap_or_else(Value::undefined)
+                    } else {
+                        args.get(2).cloned().unwrap_or_else(Value::undefined)
+                    };
+
+                loader_commit
+                    .commit_cjs_exports(&url, module_exports)
+                    .map_err(|e| VmError::type_error(e.to_string()))?;
+
+                Ok(Value::undefined())
             }),
             // Get __dirname for a module
             op_sync("__module_dirname", move |args| {
@@ -853,20 +1275,26 @@ pub fn module_extension(loader: Arc<RwLock<ModuleLoader>>) -> crate::Extension {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "Missing url argument".to_string())?;
 
-                let loader = loader_dirname
-                    .read()
-                    .map_err(|e| format!("Lock error: {}", e))?;
-
-                let wrapper = loader.get_cjs_wrapper(url);
+                let wrapper = loader_dirname.get_cjs_wrapper(url);
                 Ok(json!(wrapper.dirname()))
+            }),
+            // Get __filename for a module
+            op_sync("__module_filename", move |args| {
+                let url = args
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "Missing url argument".to_string())?;
+
+                let wrapper = loader_filename.get_cjs_wrapper(url);
+                Ok(json!(wrapper.filename()))
             }),
         ])
         .with_js(
             r#"
 // Dynamic import helper
 globalThis.__dynamicImport = async function(specifier, referrer) {
-    const resolved = __module_resolve(specifier, referrer);
-    const result = await __module_load(resolved);
+    const resolved = __module_resolve(specifier, referrer, "esm");
+    const result = await __module_load(resolved.url);
     return result;
 };
 
@@ -878,10 +1306,13 @@ globalThis.__createRequire = function(referrer) {
     }
 
     require.resolve = function(specifier) {
-        return __module_resolve(specifier, referrer);
+        const resolved = __module_resolve(specifier, referrer, "cjs");
+        return resolved.url;
     };
 
     require.cache = {};
+    require.filename = __module_filename(referrer);
+    require.dirname = __module_dirname(referrer);
 
     return require;
 };
@@ -889,6 +1320,11 @@ globalThis.__createRequire = function(referrer) {
 // Get __dirname for a module
 globalThis.__getDirname = function(url) {
     return __module_dirname(url);
+};
+
+// Get __filename for a module
+globalThis.__getFilename = function(url) {
+    return __module_filename(url);
 };
 "#,
         )
@@ -972,6 +1408,110 @@ mod tests {
     }
 
     #[test]
+    fn test_module_resolution_context_aware_conditions() {
+        let dir = tempdir().unwrap();
+        let loader = ModuleLoader::new(dir.path());
+
+        // Create a package with conditional exports for import/require.
+        let pkg_dir = dir.path().join("node_modules").join("pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{
+  "name": "pkg",
+  "exports": {
+    ".": {
+      "import": "./esm.mjs",
+      "require": "./cjs.cjs"
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("esm.mjs"), "export default 1;").unwrap();
+        std::fs::write(pkg_dir.join("cjs.cjs"), "module.exports = 1;").unwrap();
+
+        let main_path = dir.path().join("main.mjs");
+        std::fs::write(&main_path, "import x from 'pkg';").unwrap();
+        let referrer = main_path.to_string_lossy().to_string();
+
+        let esm = loader
+            .resolve_with_context("pkg", &referrer, ImportContext::ESM)
+            .unwrap();
+        assert!(esm.url.ends_with("esm.mjs"));
+        assert_eq!(esm.module_type, ModuleType::ESM);
+
+        let cjs = loader
+            .resolve_with_context("pkg", &referrer, ImportContext::CJS)
+            .unwrap();
+        assert!(cjs.url.ends_with("cjs.cjs"));
+        assert_eq!(cjs.module_type, ModuleType::CommonJS);
+    }
+
+    #[test]
+    fn test_module_resolution_namespace_passthrough() {
+        let dir = tempdir().unwrap();
+        let loader = ModuleLoader::new(dir.path());
+
+        let https = loader
+            .resolve("https://esm.sh/lodash", "/tmp/main.mjs")
+            .unwrap();
+        assert_eq!(https.url, "https://esm.sh/lodash");
+
+        let file = loader
+            .resolve("file:///tmp/example.mjs", "/tmp/main.mjs")
+            .unwrap();
+        assert_eq!(file.url, "file:///tmp/example.mjs");
+    }
+
+    #[test]
+    fn test_module_resolution_npm_namespace_to_node_modules() {
+        let dir = tempdir().unwrap();
+        let loader = ModuleLoader::new(dir.path());
+
+        let pkg_dir = dir.path().join("node_modules").join("lodash");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{
+  "name": "lodash",
+  "main": "index.js"
+}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("index.js"), "module.exports = {};").unwrap();
+
+        let main_path = dir.path().join("main.mjs");
+        std::fs::write(&main_path, "import _ from 'npm:lodash';").unwrap();
+        let referrer = main_path.to_string_lossy().to_string();
+
+        let npm = loader.resolve("npm:lodash@4", &referrer).unwrap();
+        assert!(npm.url.ends_with("node_modules/lodash/index.js"));
+    }
+
+    #[test]
+    fn test_normalize_npm_specifier() {
+        assert_eq!(normalize_npm_specifier("lodash").as_deref(), Some("lodash"));
+        assert_eq!(
+            normalize_npm_specifier("lodash@4").as_deref(),
+            Some("lodash")
+        );
+        assert_eq!(
+            normalize_npm_specifier("lodash@4/fp").as_deref(),
+            Some("lodash/fp")
+        );
+        assert_eq!(
+            normalize_npm_specifier("@scope/pkg").as_deref(),
+            Some("@scope/pkg")
+        );
+        assert_eq!(
+            normalize_npm_specifier("@scope/pkg@1.2.3/sub").as_deref(),
+            Some("@scope/pkg/sub")
+        );
+        assert!(normalize_npm_specifier("").is_none());
+    }
+
+    #[test]
     fn test_build_graph() {
         let dir = tempdir().unwrap();
         // Canonicalize to handle macOS /var -> /private/var symlinks
@@ -1020,6 +1560,13 @@ mod tests {
     }
 
     #[test]
+    fn test_cjs_wrapper_file_url() {
+        let wrapper = CjsWrapper::new("file:///tmp/example/module.js");
+        assert!(wrapper.filename().ends_with("/tmp/example/module.js"));
+        assert!(wrapper.dirname().ends_with("/tmp/example"));
+    }
+
+    #[test]
     fn test_module_require() {
         let dir = tempdir().unwrap();
         let loader = ModuleLoader::new(dir.path());
@@ -1044,6 +1591,122 @@ mod tests {
     }
 
     #[test]
+    fn test_wrap_commonjs_source_contains_runtime_contract() {
+        let loader = ModuleLoader::new("/tmp");
+        let wrapped = loader
+            .wrap_commonjs_source("/tmp/example.cjs", "module.exports = { x: 1 };")
+            .unwrap();
+        assert!(wrapped.contains("__createRequire"));
+        assert!(wrapped.contains("__module_commit"));
+        assert!(wrapped.contains("(exports, require, module, __filename, __dirname)"));
+    }
+
+    #[test]
+    fn test_commit_cjs_exports_populates_esm_view() {
+        let dir = tempdir().unwrap();
+        let loader = ModuleLoader::new(dir.path());
+
+        let module_path = dir.path().join("mod.cjs");
+        std::fs::write(&module_path, "module.exports = {};").unwrap();
+        let module_url = module_path.to_string_lossy().to_string();
+
+        loader.load(&module_url, ModuleType::CommonJS).unwrap();
+
+        let mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
+        let exports_obj = GcRef::new(JsObject::new(Value::null(), mm));
+        exports_obj
+            .set(PropertyKey::string("named"), Value::int32(7))
+            .unwrap();
+
+        loader
+            .commit_cjs_exports(&module_url, Value::object(exports_obj))
+            .unwrap();
+
+        let module = loader.get(&module_url).unwrap();
+        let guard = module.read().unwrap();
+        assert_eq!(guard.namespace.get("named"), Some(Value::int32(7)));
+        assert!(guard.namespace.get("default").is_some());
+        assert!(guard.namespace.get("module.exports").is_some());
+    }
+
+    #[test]
+    fn test_require_value_returns_cjs_module_exports_identity() {
+        let dir = tempdir().unwrap();
+        let loader = ModuleLoader::new(dir.path());
+
+        let main_path = dir.path().join("main.cjs");
+        std::fs::write(&main_path, "require('./shared.cjs');").unwrap();
+        let shared_path = dir.path().join("shared.cjs");
+        std::fs::write(&shared_path, "module.exports = {};").unwrap();
+        let main_url = main_path.to_string_lossy().to_string();
+        let shared_url = shared_path.to_string_lossy().to_string();
+
+        loader.load(&shared_url, ModuleType::CommonJS).unwrap();
+
+        let mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
+        let exports_obj = GcRef::new(JsObject::new(Value::null(), Arc::clone(&mm)));
+        exports_obj
+            .set(PropertyKey::string("value"), Value::int32(1))
+            .unwrap();
+        loader
+            .commit_cjs_exports(&shared_url, Value::object(exports_obj))
+            .unwrap();
+
+        let value = loader
+            .require_value("./shared.cjs", &main_url, Arc::clone(&mm))
+            .unwrap();
+        let required_obj = value.as_object().unwrap();
+        required_obj
+            .set(PropertyKey::string("value"), Value::int32(2))
+            .unwrap();
+
+        let module = loader.get(&shared_url).unwrap();
+        let guard = module.read().unwrap();
+        let cached_obj = guard
+            .namespace
+            .get("module.exports")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            cached_obj.get(&PropertyKey::string("value")),
+            Some(Value::int32(2))
+        );
+    }
+
+    #[test]
+    fn test_require_value_returns_esm_namespace_object() {
+        let dir = tempdir().unwrap();
+        let loader = ModuleLoader::new(dir.path());
+
+        let main_path = dir.path().join("main.cjs");
+        std::fs::write(&main_path, "require('./lib.mjs');").unwrap();
+        let lib_path = dir.path().join("lib.mjs");
+        std::fs::write(&lib_path, "export const named = 5; export default 9;").unwrap();
+        let main_url = main_path.to_string_lossy().to_string();
+        let lib_url = lib_path.to_string_lossy().to_string();
+
+        let module = loader.load(&lib_url, ModuleType::ESM).unwrap();
+        {
+            let guard = module.read().unwrap();
+            guard.namespace.set("default", Value::int32(9));
+            guard.namespace.set("named", Value::int32(5));
+        }
+
+        let mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
+        let value = loader.require_value("./lib.mjs", &main_url, mm).unwrap();
+        let ns_obj = value.as_object().unwrap();
+
+        assert_eq!(
+            ns_obj.get(&PropertyKey::string("default")),
+            Some(Value::int32(9))
+        );
+        assert_eq!(
+            ns_obj.get(&PropertyKey::string("named")),
+            Some(Value::int32(5))
+        );
+    }
+
+    #[test]
     fn test_interop_cjs_to_esm() {
         let cjs_ns = ModuleNamespace::new();
         cjs_ns.set("foo", Value::int32(1));
@@ -1057,6 +1720,17 @@ mod tests {
     }
 
     #[test]
+    fn test_interop_cjs_to_esm_default_from_module_exports() {
+        let cjs_ns = ModuleNamespace::new();
+        cjs_ns.set("module.exports", Value::int32(42));
+        cjs_ns.set("named", Value::int32(7));
+
+        let esm_ns = interop::cjs_to_esm(&cjs_ns);
+        assert_eq!(esm_ns.get("default"), Some(Value::int32(42)));
+        assert_eq!(esm_ns.get("named"), Some(Value::int32(7)));
+    }
+
+    #[test]
     fn test_interop_esm_to_cjs() {
         let esm_ns = ModuleNamespace::new();
         esm_ns.set("default", Value::int32(42));
@@ -1066,5 +1740,15 @@ mod tests {
 
         assert!(cjs_ns.has("default"));
         assert!(cjs_ns.has("named"));
+    }
+
+    #[test]
+    fn test_interop_esm_to_cjs_default_is_always_present() {
+        let esm_ns = ModuleNamespace::new();
+        esm_ns.set("named", Value::int32(1));
+
+        let cjs_ns = interop::esm_to_cjs(&esm_ns);
+        assert!(cjs_ns.has("default"));
+        assert_eq!(cjs_ns.get("named"), Some(Value::int32(1)));
     }
 }

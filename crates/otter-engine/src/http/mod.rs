@@ -11,7 +11,7 @@ mod request;
 mod server;
 mod service;
 
-use otter_vm_runtime::{ActiveServerCount, HttpEvent, Op, WsEvent, op_async, op_sync};
+use otter_vm_runtime::{ActiveServerCount, Extension, HttpEvent, Op, WsEvent, op_async, op_sync};
 use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,7 +20,6 @@ use tokio::sync::mpsc;
 
 use otter_vm_runtime::capabilities_context;
 
-pub use request::{HttpRequest, get_request, insert_request, remove_request};
 pub use server::{HttpServerManager, ServerOptions, TlsConfig, WebSocketServerConfig};
 
 /// Create HTTP server operations
@@ -525,3 +524,14 @@ fn json_to_bytes(value: &JsonValue) -> Option<Vec<u8>> {
 
 /// JavaScript shim code for HTTP server
 pub const JS_SHIM: &str = include_str!("serve.js");
+
+/// Create HTTP server extension for Otter.serve().
+pub fn create_http_extension(
+    event_tx: tokio::sync::mpsc::UnboundedSender<otter_vm_runtime::HttpEvent>,
+    ws_event_tx: tokio::sync::mpsc::UnboundedSender<otter_vm_runtime::WsEvent>,
+    active_count: otter_vm_runtime::ActiveServerCount,
+) -> Extension {
+    Extension::new("http")
+        .with_ops(ops(event_tx, ws_event_tx, active_count))
+        .with_js(JS_SHIM)
+}

@@ -25,7 +25,13 @@ fn register_path_fns_and_props(
     delimiter: &str,
 ) -> otter_vm_runtime::registration::ModuleNamespaceBuilder {
     // Register all #[dive] functions
-    let fns: &[fn() -> (&'static str, std::sync::Arc<dyn Fn(&Value, &[Value], &mut NativeContext) -> Result<Value, VmError> + Send + Sync>, u32)] = &[
+    let fns: &[fn() -> (
+        &'static str,
+        std::sync::Arc<
+            dyn Fn(&Value, &[Value], &mut NativeContext) -> Result<Value, VmError> + Send + Sync,
+        >,
+        u32,
+    )] = &[
         path_join_decl,
         path_resolve_decl,
         path_dirname_decl,
@@ -67,10 +73,7 @@ impl OtterExtension for NodePathExtension {
         &SPECIFIERS
     }
 
-    fn install(
-        &self,
-        _ctx: &mut RegistrationContext,
-    ) -> Result<(), otter_vm_core::error::VmError> {
+    fn install(&self, _ctx: &mut RegistrationContext) -> Result<(), otter_vm_core::error::VmError> {
         Ok(())
     }
 
@@ -216,10 +219,7 @@ fn path_parse(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError>
     let p_str = arg_str(args, 0, "parse")?;
     let p = Path::new(&p_str);
 
-    let dir = p
-        .parent()
-        .map(|d| d.to_string_lossy())
-        .unwrap_or_default();
+    let dir = p.parent().map(|d| d.to_string_lossy()).unwrap_or_default();
     let base = p
         .file_name()
         .map(|n| n.to_string_lossy())
@@ -233,16 +233,9 @@ fn path_parse(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError>
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
 
-    let root = if p_str.starts_with('/') {
-        "/"
-    } else {
-        ""
-    };
+    let root = if p_str.starts_with('/') { "/" } else { "" };
 
-    let obj = GcRef::new(JsObject::new(
-        Value::null(),
-        ncx.memory_manager().clone(),
-    ));
+    let obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
     let _ = obj.set(
         PropertyKey::string("root"),
         Value::string(JsString::new_gc(root)),

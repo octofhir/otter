@@ -2,7 +2,7 @@
 //!
 //! Async-only event loop with tokio integration for HTTP server support.
 
-use crate::microtask::{JsJobQueue, MicrotaskQueue, MicrotaskSequencer};
+use crate::microtask::{JsJobQueue, MicrotaskQueue, MicrotaskSequencer, NextTickQueue};
 use crate::timer::{Immediate, ImmediateId, Timer, TimerCallback, TimerHeapEntry, TimerId};
 use parking_lot::Mutex;
 use serde_json::Value as JsonValue;
@@ -100,6 +100,8 @@ pub struct EventLoop {
     microtasks: MicrotaskQueue,
     /// JS callback job queue (JavaScript functions)
     js_jobs: Arc<JsJobQueue>,
+    /// process.nextTick() queue — drained before promise microtasks
+    next_tick: Arc<NextTickQueue>,
     /// Next timer ID
     next_timer_id: AtomicU64,
     /// Next immediate ID
@@ -140,6 +142,7 @@ impl EventLoop {
             immediates: Mutex::new(VecDeque::new()),
             microtasks: MicrotaskQueue::with_sequencer(sequencer.clone()),
             js_jobs: Arc::new(JsJobQueue::with_sequencer(sequencer)),
+            next_tick: Arc::new(NextTickQueue::new()),
             next_timer_id: AtomicU64::new(1),
             next_immediate_id: AtomicU64::new(1),
             running: AtomicBool::new(false),
@@ -409,9 +412,16 @@ impl EventLoop {
         &self.js_jobs
     }
 
+    /// Get access to the nextTick queue.
+    ///
+    /// Used by `process.nextTick()` to enqueue callbacks.
+    pub fn next_tick_queue(&self) -> &Arc<NextTickQueue> {
+        &self.next_tick
+    }
+
     /// Check if there are pending tasks that keep the loop alive
     pub fn has_pending_tasks(&self) -> bool {
-        if !self.microtasks.is_empty() || !self.js_jobs.is_empty() {
+        if !self.microtasks.is_empty() || !self.js_jobs.is_empty() || !self.next_tick.is_empty() {
             return true;
         }
 
@@ -862,6 +872,7 @@ impl Default for EventLoop {
             immediates: Mutex::new(VecDeque::new()),
             microtasks: MicrotaskQueue::with_sequencer(sequencer.clone()),
             js_jobs: Arc::new(JsJobQueue::with_sequencer(sequencer)),
+            next_tick: Arc::new(NextTickQueue::new()),
             next_timer_id: AtomicU64::new(1),
             next_immediate_id: AtomicU64::new(1),
             running: AtomicBool::new(false),

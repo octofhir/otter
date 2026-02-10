@@ -182,3 +182,38 @@ fn test_process_hrtime_allowed_with_capability() {
         "import process from 'node:process'; const t = process.hrtime(); if (!Array.isArray(t) || t.length !== 2) throw new Error('bad'); 'ok';",
     );
 }
+
+#[test]
+fn test_process_env_reads_from_env_store_when_allowed() {
+    let caps = CapabilitiesBuilder::new()
+        .allow_env(vec!["NODE_ENV".into()])
+        .build();
+    let mut otter = EngineBuilder::new()
+        .with_nodejs_profile(NodeApiProfile::Full)
+        .capabilities(caps)
+        .env(|b| b.explicit("NODE_ENV", "production"))
+        .build();
+    eval_ok(
+        &mut otter,
+        "import process from 'node:process'; if (process.env.NODE_ENV !== 'production') throw new Error('env read'); if (!('NODE_ENV' in process.env)) throw new Error('env has'); if (!Object.keys(process.env).includes('NODE_ENV')) throw new Error('env keys'); 'ok';",
+    );
+}
+
+#[test]
+fn test_process_env_hides_denied_vars_from_get_has_and_keys() {
+    let caps = CapabilitiesBuilder::new()
+        .allow_env(vec!["NODE_ENV".into()])
+        .build();
+    let mut otter = EngineBuilder::new()
+        .with_nodejs_profile(NodeApiProfile::Full)
+        .capabilities(caps)
+        .env(|b| {
+            b.explicit("NODE_ENV", "production")
+                .explicit("SECRET_TOKEN", "leak")
+        })
+        .build();
+    eval_ok(
+        &mut otter,
+        "import process from 'node:process'; if (process.env.SECRET_TOKEN !== undefined) throw new Error('env get leak'); if ('SECRET_TOKEN' in process.env) throw new Error('env has leak'); if (Object.keys(process.env).includes('SECRET_TOKEN')) throw new Error('env key leak'); 'ok';",
+    );
+}

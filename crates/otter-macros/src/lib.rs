@@ -164,8 +164,7 @@ fn detect_pattern(input: &ItemFn) -> ParamPattern {
 
     // Check for reference types that indicate native patterns
     if params.len() >= 3 {
-        if is_value_ref(&params[0]) && is_value_slice(&params[1]) && is_native_context(&params[2])
-        {
+        if is_value_ref(&params[0]) && is_value_slice(&params[1]) && is_native_context(&params[2]) {
             return ParamPattern::FullNative;
         }
     }
@@ -921,41 +920,167 @@ fn expand_js_class_struct(input: ItemStruct, args: JsClassArgs) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+/// Parse `name` and `length` from a `#[js_*(...)]` attribute's arguments.
+///
+/// Handles: `#[js_method]` (no args), `#[js_method(name = "on")]`,
+/// `#[js_method(name = "on", length = 2)]`, `#[js_method(length = 2)]`.
+fn parse_js_attr_args(attr: &syn::Attribute) -> (Option<String>, Option<u32>) {
+    let mut name = None;
+    let mut length = None;
+
+    if let syn::Meta::List(list) = &attr.meta {
+        let _ = syn::parse::Parser::parse2(
+            |input: ParseStream| {
+                while !input.is_empty() {
+                    let ident: Ident = input.parse()?;
+                    input.parse::<Token![=]>()?;
+
+                    if ident == "name" {
+                        let lit: LitStr = input.parse()?;
+                        name = Some(lit.value());
+                    } else if ident == "length" {
+                        let lit: LitInt = input.parse()?;
+                        length = Some(lit.base10_parse()?);
+                    }
+
+                    if input.peek(Token![,]) {
+                        input.parse::<Token![,]>()?;
+                    }
+                }
+                Ok(())
+            },
+            list.tokens.clone(),
+        );
+    }
+
+    (name, length)
+}
+
 fn expand_js_class_impl(input: ItemImpl) -> TokenStream {
     let self_ty = &input.self_ty;
 
+    // Metadata lists (backward compatible)
     let mut constructors = Vec::new();
     let mut methods = Vec::new();
     let mut static_methods = Vec::new();
     let mut js_getters = Vec::new();
     let mut js_setters = Vec::new();
 
+    // Info for _decl() generation
+    struct DeclInfo {
+        rust_ident: Ident,
+        js_name: String,
+        length: u32,
+    }
+    let mut all_decls: Vec<DeclInfo> = Vec::new();
+
     for item in &input.items {
         if let syn::ImplItem::Fn(method) = item {
-            let is_constructor = method
-                .attrs
-                .iter()
-                .any(|a| a.path().is_ident("js_constructor"));
-            let is_static = method.attrs.iter().any(|a| a.path().is_ident("js_static"));
-            let is_getter = method.attrs.iter().any(|a| a.path().is_ident("js_getter"));
-            let is_setter = method.attrs.iter().any(|a| a.path().is_ident("js_setter"));
-            let is_method = method.attrs.iter().any(|a| a.path().is_ident("js_method"));
+            let rust_ident = method.sig.ident.clone();
+            let rust_name = rust_ident.to_string();
 
-            let name = method.sig.ident.to_string();
+            for attr in &method.attrs {
+                let (attr_name, attr_length) = if attr.path().is_ident("js_constructor")
+                    || attr.path().is_ident("js_method")
+                    || attr.path().is_ident("js_static")
+                    || attr.path().is_ident("js_getter")
+                    || attr.path().is_ident("js_setter")
+                {
+                    parse_js_attr_args(attr)
+                } else {
+                    continue;
+                };
 
-            if is_constructor {
-                constructors.push(name);
-            } else if is_static {
-                static_methods.push(name);
-            } else if is_getter {
-                js_getters.push(name);
-            } else if is_setter {
-                js_setters.push(name);
-            } else if is_method {
-                methods.push(name);
+                // Only generate _decl() when the attribute has explicit args
+                // (name or length), signaling the method has NativeFn-compatible
+                // signature: (this: &Value, args: &[Value], ncx: &mut NativeContext)
+                let has_explicit_args = attr_name.is_some() || attr_length.is_some();
+
+                let js_name = attr_name.unwrap_or_else(|| rust_name.clone());
+                let length = attr_length.unwrap_or(0);
+
+                if attr.path().is_ident("js_constructor") {
+                    constructors.push(rust_name.clone());
+                } else if attr.path().is_ident("js_method") {
+                    methods.push(rust_name.clone());
+                } else if attr.path().is_ident("js_static") {
+                    static_methods.push(rust_name.clone());
+                } else if attr.path().is_ident("js_getter") {
+                    js_getters.push(rust_name.clone());
+                } else if attr.path().is_ident("js_setter") {
+                    js_setters.push(rust_name.clone());
+                }
+
+                if has_explicit_args {
+                    all_decls.push(DeclInfo {
+                        rust_ident: rust_ident.clone(),
+                        js_name,
+                        length,
+                    });
+                }
             }
         }
     }
+
+    // Generate _decl() functions: each returns (&str, NativeFn, u32)
+    let decl_fns: Vec<_> = all_decls
+        .iter()
+        .map(|info| {
+            let decl_fn_name = format_ident!("{}_decl", info.rust_ident);
+            let js_name = &info.js_name;
+            let length = info.length;
+            let rust_ident = &info.rust_ident;
+
+            quote! {
+                /// NativeFn declaration: `(js_name, native_fn, length)`.
+                pub fn #decl_fn_name() -> (
+                    &'static str,
+                    std::sync::Arc<
+                        dyn Fn(
+                            &otter_vm_core::value::Value,
+                            &[otter_vm_core::value::Value],
+                            &mut otter_vm_core::context::NativeContext<'_>,
+                        ) -> std::result::Result<
+                            otter_vm_core::value::Value,
+                            otter_vm_core::error::VmError,
+                        > + Send
+                            + Sync,
+                    >,
+                    u32,
+                ) {
+                    type NativeFnArc = std::sync::Arc<
+                        dyn Fn(
+                            &otter_vm_core::value::Value,
+                            &[otter_vm_core::value::Value],
+                            &mut otter_vm_core::context::NativeContext<'_>,
+                        ) -> std::result::Result<
+                            otter_vm_core::value::Value,
+                            otter_vm_core::error::VmError,
+                        > + Send
+                            + Sync,
+                    >;
+                    static CACHED: std::sync::OnceLock<NativeFnArc> =
+                        std::sync::OnceLock::new();
+                    let f = CACHED
+                        .get_or_init(|| {
+                            std::sync::Arc::new(
+                                |this: &otter_vm_core::value::Value,
+                                 args: &[otter_vm_core::value::Value],
+                                 ncx: &mut otter_vm_core::context::NativeContext<'_>|
+                                 -> std::result::Result<
+                                    otter_vm_core::value::Value,
+                                    otter_vm_core::error::VmError,
+                                > {
+                                    Self::#rust_ident(this, args, ncx)
+                                },
+                            )
+                        })
+                        .clone();
+                    (#js_name, f, #length)
+                }
+            }
+        })
+        .collect();
 
     let expanded = quote! {
         #input
@@ -985,6 +1110,8 @@ fn expand_js_class_impl(input: ItemImpl) -> TokenStream {
             pub fn js_setters() -> &'static [&'static str] {
                 &[#(#js_setters),*]
             }
+
+            #(#decl_fns)*
         }
     };
 

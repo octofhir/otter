@@ -32,7 +32,7 @@ use otter_vm_core::value::Value;
 
 use crate::event_loop::{ActiveServerCount, EventLoop, HttpEvent, WsEvent};
 use crate::extension::{AsyncOpFn, ExtensionRegistry, OpHandler};
-use crate::microtask::JsJobQueueWrapper;
+use crate::microtask::{JsJobQueueWrapper, NextTickQueueWrapper};
 
 /// Signal for async resume - stores resolved/rejected value
 struct ResumeSignal {
@@ -354,6 +354,8 @@ impl Otter {
 
         Self::configure_eval(&mut ctx);
         Self::configure_js_job_queue(&mut ctx, &self.event_loop);
+        Self::configure_next_tick_queue(&mut ctx, &self.event_loop);
+        Self::configure_pending_async_ops(&mut ctx, &self.event_loop);
 
         // 4. Register extension ops as global native functions
         self.register_ops_in_context(&mut ctx);
@@ -444,7 +446,8 @@ impl Otter {
 
         // Now execute the main module with suspension support
         let result_promise = JsPromise::new();
-        let mut exec_result = self.execute_with_suspension(&mut ctx, bytecode, result_promise, locals_opt)?;
+        let mut exec_result =
+            self.execute_with_suspension(&mut ctx, bytecode, result_promise, locals_opt)?;
 
         // After main execution starts, we might need a way to update its namespace too if it's imported elsewhere,
         // but for high-level eval it's usually the end of the chain.
@@ -629,7 +632,12 @@ impl Otter {
         initial_locals: Option<HashMap<u16, Value>>,
     ) -> Result<VmExecutionResult, OtterError> {
         let interpreter = Interpreter::new();
-        Ok(interpreter.execute_with_suspension_and_locals(module, ctx, result_promise, initial_locals))
+        Ok(interpreter.execute_with_suspension_and_locals(
+            module,
+            ctx,
+            result_promise,
+            initial_locals,
+        ))
     }
 
     /// Register a signal on a promise to be notified when it resolves/rejects
@@ -682,6 +690,7 @@ impl Otter {
 
         Self::configure_eval(&mut ctx);
         Self::configure_js_job_queue(&mut ctx, &self.event_loop);
+        Self::configure_next_tick_queue(&mut ctx, &self.event_loop);
 
         // Register extension ops as global native functions
         self.register_ops_in_context(&mut ctx);
@@ -802,9 +811,9 @@ impl Otter {
                 Some(m) => m,
                 None => continue,
             };
-            let module_lock = module_arc.read().map_err(|e| {
-                OtterError::Runtime(format!("Failed to read module: {}", e))
-            })?;
+            let module_lock = module_arc
+                .read()
+                .map_err(|e| OtterError::Runtime(format!("Failed to read module: {}", e)))?;
 
             for binding in &import.bindings {
                 let (imported_name, local_name, is_namespace) = match binding {
@@ -817,10 +826,7 @@ impl Otter {
 
                 let value = if is_namespace {
                     // Build namespace object from all exports
-                    crate::module_loader::namespace_to_object(
-                        &module_lock.namespace,
-                        mm.clone(),
-                    )
+                    crate::module_loader::namespace_to_object(&module_lock.namespace, mm.clone())
                 } else {
                     match module_lock.get_export(imported_name) {
                         Some(val) => val,
@@ -828,9 +834,7 @@ impl Otter {
                     }
                 };
 
-                if let Some(idx) =
-                    entry_func.local_names.iter().position(|n| n == local_name)
-                {
+                if let Some(idx) = entry_func.local_names.iter().position(|n| n == local_name) {
                     initial_locals.insert(idx as u16, value);
                 }
             }
@@ -889,7 +893,8 @@ impl Otter {
                 // Register with the loader using the builtin:// URL format
                 // that NodeModuleProvider produces: "builtin://node:path"
                 let builtin_url = format!("builtin://{}", specifier);
-                self.loader.register_native_module(&builtin_url, namespace_obj);
+                self.loader
+                    .register_native_module(&builtin_url, namespace_obj);
             }
         }
 
@@ -1251,13 +1256,18 @@ impl Otter {
         );
 
         let env_store_keys = Arc::clone(&env_store);
+        let caps_keys = caps.clone();
         let mm_keys = mm_env.clone();
         let mm_keys_closure = mm_keys.clone();
         let _ = global.set(
             PropertyKey::string("__env_keys"),
             Value::native_function_with_proto(
                 move |_this: &Value, _args: &[Value], _mm| {
-                    let keys = env_store_keys.keys();
+                    let keys: Vec<String> = env_store_keys
+                        .keys()
+                        .into_iter()
+                        .filter(|key| caps_keys.can_env(key))
+                        .collect();
                     let arr = JsObject::array(keys.len(), mm_keys_closure.clone());
                     for (i, key) in keys.into_iter().enumerate() {
                         let _ = arr.set(
@@ -1329,6 +1339,8 @@ impl Otter {
         ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
         Self::configure_eval(ctx);
         Self::configure_js_job_queue(ctx, &self.event_loop);
+        Self::configure_next_tick_queue(ctx, &self.event_loop);
+        Self::configure_pending_async_ops(ctx, &self.event_loop);
 
         // Register extension ops as global native functions
         self.register_ops_in_context(ctx);
@@ -1667,11 +1679,49 @@ impl Otter {
         };
 
         loop {
+            // Node.js semantics: drain ALL nextTick callbacks before ANY promise microtask.
+            while let Some(tick_job) = self.event_loop.next_tick_queue().dequeue() {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    interpreter.call_function(
+                        ctx,
+                        &tick_job.callback,
+                        Value::undefined(),
+                        &tick_job.args,
+                    )
+                }));
+                match result {
+                    Ok(Err(e)) => {
+                        if first_error.is_none() {
+                            first_error = Some(e.to_string());
+                        }
+                    }
+                    Err(panic) => {
+                        let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                            format!("nextTick panic: {s}")
+                        } else if let Some(s) = panic.downcast_ref::<String>() {
+                            format!("nextTick panic: {s}")
+                        } else {
+                            "nextTick panic: unknown".to_string()
+                        };
+                        if first_error.is_none() {
+                            first_error = Some(msg);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             let next_js = self.event_loop.js_job_queue().peek_seq();
             let next_rust = self.event_loop.microtask_queue().peek_seq();
 
             let run_js = match (next_js, next_rust) {
-                (None, None) => break,
+                (None, None) => {
+                    // Also check nextTick — a promise callback may have enqueued one.
+                    if self.event_loop.next_tick_queue().is_empty() {
+                        break;
+                    }
+                    continue;
+                }
                 (Some(_), None) => true,
                 (None, Some(_)) => false,
                 (Some(js_seq), Some(rust_seq)) => js_seq <= rust_seq,
@@ -2059,6 +2109,19 @@ impl Otter {
         let queue: Arc<dyn otter_vm_core::context::JsJobQueueTrait + Send + Sync> = wrapper.clone();
         ctx.set_js_job_queue(queue);
         ctx.register_external_root_set(wrapper);
+    }
+
+    fn configure_next_tick_queue(ctx: &mut VmContext, event_loop: &Arc<EventLoop>) {
+        let next_tick = Arc::clone(event_loop.next_tick_queue());
+        ctx.set_next_tick_enqueue(Arc::new(move |callback, args| {
+            next_tick.enqueue(callback, args);
+        }));
+        let wrapper = NextTickQueueWrapper::new(Arc::clone(event_loop.next_tick_queue()));
+        ctx.register_external_root_set(wrapper);
+    }
+
+    fn configure_pending_async_ops(ctx: &mut VmContext, event_loop: &Arc<EventLoop>) {
+        ctx.set_pending_async_ops(event_loop.get_pending_async_ops_count());
     }
 
     /// Execute JS code with eval semantics (returns last expression value)

@@ -34,7 +34,7 @@ pub use extension::{
     Extension, ExtensionRegistry, NativeOpResult, Op, OpHandler, op_async, op_native,
     op_native_with_mm, op_sync,
 };
-pub use microtask::MicrotaskQueue;
+pub use microtask::{MicrotaskQueue, NextTickQueue};
 pub use module_loader::{
     LoadedModule, ModuleError, ModuleLoader, ModuleNamespace, ModuleState, module_extension,
 };

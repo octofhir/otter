@@ -18,7 +18,7 @@ use crate::object::JsObject;
 use crate::value::{Symbol, Value};
 
 /// Well-known symbol IDs (fixed, pre-defined).
-/// These must match the IDs in `otter-vm-builtins/src/symbol.rs`.
+/// Keep these stable: symbol identity is based on IDs across the runtime.
 pub mod well_known {
     /// `Symbol.iterator`
     pub const ITERATOR: u64 = 1;
@@ -1013,6 +1013,16 @@ impl Intrinsics {
         if let Some(apply_fn) = self.function_prototype.get(&PropertyKey::string("apply")) {
             let _ = global.set(PropertyKey::string("__Function_apply"), apply_fn);
         }
+        if let Some(object_ctor) = global
+            .get(&PropertyKey::string("Object"))
+            .and_then(|v| v.as_object())
+            && let Some(assign_fn) = object_ctor.get(&PropertyKey::string("assign"))
+        {
+            let _ = global.set(PropertyKey::string("__Object_assign"), assign_fn);
+        }
+        let object_rest_fn =
+            crate::intrinsics_impl::object::create_object_rest_helper(fn_proto, mm);
+        let _ = global.set(PropertyKey::string("__Object_rest"), object_rest_fn);
 
         // ====================================================================
         // Primitive wrapper constructors

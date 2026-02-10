@@ -57,13 +57,19 @@ fn to_uint32(n: f64) -> u32 {
 // ============================================================================
 
 #[dive(name = "abs")]
-fn math_abs(x: f64) -> f64 { x.abs() }
+fn math_abs(x: f64) -> f64 {
+    x.abs()
+}
 
 #[dive(name = "ceil")]
-fn math_ceil(x: f64) -> f64 { x.ceil() }
+fn math_ceil(x: f64) -> f64 {
+    x.ceil()
+}
 
 #[dive(name = "floor")]
-fn math_floor(x: f64) -> f64 { x.floor() }
+fn math_floor(x: f64) -> f64 {
+    x.floor()
+}
 
 #[dive(name = "round", length = 1)]
 fn math_round(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
@@ -82,67 +88,109 @@ fn math_round(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError
 }
 
 #[dive(name = "trunc")]
-fn math_trunc(x: f64) -> f64 { x.trunc() }
+fn math_trunc(x: f64) -> f64 {
+    x.trunc()
+}
 
 #[dive(name = "sqrt")]
-fn math_sqrt(x: f64) -> f64 { x.sqrt() }
+fn math_sqrt(x: f64) -> f64 {
+    x.sqrt()
+}
 
 #[dive(name = "cbrt")]
-fn math_cbrt(x: f64) -> f64 { x.cbrt() }
+fn math_cbrt(x: f64) -> f64 {
+    x.cbrt()
+}
 
 #[dive(name = "exp")]
-fn math_exp(x: f64) -> f64 { x.exp() }
+fn math_exp(x: f64) -> f64 {
+    x.exp()
+}
 
 #[dive(name = "expm1")]
-fn math_expm1(x: f64) -> f64 { x.exp_m1() }
+fn math_expm1(x: f64) -> f64 {
+    x.exp_m1()
+}
 
 #[dive(name = "log")]
-fn math_log(x: f64) -> f64 { x.ln() }
+fn math_log(x: f64) -> f64 {
+    x.ln()
+}
 
 #[dive(name = "log1p")]
-fn math_log1p(x: f64) -> f64 { x.ln_1p() }
+fn math_log1p(x: f64) -> f64 {
+    x.ln_1p()
+}
 
 #[dive(name = "log2")]
-fn math_log2(x: f64) -> f64 { x.log2() }
+fn math_log2(x: f64) -> f64 {
+    x.log2()
+}
 
 #[dive(name = "log10")]
-fn math_log10(x: f64) -> f64 { x.log10() }
+fn math_log10(x: f64) -> f64 {
+    x.log10()
+}
 
 #[dive(name = "sin")]
-fn math_sin(x: f64) -> f64 { x.sin() }
+fn math_sin(x: f64) -> f64 {
+    x.sin()
+}
 
 #[dive(name = "cos")]
-fn math_cos(x: f64) -> f64 { x.cos() }
+fn math_cos(x: f64) -> f64 {
+    x.cos()
+}
 
 #[dive(name = "tan")]
-fn math_tan(x: f64) -> f64 { x.tan() }
+fn math_tan(x: f64) -> f64 {
+    x.tan()
+}
 
 #[dive(name = "asin")]
-fn math_asin(x: f64) -> f64 { x.asin() }
+fn math_asin(x: f64) -> f64 {
+    x.asin()
+}
 
 #[dive(name = "acos")]
-fn math_acos(x: f64) -> f64 { x.acos() }
+fn math_acos(x: f64) -> f64 {
+    x.acos()
+}
 
 #[dive(name = "atan")]
-fn math_atan(x: f64) -> f64 { x.atan() }
+fn math_atan(x: f64) -> f64 {
+    x.atan()
+}
 
 #[dive(name = "sinh")]
-fn math_sinh(x: f64) -> f64 { x.sinh() }
+fn math_sinh(x: f64) -> f64 {
+    x.sinh()
+}
 
 #[dive(name = "cosh")]
-fn math_cosh(x: f64) -> f64 { x.cosh() }
+fn math_cosh(x: f64) -> f64 {
+    x.cosh()
+}
 
 #[dive(name = "tanh")]
-fn math_tanh(x: f64) -> f64 { x.tanh() }
+fn math_tanh(x: f64) -> f64 {
+    x.tanh()
+}
 
 #[dive(name = "asinh")]
-fn math_asinh(x: f64) -> f64 { x.asinh() }
+fn math_asinh(x: f64) -> f64 {
+    x.asinh()
+}
 
 #[dive(name = "acosh")]
-fn math_acosh(x: f64) -> f64 { x.acosh() }
+fn math_acosh(x: f64) -> f64 {
+    x.acosh()
+}
 
 #[dive(name = "atanh")]
-fn math_atanh(x: f64) -> f64 { x.atanh() }
+fn math_atanh(x: f64) -> f64 {
+    x.atanh()
+}
 
 // ============================================================================
 // Two-argument methods
@@ -177,7 +225,11 @@ fn js_pow(base: f64, exp: f64) -> f64 {
     // 5. If base is -Infinity
     if base == f64::NEG_INFINITY {
         if exp > 0.0 {
-            return if is_odd_integer(exp) { f64::NEG_INFINITY } else { f64::INFINITY };
+            return if is_odd_integer(exp) {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            };
         }
         return if is_odd_integer(exp) { -0.0 } else { 0.0 };
     }
@@ -190,7 +242,11 @@ fn js_pow(base: f64, exp: f64) -> f64 {
         if exp > 0.0 {
             return if is_odd_integer(exp) { -0.0 } else { 0.0 };
         }
-        return if is_odd_integer(exp) { f64::NEG_INFINITY } else { f64::INFINITY };
+        return if is_odd_integer(exp) {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
     }
     // 8. If base < 0 and base is finite, and exponent is finite and not integer
     if base < 0.0 && base.is_finite() && exp.is_finite() && exp.fract() != 0.0 {
@@ -202,15 +258,23 @@ fn js_pow(base: f64, exp: f64) -> f64 {
     }
     // 10. If abs(base) > 1
     if base.abs() > 1.0 {
-        return if exp == f64::INFINITY { f64::INFINITY }
-        else if exp == f64::NEG_INFINITY { 0.0 }
-        else { base.powf(exp) };
+        return if exp == f64::INFINITY {
+            f64::INFINITY
+        } else if exp == f64::NEG_INFINITY {
+            0.0
+        } else {
+            base.powf(exp)
+        };
     }
     // 11. If abs(base) < 1
     if base.abs() < 1.0 {
-        return if exp == f64::INFINITY { 0.0 }
-        else if exp == f64::NEG_INFINITY { f64::INFINITY }
-        else { base.powf(exp) };
+        return if exp == f64::INFINITY {
+            0.0
+        } else if exp == f64::NEG_INFINITY {
+            f64::INFINITY
+        } else {
+            base.powf(exp)
+        };
     }
     base.powf(exp)
 }
@@ -228,7 +292,9 @@ fn is_odd_integer(n: f64) -> bool {
 }
 
 #[dive(name = "atan2")]
-fn math_atan2(y: f64, x: f64) -> f64 { y.atan2(x) }
+fn math_atan2(y: f64, x: f64) -> f64 {
+    y.atan2(x)
+}
 
 #[dive(name = "imul", length = 2)]
 fn math_imul(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
@@ -580,8 +646,8 @@ fn shewchuk_sum(values: &[f64]) -> f64 {
                     break;
                 }
             }
-            if qidx > 0 && ((qlo < 0.0 && qp[qidx - 1] < 0.0) ||
-                              (qlo > 0.0 && qp[qidx - 1] > 0.0)) {
+            if qidx > 0 && ((qlo < 0.0 && qp[qidx - 1] < 0.0) || (qlo > 0.0 && qp[qidx - 1] > 0.0))
+            {
                 let qy3 = qlo * 2.0;
                 let qx3 = qhi + qy3;
                 let qyr3 = qx3 - qhi;
@@ -602,8 +668,7 @@ fn shewchuk_sum(values: &[f64]) -> f64 {
             break;
         }
     }
-    if idx > 0 && ((lo < 0.0 && partials[idx - 1] < 0.0) ||
-                    (lo > 0.0 && partials[idx - 1] > 0.0)) {
+    if idx > 0 && ((lo < 0.0 && partials[idx - 1] < 0.0) || (lo > 0.0 && partials[idx - 1] > 0.0)) {
         let y = lo * 2.0;
         let x = hi + y;
         let yr = x - hi;

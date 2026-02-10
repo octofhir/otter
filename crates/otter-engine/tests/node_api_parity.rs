@@ -69,7 +69,9 @@ fn test_fs_promises_extended_api_surface() {
          fs.writeFileSync(p, 'x');\n\
          const pending = fsp.readFile(p, 'utf8');\n\
          if (typeof pending?.then !== 'function') throw new Error('readFile promise');\n\
-         for (const name of ['appendFile','mkdtemp','cp','rm','access','copyFile','rename','realpath']) {{\n\
+         const openPending = fsp.open(p, 'r');\n\
+         if (typeof openPending?.then !== 'function') throw new Error('open promise');\n\
+         for (const name of ['appendFile','mkdtemp','cp','open','rm','access','copyFile','rename','realpath']) {{\n\
              if (typeof fsp[name] !== 'function') throw new Error('missing ' + name);\n\
          }}\n\
          'ok';"

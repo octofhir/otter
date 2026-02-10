@@ -40,17 +40,50 @@ const SAFE_BUILTIN_MODULES: &[&str] = &[
 ];
 
 static NODE_MODULES: &[NodeModuleEntry] = &[
-    NodeModuleEntry { name: "buffer", safe_core: true },
-    NodeModuleEntry { name: "events", safe_core: true },
-    NodeModuleEntry { name: "fs", safe_core: false },
-    NodeModuleEntry { name: "fs/promises", safe_core: false },
-    NodeModuleEntry { name: "path", safe_core: true },
-    NodeModuleEntry { name: "process", safe_core: false },
-    NodeModuleEntry { name: "util", safe_core: true },
-    NodeModuleEntry { name: "stream", safe_core: true },
-    NodeModuleEntry { name: "assert", safe_core: true },
-    NodeModuleEntry { name: "assert/strict", safe_core: true },
-    NodeModuleEntry { name: "os", safe_core: false },
+    NodeModuleEntry {
+        name: "buffer",
+        safe_core: true,
+    },
+    NodeModuleEntry {
+        name: "events",
+        safe_core: true,
+    },
+    NodeModuleEntry {
+        name: "fs",
+        safe_core: false,
+    },
+    NodeModuleEntry {
+        name: "fs/promises",
+        safe_core: false,
+    },
+    NodeModuleEntry {
+        name: "path",
+        safe_core: true,
+    },
+    NodeModuleEntry {
+        name: "process",
+        safe_core: false,
+    },
+    NodeModuleEntry {
+        name: "util",
+        safe_core: true,
+    },
+    NodeModuleEntry {
+        name: "stream",
+        safe_core: true,
+    },
+    NodeModuleEntry {
+        name: "assert",
+        safe_core: true,
+    },
+    NodeModuleEntry {
+        name: "assert/strict",
+        safe_core: true,
+    },
+    NodeModuleEntry {
+        name: "os",
+        safe_core: false,
+    },
 ];
 
 fn normalize_builtin_name(specifier: &str) -> &str {

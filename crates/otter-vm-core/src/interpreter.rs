@@ -150,7 +150,6 @@ impl Interpreter {
         ctx.pop_frame();
 
         ctx.set_running(false);
-        println!("Module execution finished. Result: {:?}", result);
         result
     }
 
@@ -1334,7 +1333,6 @@ impl Interpreter {
             // ==================== Variables ====================
             Instruction::GetLocal { dst, idx } => {
                 let value = ctx.get_local(idx.0)?;
-
 
                 if std::env::var("OTTER_TRACE_ASSERT_GETLOCAL").is_ok() {
                     if let Some(frame) = ctx.current_frame() {

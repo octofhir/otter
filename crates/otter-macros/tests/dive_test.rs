@@ -40,15 +40,8 @@ fn noop() {}
 // ---------------------------------------------------------------------------
 
 #[dive(name = "fullNative", length = 1)]
-fn full_native(
-    _this: &Value,
-    args: &[Value],
-    _ncx: &mut NativeContext,
-) -> Result<Value, VmError> {
-    let x = args
-        .first()
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0);
+fn full_native(_this: &Value, args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
+    let x = args.first().and_then(|v| v.as_number()).unwrap_or(0.0);
     Ok(Value::number(x * 2.0))
 }
 
@@ -58,10 +51,7 @@ fn full_native(
 
 #[dive(name = "sumArgs", length = 0)]
 fn sum_args(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
-    let sum: f64 = args
-        .iter()
-        .filter_map(|v| v.as_number())
-        .sum();
+    let sum: f64 = args.iter().filter_map(|v| v.as_number()).sum();
     Ok(Value::number(sum))
 }
 

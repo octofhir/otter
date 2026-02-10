@@ -145,10 +145,9 @@ impl OtterBuilder {
         let caps = self.capabilities.unwrap_or_default();
         runtime.set_capabilities(caps);
 
-        // Note: builtins are NOT registered here to avoid circular dependencies.
-        // Use otter_engine::EngineBuilder for automatic builtins registration,
-        // or manually register via:
-        //   runtime.register_extension(otter_vm_builtins::create_builtins_extension())
+        // Note: default builtins are NOT registered here to avoid circular dependencies.
+        // Use `otter_engine::EngineBuilder` for automatic registration,
+        // or register your own extensions manually.
 
         // Register custom extensions (v1)
         for ext in self.extensions {

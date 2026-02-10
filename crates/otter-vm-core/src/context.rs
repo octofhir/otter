@@ -205,6 +205,16 @@ impl<'a> NativeContext<'a> {
         self.ctx.enqueue_js_job(job, args)
     }
 
+    /// Enqueue a `process.nextTick()` callback.
+    /// Returns true if enqueued, false if no nextTick queue is configured.
+    pub fn enqueue_next_tick(
+        &self,
+        callback: crate::value::Value,
+        args: Vec<crate::value::Value>,
+    ) -> bool {
+        self.ctx.enqueue_next_tick(callback, args)
+    }
+
     /// Get the JS job queue, if configured.
     pub fn js_job_queue(&self) -> Option<Arc<dyn JsJobQueueTrait + Send + Sync>> {
         self.ctx.js_job_queue()
@@ -213,6 +223,11 @@ impl<'a> NativeContext<'a> {
     /// Check if a JS job queue is available.
     pub fn has_js_job_queue(&self) -> bool {
         self.ctx.has_js_job_queue()
+    }
+
+    /// Get the pending async ops counter, if configured.
+    pub fn pending_async_ops(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        self.ctx.pending_async_ops()
     }
 
     /// Get the interpreter reference (for advanced operations).
@@ -422,9 +437,15 @@ pub struct VmContext {
     /// Microtask enqueue function for Promise callbacks.
     /// Set by otter-vm-runtime to enable proper microtask queuing from intrinsics.
     microtask_enqueue: Option<Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>>,
+    /// process.nextTick() enqueue function.
+    /// Set by otter-vm-runtime to enable nextTick callbacks from native extensions.
+    next_tick_enqueue: Option<Arc<dyn Fn(Value, Vec<Value>) + Send + Sync>>,
     /// JS job queue for JavaScript function callbacks (Promise.then/catch/finally).
     /// Set by otter-vm-runtime to enable Promise callbacks to be executed via interpreter.
     js_job_queue: Option<Arc<dyn JsJobQueueTrait + Send + Sync>>,
+    /// Counter for pending async operations (tokio tasks).
+    /// Used by the event loop to know when async work is still in flight.
+    pending_async_ops: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// External root sets registered by the runtime (e.g., job queues).
     /// These are traced during GC root collection.
     external_root_sets: Vec<Arc<dyn ExternalRootSet + Send + Sync>>,
@@ -563,7 +584,9 @@ impl VmContext {
             async_generator_prototype_intrinsic: None,
             eval_fn: None,
             microtask_enqueue: None,
+            next_tick_enqueue: None,
             js_job_queue: None,
+            pending_async_ops: None,
             external_root_sets: Vec::new(),
             symbol_registry: Arc::new(SymbolRegistry::new()),
             realm_id: 0,
@@ -1245,6 +1268,34 @@ impl VmContext {
         f: Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>,
     ) {
         self.microtask_enqueue = Some(f);
+    }
+
+    /// Set the nextTick enqueue callback used by `process.nextTick()`.
+    /// Called by otter-vm-runtime during context setup.
+    pub fn set_next_tick_enqueue(&mut self, f: Arc<dyn Fn(Value, Vec<Value>) + Send + Sync>) {
+        self.next_tick_enqueue = Some(f);
+    }
+
+    /// Enqueue a nextTick callback if a nextTick queue is configured.
+    /// Returns true if enqueued, false if no queue is available.
+    pub fn enqueue_next_tick(&self, callback: Value, args: Vec<Value>) -> bool {
+        if let Some(enqueue) = &self.next_tick_enqueue {
+            enqueue(callback, args);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set the pending async ops counter.
+    /// Called by otter-vm-runtime during context setup.
+    pub fn set_pending_async_ops(&mut self, counter: Arc<std::sync::atomic::AtomicU64>) {
+        self.pending_async_ops = Some(counter);
+    }
+
+    /// Get the pending async ops counter, if configured.
+    pub fn pending_async_ops(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        self.pending_async_ops.clone()
     }
 
     /// Enqueue a microtask if a microtask queue is configured.

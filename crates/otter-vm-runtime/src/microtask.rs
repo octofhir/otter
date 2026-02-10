@@ -181,6 +181,67 @@ impl Default for JsJobQueue {
     }
 }
 
+/// A `process.nextTick()` callback job.
+///
+/// In Node.js, nextTick callbacks fire before promise reactions (microtasks).
+/// This queue is drained entirely before the interleaved microtask/JS-job loop.
+#[derive(Clone)]
+pub struct NextTickJob {
+    /// The JavaScript callback function.
+    pub callback: Value,
+    /// Additional arguments to pass to the callback.
+    pub args: Vec<Value>,
+}
+
+/// Queue for `process.nextTick()` callbacks.
+///
+/// Semantics: All pending nextTick callbacks are drained before ANY promise
+/// microtask in the same drain cycle, matching Node.js behavior.
+pub struct NextTickQueue {
+    queue: Mutex<VecDeque<NextTickJob>>,
+}
+
+impl NextTickQueue {
+    /// Create a new empty nextTick queue.
+    pub fn new() -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Enqueue a nextTick callback.
+    pub fn enqueue(&self, callback: Value, args: Vec<Value>) {
+        self.queue.lock().push_back(NextTickJob { callback, args });
+    }
+
+    /// Dequeue the next nextTick callback.
+    pub fn dequeue(&self) -> Option<NextTickJob> {
+        self.queue.lock().pop_front()
+    }
+
+    /// Check if queue is empty.
+    pub fn is_empty(&self) -> bool {
+        self.queue.lock().is_empty()
+    }
+
+    /// Trace GC roots held by queued nextTick jobs.
+    pub fn trace_roots(&self, tracer: &mut dyn FnMut(*const otter_vm_core::gc::GcHeader)) {
+        let queue = self.queue.lock();
+        for job in queue.iter() {
+            job.callback.trace(tracer);
+            for arg in &job.args {
+                arg.trace(tracer);
+            }
+        }
+    }
+}
+
+impl Default for NextTickQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Wrapper to implement the trait from otter-vm-core
 pub struct JsJobQueueWrapper {
     queue: Arc<JsJobQueue>,
@@ -199,6 +260,24 @@ impl otter_vm_core::context::JsJobQueueTrait for JsJobQueueWrapper {
 }
 
 impl otter_vm_core::context::ExternalRootSet for JsJobQueueWrapper {
+    fn trace_roots(&self, tracer: &mut dyn FnMut(*const otter_vm_core::gc::GcHeader)) {
+        self.queue.trace_roots(tracer);
+    }
+}
+
+/// Wrapper for NextTickQueue to implement ExternalRootSet for GC tracing.
+pub struct NextTickQueueWrapper {
+    queue: Arc<NextTickQueue>,
+}
+
+impl NextTickQueueWrapper {
+    /// Create a new wrapper.
+    pub fn new(queue: Arc<NextTickQueue>) -> Arc<Self> {
+        Arc::new(Self { queue })
+    }
+}
+
+impl otter_vm_core::context::ExternalRootSet for NextTickQueueWrapper {
     fn trace_roots(&self, tracer: &mut dyn FnMut(*const otter_vm_core::gc::GcHeader)) {
         self.queue.trace_roots(tracer);
     }

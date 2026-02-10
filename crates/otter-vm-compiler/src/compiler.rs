@@ -7600,7 +7600,11 @@ mod tests {
 
     #[test]
     fn test_shim_fetch_js_compiles() {
-        let fetch = include_str!("../../otter-vm-builtins/src/fetch.js");
+        let fetch = r#"
+            globalThis.fetch = function fetch(input, init) {
+                return __fetch(String(input), "GET", null, null);
+            };
+        "#;
         Compiler::new().compile(fetch, "fetch.js", false).unwrap();
     }
 

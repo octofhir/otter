@@ -1705,3 +1705,51 @@ pub fn create_object_constructor() -> Box<
         Ok(Value::undefined())
     })
 }
+
+/// Create internal helper used by compiler lowering for object rest:
+/// `__Object_rest(source, excludedKeysArray)`.
+pub fn create_object_rest_helper(fn_proto: GcRef<JsObject>, mm: &Arc<MemoryManager>) -> Value {
+    Value::native_function_with_proto(
+        |_this, args, ncx| {
+            let source = args.first().cloned().unwrap_or_else(Value::undefined);
+            if source.is_null() || source.is_undefined() {
+                return Err(VmError::type_error("Cannot destructure null or undefined"));
+            }
+            let source_obj = to_object_for_builtin(ncx, &source)?;
+
+            let excluded_keys_arg = args.get(1).cloned().unwrap_or_else(Value::undefined);
+            let mut excluded_keys = Vec::new();
+            if let Some(excluded_obj) = excluded_keys_arg.as_object() {
+                for key in excluded_obj.own_keys() {
+                    if matches!(key, PropertyKey::Index(_))
+                        && let Some(v) = excluded_obj.get(&key)
+                    {
+                        excluded_keys.push(crate::intrinsics_impl::reflect::to_property_key(&v));
+                    }
+                }
+            }
+
+            let proto = get_builtin_proto(&ncx.global(), "Object");
+            let result = GcRef::new(JsObject::new(
+                proto.map(Value::object).unwrap_or_else(Value::null),
+                ncx.memory_manager().clone(),
+            ));
+
+            for key in source_obj.own_keys() {
+                if excluded_keys.iter().any(|k| *k == key) {
+                    continue;
+                }
+                if let Some(desc) = source_obj.get_own_property_descriptor(&key)
+                    && desc.enumerable()
+                    && let Some(value) = source_obj.get(&key)
+                {
+                    let _ = result.set(key, value);
+                }
+            }
+
+            Ok(Value::object(result))
+        },
+        mm.clone(),
+        fn_proto,
+    )
+}

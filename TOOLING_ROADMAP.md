@@ -108,7 +108,7 @@ describe('MyModule', () => {
 
 ### Implementation
 
-Test runner builtins in `crates/otter-vm-builtins/src/test.rs`:
+Test runner builtins in runtime extensions (planned under `crates/otter-engine/src/`):
 
 - `describe(name, fn)` - Test suite
 - `it(name, fn)` / `test(name, fn)` - Test case

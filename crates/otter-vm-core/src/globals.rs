@@ -1393,7 +1393,12 @@ pub fn js_number_to_string(n: f64) -> String {
     } else {
         // Scientific notation
         if k == 1 {
-            format!("{}e{}{}", &digits[..1], if n - 1 >= 0 { "+" } else { "" }, n - 1)
+            format!(
+                "{}e{}{}",
+                &digits[..1],
+                if n - 1 >= 0 { "+" } else { "" },
+                n - 1
+            )
         } else {
             let mut sig = String::new();
             sig.push_str(&digits[..1]);

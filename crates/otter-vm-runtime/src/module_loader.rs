@@ -527,7 +527,7 @@ impl ModuleLoader {
                                 .and_then(|g| g.get(&"default".into()))
                             {
                                 guard.namespace.set("default", val);
-                            } 
+                            }
                         }
                         _ => {}
                     }

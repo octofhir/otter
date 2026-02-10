@@ -20,16 +20,19 @@
 //! }
 //! ```
 
+pub mod assert_ext;
 pub mod buffer;
-pub mod events;
-pub mod fs;
+pub mod buffer_ext;
+pub mod events_ext;
+mod fs_core;
+pub mod fs_ext;
 mod module_registry;
 pub mod os_ext;
-pub mod path;
 pub mod path_ext;
-pub mod process;
+pub mod process_ext;
 pub mod provider;
 mod security;
+pub mod util_ext;
 
 pub use module_registry::NodeModuleEntry;
 use otter_vm_runtime::extension_v2::OtterExtension;
@@ -94,5 +97,11 @@ pub fn nodejs_extensions() -> Vec<Box<dyn OtterExtension>> {
     vec![
         path_ext::node_path_extension(),
         os_ext::node_os_extension(),
+        process_ext::node_process_extension(),
+        fs_ext::node_fs_extension(),
+        events_ext::node_events_extension(),
+        util_ext::node_util_extension(),
+        assert_ext::node_assert_extension(),
+        buffer_ext::node_buffer_extension(),
     ]
 }

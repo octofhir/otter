@@ -196,7 +196,8 @@ impl ModuleGraph {
         let module_url = module.url.clone();
 
         // Skip parsing dependencies for built-ins (they have no source)
-        let (dependencies, import_records) = if module.url.starts_with("otter:") {
+        let (dependencies, import_records) =
+            if module.url.starts_with("otter:") || module.url.starts_with("builtin://node:") {
                 (Vec::new(), Vec::new())
             } else {
                 // Parse dependencies based on module type (ESM or CommonJS)

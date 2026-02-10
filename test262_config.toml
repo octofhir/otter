@@ -68,7 +68,10 @@ skip_features = [
 ]
 
 # Test path patterns to ignore (tests matching these patterns will be skipped)
-ignored_tests = []
+ignored_tests = [
+    # SpiderMonkey staging tests use SM-specific harness functions (diff, etc.)
+    "staging/sm/Math",
+]
 
 # Tests known to panic/crash the VM (will be skipped with a warning)
 known_panics = [

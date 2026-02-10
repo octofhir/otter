@@ -19,6 +19,11 @@ otter script.js
 otter run script.ts
 otter run script.ts --watch
 otter run script.ts --timeout 5000
+
+# Choose Node API profile explicitly
+otter run script.ts --node-api full
+otter run script.ts --node-api safe-core
+otter run script.ts --node-api none
 ```
 
 ## Commands
@@ -49,6 +54,7 @@ otter test
 
 # Start REPL
 otter repl
+otter repl --node-api safe-core
 
 # Package management
 otter init

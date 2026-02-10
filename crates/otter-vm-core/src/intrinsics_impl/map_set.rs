@@ -74,27 +74,19 @@ where
 }
 
 fn is_map(obj: &GcRef<JsObject>) -> bool {
-    obj.get(&pk(IS_MAP_KEY))
-        .and_then(|v| v.as_boolean())
-        == Some(true)
+    obj.get(&pk(IS_MAP_KEY)).and_then(|v| v.as_boolean()) == Some(true)
 }
 
 fn is_set(obj: &GcRef<JsObject>) -> bool {
-    obj.get(&pk(IS_SET_KEY))
-        .and_then(|v| v.as_boolean())
-        == Some(true)
+    obj.get(&pk(IS_SET_KEY)).and_then(|v| v.as_boolean()) == Some(true)
 }
 
 fn is_weakmap(obj: &GcRef<JsObject>) -> bool {
-    obj.get(&pk(IS_WEAKMAP_KEY))
-        .and_then(|v| v.as_boolean())
-        == Some(true)
+    obj.get(&pk(IS_WEAKMAP_KEY)).and_then(|v| v.as_boolean()) == Some(true)
 }
 
 fn is_weakset(obj: &GcRef<JsObject>) -> bool {
-    obj.get(&pk(IS_WEAKSET_KEY))
-        .and_then(|v| v.as_boolean())
-        == Some(true)
+    obj.get(&pk(IS_WEAKSET_KEY)).and_then(|v| v.as_boolean()) == Some(true)
 }
 
 fn get_map_data(obj: &GcRef<JsObject>) -> Option<GcRef<MapData>> {
@@ -105,16 +97,17 @@ fn get_set_data(obj: &GcRef<JsObject>) -> Option<GcRef<SetData>> {
     obj.get(&pk(SET_DATA_KEY)).and_then(|v| v.as_set_data())
 }
 
-fn is_valid_weak_key(value: &Value) -> bool {
+fn is_valid_weak_key(
+    value: &Value,
+    symbol_registry: &crate::symbol_registry::SymbolRegistry,
+) -> bool {
     if value.is_object() || value.is_function() {
         return true;
     }
     // Symbols are valid weak keys UNLESS they are registered (Symbol.for).
     // Registered symbols are globally shared and never garbage collected.
     if let Some(sym) = value.as_symbol() {
-        return crate::symbol_registry::global_symbol_registry()
-            .key_for(&sym)
-            .is_none();
+        return symbol_registry.key_for(&sym).is_none();
     }
     false
 }
@@ -155,9 +148,7 @@ fn value_to_bytes(value: &Value) -> Vec<u8> {
 /// Convert bytes back to Value from ephemeron storage
 unsafe fn bytes_to_value(bytes: &[u8]) -> Value {
     assert_eq!(bytes.len(), std::mem::size_of::<Value>());
-    unsafe {
-        std::ptr::read(bytes.as_ptr() as *const Value)
-    }
+    unsafe { std::ptr::read(bytes.as_ptr() as *const Value) }
 }
 
 /// JavaScript-style property Get that triggers accessor getters.
@@ -257,7 +248,8 @@ fn iterate_with_protocol(
 
     // Call @@iterator to get the iterator
     let iterator = ncx.call_function(&iter_fn, iterable.clone(), &[])?;
-    let iterator_obj = iterator.as_object()
+    let iterator_obj = iterator
+        .as_object()
         .ok_or_else(|| VmError::type_error("Iterator result is not an object"))?;
 
     // Get the `next` method
@@ -269,7 +261,8 @@ fn iterate_with_protocol(
     // Iterate
     loop {
         let result = ncx.call_function(&next_fn, iterator.clone(), &[])?;
-        let result_obj = result.as_object()
+        let result_obj = result
+            .as_object()
             .ok_or_else(|| VmError::type_error("Iterator result is not an object"))?;
 
         // Check .done - must use js_get_value to trigger accessor getters
@@ -304,12 +297,21 @@ fn init_set_slots(obj: &GcRef<JsObject>) {
 }
 
 /// Require `this` to be a Map and extract its data.
-fn require_map(this_val: &Value, method: &str) -> Result<(GcRef<JsObject>, GcRef<MapData>), VmError> {
-    let obj = this_val
-        .as_object()
-        .ok_or_else(|| VmError::type_error(format!("Method Map.prototype.{} called on incompatible receiver", method)))?;
+fn require_map(
+    this_val: &Value,
+    method: &str,
+) -> Result<(GcRef<JsObject>, GcRef<MapData>), VmError> {
+    let obj = this_val.as_object().ok_or_else(|| {
+        VmError::type_error(format!(
+            "Method Map.prototype.{} called on incompatible receiver",
+            method
+        ))
+    })?;
     if !is_map(&obj) {
-        return Err(VmError::type_error(format!("Method Map.prototype.{} called on incompatible receiver", method)));
+        return Err(VmError::type_error(format!(
+            "Method Map.prototype.{} called on incompatible receiver",
+            method
+        )));
     }
     let data = get_map_data(&obj)
         .ok_or_else(|| VmError::type_error("Map object missing internal data"))?;
@@ -317,12 +319,21 @@ fn require_map(this_val: &Value, method: &str) -> Result<(GcRef<JsObject>, GcRef
 }
 
 /// Require `this` to be a Set and extract its data.
-fn require_set(this_val: &Value, method: &str) -> Result<(GcRef<JsObject>, GcRef<SetData>), VmError> {
-    let obj = this_val
-        .as_object()
-        .ok_or_else(|| VmError::type_error(format!("Method Set.prototype.{} called on incompatible receiver", method)))?;
+fn require_set(
+    this_val: &Value,
+    method: &str,
+) -> Result<(GcRef<JsObject>, GcRef<SetData>), VmError> {
+    let obj = this_val.as_object().ok_or_else(|| {
+        VmError::type_error(format!(
+            "Method Set.prototype.{} called on incompatible receiver",
+            method
+        ))
+    })?;
     if !is_set(&obj) {
-        return Err(VmError::type_error(format!("Method Set.prototype.{} called on incompatible receiver", method)));
+        return Err(VmError::type_error(format!(
+            "Method Set.prototype.{} called on incompatible receiver",
+            method
+        )));
     }
     let data = get_set_data(&obj)
         .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
@@ -377,7 +388,8 @@ fn make_map_iterator(
                 loop {
                     let entries_len = data.entries_len();
                     if idx >= entries_len {
-                        let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                        let result =
+                            GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                         let _ = result.set(pk("value"), Value::undefined());
                         let _ = result.set(pk("done"), Value::boolean(true));
                         // Park index at end
@@ -389,13 +401,15 @@ fn make_map_iterator(
                         idx += 1;
                         let _ = iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
 
-                        let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                        let result =
+                            GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                         match kind.as_str() {
                             "key" => {
                                 let _ = result.set(pk("value"), key);
                             }
                             "entry" => {
-                                let entry = GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
+                                let entry =
+                                    GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
                                 let _ = entry.set(PropertyKey::Index(0), key);
                                 let _ = entry.set(PropertyKey::Index(1), value);
                                 let _ = result.set(pk("value"), Value::array(entry));
@@ -555,7 +569,13 @@ pub fn init_map_prototype(
             "keys",
             0,
             move |this_val, _args, ncx| {
-                make_map_iterator(this_val, "key", ncx.memory_manager().clone(), fn_proto_for_keys, iter_proto_for_keys)
+                make_map_iterator(
+                    this_val,
+                    "key",
+                    ncx.memory_manager().clone(),
+                    fn_proto_for_keys,
+                    iter_proto_for_keys,
+                )
             },
             mm_for_keys,
             fn_proto,
@@ -572,7 +592,13 @@ pub fn init_map_prototype(
             "values",
             0,
             move |this_val, _args, ncx| {
-                make_map_iterator(this_val, "value", ncx.memory_manager().clone(), fn_proto_for_values, iter_proto_for_values)
+                make_map_iterator(
+                    this_val,
+                    "value",
+                    ncx.memory_manager().clone(),
+                    fn_proto_for_values,
+                    iter_proto_for_values,
+                )
             },
             mm_for_values,
             fn_proto,
@@ -589,7 +615,13 @@ pub fn init_map_prototype(
             "entries",
             0,
             move |this_val, _args, ncx| {
-                make_map_iterator(this_val, "entry", ncx.memory_manager().clone(), fn_proto_for_entries, iter_proto_for_entries)
+                make_map_iterator(
+                    this_val,
+                    "entry",
+                    ncx.memory_manager().clone(),
+                    fn_proto_for_entries,
+                    iter_proto_for_entries,
+                )
             },
             mm_for_entries,
             fn_proto,
@@ -608,7 +640,9 @@ pub fn init_map_prototype(
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
                 if !callback.is_callable() {
-                    return Err(VmError::type_error("Map.prototype.forEach: callback is not a function"));
+                    return Err(VmError::type_error(
+                        "Map.prototype.forEach: callback is not a function",
+                    ));
                 }
 
                 // Live iteration: check entries_len each round to see new entries
@@ -619,7 +653,11 @@ pub fn init_map_prototype(
                         break;
                     }
                     if let Some((key, value)) = data.entry_at(pos) {
-                        ncx.call_function(&callback, this_arg.clone(), &[value, key, this_val.clone()])?;
+                        ncx.call_function(
+                            &callback,
+                            this_arg.clone(),
+                            &[value, key, this_val.clone()],
+                        )?;
                     }
                     pos += 1;
                 }
@@ -670,7 +708,9 @@ pub fn init_map_prototype(
                     key
                 };
                 if !callback.is_callable() {
-                    return Err(VmError::type_error("Map.prototype.getOrInsertComputed: callbackfn is not a function"));
+                    return Err(VmError::type_error(
+                        "Map.prototype.getOrInsertComputed: callbackfn is not a function",
+                    ));
                 }
                 // Check if key exists first
                 let mk = MapKey(key.clone());
@@ -697,7 +737,13 @@ pub fn init_map_prototype(
             "[Symbol.iterator]",
             0,
             move |this_val, _args, ncx| {
-                make_map_iterator(this_val, "entry", ncx.memory_manager().clone(), fn_proto_for_symbol, iter_proto_for_symbol)
+                make_map_iterator(
+                    this_val,
+                    "entry",
+                    ncx.memory_manager().clone(),
+                    fn_proto_for_symbol,
+                    iter_proto_for_symbol,
+                )
             },
             mm_for_symbol,
             fn_proto,
@@ -764,7 +810,8 @@ fn make_set_iterator(
                 loop {
                     let entries_len = data.entries_len();
                     if idx >= entries_len {
-                        let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                        let result =
+                            GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                         let _ = result.set(pk("value"), Value::undefined());
                         let _ = result.set(pk("done"), Value::boolean(true));
                         let _ = iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
@@ -775,10 +822,12 @@ fn make_set_iterator(
                         idx += 1;
                         let _ = iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
 
-                        let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                        let result =
+                            GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                         match kind.as_str() {
                             "entry" => {
-                                let entry = GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
+                                let entry =
+                                    GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
                                 let _ = entry.set(PropertyKey::Index(0), value.clone());
                                 let _ = entry.set(PropertyKey::Index(1), value);
                                 let _ = result.set(pk("value"), Value::array(entry));
@@ -920,7 +969,13 @@ pub fn init_set_prototype(
             "values",
             0,
             move |this_val, _args, ncx| {
-                make_set_iterator(this_val, "value", ncx.memory_manager().clone(), fn_proto_for_values, iter_proto_for_values)
+                make_set_iterator(
+                    this_val,
+                    "value",
+                    ncx.memory_manager().clone(),
+                    fn_proto_for_values,
+                    iter_proto_for_values,
+                )
             },
             mm_for_values,
             fn_proto,
@@ -937,7 +992,13 @@ pub fn init_set_prototype(
             "keys",
             0,
             move |this_val, _args, ncx| {
-                make_set_iterator(this_val, "value", ncx.memory_manager().clone(), fn_proto_for_keys, iter_proto_for_keys)
+                make_set_iterator(
+                    this_val,
+                    "value",
+                    ncx.memory_manager().clone(),
+                    fn_proto_for_keys,
+                    iter_proto_for_keys,
+                )
             },
             mm_for_keys,
             fn_proto,
@@ -954,7 +1015,13 @@ pub fn init_set_prototype(
             "entries",
             0,
             move |this_val, _args, ncx| {
-                make_set_iterator(this_val, "entry", ncx.memory_manager().clone(), fn_proto_for_entries, iter_proto_for_entries)
+                make_set_iterator(
+                    this_val,
+                    "entry",
+                    ncx.memory_manager().clone(),
+                    fn_proto_for_entries,
+                    iter_proto_for_entries,
+                )
             },
             mm_for_entries,
             fn_proto,
@@ -973,7 +1040,9 @@ pub fn init_set_prototype(
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
                 if !callback.is_callable() {
-                    return Err(VmError::type_error("Set.prototype.forEach: callback is not a function"));
+                    return Err(VmError::type_error(
+                        "Set.prototype.forEach: callback is not a function",
+                    ));
                 }
 
                 // Live iteration: check entries_len each round to see new entries
@@ -984,7 +1053,11 @@ pub fn init_set_prototype(
                         break;
                     }
                     if let Some(value) = data.entry_at(pos) {
-                        ncx.call_function(&callback, this_arg.clone(), &[value.clone(), value, this_val.clone()])?;
+                        ncx.call_function(
+                            &callback,
+                            this_arg.clone(),
+                            &[value.clone(), value, this_val.clone()],
+                        )?;
                     }
                     pos += 1;
                 }
@@ -1007,11 +1080,16 @@ pub fn init_set_prototype(
             1,
             |this_val, args, ncx| {
                 let (_, this_data) = require_set(this_val, "union")?;
-                let other = args.first().ok_or_else(|| VmError::type_error("Set.prototype.union requires argument"))?;
-                let other_obj = other.as_object()
-                    .ok_or_else(|| VmError::type_error("Set.prototype.union requires a Set-like argument"))?;
+                let other = args
+                    .first()
+                    .ok_or_else(|| VmError::type_error("Set.prototype.union requires argument"))?;
+                let other_obj = other.as_object().ok_or_else(|| {
+                    VmError::type_error("Set.prototype.union requires a Set-like argument")
+                })?;
                 if !is_set(&other_obj) {
-                    return Err(VmError::type_error("Set.prototype.union requires a Set-like argument"));
+                    return Err(VmError::type_error(
+                        "Set.prototype.union requires a Set-like argument",
+                    ));
                 }
                 let other_data = get_set_data(&other_obj)
                     .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
@@ -1041,11 +1119,16 @@ pub fn init_set_prototype(
             1,
             |this_val, args, ncx| {
                 let (_, this_data) = require_set(this_val, "intersection")?;
-                let other = args.first().ok_or_else(|| VmError::type_error("Set.prototype.intersection requires argument"))?;
-                let other_obj = other.as_object()
-                    .ok_or_else(|| VmError::type_error("Set.prototype.intersection requires a Set-like argument"))?;
+                let other = args.first().ok_or_else(|| {
+                    VmError::type_error("Set.prototype.intersection requires argument")
+                })?;
+                let other_obj = other.as_object().ok_or_else(|| {
+                    VmError::type_error("Set.prototype.intersection requires a Set-like argument")
+                })?;
                 if !is_set(&other_obj) {
-                    return Err(VmError::type_error("Set.prototype.intersection requires a Set-like argument"));
+                    return Err(VmError::type_error(
+                        "Set.prototype.intersection requires a Set-like argument",
+                    ));
                 }
                 let other_data = get_set_data(&other_obj)
                     .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
@@ -1074,11 +1157,16 @@ pub fn init_set_prototype(
             1,
             |this_val, args, ncx| {
                 let (_, this_data) = require_set(this_val, "difference")?;
-                let other = args.first().ok_or_else(|| VmError::type_error("Set.prototype.difference requires argument"))?;
-                let other_obj = other.as_object()
-                    .ok_or_else(|| VmError::type_error("Set.prototype.difference requires a Set-like argument"))?;
+                let other = args.first().ok_or_else(|| {
+                    VmError::type_error("Set.prototype.difference requires argument")
+                })?;
+                let other_obj = other.as_object().ok_or_else(|| {
+                    VmError::type_error("Set.prototype.difference requires a Set-like argument")
+                })?;
                 if !is_set(&other_obj) {
-                    return Err(VmError::type_error("Set.prototype.difference requires a Set-like argument"));
+                    return Err(VmError::type_error(
+                        "Set.prototype.difference requires a Set-like argument",
+                    ));
                 }
                 let other_data = get_set_data(&other_obj)
                     .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
@@ -1107,11 +1195,18 @@ pub fn init_set_prototype(
             1,
             |this_val, args, ncx| {
                 let (_, this_data) = require_set(this_val, "symmetricDifference")?;
-                let other = args.first().ok_or_else(|| VmError::type_error("Set.prototype.symmetricDifference requires argument"))?;
-                let other_obj = other.as_object()
-                    .ok_or_else(|| VmError::type_error("Set.prototype.symmetricDifference requires a Set-like argument"))?;
+                let other = args.first().ok_or_else(|| {
+                    VmError::type_error("Set.prototype.symmetricDifference requires argument")
+                })?;
+                let other_obj = other.as_object().ok_or_else(|| {
+                    VmError::type_error(
+                        "Set.prototype.symmetricDifference requires a Set-like argument",
+                    )
+                })?;
                 if !is_set(&other_obj) {
-                    return Err(VmError::type_error("Set.prototype.symmetricDifference requires a Set-like argument"));
+                    return Err(VmError::type_error(
+                        "Set.prototype.symmetricDifference requires a Set-like argument",
+                    ));
                 }
                 let other_data = get_set_data(&other_obj)
                     .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
@@ -1147,11 +1242,16 @@ pub fn init_set_prototype(
             1,
             |this_val, args, _ncx| {
                 let (_, this_data) = require_set(this_val, "isSubsetOf")?;
-                let other = args.first().ok_or_else(|| VmError::type_error("Set.prototype.isSubsetOf requires argument"))?;
-                let other_obj = other.as_object()
-                    .ok_or_else(|| VmError::type_error("Set.prototype.isSubsetOf requires a Set-like argument"))?;
+                let other = args.first().ok_or_else(|| {
+                    VmError::type_error("Set.prototype.isSubsetOf requires argument")
+                })?;
+                let other_obj = other.as_object().ok_or_else(|| {
+                    VmError::type_error("Set.prototype.isSubsetOf requires a Set-like argument")
+                })?;
                 if !is_set(&other_obj) {
-                    return Err(VmError::type_error("Set.prototype.isSubsetOf requires a Set-like argument"));
+                    return Err(VmError::type_error(
+                        "Set.prototype.isSubsetOf requires a Set-like argument",
+                    ));
                 }
                 let other_data = get_set_data(&other_obj)
                     .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
@@ -1176,11 +1276,16 @@ pub fn init_set_prototype(
             1,
             |this_val, args, _ncx| {
                 let (_, this_data) = require_set(this_val, "isSupersetOf")?;
-                let other = args.first().ok_or_else(|| VmError::type_error("Set.prototype.isSupersetOf requires argument"))?;
-                let other_obj = other.as_object()
-                    .ok_or_else(|| VmError::type_error("Set.prototype.isSupersetOf requires a Set-like argument"))?;
+                let other = args.first().ok_or_else(|| {
+                    VmError::type_error("Set.prototype.isSupersetOf requires argument")
+                })?;
+                let other_obj = other.as_object().ok_or_else(|| {
+                    VmError::type_error("Set.prototype.isSupersetOf requires a Set-like argument")
+                })?;
                 if !is_set(&other_obj) {
-                    return Err(VmError::type_error("Set.prototype.isSupersetOf requires a Set-like argument"));
+                    return Err(VmError::type_error(
+                        "Set.prototype.isSupersetOf requires a Set-like argument",
+                    ));
                 }
                 let other_data = get_set_data(&other_obj)
                     .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
@@ -1205,11 +1310,16 @@ pub fn init_set_prototype(
             1,
             |this_val, args, _ncx| {
                 let (_, this_data) = require_set(this_val, "isDisjointFrom")?;
-                let other = args.first().ok_or_else(|| VmError::type_error("Set.prototype.isDisjointFrom requires argument"))?;
-                let other_obj = other.as_object()
-                    .ok_or_else(|| VmError::type_error("Set.prototype.isDisjointFrom requires a Set-like argument"))?;
+                let other = args.first().ok_or_else(|| {
+                    VmError::type_error("Set.prototype.isDisjointFrom requires argument")
+                })?;
+                let other_obj = other.as_object().ok_or_else(|| {
+                    VmError::type_error("Set.prototype.isDisjointFrom requires a Set-like argument")
+                })?;
                 if !is_set(&other_obj) {
-                    return Err(VmError::type_error("Set.prototype.isDisjointFrom requires a Set-like argument"));
+                    return Err(VmError::type_error(
+                        "Set.prototype.isDisjointFrom requires a Set-like argument",
+                    ));
                 }
                 let other_data = get_set_data(&other_obj)
                     .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
@@ -1236,7 +1346,13 @@ pub fn init_set_prototype(
             "[Symbol.iterator]",
             0,
             move |this_val, _args, ncx| {
-                make_set_iterator(this_val, "value", ncx.memory_manager().clone(), fn_proto_for_symbol, iter_proto_for_symbol)
+                make_set_iterator(
+                    this_val,
+                    "value",
+                    ncx.memory_manager().clone(),
+                    fn_proto_for_symbol,
+                    iter_proto_for_symbol,
+                )
             },
             mm_for_symbol,
             fn_proto,
@@ -1265,7 +1381,8 @@ pub fn init_set_prototype(
 /// Keys are tracked by pointer identity and entries are automatically collected
 /// when keys become unreachable.
 fn get_weakmap_entries(obj: &GcRef<JsObject>) -> Option<GcRef<otter_vm_gc::EphemeronTable>> {
-    obj.get(&pk(WEAKMAP_ENTRIES_KEY)).and_then(|v| v.as_ephemeron_table())
+    obj.get(&pk(WEAKMAP_ENTRIES_KEY))
+        .and_then(|v| v.as_ephemeron_table())
 }
 
 /// Initialize WeakMap.prototype with all ES2023 methods.
@@ -1280,16 +1397,20 @@ pub fn init_weak_map_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "get",
             1,
-            |this_val, args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.get called on incompatible receiver"))?;
+            |this_val, args, ncx| {
+                let obj = this_val.as_object().ok_or_else(|| {
+                    VmError::type_error(
+                        "Method WeakMap.prototype.get called on incompatible receiver",
+                    )
+                })?;
                 if !is_weakmap(&obj) {
-                    return Err(VmError::type_error("Method WeakMap.prototype.get called on incompatible receiver"));
+                    return Err(VmError::type_error(
+                        "Method WeakMap.prototype.get called on incompatible receiver",
+                    ));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
                 // Return undefined if key cannot be held weakly (spec step 4)
-                if !is_valid_weak_key(&key) {
+                if !is_valid_weak_key(&key, ncx.ctx.symbol_registry()) {
                     return Ok(Value::undefined());
                 }
                 let Some(key_header) = weak_key_header(&key) else {
@@ -1316,19 +1437,24 @@ pub fn init_weak_map_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "set",
             2,
-            |this_val, args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.set called on incompatible receiver"))?;
+            |this_val, args, ncx| {
+                let obj = this_val.as_object().ok_or_else(|| {
+                    VmError::type_error(
+                        "Method WeakMap.prototype.set called on incompatible receiver",
+                    )
+                })?;
                 if !is_weakmap(&obj) {
-                    return Err(VmError::type_error("Method WeakMap.prototype.set called on incompatible receiver"));
+                    return Err(VmError::type_error(
+                        "Method WeakMap.prototype.set called on incompatible receiver",
+                    ));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&key) {
+                if !is_valid_weak_key(&key, ncx.ctx.symbol_registry()) {
                     return Err(VmError::type_error("Invalid value used as weak map key"));
                 }
                 let value = args.get(1).cloned().unwrap_or(Value::undefined());
-                let key_header = weak_key_header(&key).ok_or_else(|| VmError::type_error("Invalid weak key"))?;
+                let key_header =
+                    weak_key_header(&key).ok_or_else(|| VmError::type_error("Invalid weak key"))?;
                 let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
 
                 let value_bytes = value_to_bytes(&value);
@@ -1348,15 +1474,19 @@ pub fn init_weak_map_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "has",
             1,
-            |this_val, args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.has called on incompatible receiver"))?;
+            |this_val, args, ncx| {
+                let obj = this_val.as_object().ok_or_else(|| {
+                    VmError::type_error(
+                        "Method WeakMap.prototype.has called on incompatible receiver",
+                    )
+                })?;
                 if !is_weakmap(&obj) {
-                    return Err(VmError::type_error("Method WeakMap.prototype.has called on incompatible receiver"));
+                    return Err(VmError::type_error(
+                        "Method WeakMap.prototype.has called on incompatible receiver",
+                    ));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&key) {
+                if !is_valid_weak_key(&key, ncx.ctx.symbol_registry()) {
                     return Ok(Value::boolean(false));
                 }
                 let key_header = match weak_key_header(&key) {
@@ -1365,9 +1495,7 @@ pub fn init_weak_map_prototype(
                 };
                 let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
 
-                unsafe {
-                    Ok(Value::boolean(entries.has(key_header)))
-                }
+                unsafe { Ok(Value::boolean(entries.has(key_header))) }
             },
             mm.clone(),
             fn_proto,
@@ -1380,15 +1508,19 @@ pub fn init_weak_map_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "delete",
             1,
-            |this_val, args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.delete called on incompatible receiver"))?;
+            |this_val, args, ncx| {
+                let obj = this_val.as_object().ok_or_else(|| {
+                    VmError::type_error(
+                        "Method WeakMap.prototype.delete called on incompatible receiver",
+                    )
+                })?;
                 if !is_weakmap(&obj) {
-                    return Err(VmError::type_error("Method WeakMap.prototype.delete called on incompatible receiver"));
+                    return Err(VmError::type_error(
+                        "Method WeakMap.prototype.delete called on incompatible receiver",
+                    ));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&key) {
+                if !is_valid_weak_key(&key, ncx.ctx.symbol_registry()) {
                     return Ok(Value::boolean(false));
                 }
                 let key_header = match weak_key_header(&key) {
@@ -1397,9 +1529,7 @@ pub fn init_weak_map_prototype(
                 };
                 let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
 
-                unsafe {
-                    Ok(Value::boolean(entries.delete(key_header)))
-                }
+                unsafe { Ok(Value::boolean(entries.delete(key_header))) }
             },
             mm.clone(),
             fn_proto,
@@ -1412,15 +1542,19 @@ pub fn init_weak_map_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "getOrInsert",
             2,
-            |this_val, args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| VmError::type_error("Method WeakMap.prototype.getOrInsert called on incompatible receiver"))?;
+            |this_val, args, ncx| {
+                let obj = this_val.as_object().ok_or_else(|| {
+                    VmError::type_error(
+                        "Method WeakMap.prototype.getOrInsert called on incompatible receiver",
+                    )
+                })?;
                 if !is_weakmap(&obj) {
-                    return Err(VmError::type_error("Method WeakMap.prototype.getOrInsert called on incompatible receiver"));
+                    return Err(VmError::type_error(
+                        "Method WeakMap.prototype.getOrInsert called on incompatible receiver",
+                    ));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&key) {
+                if !is_valid_weak_key(&key, ncx.ctx.symbol_registry()) {
                     return Err(VmError::type_error("Invalid value used as weak map key"));
                 }
                 let default_value = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1459,7 +1593,7 @@ pub fn init_weak_map_prototype(
                     return Err(VmError::type_error("Method WeakMap.prototype.getOrInsertComputed called on incompatible receiver"));
                 }
                 let key = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&key) {
+                if !is_valid_weak_key(&key, ncx.ctx.symbol_registry()) {
                     return Err(VmError::type_error("Invalid value used as weak map key"));
                 }
                 let callback = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1512,7 +1646,8 @@ pub fn init_weak_map_prototype(
 // ============================================================================
 
 fn get_weakset_entries(obj: &GcRef<JsObject>) -> Option<GcRef<otter_vm_gc::EphemeronTable>> {
-    obj.get(&pk(WEAKSET_ENTRIES_KEY)).and_then(|v| v.as_ephemeron_table())
+    obj.get(&pk(WEAKSET_ENTRIES_KEY))
+        .and_then(|v| v.as_ephemeron_table())
 }
 
 /// Initialize WeakSet.prototype with all ES2023 methods.
@@ -1527,18 +1662,23 @@ pub fn init_weak_set_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "add",
             1,
-            |this_val, args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| VmError::type_error("Method WeakSet.prototype.add called on incompatible receiver"))?;
+            |this_val, args, ncx| {
+                let obj = this_val.as_object().ok_or_else(|| {
+                    VmError::type_error(
+                        "Method WeakSet.prototype.add called on incompatible receiver",
+                    )
+                })?;
                 if !is_weakset(&obj) {
-                    return Err(VmError::type_error("Method WeakSet.prototype.add called on incompatible receiver"));
+                    return Err(VmError::type_error(
+                        "Method WeakSet.prototype.add called on incompatible receiver",
+                    ));
                 }
                 let value = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&value) {
+                if !is_valid_weak_key(&value, ncx.ctx.symbol_registry()) {
                     return Err(VmError::type_error("Invalid value used in weak set"));
                 }
-                let key_header = weak_key_header(&value).ok_or_else(|| VmError::type_error("Invalid weak key"))?;
+                let key_header = weak_key_header(&value)
+                    .ok_or_else(|| VmError::type_error("Invalid weak key"))?;
                 let entries = get_weakset_entries(&obj).ok_or("Internal error: missing entries")?;
 
                 // For WeakSet, we just store a boolean true marker
@@ -1560,15 +1700,19 @@ pub fn init_weak_set_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "has",
             1,
-            |this_val, args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| VmError::type_error("Method WeakSet.prototype.has called on incompatible receiver"))?;
+            |this_val, args, ncx| {
+                let obj = this_val.as_object().ok_or_else(|| {
+                    VmError::type_error(
+                        "Method WeakSet.prototype.has called on incompatible receiver",
+                    )
+                })?;
                 if !is_weakset(&obj) {
-                    return Err(VmError::type_error("Method WeakSet.prototype.has called on incompatible receiver"));
+                    return Err(VmError::type_error(
+                        "Method WeakSet.prototype.has called on incompatible receiver",
+                    ));
                 }
                 let value = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&value) {
+                if !is_valid_weak_key(&value, ncx.ctx.symbol_registry()) {
                     return Ok(Value::boolean(false));
                 }
                 let key_header = match weak_key_header(&value) {
@@ -1577,9 +1721,7 @@ pub fn init_weak_set_prototype(
                 };
                 let entries = get_weakset_entries(&obj).ok_or("Internal error: missing entries")?;
 
-                unsafe {
-                    Ok(Value::boolean(entries.has(key_header)))
-                }
+                unsafe { Ok(Value::boolean(entries.has(key_header))) }
             },
             mm.clone(),
             fn_proto,
@@ -1592,15 +1734,19 @@ pub fn init_weak_set_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "delete",
             1,
-            |this_val, args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| VmError::type_error("Method WeakSet.prototype.delete called on incompatible receiver"))?;
+            |this_val, args, ncx| {
+                let obj = this_val.as_object().ok_or_else(|| {
+                    VmError::type_error(
+                        "Method WeakSet.prototype.delete called on incompatible receiver",
+                    )
+                })?;
                 if !is_weakset(&obj) {
-                    return Err(VmError::type_error("Method WeakSet.prototype.delete called on incompatible receiver"));
+                    return Err(VmError::type_error(
+                        "Method WeakSet.prototype.delete called on incompatible receiver",
+                    ));
                 }
                 let value = args.first().cloned().unwrap_or(Value::undefined());
-                if !is_valid_weak_key(&value) {
+                if !is_valid_weak_key(&value, ncx.ctx.symbol_registry()) {
                     return Ok(Value::boolean(false));
                 }
                 let key_header = match weak_key_header(&value) {
@@ -1609,9 +1755,7 @@ pub fn init_weak_set_prototype(
                 };
                 let entries = get_weakset_entries(&obj).ok_or("Internal error: missing entries")?;
 
-                unsafe {
-                    Ok(Value::boolean(entries.delete(key_header)))
-                }
+                unsafe { Ok(Value::boolean(entries.delete(key_header))) }
             },
             mm.clone(),
             fn_proto,
@@ -1656,15 +1800,20 @@ pub fn create_map_constructor() -> Box<
                 let data = get_map_data(&obj).unwrap();
                 // Try to iterate the argument as an array-like
                 if let Some(arr) = iterable.as_array().or_else(|| iterable.as_object()) {
-                    let len = arr.get(&PropertyKey::string("length"))
+                    let len = arr
+                        .get(&PropertyKey::string("length"))
                         .and_then(|v| v.as_number())
                         .unwrap_or(0.0) as usize;
                     for i in 0..len {
                         if let Some(entry) = arr.get(&PropertyKey::Index(i as u32))
                             && let Some(entry_obj) = entry.as_array().or_else(|| entry.as_object())
                         {
-                            let key = entry_obj.get(&PropertyKey::Index(0)).unwrap_or(Value::undefined());
-                            let value = entry_obj.get(&PropertyKey::Index(1)).unwrap_or(Value::undefined());
+                            let key = entry_obj
+                                .get(&PropertyKey::Index(0))
+                                .unwrap_or(Value::undefined());
+                            let value = entry_obj
+                                .get(&PropertyKey::Index(1))
+                                .unwrap_or(Value::undefined());
                             let _ = data.set(MapKey(key), value);
                         }
                     }
@@ -1697,7 +1846,8 @@ pub fn create_set_constructor() -> Box<
             if !iterable.is_undefined() && !iterable.is_null() {
                 let data = get_set_data(&obj).unwrap();
                 if let Some(arr) = iterable.as_array().or_else(|| iterable.as_object()) {
-                    let len = arr.get(&PropertyKey::string("length"))
+                    let len = arr
+                        .get(&PropertyKey::string("length"))
                         .and_then(|v| v.as_number())
                         .unwrap_or(0.0) as usize;
                     for i in 0..len {
@@ -1728,7 +1878,10 @@ pub fn create_weak_map_constructor() -> Box<
         }
         if let Some(obj) = this_val.as_object() {
             let ephemeron_table = GcRef::new(otter_vm_gc::EphemeronTable::new());
-            let _ = obj.set(pk(WEAKMAP_ENTRIES_KEY), Value::ephemeron_table(ephemeron_table));
+            let _ = obj.set(
+                pk(WEAKMAP_ENTRIES_KEY),
+                Value::ephemeron_table(ephemeron_table),
+            );
             let _ = obj.set(pk(IS_WEAKMAP_KEY), Value::boolean(true));
 
             // Handle iterable argument: new WeakMap([[k1, v1], [k2, v2], ...])
@@ -1746,8 +1899,13 @@ pub fn create_weak_map_constructor() -> Box<
                 let this_clone = this_val.clone();
                 iterate_with_protocol(&iterable, ncx, |entry, ncx| {
                     // Each entry must be an object [key, value] (spec step 9.f)
-                    let entry_obj = entry.as_array().or_else(|| entry.as_object())
-                        .ok_or_else(|| VmError::type_error("Iterator value is not an entry object"))?;
+                    let entry_obj =
+                        entry
+                            .as_array()
+                            .or_else(|| entry.as_object())
+                            .ok_or_else(|| {
+                                VmError::type_error("Iterator value is not an entry object")
+                            })?;
 
                     // Use js_get_value to trigger accessor getters (spec: Get(nextItem, "0") / Get(nextItem, "1"))
                     let entry_val = entry.clone();
@@ -1780,7 +1938,10 @@ pub fn create_weak_set_constructor() -> Box<
         }
         if let Some(obj) = this_val.as_object() {
             let ephemeron_table = GcRef::new(otter_vm_gc::EphemeronTable::new());
-            let _ = obj.set(pk(WEAKSET_ENTRIES_KEY), Value::ephemeron_table(ephemeron_table));
+            let _ = obj.set(
+                pk(WEAKSET_ENTRIES_KEY),
+                Value::ephemeron_table(ephemeron_table),
+            );
             let _ = obj.set(pk(IS_WEAKSET_KEY), Value::boolean(true));
 
             // Handle iterable argument: new WeakSet([v1, v2, ...])

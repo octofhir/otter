@@ -4,7 +4,10 @@
 //! MemoryManager with other realms.
 
 use parking_lot::RwLock;
-use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+};
 
 use crate::gc::GcRef;
 use crate::intrinsics::Intrinsics;

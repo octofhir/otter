@@ -7,12 +7,16 @@
 //! - Capabilities for permission checking
 //! - Environment store for secure env var access
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
 use crate::capabilities::Capabilities;
 use crate::env_store::IsolatedEnvStore;
+use crate::module_provider::ModuleType;
+use otter_vm_bytecode::module::{ImportBinding, ImportRecord};
+use otter_vm_bytecode::{Instruction, Module, Register, TypeFlags, UpvalueCapture};
 use otter_vm_compiler::Compiler;
 use otter_vm_core::async_context::VmExecutionResult;
 use otter_vm_core::context::{VmContext, VmContextSnapshot};
@@ -28,7 +32,7 @@ use otter_vm_core::value::Value;
 
 use crate::event_loop::{ActiveServerCount, EventLoop, HttpEvent, WsEvent};
 use crate::extension::{AsyncOpFn, ExtensionRegistry, OpHandler};
-use crate::microtask::JsJobQueueWrapper;
+use crate::microtask::{JsJobQueueWrapper, NextTickQueueWrapper};
 
 /// Signal for async resume - stores resolved/rejected value
 struct ResumeSignal {
@@ -71,8 +75,14 @@ pub struct Otter {
     vm: VmRuntime,
     /// Event loop (shared)
     event_loop: Arc<EventLoop>,
-    /// Extension registry
+    /// Module loader for resolving and loading ES modules
+    loader: Arc<crate::module_loader::ModuleLoader>,
+    /// Extension registry (v1 — JSON ops + JS shims)
     extensions: ExtensionRegistry,
+    /// Extension registry (v2 — native-first, no JS shims)
+    native_extensions: crate::extension_v2::NativeExtensionRegistry,
+    /// Per-extension typed state storage
+    extension_state: crate::extension_state::ExtensionState,
     /// HTTP events sender (for HTTP extension to use)
     http_tx: mpsc::UnboundedSender<HttpEvent>,
     /// HTTP events receiver (moves to event loop on first eval)
@@ -114,7 +124,12 @@ impl Otter {
         Self {
             vm: VmRuntime::new(),
             event_loop,
+            loader: Arc::new(crate::module_loader::ModuleLoader::new(
+                std::env::current_dir().unwrap_or_default(),
+            )),
             extensions: ExtensionRegistry::new(),
+            native_extensions: crate::extension_v2::NativeExtensionRegistry::new(),
+            extension_state: crate::extension_state::ExtensionState::new(),
             http_tx,
             http_rx: Some(http_rx),
             ws_tx,
@@ -198,7 +213,8 @@ impl Otter {
 
         // Create a temporary ring buffer from the snapshot entries if present
         let trace_buffer = if !snapshot.recent_instructions.is_empty() {
-            let mut buffer = otter_vm_core::TraceRingBuffer::new(snapshot.recent_instructions.len().max(1));
+            let mut buffer =
+                otter_vm_core::TraceRingBuffer::new(snapshot.recent_instructions.len().max(1));
             for entry in &snapshot.recent_instructions {
                 buffer.push(entry.clone());
             }
@@ -216,6 +232,32 @@ impl Otter {
     /// Register an extension
     pub fn register_extension(&mut self, ext: crate::extension::Extension) -> Result<(), String> {
         self.extensions.register(ext)
+    }
+
+    /// Register a v2 native extension.
+    ///
+    /// V2 extensions use `OtterExtension` trait and register native functions
+    /// directly without JS shims or JSON serde.
+    pub fn register_native_extension(
+        &mut self,
+        ext: Box<dyn crate::extension_v2::OtterExtension>,
+    ) -> Result<(), String> {
+        self.native_extensions.register(ext)
+    }
+
+    /// Get the v2 extension registry.
+    pub fn native_extensions(&self) -> &crate::extension_v2::NativeExtensionRegistry {
+        &self.native_extensions
+    }
+
+    /// Get the extension state.
+    pub fn extension_state(&self) -> &crate::extension_state::ExtensionState {
+        &self.extension_state
+    }
+
+    /// Get the extension state mutably.
+    pub fn extension_state_mut(&mut self) -> &mut crate::extension_state::ExtensionState {
+        &mut self.extension_state
     }
 
     /// Pre-compile all registered extensions to speed up initialization
@@ -241,6 +283,19 @@ impl Otter {
     /// Set environment store
     pub fn set_env_store(&mut self, store: Arc<IsolatedEnvStore>) {
         self.env_store = store;
+    }
+
+    /// Register a module provider to handle custom import protocols or resolution logic.
+    pub fn register_module_provider(
+        &self,
+        provider: Arc<dyn crate::module_provider::ModuleProvider>,
+    ) {
+        self.loader.register_provider(provider);
+    }
+
+    /// Get the module loader instance.
+    pub fn loader(&self) -> Arc<crate::module_loader::ModuleLoader> {
+        Arc::clone(&self.loader)
     }
 
     /// Get environment store
@@ -271,7 +326,18 @@ impl Otter {
     /// - `function` declarations creating global properties
     /// - Correct `this` binding (global object for scripts)
     /// - Top-level `await` via the interpreter's suspension machinery
-    pub async fn eval(&mut self, code: &str) -> Result<Value, OtterError> {
+    /// Compile and execute JavaScript/TypeScript code.
+    ///
+    /// When `source_url` is `Some`, relative `require()` / `import` paths
+    /// resolve from that file location. Pass an absolute file path
+    /// (e.g. `/app/src/main.js`) so that `require('./util')` works.
+    /// When `None`, defaults to `"main.js"`.
+    pub async fn eval(
+        &mut self,
+        code: &str,
+        source_url: Option<&str>,
+    ) -> Result<Value, OtterError> {
+        let source_url = source_url.unwrap_or("main.js");
         // 0. Clear interrupt flag before starting (in case of re-use)
         self.clear_interrupt();
 
@@ -299,9 +365,14 @@ impl Otter {
 
         Self::configure_eval(&mut ctx);
         Self::configure_js_job_queue(&mut ctx, &self.event_loop);
+        Self::configure_next_tick_queue(&mut ctx, &self.event_loop);
+        Self::configure_pending_async_ops(&mut ctx, &self.event_loop);
 
         // 4. Register extension ops as global native functions
         self.register_ops_in_context(&mut ctx);
+
+        // 4b. Bootstrap v2 native extensions (no JS compilation needed)
+        self.bootstrap_native_extensions(&ctx)?;
 
         // 5. Execute setup JS from extensions (using pre-compiled modules if available)
         let compiled_modules = self.extensions.all_compiled_js();
@@ -325,21 +396,84 @@ impl Otter {
         // ES spec: Drain microtasks after extension setup JS execution
         self.drain_microtasks(&mut ctx)?;
 
+        // 5b. If source_url is a real file path, re-scope global require
+        if source_url != "main.js" {
+            let referrer_lit =
+                serde_json::to_string(source_url).unwrap_or_else(|_| "\"main.js\"".to_string());
+            let rescope = format!(
+                "globalThis.require = globalThis.__createRequire({});",
+                referrer_lit
+            );
+            let _ = self.execute_js(&mut ctx, &rescope, "<require-scope>");
+        }
+
         // 6. Set top-level `this` to the global object per ES2023 §19.2.1.
         ctx.set_pending_this(Value::object(ctx.global().clone()));
 
-        // 7. Compile as module (allows top-level await) and execute directly.
-        //    No async IIFE wrapper — code runs at the top level so var/function
-        //    declarations correctly become global properties.
-        let result_promise = JsPromise::new();
-        let mut exec_result = self.execute_with_suspension(
-            &mut ctx,
-            code,
-            "main.js",
-            result_promise,
-        )?;
+        // 7. Load, link and execute as module
+        let main_url = source_url;
 
-        // 8. Handle execution result with async resume loop
+        let bytecode = match self.loader.compile_source(code, main_url, false) {
+            Ok(b) => b,
+            Err(e) => return Err(OtterError::Compile(e.to_string())),
+        };
+
+        // Link the module (resolves all imports)
+        if let Err(e) = self.loader.link(main_url) {
+            return Err(OtterError::Runtime(format!("Module linking failed: {}", e)));
+        }
+
+        // Build the dependency graph and execute modules in order
+        let order = match self.loader.build_graph(main_url) {
+            Ok(o) => o,
+            Err(e) => return Err(OtterError::Runtime(e.to_string())),
+        };
+
+        // Execute all dependencies first (excluding main)
+        let normalized_main_url = self.loader.normalize_url(main_url);
+        for url in &order {
+            if url == main_url || url == &normalized_main_url {
+                continue;
+            }
+            let m = self.loader.get(url).unwrap();
+            let (bytecode, already_evaluated) = {
+                let guard = m.read().unwrap();
+                (
+                    Arc::clone(&guard.bytecode),
+                    guard.state == crate::module_loader::ModuleState::Evaluated,
+                )
+            };
+
+            // Skip native modules that are already evaluated (v2 extensions)
+            if already_evaluated {
+                continue;
+            }
+
+            // Execute dependency module
+            if let Err(e) = self.vm.execute_module_with_context(&bytecode, &mut ctx) {
+                return Err(OtterError::Runtime(e.to_string()));
+            }
+
+            // Populate namespace
+            self.loader.update_namespace(url, &ctx);
+        }
+
+        // Resolve imports for the main module
+        let initial_locals = self.resolve_module_imports(&bytecode, main_url)?;
+        let locals_opt = if initial_locals.is_empty() {
+            None
+        } else {
+            Some(initial_locals)
+        };
+
+        // Now execute the main module with suspension support
+        let result_promise = JsPromise::new();
+        let mut exec_result =
+            self.execute_with_suspension(&mut ctx, bytecode, result_promise, locals_opt)?;
+
+        // After main execution starts, we might need a way to update its namespace too if it's imported elsewhere,
+        // but for high-level eval it's usually the end of the chain.
+        self.loader.update_namespace(main_url, &ctx); // 8. Handle execution result with async resume loop
         let final_value = loop {
             match exec_result {
                 VmExecutionResult::Complete(value) => {
@@ -402,6 +536,16 @@ impl Otter {
                 }
             }
         };
+
+        if self.interrupt_flag.load(Ordering::Relaxed) {
+            return Err(OtterError::Runtime(
+                "Execution interrupted (timeout)".to_string(),
+            ));
+        }
+
+        // Keep runtime alive for detached async work (e.g. fs callbacks/promises
+        // started without top-level await) until the event loop reaches quiescence.
+        self.run_event_loop_with_http(&mut ctx).await;
 
         if self.interrupt_flag.load(Ordering::Relaxed) {
             return Err(OtterError::Runtime(
@@ -511,22 +655,21 @@ impl Otter {
     /// Compiles as a script (NOT a module) to preserve non-strict mode semantics,
     /// while still supporting top-level await through the interpreter's suspension machinery.
     /// ES2023 §16.1.6: Scripts are not automatically strict unless they have "use strict" directive.
+    /// Execute pre-compiled bytecode with suspension support.
     fn execute_with_suspension(
         &self,
         ctx: &mut VmContext,
-        code: &str,
-        source_url: &str,
+        module: Arc<otter_vm_bytecode::Module>,
         result_promise: GcRef<JsPromise>,
+        initial_locals: Option<HashMap<u16, Value>>,
     ) -> Result<VmExecutionResult, OtterError> {
-        let compiler = Compiler::new();
-        let module = compiler
-            .compile(code, source_url, false)  // Non-strict context for top-level code
-            .map_err(|e| OtterError::Compile(e.to_string()))?;
-
-        let module_arc = Arc::new(module);
         let interpreter = Interpreter::new();
-
-        Ok(interpreter.execute_with_suspension(module_arc, ctx, result_promise))
+        Ok(interpreter.execute_with_suspension_and_locals(
+            module,
+            ctx,
+            result_promise,
+            initial_locals,
+        ))
     }
 
     /// Register a signal on a promise to be notified when it resolves/rejects
@@ -579,28 +722,216 @@ impl Otter {
 
         Self::configure_eval(&mut ctx);
         Self::configure_js_job_queue(&mut ctx, &self.event_loop);
+        Self::configure_next_tick_queue(&mut ctx, &self.event_loop);
+        Self::configure_pending_async_ops(&mut ctx, &self.event_loop);
 
         // Register extension ops as global native functions
         self.register_ops_in_context(&mut ctx);
 
+        // Bootstrap v2 native extensions (no JS compilation needed)
+        self.bootstrap_native_extensions(&ctx)?;
+
         // Execute setup JS from extensions
         for js in self.extensions.all_js() {
             self.execute_js(&mut ctx, js, "setup.js")?;
+            self.drain_microtasks(&mut ctx)?;
         }
 
-        // ES spec: Drain microtasks after extension setup JS execution
-        self.drain_microtasks(&mut ctx)?;
-
-        // Set top-level `this` to the global object per ES2023 §19.2.1
+        // Set top-level `this` to global object
         ctx.set_pending_this(Value::object(ctx.global().clone()));
 
-        // Compile and execute with eval semantics (return last expression value)
-        let result = self.execute_js_eval(&mut ctx, code, "eval.js")?;
+        // Load, link and execute
+        let is_module =
+            code.contains("import ") || code.contains("export ") || code.contains("await ");
+        let main_url = if is_module { "main.mjs" } else { "main.js" };
+        let bytecode = match self.loader.compile_source(code, main_url, true) {
+            Ok(b) => b,
+            Err(e) => return Err(OtterError::Compile(e.to_string())),
+        };
 
-        // ES spec: Drain microtasks after synchronous script execution
-        self.drain_microtasks(&mut ctx)?;
+        if let Err(e) = self.loader.link(main_url) {
+            return Err(OtterError::Runtime(format!("Module linking failed: {}", e)));
+        }
+
+        // Execute dependencies
+        let order = match self.loader.build_graph(main_url) {
+            Ok(o) => o,
+            Err(e) => return Err(OtterError::Runtime(e.to_string())),
+        };
+
+        let normalized_main_url = self.loader.normalize_url(main_url);
+        for url in &order {
+            if url == main_url || url == &normalized_main_url {
+                continue;
+            }
+            let m = self.loader.get(url).unwrap();
+            let (module_bytecode, already_evaluated) = {
+                let guard = m.read().unwrap();
+                (
+                    Arc::clone(&guard.bytecode),
+                    guard.state == crate::module_loader::ModuleState::Evaluated,
+                )
+            };
+
+            // Skip native modules that are already evaluated (v2 extensions)
+            if already_evaluated {
+                continue;
+            }
+
+            // Resolve imports for this dependency
+            let dep_locals = self.resolve_module_imports(&module_bytecode, url)?;
+
+            self.vm
+                .execute_module_with_context_and_locals(
+                    &module_bytecode,
+                    &mut ctx,
+                    if dep_locals.is_empty() {
+                        None
+                    } else {
+                        Some(dep_locals)
+                    },
+                )
+                .map_err(|e: otter_vm_core::VmError| OtterError::Runtime(e.to_string()))?;
+
+            self.loader.update_namespace(url, &ctx);
+        }
+
+        // Resolve imports for main module
+        let initial_locals = self.resolve_module_imports(&bytecode, main_url)?;
+        let result = self
+            .vm
+            .execute_module_with_context_and_locals(
+                &bytecode,
+                &mut ctx,
+                if initial_locals.is_empty() {
+                    None
+                } else {
+                    Some(initial_locals)
+                },
+            )
+            .map_err(|e: otter_vm_core::VmError| OtterError::Runtime(e.to_string()))?;
+
+        self.loader.update_namespace(main_url, &ctx);
 
         Ok(result)
+    }
+
+    /// Resolve import bindings for a module into initial locals map.
+    ///
+    /// Walks the module's import records, resolves each to its source module,
+    /// and maps imported values to local variable indices.
+    /// Used by both `eval()` and `eval_sync()`.
+    fn resolve_module_imports(
+        &self,
+        bytecode: &otter_vm_bytecode::Module,
+        module_url: &str,
+    ) -> Result<HashMap<u16, Value>, OtterError> {
+        let mut initial_locals = HashMap::new();
+        let entry_func = match bytecode.entry_function() {
+            Some(f) => f,
+            None => return Ok(initial_locals),
+        };
+
+        let mm = self.vm.memory_manager().clone();
+
+        for import in &bytecode.imports {
+            let resolved = self
+                .loader
+                .resolve(&import.specifier, module_url)
+                .map_err(|e| OtterError::Runtime(format!("Import resolution failed: {}", e)))?;
+
+            let module_arc = match self.loader.get(&resolved.url) {
+                Some(m) => m,
+                None => continue,
+            };
+            let module_lock = module_arc
+                .read()
+                .map_err(|e| OtterError::Runtime(format!("Failed to read module: {}", e)))?;
+
+            for binding in &import.bindings {
+                let (imported_name, local_name, is_namespace) = match binding {
+                    ImportBinding::Named { imported, local } => {
+                        (imported.as_str(), local.as_str(), false)
+                    }
+                    ImportBinding::Default { local } => ("default", local.as_str(), false),
+                    ImportBinding::Namespace { local } => ("*", local.as_str(), true),
+                };
+
+                let value = if is_namespace {
+                    // Build namespace object from all exports
+                    crate::module_loader::namespace_to_object(&module_lock.namespace, mm.clone())
+                } else {
+                    match module_lock.get_export(imported_name) {
+                        Some(val) => val,
+                        None => continue,
+                    }
+                };
+
+                if let Some(idx) = entry_func.local_names.iter().position(|n| n == local_name) {
+                    initial_locals.insert(idx as u16, value);
+                }
+            }
+        }
+
+        Ok(initial_locals)
+    }
+
+    /// Bootstrap v2 native extensions (no JS compilation needed).
+    ///
+    /// Creates a `RegistrationContext` and runs the full bootstrap sequence
+    /// (init_state → allocate → install) for all registered v2 extensions.
+    /// Then builds native module namespaces and registers them with the loader.
+    fn bootstrap_native_extensions(&mut self, ctx: &VmContext) -> Result<(), OtterError> {
+        if self.native_extensions.extension_count() == 0 {
+            return Ok(());
+        }
+
+        let intrinsics = self.vm.intrinsics();
+        let global = ctx.global().clone();
+        let mm = self.vm.memory_manager().clone();
+
+        // Determine profile — for now default to Full, will be configurable later
+        let profile = crate::extension_v2::Profile::Full;
+
+        let mut reg_ctx = crate::registration::RegistrationContext::new(
+            intrinsics,
+            global,
+            mm.clone(),
+            &mut self.extension_state,
+        );
+
+        // Phase 1: bootstrap (init_state → allocate → install)
+        self.native_extensions
+            .bootstrap(&mut reg_ctx, profile)
+            .map_err(|e| OtterError::Runtime(e.to_string()))?;
+
+        // Phase 2: build native module namespaces and register with loader
+        // Collect specifiers from all extensions, then load each module
+        let mut specifier_map: Vec<(String, usize)> = Vec::new();
+        for (idx, ext) in self.native_extensions.extensions().iter().enumerate() {
+            for &spec in ext.module_specifiers() {
+                specifier_map.push((spec.to_string(), idx));
+            }
+        }
+
+        for (specifier, idx) in &specifier_map {
+            let ext = &self.native_extensions.extensions()[*idx];
+            let mut load_ctx = crate::registration::RegistrationContext::new(
+                intrinsics,
+                ctx.global().clone(),
+                mm.clone(),
+                &mut self.extension_state,
+            );
+            if let Some(namespace_obj) = ext.load_module(specifier, &mut load_ctx) {
+                // Register with the loader using the builtin:// URL format
+                // that NodeModuleProvider produces: "builtin://node:path"
+                let builtin_url = format!("builtin://{}", specifier);
+                self.loader
+                    .register_native_module(&builtin_url, namespace_obj);
+            }
+        }
+
+        Ok(())
     }
 
     /// Register extension ops as global native functions in context
@@ -625,7 +956,10 @@ impl Otter {
         }
 
         // Also register environment access if capabilities allow
-        self.register_env_access(global, fn_proto);
+        self.register_env_access(global.clone(), fn_proto);
+
+        // Register __module_require with bytecode execution via NativeContext (safe)
+        self.register_module_require(global.clone(), fn_proto);
 
         let ctx_ptr = ctx as *mut VmContext as usize;
         let vm_ptr = &self.vm as *const VmRuntime as usize;
@@ -679,7 +1013,8 @@ impl Otter {
 
                         // Determine if we're in strict mode context (for direct eval)
                         // Per ES2023 §19.2.1.1: Direct eval inherits strict mode from calling context
-                        let is_strict_context = ctx.current_frame()
+                        let is_strict_context = ctx
+                            .current_frame()
                             .and_then(|frame| {
                                 frame.module.functions.get(frame.function_index as usize)
                             })
@@ -737,7 +1072,10 @@ impl Otter {
                         // Store the realm context for future evalScript calls.
                         {
                             let mut guard = realms_for_create.lock();
-                            guard.push(RealmSlot { id: realm_id, ctx: realm_ctx });
+                            guard.push(RealmSlot {
+                                id: realm_id,
+                                ctx: realm_ctx,
+                            });
                         }
 
                         let realms_for_eval = Arc::clone(&realms_for_create);
@@ -758,17 +1096,15 @@ impl Otter {
                                     .map(|s| s.as_str().to_string())
                                     .unwrap_or_default();
 
-                                unsafe {
-                                    let otter = &*(otter_ptr as *const Otter);
-                                    let mut guard = realms_for_eval.lock();
-                                    let slot = guard
-                                        .iter_mut()
-                                        .find(|slot| slot.id == realm_id)
-                                        .ok_or_else(|| VmError::internal("Realm not found"))?;
-                                    otter
-                                        .eval_in_context(&mut slot.ctx, &code)
-                                        .map_err(|e| VmError::type_error(e.to_string()))
-                                }
+                                let otter = &*(otter_ptr as *const Otter);
+                                let mut guard = realms_for_eval.lock();
+                                let slot = guard
+                                    .iter_mut()
+                                    .find(|slot| slot.id == realm_id)
+                                    .ok_or_else(|| VmError::internal("Realm not found"))?;
+                                otter
+                                    .eval_in_context(&mut slot.ctx, &code)
+                                    .map_err(|e| VmError::type_error(e.to_string()))
                             },
                             mm_eval_realm,
                             fn_proto_realm,
@@ -776,7 +1112,8 @@ impl Otter {
 
                         let realm_obj =
                             GcRef::new(JsObject::new(Value::null(), mm_realm_for_create.clone()));
-                        let _ = realm_obj.set(PropertyKey::string("global"), Value::object(realm_global));
+                        let _ = realm_obj
+                            .set(PropertyKey::string("global"), Value::object(realm_global));
                         let _ = realm_obj.set(PropertyKey::string("evalScript"), eval_fn);
                         Ok(Value::object(realm_obj))
                     }
@@ -787,7 +1124,10 @@ impl Otter {
         );
 
         // Create console object from __console_* ops
-        let console_obj = GcRef::new(JsObject::new(Value::null(), self.vm.memory_manager().clone()));
+        let console_obj = GcRef::new(JsObject::new(
+            Value::null(),
+            self.vm.memory_manager().clone(),
+        ));
 
         // Helper to wire console methods from global __console_* functions
         let wire_console = |method_name: &str, global_name: &str| {
@@ -933,7 +1273,10 @@ impl Otter {
                         .ok_or_else(|| "env_get requires a string key".to_string())?;
 
                     if !caps_get.can_env(&key) {
-                        return Err(VmError::type_error(format!("Permission denied: env access to '{}'", key)));
+                        return Err(VmError::type_error(format!(
+                            "Permission denied: env access to '{}'",
+                            key
+                        )));
                     }
 
                     match env_store_get.get(&key) {
@@ -949,13 +1292,18 @@ impl Otter {
         );
 
         let env_store_keys = Arc::clone(&env_store);
+        let caps_keys = caps.clone();
         let mm_keys = mm_env.clone();
         let mm_keys_closure = mm_keys.clone();
         let _ = global.set(
             PropertyKey::string("__env_keys"),
             Value::native_function_with_proto(
                 move |_this: &Value, _args: &[Value], _mm| {
-                    let keys = env_store_keys.keys();
+                    let keys: Vec<String> = env_store_keys
+                        .keys()
+                        .into_iter()
+                        .filter(|key| caps_keys.can_env(key))
+                        .collect();
                     let arr = JsObject::array(keys.len(), mm_keys_closure.clone());
                     for (i, key) in keys.into_iter().enumerate() {
                         let _ = arr.set(
@@ -996,6 +1344,120 @@ impl Otter {
         );
     }
 
+    /// Register `__module_require` as a NativeFn with bytecode execution capability.
+    ///
+    /// Unlike extension ops (which only get `&[Value], Arc<MemoryManager>`),
+    /// this uses `NativeContext::execute_module()` to synchronously execute
+    /// CJS module bytecode — enabling `require()` for local files.
+    fn register_module_require(&self, global: GcRef<JsObject>, fn_proto: GcRef<JsObject>) {
+        let loader = Arc::clone(&self.loader);
+        let mm = self.vm.memory_manager().clone();
+
+        let _ = global.set(
+            PropertyKey::string("__module_require"),
+            Value::native_function_with_proto(
+                move |_this: &Value,
+                      args: &[Value],
+                      ncx: &mut otter_vm_core::context::NativeContext<'_>| {
+                    let specifier = args
+                        .first()
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string())
+                        .ok_or_else(|| VmError::type_error("require: missing specifier"))?;
+                    let referrer = args
+                        .get(1)
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string())
+                        .ok_or_else(|| VmError::type_error("require: missing referrer"))?;
+
+                    // 1. Resolve specifier
+                    let resolution = loader
+                        .resolve_require(&specifier, &referrer)
+                        .map_err(|e| VmError::type_error(e.to_string()))?;
+
+                    // 2. Check if already evaluated or currently evaluating (cycle)
+                    if let Some(m) = loader.get(&resolution.url) {
+                        let guard = m
+                            .read()
+                            .map_err(|_| VmError::type_error("require: lock poisoned"))?;
+                        let state = guard.state;
+                        drop(guard);
+                        if state == crate::module_loader::ModuleState::Evaluated
+                            || state == crate::module_loader::ModuleState::Evaluating
+                        {
+                            // For cycles (Evaluating) return partial module.exports — Node.js semantics
+                            return loader
+                                .require_value(&specifier, &referrer, ncx.memory_manager().clone())
+                                .map_err(|e| VmError::type_error(e.to_string()));
+                        }
+                    }
+
+                    // 3. Load & compile (CJS wrapper applied automatically for CJS modules)
+                    loader
+                        .load(&resolution.url, resolution.module_type)
+                        .map_err(|e| VmError::type_error(e.to_string()))?;
+
+                    // 4. Build dependency graph & link
+                    let order = loader
+                        .build_graph(&resolution.url)
+                        .map_err(|e| VmError::type_error(e.to_string()))?;
+                    for url in &order {
+                        loader
+                            .link(url)
+                            .map_err(|e| VmError::type_error(e.to_string()))?;
+                    }
+
+                    // 5. Execute all unexecuted modules in dependency order
+                    for url in &order {
+                        let m = loader.get(url).ok_or_else(|| {
+                            VmError::type_error(format!("require: module not found: {}", url))
+                        })?;
+
+                        let (bytecode, state) = {
+                            let guard = m
+                                .read()
+                                .map_err(|_| VmError::type_error("require: lock poisoned"))?;
+                            (Arc::clone(&guard.bytecode), guard.state)
+                        };
+
+                        // Skip already-evaluated or currently-evaluating (cycle) modules
+                        if state == crate::module_loader::ModuleState::Evaluated
+                            || state == crate::module_loader::ModuleState::Evaluating
+                        {
+                            continue;
+                        }
+
+                        // Mark as evaluating
+                        if let Ok(mut g) = m.write() {
+                            g.state = crate::module_loader::ModuleState::Evaluating;
+                        }
+
+                        // Execute bytecode — CJS wrapper calls __module_commit automatically
+                        match ncx.execute_module(&bytecode) {
+                            Ok(_) => {
+                                // Update namespace (for ESM modules with export declarations)
+                                loader.update_namespace(url, ncx.ctx);
+                            }
+                            Err(e) => {
+                                if let Ok(mut g) = m.write() {
+                                    g.state = crate::module_loader::ModuleState::Error;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+
+                    // 6. Return module.exports
+                    loader
+                        .require_value(&specifier, &referrer, ncx.memory_manager().clone())
+                        .map_err(|e| VmError::type_error(e.to_string()))
+                },
+                mm,
+                fn_proto,
+            ),
+        );
+    }
+
     /// Compile and execute JS code
     fn execute_js(
         &self,
@@ -1005,7 +1467,7 @@ impl Otter {
     ) -> Result<Value, OtterError> {
         let compiler = Compiler::new();
         let module = compiler
-            .compile(code, source_url, false)  // Non-strict context for top-level code
+            .compile(code, source_url, false) // Non-strict context for top-level code
             .map_err(|e| OtterError::Compile(e.to_string()))?;
 
         self.vm
@@ -1027,6 +1489,8 @@ impl Otter {
         ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
         Self::configure_eval(ctx);
         Self::configure_js_job_queue(ctx, &self.event_loop);
+        Self::configure_next_tick_queue(ctx, &self.event_loop);
+        Self::configure_pending_async_ops(ctx, &self.event_loop);
 
         // Register extension ops as global native functions
         self.register_ops_in_context(ctx);
@@ -1042,11 +1506,7 @@ impl Otter {
     }
 
     /// Execute JS code in an existing context (no context creation/teardown).
-    pub fn eval_in_context(
-        &self,
-        ctx: &mut VmContext,
-        code: &str,
-    ) -> Result<Value, OtterError> {
+    pub fn eval_in_context(&self, ctx: &mut VmContext, code: &str) -> Result<Value, OtterError> {
         self.clear_interrupt();
         let compiler = Compiler::new();
         let module = compiler
@@ -1054,7 +1514,8 @@ impl Otter {
             .map_err(|e| OtterError::Compile(e.to_string()))?;
 
         // Execute in provided context
-        let result = self.vm
+        let result = self
+            .vm
             .execute_module_with_context(&module, ctx)
             .map_err(|e| OtterError::Runtime(e.to_string()))?;
 
@@ -1077,7 +1538,7 @@ impl Otter {
     /// If a task panics or errors, the error is captured and the first error is returned.
     /// Remaining tasks continue to execute.
     fn drain_microtasks(&self, ctx: &mut VmContext) -> Result<(), OtterError> {
-        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::panic::{AssertUnwindSafe, catch_unwind};
 
         // // eprintln!("DEBUG: drain_microtasks called");
 
@@ -1103,8 +1564,8 @@ impl Otter {
         };
 
         let get_then_property = |interpreter: &mut Interpreter,
-                                     ctx: &mut VmContext,
-                                     value: &Value|
+                                 ctx: &mut VmContext,
+                                 value: &Value|
          -> Result<Value, VmError> {
             let key = PropertyKey::string("then");
 
@@ -1131,85 +1592,93 @@ impl Otter {
                     };
                     interpreter.call_function(ctx, &getter, value.clone(), &[])
                 }
-                Some(PropertyDescriptor::Data { value: prop_value, .. }) => Ok(prop_value),
+                Some(PropertyDescriptor::Data {
+                    value: prop_value, ..
+                }) => Ok(prop_value),
                 _ => Ok(Value::undefined()),
             }
         };
 
-        let resolve_result_promise =
-            |interpreter: &mut Interpreter, ctx: &mut VmContext, result_promise: GcRef<JsPromise>, value: Value| {
-                if let Some(promise) = value.as_promise() {
-                    if std::ptr::eq(promise.as_ptr(), result_promise.as_ptr()) {
-                        let error_val =
-                            make_error_value(ctx, "TypeError", "Promise cannot resolve itself");
-                        JsPromise::reject_with_js_jobs(result_promise, error_val, make_js_enqueuer());
-                        return;
-                    }
-
-                    let result_clone = result_promise.clone();
-                    let enqueue_js = make_js_enqueuer();
-                    let enqueue_microtask = make_microtask_enqueuer();
-                    promise.then_with_enqueue(
-                        move |v| {
-                            let job = JsPromiseJob {
-                                kind: JsPromiseJobKind::PassthroughFulfill,
-                                callback: Value::undefined(),
-                                this_arg: Value::undefined(),
-                                result_promise: Some(result_clone.clone()),
-                            };
-                            enqueue_js(job, vec![v]);
-                        },
-                        enqueue_microtask,
-                    );
-
-                    let result_clone = result_promise;
-                    let enqueue_js = make_js_enqueuer();
-                    let enqueue_microtask = make_microtask_enqueuer();
-                    promise.catch_with_enqueue(
-                        move |e| {
-                            let job = JsPromiseJob {
-                                kind: JsPromiseJobKind::PassthroughReject,
-                                callback: Value::undefined(),
-                                this_arg: Value::undefined(),
-                                result_promise: Some(result_clone.clone()),
-                            };
-                            enqueue_js(job, vec![e]);
-                        },
-                        enqueue_microtask,
-                    );
+        let resolve_result_promise = |interpreter: &mut Interpreter,
+                                      ctx: &mut VmContext,
+                                      result_promise: GcRef<JsPromise>,
+                                      value: Value| {
+            if let Some(promise) = value.as_promise() {
+                if std::ptr::eq(promise.as_ptr(), result_promise.as_ptr()) {
+                    let error_val =
+                        make_error_value(ctx, "TypeError", "Promise cannot resolve itself");
+                    JsPromise::reject_with_js_jobs(result_promise, error_val, make_js_enqueuer());
                     return;
                 }
 
-                if value.is_object() {
-                    match get_then_property(interpreter, ctx, &value) {
-                        Ok(then_val) if then_val.is_callable() => {
-                            let job = JsPromiseJob {
-                                kind: JsPromiseJobKind::ResolveThenable,
-                                callback: then_val,
-                                this_arg: value,
-                                result_promise: Some(result_promise),
-                            };
-                            make_js_enqueuer()(job, Vec::new());
-                            return;
-                        }
-                        Ok(_) => {}
-                        Err(vm_err) => {
-                            let error_val = vm_error_to_value(ctx, vm_err);
-                            JsPromise::reject_with_js_jobs(result_promise, error_val, make_js_enqueuer());
-                            return;
-                        }
+                let result_clone = result_promise.clone();
+                let enqueue_js = make_js_enqueuer();
+                let enqueue_microtask = make_microtask_enqueuer();
+                promise.then_with_enqueue(
+                    move |v| {
+                        let job = JsPromiseJob {
+                            kind: JsPromiseJobKind::PassthroughFulfill,
+                            callback: Value::undefined(),
+                            this_arg: Value::undefined(),
+                            result_promise: Some(result_clone.clone()),
+                        };
+                        enqueue_js(job, vec![v]);
+                    },
+                    enqueue_microtask,
+                );
+
+                let result_clone = result_promise;
+                let enqueue_js = make_js_enqueuer();
+                let enqueue_microtask = make_microtask_enqueuer();
+                promise.catch_with_enqueue(
+                    move |e| {
+                        let job = JsPromiseJob {
+                            kind: JsPromiseJobKind::PassthroughReject,
+                            callback: Value::undefined(),
+                            this_arg: Value::undefined(),
+                            result_promise: Some(result_clone.clone()),
+                        };
+                        enqueue_js(job, vec![e]);
+                    },
+                    enqueue_microtask,
+                );
+                return;
+            }
+
+            if value.is_object() {
+                match get_then_property(interpreter, ctx, &value) {
+                    Ok(then_val) if then_val.is_callable() => {
+                        let job = JsPromiseJob {
+                            kind: JsPromiseJobKind::ResolveThenable,
+                            callback: then_val,
+                            this_arg: value,
+                            result_promise: Some(result_promise),
+                        };
+                        make_js_enqueuer()(job, Vec::new());
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(vm_err) => {
+                        let error_val = vm_error_to_value(ctx, vm_err);
+                        JsPromise::reject_with_js_jobs(
+                            result_promise,
+                            error_val,
+                            make_js_enqueuer(),
+                        );
+                        return;
                     }
                 }
+            }
 
-                JsPromise::resolve_with_js_jobs(result_promise, value, make_js_enqueuer());
-            };
+            JsPromise::resolve_with_js_jobs(result_promise, value, make_js_enqueuer());
+        };
 
         let call_thenable = |interpreter: &mut Interpreter,
-                                 ctx: &mut VmContext,
-                                 then_fn: Value,
-                                 then_this: Value,
-                                 promise: GcRef<JsPromise>,
-                                 first_error: &mut Option<String>| {
+                             ctx: &mut VmContext,
+                             then_fn: Value,
+                             then_this: Value,
+                             promise: GcRef<JsPromise>,
+                             first_error: &mut Option<String>| {
             if !then_fn.is_callable() {
                 let js_queue = Arc::clone(&js_queue);
                 JsPromise::fulfill_with_js_jobs(promise, then_this, move |job, args| {
@@ -1232,9 +1701,13 @@ impl Otter {
                             }
                             let value = args.get(0).cloned().unwrap_or(Value::undefined());
                             let js_queue = Arc::clone(&js_queue);
-                            JsPromise::resolve_from_thenable_with_js_jobs(result_promise, value, move |job, args| {
-                                js_queue.enqueue(job, args);
-                            });
+                            JsPromise::resolve_from_thenable_with_js_jobs(
+                                result_promise,
+                                value,
+                                move |job, args| {
+                                    js_queue.enqueue(job, args);
+                                },
+                            );
                             Ok(Value::undefined())
                         },
                         memory_manager.clone(),
@@ -1248,9 +1721,13 @@ impl Otter {
                             }
                             let value = args.get(0).cloned().unwrap_or(Value::undefined());
                             let js_queue = Arc::clone(&js_queue);
-                            JsPromise::resolve_from_thenable_with_js_jobs(result_promise, value, move |job, args| {
-                                js_queue.enqueue(job, args);
-                            });
+                            JsPromise::resolve_from_thenable_with_js_jobs(
+                                result_promise,
+                                value,
+                                move |job, args| {
+                                    js_queue.enqueue(job, args);
+                                },
+                            );
                             Ok(Value::undefined())
                         },
                         memory_manager.clone(),
@@ -1270,9 +1747,13 @@ impl Otter {
                             }
                             let value = args.get(0).cloned().unwrap_or(Value::undefined());
                             let js_queue = Arc::clone(&js_queue);
-                            JsPromise::reject_from_thenable_with_js_jobs(result_promise, value, move |job, args| {
-                                js_queue.enqueue(job, args);
-                            });
+                            JsPromise::reject_from_thenable_with_js_jobs(
+                                result_promise,
+                                value,
+                                move |job, args| {
+                                    js_queue.enqueue(job, args);
+                                },
+                            );
                             Ok(Value::undefined())
                         },
                         memory_manager.clone(),
@@ -1286,9 +1767,13 @@ impl Otter {
                             }
                             let value = args.get(0).cloned().unwrap_or(Value::undefined());
                             let js_queue = Arc::clone(&js_queue);
-                            JsPromise::reject_from_thenable_with_js_jobs(result_promise, value, move |job, args| {
-                                js_queue.enqueue(job, args);
-                            });
+                            JsPromise::reject_from_thenable_with_js_jobs(
+                                result_promise,
+                                value,
+                                move |job, args| {
+                                    js_queue.enqueue(job, args);
+                                },
+                            );
                             Ok(Value::undefined())
                         },
                         memory_manager.clone(),
@@ -1308,7 +1793,11 @@ impl Otter {
                     if !called.load(Ordering::Acquire) {
                         let err_msg = vm_err.to_string();
                         let error_val = vm_error_to_value(ctx, vm_err);
-                        JsPromise::reject_from_thenable_with_js_jobs(promise, error_val, make_js_enqueuer());
+                        JsPromise::reject_from_thenable_with_js_jobs(
+                            promise,
+                            error_val,
+                            make_js_enqueuer(),
+                        );
                         runtime_error = Some(format!("Error in thenable resolve: {}", err_msg));
                     }
                 }
@@ -1322,7 +1811,11 @@ impl Otter {
                             "Unknown panic in thenable resolve".to_string()
                         };
                         let error_val = Value::string(JsString::intern(&error_msg));
-                        JsPromise::reject_from_thenable_with_js_jobs(promise, error_val, make_js_enqueuer());
+                        JsPromise::reject_from_thenable_with_js_jobs(
+                            promise,
+                            error_val,
+                            make_js_enqueuer(),
+                        );
                         runtime_error = Some(error_msg);
                     }
                 }
@@ -1336,11 +1829,49 @@ impl Otter {
         };
 
         loop {
+            // Node.js semantics: drain ALL nextTick callbacks before ANY promise microtask.
+            while let Some(tick_job) = self.event_loop.next_tick_queue().dequeue() {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    interpreter.call_function(
+                        ctx,
+                        &tick_job.callback,
+                        Value::undefined(),
+                        &tick_job.args,
+                    )
+                }));
+                match result {
+                    Ok(Err(e)) => {
+                        if first_error.is_none() {
+                            first_error = Some(e.to_string());
+                        }
+                    }
+                    Err(panic) => {
+                        let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                            format!("nextTick panic: {s}")
+                        } else if let Some(s) = panic.downcast_ref::<String>() {
+                            format!("nextTick panic: {s}")
+                        } else {
+                            "nextTick panic: unknown".to_string()
+                        };
+                        if first_error.is_none() {
+                            first_error = Some(msg);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             let next_js = self.event_loop.js_job_queue().peek_seq();
             let next_rust = self.event_loop.microtask_queue().peek_seq();
 
             let run_js = match (next_js, next_rust) {
-                (None, None) => break,
+                (None, None) => {
+                    // Also check nextTick — a promise callback may have enqueued one.
+                    if self.event_loop.next_tick_queue().is_empty() {
+                        break;
+                    }
+                    continue;
+                }
                 (Some(_), None) => true,
                 (None, Some(_)) => false,
                 (Some(js_seq), Some(rust_seq)) => js_seq <= rust_seq,
@@ -1363,7 +1894,8 @@ impl Otter {
                 match kind {
                     JsPromiseJobKind::PassthroughFulfill => {
                         if let Some(promise) = result_promise {
-                            JsPromise::resolve_from_thenable_with_js_jobs(promise, 
+                            JsPromise::resolve_from_thenable_with_js_jobs(
+                                promise,
                                 passthrough_value,
                                 make_js_enqueuer(),
                             );
@@ -1372,7 +1904,8 @@ impl Otter {
                     }
                     JsPromiseJobKind::PassthroughReject => {
                         if let Some(promise) = result_promise {
-                            JsPromise::reject_from_thenable_with_js_jobs(promise, 
+                            JsPromise::reject_from_thenable_with_js_jobs(
+                                promise,
                                 passthrough_value,
                                 make_js_enqueuer(),
                             );
@@ -1398,7 +1931,8 @@ impl Otter {
                             }
                             Err(vm_err) => {
                                 let error_val = vm_error_to_value(ctx, vm_err);
-                                JsPromise::reject_from_thenable_with_js_jobs(promise, 
+                                JsPromise::reject_from_thenable_with_js_jobs(
+                                    promise,
                                     error_val,
                                     make_js_enqueuer(),
                                 );
@@ -1421,7 +1955,12 @@ impl Otter {
                         match result {
                             Ok(Ok(value)) => {
                                 let gate_promise = JsPromise::new();
-                                resolve_result_promise(&mut interpreter, ctx, gate_promise.clone(), value);
+                                resolve_result_promise(
+                                    &mut interpreter,
+                                    ctx,
+                                    gate_promise.clone(),
+                                    value,
+                                );
 
                                 let enqueue_microtask = make_microtask_enqueuer();
                                 let enqueue_js = make_js_enqueuer();
@@ -1457,9 +1996,14 @@ impl Otter {
                                 );
                             }
                             Ok(Err(vm_err)) => {
-                                runtime_error = Some(format!("Error in finally callback: {}", vm_err));
+                                runtime_error =
+                                    Some(format!("Error in finally callback: {}", vm_err));
                                 let error_val = vm_error_to_value(ctx, vm_err);
-                                JsPromise::reject_with_js_jobs(promise, error_val, make_js_enqueuer());
+                                JsPromise::reject_with_js_jobs(
+                                    promise,
+                                    error_val,
+                                    make_js_enqueuer(),
+                                );
                             }
                             Err(panic_err) => {
                                 let error_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
@@ -1470,7 +2014,11 @@ impl Otter {
                                     "Unknown panic in finally callback".to_string()
                                 };
                                 let error_val = Value::string(JsString::intern(&error_msg));
-                                JsPromise::reject_with_js_jobs(promise, error_val, make_js_enqueuer());
+                                JsPromise::reject_with_js_jobs(
+                                    promise,
+                                    error_val,
+                                    make_js_enqueuer(),
+                                );
                                 runtime_error = Some(error_msg);
                             }
                         }
@@ -1498,7 +2046,12 @@ impl Otter {
                         match result {
                             Ok(Ok(value)) => {
                                 let gate_promise = JsPromise::new();
-                                resolve_result_promise(&mut interpreter, ctx, gate_promise.clone(), value);
+                                resolve_result_promise(
+                                    &mut interpreter,
+                                    ctx,
+                                    gate_promise.clone(),
+                                    value,
+                                );
 
                                 let enqueue_microtask = make_microtask_enqueuer();
                                 let enqueue_js = make_js_enqueuer();
@@ -1534,9 +2087,14 @@ impl Otter {
                                 );
                             }
                             Ok(Err(vm_err)) => {
-                                runtime_error = Some(format!("Error in finally callback: {}", vm_err));
+                                runtime_error =
+                                    Some(format!("Error in finally callback: {}", vm_err));
                                 let error_val = vm_error_to_value(ctx, vm_err);
-                                JsPromise::reject_with_js_jobs(promise, error_val, make_js_enqueuer());
+                                JsPromise::reject_with_js_jobs(
+                                    promise,
+                                    error_val,
+                                    make_js_enqueuer(),
+                                );
                             }
                             Err(panic_err) => {
                                 let error_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
@@ -1547,7 +2105,11 @@ impl Otter {
                                     "Unknown panic in finally callback".to_string()
                                 };
                                 let error_val = Value::string(JsString::intern(&error_msg));
-                                JsPromise::reject_with_js_jobs(promise, error_val, make_js_enqueuer());
+                                JsPromise::reject_with_js_jobs(
+                                    promise,
+                                    error_val,
+                                    make_js_enqueuer(),
+                                );
                                 runtime_error = Some(error_msg);
                             }
                         }
@@ -1582,13 +2144,15 @@ impl Otter {
                     if let Some(promise) = result_promise {
                         match kind {
                             JsPromiseJobKind::Reject | JsPromiseJobKind::FinallyReject => {
-                                JsPromise::reject_from_thenable_with_js_jobs(promise, 
+                                JsPromise::reject_from_thenable_with_js_jobs(
+                                    promise,
                                     passthrough_value,
                                     make_js_enqueuer(),
                                 );
                             }
                             _ => {
-                                JsPromise::resolve_from_thenable_with_js_jobs(promise, 
+                                JsPromise::resolve_from_thenable_with_js_jobs(
+                                    promise,
                                     passthrough_value,
                                     make_js_enqueuer(),
                                 );
@@ -1599,12 +2163,7 @@ impl Otter {
                 }
 
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    interpreter.call_function(
-                        ctx,
-                        &callback,
-                        this_arg,
-                        &args
-                    )
+                    interpreter.call_function(ctx, &callback, this_arg, &args)
                 }));
 
                 let mut runtime_error: Option<String> = None;
@@ -1697,10 +2256,22 @@ impl Otter {
     /// Configure the JS job queue on a VmContext to enable Promise callbacks
     fn configure_js_job_queue(ctx: &mut VmContext, event_loop: &Arc<EventLoop>) {
         let wrapper = JsJobQueueWrapper::new(Arc::clone(event_loop.js_job_queue()));
-        let queue: Arc<dyn otter_vm_core::context::JsJobQueueTrait + Send + Sync> =
-            wrapper.clone();
+        let queue: Arc<dyn otter_vm_core::context::JsJobQueueTrait + Send + Sync> = wrapper.clone();
         ctx.set_js_job_queue(queue);
         ctx.register_external_root_set(wrapper);
+    }
+
+    fn configure_next_tick_queue(ctx: &mut VmContext, event_loop: &Arc<EventLoop>) {
+        let next_tick = Arc::clone(event_loop.next_tick_queue());
+        ctx.set_next_tick_enqueue(Arc::new(move |callback, args| {
+            next_tick.enqueue(callback, args);
+        }));
+        let wrapper = NextTickQueueWrapper::new(Arc::clone(event_loop.next_tick_queue()));
+        ctx.register_external_root_set(wrapper);
+    }
+
+    fn configure_pending_async_ops(ctx: &mut VmContext, event_loop: &Arc<EventLoop>) {
+        ctx.set_pending_async_ops(event_loop.get_pending_async_ops_count());
     }
 
     /// Execute JS code with eval semantics (returns last expression value)
@@ -1749,17 +2320,15 @@ impl Otter {
         otter_profiler::MemoryProfiler::new()
     }
 
-    /// Create a MemoryProfiler connected to a GcHeap
+    /// Create a MemoryProfiler connected to the global GC registry
     #[cfg(feature = "profiling")]
-    pub fn create_memory_profiler_with_heap(
-        heap: std::sync::Arc<otter_vm_gc::GcHeap>,
-    ) -> otter_profiler::MemoryProfiler {
+    pub fn create_memory_profiler_with_gc() -> otter_profiler::MemoryProfiler {
         use otter_profiler::{HeapInfo, MemoryProfiler};
 
-        let provider = std::sync::Arc::new(move || HeapInfo {
-            total_allocated: heap.allocated(),
+        let provider = std::sync::Arc::new(|| HeapInfo {
+            total_allocated: otter_vm_gc::global_registry().total_bytes(),
             objects_by_type: std::collections::HashMap::new(),
-            object_count: 0,
+            object_count: otter_vm_gc::global_registry().allocation_count(),
         });
 
         MemoryProfiler::with_heap_provider(provider)

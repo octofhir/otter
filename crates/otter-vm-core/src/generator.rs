@@ -18,7 +18,7 @@
 
 use crate::value::{UpvalueCell, Value};
 use otter_vm_bytecode::Module;
-use parking_lot::Mutex;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 /// Generator execution state
@@ -114,7 +114,7 @@ impl GeneratorFrame {
             value.trace(tracer);
         }
 
-        // Trace upvalue values (each UpvalueCell contains Arc<Mutex<Value>>)
+        // Trace upvalue values (each UpvalueCell contains Arc<RefCell<Value>>)
         for upvalue in &self.upvalues {
             let value = upvalue.get(); // Locks and clones the Value
             value.trace(tracer);
@@ -281,32 +281,37 @@ pub struct JsGenerator {
     pub module: Arc<Module>,
     /// Captured upvalues (closure variables)
     pub upvalues: Vec<UpvalueCell>,
-    /// Current state
-    pub(crate) state: Mutex<GeneratorState>,
+    /// Current state (Cell: Copy type, zero overhead)
+    pub(crate) state: Cell<GeneratorState>,
     /// Saved execution frame for resumption (complete state snapshot)
-    pub(crate) frame: Mutex<Option<GeneratorFrame>>,
+    pub(crate) frame: RefCell<Option<GeneratorFrame>>,
     /// Initial arguments passed when the generator was created
-    pub(crate) initial_args: Mutex<Vec<Value>>,
+    pub(crate) initial_args: RefCell<Vec<Value>>,
     /// Initial `this` value
-    pub(crate) initial_this: Mutex<Value>,
+    pub(crate) initial_this: RefCell<Value>,
     /// Whether this is a constructor invocation
     pub is_construct: bool,
     /// Whether this is an async generator
     pub is_async: bool,
     /// Pending return value (persists independently of frame, for generator.return())
-    pub(crate) abrupt_return: Mutex<Option<Value>>,
+    pub(crate) abrupt_return: RefCell<Option<Value>>,
     /// Pending throw value (persists independently of frame, for generator.throw())
-    pub(crate) abrupt_throw: Mutex<Option<Value>>,
+    pub(crate) abrupt_throw: RefCell<Option<Value>>,
     /// The callee function value (for arguments.callee in sloppy mode generators)
-    pub(crate) callee_value: Mutex<Option<Value>>,
+    pub(crate) callee_value: RefCell<Option<Value>>,
 }
+
+// SAFETY: JsGenerator is only accessed from the single VM thread.
+// Thread confinement is enforced at the VmRuntime/VmContext level.
+unsafe impl Send for JsGenerator {}
+unsafe impl Sync for JsGenerator {}
 
 impl std::fmt::Debug for JsGenerator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Generator")
             .field("function_index", &self.function_index)
-            .field("state", &*self.state.lock())
-            .field("has_frame", &self.frame.lock().is_some())
+            .field("state", &self.state.get())
+            .field("has_frame", &self.frame.borrow().is_some())
             .finish()
     }
 }
@@ -318,35 +323,30 @@ impl otter_vm_gc::GcTraceable for JsGenerator {
         // Trace the generator object
         tracer(self.object.header() as *const _);
 
-        // CRITICAL FIX: Trace generator upvalues
         for upvalue in &self.upvalues {
             let value = upvalue.get();
             value.trace(tracer);
         }
 
-        // CRITICAL FIX: Trace frame state (all locals, registers, etc.)
-        if let Some(frame) = self.frame.lock().as_ref() {
+        if let Some(frame) = self.frame.borrow().as_ref() {
             frame.trace_frame(tracer);
         }
 
-        // CRITICAL FIX: Trace initial arguments
-        for value in self.initial_args.lock().iter() {
+        for value in self.initial_args.borrow().iter() {
             value.trace(tracer);
         }
 
-        // CRITICAL FIX: Trace initial this value
-        self.initial_this.lock().trace(tracer);
+        self.initial_this.borrow().trace(tracer);
 
-        // CRITICAL FIX: Trace abrupt completion values
-        if let Some(v) = self.abrupt_return.lock().as_ref() {
+        if let Some(v) = self.abrupt_return.borrow().as_ref() {
             v.trace(tracer);
         }
-        if let Some(v) = self.abrupt_throw.lock().as_ref() {
+        if let Some(v) = self.abrupt_throw.borrow().as_ref() {
             v.trace(tracer);
         }
 
         // Trace callee value
-        if let Some(v) = self.callee_value.lock().as_ref() {
+        if let Some(v) = self.callee_value.borrow().as_ref() {
             v.trace(tracer);
         }
     }
@@ -374,100 +374,100 @@ impl JsGenerator {
             function_index,
             module,
             upvalues,
-            state: Mutex::new(GeneratorState::SuspendedStart),
-            frame: Mutex::new(None),
-            initial_args: Mutex::new(args),
-            initial_this: Mutex::new(this_value),
+            state: Cell::new(GeneratorState::SuspendedStart),
+            frame: RefCell::new(None),
+            initial_args: RefCell::new(args),
+            initial_this: RefCell::new(this_value),
             is_construct,
             is_async,
-            abrupt_return: Mutex::new(None),
-            abrupt_throw: Mutex::new(None),
-            callee_value: Mutex::new(None),
+            abrupt_return: RefCell::new(None),
+            abrupt_throw: RefCell::new(None),
+            callee_value: RefCell::new(None),
         })
     }
 
     /// Set the callee function value (for arguments.callee in sloppy mode)
     pub fn set_callee_value(&self, value: Value) {
-        *self.callee_value.lock() = Some(value);
+        *self.callee_value.borrow_mut() = Some(value);
     }
 
     /// Take the callee function value
     pub fn take_callee_value(&self) -> Option<Value> {
-        self.callee_value.lock().take()
+        self.callee_value.borrow_mut().take()
     }
 
     /// Get the current state
     pub fn state(&self) -> GeneratorState {
-        *self.state.lock()
+        self.state.get()
     }
 
     /// Check if generator is suspended (either start or yield)
     pub fn is_suspended(&self) -> bool {
         matches!(
-            *self.state.lock(),
+            self.state.get(),
             GeneratorState::SuspendedStart | GeneratorState::SuspendedYield
         )
     }
 
     /// Check if generator is in suspended-start state (not yet started)
     pub fn is_suspended_start(&self) -> bool {
-        *self.state.lock() == GeneratorState::SuspendedStart
+        self.state.get() == GeneratorState::SuspendedStart
     }
 
     /// Check if generator is in suspended-yield state (has yielded)
     pub fn is_suspended_yield(&self) -> bool {
-        *self.state.lock() == GeneratorState::SuspendedYield
+        self.state.get() == GeneratorState::SuspendedYield
     }
 
     /// Check if generator is executing
     pub fn is_executing(&self) -> bool {
-        *self.state.lock() == GeneratorState::Executing
+        self.state.get() == GeneratorState::Executing
     }
 
     /// Check if generator is completed
     pub fn is_completed(&self) -> bool {
-        *self.state.lock() == GeneratorState::Completed
+        self.state.get() == GeneratorState::Completed
     }
 
     /// Set state to executing
     pub fn start_executing(&self) {
-        *self.state.lock() = GeneratorState::Executing;
+        self.state.set(GeneratorState::Executing);
     }
 
     /// Suspend the generator with a complete frame snapshot
     ///
     /// This captures all execution state needed to resume the generator.
     pub fn suspend_with_frame(&self, frame: GeneratorFrame) {
-        *self.state.lock() = GeneratorState::SuspendedYield;
-        *self.frame.lock() = Some(frame);
+        self.state.set(GeneratorState::SuspendedYield);
+        *self.frame.borrow_mut() = Some(frame);
     }
 
     /// Complete the generator
     pub fn complete(&self) {
-        *self.state.lock() = GeneratorState::Completed;
-        *self.frame.lock() = None; // Clear saved frame
+        self.state.set(GeneratorState::Completed);
+        *self.frame.borrow_mut() = None; // Clear saved frame
     }
 
     /// Get the saved frame (if any)
     pub fn get_frame(&self) -> Option<GeneratorFrame> {
-        self.frame.lock().clone()
+        self.frame.borrow().clone()
     }
 
     /// Take the saved frame (returns None if not set)
     pub fn take_frame(&self) -> Option<GeneratorFrame> {
-        self.frame.lock().take()
+        self.frame.borrow_mut().take()
     }
 
     /// Set the value to be sent to the generator on next resume
     pub fn set_sent_value(&self, value: Value) {
-        if let Some(frame) = self.frame.lock().as_mut() {
+        if let Some(frame) = self.frame.borrow_mut().as_mut() {
             frame.received_value = Some(value);
         }
     }
 
     /// Take the sent value (returns None if not set)
     pub fn take_sent_value(&self) -> Option<Value> {
-        if let Some(frame) = self.frame.lock().as_mut() {
+        if let Some(frame) = self.frame.borrow_mut().as_mut() {
             frame.received_value.take()
         } else {
             None
@@ -476,26 +476,26 @@ impl JsGenerator {
 
     /// Set a pending throw value (for generator.throw())
     pub fn set_pending_throw(&self, error: Value) {
-        if let Some(frame) = self.frame.lock().as_mut() {
+        if let Some(frame) = self.frame.borrow_mut().as_mut() {
             frame.pending_throw = Some(error);
         } else {
-            *self.abrupt_throw.lock() = Some(error);
+            *self.abrupt_throw.borrow_mut() = Some(error);
         }
     }
 
     /// Take pending throw value
     pub fn take_pending_throw(&self) -> Option<Value> {
-        if let Some(frame) = self.frame.lock().as_mut() {
+        if let Some(frame) = self.frame.borrow_mut().as_mut() {
             if let Some(error) = frame.pending_throw.take() {
                 return Some(error);
             }
         }
-        self.abrupt_throw.lock().take()
+        self.abrupt_throw.borrow_mut().take()
     }
 
     /// Set completion type (for generator.return())
     pub fn set_completion_type(&self, completion: CompletionType) {
-        if let Some(frame) = self.frame.lock().as_mut() {
+        if let Some(frame) = self.frame.borrow_mut().as_mut() {
             frame.completion_type = completion;
         }
     }
@@ -503,7 +503,7 @@ impl JsGenerator {
     /// Get completion type
     pub fn completion_type(&self) -> CompletionType {
         self.frame
-            .lock()
+            .borrow()
             .as_ref()
             .map(|f| f.completion_type.clone())
             .unwrap_or_default()
@@ -511,12 +511,12 @@ impl JsGenerator {
 
     /// Take initial arguments (only valid for suspended-start state)
     pub fn take_initial_args(&self) -> Vec<Value> {
-        std::mem::take(&mut *self.initial_args.lock())
+        std::mem::take(&mut *self.initial_args.borrow_mut())
     }
 
     /// Take initial this value (only valid for suspended-start state)
     pub fn take_initial_this(&self) -> Value {
-        std::mem::take(&mut *self.initial_this.lock())
+        std::mem::take(&mut *self.initial_this.borrow_mut())
     }
 
     /// Check if this is a constructor invocation
@@ -535,7 +535,7 @@ impl JsGenerator {
     /// execution to allow finally blocks to run.
     pub fn has_try_handlers(&self) -> bool {
         self.frame
-            .lock()
+            .borrow()
             .as_ref()
             .map(|f| !f.try_stack.is_empty())
             .unwrap_or(false)
@@ -544,27 +544,27 @@ impl JsGenerator {
     /// Set pending return value (for generator.return() with finally blocks)
     /// This persists independently of the frame for abrupt returns.
     pub fn set_pending_return(&self, value: Value) {
-        *self.abrupt_return.lock() = Some(value);
+        *self.abrupt_return.borrow_mut() = Some(value);
     }
 
     /// Take pending return value if set
     pub fn take_pending_return(&self) -> Option<Value> {
-        self.abrupt_return.lock().take()
+        self.abrupt_return.borrow_mut().take()
     }
 
     /// Check if there's a pending return value
     pub fn has_pending_return(&self) -> bool {
-        self.abrupt_return.lock().is_some()
+        self.abrupt_return.borrow().is_some()
     }
 
     /// Get pending return value without taking it (peek)
     pub fn get_pending_return(&self) -> Option<Value> {
-        self.abrupt_return.lock().clone()
+        self.abrupt_return.borrow().clone()
     }
 
     /// Get the yield destination register (if any)
     pub fn get_yield_dst(&self) -> Option<u16> {
-        self.frame.lock().as_ref().and_then(|f| f.yield_dst)
+        self.frame.borrow().as_ref().and_then(|f| f.yield_dst)
     }
 }
 

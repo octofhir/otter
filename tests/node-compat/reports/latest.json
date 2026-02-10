@@ -1,0 +1,65 @@
+{
+  "timestamp": "2026-02-10T20:36:03.829240+00:00",
+  "otter_version": "0.1.0",
+  "duration_secs": 0.091703916,
+  "summary": {
+    "total": 4,
+    "passed": 3,
+    "failed": 1,
+    "skipped": 0,
+    "timeout": 0,
+    "crashed": 0,
+    "pass_rate": 75.0,
+    "by_module": {
+      "assert": {
+        "total": 3,
+        "passed": 2,
+        "failed": 1,
+        "skipped": 0
+      },
+      "buffer": {
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0
+      }
+    },
+    "failures": [
+      {
+        "path": "assert/test-assert-fail.js",
+        "module": "assert",
+        "error": "RuntimeError: Uncaught exception: TypeError: AssertionError: this should fail"
+      }
+    ]
+  },
+  "results": [
+    {
+      "path": "assert/test-assert-deepequal.js",
+      "module": "assert",
+      "outcome": "Pass",
+      "duration_ms": 30,
+      "error": null
+    },
+    {
+      "path": "assert/test-assert-fail.js",
+      "module": "assert",
+      "outcome": "Fail",
+      "duration_ms": 15,
+      "error": "RuntimeError: Uncaught exception: TypeError: AssertionError: this should fail"
+    },
+    {
+      "path": "assert/test-assert-ok.js",
+      "module": "assert",
+      "outcome": "Pass",
+      "duration_ms": 21,
+      "error": null
+    },
+    {
+      "path": "buffer/test-buffer-from.js",
+      "module": "buffer",
+      "outcome": "Pass",
+      "duration_ms": 24,
+      "error": null
+    }
+  ]
+}

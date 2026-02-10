@@ -12,6 +12,7 @@ profiling = ["dep:otter-profiler"]
 [dependencies]
 otter-vm-bytecode = { path = "../otter-vm-bytecode" }
 otter-vm-gc = { path = "../otter-vm-gc" }
+otter-macros = { path = "../otter-macros" }
 otter-profiler = { path = "../otter-profiler", optional = true }
 thiserror.workspace = true
 parking_lot = "0.12"

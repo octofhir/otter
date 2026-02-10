@@ -1,31 +1,39 @@
-use parking_lot::Mutex;
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
 
 use crate::gc::GcRef;
 use crate::value::Symbol;
 
+/// Per-isolate symbol registry for Symbol.for() / Symbol.keyFor()
+///
+/// Each VmContext owns its own registry. Uses RefCell since all access
+/// is from the single VM thread.
 pub struct SymbolRegistry {
-    map: Mutex<HashMap<String, GcRef<Symbol>>>,
+    map: RefCell<HashMap<String, GcRef<Symbol>>>,
 }
+
+// SAFETY: SymbolRegistry is only accessed from the single VM thread.
+// Thread confinement is enforced at the VmRuntime/VmContext level.
+unsafe impl Send for SymbolRegistry {}
+unsafe impl Sync for SymbolRegistry {}
 
 impl SymbolRegistry {
     pub fn new() -> Self {
         Self {
-            map: Mutex::new(HashMap::new()),
+            map: RefCell::new(HashMap::new()),
         }
     }
 
     pub fn get(&self, key: &str) -> Option<GcRef<Symbol>> {
-        self.map.lock().get(key).cloned()
+        self.map.borrow().get(key).cloned()
     }
 
     pub fn insert(&self, key: String, symbol: GcRef<Symbol>) {
-        self.map.lock().insert(key, symbol);
+        self.map.borrow_mut().insert(key, symbol);
     }
 
     pub fn key_for(&self, symbol: &GcRef<Symbol>) -> Option<String> {
-        let map = self.map.lock();
+        let map = self.map.borrow();
         for (key, value) in map.iter() {
             if std::ptr::eq(value.as_ptr(), symbol.as_ptr()) {
                 return Some(key.clone());
@@ -35,17 +43,15 @@ impl SymbolRegistry {
     }
 
     pub fn trace_roots(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
-        let map = self.map.lock();
+        let map = self.map.borrow();
         for symbol in map.values() {
             tracer(symbol.header() as *const _);
         }
     }
 }
 
-static GLOBAL_SYMBOL_REGISTRY: OnceLock<Arc<SymbolRegistry>> = OnceLock::new();
-
-pub fn global_symbol_registry() -> Arc<SymbolRegistry> {
-    GLOBAL_SYMBOL_REGISTRY
-        .get_or_init(|| Arc::new(SymbolRegistry::new()))
-        .clone()
+impl Default for SymbolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }

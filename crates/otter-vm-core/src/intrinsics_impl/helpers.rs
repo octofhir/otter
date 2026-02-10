@@ -24,8 +24,10 @@ pub fn strict_equal(a: &Value, b: &Value) -> bool {
         sym1.id == sym2.id
     } else if let (Some(o1), Some(o2)) = (a.as_object(), b.as_object()) {
         o1.as_ptr() == o2.as_ptr()
-    } else if let (Some(crate::value::HeapRef::BigInt(ba)), Some(crate::value::HeapRef::BigInt(bb))) =
-        (a.heap_ref(), b.heap_ref())
+    } else if let (
+        Some(crate::value::HeapRef::BigInt(ba)),
+        Some(crate::value::HeapRef::BigInt(bb)),
+    ) = (a.heap_ref(), b.heap_ref())
     {
         ba.value == bb.value
     } else {

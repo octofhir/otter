@@ -1,9 +1,5 @@
 //! Builder pattern for creating spec-correct builtin constructors and prototypes.
 //!
-//! Inspired by Boa's `BuiltInBuilder`, this ensures that all builtin methods
-//! get the correct property attributes (non-enumerable) and that function
-//! objects have proper `length` and `name` properties.
-//!
 //! ## Usage
 //!
 //! ```ignore
@@ -156,7 +152,11 @@ impl BuiltInBuilder {
     /// Set the constructor function implementation and its arity.
     pub fn constructor_fn<F>(mut self, f: F, length: u32) -> Self
     where
-        F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
+        F: Fn(
+                &Value,
+                &[Value],
+                &mut crate::context::NativeContext<'_>,
+            ) -> std::result::Result<Value, VmError>
             + Send
             + Sync
             + 'static,
@@ -172,7 +172,11 @@ impl BuiltInBuilder {
     /// The function object will have `length` and `name` properties set correctly.
     pub fn method<F>(mut self, name: &str, f: F, length: u32) -> Self
     where
-        F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
+        F: Fn(
+                &Value,
+                &[Value],
+                &mut crate::context::NativeContext<'_>,
+            ) -> std::result::Result<Value, VmError>
             + Send
             + Sync
             + 'static,
@@ -198,7 +202,11 @@ impl BuiltInBuilder {
     /// Add a static method to the constructor.
     pub fn static_method<F>(mut self, name: &str, f: F, length: u32) -> Self
     where
-        F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
+        F: Fn(
+                &Value,
+                &[Value],
+                &mut crate::context::NativeContext<'_>,
+            ) -> std::result::Result<Value, VmError>
             + Send
             + Sync
             + 'static,
@@ -223,11 +231,8 @@ impl BuiltInBuilder {
 
     /// Add a data property to the prototype with explicit attributes.
     pub fn property(mut self, key: PropertyKey, value: Value, attrs: PropertyAttributes) -> Self {
-        self.properties.push(DeferredProperty::Property {
-            key,
-            value,
-            attrs,
-        });
+        self.properties
+            .push(DeferredProperty::Property { key, value, attrs });
         self
     }
 
@@ -238,11 +243,8 @@ impl BuiltInBuilder {
         value: Value,
         attrs: PropertyAttributes,
     ) -> Self {
-        self.properties.push(DeferredProperty::StaticProperty {
-            key,
-            value,
-            attrs,
-        });
+        self.properties
+            .push(DeferredProperty::StaticProperty { key, value, attrs });
         self
     }
 
@@ -277,15 +279,13 @@ impl BuiltInBuilder {
     }
 
     /// Add a symbol-keyed method to the prototype (e.g., `[Symbol.iterator]`).
-    pub fn symbol_method<F>(
-        mut self,
-        symbol: Value,
-        name: &str,
-        f: F,
-        length: u32,
-    ) -> Self
+    pub fn symbol_method<F>(mut self, symbol: Value, name: &str, f: F, length: u32) -> Self
     where
-        F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
+        F: Fn(
+                &Value,
+                &[Value],
+                &mut crate::context::NativeContext<'_>,
+            ) -> std::result::Result<Value, VmError>
             + Send
             + Sync
             + 'static,
@@ -365,10 +365,10 @@ impl BuiltInBuilder {
                     getter,
                     setter,
                 } => {
-                    let get_val =
-                        getter.map(|g| make_native_fn(&mm, fn_proto, g, &format!("get {acc_name}"), 0));
-                    let set_val =
-                        setter.map(|s| make_native_fn(&mm, fn_proto, s, &format!("set {acc_name}"), 1));
+                    let get_val = getter
+                        .map(|g| make_native_fn(&mm, fn_proto, g, &format!("get {acc_name}"), 0));
+                    let set_val = setter
+                        .map(|s| make_native_fn(&mm, fn_proto, s, &format!("set {acc_name}"), 1));
                     prototype.define_property(
                         PropertyKey::string(&acc_name),
                         PropertyDescriptor::Accessor {
@@ -383,10 +383,10 @@ impl BuiltInBuilder {
                     getter,
                     setter,
                 } => {
-                    let get_val =
-                        getter.map(|g| make_native_fn(&mm, fn_proto, g, &format!("get {acc_name}"), 0));
-                    let set_val =
-                        setter.map(|s| make_native_fn(&mm, fn_proto, s, &format!("set {acc_name}"), 1));
+                    let get_val = getter
+                        .map(|g| make_native_fn(&mm, fn_proto, g, &format!("get {acc_name}"), 0));
+                    let set_val = setter
+                        .map(|s| make_native_fn(&mm, fn_proto, s, &format!("set {acc_name}"), 1));
                     constructor.define_property(
                         PropertyKey::string(&acc_name),
                         PropertyDescriptor::Accessor {
@@ -499,11 +499,7 @@ pub struct NamespaceBuilder {
 
 impl NamespaceBuilder {
     /// Create a new namespace builder.
-    pub fn new(
-        mm: Arc<MemoryManager>,
-        fn_proto: GcRef<JsObject>,
-        object: GcRef<JsObject>,
-    ) -> Self {
+    pub fn new(mm: Arc<MemoryManager>, fn_proto: GcRef<JsObject>, object: GcRef<JsObject>) -> Self {
         Self {
             mm,
             fn_proto,
@@ -515,7 +511,11 @@ impl NamespaceBuilder {
     /// Add a method to the namespace object.
     pub fn method<F>(mut self, name: &str, f: F, length: u32) -> Self
     where
-        F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
+        F: Fn(
+                &Value,
+                &[Value],
+                &mut crate::context::NativeContext<'_>,
+            ) -> std::result::Result<Value, VmError>
             + Send
             + Sync
             + 'static,
@@ -530,11 +530,8 @@ impl NamespaceBuilder {
 
     /// Add a data property to the namespace object.
     pub fn property(mut self, key: PropertyKey, value: Value, attrs: PropertyAttributes) -> Self {
-        self.properties.push(DeferredProperty::Property {
-            key,
-            value,
-            attrs,
-        });
+        self.properties
+            .push(DeferredProperty::Property { key, value, attrs });
         self
     }
 
@@ -557,8 +554,7 @@ impl NamespaceBuilder {
                     );
                 }
                 DeferredProperty::Property { key, value, attrs } => {
-                    object
-                        .define_property(key, PropertyDescriptor::data_with_attrs(value, attrs));
+                    object.define_property(key, PropertyDescriptor::data_with_attrs(value, attrs));
                 }
                 _ => {} // Namespace objects only support methods and properties
             }

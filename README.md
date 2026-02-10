@@ -99,8 +99,7 @@ crates/
 ├── otter-vm-gc        # Garbage collector
 ├── otter-vm-core      # VM interpreter
 ├── otter-vm-compiler  # JS/TS to bytecode compiler
-├── otter-vm-runtime   # Runtime with builtins
-├── otter-vm-builtins  # Built-in functions and JS shims
+├── otter-vm-runtime   # Runtime and event loop primitives
 ├── otter-engine       # Module loader, capabilities, extensions
 ├── otter-pm           # Package manager integration (in progress)
 ├── otter-sql          # SQL extension (SQLite + PostgreSQL)

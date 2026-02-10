@@ -80,7 +80,9 @@ impl PeepholeOptimizer {
         while i < instructions.len() {
             // Try 2-instruction window optimizations
             if i + 1 < instructions.len() {
-                if let Some(replacement) = self.optimize_window_2(&instructions[i], &instructions[i + 1]) {
+                if let Some(replacement) =
+                    self.optimize_window_2(&instructions[i], &instructions[i + 1])
+                {
                     match replacement {
                         WindowResult::Replace1(instr) => {
                             instructions[i] = instr;
@@ -342,46 +344,89 @@ impl PeepholeOptimizer {
     }
 
     /// Substitute register uses with their copy sources
-    fn substitute_copies(&self, instr: &Instruction, copies: &HashMap<u16, u16>) -> Option<Instruction> {
+    fn substitute_copies(
+        &self,
+        instr: &Instruction,
+        copies: &HashMap<u16, u16>,
+    ) -> Option<Instruction> {
         // Helper to resolve a register through copies
-        let resolve = |reg: Register| -> Register {
-            Register(*copies.get(&reg.0).unwrap_or(&reg.0))
-        };
+        let resolve =
+            |reg: Register| -> Register { Register(*copies.get(&reg.0).unwrap_or(&reg.0)) };
 
         match instr {
             // Binary operations
-            Instruction::Add { dst, lhs, rhs, feedback_index } => {
+            Instruction::Add {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => {
                 let new_lhs = resolve(*lhs);
                 let new_rhs = resolve(*rhs);
                 if new_lhs != *lhs || new_rhs != *rhs {
-                    Some(Instruction::Add { dst: *dst, lhs: new_lhs, rhs: new_rhs, feedback_index: *feedback_index })
+                    Some(Instruction::Add {
+                        dst: *dst,
+                        lhs: new_lhs,
+                        rhs: new_rhs,
+                        feedback_index: *feedback_index,
+                    })
                 } else {
                     None
                 }
             }
-            Instruction::Sub { dst, lhs, rhs, feedback_index } => {
+            Instruction::Sub {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => {
                 let new_lhs = resolve(*lhs);
                 let new_rhs = resolve(*rhs);
                 if new_lhs != *lhs || new_rhs != *rhs {
-                    Some(Instruction::Sub { dst: *dst, lhs: new_lhs, rhs: new_rhs, feedback_index: *feedback_index })
+                    Some(Instruction::Sub {
+                        dst: *dst,
+                        lhs: new_lhs,
+                        rhs: new_rhs,
+                        feedback_index: *feedback_index,
+                    })
                 } else {
                     None
                 }
             }
-            Instruction::Mul { dst, lhs, rhs, feedback_index } => {
+            Instruction::Mul {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => {
                 let new_lhs = resolve(*lhs);
                 let new_rhs = resolve(*rhs);
                 if new_lhs != *lhs || new_rhs != *rhs {
-                    Some(Instruction::Mul { dst: *dst, lhs: new_lhs, rhs: new_rhs, feedback_index: *feedback_index })
+                    Some(Instruction::Mul {
+                        dst: *dst,
+                        lhs: new_lhs,
+                        rhs: new_rhs,
+                        feedback_index: *feedback_index,
+                    })
                 } else {
                     None
                 }
             }
-            Instruction::Div { dst, lhs, rhs, feedback_index } => {
+            Instruction::Div {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => {
                 let new_lhs = resolve(*lhs);
                 let new_rhs = resolve(*rhs);
                 if new_lhs != *lhs || new_rhs != *rhs {
-                    Some(Instruction::Div { dst: *dst, lhs: new_lhs, rhs: new_rhs, feedback_index: *feedback_index })
+                    Some(Instruction::Div {
+                        dst: *dst,
+                        lhs: new_lhs,
+                        rhs: new_rhs,
+                        feedback_index: *feedback_index,
+                    })
                 } else {
                     None
                 }
@@ -391,7 +436,11 @@ impl PeepholeOptimizer {
                 let new_lhs = resolve(*lhs);
                 let new_rhs = resolve(*rhs);
                 if new_lhs != *lhs || new_rhs != *rhs {
-                    Some(Instruction::Eq { dst: *dst, lhs: new_lhs, rhs: new_rhs })
+                    Some(Instruction::Eq {
+                        dst: *dst,
+                        lhs: new_lhs,
+                        rhs: new_rhs,
+                    })
                 } else {
                     None
                 }
@@ -400,7 +449,11 @@ impl PeepholeOptimizer {
                 let new_lhs = resolve(*lhs);
                 let new_rhs = resolve(*rhs);
                 if new_lhs != *lhs || new_rhs != *rhs {
-                    Some(Instruction::StrictEq { dst: *dst, lhs: new_lhs, rhs: new_rhs })
+                    Some(Instruction::StrictEq {
+                        dst: *dst,
+                        lhs: new_lhs,
+                        rhs: new_rhs,
+                    })
                 } else {
                     None
                 }
@@ -409,7 +462,11 @@ impl PeepholeOptimizer {
                 let new_lhs = resolve(*lhs);
                 let new_rhs = resolve(*rhs);
                 if new_lhs != *lhs || new_rhs != *rhs {
-                    Some(Instruction::Lt { dst: *dst, lhs: new_lhs, rhs: new_rhs })
+                    Some(Instruction::Lt {
+                        dst: *dst,
+                        lhs: new_lhs,
+                        rhs: new_rhs,
+                    })
                 } else {
                     None
                 }
@@ -418,7 +475,11 @@ impl PeepholeOptimizer {
                 let new_lhs = resolve(*lhs);
                 let new_rhs = resolve(*rhs);
                 if new_lhs != *lhs || new_rhs != *rhs {
-                    Some(Instruction::Le { dst: *dst, lhs: new_lhs, rhs: new_rhs })
+                    Some(Instruction::Le {
+                        dst: *dst,
+                        lhs: new_lhs,
+                        rhs: new_rhs,
+                    })
                 } else {
                     None
                 }
@@ -427,7 +488,11 @@ impl PeepholeOptimizer {
                 let new_lhs = resolve(*lhs);
                 let new_rhs = resolve(*rhs);
                 if new_lhs != *lhs || new_rhs != *rhs {
-                    Some(Instruction::Gt { dst: *dst, lhs: new_lhs, rhs: new_rhs })
+                    Some(Instruction::Gt {
+                        dst: *dst,
+                        lhs: new_lhs,
+                        rhs: new_rhs,
+                    })
                 } else {
                     None
                 }
@@ -436,7 +501,11 @@ impl PeepholeOptimizer {
                 let new_lhs = resolve(*lhs);
                 let new_rhs = resolve(*rhs);
                 if new_lhs != *lhs || new_rhs != *rhs {
-                    Some(Instruction::Ge { dst: *dst, lhs: new_lhs, rhs: new_rhs })
+                    Some(Instruction::Ge {
+                        dst: *dst,
+                        lhs: new_lhs,
+                        rhs: new_rhs,
+                    })
                 } else {
                     None
                 }
@@ -445,7 +514,10 @@ impl PeepholeOptimizer {
             Instruction::Neg { dst, src } => {
                 let new_src = resolve(*src);
                 if new_src != *src {
-                    Some(Instruction::Neg { dst: *dst, src: new_src })
+                    Some(Instruction::Neg {
+                        dst: *dst,
+                        src: new_src,
+                    })
                 } else {
                     None
                 }
@@ -453,7 +525,10 @@ impl PeepholeOptimizer {
             Instruction::Not { dst, src } => {
                 let new_src = resolve(*src);
                 if new_src != *src {
-                    Some(Instruction::Not { dst: *dst, src: new_src })
+                    Some(Instruction::Not {
+                        dst: *dst,
+                        src: new_src,
+                    })
                 } else {
                     None
                 }
@@ -471,7 +546,10 @@ impl PeepholeOptimizer {
             Instruction::SetLocal { idx, src } => {
                 let new_src = resolve(*src);
                 if new_src != *src {
-                    Some(Instruction::SetLocal { idx: *idx, src: new_src })
+                    Some(Instruction::SetLocal {
+                        idx: *idx,
+                        src: new_src,
+                    })
                 } else {
                     None
                 }
@@ -572,13 +650,18 @@ impl PeepholeOptimizer {
                 // and not used anywhere else in the remaining code
                 if i + 1 < instructions.len() {
                     let next_uses_dst = self.instruction_uses_register(&instructions[i + 1], dst);
-                    let next_writes_dst = self.get_written_register(&instructions[i + 1]) == Some(dst.0);
+                    let next_writes_dst =
+                        self.get_written_register(&instructions[i + 1]) == Some(dst.0);
 
                     // If next instruction uses dst and also overwrites it (or it's the last use)
                     // we might be able to substitute
-                    if next_uses_dst && (next_writes_dst || !self.register_used_after(instructions, i + 2, dst)) {
+                    if next_uses_dst
+                        && (next_writes_dst || !self.register_used_after(instructions, i + 2, dst))
+                    {
                         // Try to substitute dst with src in the next instruction
-                        if let Some(new_instr) = self.substitute_register(&instructions[i + 1], dst, src) {
+                        if let Some(new_instr) =
+                            self.substitute_register(&instructions[i + 1], dst, src)
+                        {
                             instructions[i] = Instruction::Nop;
                             instructions[i + 1] = new_instr;
                             changed = true;
@@ -628,18 +711,25 @@ impl PeepholeOptimizer {
             | Instruction::SetLocal { src, .. }
             | Instruction::SetUpvalue { src, .. } => *src == reg,
 
-            Instruction::JumpIfTrue { cond, .. }
-            | Instruction::JumpIfFalse { cond, .. } => *cond == reg,
+            Instruction::JumpIfTrue { cond, .. } | Instruction::JumpIfFalse { cond, .. } => {
+                *cond == reg
+            }
 
-            Instruction::JumpIfNullish { src, .. }
-            | Instruction::JumpIfNotNullish { src, .. } => *src == reg,
+            Instruction::JumpIfNullish { src, .. } | Instruction::JumpIfNotNullish { src, .. } => {
+                *src == reg
+            }
 
             _ => false,
         }
     }
 
     /// Check if a register is used anywhere from a given index onwards
-    fn register_used_after(&self, instructions: &[Instruction], from: usize, reg: Register) -> bool {
+    fn register_used_after(
+        &self,
+        instructions: &[Instruction],
+        from: usize,
+        reg: Register,
+    ) -> bool {
         for i in from..instructions.len() {
             if self.instruction_uses_register(&instructions[i], reg) {
                 return true;
@@ -653,52 +743,102 @@ impl PeepholeOptimizer {
     }
 
     /// Substitute one register for another in an instruction
-    fn substitute_register(&self, instr: &Instruction, old: Register, new: Register) -> Option<Instruction> {
+    fn substitute_register(
+        &self,
+        instr: &Instruction,
+        old: Register,
+        new: Register,
+    ) -> Option<Instruction> {
         let sub = |r: Register| if r == old { new } else { r };
 
         match instr {
-            Instruction::Add { dst, lhs, rhs, feedback_index } => {
-                Some(Instruction::Add { dst: *dst, lhs: sub(*lhs), rhs: sub(*rhs), feedback_index: *feedback_index })
-            }
-            Instruction::Sub { dst, lhs, rhs, feedback_index } => {
-                Some(Instruction::Sub { dst: *dst, lhs: sub(*lhs), rhs: sub(*rhs), feedback_index: *feedback_index })
-            }
-            Instruction::Mul { dst, lhs, rhs, feedback_index } => {
-                Some(Instruction::Mul { dst: *dst, lhs: sub(*lhs), rhs: sub(*rhs), feedback_index: *feedback_index })
-            }
-            Instruction::Div { dst, lhs, rhs, feedback_index } => {
-                Some(Instruction::Div { dst: *dst, lhs: sub(*lhs), rhs: sub(*rhs), feedback_index: *feedback_index })
-            }
-            Instruction::Eq { dst, lhs, rhs } => {
-                Some(Instruction::Eq { dst: *dst, lhs: sub(*lhs), rhs: sub(*rhs) })
-            }
-            Instruction::StrictEq { dst, lhs, rhs } => {
-                Some(Instruction::StrictEq { dst: *dst, lhs: sub(*lhs), rhs: sub(*rhs) })
-            }
-            Instruction::Lt { dst, lhs, rhs } => {
-                Some(Instruction::Lt { dst: *dst, lhs: sub(*lhs), rhs: sub(*rhs) })
-            }
-            Instruction::Le { dst, lhs, rhs } => {
-                Some(Instruction::Le { dst: *dst, lhs: sub(*lhs), rhs: sub(*rhs) })
-            }
-            Instruction::Gt { dst, lhs, rhs } => {
-                Some(Instruction::Gt { dst: *dst, lhs: sub(*lhs), rhs: sub(*rhs) })
-            }
-            Instruction::Ge { dst, lhs, rhs } => {
-                Some(Instruction::Ge { dst: *dst, lhs: sub(*lhs), rhs: sub(*rhs) })
-            }
-            Instruction::Neg { dst, src } => {
-                Some(Instruction::Neg { dst: *dst, src: sub(*src) })
-            }
-            Instruction::Not { dst, src } => {
-                Some(Instruction::Not { dst: *dst, src: sub(*src) })
-            }
-            Instruction::Return { src } => {
-                Some(Instruction::Return { src: sub(*src) })
-            }
-            Instruction::SetLocal { idx, src } => {
-                Some(Instruction::SetLocal { idx: *idx, src: sub(*src) })
-            }
+            Instruction::Add {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => Some(Instruction::Add {
+                dst: *dst,
+                lhs: sub(*lhs),
+                rhs: sub(*rhs),
+                feedback_index: *feedback_index,
+            }),
+            Instruction::Sub {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => Some(Instruction::Sub {
+                dst: *dst,
+                lhs: sub(*lhs),
+                rhs: sub(*rhs),
+                feedback_index: *feedback_index,
+            }),
+            Instruction::Mul {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => Some(Instruction::Mul {
+                dst: *dst,
+                lhs: sub(*lhs),
+                rhs: sub(*rhs),
+                feedback_index: *feedback_index,
+            }),
+            Instruction::Div {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => Some(Instruction::Div {
+                dst: *dst,
+                lhs: sub(*lhs),
+                rhs: sub(*rhs),
+                feedback_index: *feedback_index,
+            }),
+            Instruction::Eq { dst, lhs, rhs } => Some(Instruction::Eq {
+                dst: *dst,
+                lhs: sub(*lhs),
+                rhs: sub(*rhs),
+            }),
+            Instruction::StrictEq { dst, lhs, rhs } => Some(Instruction::StrictEq {
+                dst: *dst,
+                lhs: sub(*lhs),
+                rhs: sub(*rhs),
+            }),
+            Instruction::Lt { dst, lhs, rhs } => Some(Instruction::Lt {
+                dst: *dst,
+                lhs: sub(*lhs),
+                rhs: sub(*rhs),
+            }),
+            Instruction::Le { dst, lhs, rhs } => Some(Instruction::Le {
+                dst: *dst,
+                lhs: sub(*lhs),
+                rhs: sub(*rhs),
+            }),
+            Instruction::Gt { dst, lhs, rhs } => Some(Instruction::Gt {
+                dst: *dst,
+                lhs: sub(*lhs),
+                rhs: sub(*rhs),
+            }),
+            Instruction::Ge { dst, lhs, rhs } => Some(Instruction::Ge {
+                dst: *dst,
+                lhs: sub(*lhs),
+                rhs: sub(*rhs),
+            }),
+            Instruction::Neg { dst, src } => Some(Instruction::Neg {
+                dst: *dst,
+                src: sub(*src),
+            }),
+            Instruction::Not { dst, src } => Some(Instruction::Not {
+                dst: *dst,
+                src: sub(*src),
+            }),
+            Instruction::Return { src } => Some(Instruction::Return { src: sub(*src) }),
+            Instruction::SetLocal { idx, src } => Some(Instruction::SetLocal {
+                idx: *idx,
+                src: sub(*src),
+            }),
             _ => None,
         }
     }
@@ -707,19 +847,21 @@ impl PeepholeOptimizer {
     fn optimize_single(&self, instr: &Instruction) -> Option<Instruction> {
         match instr {
             // Move to self is a no-op
-            Instruction::Move { dst, src } if dst == src => {
-                Some(Instruction::Nop)
-            }
+            Instruction::Move { dst, src } if dst == src => Some(Instruction::Nop),
 
             // LoadInt8 0 can stay as is (it's already optimal)
             // LoadInt32 0 can be converted to LoadInt8 0
-            Instruction::LoadInt32 { dst, value: 0 } => {
-                Some(Instruction::LoadInt8 { dst: *dst, value: 0 })
-            }
+            Instruction::LoadInt32 { dst, value: 0 } => Some(Instruction::LoadInt8 {
+                dst: *dst,
+                value: 0,
+            }),
 
             // LoadInt32 small values can be LoadInt8
             Instruction::LoadInt32 { dst, value } if *value >= -128 && *value <= 127 => {
-                Some(Instruction::LoadInt8 { dst: *dst, value: *value as i8 })
+                Some(Instruction::LoadInt8 {
+                    dst: *dst,
+                    value: *value as i8,
+                })
             }
 
             _ => None,
@@ -730,9 +872,16 @@ impl PeepholeOptimizer {
     fn optimize_window_2(&self, first: &Instruction, second: &Instruction) -> Option<WindowResult> {
         // Double negation: Neg then Neg
         if let (
-            Instruction::Neg { dst: dst1, src: src1 },
-            Instruction::Neg { dst: dst2, src: src2 },
-        ) = (first, second) {
+            Instruction::Neg {
+                dst: dst1,
+                src: src1,
+            },
+            Instruction::Neg {
+                dst: dst2,
+                src: src2,
+            },
+        ) = (first, second)
+        {
             if dst1 == src2 {
                 // -(-x) = x
                 return Some(WindowResult::Replace1(Instruction::Move {
@@ -744,9 +893,16 @@ impl PeepholeOptimizer {
 
         // Double Not: !(!x) = x (for booleans)
         if let (
-            Instruction::Not { dst: dst1, src: src1 },
-            Instruction::Not { dst: dst2, src: src2 },
-        ) = (first, second) {
+            Instruction::Not {
+                dst: dst1,
+                src: src1,
+            },
+            Instruction::Not {
+                dst: dst2,
+                src: src2,
+            },
+        ) = (first, second)
+        {
             if dst1 == src2 {
                 return Some(WindowResult::Replace1(Instruction::Move {
                     dst: *dst2,
@@ -767,14 +923,24 @@ impl PeepholeOptimizer {
 
         // SetLocal followed by GetLocal from same local to same register
         if let (
-            Instruction::SetLocal { idx: idx1, src: src1 },
-            Instruction::GetLocal { dst: dst2, idx: idx2 },
-        ) = (first, second) {
+            Instruction::SetLocal {
+                idx: idx1,
+                src: src1,
+            },
+            Instruction::GetLocal {
+                dst: dst2,
+                idx: idx2,
+            },
+        ) = (first, second)
+        {
             if idx1 == idx2 {
                 // Replace GetLocal with Move
                 return Some(WindowResult::Replace2(
                     first.clone(),
-                    Instruction::Move { dst: *dst2, src: *src1 },
+                    Instruction::Move {
+                        dst: *dst2,
+                        src: *src1,
+                    },
                 ));
             }
         }
@@ -847,9 +1013,15 @@ mod tests {
     fn test_remove_nops() {
         let mut optimizer = PeepholeOptimizer::new();
         let mut instructions = vec![
-            Instruction::LoadInt8 { dst: Register(0), value: 1 },
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 1,
+            },
             Instruction::Nop,
-            Instruction::LoadInt8 { dst: Register(1), value: 2 },
+            Instruction::LoadInt8 {
+                dst: Register(1),
+                value: 2,
+            },
             Instruction::Nop,
             Instruction::Nop,
         ];
@@ -862,9 +1034,10 @@ mod tests {
     #[test]
     fn test_move_to_self() {
         let mut optimizer = PeepholeOptimizer::new();
-        let mut instructions = vec![
-            Instruction::Move { dst: Register(0), src: Register(0) },
-        ];
+        let mut instructions = vec![Instruction::Move {
+            dst: Register(0),
+            src: Register(0),
+        }];
 
         let changed = optimizer.optimize(&mut instructions);
         assert!(changed);
@@ -875,8 +1048,14 @@ mod tests {
     fn test_double_negation() {
         let mut optimizer = PeepholeOptimizer::new();
         let mut instructions = vec![
-            Instruction::Neg { dst: Register(1), src: Register(0) },
-            Instruction::Neg { dst: Register(2), src: Register(1) },
+            Instruction::Neg {
+                dst: Register(1),
+                src: Register(0),
+            },
+            Instruction::Neg {
+                dst: Register(2),
+                src: Register(1),
+            },
         ];
 
         let changed = optimizer.optimize(&mut instructions);
@@ -884,7 +1063,10 @@ mod tests {
         assert_eq!(instructions.len(), 1);
         assert!(matches!(
             instructions[0],
-            Instruction::Move { dst: Register(2), src: Register(0) }
+            Instruction::Move {
+                dst: Register(2),
+                src: Register(0)
+            }
         ));
     }
 
@@ -892,8 +1074,14 @@ mod tests {
     fn test_double_not() {
         let mut optimizer = PeepholeOptimizer::new();
         let mut instructions = vec![
-            Instruction::Not { dst: Register(1), src: Register(0) },
-            Instruction::Not { dst: Register(2), src: Register(1) },
+            Instruction::Not {
+                dst: Register(1),
+                src: Register(0),
+            },
+            Instruction::Not {
+                dst: Register(2),
+                src: Register(1),
+            },
         ];
 
         let changed = optimizer.optimize(&mut instructions);
@@ -901,7 +1089,10 @@ mod tests {
         assert_eq!(instructions.len(), 1);
         assert!(matches!(
             instructions[0],
-            Instruction::Move { dst: Register(2), src: Register(0) }
+            Instruction::Move {
+                dst: Register(2),
+                src: Register(0)
+            }
         ));
     }
 
@@ -909,8 +1100,14 @@ mod tests {
     fn test_dead_load() {
         let mut optimizer = PeepholeOptimizer::new();
         let mut instructions = vec![
-            Instruction::LoadInt8 { dst: Register(0), value: 1 },
-            Instruction::LoadInt8 { dst: Register(0), value: 2 },
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 1,
+            },
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 2,
+            },
         ];
 
         let changed = optimizer.optimize(&mut instructions);
@@ -918,7 +1115,10 @@ mod tests {
         assert_eq!(instructions.len(), 1);
         assert!(matches!(
             instructions[0],
-            Instruction::LoadInt8 { dst: Register(0), value: 2 }
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 2
+            }
         ));
     }
 
@@ -926,8 +1126,14 @@ mod tests {
     fn test_set_get_local_optimization() {
         let mut optimizer = PeepholeOptimizer::new();
         let mut instructions = vec![
-            Instruction::SetLocal { idx: LocalIndex(0), src: Register(1) },
-            Instruction::GetLocal { dst: Register(2), idx: LocalIndex(0) },
+            Instruction::SetLocal {
+                idx: LocalIndex(0),
+                src: Register(1),
+            },
+            Instruction::GetLocal {
+                dst: Register(2),
+                idx: LocalIndex(0),
+            },
         ];
 
         let changed = optimizer.optimize(&mut instructions);
@@ -935,7 +1141,10 @@ mod tests {
         assert_eq!(instructions.len(), 2);
         assert!(matches!(
             instructions[1],
-            Instruction::Move { dst: Register(2), src: Register(1) }
+            Instruction::Move {
+                dst: Register(2),
+                src: Register(1)
+            }
         ));
     }
 
@@ -943,8 +1152,13 @@ mod tests {
     fn test_jump_to_next() {
         let mut optimizer = PeepholeOptimizer::new();
         let mut instructions = vec![
-            Instruction::Jump { offset: JumpOffset(1) },
-            Instruction::LoadInt8 { dst: Register(0), value: 1 },
+            Instruction::Jump {
+                offset: JumpOffset(1),
+            },
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 1,
+            },
         ];
 
         let changed = optimizer.optimize(&mut instructions);
@@ -952,7 +1166,10 @@ mod tests {
         assert_eq!(instructions.len(), 1);
         assert!(matches!(
             instructions[0],
-            Instruction::LoadInt8 { dst: Register(0), value: 1 }
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 1
+            }
         ));
     }
 
@@ -967,8 +1184,13 @@ mod tests {
                 offset: JumpOffset(2),
             },
             // Jump over one Nop and land at Return.
-            Instruction::Jump { offset: JumpOffset(3) },
-            Instruction::LoadInt8 { dst: Register(1), value: 7 },
+            Instruction::Jump {
+                offset: JumpOffset(3),
+            },
+            Instruction::LoadInt8 {
+                dst: Register(1),
+                value: 7,
+            },
             Instruction::Move {
                 dst: Register(0),
                 src: Register(0),
@@ -981,23 +1203,29 @@ mod tests {
         assert_eq!(instructions.len(), 4);
         assert!(matches!(
             instructions[1],
-            Instruction::Jump { offset: JumpOffset(2) }
+            Instruction::Jump {
+                offset: JumpOffset(2)
+            }
         ));
     }
 
     #[test]
     fn test_load_int32_to_int8() {
         let mut optimizer = PeepholeOptimizer::new();
-        let mut instructions = vec![
-            Instruction::LoadInt32 { dst: Register(0), value: 42 },
-        ];
+        let mut instructions = vec![Instruction::LoadInt32 {
+            dst: Register(0),
+            value: 42,
+        }];
 
         let changed = optimizer.optimize(&mut instructions);
         assert!(changed);
         assert_eq!(instructions.len(), 1);
         assert!(matches!(
             instructions[0],
-            Instruction::LoadInt8 { dst: Register(0), value: 42 }
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 42
+            }
         ));
     }
 
@@ -1005,9 +1233,20 @@ mod tests {
     fn test_no_change_needed() {
         let mut optimizer = PeepholeOptimizer::new();
         let mut instructions = vec![
-            Instruction::LoadInt8 { dst: Register(0), value: 1 },
-            Instruction::LoadInt8 { dst: Register(1), value: 2 },
-            Instruction::Add { dst: Register(2), lhs: Register(0), rhs: Register(1), feedback_index: 0 },
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 1,
+            },
+            Instruction::LoadInt8 {
+                dst: Register(1),
+                value: 2,
+            },
+            Instruction::Add {
+                dst: Register(2),
+                lhs: Register(0),
+                rhs: Register(1),
+                feedback_index: 0,
+            },
         ];
 
         let changed = optimizer.optimize(&mut instructions);
@@ -1019,11 +1258,20 @@ mod tests {
     fn test_dead_code_after_return() {
         let mut optimizer = PeepholeOptimizer::new();
         let mut instructions = vec![
-            Instruction::LoadInt8 { dst: Register(0), value: 1 },
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 1,
+            },
             Instruction::Return { src: Register(0) },
             // Dead code - unreachable
-            Instruction::LoadInt8 { dst: Register(1), value: 2 },
-            Instruction::LoadInt8 { dst: Register(2), value: 3 },
+            Instruction::LoadInt8 {
+                dst: Register(1),
+                value: 2,
+            },
+            Instruction::LoadInt8 {
+                dst: Register(2),
+                value: 3,
+            },
         ];
 
         let changed = optimizer.optimize(&mut instructions);
@@ -1036,10 +1284,16 @@ mod tests {
     fn test_dead_code_after_throw() {
         let mut optimizer = PeepholeOptimizer::new();
         let mut instructions = vec![
-            Instruction::LoadInt8 { dst: Register(0), value: 1 },
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 1,
+            },
             Instruction::Throw { src: Register(0) },
             // Dead code - unreachable
-            Instruction::LoadInt8 { dst: Register(1), value: 2 },
+            Instruction::LoadInt8 {
+                dst: Register(1),
+                value: 2,
+            },
         ];
 
         let changed = optimizer.optimize(&mut instructions);
@@ -1053,11 +1307,20 @@ mod tests {
         let mut optimizer = PeepholeOptimizer::new();
         // JumpIfFalse offset 2 means: from index 1, jump to index 1+2=3
         let mut instructions = vec![
-            Instruction::LoadInt8 { dst: Register(0), value: 1 },
-            Instruction::JumpIfFalse { cond: Register(0), offset: JumpOffset(2) },
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 1,
+            },
+            Instruction::JumpIfFalse {
+                cond: Register(0),
+                offset: JumpOffset(2),
+            },
             Instruction::Return { src: Register(0) },
             // This is the jump target (index 3)
-            Instruction::LoadInt8 { dst: Register(1), value: 2 },
+            Instruction::LoadInt8 {
+                dst: Register(1),
+                value: 2,
+            },
             Instruction::Return { src: Register(1) },
         ];
 
@@ -1074,10 +1337,16 @@ mod tests {
         let mut optimizer = PeepholeOptimizer::new();
         // Dead code at the very end - no jumps involved
         let mut instructions = vec![
-            Instruction::LoadInt8 { dst: Register(0), value: 1 },
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 1,
+            },
             Instruction::Return { src: Register(0) },
             // Dead code at end - definitely unreachable
-            Instruction::LoadInt8 { dst: Register(1), value: 2 },
+            Instruction::LoadInt8 {
+                dst: Register(1),
+                value: 2,
+            },
         ];
 
         let changed = optimizer.optimize(&mut instructions);
@@ -1090,9 +1359,20 @@ mod tests {
         let mut optimizer = PeepholeOptimizer::new();
         // Move r1 <- r0; Add r2, r1, r1 should become Add r2, r0, r0
         let mut instructions = vec![
-            Instruction::LoadInt8 { dst: Register(0), value: 5 },
-            Instruction::Move { dst: Register(1), src: Register(0) },
-            Instruction::Add { dst: Register(2), lhs: Register(1), rhs: Register(1), feedback_index: 0 },
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 5,
+            },
+            Instruction::Move {
+                dst: Register(1),
+                src: Register(0),
+            },
+            Instruction::Add {
+                dst: Register(2),
+                lhs: Register(1),
+                rhs: Register(1),
+                feedback_index: 0,
+            },
             Instruction::Return { src: Register(2) },
         ];
 
@@ -1101,7 +1381,14 @@ mod tests {
         // After copy propagation, Add should use r0 directly
         // The Move might be eliminated or kept depending on register coalescing
         let has_add_with_r0 = instructions.iter().any(|i| {
-            matches!(i, Instruction::Add { lhs: Register(0), rhs: Register(0), .. })
+            matches!(
+                i,
+                Instruction::Add {
+                    lhs: Register(0),
+                    rhs: Register(0),
+                    ..
+                }
+            )
         });
         assert!(has_add_with_r0);
     }
@@ -1111,18 +1398,27 @@ mod tests {
         let mut optimizer = PeepholeOptimizer::new();
         // r0 = 5; r1 = r0; r2 = r1; return r2 -> return r0
         let mut instructions = vec![
-            Instruction::LoadInt8 { dst: Register(0), value: 5 },
-            Instruction::Move { dst: Register(1), src: Register(0) },
-            Instruction::Move { dst: Register(2), src: Register(1) },
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 5,
+            },
+            Instruction::Move {
+                dst: Register(1),
+                src: Register(0),
+            },
+            Instruction::Move {
+                dst: Register(2),
+                src: Register(1),
+            },
             Instruction::Return { src: Register(2) },
         ];
 
         let changed = optimizer.optimize(&mut instructions);
         assert!(changed);
         // Return should use r0 after propagation
-        let has_return_r0 = instructions.iter().any(|i| {
-            matches!(i, Instruction::Return { src: Register(0) })
-        });
+        let has_return_r0 = instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::Return { src: Register(0) }));
         assert!(has_return_r0);
     }
 
@@ -1131,9 +1427,18 @@ mod tests {
         let mut optimizer = PeepholeOptimizer::new();
         // Move r1, r0; Neg r2, r1 should have Neg use r0 after copy propagation
         let mut instructions = vec![
-            Instruction::LoadInt8 { dst: Register(0), value: 5 },
-            Instruction::Move { dst: Register(1), src: Register(0) },
-            Instruction::Neg { dst: Register(2), src: Register(1) },
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 5,
+            },
+            Instruction::Move {
+                dst: Register(1),
+                src: Register(0),
+            },
+            Instruction::Neg {
+                dst: Register(2),
+                src: Register(1),
+            },
             Instruction::Return { src: Register(2) },
         ];
 
@@ -1141,7 +1446,13 @@ mod tests {
         assert!(changed);
         // After copy propagation, Neg should use r0 directly
         let has_neg_r0 = instructions.iter().any(|i| {
-            matches!(i, Instruction::Neg { src: Register(0), .. })
+            matches!(
+                i,
+                Instruction::Neg {
+                    src: Register(0),
+                    ..
+                }
+            )
         });
         assert!(has_neg_r0, "Neg should use r0 after copy propagation");
     }
@@ -1151,10 +1462,26 @@ mod tests {
         let mut optimizer = PeepholeOptimizer::new();
         // If r1 is used multiple times, Move should be preserved
         let mut instructions = vec![
-            Instruction::LoadInt8 { dst: Register(0), value: 5 },
-            Instruction::Move { dst: Register(1), src: Register(0) },
-            Instruction::Add { dst: Register(2), lhs: Register(1), rhs: Register(1), feedback_index: 0 },
-            Instruction::Add { dst: Register(3), lhs: Register(1), rhs: Register(2), feedback_index: 1 },
+            Instruction::LoadInt8 {
+                dst: Register(0),
+                value: 5,
+            },
+            Instruction::Move {
+                dst: Register(1),
+                src: Register(0),
+            },
+            Instruction::Add {
+                dst: Register(2),
+                lhs: Register(1),
+                rhs: Register(1),
+                feedback_index: 0,
+            },
+            Instruction::Add {
+                dst: Register(3),
+                lhs: Register(1),
+                rhs: Register(2),
+                feedback_index: 1,
+            },
             Instruction::Return { src: Register(3) },
         ];
 

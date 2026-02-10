@@ -3,8 +3,8 @@
 //! Compares property access performance between shape-based storage and dictionary mode.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use otter_vm_core::{GcRef, JsObject, MemoryManager, PropertyKey, value::Value};
+use std::hint::black_box;
 use std::sync::Arc;
 
 /// Benchmark: Shape-based storage property access (< 32 properties)
@@ -66,7 +66,10 @@ fn bench_dictionary_mode_access(c: &mut Criterion) {
         }
 
         // Verify it's in dictionary mode
-        assert!(obj.is_dictionary_mode(), "Object should be in dictionary mode");
+        assert!(
+            obj.is_dictionary_mode(),
+            "Object should be in dictionary mode"
+        );
 
         b.iter(|| {
             let mut sum = 0i32;
@@ -95,12 +98,17 @@ fn bench_delete_triggered_dictionary(c: &mut Criterion) {
         // Delete one to trigger dictionary mode
         obj.delete(&PropertyKey::string("prop5"));
 
-        assert!(obj.is_dictionary_mode(), "Object should be in dictionary mode after delete");
+        assert!(
+            obj.is_dictionary_mode(),
+            "Object should be in dictionary mode after delete"
+        );
 
         b.iter(|| {
             let mut sum = 0i32;
             for i in 0..10 {
-                if i == 5 { continue; }
+                if i == 5 {
+                    continue;
+                }
                 let key = PropertyKey::string(&format!("prop{}", i));
                 if let Some(v) = obj.get(&key) {
                     sum += v.as_int32().unwrap_or(0);

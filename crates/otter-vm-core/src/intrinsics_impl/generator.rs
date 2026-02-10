@@ -29,7 +29,7 @@ use crate::value::Value;
 fn sync_generator_result_to_value(
     gen_result: GeneratorResult,
     mm: &Arc<MemoryManager>,
-) -> Result<Value, VmError> {
+) -> std::result::Result<Value, VmError> {
     match gen_result {
         GeneratorResult::Yielded(v) => {
             let result = GcRef::new(JsObject::new(Value::null(), mm.clone()));
@@ -110,8 +110,7 @@ fn async_generator_result_to_promise(
             let result_promise = promise.clone();
             let js_queue = js_queue.clone();
             awaited_promise.then(move |resolved_value| {
-                let iter_result =
-                    GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                let iter_result = GcRef::new(JsObject::new(Value::null(), mm.clone()));
                 let _ = iter_result.set(PropertyKey::string("value"), resolved_value);
                 let _ = iter_result.set(PropertyKey::string("done"), Value::boolean(false));
                 let js_queue = js_queue.clone();
@@ -155,9 +154,9 @@ pub fn init_generator_prototype(
         PropertyKey::string("next"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, ncx| {
-                let generator = this_val
-                    .as_generator()
-                    .ok_or_else(|| VmError::type_error("Generator.prototype.next called on non-generator"))?;
+                let generator = this_val.as_generator().ok_or_else(|| {
+                    VmError::type_error("Generator.prototype.next called on non-generator")
+                })?;
 
                 if generator.is_async() {
                     return Err(VmError::type_error(
@@ -180,9 +179,9 @@ pub fn init_generator_prototype(
         PropertyKey::string("return"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, ncx| {
-                let generator = this_val
-                    .as_generator()
-                    .ok_or_else(|| VmError::type_error("Generator.prototype.return called on non-generator"))?;
+                let generator = this_val.as_generator().ok_or_else(|| {
+                    VmError::type_error("Generator.prototype.return called on non-generator")
+                })?;
 
                 if generator.is_async() {
                     return Err(VmError::type_error(
@@ -220,9 +219,9 @@ pub fn init_generator_prototype(
         PropertyKey::string("throw"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, ncx| {
-                let generator = this_val
-                    .as_generator()
-                    .ok_or_else(|| VmError::type_error("Generator.prototype.throw called on non-generator"))?;
+                let generator = this_val.as_generator().ok_or_else(|| {
+                    VmError::type_error("Generator.prototype.throw called on non-generator")
+                })?;
 
                 if generator.is_async() {
                     return Err(VmError::type_error(
@@ -251,9 +250,7 @@ pub fn init_generator_prototype(
     proto.define_property(
         PropertyKey::Symbol(symbol_iterator),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _ncx| {
-                Ok(this_val.clone())
-            },
+            |this_val, _args, _ncx| Ok(this_val.clone()),
             mm.clone(),
             fn_proto,
         )),
@@ -290,11 +287,9 @@ pub fn init_async_generator_prototype(
         PropertyKey::string("next"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, ncx| {
-                let generator = this_val
-                    .as_generator()
-                    .ok_or_else(|| {
-                        VmError::type_error("AsyncGenerator.prototype.next called on non-generator")
-                    })?;
+                let generator = this_val.as_generator().ok_or_else(|| {
+                    VmError::type_error("AsyncGenerator.prototype.next called on non-generator")
+                })?;
 
                 if !generator.is_async() {
                     return Err(VmError::type_error(
@@ -380,9 +375,7 @@ pub fn init_async_generator_prototype(
     proto.define_property(
         PropertyKey::Symbol(symbol_async_iterator),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _ncx| {
-                Ok(this_val.clone())
-            },
+            |this_val, _args, _ncx| Ok(this_val.clone()),
             mm.clone(),
             fn_proto,
         )),

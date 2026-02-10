@@ -1,9 +1,8 @@
 //! JavaScript objects with hidden classes (shapes)
 //!
 //! Objects use hidden classes (called "shapes") for property access optimization.
-//! This is similar to V8's approach.
 //!
-//! ## Inline Properties (JSC Pattern)
+//! ## Inline Properties
 //!
 //! The first few properties (up to `INLINE_PROPERTY_COUNT`) are stored inline
 //! in the object struct rather than in a separate Vec. This improves cache
@@ -17,6 +16,7 @@ use std::sync::Arc;
 use crate::gc::GcRef;
 use crate::shape::Shape;
 use crate::value::UpvalueCell;
+use otter_vm_gc::object::MarkColor;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -43,7 +43,7 @@ pub fn bump_proto_epoch() -> u64 {
 /// Maximum prototype chain depth to prevent stack overflow
 const MAX_PROTOTYPE_CHAIN_DEPTH: usize = 100;
 
-/// Number of properties stored inline in the object (JSC-style optimization)
+/// Number of properties stored inline in the object
 /// Properties beyond this count overflow to a Vec.
 pub const INLINE_PROPERTY_COUNT: usize = 4;
 
@@ -54,6 +54,54 @@ pub const INLINE_PROPERTY_COUNT: usize = 4;
 pub const DICTIONARY_THRESHOLD: usize = 32;
 use crate::string::JsString;
 use crate::value::Value;
+
+/// Write barrier for incremental GC.
+///
+/// When the GC is in the Marking phase and a value is being stored into an
+/// object, this ensures the stored value's GcHeader is grayed and pushed to
+/// the barrier buffer so the incremental marker will visit it.
+///
+/// Fast path: single `Cell::get()` check — zero cost when GC is idle (99.9% of the time).
+#[inline]
+pub fn gc_write_barrier(value: &Value) {
+    let registry = otter_vm_gc::global_registry();
+    if !registry.is_marking() {
+        return;
+    }
+    gc_write_barrier_slow(value);
+}
+
+#[inline(never)]
+fn gc_write_barrier_slow(value: &Value) {
+    if let Some(header_ptr) = value.gc_header() {
+        let header = unsafe { &*header_ptr };
+        if header.mark() == MarkColor::White {
+            header.set_mark(MarkColor::Gray);
+            otter_vm_gc::barrier_push(header_ptr);
+        }
+    }
+}
+
+/// Write barrier for a PropertyDescriptor being stored.
+#[inline]
+fn gc_write_barrier_desc(desc: &PropertyDescriptor) {
+    let registry = otter_vm_gc::global_registry();
+    if !registry.is_marking() {
+        return;
+    }
+    match desc {
+        PropertyDescriptor::Data { value, .. } => gc_write_barrier_slow(value),
+        PropertyDescriptor::Accessor { get, set, .. } => {
+            if let Some(g) = get {
+                gc_write_barrier_slow(g);
+            }
+            if let Some(s) = set {
+                gc_write_barrier_slow(s);
+            }
+        }
+        PropertyDescriptor::Deleted => {}
+    }
+}
 
 /// Property key (string or symbol)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -653,7 +701,7 @@ pub struct ArgumentMapping {
 pub struct JsObject {
     /// Current shape of the object
     shape: ObjectCell<Arc<Shape>>,
-    /// Inline property storage for first N properties (JSC-style)
+    /// Inline property storage for first N properties
     inline_properties: ObjectCell<[Option<PropertyEntry>; INLINE_PROPERTY_COUNT]>,
     /// Overflow properties storage (for properties beyond INLINE_PROPERTY_COUNT)
     overflow_properties: ObjectCell<Vec<PropertyEntry>>,
@@ -871,6 +919,7 @@ impl JsObject {
                         if is_sealed {
                             return Err(SetPropertyError::Sealed);
                         }
+                        gc_write_barrier(&value);
                         entry.desc = PropertyDescriptor::data(value);
                         return Ok(());
                     }
@@ -879,6 +928,7 @@ impl JsObject {
                         attributes,
                     } => {
                         if attributes.writable {
+                            gc_write_barrier(&value);
                             *v = value;
                             return Ok(());
                         }
@@ -902,6 +952,7 @@ impl JsObject {
                         if is_sealed {
                             return Err(SetPropertyError::Sealed);
                         }
+                        gc_write_barrier(&value);
                         entry.desc = PropertyDescriptor::data(value);
                         return Ok(());
                     }
@@ -910,6 +961,7 @@ impl JsObject {
                         attributes,
                     } => {
                         if attributes.writable {
+                            gc_write_barrier(&value);
                             *v = value;
                             return Ok(());
                         }
@@ -1426,6 +1478,7 @@ impl JsObject {
             let idx = *i as usize;
             // For mapped arguments: write through UpvalueCell for aliased parameters
             if let Some(cell) = self.get_argument_cell(idx) {
+                gc_write_barrier(&value);
                 cell.set(value.clone());
                 // Also update elements for when mapping is later removed
                 let mut elements = self.elements.borrow_mut();
@@ -1436,6 +1489,7 @@ impl JsObject {
             }
             let mut elements = self.elements.borrow_mut();
             if idx < elements.len() {
+                gc_write_barrier(&value);
                 elements[idx] = value;
                 return Ok(());
             } else if flags.is_array && flags.extensible && !flags.sealed {
@@ -1443,6 +1497,7 @@ impl JsObject {
                 // Indices beyond this limit are stored as dictionary properties.
                 const MAX_DENSE_LENGTH: usize = 1 << 24; // 16M elements
                 if idx < MAX_DENSE_LENGTH {
+                    gc_write_barrier(&value);
                     elements.resize(idx + 1, Value::hole());
                     elements[idx] = value;
                     return Ok(());
@@ -1470,6 +1525,7 @@ impl JsObject {
                             }
                             // Preserve existing attributes, only update value
                             let attrs = *attributes;
+                            gc_write_barrier(&value);
                             map.insert(
                                 key,
                                 PropertyEntry {
@@ -1490,6 +1546,7 @@ impl JsObject {
                     }
                 }
                 // New property or deleted slot — use default attributes
+                gc_write_barrier(&value);
                 let entry = PropertyEntry {
                     desc: PropertyDescriptor::data(value),
                 };
@@ -1528,6 +1585,7 @@ impl JsObject {
                 // Now set in dictionary mode
                 let mut dict = self.dictionary_properties.borrow_mut();
                 if let Some(map) = dict.as_mut() {
+                    gc_write_barrier(&value);
                     let entry = PropertyEntry {
                         desc: PropertyDescriptor::data(value),
                     };
@@ -1540,6 +1598,7 @@ impl JsObject {
 
             *shape_write = next_shape;
 
+            gc_write_barrier(&value);
             let entry = PropertyEntry {
                 desc: PropertyDescriptor::data(value),
             };
@@ -1961,6 +2020,7 @@ impl JsObject {
                     // Cannot add new property to non-extensible object
                     return false;
                 }
+                gc_write_barrier_desc(&desc);
                 map.insert(key, PropertyEntry { desc });
                 return true;
             }
@@ -1986,6 +2046,7 @@ impl JsObject {
                     if Self::validate_property_descriptor_change(&entry.desc, &desc).is_err() {
                         return false;
                     }
+                    gc_write_barrier_desc(&desc);
                     entry.desc = desc;
                     return true;
                 }
@@ -1997,6 +2058,7 @@ impl JsObject {
                     if Self::validate_property_descriptor_change(&entry.desc, &desc).is_err() {
                         return false;
                     }
+                    gc_write_barrier_desc(&desc);
                     entry.desc = desc;
                     return true;
                 }
@@ -2025,6 +2087,7 @@ impl JsObject {
             // Store in dictionary
             let mut dict = self.dictionary_properties.borrow_mut();
             if let Some(map) = dict.as_mut() {
+                gc_write_barrier_desc(&desc);
                 map.insert(key, PropertyEntry { desc });
                 return true;
             }
@@ -2033,6 +2096,7 @@ impl JsObject {
 
         *shape_write = next_shape;
 
+        gc_write_barrier_desc(&desc);
         let entry = PropertyEntry { desc };
 
         if offset < INLINE_PROPERTY_COUNT {
@@ -2059,6 +2123,7 @@ impl JsObject {
     /// Store a property without validation checks.
     /// Used by `define_own_property` after it has already validated the operation.
     fn store_property(&self, key: PropertyKey, desc: PropertyDescriptor) {
+        gc_write_barrier_desc(&desc);
         // Dictionary mode: store directly in HashMap
         if self.flags.borrow().is_dictionary {
             let mut dict = self.dictionary_properties.borrow_mut();
@@ -2233,11 +2298,12 @@ impl JsObject {
                 }
 
                 // Step 6: Type mismatch (data vs accessor)
+                // By this point, generic descriptors have been handled (step 5).
+                // Desc must be either data or accessor.
                 let current_is_data = matches!(existing, PropertyDescriptor::Data { .. });
                 let desc_is_data = desc.is_data_descriptor();
-                let desc_is_accessor = desc.is_accessor_descriptor();
 
-                if current_is_data != desc_is_data && current_is_data != !desc_is_accessor {
+                if current_is_data != desc_is_data {
                     // Type conversion: data ↔ accessor
                     if !current_configurable {
                         return false;
@@ -2249,7 +2315,7 @@ impl JsObject {
                 }
 
                 // Step 7: Both data descriptors
-                if desc_is_data && current_is_data {
+                if current_is_data {
                     if let PropertyDescriptor::Data {
                         value: curr_val,
                         attributes: curr_attrs,
@@ -2275,41 +2341,31 @@ impl JsObject {
                     return true;
                 }
 
-                // Step 8: Both accessor descriptors
-                if desc_is_accessor && matches!(existing, PropertyDescriptor::Accessor { .. }) {
-                    if let PropertyDescriptor::Accessor {
-                        get: curr_get,
-                        set: curr_set,
-                        ..
-                    } = &existing
-                    {
-                        if !current_configurable {
-                            // Step 8.a.i: Cannot change set
-                            if let Some(ref new_set) = desc.set {
-                                let curr_set_val = curr_set.clone().unwrap_or(Value::undefined());
-                                if !same_value(&curr_set_val, new_set) {
-                                    return false;
-                                }
+                // Step 8: Both accessor descriptors (the only remaining case)
+                if let PropertyDescriptor::Accessor {
+                    get: curr_get,
+                    set: curr_set,
+                    ..
+                } = &existing
+                {
+                    if !current_configurable {
+                        // Step 8.a.i: Cannot change set
+                        if let Some(ref new_set) = desc.set {
+                            let curr_set_val = curr_set.clone().unwrap_or(Value::undefined());
+                            if !same_value(&curr_set_val, new_set) {
+                                return false;
                             }
-                            // Step 8.a.ii: Cannot change get
-                            if let Some(ref new_get) = desc.get {
-                                let curr_get_val = curr_get.clone().unwrap_or(Value::undefined());
-                                if !same_value(&curr_get_val, new_get) {
-                                    return false;
-                                }
+                        }
+                        // Step 8.a.ii: Cannot change get
+                        if let Some(ref new_get) = desc.get {
+                            let curr_get_val = curr_get.clone().unwrap_or(Value::undefined());
+                            if !same_value(&curr_get_val, new_get) {
+                                return false;
                             }
                         }
                     }
-                    let merged = Self::merge_partial_with_current(existing, desc);
-                    self.store_property(key, merged);
-                    return true;
                 }
-
-                // Type conversion needed (data → accessor or accessor → data)
-                if !current_configurable {
-                    return false;
-                }
-                let merged = Self::merge_partial_with_current_converting(existing, desc);
+                let merged = Self::merge_partial_with_current(existing, desc);
                 self.store_property(key, merged);
                 true
             }
@@ -2702,8 +2758,7 @@ impl JsObject {
                 }
                 let current_is_data = matches!(existing, PropertyDescriptor::Data { .. });
                 let desc_is_data = desc.is_data_descriptor();
-                let desc_is_accessor = desc.is_accessor_descriptor();
-                if current_is_data != desc_is_data && current_is_data != !desc_is_accessor {
+                if current_is_data != desc_is_data {
                     if !current_configurable {
                         return false;
                     }
@@ -2711,7 +2766,7 @@ impl JsObject {
                     self.store_property(key, merged);
                     return true;
                 }
-                if desc_is_data && current_is_data {
+                if current_is_data {
                     if let PropertyDescriptor::Data {
                         value: curr_val,
                         attributes: curr_attrs,
@@ -2732,36 +2787,29 @@ impl JsObject {
                     self.store_property(key, merged);
                     return true;
                 }
-                if desc_is_accessor && matches!(existing, PropertyDescriptor::Accessor { .. }) {
-                    if let PropertyDescriptor::Accessor {
-                        get: curr_get,
-                        set: curr_set,
-                        ..
-                    } = &existing
-                    {
-                        if !current_configurable {
-                            if let Some(ref new_set) = desc.set {
-                                let curr_set_val = curr_set.clone().unwrap_or(Value::undefined());
-                                if !same_value(&curr_set_val, new_set) {
-                                    return false;
-                                }
+                // Both accessor descriptors
+                if let PropertyDescriptor::Accessor {
+                    get: curr_get,
+                    set: curr_set,
+                    ..
+                } = &existing
+                {
+                    if !current_configurable {
+                        if let Some(ref new_set) = desc.set {
+                            let curr_set_val = curr_set.clone().unwrap_or(Value::undefined());
+                            if !same_value(&curr_set_val, new_set) {
+                                return false;
                             }
-                            if let Some(ref new_get) = desc.get {
-                                let curr_get_val = curr_get.clone().unwrap_or(Value::undefined());
-                                if !same_value(&curr_get_val, new_get) {
-                                    return false;
-                                }
+                        }
+                        if let Some(ref new_get) = desc.get {
+                            let curr_get_val = curr_get.clone().unwrap_or(Value::undefined());
+                            if !same_value(&curr_get_val, new_get) {
+                                return false;
                             }
                         }
                     }
-                    let merged = Self::merge_partial_with_current(existing, desc);
-                    self.store_property(key, merged);
-                    return true;
                 }
-                if !current_configurable {
-                    return false;
-                }
-                let merged = Self::merge_partial_with_current_converting(existing, desc);
+                let merged = Self::merge_partial_with_current(existing, desc);
                 self.store_property(key, merged);
                 true
             }
@@ -2815,6 +2863,7 @@ impl JsObject {
             }
         }
 
+        gc_write_barrier(&prototype);
         *self.prototype.borrow_mut() = prototype;
         // Bump global proto epoch to invalidate any cached prototype chain lookups
         bump_proto_epoch();
@@ -2877,11 +2926,52 @@ impl JsObject {
                 PropertyDescriptor::Deleted => {}
             }
         }
+        drop(overflow);
+
+        // Make all dictionary-mode properties non-writable and non-configurable
+        if let Some(dict) = self.dictionary_properties.borrow_mut().as_mut() {
+            for entry in dict.values_mut() {
+                match &mut entry.desc {
+                    PropertyDescriptor::Data { attributes, .. } => {
+                        attributes.writable = false;
+                        attributes.configurable = false;
+                    }
+                    PropertyDescriptor::Accessor { attributes, .. } => {
+                        attributes.configurable = false;
+                    }
+                    PropertyDescriptor::Deleted => {}
+                }
+            }
+        }
     }
 
-    /// Check if object is frozen
+    /// Check if object is frozen per ES2024 §20.1.2.13:
+    /// Not extensible AND all own properties non-configurable AND all data properties non-writable.
     pub fn is_frozen(&self) -> bool {
-        self.flags.borrow().frozen
+        let flags = self.flags.borrow();
+        // Fast path: if freeze() was called, all properties were already modified
+        if flags.frozen {
+            return true;
+        }
+        // If extensible, cannot be frozen
+        if flags.extensible {
+            return false;
+        }
+        drop(flags);
+        // Slow path: check every own property
+        for key in self.own_keys() {
+            if let Some(desc) = self.get_own_property_descriptor(&key) {
+                if desc.is_configurable() {
+                    return false;
+                }
+                if let PropertyDescriptor::Data { attributes, .. } = &desc {
+                    if attributes.writable {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Seal the object - prevents adding new properties and makes all existing
@@ -2922,11 +3012,46 @@ impl JsObject {
                 PropertyDescriptor::Deleted => {}
             };
         }
+        drop(overflow);
+
+        // Make all dictionary-mode properties non-configurable
+        if let Some(dict) = self.dictionary_properties.borrow_mut().as_mut() {
+            for entry in dict.values_mut() {
+                match &mut entry.desc {
+                    PropertyDescriptor::Data { attributes, .. } => {
+                        attributes.configurable = false;
+                    }
+                    PropertyDescriptor::Accessor { attributes, .. } => {
+                        attributes.configurable = false;
+                    }
+                    PropertyDescriptor::Deleted => {}
+                }
+            }
+        }
     }
 
-    /// Check if object is sealed
+    /// Check if object is sealed per ES2024 §20.1.2.15:
+    /// Not extensible AND all own properties non-configurable.
     pub fn is_sealed(&self) -> bool {
-        self.flags.borrow().sealed
+        let flags = self.flags.borrow();
+        // Fast path: if seal() was called, all properties were already modified
+        if flags.sealed {
+            return true;
+        }
+        // If extensible, cannot be sealed
+        if flags.extensible {
+            return false;
+        }
+        drop(flags);
+        // Slow path: check every own property
+        for key in self.own_keys() {
+            if let Some(desc) = self.get_own_property_descriptor(&key) {
+                if desc.is_configurable() {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Prevent extensions - prevents adding new properties

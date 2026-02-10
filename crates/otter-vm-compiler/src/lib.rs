@@ -20,6 +20,6 @@ pub mod peephole;
 pub mod scope;
 
 pub use compiler::Compiler;
-pub use peephole::PeepholeOptimizer;
 pub use error::{CompileError, CompileResult};
-pub use literal_validator::{LiteralValidator, ValidationContext, SourceLocation, EcmaVersion};
+pub use literal_validator::{EcmaVersion, LiteralValidator, SourceLocation, ValidationContext};
+pub use peephole::PeepholeOptimizer;

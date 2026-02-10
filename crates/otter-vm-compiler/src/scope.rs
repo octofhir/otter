@@ -285,6 +285,20 @@ impl ScopeChain {
         self.scopes[fs].next_local += 1;
         Some(idx)
     }
+
+    /// Collect all local names in the current function scope chain.
+    pub fn collect_local_names(&self) -> Vec<String> {
+        let local_count = self.local_count();
+        let mut names = vec![String::new(); local_count as usize];
+        for scope in &self.scopes {
+            for (name, binding) in &scope.bindings {
+                if (binding.index as usize) < names.len() {
+                    names[binding.index as usize] = name.clone();
+                }
+            }
+        }
+        names
+    }
 }
 
 /// Result of resolving a variable
@@ -375,7 +389,10 @@ mod tests {
         chain.exit();
 
         // `var` binding survives exiting the block (function-scoped).
-        assert!(matches!(chain.resolve("x"), Some(ResolvedBinding::Local(0))));
+        assert!(matches!(
+            chain.resolve("x"),
+            Some(ResolvedBinding::Local(0))
+        ));
     }
 
     #[test]

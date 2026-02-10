@@ -10,12 +10,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::async_context::SavedFrame;
 use crate::error::{VmError, VmResult};
 use crate::gc::GcRef;
+use crate::interpreter::PreferredType;
 use crate::object::JsObject;
 use crate::realm::{RealmId, RealmRegistry};
-use crate::symbol_registry::{SymbolRegistry, global_symbol_registry};
 use crate::string::JsString;
+use crate::symbol_registry::SymbolRegistry;
 use crate::value::{UpvalueCell, Value};
-use crate::interpreter::PreferredType;
 use num_bigint::BigInt as NumBigInt;
 use otter_vm_bytecode::Module;
 
@@ -27,7 +27,6 @@ pub const DEFAULT_MAX_STACK_DEPTH: usize = 10000;
 
 /// Context passed to native functions, enabling VM re-entry.
 ///
-/// This replaces the old `Arc<MemoryManager>` parameter in `NativeFn`.
 /// Native functions can now call JavaScript functions (closures or other
 /// natives) through `call_function`, access the memory manager, global
 /// object, and enqueue microtask jobs — all without interception signals.
@@ -43,12 +42,23 @@ pub struct NativeContext<'a> {
 impl<'a> NativeContext<'a> {
     /// Create a new `NativeContext` for a regular function call.
     pub fn new(ctx: &'a mut VmContext, interpreter: &'a crate::interpreter::Interpreter) -> Self {
-        Self { ctx, interpreter, is_construct: false }
+        Self {
+            ctx,
+            interpreter,
+            is_construct: false,
+        }
     }
 
     /// Create a new `NativeContext` for a constructor call (via `new`).
-    pub fn new_construct(ctx: &'a mut VmContext, interpreter: &'a crate::interpreter::Interpreter) -> Self {
-        Self { ctx, interpreter, is_construct: true }
+    pub fn new_construct(
+        ctx: &'a mut VmContext,
+        interpreter: &'a crate::interpreter::Interpreter,
+    ) -> Self {
+        Self {
+            ctx,
+            interpreter,
+            is_construct: true,
+        }
     }
 
     /// Returns true if this function is being called as a constructor (via `new`).
@@ -72,7 +82,9 @@ impl<'a> NativeContext<'a> {
 
         // Unwrap bound functions (stored as objects)
         while let Some(obj) = current_func.as_object() {
-            if let Some(bound_fn) = obj.get(&crate::object::PropertyKey::string("__boundFunction__")) {
+            if let Some(bound_fn) =
+                obj.get(&crate::object::PropertyKey::string("__boundFunction__"))
+            {
                 let raw_this_arg = obj
                     .get(&crate::object::PropertyKey::string("__boundThis__"))
                     .unwrap_or_else(crate::value::Value::undefined);
@@ -82,7 +94,9 @@ impl<'a> NativeContext<'a> {
                     current_this = raw_this_arg;
                 }
 
-                if let Some(bound_args_val) = obj.get(&crate::object::PropertyKey::string("__boundArgs__")) {
+                if let Some(bound_args_val) =
+                    obj.get(&crate::object::PropertyKey::string("__boundArgs__"))
+                {
                     if let Some(args_obj) = bound_args_val.as_object() {
                         let len = args_obj
                             .get(&crate::object::PropertyKey::string("length"))
@@ -183,8 +197,22 @@ impl<'a> NativeContext<'a> {
     }
 
     /// Enqueue a JS microtask job (for Promise callbacks).
-    pub fn enqueue_js_job(&self, job: crate::promise::JsPromiseJob, args: Vec<crate::value::Value>) -> bool {
+    pub fn enqueue_js_job(
+        &self,
+        job: crate::promise::JsPromiseJob,
+        args: Vec<crate::value::Value>,
+    ) -> bool {
         self.ctx.enqueue_js_job(job, args)
+    }
+
+    /// Enqueue a `process.nextTick()` callback.
+    /// Returns true if enqueued, false if no nextTick queue is configured.
+    pub fn enqueue_next_tick(
+        &self,
+        callback: crate::value::Value,
+        args: Vec<crate::value::Value>,
+    ) -> bool {
+        self.ctx.enqueue_next_tick(callback, args)
     }
 
     /// Get the JS job queue, if configured.
@@ -195,6 +223,11 @@ impl<'a> NativeContext<'a> {
     /// Check if a JS job queue is available.
     pub fn has_js_job_queue(&self) -> bool {
         self.ctx.has_js_job_queue()
+    }
+
+    /// Get the pending async ops counter, if configured.
+    pub fn pending_async_ops(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        self.ctx.pending_async_ops()
     }
 
     /// Get the interpreter reference (for advanced operations).
@@ -211,7 +244,17 @@ impl<'a> NativeContext<'a> {
         generator: GcRef<crate::generator::JsGenerator>,
         sent_value: Option<Value>,
     ) -> crate::interpreter::GeneratorResult {
-        self.interpreter.execute_generator(generator, self.ctx, sent_value)
+        self.interpreter
+            .execute_generator(generator, self.ctx, sent_value)
+    }
+
+    /// Execute a compiled module within this context.
+    ///
+    /// Used by `require()` to synchronously execute CJS modules.
+    /// Pushes a new frame, runs until completion, returns without
+    /// consuming outer call frames.
+    pub fn execute_module(&mut self, module: &Module) -> VmResult<Value> {
+        self.interpreter.execute_eval_module(self.ctx, module)
     }
 
     /// Execute an eval-compiled module within this context.
@@ -398,13 +441,20 @@ pub struct VmContext {
     /// Set by otter-vm-runtime to bridge the compiler (which otter-vm-core
     /// cannot depend on directly). The interpreter handles execution.
     /// The boolean parameter indicates whether the caller is in strict mode context.
-    eval_fn: Option<Arc<dyn Fn(&str, bool) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync>>,
+    eval_fn:
+        Option<Arc<dyn Fn(&str, bool) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync>>,
     /// Microtask enqueue function for Promise callbacks.
     /// Set by otter-vm-runtime to enable proper microtask queuing from intrinsics.
     microtask_enqueue: Option<Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>>,
+    /// process.nextTick() enqueue function.
+    /// Set by otter-vm-runtime to enable nextTick callbacks from native extensions.
+    next_tick_enqueue: Option<Arc<dyn Fn(Value, Vec<Value>) + Send + Sync>>,
     /// JS job queue for JavaScript function callbacks (Promise.then/catch/finally).
     /// Set by otter-vm-runtime to enable Promise callbacks to be executed via interpreter.
     js_job_queue: Option<Arc<dyn JsJobQueueTrait + Send + Sync>>,
+    /// Counter for pending async operations (tokio tasks).
+    /// Used by the event loop to know when async work is still in flight.
+    pending_async_ops: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// External root sets registered by the runtime (e.g., job queues).
     /// These are traced during GC root collection.
     external_root_sets: Vec<Arc<dyn ExternalRootSet + Send + Sync>>,
@@ -416,6 +466,9 @@ pub struct VmContext {
     realm_registry: Option<Arc<RealmRegistry>>,
     /// Trace state (if tracing is enabled)
     pub(crate) trace_state: Option<crate::trace::TraceState>,
+    /// Captured exports from the last executed module.
+    /// Used by ModuleLoader to populate namespaces.
+    captured_module_exports: Option<HashMap<String, Value>>,
 }
 
 /// Trait for JS job queue access (allows runtime to inject the queue)
@@ -540,13 +593,31 @@ impl VmContext {
             async_generator_prototype_intrinsic: None,
             eval_fn: None,
             microtask_enqueue: None,
+            next_tick_enqueue: None,
             js_job_queue: None,
+            pending_async_ops: None,
             external_root_sets: Vec::new(),
-            symbol_registry: global_symbol_registry(),
+            symbol_registry: Arc::new(SymbolRegistry::new()),
             realm_id: 0,
             realm_registry: None,
             trace_state: None,
+            captured_module_exports: None,
         }
+    }
+
+    /// Set captured module exports.
+    pub fn set_captured_exports(&mut self, exports: HashMap<String, Value>) {
+        self.captured_module_exports = Some(exports);
+    }
+
+    /// Get captured module exports.
+    pub fn captured_exports(&self) -> Option<&HashMap<String, Value>> {
+        self.captured_module_exports.as_ref()
+    }
+
+    /// Take captured module exports (clearing them).
+    pub fn take_captured_exports(&mut self) -> Option<HashMap<String, Value>> {
+        self.captured_module_exports.take()
     }
 
     /// Get the memory manager
@@ -571,17 +642,26 @@ impl VmContext {
 
     /// Lookup intrinsics for a realm id.
     pub fn realm_intrinsics(&self, realm_id: RealmId) -> Option<crate::intrinsics::Intrinsics> {
-        self.realm_registry.as_ref().and_then(|registry| registry.get(realm_id)).map(|rec| rec.intrinsics)
+        self.realm_registry
+            .as_ref()
+            .and_then(|registry| registry.get(realm_id))
+            .map(|rec| rec.intrinsics)
     }
 
     /// Lookup global object for a realm id.
     pub fn realm_global(&self, realm_id: RealmId) -> Option<GcRef<JsObject>> {
-        self.realm_registry.as_ref().and_then(|registry| registry.get(realm_id)).map(|rec| rec.global)
+        self.realm_registry
+            .as_ref()
+            .and_then(|registry| registry.get(realm_id))
+            .map(|rec| rec.global)
     }
 
     /// Lookup the realm's Function.prototype for a realm id.
     pub fn realm_function_prototype(&self, realm_id: RealmId) -> Option<GcRef<JsObject>> {
-        self.realm_registry.as_ref().and_then(|registry| registry.get(realm_id)).map(|rec| rec.function_prototype)
+        self.realm_registry
+            .as_ref()
+            .and_then(|registry| registry.get(realm_id))
+            .map(|rec| rec.function_prototype)
     }
 
     /// Temporarily run with a different realm/global, restoring after the closure.
@@ -633,17 +713,16 @@ impl VmContext {
     }
 
     /// Attach a debug snapshot target to update periodically.
-    pub fn set_debug_snapshot_target(
-        &mut self,
-        target: Option<Arc<Mutex<VmContextSnapshot>>>,
-    ) {
+    pub fn set_debug_snapshot_target(&mut self, target: Option<Arc<Mutex<VmContextSnapshot>>>) {
         self.debug_snapshot = target;
         self.update_debug_snapshot();
     }
 
     /// Get the current debug snapshot (if enabled).
     pub fn debug_snapshot(&self) -> Option<VmContextSnapshot> {
-        self.debug_snapshot.as_ref().map(|snapshot| snapshot.lock().clone())
+        self.debug_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.lock().clone())
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -688,10 +767,14 @@ impl VmContext {
             function_index,
             function_name,
             module_url: module.source_url.clone(),
-            opcode: format!("{:?}", instruction).split(' ').next().unwrap_or("Unknown").to_string(),
+            opcode: format!("{:?}", instruction)
+                .split(' ')
+                .next()
+                .unwrap_or("Unknown")
+                .to_string(),
             operands,
             modified_registers: vec![], // TODO: Track register modifications
-            execution_time_ns: None, // TODO: Add timing support
+            execution_time_ns: None,    // TODO: Add timing support
         };
 
         // Check filter
@@ -948,9 +1031,7 @@ impl VmContext {
 
         // Add trace buffer entries if available
         if let Some(trace_state) = &self.trace_state {
-            snapshot.recent_instructions = trace_state.ring_buffer.iter()
-                .cloned()
-                .collect();
+            snapshot.recent_instructions = trace_state.ring_buffer.iter().cloned().collect();
         }
 
         *target.lock() = snapshot;
@@ -1168,9 +1249,7 @@ impl VmContext {
     /// and returns a compiled Module.
     pub fn set_eval_fn(
         &mut self,
-        f: Arc<
-            dyn Fn(&str, bool) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync,
-        >,
+        f: Arc<dyn Fn(&str, bool) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync>,
     ) {
         self.eval_fn = Some(f);
     }
@@ -1178,7 +1257,11 @@ impl VmContext {
     /// Compile eval code into a Module using the registered eval compiler.
     /// The strict_context parameter indicates whether the caller is in strict mode.
     /// Returns `VmError::TypeError` if the eval callback is not configured.
-    pub fn compile_eval(&self, code: &str, strict_context: bool) -> Result<otter_vm_bytecode::Module, VmError> {
+    pub fn compile_eval(
+        &self,
+        code: &str,
+        strict_context: bool,
+    ) -> Result<otter_vm_bytecode::Module, VmError> {
         let eval_fn = self
             .eval_fn
             .as_ref()
@@ -1194,6 +1277,34 @@ impl VmContext {
         f: Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>,
     ) {
         self.microtask_enqueue = Some(f);
+    }
+
+    /// Set the nextTick enqueue callback used by `process.nextTick()`.
+    /// Called by otter-vm-runtime during context setup.
+    pub fn set_next_tick_enqueue(&mut self, f: Arc<dyn Fn(Value, Vec<Value>) + Send + Sync>) {
+        self.next_tick_enqueue = Some(f);
+    }
+
+    /// Enqueue a nextTick callback if a nextTick queue is configured.
+    /// Returns true if enqueued, false if no queue is available.
+    pub fn enqueue_next_tick(&self, callback: Value, args: Vec<Value>) -> bool {
+        if let Some(enqueue) = &self.next_tick_enqueue {
+            enqueue(callback, args);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set the pending async ops counter.
+    /// Called by otter-vm-runtime during context setup.
+    pub fn set_pending_async_ops(&mut self, counter: Arc<std::sync::atomic::AtomicU64>) {
+        self.pending_async_ops = Some(counter);
+    }
+
+    /// Get the pending async ops counter, if configured.
+    pub fn pending_async_ops(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        self.pending_async_ops.clone()
     }
 
     /// Enqueue a microtask if a microtask queue is configured.
@@ -1213,10 +1324,7 @@ impl VmContext {
     }
 
     /// Register an external root set for GC (e.g., job queues)
-    pub fn register_external_root_set(
-        &mut self,
-        roots: Arc<dyn ExternalRootSet + Send + Sync>,
-    ) {
+    pub fn register_external_root_set(&mut self, roots: Arc<dyn ExternalRootSet + Send + Sync>) {
         self.external_root_sets.push(roots);
     }
 
@@ -1304,7 +1412,11 @@ impl VmContext {
         // into an array and passes it as the last argument. This rest array should
         // be mapped to the rest parameter's local slot (at index param_count).
         // So effective_param_count is param_count + 1 when has_rest is true.
-        let effective_param_count = if has_rest { param_count + 1 } else { param_count };
+        let effective_param_count = if has_rest {
+            param_count + 1
+        } else {
+            param_count
+        };
 
         let extra_args_count = if args.len() > effective_param_count {
             args.len() - effective_param_count
@@ -1341,8 +1453,7 @@ impl VmContext {
                         .collect();
                     eprintln!(
                         "[OTTER_TRACE_ASSERT_ARGS] params={} types={:?}",
-                        param_count,
-                        arg_types
+                        param_count, arg_types
                     );
                 }
             }
@@ -1855,7 +1966,9 @@ impl VmContext {
             // WeakMap/WeakSet object containing ephemeron table
             if let Some(obj) = value.as_object() {
                 // Check for __weakmap_entries__
-                if let Some(entries_value) = obj.get(&crate::object::PropertyKey::string("__weakmap_entries__")) {
+                if let Some(entries_value) =
+                    obj.get(&crate::object::PropertyKey::string("__weakmap_entries__"))
+                {
                     if let Some(table) = entries_value.as_ephemeron_table() {
                         let ptr = table.as_ptr() as usize;
                         if visited.insert(ptr) {
@@ -1864,7 +1977,9 @@ impl VmContext {
                     }
                 }
                 // Check for __weakset_entries__
-                if let Some(entries_value) = obj.get(&crate::object::PropertyKey::string("__weakset_entries__")) {
+                if let Some(entries_value) =
+                    obj.get(&crate::object::PropertyKey::string("__weakset_entries__"))
+                {
                     if let Some(table) = entries_value.as_ephemeron_table() {
                         let ptr = table.as_ptr() as usize;
                         if visited.insert(ptr) {
@@ -1914,16 +2029,56 @@ impl VmContext {
         tables
     }
 
-    /// Trigger GC if allocation threshold is exceeded
+    /// Trigger GC if allocation threshold is exceeded.
     ///
-    /// Returns true if a collection was performed.
+    /// Uses incremental marking when possible: starts marking, then processes
+    /// a budget of gray objects per safepoint. Falls back to full STW collection
+    /// when ephemeron tables are present (fixpoint requires complete worklist).
+    ///
+    /// Returns true if GC work was performed.
     pub fn maybe_collect_garbage(&self) -> bool {
-        if self.memory_manager.should_collect_garbage() {
-            self.collect_garbage();
-            true
-        } else {
-            false
+        /// Budget: number of objects to mark per incremental step (~50-100μs)
+        const MARKING_BUDGET: usize = 1000;
+
+        let registry = otter_vm_gc::global_registry();
+
+        // If incremental marking is in progress, do a step
+        if registry.is_marking() {
+            let done = registry.incremental_mark_step(MARKING_BUDGET);
+            if done {
+                let _reclaimed = registry.finish_gc();
+                let live_bytes = registry.total_bytes();
+                self.memory_manager.on_gc_complete(live_bytes);
+            }
+            return true;
         }
+
+        // Check if we should start a new GC cycle
+        if self.memory_manager.should_collect_garbage() {
+            let roots = self.collect_gc_roots();
+            let ephemeron_tables = self.collect_ephemeron_tables();
+
+            if ephemeron_tables.is_empty() {
+                // Start incremental marking
+                registry.start_incremental_gc(&roots);
+                // Do first step immediately
+                let done = registry.incremental_mark_step(MARKING_BUDGET);
+                if done {
+                    let _reclaimed = registry.finish_gc();
+                    let live_bytes = registry.total_bytes();
+                    self.memory_manager.on_gc_complete(live_bytes);
+                }
+            } else {
+                // Ephemerons: full STW (fixpoint needs complete worklist)
+                let table_refs: Vec<_> = ephemeron_tables.iter().map(|t| t.as_ref()).collect();
+                registry.collect_with_ephemerons(&roots, &table_refs);
+                let live_bytes = registry.total_bytes();
+                self.memory_manager.on_gc_complete(live_bytes);
+            }
+            return true;
+        }
+
+        false
     }
 
     /// Request an explicit GC cycle
@@ -2028,7 +2183,8 @@ impl VmContext {
         // Break the globalThis cycle first
         use crate::object::PropertyKey;
 
-        let _ = self.global
+        let _ = self
+            .global
             .set(PropertyKey::string("globalThis"), Value::undefined());
 
         // FORCE clear all properties to break reference cycles.

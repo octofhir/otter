@@ -21,13 +21,13 @@
 //! - toString §20.2.3.5
 
 use crate::context::NativeContext;
-use crate::gc::GcRef;
-use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
-use crate::string::JsString;
-use crate::realm::RealmId;
-use crate::value::Value;
-use crate::memory::MemoryManager;
 use crate::error::VmError;
+use crate::gc::GcRef;
+use crate::memory::MemoryManager;
+use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
+use crate::realm::RealmId;
+use crate::string::JsString;
+use crate::value::Value;
 use std::sync::Arc;
 
 /// Initialize Function.prototype with all ES2026 methods
@@ -40,10 +40,7 @@ use std::sync::Arc;
 ///
 /// # Property Attributes
 /// All methods: `{ writable: true, enumerable: false, configurable: true }`
-pub fn init_function_prototype(
-    fn_proto: GcRef<JsObject>,
-    mm: &Arc<MemoryManager>,
-) {
+pub fn init_function_prototype(fn_proto: GcRef<JsObject>, mm: &Arc<MemoryManager>) {
     // Function.prototype.length = 0 (§20.2.3)
     fn_proto.define_property(
         PropertyKey::string("length"),
@@ -74,19 +71,21 @@ pub fn init_function_prototype(
                 // Check if this is a native function
                 if this_val.is_native_function() {
                     return Ok(Value::string(JsString::intern(
-                        "function () { [native code] }"
+                        "function () { [native code] }",
                     )));
                 }
                 // Check if this is a bound function
                 if let Some(obj) = this_val.as_object() {
                     if obj.has(&PropertyKey::string("__boundFunction__")) {
                         return Ok(Value::string(JsString::intern(
-                            "function bound() { [native code] }"
+                            "function bound() { [native code] }",
                         )));
                     }
                 }
                 // Not a function
-                Err(VmError::type_error("Function.prototype.toString requires a function"))
+                Err(VmError::type_error(
+                    "Function.prototype.toString requires a function",
+                ))
             },
             mm.clone(),
             fn_proto,
@@ -116,7 +115,9 @@ pub fn init_function_prototype(
 
                 // Check if target is callable
                 if !this_val.is_callable() {
-                    return Err(VmError::type_error("Function.prototype.call requires a callable target"));
+                    return Err(VmError::type_error(
+                        "Function.prototype.call requires a callable target",
+                    ));
                 }
 
                 // Call the function (handles both closures and native functions)
@@ -149,16 +150,21 @@ pub fn init_function_prototype(
                         let mut extracted = Vec::with_capacity(len);
                         for i in 0..len {
                             extracted.push(
-                                arr_obj.get(&PropertyKey::Index(i as u32))
-                                    .unwrap_or(Value::undefined())
+                                arr_obj
+                                    .get(&PropertyKey::Index(i as u32))
+                                    .unwrap_or(Value::undefined()),
                             );
                         }
                         extracted
                     } else {
-                        return Err(VmError::type_error("Function.prototype.apply: argumentsList must be an array"));
+                        return Err(VmError::type_error(
+                            "Function.prototype.apply: argumentsList must be an array",
+                        ));
                     }
                 } else {
-                    return Err(VmError::type_error("Function.prototype.apply: argumentsList must be an object"));
+                    return Err(VmError::type_error(
+                        "Function.prototype.apply: argumentsList must be an object",
+                    ));
                 };
 
                 if let Some(proxy) = this_val.as_proxy() {
@@ -167,7 +173,9 @@ pub fn init_function_prototype(
 
                 // Check if target is callable
                 if !this_val.is_callable() {
-                    return Err(VmError::type_error("Function.prototype.apply requires a callable target"));
+                    return Err(VmError::type_error(
+                        "Function.prototype.apply requires a callable target",
+                    ));
                 }
 
                 // Call the function (handles both closures and native functions)
@@ -190,20 +198,21 @@ pub fn init_function_prototype(
                 let this_arg = args.first().cloned().unwrap_or(Value::undefined());
 
                 // Create bound function object with Function.prototype as prototype
-                let bound = GcRef::new(JsObject::new(Value::object(fn_proto_for_bind.clone()), ncx.memory_manager().clone()));
+                let bound = GcRef::new(JsObject::new(
+                    Value::object(fn_proto_for_bind.clone()),
+                    ncx.memory_manager().clone(),
+                ));
 
                 // Store the original function
-                let _ = bound.set(
-                    PropertyKey::string("__boundFunction__"),
-                    this_val.clone(),
-                );
+                let _ = bound.set(PropertyKey::string("__boundFunction__"), this_val.clone());
 
                 // Store the thisArg
                 let _ = bound.set(PropertyKey::string("__boundThis__"), this_arg);
 
                 // Store bound arguments (if any)
                 if args.len() > 1 {
-                    let arr = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                    let arr =
+                        GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                     for (i, arg) in args[1..].iter().enumerate() {
                         let _ = arr.set(PropertyKey::Index(i as u32), arg.clone());
                     }
@@ -211,10 +220,7 @@ pub fn init_function_prototype(
                         PropertyKey::string("length"),
                         Value::int32((args.len() - 1) as i32),
                     );
-                    let _ = bound.set(
-                        PropertyKey::string("__boundArgs__"),
-                        Value::object(arr),
-                    );
+                    let _ = bound.set(PropertyKey::string("__boundArgs__"), Value::object(arr));
                 }
 
                 // Set name
@@ -232,10 +238,7 @@ pub fn init_function_prototype(
                 );
 
                 // Mark as callable
-                let _ = bound.set(
-                    PropertyKey::string("__isCallable__"),
-                    Value::boolean(true),
-                );
+                let _ = bound.set(PropertyKey::string("__isCallable__"), Value::boolean(true));
 
                 Ok(Value::object(bound))
             },
@@ -248,33 +251,25 @@ pub fn init_function_prototype(
 /// Create a dynamic Function constructor (Function/GeneratorFunction/AsyncFunction).
 pub fn create_function_constructor(
     realm_id: RealmId,
-) -> Box<
-    dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
-> {
+) -> Box<dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync> {
     create_dynamic_function_constructor(DynamicFunctionKind::Normal, realm_id)
 }
 
 pub fn create_generator_function_constructor(
     realm_id: RealmId,
-) -> Box<
-    dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
-> {
+) -> Box<dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync> {
     create_dynamic_function_constructor(DynamicFunctionKind::Generator, realm_id)
 }
 
 pub fn create_async_function_constructor(
     realm_id: RealmId,
-) -> Box<
-    dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
-> {
+) -> Box<dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync> {
     create_dynamic_function_constructor(DynamicFunctionKind::Async, realm_id)
 }
 
 pub fn create_async_generator_function_constructor(
     realm_id: RealmId,
-) -> Box<
-    dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
-> {
+) -> Box<dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync> {
     create_dynamic_function_constructor(DynamicFunctionKind::AsyncGenerator, realm_id)
 }
 
@@ -297,7 +292,9 @@ fn build_dynamic_function_source(
         DynamicFunctionKind::Generator => {
             format!("(function* anonymous({}) {{ {} }})", params, body)
         }
-        DynamicFunctionKind::Async => format!("(async function anonymous({}) {{ {} }})", params, body),
+        DynamicFunctionKind::Async => {
+            format!("(async function anonymous({}) {{ {} }})", params, body)
+        }
         DynamicFunctionKind::AsyncGenerator => {
             format!("(async function* anonymous({}) {{ {} }})", params, body)
         }
@@ -327,9 +324,7 @@ fn dynamic_function_fallback_proto(ncx: &NativeContext<'_>, kind: DynamicFunctio
 fn create_dynamic_function_constructor(
     kind: DynamicFunctionKind,
     constructor_realm_id: RealmId,
-) -> Box<
-    dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
-> {
+) -> Box<dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync> {
     Box::new(move |this, args, ncx| {
         let mut params = Vec::new();
         let mut body = String::new();

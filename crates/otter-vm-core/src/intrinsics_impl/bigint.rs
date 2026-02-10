@@ -63,15 +63,17 @@ fn to_bigint(ncx: &mut NativeContext<'_>, value: &Value) -> Result<NumBigInt, Vm
         ));
     }
     if prim.is_undefined() {
-        return Err(VmError::type_error(
-            "Cannot convert undefined to a BigInt",
-        ));
+        return Err(VmError::type_error("Cannot convert undefined to a BigInt"));
     }
     if prim.is_null() {
         return Err(VmError::type_error("Cannot convert null to a BigInt"));
     }
     if let Some(b) = prim.as_boolean() {
-        return Ok(if b { NumBigInt::one() } else { NumBigInt::zero() });
+        return Ok(if b {
+            NumBigInt::one()
+        } else {
+            NumBigInt::zero()
+        });
     }
     if let Some(s) = prim.as_string() {
         let bigint = ncx
@@ -294,9 +296,8 @@ pub fn install_bigint_statics(
 }
 
 /// Create BigInt constructor function (callable, not constructable).
-pub fn create_bigint_constructor(
-) -> Box<dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync>
-{
+pub fn create_bigint_constructor()
+-> Box<dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync> {
     Box::new(|_this, args, ncx| {
         if ncx.is_construct() {
             return Err(VmError::type_error("BigInt is not a constructor"));
@@ -314,15 +315,17 @@ pub fn create_bigint_constructor(
             ));
         }
         if prim.is_undefined() {
-            return Err(VmError::type_error(
-                "Cannot convert undefined to a BigInt",
-            ));
+            return Err(VmError::type_error("Cannot convert undefined to a BigInt"));
         }
         if prim.is_null() {
             return Ok(Value::bigint("0".to_string()));
         }
         if let Some(b) = prim.as_boolean() {
-            return Ok(Value::bigint(if b { "1".to_string() } else { "0".to_string() }));
+            return Ok(Value::bigint(if b {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }));
         }
         if let Some(s) = prim.as_string() {
             let bigint = ncx
@@ -332,13 +335,10 @@ pub fn create_bigint_constructor(
         }
         if let Some(n) = prim.as_number() {
             if !n.is_finite() || n.fract() != 0.0 {
-                return Err(VmError::range_error(
-                    "Cannot convert number to a BigInt",
-                ));
+                return Err(VmError::range_error("Cannot convert number to a BigInt"));
             }
-            let bigint = NumBigInt::from_f64(n).ok_or_else(|| {
-                VmError::range_error("Cannot convert number to a BigInt")
-            })?;
+            let bigint = NumBigInt::from_f64(n)
+                .ok_or_else(|| VmError::range_error("Cannot convert number to a BigInt"))?;
             return Ok(Value::bigint(bigint.to_str_radix(10)));
         }
 

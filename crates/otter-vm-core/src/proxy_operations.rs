@@ -3,9 +3,9 @@
 //! This module implements all 13 proxy handler traps with proper
 //! invariant validation according to the ECMAScript specification.
 
+use crate::context::NativeContext;
 use crate::error::{VmError, VmResult};
 use crate::gc::GcRef;
-use crate::context::NativeContext;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::proxy::JsProxy;
 use crate::string::JsString;
@@ -370,10 +370,7 @@ fn validate_get_trap_invariants(
 
     if let Some(desc) = target_desc {
         match desc {
-            PropertyDescriptor::Data {
-                value,
-                attributes,
-            } => {
+            PropertyDescriptor::Data { value, attributes } => {
                 // If property is non-configurable and non-writable,
                 // trap result must be SameValue as target's value
                 if !attributes.configurable && !attributes.writable {
@@ -384,7 +381,9 @@ fn validate_get_trap_invariants(
                     }
                 }
             }
-            PropertyDescriptor::Accessor { get, attributes, .. } => {
+            PropertyDescriptor::Accessor {
+                get, attributes, ..
+            } => {
                 // If property is non-configurable accessor with undefined getter,
                 // trap result must be undefined
                 if !attributes.configurable && get.is_none() {
@@ -419,7 +418,12 @@ pub fn proxy_set(
     let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.set(target, key, value, receiver)
-    let trap_args = &[target.clone(), key_value.clone(), value.clone(), receiver.clone()];
+    let trap_args = &[
+        target.clone(),
+        key_value.clone(),
+        value.clone(),
+        receiver.clone(),
+    ];
     let trap_result = invoke_trap(ncx, proxy, "set", trap_args)?;
 
     // If no trap, perform default [[Set]] on target
@@ -467,7 +471,9 @@ fn validate_set_trap_invariants(
                     }
                 }
             }
-            PropertyDescriptor::Accessor { set, attributes, .. } => {
+            PropertyDescriptor::Accessor {
+                set, attributes, ..
+            } => {
                 // If property is non-configurable accessor with undefined setter,
                 // cannot set
                 if !attributes.configurable && set.is_none() {
@@ -629,7 +635,9 @@ pub fn proxy_own_keys(
         .ok_or_else(|| VmError::type_error("Proxy 'ownKeys' trap must return an object"))?;
 
     // Get length property
-    let length_value = keys_obj.get(&PropertyKey::from("length")).unwrap_or(Value::int32(0));
+    let length_value = keys_obj
+        .get(&PropertyKey::from("length"))
+        .unwrap_or(Value::int32(0));
     let length = length_value.as_number().unwrap_or(0.0) as usize;
 
     // Extract keys from array-like object
@@ -648,7 +656,7 @@ pub fn proxy_own_keys(
         } else {
             // Per spec, throw TypeError for any other type
             return Err(VmError::type_error(
-                "Proxy 'ownKeys' trap result must only contain String or Symbol values"
+                "Proxy 'ownKeys' trap result must only contain String or Symbol values",
             ));
         }
     }
@@ -748,9 +756,7 @@ pub fn proxy_get_own_property_descriptor(
         }
 
         // If target is non-extensible and property exists, trap cannot return undefined
-        if !target_is_extensible(ncx, &target)?
-            && target_has_own(ncx, &target, key, key_value)?
-        {
+        if !target_is_extensible(ncx, &target)? && target_has_own(ncx, &target, key, key_value)? {
             return Err(VmError::type_error(
                 "Proxy 'getOwnPropertyDescriptor' trap cannot return undefined for property of non-extensible target",
             ));
@@ -793,10 +799,19 @@ fn validate_get_own_property_descriptor_invariants(
             }
 
             // For data properties, check value and writable
-            if let PropertyDescriptor::Data { value: target_value, attributes: target_attrs } = &target_desc {
-                if let PropertyDescriptor::Data { value: trap_value, attributes: trap_attrs } = trap_desc {
+            if let PropertyDescriptor::Data {
+                value: target_value,
+                attributes: target_attrs,
+            } = &target_desc
+            {
+                if let PropertyDescriptor::Data {
+                    value: trap_value,
+                    attributes: trap_attrs,
+                } = trap_desc
+                {
                     // ES §9.5.5 step 17.b.i: If trap reports writable: false but target has writable: true, throw TypeError
-                    if target_attrs.writable && !trap_attrs.writable && !trap_desc.is_configurable() {
+                    if target_attrs.writable && !trap_attrs.writable && !trap_desc.is_configurable()
+                    {
                         return Err(VmError::type_error(
                             "Proxy 'getOwnPropertyDescriptor' trap cannot report writable property as non-writable when non-configurable",
                         ));
@@ -908,19 +923,38 @@ fn descriptor_to_object(desc: &PropertyDescriptor, ncx: &NativeContext) -> Value
     match desc {
         PropertyDescriptor::Data { value, attributes } => {
             let _ = obj.set(PropertyKey::from("value"), value.clone());
-            let _ = obj.set(PropertyKey::from("writable"), Value::boolean(attributes.writable));
-            let _ = obj.set(PropertyKey::from("enumerable"), Value::boolean(attributes.enumerable));
-            let _ = obj.set(PropertyKey::from("configurable"), Value::boolean(attributes.configurable));
+            let _ = obj.set(
+                PropertyKey::from("writable"),
+                Value::boolean(attributes.writable),
+            );
+            let _ = obj.set(
+                PropertyKey::from("enumerable"),
+                Value::boolean(attributes.enumerable),
+            );
+            let _ = obj.set(
+                PropertyKey::from("configurable"),
+                Value::boolean(attributes.configurable),
+            );
         }
-        PropertyDescriptor::Accessor { get, set, attributes } => {
+        PropertyDescriptor::Accessor {
+            get,
+            set,
+            attributes,
+        } => {
             if let Some(getter) = get {
                 let _ = obj.set(PropertyKey::from("get"), getter.clone());
             }
             if let Some(setter) = set {
                 let _ = obj.set(PropertyKey::from("set"), setter.clone());
             }
-            let _ = obj.set(PropertyKey::from("enumerable"), Value::boolean(attributes.enumerable));
-            let _ = obj.set(PropertyKey::from("configurable"), Value::boolean(attributes.configurable));
+            let _ = obj.set(
+                PropertyKey::from("enumerable"),
+                Value::boolean(attributes.enumerable),
+            );
+            let _ = obj.set(
+                PropertyKey::from("configurable"),
+                Value::boolean(attributes.configurable),
+            );
         }
         PropertyDescriptor::Deleted => {
             // Deleted descriptor shouldn't be converted
@@ -949,7 +983,9 @@ fn descriptor_from_object(obj: &GcRef<JsObject>) -> VmResult<PropertyDescriptor>
     // Determine if it's a data or accessor descriptor
     if has_value || has_writable {
         // Data descriptor
-        let value = obj.get(&PropertyKey::from("value")).unwrap_or(Value::undefined());
+        let value = obj
+            .get(&PropertyKey::from("value"))
+            .unwrap_or(Value::undefined());
         let writable = obj
             .get(&PropertyKey::from("writable"))
             .map(|v| v.to_boolean())
@@ -965,8 +1001,12 @@ fn descriptor_from_object(obj: &GcRef<JsObject>) -> VmResult<PropertyDescriptor>
         })
     } else if has_get || has_set {
         // Accessor descriptor
-        let get = obj.get(&PropertyKey::from("get")).filter(|v| !v.is_undefined());
-        let set = obj.get(&PropertyKey::from("set")).filter(|v| !v.is_undefined());
+        let get = obj
+            .get(&PropertyKey::from("get"))
+            .filter(|v| !v.is_undefined());
+        let set = obj
+            .get(&PropertyKey::from("set"))
+            .filter(|v| !v.is_undefined());
 
         Ok(PropertyDescriptor::Accessor {
             get,
@@ -1121,10 +1161,7 @@ fn validate_set_prototype_of_invariants(
 /// ES §9.5.3: [[IsExtensible]] trap
 ///
 /// Implements the `isExtensible` trap with proper invariant validation.
-pub fn proxy_is_extensible(
-    ncx: &mut NativeContext,
-    proxy: GcRef<JsProxy>,
-) -> VmResult<bool> {
+pub fn proxy_is_extensible(ncx: &mut NativeContext, proxy: GcRef<JsProxy>) -> VmResult<bool> {
     // Get target
     let target = proxy_target_value(proxy)?;
 
@@ -1154,10 +1191,7 @@ pub fn proxy_is_extensible(
 /// ES §9.5.4: [[PreventExtensions]] trap
 ///
 /// Implements the `preventExtensions` trap with proper invariant validation.
-pub fn proxy_prevent_extensions(
-    ncx: &mut NativeContext,
-    proxy: GcRef<JsProxy>,
-) -> VmResult<bool> {
+pub fn proxy_prevent_extensions(ncx: &mut NativeContext, proxy: GcRef<JsProxy>) -> VmResult<bool> {
     // Get target
     let target = proxy_target_value(proxy)?;
 
@@ -1202,7 +1236,11 @@ pub fn proxy_apply(
     let args_array = create_args_array(ncx, args);
 
     // Invoke trap: handler.apply(target, thisValue, args)
-    let trap_args = &[target.clone(), this_value.clone(), Value::object(args_array)];
+    let trap_args = &[
+        target.clone(),
+        this_value.clone(),
+        Value::object(args_array),
+    ];
     let trap_result = invoke_trap(ncx, proxy, "apply", trap_args)?;
 
     // If no trap, perform default [[Call]] on target
@@ -1240,7 +1278,11 @@ pub fn proxy_construct(
     let args_array = create_args_array(ncx, args);
 
     // Invoke trap: handler.construct(target, args, newTarget)
-    let trap_args = &[target.clone(), Value::object(args_array), new_target.clone()];
+    let trap_args = &[
+        target.clone(),
+        Value::object(args_array),
+        new_target.clone(),
+    ];
     let trap_result = invoke_trap(ncx, proxy, "construct", trap_args)?;
 
     // If no trap, perform default [[Construct]] on target

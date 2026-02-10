@@ -267,7 +267,7 @@ Each bytecode instruction stores source location:
 
 #### 3.4.2 Error Enhancement
 
-Location: `crates/otter-vm-builtins/src/error.rs`
+Location: `crates/otter-vm-core/src/intrinsics_impl/error.rs`
 
 - Parse source maps (`.map` files) when available
 - Include original TypeScript locations in `Error.stack`
@@ -300,9 +300,9 @@ Location: `crates/otter-vm-builtins/src/error.rs`
 | Task | Files | Verification |
 |------|-------|--------------|
 | Full frame snapshot (pc, sp, registers, catch_stack, env) | `otter-vm-core/src/generator.rs` | Test262 generators |
-| `generator.next(value)` - send value into generator | `otter-vm-builtins/src/iterator.rs` | Protocol tests |
-| `generator.return(value)` - force completion | `otter-vm-builtins/src/iterator.rs` | Finally semantics |
-| `generator.throw(error)` - throw into generator | `otter-vm-builtins/src/iterator.rs` | Catch semantics |
+| `generator.next(value)` - send value into generator | `otter-vm-core/src/intrinsics_impl/generator.rs` | Protocol tests |
+| `generator.return(value)` - force completion | `otter-vm-core/src/intrinsics_impl/generator.rs` | Finally semantics |
+| `generator.throw(error)` - throw into generator | `otter-vm-core/src/intrinsics_impl/generator.rs` | Catch semantics |
 | Async generators (`async function*`) | `otter-vm-core/src/generator.rs` | Test262 async-gen |
 
 **Generator frame snapshot format**:
@@ -324,9 +324,9 @@ struct GeneratorState {
 
 | Task | Files | Verification |
 |------|-------|--------------|
-| `ArrayBuffer` (wraps `Vec<u8>`, detach state) | `otter-vm-builtins/src/array_buffer.rs` | Test262 ArrayBuffer |
-| TypedArray views (no-copy view into buffer) | `otter-vm-builtins/src/typed_array.rs` | Test262 TypedArray |
-| `DataView` (arbitrary byte-order access) | `otter-vm-builtins/src/data_view.rs` | Test262 DataView |
+| `ArrayBuffer` (wraps `Vec<u8>`, detach state) | `otter-vm-core/src/array_buffer.rs` | Test262 ArrayBuffer |
+| TypedArray views (no-copy view into buffer) | `otter-vm-core/src/typed_array.rs` | Test262 TypedArray |
+| `DataView` (arbitrary byte-order access) | `otter-vm-core/src/data_view.rs` | Test262 DataView |
 
 **TypedArray view model** (critical: no copies):
 
@@ -535,7 +535,7 @@ Following Node.js semantics for ecosystem compatibility:
 | `otter-vm-runtime/src/event_loop.rs` | `EventLoopAdapter` trait + `TokioEventLoop` |
 | `otter-vm-runtime/src/timer.rs` | Timer heap, setTimeout/setInterval |
 | `otter-vm-runtime/src/microtask.rs` | Microtask queue, queueMicrotask |
-| `otter-vm-builtins/src/timers.rs` | setTimeout/setInterval builtins |
+| `otter-vm-runtime/src/timer.rs` | setTimeout/setInterval scheduling |
 
 **Success metric**: Event loop passes spec compliance tests. Embedding API works for real integration scenarios.
 

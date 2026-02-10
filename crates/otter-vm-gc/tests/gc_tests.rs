@@ -3,9 +3,7 @@
 //! These tests verify that the stop-the-world mark/sweep garbage collector
 //! correctly handles various scenarios.
 
-use otter_vm_gc::{
-    AllocationRegistry, GcHeader, GcTraceable, gc_alloc_in,
-};
+use otter_vm_gc::{AllocationRegistry, GcHeader, GcTraceable, gc_alloc_in};
 
 /// Simple test object for GC testing
 struct TestObject {
@@ -36,10 +34,13 @@ fn test_collect_simple_garbage() {
 
     // Create object without rooting
     unsafe {
-        let _ = gc_alloc_in(&registry, TestObject {
-            value: 42,
-            reference: None,
-        });
+        let _ = gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 42,
+                reference: None,
+            },
+        );
     }
 
     // Verify allocation
@@ -62,10 +63,13 @@ fn test_rooted_objects_survive() {
 
     // Allocate and keep a root
     let obj = unsafe {
-        gc_alloc_in(&registry, TestObject {
-            value: 42,
-            reference: None,
-        })
+        gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 42,
+                reference: None,
+            },
+        )
     };
 
     // Get the header for rooting
@@ -93,18 +97,24 @@ fn test_circular_references_collected() {
 
     // Create two objects
     let obj1 = unsafe {
-        gc_alloc_in(&registry, TestObject {
-            value: 1,
-            reference: None,
-        })
+        gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 1,
+                reference: None,
+            },
+        )
     };
     let header1 = unsafe { header_from_ptr(obj1) };
 
     let obj2 = unsafe {
-        gc_alloc_in(&registry, TestObject {
-            value: 2,
-            reference: Some(header1), // obj2 -> obj1
-        })
+        gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 2,
+                reference: Some(header1), // obj2 -> obj1
+            },
+        )
     };
     let header2 = unsafe { header_from_ptr(obj2) };
 
@@ -132,18 +142,24 @@ fn test_circular_references_survive_when_rooted() {
 
     // Create a circular structure
     let obj1 = unsafe {
-        gc_alloc_in(&registry, TestObject {
-            value: 1,
-            reference: None,
-        })
+        gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 1,
+                reference: None,
+            },
+        )
     };
     let header1 = unsafe { header_from_ptr(obj1) };
 
     let obj2 = unsafe {
-        gc_alloc_in(&registry, TestObject {
-            value: 2,
-            reference: Some(header1),
-        })
+        gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 2,
+                reference: Some(header1),
+            },
+        )
     };
     let header2 = unsafe { header_from_ptr(obj2) };
 
@@ -173,10 +189,13 @@ fn test_heap_growth_bounded() {
     // Allocate many temporary objects (not rooted)
     for i in 0..100 {
         unsafe {
-            let _ = gc_alloc_in(&registry, TestObject {
-                value: i,
-                reference: None,
-            });
+            let _ = gc_alloc_in(
+                &registry,
+                TestObject {
+                    value: i,
+                    reference: None,
+                },
+            );
         }
 
         // Trigger GC periodically to keep heap bounded
@@ -199,35 +218,47 @@ fn test_transitive_reachability() {
 
     // Create a chain: root -> obj1 -> obj2 -> obj3
     let obj3 = unsafe {
-        gc_alloc_in(&registry, TestObject {
-            value: 3,
-            reference: None,
-        })
+        gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 3,
+                reference: None,
+            },
+        )
     };
     let header3 = unsafe { header_from_ptr(obj3) };
 
     let obj2 = unsafe {
-        gc_alloc_in(&registry, TestObject {
-            value: 2,
-            reference: Some(header3),
-        })
+        gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 2,
+                reference: Some(header3),
+            },
+        )
     };
     let header2 = unsafe { header_from_ptr(obj2) };
 
     let obj1 = unsafe {
-        gc_alloc_in(&registry, TestObject {
-            value: 1,
-            reference: Some(header2),
-        })
+        gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 1,
+                reference: Some(header2),
+            },
+        )
     };
     let header1 = unsafe { header_from_ptr(obj1) };
 
     // Also create an unreachable object
     unsafe {
-        let _ = gc_alloc_in(&registry, TestObject {
-            value: 999,
-            reference: None,
-        });
+        let _ = gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 999,
+                reference: None,
+            },
+        );
     }
 
     assert_eq!(registry.allocation_count(), 4);
@@ -253,27 +284,36 @@ fn test_multiple_roots() {
 
     // Create multiple independent object graphs
     let obj_a = unsafe {
-        gc_alloc_in(&registry, TestObject {
-            value: 1,
-            reference: None,
-        })
+        gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 1,
+                reference: None,
+            },
+        )
     };
     let header_a = unsafe { header_from_ptr(obj_a) };
 
     let obj_b = unsafe {
-        gc_alloc_in(&registry, TestObject {
-            value: 2,
-            reference: None,
-        })
+        gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 2,
+                reference: None,
+            },
+        )
     };
     let header_b = unsafe { header_from_ptr(obj_b) };
 
     // Unreachable object
     unsafe {
-        let _ = gc_alloc_in(&registry, TestObject {
-            value: 999,
-            reference: None,
-        });
+        let _ = gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 999,
+                reference: None,
+            },
+        );
     }
 
     assert_eq!(registry.allocation_count(), 3);
@@ -292,18 +332,24 @@ fn test_multiple_gc_cycles() {
 
     // First cycle
     let obj1 = unsafe {
-        gc_alloc_in(&registry, TestObject {
-            value: 1,
-            reference: None,
-        })
+        gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 1,
+                reference: None,
+            },
+        )
     };
     let header1 = unsafe { header_from_ptr(obj1) };
 
     unsafe {
-        let _ = gc_alloc_in(&registry, TestObject {
-            value: 2,
-            reference: None,
-        }); // unreachable
+        let _ = gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 2,
+                reference: None,
+            },
+        ); // unreachable
     }
 
     registry.collect(&[header1]);
@@ -311,18 +357,24 @@ fn test_multiple_gc_cycles() {
 
     // Second cycle - add more objects
     let obj3 = unsafe {
-        gc_alloc_in(&registry, TestObject {
-            value: 3,
-            reference: Some(header1),
-        })
+        gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 3,
+                reference: Some(header1),
+            },
+        )
     };
     let header3 = unsafe { header_from_ptr(obj3) };
 
     unsafe {
-        let _ = gc_alloc_in(&registry, TestObject {
-            value: 4,
-            reference: None,
-        }); // unreachable
+        let _ = gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 4,
+                reference: None,
+            },
+        ); // unreachable
     }
 
     registry.collect(&[header3]);
@@ -345,10 +397,13 @@ fn test_gc_statistics() {
 
     // Allocate
     unsafe {
-        let _ = gc_alloc_in(&registry, TestObject {
-            value: 42,
-            reference: None,
-        });
+        let _ = gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 42,
+                reference: None,
+            },
+        );
     }
 
     let stats = registry.stats();
@@ -374,10 +429,13 @@ fn test_should_gc_threshold() {
     // Allocate until threshold is exceeded
     for _ in 0..10 {
         unsafe {
-            let _ = gc_alloc_in(&registry, TestObject {
-                value: 0,
-                reference: None,
-            });
+            let _ = gc_alloc_in(
+                &registry,
+                TestObject {
+                    value: 0,
+                    reference: None,
+                },
+            );
         }
     }
 
@@ -395,10 +453,13 @@ fn test_self_referential_object() {
 
     // Create an object that references itself
     let obj = unsafe {
-        gc_alloc_in(&registry, TestObject {
-            value: 42,
-            reference: None,
-        })
+        gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 42,
+                reference: None,
+            },
+        )
     };
     let header = unsafe { header_from_ptr(obj) };
 
@@ -415,10 +476,13 @@ fn test_self_referential_object() {
 
     // Create another self-referential object and root it
     let obj2 = unsafe {
-        gc_alloc_in(&registry, TestObject {
-            value: 100,
-            reference: None,
-        })
+        gc_alloc_in(
+            &registry,
+            TestObject {
+                value: 100,
+                reference: None,
+            },
+        )
     };
     let header2 = unsafe { header_from_ptr(obj2) };
     unsafe {

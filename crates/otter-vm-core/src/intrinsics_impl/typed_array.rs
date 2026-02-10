@@ -179,9 +179,7 @@ fn init_typed_array_methods(
             |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
-                let index = args.first()
-                    .and_then(|v| v.as_int32())
-                    .unwrap_or(0);
+                let index = args.first().and_then(|v| v.as_int32()).unwrap_or(0);
 
                 let length = ta.length() as i32;
                 let actual_index = if index < 0 {
@@ -211,15 +209,9 @@ fn init_typed_array_methods(
             |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
-                let target = args.get(0)
-                    .and_then(|v| v.as_int32())
-                    .unwrap_or(0) as i64;
-                let start = args.get(1)
-                    .and_then(|v| v.as_int32())
-                    .unwrap_or(0) as i64;
-                let end = args.get(2)
-                    .and_then(|v| v.as_int32())
-                    .map(|v| v as i64);
+                let target = args.get(0).and_then(|v| v.as_int32()).unwrap_or(0) as i64;
+                let start = args.get(1).and_then(|v| v.as_int32()).unwrap_or(0) as i64;
+                let end = args.get(2).and_then(|v| v.as_int32()).map(|v| v as i64);
 
                 ta.copy_within(target, start, end);
 
@@ -237,17 +229,11 @@ fn init_typed_array_methods(
             |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
-                let value = args.first()
-                    .and_then(|v| v.as_number())
-                    .unwrap_or(0.0);
+                let value = args.first().and_then(|v| v.as_number()).unwrap_or(0.0);
 
-                let start = args.get(1)
-                    .and_then(|v| v.as_int32())
-                    .map(|v| v as i64);
+                let start = args.get(1).and_then(|v| v.as_int32()).map(|v| v as i64);
 
-                let end = args.get(2)
-                    .and_then(|v| v.as_int32())
-                    .map(|v| v as i64);
+                let end = args.get(2).and_then(|v| v.as_int32()).map(|v| v as i64);
 
                 ta.fill(value, start, end);
 
@@ -265,13 +251,9 @@ fn init_typed_array_methods(
             |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
-                let search = args.first()
-                    .and_then(|v| v.as_number())
-                    .unwrap_or(f64::NAN);
+                let search = args.first().and_then(|v| v.as_number()).unwrap_or(f64::NAN);
 
-                let from_index = args.get(1)
-                    .and_then(|v| v.as_int32())
-                    .unwrap_or(0) as usize;
+                let from_index = args.get(1).and_then(|v| v.as_int32()).unwrap_or(0) as usize;
 
                 for i in from_index..ta.length() {
                     if let Some(val) = ta.get(i) {
@@ -295,13 +277,9 @@ fn init_typed_array_methods(
             |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
-                let search = args.first()
-                    .and_then(|v| v.as_number())
-                    .unwrap_or(f64::NAN);
+                let search = args.first().and_then(|v| v.as_number()).unwrap_or(f64::NAN);
 
-                let from_index = args.get(1)
-                    .and_then(|v| v.as_int32())
-                    .unwrap_or(0) as usize;
+                let from_index = args.get(1).and_then(|v| v.as_int32()).unwrap_or(0) as usize;
 
                 for i in from_index..ta.length() {
                     if let Some(val) = ta.get(i) {
@@ -325,7 +303,8 @@ fn init_typed_array_methods(
             |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
-                let separator = args.first()
+                let separator = args
+                    .first()
                     .and_then(|v| v.as_string())
                     .map(|s| s.as_str().to_owned())
                     .unwrap_or_else(|| ",".to_owned());
@@ -354,11 +333,10 @@ fn init_typed_array_methods(
             |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
-                let search = args.first()
-                    .and_then(|v| v.as_number())
-                    .unwrap_or(f64::NAN);
+                let search = args.first().and_then(|v| v.as_number()).unwrap_or(f64::NAN);
 
-                let from_index = args.get(1)
+                let from_index = args
+                    .get(1)
                     .and_then(|v| v.as_int32())
                     .map(|v| v as usize)
                     .unwrap_or(ta.length().saturating_sub(1));
@@ -401,9 +379,7 @@ fn init_typed_array_methods(
             |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
-                let offset = args.get(1)
-                    .and_then(|v| v.as_int32())
-                    .unwrap_or(0) as usize;
+                let offset = args.get(1).and_then(|v| v.as_int32()).unwrap_or(0) as usize;
 
                 if let Some(source) = args.first() {
                     // Check if source is a TypedArray
@@ -418,7 +394,8 @@ fn init_typed_array_methods(
                         if let Some(length_val) = source_obj.get(&PropertyKey::string("length")) {
                             if let Some(length) = length_val.as_int32() {
                                 for i in 0..(length as usize) {
-                                    if let Some(val) = source_obj.get(&PropertyKey::Index(i as u32)) {
+                                    if let Some(val) = source_obj.get(&PropertyKey::Index(i as u32))
+                                    {
                                         if let Some(num) = val.as_number() {
                                             let _ = ta.set(offset + i, num);
                                         }
@@ -443,16 +420,11 @@ fn init_typed_array_methods(
             |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
-                let start = args.get(0)
-                    .and_then(|v| v.as_int32())
-                    .unwrap_or(0) as i64;
+                let start = args.get(0).and_then(|v| v.as_int32()).unwrap_or(0) as i64;
 
-                let end = args.get(1)
-                    .and_then(|v| v.as_int32())
-                    .map(|v| v as i64);
+                let end = args.get(1).and_then(|v| v.as_int32()).map(|v| v as i64);
 
-                let new_ta = ta.slice(start, end)
-                    .map_err(|e| VmError::type_error(e))?;
+                let new_ta = ta.slice(start, end).map_err(|e| VmError::type_error(e))?;
 
                 Ok(Value::typed_array(GcRef::new(new_ta)))
             },
@@ -468,15 +440,12 @@ fn init_typed_array_methods(
             |this_val, args, _ncx| {
                 let ta = get_typed_array(this_val)?;
 
-                let begin = args.get(0)
-                    .and_then(|v| v.as_int32())
-                    .unwrap_or(0) as i64;
+                let begin = args.get(0).and_then(|v| v.as_int32()).unwrap_or(0) as i64;
 
-                let end = args.get(1)
-                    .and_then(|v| v.as_int32())
-                    .map(|v| v as i64);
+                let end = args.get(1).and_then(|v| v.as_int32()).map(|v| v as i64);
 
-                let new_ta = ta.subarray(begin, end)
+                let new_ta = ta
+                    .subarray(begin, end)
                     .map_err(|e| VmError::type_error(e))?;
 
                 Ok(Value::typed_array(GcRef::new(new_ta)))
@@ -573,27 +542,37 @@ fn init_typed_array_iterators(
                             .as_object()
                             .ok_or_else(|| VmError::internal("iterator is not an object"))?;
 
-                        let ta_val = iter_obj.get(&PropertyKey::string("_typedArray"))
+                        let ta_val = iter_obj
+                            .get(&PropertyKey::string("_typedArray"))
                             .ok_or_else(|| VmError::internal("iterator missing _typedArray"))?;
-                        let ta = ta_val.as_typed_array()
+                        let ta = ta_val
+                            .as_typed_array()
                             .ok_or_else(|| VmError::internal("_typedArray is not a TypedArray"))?;
 
-                        let index_val = iter_obj.get(&PropertyKey::string("_index"))
+                        let index_val = iter_obj
+                            .get(&PropertyKey::string("_index"))
                             .ok_or_else(|| VmError::internal("iterator missing _index"))?;
                         let index = index_val.as_int32().unwrap_or(0) as usize;
 
-                        let result = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
+                        let result = GcRef::new(JsObject::new(
+                            Value::null(),
+                            ncx_inner.memory_manager().clone(),
+                        ));
 
                         if index >= ta.length() {
                             let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
                             let _ = result.set(PropertyKey::string("value"), Value::undefined());
                         } else {
-                            let val = ta.get(index)
+                            let val = ta
+                                .get(index)
                                 .map(Value::number)
                                 .unwrap_or(Value::undefined());
                             let _ = result.set(PropertyKey::string("value"), val);
                             let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
-                            let _ = iter_obj.set(PropertyKey::string("_index"), Value::int32((index + 1) as i32));
+                            let _ = iter_obj.set(
+                                PropertyKey::string("_index"),
+                                Value::int32((index + 1) as i32),
+                            );
                         }
 
                         Ok(Value::object(result))
@@ -627,7 +606,8 @@ fn init_typed_array_iterators(
             move |this_val, _args, ncx| {
                 let _ta = get_typed_array(this_val)?;
 
-                let iter_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                let iter_obj =
+                    GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 let _ = iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
                 let _ = iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
 
@@ -635,27 +615,41 @@ fn init_typed_array_iterators(
                     PropertyKey::string("next"),
                     Value::native_function_with_proto(
                         move |iter_this, _args, ncx_inner| {
-                            let iter_obj = iter_this.as_object()
+                            let iter_obj = iter_this
+                                .as_object()
                                 .ok_or_else(|| VmError::internal("iterator is not an object"))?;
 
-                            let ta_val = iter_obj.get(&PropertyKey::string("_typedArray"))
+                            let ta_val = iter_obj
+                                .get(&PropertyKey::string("_typedArray"))
                                 .ok_or_else(|| VmError::internal("iterator missing _typedArray"))?;
-                            let ta = ta_val.as_typed_array()
-                                .ok_or_else(|| VmError::internal("_typedArray is not a TypedArray"))?;
+                            let ta = ta_val.as_typed_array().ok_or_else(|| {
+                                VmError::internal("_typedArray is not a TypedArray")
+                            })?;
 
-                            let index = iter_obj.get(&PropertyKey::string("_index"))
+                            let index = iter_obj
+                                .get(&PropertyKey::string("_index"))
                                 .and_then(|v| v.as_int32())
                                 .unwrap_or(0) as usize;
 
-                            let result = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
+                            let result = GcRef::new(JsObject::new(
+                                Value::null(),
+                                ncx_inner.memory_manager().clone(),
+                            ));
 
                             if index >= ta.length() {
-                                let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
-                                let _ = result.set(PropertyKey::string("value"), Value::undefined());
+                                let _ =
+                                    result.set(PropertyKey::string("done"), Value::boolean(true));
+                                let _ =
+                                    result.set(PropertyKey::string("value"), Value::undefined());
                             } else {
-                                let _ = result.set(PropertyKey::string("value"), Value::int32(index as i32));
-                                let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
-                                let _ = iter_obj.set(PropertyKey::string("_index"), Value::int32((index + 1) as i32));
+                                let _ = result
+                                    .set(PropertyKey::string("value"), Value::int32(index as i32));
+                                let _ =
+                                    result.set(PropertyKey::string("done"), Value::boolean(false));
+                                let _ = iter_obj.set(
+                                    PropertyKey::string("_index"),
+                                    Value::int32((index + 1) as i32),
+                                );
                             }
 
                             Ok(Value::object(result))
@@ -679,7 +673,8 @@ fn init_typed_array_iterators(
             move |this_val, _args, ncx| {
                 let _ta = get_typed_array(this_val)?;
 
-                let iter_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                let iter_obj =
+                    GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                 let _ = iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
                 let _ = iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
 
@@ -687,36 +682,55 @@ fn init_typed_array_iterators(
                     PropertyKey::string("next"),
                     Value::native_function_with_proto(
                         move |iter_this, _args, ncx_inner| {
-                            let iter_obj = iter_this.as_object()
+                            let iter_obj = iter_this
+                                .as_object()
                                 .ok_or_else(|| VmError::internal("iterator is not an object"))?;
 
-                            let ta_val = iter_obj.get(&PropertyKey::string("_typedArray"))
+                            let ta_val = iter_obj
+                                .get(&PropertyKey::string("_typedArray"))
                                 .ok_or_else(|| VmError::internal("iterator missing _typedArray"))?;
-                            let ta = ta_val.as_typed_array()
-                                .ok_or_else(|| VmError::internal("_typedArray is not a TypedArray"))?;
+                            let ta = ta_val.as_typed_array().ok_or_else(|| {
+                                VmError::internal("_typedArray is not a TypedArray")
+                            })?;
 
-                            let index = iter_obj.get(&PropertyKey::string("_index"))
+                            let index = iter_obj
+                                .get(&PropertyKey::string("_index"))
                                 .and_then(|v| v.as_int32())
                                 .unwrap_or(0) as usize;
 
-                            let result = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
+                            let result = GcRef::new(JsObject::new(
+                                Value::null(),
+                                ncx_inner.memory_manager().clone(),
+                            ));
 
                             if index >= ta.length() {
-                                let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
-                                let _ = result.set(PropertyKey::string("value"), Value::undefined());
+                                let _ =
+                                    result.set(PropertyKey::string("done"), Value::boolean(true));
+                                let _ =
+                                    result.set(PropertyKey::string("value"), Value::undefined());
                             } else {
-                                let val = ta.get(index)
+                                let val = ta
+                                    .get(index)
                                     .map(Value::number)
                                     .unwrap_or(Value::undefined());
 
                                 // Create [index, value] array
-                                let entry = GcRef::new(JsObject::new(Value::null(), ncx_inner.memory_manager().clone()));
-                                let _ = entry.set(PropertyKey::Index(0), Value::int32(index as i32));
+                                let entry = GcRef::new(JsObject::new(
+                                    Value::null(),
+                                    ncx_inner.memory_manager().clone(),
+                                ));
+                                let _ =
+                                    entry.set(PropertyKey::Index(0), Value::int32(index as i32));
                                 let _ = entry.set(PropertyKey::Index(1), val);
 
-                                let _ = result.set(PropertyKey::string("value"), Value::object(entry));
-                                let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
-                                let _ = iter_obj.set(PropertyKey::string("_index"), Value::int32((index + 1) as i32));
+                                let _ =
+                                    result.set(PropertyKey::string("value"), Value::object(entry));
+                                let _ =
+                                    result.set(PropertyKey::string("done"), Value::boolean(false));
+                                let _ = iter_obj.set(
+                                    PropertyKey::string("_index"),
+                                    Value::int32((index + 1) as i32),
+                                );
                             }
 
                             Ok(Value::object(result))

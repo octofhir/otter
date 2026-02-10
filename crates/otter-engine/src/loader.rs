@@ -5,6 +5,7 @@
 //! - `https://` URLs for remote modules (with allowlist-based security)
 
 use crate::error::{EngineError, EngineResult};
+use otter_nodejs::{NodeApiProfile, get_builtin_entry_for_profile, is_builtin_for_profile};
 use oxc_resolver::{ResolveOptions, Resolver};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,9 @@ pub struct LoaderConfig {
     /// Condition names for CJS requires (require() calls)
     /// e.g., ["require", "node", "default"]
     pub cjs_conditions: Vec<String>,
+
+    /// Node.js builtin availability profile for module resolution/loading.
+    pub node_api_profile: NodeApiProfile,
 }
 
 impl Default for LoaderConfig {
@@ -74,6 +78,8 @@ impl Default for LoaderConfig {
             ],
             // CJS: prefer "require" entry points
             cjs_conditions: vec!["require".into(), "node".into(), "default".into()],
+            // Secure-by-default loader profile (Node builtins disabled unless enabled explicitly).
+            node_api_profile: NodeApiProfile::None,
         }
     }
 }
@@ -187,21 +193,17 @@ impl ModuleLoader {
         referrer: Option<&str>,
         context: ImportContext,
     ) -> EngineResult<ResolvedModule> {
-        // Check cache first (include context in key for different resolutions)
-        let context_str = match context {
-            ImportContext::ESM => "esm",
-            ImportContext::CJS => "cjs",
-        };
-        let cache_key = format!("{}|{}|{}", specifier, referrer.unwrap_or(""), context_str);
+        // Resolve the specifier with context
+        let resolved_url = self.resolve_with_context(specifier, referrer, context)?;
+
+        // Shared cache by canonical URL for mixed ESM/CJS graphs.
+        // A single module instance must be reused regardless of import context.
         {
             let cache = self.cache.read().await;
-            if let Some(module) = cache.get(&cache_key) {
+            if let Some(module) = cache.get(&resolved_url) {
                 return Ok(module.clone());
             }
         }
-
-        // Resolve the specifier with context
-        let resolved_url = self.resolve_with_context(specifier, referrer, context)?;
 
         // Load the module
         let module = self.load_url(&resolved_url).await?;
@@ -209,7 +211,7 @@ impl ModuleLoader {
         // Cache the result
         {
             let mut cache = self.cache.write().await;
-            cache.insert(cache_key, module.clone());
+            cache.insert(resolved_url, module.clone());
         }
 
         Ok(module)
@@ -249,12 +251,18 @@ impl ModuleLoader {
             return Ok(format!("otter:{}", specifier));
         }
 
-        // node: imports are not supported - use otter: builtins instead
-        if specifier.starts_with("node:") {
-            return Err(EngineError::ModuleError(format!(
-                "Node.js built-in modules are not supported.\n\
-Use Otter built-in modules (otter:*) instead, or install npm packages.",
-            )));
+        // Node built-ins (prefixed and bare) are canonicalized to builtin://node:*
+        if is_builtin_for_profile(specifier, self.config.node_api_profile) {
+            let name = specifier.strip_prefix("node:").unwrap_or(specifier);
+            return Ok(format!("builtin://node:{}", name));
+        }
+
+        // npm namespace support (initial Bun-style path): `npm:pkg` -> resolve as `pkg`.
+        if let Some(raw) = specifier.strip_prefix("npm:") {
+            let normalized = normalize_npm_specifier(raw).ok_or_else(|| {
+                EngineError::ModuleError(format!("Invalid npm specifier '{}'", specifier))
+            })?;
+            return self.resolve_with_context(&normalized, referrer, context);
         }
 
         // Absolute URLs (https://, http://)
@@ -264,7 +272,9 @@ Use Otter built-in modules (otter:*) instead, or install npm packages.",
 
         // File URLs - convert to path and resolve
         if specifier.starts_with("file://") {
-            return Ok(specifier.to_string());
+            let path = specifier.strip_prefix("file://").unwrap_or(specifier);
+            let canonical = canonicalize_path(Path::new(path));
+            return Ok(format!("file://{}", canonical.display()));
         }
 
         // Use oxc-resolver for everything else (relative paths, bare specifiers)
@@ -283,7 +293,7 @@ Use Otter built-in modules (otter:*) instead, or install npm packages.",
 
         match resolver.resolve(&base_dir, specifier) {
             Ok(resolution) => {
-                let path = resolution.full_path();
+                let path = canonicalize_path(&resolution.full_path());
                 Ok(format!("file://{}", path.display()))
             }
             Err(e) => Err(EngineError::ModuleError(format!(
@@ -311,9 +321,20 @@ Use Otter built-in modules (otter:*) instead, or install npm packages.",
 
     /// Load module from URL
     async fn load_url(&self, url: &str) -> EngineResult<ResolvedModule> {
+        if let Some(name) = url.strip_prefix("builtin://node:") {
+            return self.load_node_builtin(name);
+        }
+
         // Otter built-in modules (e.g., "otter")
         if let Some(builtin) = url.strip_prefix("otter:") {
             return self.load_otter_builtin(builtin);
+        }
+
+        if url.starts_with("npm:") {
+            return Err(EngineError::ModuleError(format!(
+                "npm namespace is not configured for '{}'. Configure npm resolution/provider first.",
+                url
+            )));
         }
 
         if let Some(path) = url.strip_prefix("file://") {
@@ -412,6 +433,28 @@ Use Otter built-in modules (otter:*) instead, or install npm packages.",
             source: String::new(),
             source_type: SourceType::JavaScript,
             module_type: ModuleType::ESM, // Otter builtins are exposed as ESM
+        })
+    }
+
+    /// Load a Node.js built-in module.
+    ///
+    /// All Node.js modules are now native extensions — returns empty source
+    /// so the module loader knows the specifier is valid.
+    fn load_node_builtin(&self, name: &str) -> EngineResult<ResolvedModule> {
+        let _entry =
+            get_builtin_entry_for_profile(name, self.config.node_api_profile).ok_or_else(|| {
+                EngineError::ModuleError(format!(
+                    "Node.js built-in module '{}' is unavailable for profile {:?}",
+                    name, self.config.node_api_profile
+                ))
+            })?;
+
+        Ok(ResolvedModule {
+            specifier: format!("node:{}", name),
+            url: format!("builtin://node:{}", name),
+            source: String::new(),
+            source_type: SourceType::JavaScript,
+            module_type: ModuleType::ESM,
         })
     }
 
@@ -520,6 +563,46 @@ fn is_otter_builtin(specifier: &str) -> bool {
     matches!(specifier, "otter")
 }
 
+/// Normalize `npm:` specifier payload to a bare package specifier usable by resolver.
+fn normalize_npm_specifier(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+
+    if raw.starts_with('@') {
+        let slash = raw.find('/')?;
+        let after_scope = &raw[slash + 1..];
+        let pkg_end_rel = after_scope.find('/').unwrap_or(after_scope.len());
+        let pkg_and_ver = &after_scope[..pkg_end_rel];
+
+        let (pkg_name, rest_after_pkg) = if let Some(ver_at) = pkg_and_ver.find('@') {
+            (&pkg_and_ver[..ver_at], &after_scope[pkg_end_rel..])
+        } else {
+            (pkg_and_ver, &after_scope[pkg_end_rel..])
+        };
+
+        if pkg_name.is_empty() {
+            return None;
+        }
+
+        return Some(format!(
+            "@{}/{}{}",
+            &raw[1..slash],
+            pkg_name,
+            rest_after_pkg
+        ));
+    }
+
+    let slash = raw.find('/').unwrap_or(raw.len());
+    let pkg_and_ver = &raw[..slash];
+    let rest = &raw[slash..];
+    let pkg = pkg_and_ver.split('@').next().unwrap_or_default();
+    if pkg.is_empty() {
+        return None;
+    }
+    Some(format!("{}{}", pkg, rest))
+}
+
 /// Simple glob matching for URL patterns
 fn glob_match(pattern: &str, url: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix("/*") {
@@ -546,16 +629,49 @@ fn strip_shebang(source: &str) -> String {
     }
 }
 
+fn canonicalize_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    fn loader_for_profile(profile: NodeApiProfile) -> ModuleLoader {
+        ModuleLoader::new(LoaderConfig {
+            node_api_profile: profile,
+            ..Default::default()
+        })
+    }
 
     #[test]
-    fn test_resolve_node_imports_rejected() {
-        let loader = ModuleLoader::new(LoaderConfig::default());
-        let result = loader.resolve("node:fs", None);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not supported"));
+    fn test_resolve_node_imports_prefixed() {
+        let loader = loader_for_profile(NodeApiProfile::Full);
+        let result = loader.resolve("node:fs", None).unwrap();
+        assert_eq!(result, "builtin://node:fs");
+    }
+
+    #[test]
+    fn test_resolve_node_imports_bare() {
+        let loader = loader_for_profile(NodeApiProfile::Full);
+        let result = loader.resolve("path", None).unwrap();
+        assert_eq!(result, "builtin://node:path");
+    }
+
+    #[test]
+    fn test_resolve_node_imports_none_profile() {
+        let loader = loader_for_profile(NodeApiProfile::None);
+        assert!(loader.resolve("node:fs", None).is_err());
+        assert!(loader.resolve("path", None).is_err());
+    }
+
+    #[test]
+    fn test_resolve_node_imports_safe_profile() {
+        let loader = loader_for_profile(NodeApiProfile::SafeCore);
+        let path = loader.resolve("path", None).unwrap();
+        assert_eq!(path, "builtin://node:path");
+        assert!(loader.resolve("process", None).is_err());
     }
 
     #[test]
@@ -601,6 +717,48 @@ mod tests {
         let loader = ModuleLoader::new(LoaderConfig::default());
         let result = loader.resolve("file:///some/path/module.js", None).unwrap();
         assert_eq!(result, "file:///some/path/module.js");
+    }
+
+    #[test]
+    fn test_resolve_npm_namespace_to_node_modules() {
+        let dir = tempdir().unwrap();
+        let pkg_dir = dir.path().join("node_modules").join("lodash");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{
+  "name": "lodash",
+  "main": "index.js"
+}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("index.js"), "module.exports = {};").unwrap();
+
+        let main = dir.path().join("main.mjs");
+        std::fs::write(&main, "import _ from 'npm:lodash';").unwrap();
+
+        let config = LoaderConfig {
+            base_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let loader = ModuleLoader::new(config);
+        let referrer = format!("file://{}", main.display());
+        let result = loader.resolve("npm:lodash@4", Some(&referrer)).unwrap();
+        assert!(result.ends_with("node_modules/lodash/index.js"));
+    }
+
+    #[test]
+    fn test_normalize_npm_specifier() {
+        assert_eq!(normalize_npm_specifier("lodash").as_deref(), Some("lodash"));
+        assert_eq!(
+            normalize_npm_specifier("lodash@4/fp").as_deref(),
+            Some("lodash/fp")
+        );
+        assert_eq!(
+            normalize_npm_specifier("@scope/pkg@1.2.3/sub").as_deref(),
+            Some("@scope/pkg/sub")
+        );
+        assert!(normalize_npm_specifier("").is_none());
     }
 
     #[test]
@@ -734,5 +892,38 @@ mod tests {
             loader.detect_module_type(Path::new("/nonexistent/path/file.js")),
             ModuleType::ESM
         );
+    }
+
+    #[tokio::test]
+    async fn test_shared_cache_between_esm_and_cjs_contexts() {
+        let dir = tempdir().unwrap();
+        let shared_path = dir.path().join("shared.cjs");
+        let main_path = dir.path().join("main.mjs");
+
+        std::fs::write(&shared_path, "module.exports = { value: 1 };").unwrap();
+        std::fs::write(&main_path, "import x from './shared.cjs';").unwrap();
+
+        let loader = ModuleLoader::new(LoaderConfig {
+            base_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+
+        let referrer = format!("file://{}", main_path.display());
+        let first = loader
+            .load_with_context("./shared.cjs", Some(&referrer), ImportContext::ESM)
+            .await
+            .unwrap();
+
+        // Mutate file after first load. If ESM/CJS use separate cache entries,
+        // second load would observe changed source.
+        std::fs::write(&shared_path, "module.exports = { value: 2 };").unwrap();
+
+        let second = loader
+            .load_with_context("./shared.cjs", Some(&referrer), ImportContext::CJS)
+            .await
+            .unwrap();
+
+        assert_eq!(first.url, second.url);
+        assert_eq!(first.source, second.source);
     }
 }

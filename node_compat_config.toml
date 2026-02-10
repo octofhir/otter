@@ -1,0 +1,54 @@
+# Node.js Compatibility Test Configuration
+#
+# Tests are fetched from official nodejs/node repo via:
+#   bash scripts/fetch-node-tests.sh
+#
+# Test files live flat in tests/node-compat/node/test/parallel/
+# Each module defines glob patterns to select its test files.
+
+timeout_secs = 10
+
+[modules.assert]
+patterns = ["test-assert-*.js", "test-assert.js"]
+skip = [
+    "test-assert-async.js",                       # needs async node:test
+    "test-assert-esm-cjs-message-verify.js",       # needs child_process for message verification
+    "test-assert-class-destructuring.js",           # edge case: destructuring in class body
+]
+
+[modules.path]
+patterns = ["test-path-*.js", "test-path.js"]
+skip = [
+    "test-path-resolve.js",                         # needs child_process
+    "test-path-posix-exists.js",                     # needs path/posix submodule
+    "test-path-win32-exists.js",                     # needs path/win32 submodule
+]
+
+[modules.util]
+patterns = ["test-util-*.js", "test-util.js"]
+skip = [
+    "test-util-callbackify.js",                    # needs full promise/callback interop
+]
+
+[modules.buffer]
+patterns = ["test-buffer-*.js", "test-buffer.js"]
+skip = [
+    "test-buffer-sharedarraybuffer.js",             # needs SharedArrayBuffer
+]
+
+[modules.events]
+patterns = ["test-events-*.js", "test-event-emitter-*.js"]
+skip = [
+    "test-events-async-context.js",                 # needs AsyncLocalStorage
+]
+
+[modules.os]
+patterns = ["test-os-*.js", "test-os.js"]
+skip = []
+
+[modules.process]
+patterns = ["test-process-*.js"]
+skip = [
+    "test-process-exec.js",                         # needs child_process
+    "test-process-spawn.js",                         # needs child_process
+]

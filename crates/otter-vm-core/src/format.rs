@@ -8,13 +8,21 @@ use crate::trace::{TraceEntry, TraceRingBuffer};
 use std::fmt::Write;
 
 /// Format a VM context snapshot for human-readable output
-pub fn format_snapshot(snapshot: &VmContextSnapshot, trace_buffer: Option<&TraceRingBuffer>) -> String {
+pub fn format_snapshot(
+    snapshot: &VmContextSnapshot,
+    trace_buffer: Option<&TraceRingBuffer>,
+) -> String {
     let mut output = String::new();
 
     // VM State Section
     writeln!(&mut output, "VM State Snapshot:").unwrap();
     writeln!(&mut output, "  Stack Depth: {}", snapshot.stack_depth).unwrap();
-    writeln!(&mut output, "  Native Depth: {}", snapshot.native_call_depth).unwrap();
+    writeln!(
+        &mut output,
+        "  Native Depth: {}",
+        snapshot.native_call_depth
+    )
+    .unwrap();
 
     if let Some(current_module) = &snapshot.module_url {
         writeln!(&mut output, "  Current Module: {}", current_module).unwrap();
@@ -27,9 +35,19 @@ pub fn format_snapshot(snapshot: &VmContextSnapshot, trace_buffer: Option<&Trace
         writeln!(&mut output, "Current Frame:").unwrap();
 
         if let Some(name) = &current_frame.function_name {
-            writeln!(&mut output, "  Function: {} (index: {})", name, current_frame.function_index).unwrap();
+            writeln!(
+                &mut output,
+                "  Function: {} (index: {})",
+                name, current_frame.function_index
+            )
+            .unwrap();
         } else {
-            writeln!(&mut output, "  Function: <anonymous> (index: {})", current_frame.function_index).unwrap();
+            writeln!(
+                &mut output,
+                "  Function: <anonymous> (index: {})",
+                current_frame.function_index
+            )
+            .unwrap();
         }
 
         writeln!(&mut output, "  Module: {}", current_frame.module_url).unwrap();
@@ -45,7 +63,12 @@ pub fn format_snapshot(snapshot: &VmContextSnapshot, trace_buffer: Option<&Trace
 
     // Call Stack Section
     if !snapshot.call_stack.is_empty() {
-        writeln!(&mut output, "Call Stack ({} frames):", snapshot.call_stack.len()).unwrap();
+        writeln!(
+            &mut output,
+            "Call Stack ({} frames):",
+            snapshot.call_stack.len()
+        )
+        .unwrap();
         write!(&mut output, "{}", format_call_stack(&snapshot.call_stack)).unwrap();
         writeln!(&mut output).unwrap();
     }
@@ -116,7 +139,8 @@ pub fn format_trace_buffer(buffer: &TraceRingBuffer) -> String {
                 entry.instruction_number,
                 entry.opcode,
                 shorten_operands(&entry.operands)
-            ).unwrap();
+            )
+            .unwrap();
 
             // Show repetition notice
             let last_repeat = i + repeat_count - 1;
@@ -125,7 +149,8 @@ pub fn format_trace_buffer(buffer: &TraceRingBuffer) -> String {
                 "  ... repeated {} more times (until #{})",
                 repeat_count - 1,
                 entries[last_repeat].instruction_number
-            ).unwrap();
+            )
+            .unwrap();
 
             i += repeat_count;
         } else {
@@ -136,12 +161,19 @@ pub fn format_trace_buffer(buffer: &TraceRingBuffer) -> String {
                 entry.instruction_number,
                 entry.opcode,
                 shorten_operands(&entry.operands)
-            ).unwrap();
+            )
+            .unwrap();
 
             // Show modified registers if any
             if !entry.modified_registers.is_empty() {
                 for (reg, val) in &entry.modified_registers {
-                    writeln!(&mut output, "             r{} := {}", reg, truncate_value(val, 40)).unwrap();
+                    writeln!(
+                        &mut output,
+                        "             r{} := {}",
+                        reg,
+                        truncate_value(val, 40)
+                    )
+                    .unwrap();
                 }
             }
             i += 1;
@@ -183,8 +215,9 @@ fn count_consecutive_repeats(entries: &[&TraceEntry], start: usize) -> usize {
 /// Shorten operands for more readable output
 fn shorten_operands(operands: &str) -> String {
     // Remove "{ " and " }" wrapping
-    let trimmed = operands.trim_start_matches(|c: char| c == '{' || c.is_whitespace())
-                          .trim_end_matches(|c: char| c == '}' || c.is_whitespace());
+    let trimmed = operands
+        .trim_start_matches(|c: char| c == '{' || c.is_whitespace())
+        .trim_end_matches(|c: char| c == '}' || c.is_whitespace());
 
     // Truncate if too long
     truncate_value(trimmed, 60).to_string()
@@ -221,27 +254,47 @@ fn detect_loops(entries: &[&TraceEntry]) -> Option<String> {
     if max_count > 10 {
         let mut analysis = String::new();
         writeln!(&mut analysis, "  - Tight loop detected").unwrap();
-        writeln!(&mut analysis, "  - Repeated instruction execution (max: {} times)", max_count).unwrap();
-        writeln!(&mut analysis, "  - Possible infinite loop or missing termination condition").unwrap();
+        writeln!(
+            &mut analysis,
+            "  - Repeated instruction execution (max: {} times)",
+            max_count
+        )
+        .unwrap();
+        writeln!(
+            &mut analysis,
+            "  - Possible infinite loop or missing termination condition"
+        )
+        .unwrap();
         writeln!(&mut analysis).unwrap();
         writeln!(&mut analysis, "Suggested Actions:").unwrap();
         writeln!(&mut analysis, "  1. Check loop termination condition").unwrap();
         writeln!(&mut analysis, "  2. Verify callback function logic").unwrap();
-        writeln!(&mut analysis, "  3. Look for missing break/return statements").unwrap();
+        writeln!(
+            &mut analysis,
+            "  3. Look for missing break/return statements"
+        )
+        .unwrap();
 
         return Some(analysis);
     }
 
     // Look for jump patterns (back-jumps in sequence)
-    let back_jumps = entries.iter()
-        .filter(|e| e.opcode.contains("Jump"))
-        .count();
+    let back_jumps = entries.iter().filter(|e| e.opcode.contains("Jump")).count();
 
     if back_jumps > entries.len() / 3 {
         let mut analysis = String::new();
-        writeln!(&mut analysis, "  - High frequency of jump instructions ({} jumps in {} instructions)",
-                 back_jumps, entries.len()).unwrap();
-        writeln!(&mut analysis, "  - May indicate loop-heavy code or complex control flow").unwrap();
+        writeln!(
+            &mut analysis,
+            "  - High frequency of jump instructions ({} jumps in {} instructions)",
+            back_jumps,
+            entries.len()
+        )
+        .unwrap();
+        writeln!(
+            &mut analysis,
+            "  - May indicate loop-heavy code or complex control flow"
+        )
+        .unwrap();
 
         return Some(analysis);
     }

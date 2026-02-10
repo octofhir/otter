@@ -1,25 +1,25 @@
 //! Thread-confined interior mutability for VM objects.
 //!
-//! `ObjectCell<T>` provides zero-cost interior mutability for the single-threaded VM.
-//! In release builds, `borrow()` and `borrow_mut()` compile to raw pointer dereferences.
-//! In debug builds, runtime borrow tracking catches overlapping mutable borrows.
+//! `ObjectCell<T>` provides safe interior mutability for the single-threaded VM,
+//! backed by `RefCell<T>`. Runtime borrow checking catches overlapping mutable
+//! borrows in both debug AND release builds.
 //!
 //! # Safety
 //!
 //! This type must only be accessed from a single thread. The VM enforces thread
-//! confinement at the `VmRuntime`/`VmContext` level.
+//! confinement at the `VmRuntime`/`VmContext` level. The `Send+Sync` impls
+//! are justified by this thread confinement guarantee (same pattern used by
+//! `Shape::transitions` which also uses `RefCell`).
 
-use std::cell::UnsafeCell;
+use std::cell::{Ref, RefCell, RefMut};
 use std::ops::{Deref, DerefMut};
 
 /// Thread-confined interior mutability wrapper.
 ///
 /// Replaces `parking_lot::RwLock` in `JsObject` and similar hot-path types.
-/// Zero overhead in release builds; debug-mode borrow tracking in debug builds.
+/// Uses `RefCell` internally for safe runtime borrow checking in all build modes.
 pub struct ObjectCell<T> {
-    value: UnsafeCell<T>,
-    #[cfg(debug_assertions)]
-    borrow_state: std::cell::Cell<isize>, // >0 = shared borrows, -1 = exclusive
+    value: RefCell<T>,
 }
 
 impl<T> ObjectCell<T> {
@@ -27,57 +27,27 @@ impl<T> ObjectCell<T> {
     #[inline]
     pub fn new(value: T) -> Self {
         Self {
-            value: UnsafeCell::new(value),
-            #[cfg(debug_assertions)]
-            borrow_state: std::cell::Cell::new(0),
+            value: RefCell::new(value),
         }
     }
 
     /// Borrow the value immutably.
     ///
-    /// In debug builds, panics if an exclusive borrow is active.
+    /// Panics if an exclusive borrow is active.
     #[inline]
     pub fn borrow(&self) -> ObjectCellRef<'_, T> {
-        #[cfg(debug_assertions)]
-        {
-            let state = self.borrow_state.get();
-            if state < 0 {
-                panic!("ObjectCell: immutable borrow while mutably borrowed");
-            }
-            self.borrow_state.set(state + 1);
-        }
         ObjectCellRef {
-            // SAFETY: Single-threaded access guaranteed by VM thread confinement.
-            // Debug builds verify no exclusive borrow is active.
-            value: unsafe { &*self.value.get() },
-            #[cfg(debug_assertions)]
-            borrow_state: &self.borrow_state,
+            inner: self.value.borrow(),
         }
     }
 
     /// Borrow the value mutably.
     ///
-    /// In debug builds, panics if any borrow is active.
+    /// Panics if any borrow (shared or exclusive) is active.
     #[inline]
     pub fn borrow_mut(&self) -> ObjectCellRefMut<'_, T> {
-        #[cfg(debug_assertions)]
-        {
-            let state = self.borrow_state.get();
-            if state != 0 {
-                panic!(
-                    "ObjectCell: mutable borrow while {} active (state={})",
-                    if state > 0 { "immutably borrowed" } else { "mutably borrowed" },
-                    state
-                );
-            }
-            self.borrow_state.set(-1);
-        }
         ObjectCellRefMut {
-            // SAFETY: Single-threaded access guaranteed by VM thread confinement.
-            // Debug builds verify no other borrow is active.
-            value: unsafe { &mut *self.value.get() },
-            #[cfg(debug_assertions)]
-            borrow_state: &self.borrow_state,
+            inner: self.value.borrow_mut(),
         }
     }
 
@@ -92,22 +62,28 @@ impl<T> ObjectCell<T> {
 // The VM enforces thread confinement at the VmRuntime/VmContext level.
 // We implement Send+Sync so that GcRef<JsObject> can be stored in
 // types that need to be Send (e.g., across .await points in the engine).
+// This is the same pattern used by Shape::transitions (RefCell + unsafe Send+Sync).
 unsafe impl<T: Send> Send for ObjectCell<T> {}
 unsafe impl<T: Send + Sync> Sync for ObjectCell<T> {}
 
 impl<T: std::fmt::Debug> std::fmt::Debug for ObjectCell<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // SAFETY: Only called for debugging, single-threaded context
-        let value = unsafe { &*self.value.get() };
-        f.debug_struct("ObjectCell").field("value", value).finish()
+        match self.value.try_borrow() {
+            Ok(value) => f
+                .debug_struct("ObjectCell")
+                .field("value", &*value)
+                .finish(),
+            Err(_) => f
+                .debug_struct("ObjectCell")
+                .field("value", &"<borrowed>")
+                .finish(),
+        }
     }
 }
 
 /// Immutable borrow guard for `ObjectCell<T>`.
 pub struct ObjectCellRef<'a, T> {
-    value: &'a T,
-    #[cfg(debug_assertions)]
-    borrow_state: &'a std::cell::Cell<isize>,
+    inner: Ref<'a, T>,
 }
 
 impl<T> Deref for ObjectCellRef<'_, T> {
@@ -115,27 +91,13 @@ impl<T> Deref for ObjectCellRef<'_, T> {
 
     #[inline]
     fn deref(&self) -> &T {
-        self.value
-    }
-}
-
-impl<T> Drop for ObjectCellRef<'_, T> {
-    #[inline]
-    fn drop(&mut self) {
-        #[cfg(debug_assertions)]
-        {
-            let state = self.borrow_state.get();
-            debug_assert!(state > 0);
-            self.borrow_state.set(state - 1);
-        }
+        &self.inner
     }
 }
 
 /// Mutable borrow guard for `ObjectCell<T>`.
 pub struct ObjectCellRefMut<'a, T> {
-    value: &'a mut T,
-    #[cfg(debug_assertions)]
-    borrow_state: &'a std::cell::Cell<isize>,
+    inner: RefMut<'a, T>,
 }
 
 impl<T> Deref for ObjectCellRefMut<'_, T> {
@@ -143,26 +105,14 @@ impl<T> Deref for ObjectCellRefMut<'_, T> {
 
     #[inline]
     fn deref(&self) -> &T {
-        self.value
+        &self.inner
     }
 }
 
 impl<T> DerefMut for ObjectCellRefMut<'_, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
-        self.value
-    }
-}
-
-impl<T> Drop for ObjectCellRefMut<'_, T> {
-    #[inline]
-    fn drop(&mut self) {
-        #[cfg(debug_assertions)]
-        {
-            let state = self.borrow_state.get();
-            debug_assert_eq!(state, -1);
-            self.borrow_state.set(0);
-        }
+        &mut self.inner
     }
 }
 
@@ -188,8 +138,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "ObjectCell: mutable borrow while immutably borrowed")]
+    #[should_panic(expected = "already borrowed")]
     fn test_borrow_mut_while_borrowed() {
         let cell = ObjectCell::new(42);
         let _a = cell.borrow();
@@ -197,8 +146,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "ObjectCell: immutable borrow while mutably borrowed")]
+    #[should_panic(expected = "already mutably borrowed")]
     fn test_borrow_while_mut_borrowed() {
         let cell = ObjectCell::new(42);
         let _a = cell.borrow_mut();

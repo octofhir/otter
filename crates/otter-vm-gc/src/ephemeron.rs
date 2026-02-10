@@ -32,8 +32,8 @@
 //! ```
 
 use crate::object::GcHeader;
-use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 
 /// Ephemeron entry: (key, value) where value is only live if key is live
 #[derive(Debug, Clone)]
@@ -47,7 +47,8 @@ struct EphemeronEntry {
     drop_fn: Option<unsafe fn(*mut u8)>,
 }
 
-// SAFETY: EphemeronEntry is protected by RwLock, so Send + Sync is safe
+// SAFETY: EphemeronEntry is only accessed from the single VM thread.
+// Thread confinement is enforced at the VmRuntime/VmContext level.
 unsafe impl Send for EphemeronEntry {}
 unsafe impl Sync for EphemeronEntry {}
 
@@ -59,12 +60,17 @@ unsafe impl Sync for EphemeronEntry {}
 /// - Automatic cleanup during GC sweep
 pub struct EphemeronTable {
     /// Entries indexed by key pointer (as usize for hashing)
-    entries: RwLock<FxHashMap<usize, EphemeronEntry>>,
+    entries: RefCell<FxHashMap<usize, EphemeronEntry>>,
 }
+
+// SAFETY: EphemeronTable is only accessed from the single VM thread.
+// Thread confinement is enforced at the VmRuntime/VmContext level.
+unsafe impl Send for EphemeronTable {}
+unsafe impl Sync for EphemeronTable {}
 
 impl std::fmt::Debug for EphemeronTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let entries = self.entries.read();
+        let entries = self.entries.borrow();
         f.debug_struct("EphemeronTable")
             .field("entry_count", &entries.len())
             .finish()
@@ -75,7 +81,7 @@ impl EphemeronTable {
     /// Create a new empty ephemeron table
     pub fn new() -> Self {
         Self {
-            entries: RwLock::new(FxHashMap::default()),
+            entries: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -103,7 +109,7 @@ impl EphemeronTable {
             drop_fn,
         };
 
-        self.entries.write().insert(key_addr, entry);
+        self.entries.borrow_mut().insert(key_addr, entry);
     }
 
     /// Get value for a key (if key exists and is still alive)
@@ -118,7 +124,7 @@ impl EphemeronTable {
     pub unsafe fn get_raw(&self, key: *const GcHeader) -> Option<Vec<u8>> {
         let key_addr = key as usize;
         self.entries
-            .read()
+            .borrow()
             .get(&key_addr)
             .map(|entry| entry.value.clone())
     }
@@ -129,7 +135,7 @@ impl EphemeronTable {
     /// - `key` must point to a valid GcHeader (may be dead)
     pub unsafe fn has(&self, key: *const GcHeader) -> bool {
         let key_addr = key as usize;
-        self.entries.read().contains_key(&key_addr)
+        self.entries.borrow().contains_key(&key_addr)
     }
 
     /// Remove an entry by key
@@ -140,7 +146,7 @@ impl EphemeronTable {
     /// - `key` must point to a valid GcHeader (may be dead)
     pub unsafe fn delete(&self, key: *const GcHeader) -> bool {
         let key_addr = key as usize;
-        let mut entries = self.entries.write();
+        let mut entries = self.entries.borrow_mut();
 
         if let Some(entry) = entries.remove(&key_addr) {
             // Call drop_fn if provided
@@ -170,7 +176,7 @@ impl EphemeronTable {
     /// - Must be called during GC mark phase
     /// - `tracer` must correctly mark all GC references in values
     pub unsafe fn trace_live_entries(&self, tracer: &mut dyn FnMut(*const GcHeader)) -> usize {
-        let entries = self.entries.read();
+        let entries = self.entries.borrow();
         let mut newly_marked = 0;
 
         for entry in entries.values() {
@@ -217,7 +223,7 @@ impl EphemeronTable {
     /// - Must be called during GC sweep phase
     /// - All live keys must already be marked
     pub unsafe fn sweep(&self) -> usize {
-        let mut entries = self.entries.write();
+        let mut entries = self.entries.borrow_mut();
         let initial_count = entries.len();
 
         // Partition: keep entries with live keys, drop entries with dead keys
@@ -233,33 +239,30 @@ impl EphemeronTable {
                 let should_keep = key_header.mark() == crate::object::MarkColor::Black;
 
                 // If we're removing the entry, call drop_fn
-                if !should_keep {
-                    if let Some(drop_fn) = entry.drop_fn {
-                        drop_fn(entry.value.as_ptr() as *mut u8);
-                    }
+                if !should_keep && let Some(drop_fn) = entry.drop_fn {
+                    drop_fn(entry.value.as_ptr() as *mut u8);
                 }
 
                 should_keep
             }
         });
 
-        let removed = initial_count - entries.len();
-        removed
+        initial_count - entries.len()
     }
 
     /// Get the number of entries in the table
     pub fn len(&self) -> usize {
-        self.entries.read().len()
+        self.entries.borrow().len()
     }
 
     /// Check if the table is empty
     pub fn is_empty(&self) -> bool {
-        self.entries.read().is_empty()
+        self.entries.borrow().is_empty()
     }
 
     /// Clear all entries (for testing or table reset)
     pub fn clear(&self) {
-        let mut entries = self.entries.write();
+        let mut entries = self.entries.borrow_mut();
 
         // Call drop_fn for each entry
         for (_key, entry) in entries.drain() {

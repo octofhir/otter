@@ -250,7 +250,6 @@ fn test_generator_third_next_call() {
     }
 }
 
-
 #[test]
 fn test_generator_simple_return() {
     let mut engine = create_test_engine();

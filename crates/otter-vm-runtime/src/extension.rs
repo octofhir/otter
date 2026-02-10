@@ -67,7 +67,9 @@ impl OpHandler {
         match self {
             OpHandler::Native(f) => f(args, memory_manager),
             OpHandler::Sync(_) => Err(VmError::type_error("Cannot call JSON op with native args")),
-            OpHandler::Async(_) => Err(VmError::type_error("Cannot call async op with native args")),
+            OpHandler::Async(_) => {
+                Err(VmError::type_error("Cannot call async op with native args"))
+            }
         }
     }
 

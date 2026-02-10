@@ -16,26 +16,37 @@ pub mod capabilities_context;
 pub mod env_store;
 pub mod event_loop;
 pub mod extension;
+pub mod extension_state;
+pub mod extension_v2;
 pub mod microtask;
 pub mod module_loader;
+pub mod module_provider;
 pub mod otter_runtime;
 pub mod promise;
+pub mod registration;
 pub mod timer;
 pub mod worker;
 
 // Re-export main types
 pub use builder::OtterBuilder;
 pub use event_loop::{ActiveServerCount, EventLoop, HttpEvent, WsEvent};
-pub use microtask::MicrotaskQueue;
 pub use extension::{
     Extension, ExtensionRegistry, NativeOpResult, Op, OpHandler, op_async, op_native,
     op_native_with_mm, op_sync,
 };
+pub use microtask::{MicrotaskQueue, NextTickQueue};
 pub use module_loader::{
-    LoadedModule, ModuleError, ModuleLoader, ModuleNamespace, ModuleState, ModuleType,
-    module_extension,
+    LoadedModule, ModuleError, ModuleLoader, ModuleNamespace, ModuleState, module_extension,
+};
+pub use module_provider::{
+    MediaType, ModuleProvider, ModuleResolution, ModuleSource, ModuleType, ProviderRegistry,
 };
 pub use otter_runtime::{Otter, OtterError};
+
+// Native extension system
+pub use extension_state::ExtensionState;
+pub use extension_v2::{NativeExtensionRegistry, OtterExtension, Profile};
+pub use registration::{ModuleNamespaceBuilder, RegistrationContext};
 
 // Legacy alias for backwards compatibility
 #[deprecated(since = "0.2.0", note = "Renamed to Otter")]

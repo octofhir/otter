@@ -76,7 +76,10 @@ fn main() {
         println!("function[{}].param_count = {}", idx, func.param_count);
         println!("function[{}].locals = {}", idx, func.local_count);
         println!("function[{}].registers = {}", idx, func.register_count);
-        println!("function[{}].is_generator = {}", idx, func.flags.is_generator);
+        println!(
+            "function[{}].is_generator = {}",
+            idx, func.flags.is_generator
+        );
         println!("function[{}].is_async = {}", idx, func.flags.is_async);
         println!("function[{}].is_arrow = {}", idx, func.flags.is_arrow);
         println!("instructions:");

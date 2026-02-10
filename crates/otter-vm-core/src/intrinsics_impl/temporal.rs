@@ -9,19 +9,16 @@
 //! - Temporal.Duration
 
 use crate::gc::GcRef;
+use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyKey};
 use crate::value::Value;
-use crate::memory::MemoryManager;
 use std::sync::Arc;
 
 /// Create and install Temporal namespace on global object
 ///
 /// This function expects that all __Temporal_* ops have already been registered as globals.
 /// It creates namespace objects and wires the ops as constructors and static methods.
-pub fn install_temporal_namespace(
-    global: GcRef<JsObject>,
-    mm: &Arc<MemoryManager>,
-) {
+pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManager>) {
     // Create main Temporal namespace object
     let temporal_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
@@ -61,7 +58,10 @@ pub fn install_temporal_namespace(
     if let Some(fn_val) = global.get(&PropertyKey::string("__Temporal_Instant_epochSeconds")) {
         let _ = temporal_instant.set(PropertyKey::string("epochSeconds"), fn_val);
     }
-    let _ = temporal_obj.set(PropertyKey::string("Instant"), Value::object(temporal_instant));
+    let _ = temporal_obj.set(
+        PropertyKey::string("Instant"),
+        Value::object(temporal_instant),
+    );
 
     // ====================================================================
     // Temporal.PlainDate
@@ -73,7 +73,10 @@ pub fn install_temporal_namespace(
     if let Some(cmp_fn) = global.get(&PropertyKey::string("__Temporal_PlainDate_compare")) {
         let _ = temporal_plain_date.set(PropertyKey::string("compare"), cmp_fn);
     }
-    let _ = temporal_obj.set(PropertyKey::string("PlainDate"), Value::object(temporal_plain_date));
+    let _ = temporal_obj.set(
+        PropertyKey::string("PlainDate"),
+        Value::object(temporal_plain_date),
+    );
 
     // ====================================================================
     // Temporal.PlainTime
@@ -85,7 +88,10 @@ pub fn install_temporal_namespace(
     if let Some(cmp_fn) = global.get(&PropertyKey::string("__Temporal_PlainTime_compare")) {
         let _ = temporal_plain_time.set(PropertyKey::string("compare"), cmp_fn);
     }
-    let _ = temporal_obj.set(PropertyKey::string("PlainTime"), Value::object(temporal_plain_time));
+    let _ = temporal_obj.set(
+        PropertyKey::string("PlainTime"),
+        Value::object(temporal_plain_time),
+    );
 
     // ====================================================================
     // Temporal.PlainDateTime
@@ -97,7 +103,10 @@ pub fn install_temporal_namespace(
     if let Some(cmp_fn) = global.get(&PropertyKey::string("__Temporal_PlainDateTime_compare")) {
         let _ = temporal_plain_date_time.set(PropertyKey::string("compare"), cmp_fn);
     }
-    let _ = temporal_obj.set(PropertyKey::string("PlainDateTime"), Value::object(temporal_plain_date_time));
+    let _ = temporal_obj.set(
+        PropertyKey::string("PlainDateTime"),
+        Value::object(temporal_plain_date_time),
+    );
 
     // ====================================================================
     // Temporal.PlainYearMonth
@@ -106,7 +115,10 @@ pub fn install_temporal_namespace(
     if let Some(from_fn) = global.get(&PropertyKey::string("__Temporal_PlainYearMonth_from")) {
         let _ = temporal_plain_year_month.set(PropertyKey::string("from"), from_fn);
     }
-    let _ = temporal_obj.set(PropertyKey::string("PlainYearMonth"), Value::object(temporal_plain_year_month));
+    let _ = temporal_obj.set(
+        PropertyKey::string("PlainYearMonth"),
+        Value::object(temporal_plain_year_month),
+    );
 
     // ====================================================================
     // Temporal.PlainMonthDay
@@ -115,7 +127,10 @@ pub fn install_temporal_namespace(
     if let Some(from_fn) = global.get(&PropertyKey::string("__Temporal_PlainMonthDay_from")) {
         let _ = temporal_plain_month_day.set(PropertyKey::string("from"), from_fn);
     }
-    let _ = temporal_obj.set(PropertyKey::string("PlainMonthDay"), Value::object(temporal_plain_month_day));
+    let _ = temporal_obj.set(
+        PropertyKey::string("PlainMonthDay"),
+        Value::object(temporal_plain_month_day),
+    );
 
     // ====================================================================
     // Temporal.ZonedDateTime
@@ -127,7 +142,10 @@ pub fn install_temporal_namespace(
     if let Some(cmp_fn) = global.get(&PropertyKey::string("__Temporal_ZonedDateTime_compare")) {
         let _ = temporal_zoned_date_time.set(PropertyKey::string("compare"), cmp_fn);
     }
-    let _ = temporal_obj.set(PropertyKey::string("ZonedDateTime"), Value::object(temporal_zoned_date_time));
+    let _ = temporal_obj.set(
+        PropertyKey::string("ZonedDateTime"),
+        Value::object(temporal_zoned_date_time),
+    );
 
     // ====================================================================
     // Temporal.Duration
@@ -139,7 +157,10 @@ pub fn install_temporal_namespace(
     if let Some(cmp_fn) = global.get(&PropertyKey::string("__Temporal_Duration_compare")) {
         let _ = temporal_duration.set(PropertyKey::string("compare"), cmp_fn);
     }
-    let _ = temporal_obj.set(PropertyKey::string("Duration"), Value::object(temporal_duration));
+    let _ = temporal_obj.set(
+        PropertyKey::string("Duration"),
+        Value::object(temporal_duration),
+    );
 
     // Install Temporal on global
     let _ = global.set(PropertyKey::string("Temporal"), Value::object(temporal_obj));

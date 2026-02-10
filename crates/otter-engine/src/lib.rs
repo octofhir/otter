@@ -33,13 +33,17 @@
 //! ```
 
 // Own modules (ESM loader, graph)
+mod console;
 pub mod error;
 pub mod graph;
+mod http;
 pub mod loader;
 
 // Re-export own types
+pub use console::{ConsoleAdapter, LogLevel, StdConsole};
 pub use error::{EngineError, EngineResult};
 pub use graph::{ImportRecord, ModuleGraph, ModuleNode, parse_imports};
+pub use http::create_http_extension;
 pub use loader::{
     ImportContext, LoaderConfig, ModuleLoader, ModuleType, ResolvedModule, SourceType,
 };
@@ -143,10 +147,21 @@ pub use otter_vm_compiler::{CompileError, CompileResult, Compiler};
 // Re-export bytecode module
 pub use otter_vm_bytecode::Module;
 
-// Re-export builtin factories
-pub use otter_vm_builtins::{
-    ConsoleAdapter, LogLevel, StdConsole, create_builtins_extension,
-    create_builtins_extension_with_console, create_http_extension,
+/// Create extension with default builtins.
+///
+/// Currently includes `console` methods.
+pub fn create_builtins_extension() -> Extension {
+    create_builtins_extension_with_console(StdConsole::default())
+}
+
+/// Create extension with custom console adapter.
+pub fn create_builtins_extension_with_console<A: ConsoleAdapter>(adapter: A) -> Extension {
+    Extension::new("builtins").with_ops(console::console_ops_with_adapter(adapter))
+}
+
+// Re-export Node.js compatibility
+pub use otter_nodejs::{
+    NodeApiProfile, builtin_modules as nodejs_builtin_modules, is_builtin as nodejs_is_builtin,
 };
 
 // ============================================================================
@@ -190,6 +205,8 @@ pub use otter_vm_builtins::{
 pub struct EngineBuilder {
     inner: OtterBuilder,
     with_http: bool,
+    nodejs_profile: NodeApiProfile,
+    env_configured: bool,
 }
 
 impl EngineBuilder {
@@ -198,6 +215,8 @@ impl EngineBuilder {
         Self {
             inner: OtterBuilder::new(),
             with_http: false,
+            nodejs_profile: NodeApiProfile::None,
+            env_configured: false,
         }
     }
 
@@ -206,6 +225,31 @@ impl EngineBuilder {
     /// Note: fetch() is always available. This only enables the server API.
     pub fn with_http(mut self) -> Self {
         self.with_http = true;
+        self
+    }
+
+    /// Enable Node.js API compatibility (Buffer, process, fs, path, etc.).
+    ///
+    /// This registers the Node.js extension which provides:
+    /// - `node:fs`, `node:path`, `node:buffer`, `node:events`
+    /// - `node:process`, `node:util`, `node:stream`, `node:assert`, `node:os`
+    pub fn with_nodejs(mut self) -> Self {
+        self.nodejs_profile = NodeApiProfile::Full;
+        self
+    }
+
+    /// Enable embedded-safe Node.js core subset.
+    ///
+    /// This profile excludes dangerous host-control APIs such as `node:process`
+    /// and file-system modules.
+    pub fn with_nodejs_safe(mut self) -> Self {
+        self.nodejs_profile = NodeApiProfile::SafeCore;
+        self
+    }
+
+    /// Set explicit Node.js API profile.
+    pub fn with_nodejs_profile(mut self, profile: NodeApiProfile) -> Self {
+        self.nodejs_profile = profile;
         self
     }
 
@@ -220,6 +264,7 @@ impl EngineBuilder {
     /// Set environment store directly.
     pub fn env_store(mut self, store: IsolatedEnvStore) -> Self {
         self.inner = self.inner.env_store(store);
+        self.env_configured = true;
         self
     }
 
@@ -237,6 +282,7 @@ impl EngineBuilder {
     /// ```
     pub fn env(mut self, f: impl FnOnce(EnvStoreBuilder) -> EnvStoreBuilder) -> Self {
         self.inner = self.inner.env(f);
+        self.env_configured = true;
         self
     }
 
@@ -250,6 +296,28 @@ impl EngineBuilder {
     pub fn build(self) -> Otter {
         // Build base runtime (without builtins)
         let mut runtime = self.inner.build();
+        if !self.env_configured {
+            if let Some(allowed_env) = runtime.capabilities().env.as_ref() {
+                let mut env_builder = EnvStoreBuilder::new();
+                if allowed_env.is_empty() {
+                    let host_env_keys: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+                    let host_env_refs: Vec<&str> =
+                        host_env_keys.iter().map(String::as_str).collect();
+                    env_builder = env_builder.passthrough(&host_env_refs);
+                } else {
+                    let allowed_env_refs: Vec<&str> =
+                        allowed_env.iter().map(String::as_str).collect();
+                    env_builder = env_builder.passthrough(&allowed_env_refs);
+                }
+                runtime.set_env_store(std::sync::Arc::new(env_builder.build()));
+            }
+        }
+        let loader = runtime.loader();
+
+        // Register module interop extension (`__createRequire`, `__module_*` ops).
+        runtime
+            .register_extension(module_extension(loader))
+            .expect("Failed to register module extension");
 
         // Register standard builtins (console, Math, JSON, Date, fetch, etc.)
         runtime
@@ -266,6 +334,26 @@ impl EngineBuilder {
             runtime
                 .register_extension(http_ext)
                 .expect("Failed to register HTTP extension");
+        }
+
+        // Register Node.js compatibility profile
+        match self.nodejs_profile {
+            NodeApiProfile::None => {}
+            NodeApiProfile::SafeCore => {
+                runtime.register_module_provider(otter_nodejs::create_nodejs_safe_provider());
+            }
+            NodeApiProfile::Full => {
+                runtime.register_module_provider(otter_nodejs::create_nodejs_provider());
+            }
+        }
+
+        // Register native extensions for Node.js modules
+        if self.nodejs_profile != NodeApiProfile::None {
+            for ext in otter_nodejs::nodejs_extensions() {
+                runtime
+                    .register_native_extension(ext)
+                    .expect("Failed to register native extension");
+            }
         }
 
         // Pre-compile extensions to speed up every eval()
@@ -302,6 +390,7 @@ pub mod prelude {
         // Module loading
         ModuleGraph,
         ModuleLoader,
+        NodeApiProfile,
         Op,
         // Low-level runtime (for advanced use)
         Otter,

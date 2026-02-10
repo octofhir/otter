@@ -7,37 +7,40 @@
 //!
 //! Strings are managed via `GcRef<JsString>` which wraps a `GcBox<JsString>`.
 //! The `GcBox` provides the GC header for marking. Interned strings are kept
-//! alive by the global intern table (acting as a GC root).
+//! alive by the thread-local intern table (acting as a GC root).
 
 use crate::gc::GcRef;
-use dashmap::DashMap;
-use rustc_hash::FxHasher;
+use rustc_hash::{FxHashMap, FxHasher};
+use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
-/// Global string intern table
-///
-/// Stores `GcRef<JsString>` which are Copy (raw pointers).
-/// The backing `GcBox` memory is leaked (kept alive forever) for interned strings.
-/// This is acceptable since interned strings are typically long-lived.
-///
-/// Uses a Vec to handle hash collisions by chaining.
-static STRING_TABLE: std::sync::LazyLock<DashMap<u64, Vec<GcRef<JsString>>>> =
-    std::sync::LazyLock::new(DashMap::new);
+// Thread-local string intern table (one isolate = one thread).
+// Uses RefCell<FxHashMap> instead of DashMap for zero-lock overhead.
+// Each thread gets its own table, providing proper isolate isolation.
+thread_local! {
+    static STRING_TABLE: RefCell<FxHashMap<u64, Vec<GcRef<JsString>>>> =
+        RefCell::new(FxHashMap::default());
+}
 
 /// String interning table for explicit management
 ///
-/// This provides an instance-based alternative to the global STRING_TABLE.
+/// This provides an instance-based alternative to the thread-local STRING_TABLE.
 /// Useful for VM instances that want isolated string tables.
 pub struct StringTable {
-    strings: DashMap<u64, Vec<GcRef<JsString>>>,
+    strings: RefCell<FxHashMap<u64, Vec<GcRef<JsString>>>>,
 }
+
+// SAFETY: StringTable is only accessed from the single VM thread.
+// Thread confinement is enforced at the VmRuntime/VmContext level.
+unsafe impl Send for StringTable {}
+unsafe impl Sync for StringTable {}
 
 impl StringTable {
     /// Create a new string table
     pub fn new() -> Self {
         Self {
-            strings: DashMap::new(),
+            strings: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -47,10 +50,13 @@ impl StringTable {
         let hash = JsString::compute_hash_units(&units);
 
         // Check if already interned
-        if let Some(bucket) = self.strings.get(&hash) {
-            for existing in bucket.iter() {
-                if existing.data.as_ref() == units.as_slice() {
-                    return *existing;
+        {
+            let borrowed = self.strings.borrow();
+            if let Some(bucket) = borrowed.get(&hash) {
+                for existing in bucket.iter() {
+                    if existing.data.as_ref() == units.as_slice() {
+                        return *existing;
+                    }
                 }
             }
         }
@@ -64,6 +70,7 @@ impl StringTable {
 
         // Add to the hash bucket
         self.strings
+            .borrow_mut()
             .entry(hash)
             .or_insert_with(Vec::new)
             .push(js_str);
@@ -74,7 +81,8 @@ impl StringTable {
     pub fn is_interned(&self, s: &str) -> bool {
         let units: Vec<u16> = s.encode_utf16().collect();
         let hash = JsString::compute_hash_units(&units);
-        if let Some(bucket) = self.strings.get(&hash) {
+        let borrowed = self.strings.borrow();
+        if let Some(bucket) = borrowed.get(&hash) {
             for existing in bucket.iter() {
                 if existing.data.as_ref() == units.as_slice() {
                     return true;
@@ -89,10 +97,13 @@ impl StringTable {
         let hash = JsString::compute_hash_units(units);
 
         // Check if already interned
-        if let Some(bucket) = self.strings.get(&hash) {
-            for existing in bucket.iter() {
-                if existing.data.as_ref() == units {
-                    return *existing;
+        {
+            let borrowed = self.strings.borrow();
+            if let Some(bucket) = borrowed.get(&hash) {
+                for existing in bucket.iter() {
+                    if existing.data.as_ref() == units {
+                        return *existing;
+                    }
                 }
             }
         }
@@ -105,6 +116,7 @@ impl StringTable {
 
         // Add to the hash bucket
         self.strings
+            .borrow_mut()
             .entry(hash)
             .or_insert_with(Vec::new)
             .push(js_str);
@@ -113,12 +125,12 @@ impl StringTable {
 
     /// Get the number of interned strings
     pub fn len(&self) -> usize {
-        self.strings.len()
+        self.strings.borrow().len()
     }
 
     /// Check if the table is empty
     pub fn is_empty(&self) -> bool {
-        self.strings.is_empty()
+        self.strings.borrow().is_empty()
     }
 }
 
@@ -128,18 +140,18 @@ impl Default for StringTable {
     }
 }
 
-/// Clear the global string intern table.
+/// Clear the thread-local string intern table.
 ///
 /// Call this when tearing down a VM isolate to allow the GC to reclaim
 /// interned string memory. After calling this, all existing `GcRef<JsString>`
-/// from the global table are dangling — only use this when no VM is active.
+/// from the table are dangling — only use this when no VM is active on this thread.
 pub fn clear_global_string_table() {
-    STRING_TABLE.clear();
+    STRING_TABLE.with(|table| table.borrow_mut().clear());
 }
 
-/// Get the number of entries in the global string intern table.
+/// Get the number of entries in the thread-local string intern table.
 pub fn global_string_table_size() -> usize {
-    STRING_TABLE.len()
+    STRING_TABLE.with(|table| table.borrow().len())
 }
 
 /// An interned JavaScript string with GC support
@@ -158,33 +170,39 @@ pub struct JsString {
 }
 
 impl JsString {
-    /// Create or retrieve an interned string (using global table)
+    /// Create or retrieve an interned string (using thread-local table)
     pub fn intern(s: &str) -> GcRef<Self> {
         let units: Vec<u16> = s.encode_utf16().collect();
         let hash = Self::compute_hash_units(&units);
 
-        // Check if already interned
-        if let Some(bucket) = STRING_TABLE.get(&hash) {
-            for existing in bucket.iter() {
-                if existing.data.as_ref() == units.as_slice() {
-                    return *existing;
+        STRING_TABLE.with(|table| {
+            // Check if already interned
+            {
+                let borrowed = table.borrow();
+                if let Some(bucket) = borrowed.get(&hash) {
+                    for existing in bucket.iter() {
+                        if existing.data.as_ref() == units.as_slice() {
+                            return *existing;
+                        }
+                    }
                 }
             }
-        }
 
-        // Create new interned string via GcRef
-        let js_str = GcRef::new(Self {
-            data: units.into(),
-            utf8: OnceLock::new(),
-            hash,
-        });
+            // Create new interned string via GcRef
+            let js_str = GcRef::new(Self {
+                data: units.into(),
+                utf8: OnceLock::new(),
+                hash,
+            });
 
-        // Add to the hash bucket
-        STRING_TABLE
-            .entry(hash)
-            .or_insert_with(Vec::new)
-            .push(js_str);
-        js_str
+            // Add to the hash bucket
+            table
+                .borrow_mut()
+                .entry(hash)
+                .or_insert_with(Vec::new)
+                .push(js_str);
+            js_str
+        })
     }
 
     /// Create a string without interning (for temporary strings)
@@ -214,27 +232,33 @@ impl JsString {
     pub fn intern_utf16(units: &[u16]) -> GcRef<Self> {
         let hash = Self::compute_hash_units(units);
 
-        // Check if already interned
-        if let Some(bucket) = STRING_TABLE.get(&hash) {
-            for existing in bucket.iter() {
-                if existing.data.as_ref() == units {
-                    return *existing;
+        STRING_TABLE.with(|table| {
+            // Check if already interned
+            {
+                let borrowed = table.borrow();
+                if let Some(bucket) = borrowed.get(&hash) {
+                    for existing in bucket.iter() {
+                        if existing.data.as_ref() == units {
+                            return *existing;
+                        }
+                    }
                 }
             }
-        }
 
-        let js_str = GcRef::new(Self {
-            data: Arc::from(units),
-            utf8: OnceLock::new(),
-            hash,
-        });
+            let js_str = GcRef::new(Self {
+                data: Arc::from(units),
+                utf8: OnceLock::new(),
+                hash,
+            });
 
-        // Add to the hash bucket
-        STRING_TABLE
-            .entry(hash)
-            .or_insert_with(Vec::new)
-            .push(js_str);
-        js_str
+            // Add to the hash bucket
+            table
+                .borrow_mut()
+                .entry(hash)
+                .or_insert_with(Vec::new)
+                .push(js_str);
+            js_str
+        })
     }
 
     /// Get the string as a str slice
@@ -311,7 +335,7 @@ impl JsString {
         Self::intern_utf16(slice)
     }
 
-    /// Concatenate using a string table instead of global intern
+    /// Concatenate using a string table instead of thread-local intern
     pub fn concat_with_table(&self, other: &JsString, table: &StringTable) -> GcRef<Self> {
         let mut units = Vec::with_capacity(self.data.len() + other.data.len());
         units.extend_from_slice(&self.data);
@@ -375,17 +399,17 @@ impl AsRef<[u16]> for JsString {
 
 /// Well-known interned strings (for property names)
 ///
-/// These are lazily initialized and stored as `GcRef<JsString>`.
-/// Since `GcRef` is `Copy`, we store them directly without `LazyLock`.
+/// These are lazily initialized per-thread via the thread-local STRING_TABLE.
+/// Since `GcRef` is `Copy`, we store them in thread_local and copy out.
 pub mod well_known {
     use super::*;
-    use std::sync::LazyLock;
 
     macro_rules! well_known_string {
         ($name:ident, $value:literal) => {
-            /// Well-known string constant
-            pub static $name: LazyLock<GcRef<JsString>> =
-                LazyLock::new(|| JsString::intern($value));
+            thread_local! {
+                /// Well-known string constant
+                static $name: GcRef<JsString> = JsString::intern($value);
+            }
         };
     }
 
@@ -536,14 +560,17 @@ impl otter_vm_gc::GcTraceable for JsString {
     }
 }
 
-/// Trace all interned strings in the global STRING_TABLE
+/// Trace all interned strings in the thread-local STRING_TABLE
 ///
 /// This must be called during GC root collection to prevent
 /// interned strings from being incorrectly collected.
 pub fn trace_global_string_table(tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
-    for bucket in STRING_TABLE.iter() {
-        for js_str in bucket.value().iter() {
-            tracer(js_str.header() as *const _);
+    STRING_TABLE.with(|table| {
+        let borrowed = table.borrow();
+        for bucket in borrowed.values() {
+            for js_str in bucket.iter() {
+                tracer(js_str.header() as *const _);
+            }
         }
-    }
+    });
 }

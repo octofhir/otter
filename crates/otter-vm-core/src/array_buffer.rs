@@ -6,7 +6,7 @@
 use crate::gc::GcRef;
 use crate::object::JsObject;
 use crate::value::Value;
-use parking_lot::Mutex;
+use std::cell::RefCell;
 use std::sync::Arc;
 
 /// A JavaScript ArrayBuffer
@@ -18,10 +18,16 @@ pub struct JsArrayBuffer {
     /// The object portion (properties, prototype, etc.)
     pub object: GcRef<JsObject>,
     /// The underlying byte data. None if detached.
-    data: Mutex<Option<Vec<u8>>>,
+    data: RefCell<Option<Vec<u8>>>,
     /// Maximum byte length for resizable buffers (ES2024)
     max_byte_length: Option<usize>,
 }
+
+// SAFETY: JsArrayBuffer is only accessed from the single VM thread.
+// Thread confinement is enforced at the VmRuntime/VmContext level.
+// (SharedArrayBuffer correctly uses AtomicU8 and is NOT changed.)
+unsafe impl Send for JsArrayBuffer {}
+unsafe impl Sync for JsArrayBuffer {}
 
 impl otter_vm_gc::GcTraceable for JsArrayBuffer {
     const NEEDS_TRACE: bool = true;
@@ -42,7 +48,7 @@ impl JsArrayBuffer {
         let object = GcRef::new(JsObject::new(proto_value, memory_manager));
         Self {
             object,
-            data: Mutex::new(Some(vec![0; byte_length])),
+            data: RefCell::new(Some(vec![0; byte_length])),
             max_byte_length: None,
         }
     }
@@ -58,24 +64,24 @@ impl JsArrayBuffer {
         let object = GcRef::new(JsObject::new(proto_value, memory_manager));
         Self {
             object,
-            data: Mutex::new(Some(vec![0; byte_length])),
+            data: RefCell::new(Some(vec![0; byte_length])),
             max_byte_length: Some(max_byte_length),
         }
     }
 
     /// Check if the buffer is detached
     pub fn is_detached(&self) -> bool {
-        self.data.lock().is_none()
+        self.data.borrow().is_none()
     }
 
     /// Detach the buffer (for transfer operations)
     pub fn detach(&self) {
-        *self.data.lock() = None;
+        *self.data.borrow_mut() = None;
     }
 
     /// Get the byte length (0 if detached)
     pub fn byte_length(&self) -> usize {
-        self.data.lock().as_ref().map_or(0, |d| d.len())
+        self.data.borrow().as_ref().map_or(0, |d| d.len())
     }
 
     /// Get the max byte length for resizable buffers
@@ -91,21 +97,21 @@ impl JsArrayBuffer {
     /// Transfer the buffer contents to a new ArrayBuffer
     /// The original buffer becomes detached.
     pub fn transfer(&self) -> Option<JsArrayBuffer> {
-        let data = self.data.lock().take()?;
+        let data = self.data.borrow_mut().take()?;
         // Create new object with same memory manager but fresh object identity/proto
         // Note: Callers might need to set correct proto if not default
         let mm = self.object.memory_manager().clone();
         let object = GcRef::new(JsObject::new(Value::null(), mm));
         Some(JsArrayBuffer {
             object,
-            data: Mutex::new(Some(data)),
+            data: RefCell::new(Some(data)),
             max_byte_length: self.max_byte_length,
         })
     }
 
     /// Transfer to a new size (ES2024)
     pub fn transfer_to_fixed_length(&self, new_length: usize) -> Option<JsArrayBuffer> {
-        let mut guard = self.data.lock();
+        let mut guard = self.data.borrow_mut();
         let old_data = guard.take()?;
         let mut new_data = vec![0u8; new_length];
         let copy_len = old_data.len().min(new_length);
@@ -116,7 +122,7 @@ impl JsArrayBuffer {
 
         Some(JsArrayBuffer {
             object,
-            data: Mutex::new(Some(new_data)),
+            data: RefCell::new(Some(new_data)),
             max_byte_length: None, // Fixed length
         })
     }
@@ -127,7 +133,7 @@ impl JsArrayBuffer {
         if new_length > max {
             return Err("new length exceeds maxByteLength");
         }
-        let mut guard = self.data.lock();
+        let mut guard = self.data.borrow_mut();
         let data = guard.as_mut().ok_or("ArrayBuffer is detached")?;
         data.resize(new_length, 0);
         Ok(())
@@ -135,7 +141,7 @@ impl JsArrayBuffer {
 
     /// Slice the buffer to create a new ArrayBuffer
     pub fn slice(&self, start: usize, end: usize) -> Option<JsArrayBuffer> {
-        let guard = self.data.lock();
+        let guard = self.data.borrow();
         let data = guard.as_ref()?;
         let len = data.len();
         let actual_start = start.min(len);
@@ -151,19 +157,19 @@ impl JsArrayBuffer {
 
         Some(JsArrayBuffer {
             object,
-            data: Mutex::new(Some(new_data)),
+            data: RefCell::new(Some(new_data)),
             max_byte_length: None,
         })
     }
 
     /// Read a byte at the given index
     pub fn get(&self, index: usize) -> Option<u8> {
-        self.data.lock().as_ref()?.get(index).copied()
+        self.data.borrow().as_ref()?.get(index).copied()
     }
 
     /// Write a byte at the given index
     pub fn set(&self, index: usize, value: u8) -> bool {
-        if let Some(data) = self.data.lock().as_mut() {
+        if let Some(data) = self.data.borrow_mut().as_mut() {
             if let Some(cell) = data.get_mut(index) {
                 *cell = value;
                 return true;
@@ -174,7 +180,7 @@ impl JsArrayBuffer {
 
     /// Read bytes into a slice
     pub fn read_bytes(&self, offset: usize, dest: &mut [u8]) -> bool {
-        let guard = self.data.lock();
+        let guard = self.data.borrow();
         if let Some(data) = guard.as_ref() {
             if offset + dest.len() <= data.len() {
                 dest.copy_from_slice(&data[offset..offset + dest.len()]);
@@ -186,7 +192,7 @@ impl JsArrayBuffer {
 
     /// Write bytes from a slice
     pub fn write_bytes(&self, offset: usize, src: &[u8]) -> bool {
-        let mut guard = self.data.lock();
+        let mut guard = self.data.borrow_mut();
         if let Some(data) = guard.as_mut() {
             if offset + src.len() <= data.len() {
                 data[offset..offset + src.len()].copy_from_slice(src);
@@ -202,7 +208,7 @@ impl JsArrayBuffer {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        let guard = self.data.lock();
+        let guard = self.data.borrow();
         guard.as_ref().map(|d| f(d))
     }
 
@@ -212,7 +218,7 @@ impl JsArrayBuffer {
     where
         F: FnOnce(&mut Vec<u8>) -> R,
     {
-        let mut guard = self.data.lock();
+        let mut guard = self.data.borrow_mut();
         guard.as_mut().map(f)
     }
 }

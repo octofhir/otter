@@ -153,8 +153,8 @@ impl JsProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::JsObject;
     use crate::gc::GcRef;
+    use crate::object::JsObject;
     use std::sync::Arc;
 
     #[test]

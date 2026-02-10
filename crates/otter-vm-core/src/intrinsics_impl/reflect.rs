@@ -25,10 +25,10 @@
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
-use crate::object::{JsObject, PropertyKey, PropertyDescriptor, PropertyAttributes};
-use crate::value::Value;
 use crate::memory::MemoryManager;
+use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
+use crate::value::Value;
 use std::sync::Arc;
 
 /// Helper to convert Value to PropertyKey
@@ -130,7 +130,9 @@ fn descriptor_from_attributes(attr_obj: &GcRef<JsObject>) -> PropertyDescriptor 
         .unwrap_or(false);
 
     if has_value || has_writable {
-        let value = attr_obj.get(&PropertyKey::from("value")).unwrap_or(Value::undefined());
+        let value = attr_obj
+            .get(&PropertyKey::from("value"))
+            .unwrap_or(Value::undefined());
         let writable = attr_obj
             .get(&PropertyKey::from("writable"))
             .map(|v| v.to_boolean())
@@ -144,8 +146,12 @@ fn descriptor_from_attributes(attr_obj: &GcRef<JsObject>) -> PropertyDescriptor 
             },
         }
     } else if has_get || has_set {
-        let get = attr_obj.get(&PropertyKey::from("get")).filter(|v| !v.is_undefined());
-        let set = attr_obj.get(&PropertyKey::from("set")).filter(|v| !v.is_undefined());
+        let get = attr_obj
+            .get(&PropertyKey::from("get"))
+            .filter(|v| !v.is_undefined());
+        let set = attr_obj
+            .get(&PropertyKey::from("set"))
+            .filter(|v| !v.is_undefined());
         PropertyDescriptor::Accessor {
             get,
             set,
@@ -168,7 +174,8 @@ fn descriptor_from_attributes(attr_obj: &GcRef<JsObject>) -> PropertyDescriptor 
 }
 
 fn descriptor_to_value(desc: PropertyDescriptor, ncx: &NativeContext) -> Value {
-    let obj_proto = ncx.global()
+    let obj_proto = ncx
+        .global()
         .get(&crate::object::PropertyKey::string("Object"))
         .and_then(|v| v.as_object())
         .and_then(|o| o.get(&crate::object::PropertyKey::string("prototype")))
@@ -179,15 +186,25 @@ fn descriptor_to_value(desc: PropertyDescriptor, ncx: &NativeContext) -> Value {
             let _ = desc_obj.set("value".into(), value);
             let _ = desc_obj.set("writable".into(), Value::boolean(attributes.writable));
             let _ = desc_obj.set("enumerable".into(), Value::boolean(attributes.enumerable));
-            let _ = desc_obj.set("configurable".into(), Value::boolean(attributes.configurable));
+            let _ = desc_obj.set(
+                "configurable".into(),
+                Value::boolean(attributes.configurable),
+            );
             Value::object(desc_obj)
         }
-        PropertyDescriptor::Accessor { get, set, attributes } => {
+        PropertyDescriptor::Accessor {
+            get,
+            set,
+            attributes,
+        } => {
             let desc_obj = GcRef::new(JsObject::new(obj_proto, ncx.memory_manager().clone()));
             let _ = desc_obj.set("get".into(), get.unwrap_or(Value::undefined()));
             let _ = desc_obj.set("set".into(), set.unwrap_or(Value::undefined()));
             let _ = desc_obj.set("enumerable".into(), Value::boolean(attributes.enumerable));
-            let _ = desc_obj.set("configurable".into(), Value::boolean(attributes.configurable));
+            let _ = desc_obj.set(
+                "configurable".into(),
+                Value::boolean(attributes.configurable),
+            );
             Value::object(desc_obj)
         }
         PropertyDescriptor::Deleted => Value::undefined(),
@@ -212,10 +229,7 @@ fn descriptor_to_value(desc: PropertyDescriptor, ncx: &NativeContext) -> Value {
 /// - Prototype chain: getPrototypeOf, setPrototypeOf
 /// - Extensibility: isExtensible, preventExtensions
 /// - Function invocation: apply, construct (native functions only)
-pub fn install_reflect_namespace(
-    global: GcRef<JsObject>,
-    mm: &Arc<MemoryManager>,
-) {
+pub fn install_reflect_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManager>) {
     // Create Reflect namespace object (plain object, not a constructor)
     let reflect_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
@@ -229,10 +243,7 @@ pub fn install_reflect_namespace(
         ($name:literal, $body:expr) => {
             let _ = reflect_obj.set(
                 PropertyKey::string($name),
-                Value::native_function(
-                    $body,
-                    mm.clone(),
-                ),
+                Value::native_function($body, mm.clone()),
             );
         };
     }
@@ -241,8 +252,12 @@ pub fn install_reflect_namespace(
 
     // Reflect.get(target, propertyKey, receiver?)
     reflect_method!("get", |_, args: &[Value], ncx| {
-        let target = args.first().ok_or("Reflect.get requires a target argument")?;
-        let property_key = args.get(1).ok_or("Reflect.get requires a propertyKey argument")?;
+        let target = args
+            .first()
+            .ok_or("Reflect.get requires a target argument")?;
+        let property_key = args
+            .get(1)
+            .ok_or("Reflect.get requires a propertyKey argument")?;
         let receiver = args.get(2).cloned().unwrap_or_else(|| target.clone());
 
         // If target is a proxy, call the trap directly
@@ -265,8 +280,12 @@ pub fn install_reflect_namespace(
 
     // Reflect.set(target, propertyKey, value, receiver?)
     reflect_method!("set", |_, args, ncx| {
-        let target = args.first().ok_or("Reflect.set requires a target argument")?;
-        let property_key = args.get(1).ok_or("Reflect.set requires a propertyKey argument")?;
+        let target = args
+            .first()
+            .ok_or("Reflect.set requires a target argument")?;
+        let property_key = args
+            .get(1)
+            .ok_or("Reflect.set requires a propertyKey argument")?;
         let value = args.get(2).cloned().unwrap_or(Value::undefined());
         let receiver = args.get(3).cloned().unwrap_or_else(|| target.clone());
 
@@ -293,8 +312,12 @@ pub fn install_reflect_namespace(
 
     // Reflect.has(target, propertyKey)
     reflect_method!("has", |_, args, ncx| {
-        let target = args.first().ok_or("Reflect.has requires a target argument")?;
-        let property_key = args.get(1).ok_or("Reflect.has requires a propertyKey argument")?;
+        let target = args
+            .first()
+            .ok_or("Reflect.has requires a target argument")?;
+        let property_key = args
+            .get(1)
+            .ok_or("Reflect.has requires a propertyKey argument")?;
 
         // If target is a proxy, call the trap directly
         if let Some(proxy) = target.as_proxy() {
@@ -312,8 +335,12 @@ pub fn install_reflect_namespace(
 
     // Reflect.deleteProperty(target, propertyKey)
     reflect_method!("deleteProperty", |_, args, ncx| {
-        let target = args.first().ok_or("Reflect.deleteProperty requires a target argument")?;
-        let property_key = args.get(1).ok_or("Reflect.deleteProperty requires a propertyKey argument")?;
+        let target = args
+            .first()
+            .ok_or("Reflect.deleteProperty requires a target argument")?;
+        let property_key = args
+            .get(1)
+            .ok_or("Reflect.deleteProperty requires a propertyKey argument")?;
 
         // If target is a proxy, call the trap directly
         if let Some(proxy) = target.as_proxy() {
@@ -338,7 +365,9 @@ pub fn install_reflect_namespace(
 
     // Reflect.ownKeys(target)
     reflect_method!("ownKeys", |_, args, ncx| {
-        let target = args.first().ok_or("Reflect.ownKeys requires a target argument")?;
+        let target = args
+            .first()
+            .ok_or("Reflect.ownKeys requires a target argument")?;
 
         let keys = if let Some(proxy) = target.as_proxy() {
             crate::proxy_operations::proxy_own_keys(ncx, proxy)?
@@ -358,8 +387,12 @@ pub fn install_reflect_namespace(
 
     // Reflect.getOwnPropertyDescriptor(target, propertyKey)
     reflect_method!("getOwnPropertyDescriptor", |_, args, ncx| {
-        let target = args.first().ok_or("Reflect.getOwnPropertyDescriptor requires a target argument")?;
-        let property_key = args.get(1).ok_or("Reflect.getOwnPropertyDescriptor requires a propertyKey argument")?;
+        let target = args
+            .first()
+            .ok_or("Reflect.getOwnPropertyDescriptor requires a target argument")?;
+        let property_key = args
+            .get(1)
+            .ok_or("Reflect.getOwnPropertyDescriptor requires a propertyKey argument")?;
 
         if let Some(proxy) = target.as_proxy() {
             let key = to_property_key(property_key);
@@ -380,19 +413,31 @@ pub fn install_reflect_namespace(
         if let Some(prop_desc) = obj.lookup_property_descriptor(&key) {
             match prop_desc {
                 PropertyDescriptor::Data { value, attributes } => {
-                    let desc = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                    let desc =
+                        GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                     let _ = desc.set("value".into(), value);
                     let _ = desc.set("writable".into(), Value::boolean(attributes.writable));
                     let _ = desc.set("enumerable".into(), Value::boolean(attributes.enumerable));
-                    let _ = desc.set("configurable".into(), Value::boolean(attributes.configurable));
+                    let _ = desc.set(
+                        "configurable".into(),
+                        Value::boolean(attributes.configurable),
+                    );
                     Ok(Value::object(desc))
                 }
-                PropertyDescriptor::Accessor { get, set, attributes } => {
-                    let desc = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                PropertyDescriptor::Accessor {
+                    get,
+                    set,
+                    attributes,
+                } => {
+                    let desc =
+                        GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
                     let _ = desc.set("get".into(), get.unwrap_or(Value::undefined()));
                     let _ = desc.set("set".into(), set.unwrap_or(Value::undefined()));
                     let _ = desc.set("enumerable".into(), Value::boolean(attributes.enumerable));
-                    let _ = desc.set("configurable".into(), Value::boolean(attributes.configurable));
+                    let _ = desc.set(
+                        "configurable".into(),
+                        Value::boolean(attributes.configurable),
+                    );
                     Ok(Value::object(desc))
                 }
                 PropertyDescriptor::Deleted => Ok(Value::undefined()),
@@ -411,11 +456,19 @@ pub fn install_reflect_namespace(
 
     // Reflect.defineProperty(target, propertyKey, attributes)
     reflect_method!("defineProperty", |_, args, ncx| {
-        let target = args.first().ok_or("Reflect.defineProperty requires a target argument")?;
-        let property_key = args.get(1).ok_or("Reflect.defineProperty requires a propertyKey argument")?;
-        let attributes = args.get(2).ok_or("Reflect.defineProperty requires an attributes argument")?;
+        let target = args
+            .first()
+            .ok_or("Reflect.defineProperty requires a target argument")?;
+        let property_key = args
+            .get(1)
+            .ok_or("Reflect.defineProperty requires a propertyKey argument")?;
+        let attributes = args
+            .get(2)
+            .ok_or("Reflect.defineProperty requires an attributes argument")?;
         let Some(attr_obj) = attributes.as_object() else {
-            return Err(VmError::type_error("Reflect.defineProperty requires attributes to be an object"));
+            return Err(VmError::type_error(
+                "Reflect.defineProperty requires attributes to be an object",
+            ));
         };
         let key = to_property_key(property_key);
 
@@ -428,8 +481,16 @@ pub fn install_reflect_namespace(
                 let get_val = desc.get.clone().unwrap_or(Value::undefined());
                 let set_val = desc.set.clone().unwrap_or(Value::undefined());
                 PropertyDescriptor::Accessor {
-                    get: if get_val.is_undefined() { None } else { Some(get_val) },
-                    set: if set_val.is_undefined() { None } else { Some(set_val) },
+                    get: if get_val.is_undefined() {
+                        None
+                    } else {
+                        Some(get_val)
+                    },
+                    set: if set_val.is_undefined() {
+                        None
+                    } else {
+                        Some(set_val)
+                    },
                     attributes: PropertyAttributes {
                         writable: false,
                         enumerable: desc.enumerable.unwrap_or(false),
@@ -465,7 +526,9 @@ pub fn install_reflect_namespace(
 
     // Reflect.getPrototypeOf(target)
     reflect_method!("getPrototypeOf", |_, args, ncx| {
-        let target = args.first().ok_or("Reflect.getPrototypeOf requires a target argument")?;
+        let target = args
+            .first()
+            .ok_or("Reflect.getPrototypeOf requires a target argument")?;
 
         if let Some(proxy) = target.as_proxy() {
             let result = crate::proxy_operations::proxy_get_prototype_of(ncx, proxy)?;
@@ -483,8 +546,12 @@ pub fn install_reflect_namespace(
 
     // Reflect.setPrototypeOf(target, prototype)
     reflect_method!("setPrototypeOf", |_, args, ncx| {
-        let target = args.first().ok_or("Reflect.setPrototypeOf requires a target argument")?;
-        let prototype = args.get(1).ok_or("Reflect.setPrototypeOf requires a prototype argument")?;
+        let target = args
+            .first()
+            .ok_or("Reflect.setPrototypeOf requires a target argument")?;
+        let prototype = args
+            .get(1)
+            .ok_or("Reflect.setPrototypeOf requires a prototype argument")?;
 
         if let Some(proxy) = target.as_proxy() {
             let new_proto = if prototype.is_null() {
@@ -517,7 +584,9 @@ pub fn install_reflect_namespace(
 
     // Reflect.isExtensible(target)
     reflect_method!("isExtensible", |_, args, ncx| {
-        let target = args.first().ok_or("Reflect.isExtensible requires a target argument")?;
+        let target = args
+            .first()
+            .ok_or("Reflect.isExtensible requires a target argument")?;
 
         if let Some(proxy) = target.as_proxy() {
             let result = crate::proxy_operations::proxy_is_extensible(ncx, proxy)?;
@@ -530,7 +599,9 @@ pub fn install_reflect_namespace(
 
     // Reflect.preventExtensions(target)
     reflect_method!("preventExtensions", |_, args, ncx| {
-        let target = args.first().ok_or("Reflect.preventExtensions requires a target argument")?;
+        let target = args
+            .first()
+            .ok_or("Reflect.preventExtensions requires a target argument")?;
 
         if let Some(proxy) = target.as_proxy() {
             let result = crate::proxy_operations::proxy_prevent_extensions(ncx, proxy)?;
@@ -546,9 +617,13 @@ pub fn install_reflect_namespace(
 
     // Reflect.apply(target, thisArgument, argumentsList)
     reflect_method!("apply", |_, args, ncx| {
-        let target = args.first().ok_or("Reflect.apply requires a target argument")?;
+        let target = args
+            .first()
+            .ok_or("Reflect.apply requires a target argument")?;
         let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-        let args_list = args.get(2).ok_or("Reflect.apply requires an argumentsList argument")?;
+        let args_list = args
+            .get(2)
+            .ok_or("Reflect.apply requires an argumentsList argument")?;
 
         if let Some(proxy) = target.as_proxy() {
             // Convert argumentsList to array of Values
@@ -564,10 +639,14 @@ pub fn install_reflect_namespace(
                     }
                     call_args
                 } else {
-                    return Err(VmError::type_error("Reflect.apply argumentsList must be an array"));
+                    return Err(VmError::type_error(
+                        "Reflect.apply argumentsList must be an array",
+                    ));
                 }
             } else {
-                return Err(VmError::type_error("Reflect.apply argumentsList must be an object"));
+                return Err(VmError::type_error(
+                    "Reflect.apply argumentsList must be an object",
+                ));
             };
 
             let result = crate::proxy_operations::proxy_apply(ncx, proxy, this_arg, &args_array)?;
@@ -576,7 +655,9 @@ pub fn install_reflect_namespace(
 
         // Check if target is callable
         if !target.is_callable() {
-            return Err(VmError::type_error("Reflect.apply target must be a function"));
+            return Err(VmError::type_error(
+                "Reflect.apply target must be a function",
+            ));
         }
 
         // Convert argumentsList to array of Values
@@ -585,15 +666,21 @@ pub fn install_reflect_namespace(
                 let len = arr_obj.array_length();
                 let mut call_args = Vec::with_capacity(len);
                 for i in 0..len {
-                    let val = arr_obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                    let val = arr_obj
+                        .get(&PropertyKey::Index(i as u32))
+                        .unwrap_or(Value::undefined());
                     call_args.push(val);
                 }
                 call_args
             } else {
-                return Err(VmError::type_error("Reflect.apply argumentsList must be an array"));
+                return Err(VmError::type_error(
+                    "Reflect.apply argumentsList must be an array",
+                ));
             }
         } else {
-            return Err(VmError::type_error("Reflect.apply argumentsList must be an object"));
+            return Err(VmError::type_error(
+                "Reflect.apply argumentsList must be an object",
+            ));
         };
 
         // Call the function (handles both closures and native functions)
@@ -602,13 +689,19 @@ pub fn install_reflect_namespace(
 
     // Reflect.construct(target, argumentsList, newTarget?)
     reflect_method!("construct", |_, args, ncx| {
-        let target = args.first().ok_or("Reflect.construct requires a target argument")?;
-        let args_list = args.get(1).ok_or("Reflect.construct requires an argumentsList argument")?;
+        let target = args
+            .first()
+            .ok_or("Reflect.construct requires a target argument")?;
+        let args_list = args
+            .get(1)
+            .ok_or("Reflect.construct requires an argumentsList argument")?;
         let new_target = args.get(2).cloned().unwrap_or_else(|| target.clone());
 
         if let Some(proxy) = target.as_proxy() {
             if !is_constructor_value(&new_target) {
-                return Err(VmError::type_error("Reflect.construct newTarget must be a constructor"));
+                return Err(VmError::type_error(
+                    "Reflect.construct newTarget must be a constructor",
+                ));
             }
             // Convert argumentsList to array of Values
             let args_array = if let Some(arr_obj) = args_list.as_object() {
@@ -623,22 +716,31 @@ pub fn install_reflect_namespace(
                     }
                     call_args
                 } else {
-                    return Err(VmError::type_error("Reflect.construct argumentsList must be an array"));
+                    return Err(VmError::type_error(
+                        "Reflect.construct argumentsList must be an array",
+                    ));
                 }
             } else {
-                return Err(VmError::type_error("Reflect.construct argumentsList must be an object"));
+                return Err(VmError::type_error(
+                    "Reflect.construct argumentsList must be an object",
+                ));
             };
 
-            let result = crate::proxy_operations::proxy_construct(ncx, proxy, &args_array, new_target)?;
+            let result =
+                crate::proxy_operations::proxy_construct(ncx, proxy, &args_array, new_target)?;
             return Ok(result);
         }
 
         // Check if target is a constructor
         if !is_constructor_value(target) {
-            return Err(VmError::type_error("Reflect.construct target must be a constructor"));
+            return Err(VmError::type_error(
+                "Reflect.construct target must be a constructor",
+            ));
         }
         if !is_constructor_value(&new_target) {
-            return Err(VmError::type_error("Reflect.construct newTarget must be a constructor"));
+            return Err(VmError::type_error(
+                "Reflect.construct newTarget must be a constructor",
+            ));
         }
 
         // Convert argumentsList to array of Values
@@ -647,15 +749,21 @@ pub fn install_reflect_namespace(
                 let len = arr_obj.array_length();
                 let mut call_args = Vec::with_capacity(len);
                 for i in 0..len {
-                    let val = arr_obj.get(&PropertyKey::Index(i as u32)).unwrap_or(Value::undefined());
+                    let val = arr_obj
+                        .get(&PropertyKey::Index(i as u32))
+                        .unwrap_or(Value::undefined());
                     call_args.push(val);
                 }
                 call_args
             } else {
-                return Err(VmError::type_error("Reflect.construct argumentsList must be an array"));
+                return Err(VmError::type_error(
+                    "Reflect.construct argumentsList must be an array",
+                ));
             }
         } else {
-            return Err(VmError::type_error("Reflect.construct argumentsList must be an object"));
+            return Err(VmError::type_error(
+                "Reflect.construct argumentsList must be an object",
+            ));
         };
 
         // Create new instance using GetPrototypeFromConstructor(newTarget, %Object.prototype%)

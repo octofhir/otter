@@ -151,13 +151,25 @@ impl TraceWriter {
 
         // Write header
         use std::io::Write;
-        writeln!(writer.file, "════════════════════════════════════════════════════════════════════════════════")?;
+        writeln!(
+            writer.file,
+            "════════════════════════════════════════════════════════════════════════════════"
+        )?;
         writeln!(writer.file, "Otter VM Execution Trace")?;
-        writeln!(writer.file, "════════════════════════════════════════════════════════════════════════════════")?;
+        writeln!(
+            writer.file,
+            "════════════════════════════════════════════════════════════════════════════════"
+        )?;
         writeln!(writer.file)?;
-        writeln!(writer.file, "{:>8}  {:>6}  {:>4}  {:<25}  {:<15}  {}",
-                 "INST#", "PC", "FN", "MODULE", "OPCODE", "OPERANDS")?;
-        writeln!(writer.file, "────────────────────────────────────────────────────────────────────────────────")?;
+        writeln!(
+            writer.file,
+            "{:>8}  {:>6}  {:>4}  {:<25}  {:<15}  {}",
+            "INST#", "PC", "FN", "MODULE", "OPCODE", "OPERANDS"
+        )?;
+        writeln!(
+            writer.file,
+            "────────────────────────────────────────────────────────────────────────────────"
+        )?;
         writer.file.flush()?;
 
         Ok(writer)
@@ -168,7 +180,7 @@ impl TraceWriter {
         use std::io::Write;
 
         let module_short = if entry.module_url.len() > 25 {
-            format!("...{}", &entry.module_url[entry.module_url.len()-22..])
+            format!("...{}", &entry.module_url[entry.module_url.len() - 22..])
         } else {
             entry.module_url.clone()
         };
@@ -180,13 +192,16 @@ impl TraceWriter {
             function_name
         };
 
-        write!(self.file, "{:>8}  {:>6x}  {:>4}  {:<25}  {:<15}  {}",
-               entry.instruction_number,
-               entry.pc,
-               function_short,
-               module_short,
-               entry.opcode,
-               entry.operands)?;
+        write!(
+            self.file,
+            "{:>8}  {:>6x}  {:>4}  {:<25}  {:<15}  {}",
+            entry.instruction_number,
+            entry.pc,
+            function_short,
+            module_short,
+            entry.opcode,
+            entry.operands
+        )?;
 
         if let Some(time_ns) = entry.execution_time_ns {
             write!(self.file, "  [{:.2}µs]", time_ns as f64 / 1000.0)?;
@@ -206,7 +221,10 @@ impl TraceWriter {
     pub fn close(mut self) -> std::io::Result<()> {
         use std::io::Write;
         writeln!(self.file)?;
-        writeln!(self.file, "════════════════════════════════════════════════════════════════════════════════")?;
+        writeln!(
+            self.file,
+            "════════════════════════════════════════════════════════════════════════════════"
+        )?;
         self.file.flush()
     }
 }
@@ -249,15 +267,17 @@ impl TraceState {
         };
 
         // Compile filter regex if provided
-        let filter_regex = config.filter.as_ref().and_then(|pattern| {
-            match regex::Regex::new(pattern) {
-                Ok(re) => Some(re),
-                Err(e) => {
-                    eprintln!("Invalid trace filter regex: {}", e);
-                    None
-                }
-            }
-        });
+        let filter_regex =
+            config
+                .filter
+                .as_ref()
+                .and_then(|pattern| match regex::Regex::new(pattern) {
+                    Ok(re) => Some(re),
+                    Err(e) => {
+                        eprintln!("Invalid trace filter regex: {}", e);
+                        None
+                    }
+                });
 
         Self {
             config,

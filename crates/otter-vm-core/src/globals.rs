@@ -14,9 +14,9 @@ use num_traits::ToPrimitive;
 use crate::array_buffer::JsArrayBuffer;
 use crate::error::VmError;
 use crate::gc::GcRef;
+use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
-use crate::memory::MemoryManager;
 use crate::value::Value;
 
 /// Create a native function with proper `length` and `name` properties,
@@ -30,7 +30,10 @@ fn define_global_fn<F>(
     name: &str,
     length: u32,
 ) where
-    F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync + 'static,
+    F: Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
+        + Send
+        + Sync
+        + 'static,
 {
     let fn_obj = GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
     fn_obj.define_property(
@@ -41,8 +44,13 @@ fn define_global_fn<F>(
         PropertyKey::string("name"),
         PropertyDescriptor::function_length(Value::string(JsString::intern(name))),
     );
-    let native_fn: Arc<dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> + Send + Sync> = Arc::new(func);
-    let value = Value::native_function_with_proto_and_object(native_fn, mm.clone(), fn_proto, fn_obj);
+    let native_fn: Arc<
+        dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
+            + Send
+            + Sync,
+    > = Arc::new(func);
+    let value =
+        Value::native_function_with_proto_and_object(native_fn, mm.clone(), fn_proto, fn_obj);
     target.define_property(
         PropertyKey::string(name),
         PropertyDescriptor::builtin_method(value),
@@ -54,7 +62,11 @@ fn define_global_fn<F>(
 /// `fn_proto` is the intrinsic `%Function.prototype%` created by VmRuntime.
 /// All native functions receive it as their `[[Prototype]]` per ES2023 §10.3.1.
 /// `intrinsics_opt` is optional intrinsics for TypedArray prototypes.
-pub fn setup_global_object(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>, intrinsics_opt: Option<&crate::intrinsics::Intrinsics>) {
+pub fn setup_global_object(
+    global: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    intrinsics_opt: Option<&crate::intrinsics::Intrinsics>,
+) {
     let mm = global.memory_manager().clone();
 
     // globalThis - self-referencing, per spec: {writable: true, enumerable: false, configurable: false}
@@ -109,8 +121,22 @@ pub fn setup_global_object(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>, i
     // URI encoding/decoding functions
     define_global_fn(&global, &mm, fn_proto, global_encode_uri, "encodeURI", 1);
     define_global_fn(&global, &mm, fn_proto, global_decode_uri, "decodeURI", 1);
-    define_global_fn(&global, &mm, fn_proto, global_encode_uri_component, "encodeURIComponent", 1);
-    define_global_fn(&global, &mm, fn_proto, global_decode_uri_component, "decodeURIComponent", 1);
+    define_global_fn(
+        &global,
+        &mm,
+        fn_proto,
+        global_encode_uri_component,
+        "encodeURIComponent",
+        1,
+    );
+    define_global_fn(
+        &global,
+        &mm,
+        fn_proto,
+        global_decode_uri_component,
+        "decodeURIComponent",
+        1,
+    );
 
     // Standard built-in objects
     setup_builtin_constructors(global, fn_proto, intrinsics_opt);
@@ -120,7 +146,11 @@ pub fn setup_global_object(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>, i
 /// `fn_proto` is the intrinsic `%Function.prototype%` — used as-is for `Function.prototype`
 /// and as `[[Prototype]]` for all native function objects.
 /// `intrinsics_opt` is optional intrinsics for TypedArray prototypes.
-fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>, intrinsics_opt: Option<&crate::intrinsics::Intrinsics>) {
+fn setup_builtin_constructors(
+    global: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    intrinsics_opt: Option<&crate::intrinsics::Intrinsics>,
+) {
     let mm = global.memory_manager().clone();
     let tag_builtin = |ctor: &Value, name: &str| {
         if let Some(obj) = ctor.as_object() {
@@ -179,7 +209,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
 
     for name in builtins {
         // For the "Function" constructor, use the intrinsic fn_proto
-        // instead of creating a fresh object. This is the BOA/V8 pattern:
+        // instead of creating a fresh object.
         // Function.prototype is created once and shared.
         // For TypedArrays, use intrinsic prototypes if available.
         let proto = if name == "Function" {
@@ -226,7 +256,9 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                                 return Err(VmError::type_error("RangeError: invalid BigInt"));
                             }
                             if n.trunc() != n {
-                                return Err(VmError::type_error("RangeError: The number cannot be converted to a BigInt because it is not an integer"));
+                                return Err(VmError::type_error(
+                                    "RangeError: The number cannot be converted to a BigInt because it is not an integer",
+                                ));
                             }
                             return Ok(Value::bigint(format!("{:.0}", n)));
                         }
@@ -245,7 +277,9 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                         let s = to_string(val);
                         Ok(Value::bigint(s))
                     } else {
-                        Err(VmError::type_error("TypeError: Cannot convert undefined to a BigInt"))
+                        Err(VmError::type_error(
+                            "TypeError: Cannot convert undefined to a BigInt",
+                        ))
                     }
                 },
                 mm.clone(),
@@ -257,31 +291,37 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                 move |_this, args: &[Value], ncx| {
                     let len = if let Some(arg) = args.get(0) {
                         let n = to_number(arg);
-                        if n.is_nan() {
-                            0
-                        } else {
-                            n as usize
-                        }
+                        if n.is_nan() { 0 } else { n as usize }
                     } else {
                         0
                     };
 
-                    let ab = GcRef::new(JsArrayBuffer::new(len, Some(fn_proto), ncx.memory_manager().clone()));
+                    let ab = GcRef::new(JsArrayBuffer::new(
+                        len,
+                        Some(fn_proto),
+                        ncx.memory_manager().clone(),
+                    ));
                     Ok(Value::array_buffer(ab))
                 },
                 mm_clone,
                 fn_proto,
             )
-        } else if name.ends_with("Array") && (
-            name == "Int8Array" || name == "Uint8Array" || name == "Uint8ClampedArray" ||
-            name == "Int16Array" || name == "Uint16Array" ||
-            name == "Int32Array" || name == "Uint32Array" ||
-            name == "Float32Array" || name == "Float64Array" ||
-            name == "BigInt64Array" || name == "BigUint64Array"
-        ) {
+        } else if name.ends_with("Array")
+            && (name == "Int8Array"
+                || name == "Uint8Array"
+                || name == "Uint8ClampedArray"
+                || name == "Int16Array"
+                || name == "Uint16Array"
+                || name == "Int32Array"
+                || name == "Uint32Array"
+                || name == "Float32Array"
+                || name == "Float64Array"
+                || name == "BigInt64Array"
+                || name == "BigUint64Array")
+        {
             // TypedArray constructors
-            use crate::typed_array::{JsTypedArray, TypedArrayKind};
             use crate::array_buffer::JsArrayBuffer;
+            use crate::typed_array::{JsTypedArray, TypedArrayKind};
 
             let kind = match name {
                 "Int8Array" => TypedArrayKind::Int8,
@@ -324,8 +364,12 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
 
                     if args.is_empty() {
                         // new TypedArray() - create empty with length 0
-                        let buffer = GcRef::new(JsArrayBuffer::new(0, None, ncx.memory_manager().clone()));
-                        let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
+                        let buffer =
+                            GcRef::new(JsArrayBuffer::new(0, None, ncx.memory_manager().clone()));
+                        let object = GcRef::new(JsObject::new(
+                            Value::object(proto_clone),
+                            ncx.memory_manager().clone(),
+                        ));
                         let ta = JsTypedArray::new(object, buffer, kind, 0, 0)
                             .map_err(|e| VmError::type_error(e))?;
                         return Ok(make_typed_array(ta));
@@ -335,9 +379,8 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
 
                     // Check if arg0 is ArrayBuffer
                     if let Some(buffer) = arg0.as_array_buffer() {
-                        let byte_offset = args.get(1)
-                            .and_then(|v| v.as_int32())
-                            .unwrap_or(0) as usize;
+                        let byte_offset =
+                            args.get(1).and_then(|v| v.as_int32()).unwrap_or(0) as usize;
 
                         let length = if let Some(len_val) = args.get(2) {
                             len_val.as_int32().unwrap_or(0) as usize
@@ -347,9 +390,13 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                             available / kind.element_size()
                         };
 
-                        let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
-                        let ta = JsTypedArray::new(object, buffer.clone(), kind, byte_offset, length)
-                            .map_err(|e| VmError::type_error(e))?;
+                        let object = GcRef::new(JsObject::new(
+                            Value::object(proto_clone),
+                            ncx.memory_manager().clone(),
+                        ));
+                        let ta =
+                            JsTypedArray::new(object, buffer.clone(), kind, byte_offset, length)
+                                .map_err(|e| VmError::type_error(e))?;
                         return Ok(make_typed_array(ta));
                     }
 
@@ -361,7 +408,10 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                             None,
                             ncx.memory_manager().clone(),
                         ));
-                        let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
+                        let object = GcRef::new(JsObject::new(
+                            Value::object(proto_clone),
+                            ncx.memory_manager().clone(),
+                        ));
                         let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                             .map_err(|e| VmError::type_error(e))?;
 
@@ -387,7 +437,10 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                             None,
                             ncx.memory_manager().clone(),
                         ));
-                        let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
+                        let object = GcRef::new(JsObject::new(
+                            Value::object(proto_clone),
+                            ncx.memory_manager().clone(),
+                        ));
                         let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                             .map_err(|e| VmError::type_error(e))?;
                         return Ok(make_typed_array(ta));
@@ -400,7 +453,10 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                             None,
                             ncx.memory_manager().clone(),
                         ));
-                        let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
+                        let object = GcRef::new(JsObject::new(
+                            Value::object(proto_clone),
+                            ncx.memory_manager().clone(),
+                        ));
                         let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                             .map_err(|e| VmError::type_error(e))?;
                         return Ok(make_typed_array(ta));
@@ -416,7 +472,10 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                                     None,
                                     ncx.memory_manager().clone(),
                                 ));
-                                let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
+                                let object = GcRef::new(JsObject::new(
+                                    Value::object(proto_clone),
+                                    ncx.memory_manager().clone(),
+                                ));
                                 let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                                     .map_err(|e| VmError::type_error(e))?;
 
@@ -437,8 +496,12 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                     }
 
                     // Default: treat as length 0
-                    let buffer = GcRef::new(JsArrayBuffer::new(0, None, ncx.memory_manager().clone()));
-                    let object = GcRef::new(JsObject::new(Value::object(proto_clone), ncx.memory_manager().clone()));
+                    let buffer =
+                        GcRef::new(JsArrayBuffer::new(0, None, ncx.memory_manager().clone()));
+                    let object = GcRef::new(JsObject::new(
+                        Value::object(proto_clone),
+                        ncx.memory_manager().clone(),
+                    ));
                     let ta = JsTypedArray::new(object, buffer, kind, 0, 0)
                         .map_err(|e| VmError::type_error(e))?;
                     Ok(make_typed_array(ta))
@@ -576,16 +639,22 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                         fn_proto,
                     ),
                 );
-            } else if name.ends_with("Array") && (
-                name == "Int8Array" || name == "Uint8Array" || name == "Uint8ClampedArray" ||
-                name == "Int16Array" || name == "Uint16Array" ||
-                name == "Int32Array" || name == "Uint32Array" ||
-                name == "Float32Array" || name == "Float64Array" ||
-                name == "BigInt64Array" || name == "BigUint64Array"
-            ) {
+            } else if name.ends_with("Array")
+                && (name == "Int8Array"
+                    || name == "Uint8Array"
+                    || name == "Uint8ClampedArray"
+                    || name == "Int16Array"
+                    || name == "Uint16Array"
+                    || name == "Int32Array"
+                    || name == "Uint32Array"
+                    || name == "Float32Array"
+                    || name == "Float64Array"
+                    || name == "BigInt64Array"
+                    || name == "BigUint64Array")
+            {
                 // Add TypedArray static methods and properties
-                use crate::typed_array::{JsTypedArray, TypedArrayKind};
                 use crate::array_buffer::JsArrayBuffer;
+                use crate::typed_array::{JsTypedArray, TypedArrayKind};
 
                 let kind = match name {
                     "Int8Array" => TypedArrayKind::Int8,
@@ -615,7 +684,9 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                     PropertyKey::string("from"),
                     Value::native_function_with_proto(
                         move |_this, args, ncx| {
-                            let source = args.get(0).ok_or_else(|| VmError::type_error("TypedArray.from requires a source argument"))?;
+                            let source = args.get(0).ok_or_else(|| {
+                                VmError::type_error("TypedArray.from requires a source argument")
+                            })?;
 
                             // Get length of source
                             let length = if let Some(obj) = source.as_object() {
@@ -633,7 +704,10 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                                 None,
                                 ncx.memory_manager().clone(),
                             ));
-                            let object = GcRef::new(JsObject::new(Value::object(proto_from), ncx.memory_manager().clone()));
+                            let object = GcRef::new(JsObject::new(
+                                Value::object(proto_from),
+                                ncx.memory_manager().clone(),
+                            ));
                             let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                                 .map_err(|e| VmError::type_error(e))?;
 
@@ -685,7 +759,10 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                                 None,
                                 ncx.memory_manager().clone(),
                             ));
-                            let object = GcRef::new(JsObject::new(Value::object(proto_of), ncx.memory_manager().clone()));
+                            let object = GcRef::new(JsObject::new(
+                                Value::object(proto_of),
+                                ncx.memory_manager().clone(),
+                            ));
                             let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                                 .map_err(|e| VmError::type_error(e))?;
 
@@ -734,9 +811,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
             let _ = proto.set(
                 PropertyKey::string("valueOf"),
                 Value::native_function_with_proto(
-                    |this_val, _args, _ncx| {
-                        Ok::<Value, VmError>(this_val.clone())
-                    },
+                    |this_val, _args, _ncx| Ok::<Value, VmError>(this_val.clone()),
                     mm.clone(),
                     fn_proto,
                 ),
@@ -745,9 +820,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
             let _ = proto.set(
                 PropertyKey::string("valueOf"),
                 Value::native_function_with_proto(
-                    |this_val, _args, _ncx| {
-                        Ok::<Value, VmError>(this_val.clone())
-                    },
+                    |this_val, _args, _ncx| Ok::<Value, VmError>(this_val.clone()),
                     mm.clone(),
                     fn_proto,
                 ),
@@ -776,9 +849,7 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
                     |this_val, args, _ncx| {
                         let ab = this_val.as_array_buffer()
                             .ok_or("TypeError: ArrayBuffer.prototype.slice called on incompatible receiver")?;
-                        
                         let len = ab.byte_length() as f64;
-                        
                         let start_arg = to_number(args.get(0).unwrap_or(&Value::undefined()));
                         let start = if start_arg.is_nan() {
                             0
@@ -814,7 +885,10 @@ fn setup_builtin_constructors(global: GcRef<JsObject>, fn_proto: GcRef<JsObject>
         }
 
         // Per ES2023 §18: Global constructors are { writable: true, enumerable: false, configurable: true }
-        global.define_property(PropertyKey::string(name), PropertyDescriptor::builtin_method(ctor));
+        global.define_property(
+            PropertyKey::string(name),
+            PropertyDescriptor::builtin_method(ctor),
+        );
     }
 }
 
@@ -832,7 +906,11 @@ fn get_arg(args: &[Value], index: usize) -> Value {
 ///
 /// Currently, indirect eval is not fully supported. When called with a string,
 /// it returns an error. This is a limitation to be addressed in a future update.
-fn global_eval(this: &Value, args: &[Value], ncx: &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> {
+fn global_eval(
+    this: &Value,
+    args: &[Value],
+    ncx: &mut crate::context::NativeContext<'_>,
+) -> Result<Value, VmError> {
     // Per spec: if argument is not a string, return it unchanged
     let arg = get_arg(args, 0);
 
@@ -869,7 +947,11 @@ fn global_is_finite(
 }
 
 /// `isNaN(number)` - Determines whether a value is NaN.
-fn global_is_nan(_this: &Value, args: &[Value], _ncx: &mut crate::context::NativeContext<'_>) -> Result<Value, VmError> {
+fn global_is_nan(
+    _this: &Value,
+    args: &[Value],
+    _ncx: &mut crate::context::NativeContext<'_>,
+) -> Result<Value, VmError> {
     let value = get_arg(args, 0);
     let num = to_number(&value);
     Ok(Value::boolean(num.is_nan()))
@@ -1199,6 +1281,147 @@ fn to_boolean(value: &Value) -> bool {
     true // Objects are true
 }
 
+/// ES2023 Number::toString(10) — convert f64 to JS string representation.
+///
+/// Rules:
+/// - NaN → "NaN", ±Infinity → "Infinity"/"-Infinity"
+/// - Integers with |n| < 10^21 → no decimal point, no exponent
+/// - Otherwise → shortest representation (scientific notation for large/small)
+pub fn js_number_to_string(n: f64) -> String {
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n.is_sign_positive() {
+            "Infinity"
+        } else {
+            "-Infinity"
+        }
+        .to_string();
+    }
+    if n == 0.0 {
+        return "0".to_string();
+    }
+
+    let negative = n < 0.0 || (n == 0.0 && n.is_sign_negative());
+    let abs_n = n.abs();
+
+    // Integer check: if no fractional part AND magnitude < 10^21
+    if abs_n.fract() == 0.0 && abs_n < 1e21 {
+        // Safe to cast — all integers < 10^21 fit in i64 (max ~9.2e18) or u64
+        // Actually 10^21 > i64::MAX (~9.2e18), so use u64 for the absolute value
+        let int_val = abs_n as u64;
+        return if negative {
+            format!("-{}", int_val)
+        } else {
+            format!("{}", int_val)
+        };
+    }
+
+    // For all other numbers, use shortest representation matching JS semantics.
+    // Rust's {:e} gives scientific notation; we reformat to match JS output.
+    //
+    // Strategy: get the significant digits via ryu-like formatting, then
+    // apply JS exponent rules.
+    //
+    // JS rules for non-integer or large numbers:
+    // - If 1 significant digit: "Ne+X" format
+    // - If multiple significant digits: "N.DDDe+X" format
+    // - Small exponents (0..20): use plain decimal notation
+    // - Negative exponents (-6..0): use "0.000...N" notation — NO, JS uses plain for these too up to a point
+    //
+    // Actually: JS uses plain notation when the number can be written without
+    // too many zeros. The exact rule from the spec (7.1.12.1):
+    // - Let n, k, s be such that s × 10^(n-k) = abs(value), k is minimal
+    // - If k ≤ n ≤ 21: output digits + (n-k) zeros (integer-like)
+    // - If 0 < n ≤ 0 (impossible) ...
+    // - If 0 < n ≤ k: digits with decimal point after n digits (e.g. "1.5")
+    // - If -6 < n ≤ 0: "0." + |n| zeros + digits (e.g. "0.001")
+    // - Otherwise: scientific notation
+
+    // Get shortest decimal representation
+    let repr = format!("{:e}", abs_n);
+    // Parse mantissa and exponent from Rust's scientific notation
+    let (mantissa_str, exp) = if let Some(pos) = repr.find('e') {
+        let m = &repr[..pos];
+        let e: i32 = repr[pos + 1..].parse().unwrap_or(0);
+        (m.to_string(), e)
+    } else {
+        (repr.clone(), 0)
+    };
+
+    // Extract significant digits (remove the decimal point from mantissa)
+    let digits: String = mantissa_str.chars().filter(|c| *c != '.').collect();
+    let k = digits.len() as i32; // number of significant digits
+    // n = exponent of most significant digit + 1
+    // In Rust's {:e}, "1.23e5" means 1.23 × 10^5, so n = exp + 1
+    let n = exp + 1;
+
+    let result = if k <= n && n <= 21 {
+        // Case: integer-like, append zeros
+        let mut s = digits.clone();
+        for _ in 0..(n - k) {
+            s.push('0');
+        }
+        s
+    } else if 0 < n && n <= k {
+        // Case: decimal point within the digits
+        let mut s = String::new();
+        s.push_str(&digits[..n as usize]);
+        s.push('.');
+        s.push_str(&digits[n as usize..]);
+        // Trim trailing zeros after decimal
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+        s
+    } else if -6 < n && n <= 0 {
+        // Case: "0.000...digits"
+        let mut s = String::from("0.");
+        for _ in 0..(-n) {
+            s.push('0');
+        }
+        s.push_str(&digits);
+        // Trim trailing zeros
+        while s.ends_with('0') {
+            s.pop();
+        }
+        s
+    } else {
+        // Scientific notation
+        if k == 1 {
+            format!(
+                "{}e{}{}",
+                &digits[..1],
+                if n - 1 >= 0 { "+" } else { "" },
+                n - 1
+            )
+        } else {
+            let mut sig = String::new();
+            sig.push_str(&digits[..1]);
+            sig.push('.');
+            sig.push_str(&digits[1..]);
+            // Trim trailing zeros in significand
+            while sig.ends_with('0') {
+                sig.pop();
+            }
+            if sig.ends_with('.') {
+                sig.pop();
+            }
+            format!("{}e{}{}", sig, if n - 1 >= 0 { "+" } else { "" }, n - 1)
+        }
+    };
+
+    if negative {
+        format!("-{}", result)
+    } else {
+        result
+    }
+}
+
 pub fn to_string(value: &Value) -> String {
     if let Some(s) = value.as_string() {
         return s.as_str().to_string();
@@ -1217,24 +1440,7 @@ pub fn to_string(value: &Value) -> String {
     }
 
     if let Some(n) = value.as_number() {
-        if n.is_nan() {
-            return "NaN".to_string();
-        }
-        if n.is_infinite() {
-            return if n.is_sign_positive() {
-                "Infinity"
-            } else {
-                "-Infinity"
-            }
-            .to_string();
-        }
-        // Format number
-        let formatted = if n.fract() == 0.0 && n.abs() < 1e15 {
-            format!("{}", n as i64)
-        } else {
-            format!("{}", n)
-        };
-        return formatted;
+        return js_number_to_string(n);
     }
 
     "[object Object]".to_string()

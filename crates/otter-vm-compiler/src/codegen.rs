@@ -200,6 +200,7 @@ impl FunctionContext {
             .name(self.name.unwrap_or_default())
             .param_count(self.param_count)
             .local_count(self.scopes.local_count())
+            .local_names(self.scopes.collect_local_names())
             .register_count(self.registers.max_used())
             .flags(self.flags)
             .upvalues(self.upvalues)

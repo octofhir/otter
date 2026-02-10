@@ -4,7 +4,7 @@
 //! intrinsic objects (constructors, prototypes) and well-known symbols.
 //! It is created once per `VmRuntime` and shared across contexts.
 //!
-//! The initialization follows a two-stage pattern (inspired by Boa):
+//! The initialization follows a two-stage pattern:
 //! 1. **Stage 1**: Allocate empty prototype/constructor objects to break circular deps
 //! 2. **Stage 2**: Initialize properties in dependency order using `BuiltInBuilder`
 
@@ -18,7 +18,7 @@ use crate::object::JsObject;
 use crate::value::{Symbol, Value};
 
 /// Well-known symbol IDs (fixed, pre-defined).
-/// These must match the IDs in `otter-vm-builtins/src/symbol.rs`.
+/// Keep these stable: symbol identity is based on IDs across the runtime.
 pub mod well_known {
     /// `Symbol.iterator`
     pub const ITERATOR: u64 = 1;
@@ -685,7 +685,7 @@ impl Intrinsics {
             self.iterator_prototype.define_property(
                 PropertyKey::Symbol(sym),
                 PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                    |this_val, _args, _ncx| Ok(this_val.clone()),
+                    |this_val, _args, _ncx| std::result::Result::Ok(this_val.clone()),
                     mm.clone(),
                     fn_proto,
                 )),
@@ -739,7 +739,12 @@ impl Intrinsics {
         // ===================================================================
         // RegExp.prototype methods (extracted to intrinsics_impl/regexp.rs)
         // ===================================================================
-        crate::intrinsics_impl::regexp::init_regexp_prototype(self.regexp_prototype, fn_proto, mm, self.iterator_prototype);
+        crate::intrinsics_impl::regexp::init_regexp_prototype(
+            self.regexp_prototype,
+            fn_proto,
+            mm,
+            self.iterator_prototype,
+        );
 
         // ===================================================================
         // Promise.prototype methods (extracted to intrinsics_impl/promise.rs)
@@ -865,7 +870,7 @@ impl Intrinsics {
                         &Value,
                         &[Value],
                         &mut crate::context::NativeContext<'_>,
-                    ) -> Result<Value, VmError>
+                    ) -> std::result::Result<Value, VmError>
                     + Send
                     + Sync,
             >,
@@ -1008,6 +1013,16 @@ impl Intrinsics {
         if let Some(apply_fn) = self.function_prototype.get(&PropertyKey::string("apply")) {
             let _ = global.set(PropertyKey::string("__Function_apply"), apply_fn);
         }
+        if let Some(object_ctor) = global
+            .get(&PropertyKey::string("Object"))
+            .and_then(|v| v.as_object())
+            && let Some(assign_fn) = object_ctor.get(&PropertyKey::string("assign"))
+        {
+            let _ = global.set(PropertyKey::string("__Object_assign"), assign_fn);
+        }
+        let object_rest_fn =
+            crate::intrinsics_impl::object::create_object_rest_helper(fn_proto, mm);
+        let _ = global.set(PropertyKey::string("__Object_rest"), object_rest_fn);
 
         // ====================================================================
         // Primitive wrapper constructors
@@ -1024,7 +1039,7 @@ impl Intrinsics {
                     &Value,
                     &[Value],
                     &mut crate::context::NativeContext<'_>,
-                ) -> Result<Value, VmError>
+                ) -> std::result::Result<Value, VmError>
                 + Send
                 + Sync,
         > = Box::new(|this, args, ncx| {
@@ -1155,7 +1170,7 @@ impl Intrinsics {
                     &Value,
                     &[Value],
                     &mut crate::context::NativeContext<'_>,
-                ) -> Result<Value, VmError>
+                ) -> std::result::Result<Value, VmError>
                 + Send
                 + Sync,
         > = Box::new(|this, args, ncx| {
@@ -1221,7 +1236,7 @@ impl Intrinsics {
                     &Value,
                     &[Value],
                     &mut crate::context::NativeContext<'_>,
-                ) -> Result<Value, VmError>
+                ) -> std::result::Result<Value, VmError>
                 + Send
                 + Sync,
         > = Box::new(move |_this, args, ncx| {
@@ -1479,7 +1494,7 @@ impl Intrinsics {
         // Math namespace (extracted to intrinsics_impl/math.rs)
         // All Math methods are implemented natively in Rust using std::f64
         // ====================================================================
-        crate::intrinsics_impl::math::install_math_namespace(global, mm);
+        crate::intrinsics_impl::math::install_math_namespace(global, mm, self.object_prototype);
 
         // ====================================================================
         // Reflect namespace (extracted to intrinsics_impl/reflect.rs)

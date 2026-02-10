@@ -26,8 +26,7 @@ Otter is an embeddable TypeScript/JavaScript engine for Rust applications built 
 - `crates/otter-vm-gc`: garbage collector with mark-sweep and generational collection.
 - `crates/otter-vm-core`: bytecode interpreter, value representation, objects, strings.
 - `crates/otter-vm-compiler`: JS/TS to bytecode compiler using oxc parser.
-- `crates/otter-vm-runtime`: runtime with builtins integration and event loop.
-- `crates/otter-vm-builtins`: built-in JavaScript functions and objects.
+- `crates/otter-vm-runtime`: runtime and event loop primitives.
 
 ### Supporting crates
 - `crates/otter-macros`: `#[dive]` proc-macro for native function bindings.
@@ -170,7 +169,7 @@ Supporting crates:
 
 ### Builtin Functions
 
-Native functions are registered via `otter-vm-builtins`. Example:
+Native functions are registered via runtime/engine extensions. Example:
 ```rust
 use otter_vm_core::{Value, VmError};
 

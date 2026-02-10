@@ -125,22 +125,39 @@ impl TypeFlags {
     /// Check if only int32 has been seen
     #[inline]
     pub fn is_int32_only(&self) -> bool {
-        self.seen_int32 && !self.seen_number && !self.seen_undefined && !self.seen_null
-            && !self.seen_boolean && !self.seen_string && !self.seen_object && !self.seen_function
+        self.seen_int32
+            && !self.seen_number
+            && !self.seen_undefined
+            && !self.seen_null
+            && !self.seen_boolean
+            && !self.seen_string
+            && !self.seen_object
+            && !self.seen_function
     }
 
     /// Check if only number (f64) has been seen
     #[inline]
     pub fn is_number_only(&self) -> bool {
-        self.seen_number && !self.seen_int32 && !self.seen_undefined && !self.seen_null
-            && !self.seen_boolean && !self.seen_string && !self.seen_object && !self.seen_function
+        self.seen_number
+            && !self.seen_int32
+            && !self.seen_undefined
+            && !self.seen_null
+            && !self.seen_boolean
+            && !self.seen_string
+            && !self.seen_object
+            && !self.seen_function
     }
 
     /// Check if only numeric types (int32 or number) have been seen
     #[inline]
     pub fn is_numeric_only(&self) -> bool {
-        (self.seen_int32 || self.seen_number) && !self.seen_undefined && !self.seen_null
-            && !self.seen_boolean && !self.seen_string && !self.seen_object && !self.seen_function
+        (self.seen_int32 || self.seen_number)
+            && !self.seen_undefined
+            && !self.seen_null
+            && !self.seen_boolean
+            && !self.seen_string
+            && !self.seen_object
+            && !self.seen_function
     }
 
     /// Record seeing undefined
@@ -225,7 +242,12 @@ impl InstructionMetadata {
     }
 
     /// Transition IC to monomorphic state with proto epoch
-    pub fn transition_to_monomorphic_with_epoch(&mut self, shape_id: u64, offset: u32, proto_epoch: u64) {
+    pub fn transition_to_monomorphic_with_epoch(
+        &mut self,
+        shape_id: u64,
+        offset: u32,
+        proto_epoch: u64,
+    ) {
         self.ic_state = InlineCacheState::Monomorphic { shape_id, offset };
         self.proto_epoch = proto_epoch;
     }
@@ -247,7 +269,6 @@ impl InstructionMetadata {
         self.proto_epoch = epoch;
     }
 }
-
 
 /// Thread-confined mutable vector for inline cache feedback data.
 ///
@@ -413,12 +434,11 @@ impl Function {
         // Check if we just crossed the hot threshold
         if new_count >= HOT_FUNCTION_THRESHOLD && prev_count < HOT_FUNCTION_THRESHOLD {
             // Try to mark as hot (only succeeds once)
-            if self.is_hot.compare_exchange(
-                false,
-                true,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ).is_ok() {
+            if self
+                .is_hot
+                .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
                 return true; // First time becoming hot
             }
         }
@@ -583,9 +603,21 @@ impl FunctionBuilder {
         self
     }
 
+    /// Set all parameter names
+    pub fn param_names(mut self, names: Vec<String>) -> Self {
+        self.param_names = names;
+        self
+    }
+
     /// Add local variable name
     pub fn local_name(mut self, name: impl Into<String>) -> Self {
         self.local_names.push(name.into());
+        self
+    }
+
+    /// Set all local variable names
+    pub fn local_names(mut self, names: Vec<String>) -> Self {
+        self.local_names = names;
         self
     }
 

@@ -3,12 +3,15 @@
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use crate::context::NativeContext;
+use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::intrinsics::well_known;
 use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
+use otter_macros::dive;
 
 /// Strict equality (===) for Value, used by Array.prototype.indexOf etc.
 pub fn strict_equal(a: &Value, b: &Value) -> bool {
@@ -206,6 +209,15 @@ pub fn set_array_length(obj: &crate::gc::GcRef<crate::object::JsObject>, len: us
     );
 }
 
+#[dive(name = "[Symbol.species]", length = 0)]
+fn species_getter(
+    this_val: &Value,
+    _args: &[Value],
+    _ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    Ok(this_val.clone())
+}
+
 /// Define the standard @@species getter on a constructor.
 ///
 /// Per ES spec, this is an accessor on the constructor that returns `this`
@@ -215,23 +227,18 @@ pub fn define_species_getter(
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
-    let getter = Value::native_function_with_proto(
-        |this_val, _args, _ncx| Ok(this_val.clone()),
-        mm.clone(),
-        fn_proto,
+    let (_species_name, species_native, _species_len) = species_getter_decl();
+    let getter_object = GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
+    getter_object.define_property(
+        PropertyKey::string("name"),
+        PropertyDescriptor::function_length(Value::string(JsString::intern("get [Symbol.species]"))),
     );
-    if let Some(getter_obj) = getter.as_object() {
-        getter_obj.define_property(
-            PropertyKey::string("name"),
-            PropertyDescriptor::function_length(Value::string(JsString::intern(
-                "get [Symbol.species]",
-            ))),
-        );
-        getter_obj.define_property(
-            PropertyKey::string("length"),
-            PropertyDescriptor::function_length(Value::int32(0)),
-        );
-    }
+    getter_object.define_property(
+        PropertyKey::string("length"),
+        PropertyDescriptor::function_length(Value::int32(0)),
+    );
+    let getter =
+        Value::native_function_with_proto_and_object(species_native, mm.clone(), fn_proto, getter_object);
     ctor.define_property(
         PropertyKey::Symbol(well_known::species_symbol()),
         PropertyDescriptor::Accessor {

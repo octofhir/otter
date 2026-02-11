@@ -207,8 +207,10 @@ impl LoadedModule {
             }
         }
 
-        // Also set "default" to the entire namespace object
-        namespace.set("default", Value::object(namespace_obj));
+        // Set "default" to the entire namespace object if not already present
+        if !namespace.has("default") {
+            namespace.set("default", Value::object(namespace_obj));
+        }
 
         // Create a minimal empty bytecode module (never executed)
         let bytecode = Module::builder(&url).is_esm(true).build();

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use num_bigint::BigInt as NumBigInt;
 use num_bigint::Sign;
 use num_traits::{FromPrimitive, One, Zero};
+use otter_macros::dive;
 
 use crate::context::NativeContext;
 use crate::error::VmError;
@@ -138,81 +139,129 @@ fn set_function_properties(func: &Value, name: &str, length: i32, non_constructo
     }
 }
 
+#[dive(name = "valueOf", length = 0)]
+fn bigint_value_of(
+    this_val: &Value,
+    _args: &[Value],
+    _ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    let prim = bigint_value_from(this_val).ok_or_else(|| {
+        VmError::type_error("BigInt.prototype.valueOf requires that 'this' be a BigInt")
+    })?;
+    Ok(prim)
+}
+
+#[dive(name = "toString", length = 0)]
+fn bigint_to_string_method(
+    this_val: &Value,
+    args: &[Value],
+    ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    let bigint = bigint_from_value(ncx, this_val)?;
+    let radix = if let Some(arg) = args.first() {
+        if arg.is_undefined() {
+            10
+        } else {
+            let num = ncx.to_number_value(arg)?;
+            if !num.is_finite() {
+                return Err(VmError::range_error(
+                    "toString() radix argument must be between 2 and 36",
+                ));
+            }
+            let radix = num.trunc() as i64;
+            if !(2..=36).contains(&radix) {
+                return Err(VmError::range_error(
+                    "toString() radix argument must be between 2 and 36",
+                ));
+            }
+            radix as u32
+        }
+    } else {
+        10
+    };
+    let s = bigint.to_str_radix(radix);
+    Ok(Value::string(JsString::intern(&s)))
+}
+
+#[dive(name = "toLocaleString", length = 0)]
+fn bigint_to_locale_string_method(
+    this_val: &Value,
+    _args: &[Value],
+    ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    let bigint = bigint_from_value(ncx, this_val)?;
+    let s = bigint.to_str_radix(10);
+    Ok(Value::string(JsString::intern(&s)))
+}
+
+#[dive(name = "asIntN", length = 2)]
+fn bigint_as_int_n(
+    _this: &Value,
+    args: &[Value],
+    ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    let bits_val = args.first().cloned().unwrap_or(Value::undefined());
+    let bigint_val = args.get(1).cloned().unwrap_or(Value::undefined());
+
+    let bits = to_index(ncx, &bits_val)?;
+    let bigint = to_bigint(ncx, &bigint_val)?;
+    if bits == 0 {
+        return Ok(Value::bigint("0".to_string()));
+    }
+
+    let modulus = NumBigInt::one() << bits;
+    let mut result = bigint % &modulus;
+    if result.sign() == Sign::Minus {
+        result += &modulus;
+    }
+    let sign_bit = NumBigInt::one() << (bits - 1);
+    if result >= sign_bit {
+        result -= &modulus;
+    }
+    Ok(Value::bigint(result.to_str_radix(10)))
+}
+
+#[dive(name = "asUintN", length = 2)]
+fn bigint_as_uint_n(
+    _this: &Value,
+    args: &[Value],
+    ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    let bits_val = args.first().cloned().unwrap_or(Value::undefined());
+    let bigint_val = args.get(1).cloned().unwrap_or(Value::undefined());
+
+    let bits = to_index(ncx, &bits_val)?;
+    let bigint = to_bigint(ncx, &bigint_val)?;
+    if bits == 0 {
+        return Ok(Value::bigint("0".to_string()));
+    }
+
+    let modulus = NumBigInt::one() << bits;
+    let mut result = bigint % &modulus;
+    if result.sign() == Sign::Minus {
+        result += &modulus;
+    }
+    Ok(Value::bigint(result.to_str_radix(10)))
+}
+
 /// Initialize BigInt.prototype with valueOf and toString.
 pub fn init_bigint_prototype(
     bigint_proto: GcRef<JsObject>,
-    fn_proto: GcRef<JsObject>,
+    _fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
-    // BigInt.prototype.valueOf
-    let value_of_fn = Value::native_function_with_proto(
-        |this_val, _args, _ncx| {
-            let prim = bigint_value_from(this_val).ok_or_else(|| {
-                VmError::type_error("BigInt.prototype.valueOf requires that 'this' be a BigInt")
-            })?;
-            Ok(prim)
-        },
-        mm.clone(),
-        fn_proto.clone(),
-    );
-    set_function_properties(&value_of_fn, "valueOf", 0, true);
-    bigint_proto.define_property(
-        PropertyKey::string("valueOf"),
-        PropertyDescriptor::builtin_method(value_of_fn),
-    );
-
-    // BigInt.prototype.toString([radix])
-    let to_string_fn = Value::native_function_with_proto(
-        |this_val, args, ncx| {
-            let bigint = bigint_from_value(ncx, this_val)?;
-            let radix = if let Some(arg) = args.first() {
-                if arg.is_undefined() {
-                    10
-                } else {
-                    let num = ncx.to_number_value(arg)?;
-                    if !num.is_finite() {
-                        return Err(VmError::range_error(
-                            "toString() radix argument must be between 2 and 36",
-                        ));
-                    }
-                    let radix = num.trunc() as i64;
-                    if !(2..=36).contains(&radix) {
-                        return Err(VmError::range_error(
-                            "toString() radix argument must be between 2 and 36",
-                        ));
-                    }
-                    radix as u32
-                }
-            } else {
-                10
-            };
-            let s = bigint.to_str_radix(radix);
-            Ok(Value::string(JsString::intern(&s)))
-        },
-        mm.clone(),
-        fn_proto.clone(),
-    );
-    set_function_properties(&to_string_fn, "toString", 0, true);
-    bigint_proto.define_property(
-        PropertyKey::string("toString"),
-        PropertyDescriptor::builtin_method(to_string_fn),
-    );
-
-    // BigInt.prototype.toLocaleString()
-    let to_locale_string_fn = Value::native_function_with_proto(
-        |this_val, _args, ncx| {
-            let bigint = bigint_from_value(ncx, this_val)?;
-            let s = bigint.to_str_radix(10);
-            Ok(Value::string(JsString::intern(&s)))
-        },
-        mm.clone(),
-        fn_proto,
-    );
-    set_function_properties(&to_locale_string_fn, "toLocaleString", 0, true);
-    bigint_proto.define_property(
-        PropertyKey::string("toLocaleString"),
-        PropertyDescriptor::builtin_method(to_locale_string_fn),
-    );
+    let methods: &[(&str, crate::value::NativeFn, u32)] = &[
+        bigint_value_of_decl(),
+        bigint_to_string_method_decl(),
+        bigint_to_locale_string_method_decl(),
+    ];
+    for (name, native_fn, length) in methods {
+        let fn_val = Value::native_function_from_decl(name, native_fn.clone(), *length, mm.clone());
+        bigint_proto.define_property(
+            PropertyKey::string(name),
+            PropertyDescriptor::builtin_method(fn_val),
+        );
+    }
 
     // BigInt.prototype[Symbol.toStringTag] = "BigInt"
     bigint_proto.define_property(
@@ -227,68 +276,18 @@ pub fn init_bigint_prototype(
 /// Install static methods on the BigInt constructor.
 pub fn install_bigint_statics(
     bigint_ctor: GcRef<JsObject>,
-    fn_proto: GcRef<JsObject>,
+    _fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
-    // BigInt.asIntN(bits, bigint)
-    let as_int_n_fn = Value::native_function_with_proto(
-        |_this, args, ncx| {
-            let bits_val = args.first().cloned().unwrap_or(Value::undefined());
-            let bigint_val = args.get(1).cloned().unwrap_or(Value::undefined());
-
-            let bits = to_index(ncx, &bits_val)?;
-            let bigint = to_bigint(ncx, &bigint_val)?;
-            if bits == 0 {
-                return Ok(Value::bigint("0".to_string()));
-            }
-
-            let modulus = NumBigInt::one() << bits;
-            let mut result = bigint % &modulus;
-            if result.sign() == Sign::Minus {
-                result += &modulus;
-            }
-            let sign_bit = NumBigInt::one() << (bits - 1);
-            if result >= sign_bit {
-                result -= &modulus;
-            }
-            Ok(Value::bigint(result.to_str_radix(10)))
-        },
-        mm.clone(),
-        fn_proto.clone(),
-    );
-    set_function_properties(&as_int_n_fn, "asIntN", 2, true);
-    bigint_ctor.define_property(
-        PropertyKey::string("asIntN"),
-        PropertyDescriptor::builtin_method(as_int_n_fn),
-    );
-
-    // BigInt.asUintN(bits, bigint)
-    let as_uint_n_fn = Value::native_function_with_proto(
-        |_this, args, ncx| {
-            let bits_val = args.first().cloned().unwrap_or(Value::undefined());
-            let bigint_val = args.get(1).cloned().unwrap_or(Value::undefined());
-
-            let bits = to_index(ncx, &bits_val)?;
-            let bigint = to_bigint(ncx, &bigint_val)?;
-            if bits == 0 {
-                return Ok(Value::bigint("0".to_string()));
-            }
-
-            let modulus = NumBigInt::one() << bits;
-            let mut result = bigint % &modulus;
-            if result.sign() == Sign::Minus {
-                result += &modulus;
-            }
-            Ok(Value::bigint(result.to_str_radix(10)))
-        },
-        mm.clone(),
-        fn_proto,
-    );
-    set_function_properties(&as_uint_n_fn, "asUintN", 2, true);
-    bigint_ctor.define_property(
-        PropertyKey::string("asUintN"),
-        PropertyDescriptor::builtin_method(as_uint_n_fn),
-    );
+    let methods: &[(&str, crate::value::NativeFn, u32)] =
+        &[bigint_as_int_n_decl(), bigint_as_uint_n_decl()];
+    for (name, native_fn, length) in methods {
+        let fn_val = Value::native_function_from_decl(name, native_fn.clone(), *length, mm.clone());
+        bigint_ctor.define_property(
+            PropertyKey::string(name),
+            PropertyDescriptor::builtin_method(fn_val),
+        );
+    }
 
     // BigInt is not a constructor
     let ctor_val = Value::object(bigint_ctor);

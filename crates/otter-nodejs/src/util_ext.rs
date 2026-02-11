@@ -70,6 +70,7 @@ impl OtterExtension for NodeUtilExtension {
             Util::is_primitive_decl,
             Util::is_deep_strict_equal_decl,
             Util::strip_vt_control_characters_decl,
+            Util::get_call_sites_decl,
         ];
 
         let mut ns_builder = ctx.module_namespace();
@@ -259,6 +260,19 @@ impl Util {
             .unwrap_or_default();
         let stripped = strip_ansi(&s);
         Ok(Value::string(JsString::new_gc(&stripped)))
+    }
+
+    #[js_static(name = "getCallSites", length = 0)]
+    pub fn get_call_sites(
+        _this: &Value,
+        _args: &[Value],
+        ncx: &mut NativeContext,
+    ) -> Result<Value, VmError> {
+        // Stub: return empty array
+        Ok(Value::object(GcRef::new(JsObject::array(
+            0,
+            ncx.memory_manager().clone(),
+        ))))
     }
 }
 

@@ -2,13 +2,142 @@
 //!
 //! All Error object methods for ES2026 standard, including stack trace support.
 
+use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
+use otter_macros::dive;
 use std::sync::Arc;
+
+fn native_from_decl_with_function_proto(
+    native_fn: crate::value::NativeFn,
+    mm: &Arc<MemoryManager>,
+    fn_proto: GcRef<JsObject>,
+) -> Value {
+    // Preserve historical function object shape from native_function_with_proto:
+    // [[Prototype]] = %Function.prototype%, name="", length=0.
+    let object = GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
+    object.define_property(
+        PropertyKey::string("length"),
+        PropertyDescriptor::function_length(Value::int32(0)),
+    );
+    object.define_property(
+        PropertyKey::string("name"),
+        PropertyDescriptor::function_length(Value::string(JsString::intern(""))),
+    );
+    Value::native_function_with_proto_and_object(native_fn, mm.clone(), fn_proto, object)
+}
+
+#[dive(name = "toString", length = 0)]
+fn error_to_string(
+    this_val: &Value,
+    _args: &[Value],
+    _ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    if let Some(obj) = this_val.as_object() {
+        let name = obj
+            .get(&PropertyKey::string("name"))
+            .and_then(|v| v.as_string())
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|| "Error".to_string());
+        let msg = obj
+            .get(&PropertyKey::string("message"))
+            .and_then(|v| v.as_string())
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_default();
+        if msg.is_empty() {
+            Ok(Value::string(JsString::intern(&name)))
+        } else {
+            Ok(Value::string(JsString::intern(&format!(
+                "{}: {}",
+                name, msg
+            ))))
+        }
+    } else {
+        Ok(Value::string(JsString::intern("Error")))
+    }
+}
+
+#[dive(name = "stack", length = 0)]
+fn error_stack_getter(
+    this_val: &Value,
+    _args: &[Value],
+    _ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    if let Some(obj) = this_val.as_object() {
+        let name = obj
+            .get(&PropertyKey::string("name"))
+            .and_then(|v| v.as_string())
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|| "Error".to_string());
+        let message = obj
+            .get(&PropertyKey::string("message"))
+            .and_then(|v| v.as_string())
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_default();
+
+        let frames = obj.get(&PropertyKey::string("__stack_frames__"));
+
+        let mut stack = if message.is_empty() {
+            name.clone()
+        } else {
+            format!("{}: {}", name, message)
+        };
+
+        if let Some(frames_val) = frames {
+            if let Some(frames_arr) = frames_val.as_object() {
+                if let Some(len_val) = frames_arr.get(&PropertyKey::string("length")) {
+                    if let Some(len) = len_val.as_number() {
+                        for i in 0..(len as u32) {
+                            if let Some(frame_val) = frames_arr.get(&PropertyKey::Index(i)) {
+                                if let Some(frame) = frame_val.as_object() {
+                                    let func = frame
+                                        .get(&PropertyKey::string("function"))
+                                        .and_then(|v| v.as_string())
+                                        .map(|s| s.as_str().to_string())
+                                        .unwrap_or_else(|| "<anonymous>".to_string());
+                                    let file = frame
+                                        .get(&PropertyKey::string("file"))
+                                        .and_then(|v| v.as_string())
+                                        .map(|s| s.as_str().to_string());
+                                    let line = frame
+                                        .get(&PropertyKey::string("line"))
+                                        .and_then(|v| v.as_number())
+                                        .map(|n| n as u32);
+                                    let column = frame
+                                        .get(&PropertyKey::string("column"))
+                                        .and_then(|v| v.as_number())
+                                        .map(|n| n as u32);
+
+                                    stack.push_str("\n    at ");
+                                    stack.push_str(&func);
+                                    if let Some(file_str) = file {
+                                        stack.push_str(" (");
+                                        stack.push_str(&file_str);
+                                        if let Some(l) = line {
+                                            stack.push_str(&format!(":{}", l));
+                                            if let Some(c) = column {
+                                                stack.push_str(&format!(":{}", c));
+                                            }
+                                        }
+                                        stack.push(')');
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Value::string(JsString::intern(&stack)))
+    } else {
+        Ok(Value::undefined())
+    }
+}
 
 /// Initialize Error.prototype and all error type prototypes
 pub fn init_error_prototypes(
@@ -41,133 +170,24 @@ pub fn init_error_prototypes(
     // Mark as Error prototype for stack trace capture
     let _ = error_proto.set(PropertyKey::string("__is_error__"), Value::boolean(true));
 
+    let (_to_string_name, to_string_native, _to_string_length) = error_to_string_decl();
+    let to_string_fn = native_from_decl_with_function_proto(to_string_native, mm, fn_proto.clone());
+
     // Error.prototype.toString
     error_proto.define_property(
         PropertyKey::string("toString"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _ncx| {
-                if let Some(obj) = this_val.as_object() {
-                    let name = obj
-                        .get(&PropertyKey::string("name"))
-                        .and_then(|v| v.as_string())
-                        .map(|s| s.as_str().to_string())
-                        .unwrap_or_else(|| "Error".to_string());
-                    let msg = obj
-                        .get(&PropertyKey::string("message"))
-                        .and_then(|v| v.as_string())
-                        .map(|s| s.as_str().to_string())
-                        .unwrap_or_default();
-                    if msg.is_empty() {
-                        Ok(Value::string(JsString::intern(&name)))
-                    } else {
-                        Ok(Value::string(JsString::intern(&format!(
-                            "{}: {}",
-                            name, msg
-                        ))))
-                    }
-                } else {
-                    Ok(Value::string(JsString::intern("Error")))
-                }
-            },
-            mm.clone(),
-            fn_proto.clone(),
-        )),
+        PropertyDescriptor::builtin_method(to_string_fn),
     );
 
     // Error.prototype.stack getter
     // This is a lazy getter that formats the __stack_frames__ property
     // The actual stack frames are captured in interpreter.rs during Error construction
+    let (_stack_name, stack_native, _stack_length) = error_stack_getter_decl();
+    let stack_getter = native_from_decl_with_function_proto(stack_native, mm, fn_proto.clone());
     error_proto.define_property(
         PropertyKey::string("stack"),
         PropertyDescriptor::Accessor {
-            get: Some(Value::native_function_with_proto(
-                |this_val, _args, _ncx| {
-                    if let Some(obj) = this_val.as_object() {
-                        // Get error name and message
-                        let name = obj
-                            .get(&PropertyKey::string("name"))
-                            .and_then(|v| v.as_string())
-                            .map(|s| s.as_str().to_string())
-                            .unwrap_or_else(|| "Error".to_string());
-                        let message = obj
-                            .get(&PropertyKey::string("message"))
-                            .and_then(|v| v.as_string())
-                            .map(|s| s.as_str().to_string())
-                            .unwrap_or_default();
-
-                        // Get stack frames (if captured)
-                        let frames = obj.get(&PropertyKey::string("__stack_frames__"));
-
-                        // Format stack trace
-                        let mut stack = if message.is_empty() {
-                            name.clone()
-                        } else {
-                            format!("{}: {}", name, message)
-                        };
-
-                        if let Some(frames_val) = frames {
-                            if let Some(frames_arr) = frames_val.as_object() {
-                                // Get array length
-                                if let Some(len_val) =
-                                    frames_arr.get(&PropertyKey::string("length"))
-                                {
-                                    if let Some(len) = len_val.as_number() {
-                                        for i in 0..(len as u32) {
-                                            if let Some(frame_val) =
-                                                frames_arr.get(&PropertyKey::Index(i))
-                                            {
-                                                if let Some(frame) = frame_val.as_object() {
-                                                    // Extract frame details
-                                                    let func = frame
-                                                        .get(&PropertyKey::string("function"))
-                                                        .and_then(|v| v.as_string())
-                                                        .map(|s| s.as_str().to_string())
-                                                        .unwrap_or_else(|| {
-                                                            "<anonymous>".to_string()
-                                                        });
-                                                    let file = frame
-                                                        .get(&PropertyKey::string("file"))
-                                                        .and_then(|v| v.as_string())
-                                                        .map(|s| s.as_str().to_string());
-                                                    let line = frame
-                                                        .get(&PropertyKey::string("line"))
-                                                        .and_then(|v| v.as_number())
-                                                        .map(|n| n as u32);
-                                                    let column = frame
-                                                        .get(&PropertyKey::string("column"))
-                                                        .and_then(|v| v.as_number())
-                                                        .map(|n| n as u32);
-
-                                                    // Format: "\n    at func (file:line:col)"
-                                                    stack.push_str("\n    at ");
-                                                    stack.push_str(&func);
-                                                    if let Some(file_str) = file {
-                                                        stack.push_str(" (");
-                                                        stack.push_str(&file_str);
-                                                        if let Some(l) = line {
-                                                            stack.push_str(&format!(":{}", l));
-                                                            if let Some(c) = column {
-                                                                stack.push_str(&format!(":{}", c));
-                                                            }
-                                                        }
-                                                        stack.push(')');
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        Ok(Value::string(JsString::intern(&stack)))
-                    } else {
-                        Ok(Value::undefined())
-                    }
-                },
-                mm.clone(),
-                fn_proto.clone(),
-            )),
+            get: Some(stack_getter),
             set: None,
             attributes: PropertyAttributes {
                 writable: false,

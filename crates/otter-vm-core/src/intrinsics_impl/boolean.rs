@@ -5,14 +5,15 @@
 //! - new Boolean(value) - creates Boolean object
 //! - Boolean.prototype.valueOf() - returns primitive value
 //! - Boolean.prototype.toString() - returns "true" or "false"
-//!
-//! All methods use inline implementations for optimal performance.
 
+use crate::context::NativeContext;
+use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
+use otter_macros::dive;
 use std::sync::Arc;
 
 /// Convert a value to boolean (ToBoolean abstract operation ES2026 §7.1.2)
@@ -34,6 +35,55 @@ fn to_boolean(val: &Value) -> bool {
     }
 }
 
+#[dive(name = "valueOf", length = 0)]
+fn boolean_value_of(
+    this_val: &Value,
+    _args: &[Value],
+    _ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    if let Some(b) = this_val.as_boolean() {
+        Ok(Value::boolean(b))
+    } else if let Some(obj) = this_val.as_object() {
+        if let Some(val) = obj.get(&PropertyKey::string("__value__")) {
+            if let Some(b) = val.as_boolean() {
+                return Ok(Value::boolean(b));
+            }
+        }
+        Ok(Value::boolean(to_boolean(this_val)))
+    } else {
+        Ok(Value::boolean(to_boolean(this_val)))
+    }
+}
+
+#[dive(name = "toString", length = 0)]
+fn boolean_to_string(
+    this_val: &Value,
+    _args: &[Value],
+    _ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    let b = if let Some(b) = this_val.as_boolean() {
+        b
+    } else if let Some(obj) = this_val.as_object() {
+        if let Some(val) = obj.get(&PropertyKey::string("__value__")) {
+            if let Some(b) = val.as_boolean() {
+                b
+            } else {
+                to_boolean(this_val)
+            }
+        } else {
+            to_boolean(this_val)
+        }
+    } else {
+        to_boolean(this_val)
+    };
+
+    Ok(Value::string(JsString::intern(if b {
+        "true"
+    } else {
+        "false"
+    })))
+}
+
 /// Initialize Boolean.prototype with valueOf and toString methods
 ///
 /// # ES2026 Methods
@@ -44,71 +94,19 @@ fn to_boolean(val: &Value) -> bool {
 /// All methods use `{ writable: true, enumerable: false, configurable: true }`
 pub fn init_boolean_prototype(
     boolean_proto: GcRef<JsObject>,
-    fn_proto: GcRef<JsObject>,
+    _fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
-    // ====================================================================
-    // Boolean.prototype.valueOf()
-    // ====================================================================
-    boolean_proto.define_property(
-        PropertyKey::string("valueOf"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _ncx| {
-                // Return primitive boolean value
-                if let Some(b) = this_val.as_boolean() {
-                    Ok(Value::boolean(b))
-                } else if let Some(obj) = this_val.as_object() {
-                    // Boolean object - extract internal [[BooleanData]]
-                    if let Some(val) = obj.get(&PropertyKey::string("__value__")) {
-                        if let Some(b) = val.as_boolean() {
-                            return Ok(Value::boolean(b));
-                        }
-                    }
-                    // Fallback: coerce to boolean
-                    Ok(Value::boolean(to_boolean(this_val)))
-                } else {
-                    // Primitive - coerce to boolean
-                    Ok(Value::boolean(to_boolean(this_val)))
-                }
-            },
-            mm.clone(),
-            fn_proto,
-        )),
-    );
+    let methods: &[(&str, crate::value::NativeFn, u32)] =
+        &[boolean_value_of_decl(), boolean_to_string_decl()];
 
-    // ====================================================================
-    // Boolean.prototype.toString()
-    // ====================================================================
-    boolean_proto.define_property(
-        PropertyKey::string("toString"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _ncx| {
-                let b = if let Some(b) = this_val.as_boolean() {
-                    b
-                } else if let Some(obj) = this_val.as_object() {
-                    // Boolean object - extract internal [[BooleanData]]
-                    if let Some(val) = obj.get(&PropertyKey::string("__value__")) {
-                        if let Some(b) = val.as_boolean() {
-                            b
-                        } else {
-                            to_boolean(this_val)
-                        }
-                    } else {
-                        to_boolean(this_val)
-                    }
-                } else {
-                    to_boolean(this_val)
-                };
-                Ok(Value::string(JsString::intern(if b {
-                    "true"
-                } else {
-                    "false"
-                })))
-            },
-            mm.clone(),
-            fn_proto,
-        )),
-    );
+    for (name, native_fn, length) in methods {
+        let fn_val = Value::native_function_from_decl(name, native_fn.clone(), *length, mm.clone());
+        boolean_proto.define_property(
+            PropertyKey::string(name),
+            PropertyDescriptor::builtin_method(fn_val),
+        );
+    }
 }
 
 /// Create Boolean constructor function

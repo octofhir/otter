@@ -11,7 +11,6 @@ timeout_secs = 10
 [modules.assert]
 patterns = ["test-assert-*.js", "test-assert.js"]
 skip = [
-    "test-assert-async.js",                       # needs async node:test
     "test-assert-esm-cjs-message-verify.js",       # needs child_process for message verification
     "test-assert-class-destructuring.js",           # edge case: destructuring in class body
 ]
@@ -51,4 +50,44 @@ patterns = ["test-process-*.js"]
 skip = [
     "test-process-exec.js",                         # needs child_process
     "test-process-spawn.js",                         # needs child_process
+]
+
+[modules.test]
+patterns = ["test-runner-*.js"]
+skip = [
+    "test-runner-cli*.js",                            # CLI-level test runner features
+    "test-runner-concurrency.js",                     # needs real concurrency
+    "test-runner-coverage*.js",                       # needs V8 coverage
+    "test-runner-error-reporter.js",                  # needs reporter stream
+    "test-runner-exit-code.js",                       # needs child_process for exit code
+    "test-runner-extraneous-async-activity.js",       # needs async tracking
+    "test-runner-filetest-location.js",               # needs file location tracking
+    "test-runner-filter-warning.js",                  # needs warning system
+    "test-runner-flag-propagation.js",                # needs child_process
+    "test-runner-force-exit*.js",                     # needs force exit handling
+    "test-runner-import-no-scheme.js",                # needs ESM import
+    "test-runner-misc.js",                            # needs internal test_runner modules
+    "test-runner-mock-timers*.js",                    # needs timer mocking
+    "test-runner-mocking.js",                         # needs full mock support
+    "test-runner-module-mocking.js",                  # needs module mocking
+    "test-runner-no-isolation-filtering.js",          # needs isolation mode
+    "test-runner-reporters.js",                       # needs reporter stream
+    "test-runner-root-after-with-refed-handles.js",   # needs handle tracking
+    "test-runner-root-duration.js",                   # needs duration tracking
+    "test-runner-snapshot*.js",                       # needs snapshot testing
+    "test-runner-source-maps-invalid-json.js",        # needs source maps
+    "test-runner-string-to-regexp.js",                # needs internal convertStringToRegExp
+    "test-runner-subtest-after-hook.js",              # needs subtest lifecycle hooks
+    "test-runner-test-filepath.js",                   # needs file path tracking
+    "test-runner-test-fullname.js",                   # needs fullName API
+    "test-runner-test-rerun-failures.js",             # needs test rerun
+    "test-runner-todo-skip-tests.js",                 # needs TAP output
+    "test-runner-wait-for.js",                        # needs waitFor API
+    "test-runner-enable-source-maps-issue.js",        # needs source maps
+    "test-runner-custom-assertions.js",               # needs custom assertion plans
+    "test-runner-output*.js",                         # needs TAP output
+    "test-runner-plan*.js",                           # needs plan counting
+    "test-runner-run*.js",                            # needs test.run() stream
+    "test-runner-watch-mode*.js",                     # needs watch mode
+    "test-runner-global*.js",                         # needs --test flag globals
 ]

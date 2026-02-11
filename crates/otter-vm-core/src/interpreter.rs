@@ -7764,6 +7764,66 @@ impl Interpreter {
                     }
                     return Err(VmError::exception(error_val));
                 }
+                Err(VmError::TypeError(msg)) => {
+                    let error_val = self.make_error(ctx, "TypeError", &msg);
+                    if let Some((target_depth, catch_pc)) = ctx.peek_nearest_try() {
+                        if target_depth > prev_stack_depth {
+                            ctx.take_nearest_try();
+                            while ctx.stack_depth() > target_depth {
+                                ctx.pop_frame();
+                            }
+                            if let Some(frame) = ctx.current_frame_mut() {
+                                frame.pc = catch_pc;
+                            }
+                            ctx.set_register(0, error_val);
+                            continue;
+                        }
+                    }
+                    while ctx.stack_depth() > prev_stack_depth {
+                        ctx.pop_frame();
+                    }
+                    return Err(VmError::exception(error_val));
+                }
+                Err(VmError::ReferenceError(msg)) => {
+                    let error_val = self.make_error(ctx, "ReferenceError", &msg);
+                    if let Some((target_depth, catch_pc)) = ctx.peek_nearest_try() {
+                        if target_depth > prev_stack_depth {
+                            ctx.take_nearest_try();
+                            while ctx.stack_depth() > target_depth {
+                                ctx.pop_frame();
+                            }
+                            if let Some(frame) = ctx.current_frame_mut() {
+                                frame.pc = catch_pc;
+                            }
+                            ctx.set_register(0, error_val);
+                            continue;
+                        }
+                    }
+                    while ctx.stack_depth() > prev_stack_depth {
+                        ctx.pop_frame();
+                    }
+                    return Err(VmError::exception(error_val));
+                }
+                Err(VmError::RangeError(msg)) => {
+                    let error_val = self.make_error(ctx, "RangeError", &msg);
+                    if let Some((target_depth, catch_pc)) = ctx.peek_nearest_try() {
+                        if target_depth > prev_stack_depth {
+                            ctx.take_nearest_try();
+                            while ctx.stack_depth() > target_depth {
+                                ctx.pop_frame();
+                            }
+                            if let Some(frame) = ctx.current_frame_mut() {
+                                frame.pc = catch_pc;
+                            }
+                            ctx.set_register(0, error_val);
+                            continue;
+                        }
+                    }
+                    while ctx.stack_depth() > prev_stack_depth {
+                        ctx.pop_frame();
+                    }
+                    return Err(VmError::exception(error_val));
+                }
                 Err(other) => {
                     while ctx.stack_depth() > prev_stack_depth {
                         ctx.pop_frame();

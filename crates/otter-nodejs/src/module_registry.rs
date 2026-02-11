@@ -27,6 +27,12 @@ const FULL_BUILTIN_MODULES: &[&str] = &[
     "node:assert",
     "node:assert/strict",
     "node:os",
+    "node:test",
+    "node:worker_threads",
+    "node:net",
+    "node:child_process",
+    "node:url",
+    "node:cluster",
 ];
 
 const SAFE_BUILTIN_MODULES: &[&str] = &[
@@ -37,6 +43,9 @@ const SAFE_BUILTIN_MODULES: &[&str] = &[
     "node:stream",
     "node:assert",
     "node:assert/strict",
+    "node:test",
+    "node:worker_threads",
+    "node:url",
 ];
 
 static NODE_MODULES: &[NodeModuleEntry] = &[
@@ -82,6 +91,30 @@ static NODE_MODULES: &[NodeModuleEntry] = &[
     },
     NodeModuleEntry {
         name: "os",
+        safe_core: false,
+    },
+    NodeModuleEntry {
+        name: "test",
+        safe_core: true,
+    },
+    NodeModuleEntry {
+        name: "worker_threads",
+        safe_core: true,
+    },
+    NodeModuleEntry {
+        name: "net",
+        safe_core: false,
+    },
+    NodeModuleEntry {
+        name: "child_process",
+        safe_core: false,
+    },
+    NodeModuleEntry {
+        name: "url",
+        safe_core: true,
+    },
+    NodeModuleEntry {
+        name: "cluster",
         safe_core: false,
     },
 ];

@@ -45,6 +45,14 @@ pub struct Compiler {
     pending_inferred_name: Option<String>,
     /// Monotonic tagged template site id within this compilation unit.
     next_template_site: u32,
+    /// Whether we're currently compiling inside a ChainExpression.
+    /// When true, member/call expressions with `optional: true` emit
+    /// JumpIfNullish to the end of the entire chain (not just past the
+    /// immediate access).
+    in_chain: bool,
+    /// Jump indices collected during chain compilation, all targeting the
+    /// end of the current ChainExpression.
+    chain_end_jumps: Vec<usize>,
 }
 
 /// Context in which an identifier is used, for strict mode error messages
@@ -90,6 +98,8 @@ impl Compiler {
             eval_mode: false,
             pending_inferred_name: None,
             next_template_site: 0,
+            in_chain: false,
+            chain_end_jumps: Vec::new(),
         }
     }
 
@@ -4527,23 +4537,399 @@ impl Compiler {
     ) -> CompileResult<Register> {
         use oxc_ast::ast::ChainElement;
 
-        match &chain.expression {
+        // Set up chain context: all ?. jumps within the chain will target the
+        // end of this block, achieving "long short-circuiting".
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::LoadUndefined { dst });
+
+        let prev_in_chain = self.in_chain;
+        let prev_jumps = std::mem::take(&mut self.chain_end_jumps);
+        self.in_chain = true;
+
+        // Compile the chain element using the regular expression compilers.
+        // Member/call expressions with `optional: true` will emit JumpIfNullish
+        // that are added to self.chain_end_jumps.
+        let result = match &chain.expression {
             ChainElement::StaticMemberExpression(member) => {
-                if member.optional {
-                    self.compile_optional_static_member_expression(member)
-                } else {
-                    self.compile_static_member_expression(member)
-                }
+                self.compile_static_member_expression(member)
             }
             ChainElement::ComputedMemberExpression(member) => {
-                if member.optional {
-                    self.compile_optional_computed_member_expression(member)
-                } else {
-                    self.compile_computed_member_expression(member)
-                }
+                self.compile_computed_member_expression(member)
             }
-            _ => Err(CompileError::unsupported("ChainExpression")),
+            ChainElement::CallExpression(call) => self.compile_call_expression(call),
+            ChainElement::TSNonNullExpression(ts_expr) => {
+                self.compile_expression(&ts_expr.expression)
+            }
+            ChainElement::PrivateFieldExpression(_) => Err(CompileError::unsupported(
+                "Optional chaining with private fields",
+            )),
+        }?;
+
+        // Move the result into dst (which was pre-loaded with undefined for
+        // the short-circuit path).
+        self.codegen.emit(Instruction::Move { dst, src: result });
+        self.codegen.free_reg(result);
+
+        // Patch all chain end jumps to land here (after the Move).
+        let end_idx = self.codegen.current_index();
+        for jump_idx in &self.chain_end_jumps {
+            let offset = end_idx as i32 - *jump_idx as i32;
+            self.codegen.patch_jump(*jump_idx, offset);
         }
+
+        // Restore previous chain context.
+        self.in_chain = prev_in_chain;
+        self.chain_end_jumps = prev_jumps;
+
+        Ok(dst)
+    }
+
+    fn compile_optional_call_expression(
+        &mut self,
+        call: &CallExpression,
+    ) -> CompileResult<Register> {
+        // obj.method?.() — need to preserve `this` by using CallMethod
+        if let Expression::StaticMemberExpression(member) = &call.callee {
+            return self.compile_optional_static_method_call(call, member);
+        }
+        if let Expression::ComputedMemberExpression(member) = &call.callee {
+            return self.compile_optional_computed_method_call(call, member);
+        }
+
+        // foo?.() — plain function optional call
+        let func = self.compile_expression(&call.callee)?;
+
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::LoadUndefined { dst });
+
+        let jump_idx = self.codegen.current_index();
+        self.codegen.emit(Instruction::JumpIfNullish {
+            src: func,
+            offset: JumpOffset(0),
+        });
+
+        let argc = call.arguments.len() as u8;
+        let mut arg_tmps = Vec::with_capacity(call.arguments.len());
+        for arg in &call.arguments {
+            arg_tmps.push(self.compile_expression(arg.to_expression())?);
+        }
+
+        let frame = self.codegen.alloc_fresh_block(1 + argc);
+        self.codegen.emit(Instruction::Move {
+            dst: frame,
+            src: func,
+        });
+        for (i, tmp) in arg_tmps.iter().copied().enumerate() {
+            let target = Register(frame.0 + 1 + i as u16);
+            self.codegen.emit(Instruction::Move {
+                dst: target,
+                src: tmp,
+            });
+        }
+
+        self.codegen.emit(Instruction::Call {
+            dst,
+            func: frame,
+            argc,
+        });
+
+        for tmp in arg_tmps {
+            self.codegen.free_reg(tmp);
+        }
+        for i in 0..(1 + argc as u16) {
+            self.codegen.free_reg(Register(frame.0 + i));
+        }
+
+        let end_offset = self.codegen.current_index() as i32 - jump_idx as i32;
+        self.codegen.patch_jump(jump_idx, end_offset);
+
+        self.codegen.free_reg(func);
+        Ok(dst)
+    }
+
+    /// Compile `obj.method?.()` — optional call on a static member, preserving `this`
+    fn compile_optional_static_method_call(
+        &mut self,
+        call: &CallExpression,
+        member: &oxc_ast::ast::StaticMemberExpression,
+    ) -> CompileResult<Register> {
+        let obj = self.compile_expression(&member.object)?;
+
+        // Get the method value
+        let method_val = self.codegen.alloc_reg();
+        let name_idx = self.codegen.add_string(&member.property.name);
+        let ic_get = self.codegen.alloc_ic();
+        self.codegen.emit(Instruction::GetPropConst {
+            dst: method_val,
+            obj,
+            name: name_idx,
+            ic_index: ic_get,
+        });
+
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::LoadUndefined { dst });
+
+        // If method is nullish, skip the call
+        let jump_idx = self.codegen.current_index();
+        self.codegen.emit(Instruction::JumpIfNullish {
+            src: method_val,
+            offset: JumpOffset(0),
+        });
+
+        // Compile arguments
+        let argc = call.arguments.len() as u8;
+        let mut arg_tmps = Vec::with_capacity(call.arguments.len());
+        for arg in &call.arguments {
+            arg_tmps.push(self.compile_expression(arg.to_expression())?);
+        }
+
+        // Build contiguous frame: [obj, arg1, arg2, ...]
+        let frame = self.codegen.alloc_fresh_block(1 + argc);
+        self.codegen.emit(Instruction::Move {
+            dst: frame,
+            src: obj,
+        });
+        for (i, tmp) in arg_tmps.iter().copied().enumerate() {
+            let target = Register(frame.0 + 1 + i as u16);
+            self.codegen.emit(Instruction::Move {
+                dst: target,
+                src: tmp,
+            });
+        }
+
+        let ic_call = self.codegen.alloc_ic();
+        self.codegen.emit(Instruction::CallMethod {
+            dst,
+            obj: frame,
+            method: name_idx,
+            argc,
+            ic_index: ic_call,
+        });
+
+        self.codegen.free_reg(method_val);
+        for tmp in arg_tmps {
+            self.codegen.free_reg(tmp);
+        }
+        for i in 0..(1 + argc as u16) {
+            self.codegen.free_reg(Register(frame.0 + i));
+        }
+
+        let end_offset = self.codegen.current_index() as i32 - jump_idx as i32;
+        self.codegen.patch_jump(jump_idx, end_offset);
+
+        self.codegen.free_reg(obj);
+        Ok(dst)
+    }
+
+    /// Compile `obj[key]?.()` — optional call on a computed member, preserving `this`
+    fn compile_optional_computed_method_call(
+        &mut self,
+        call: &CallExpression,
+        member: &oxc_ast::ast::ComputedMemberExpression,
+    ) -> CompileResult<Register> {
+        let obj = self.compile_expression(&member.object)?;
+        let key = self.compile_expression(&member.expression)?;
+
+        // Get the method value
+        let method_val = self.codegen.alloc_reg();
+        let ic_get = self.codegen.alloc_ic();
+        self.codegen.emit(Instruction::GetProp {
+            dst: method_val,
+            obj,
+            key,
+            ic_index: ic_get,
+        });
+
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::LoadUndefined { dst });
+
+        // If method is nullish, skip the call
+        let jump_idx = self.codegen.current_index();
+        self.codegen.emit(Instruction::JumpIfNullish {
+            src: method_val,
+            offset: JumpOffset(0),
+        });
+
+        // Compile arguments
+        let argc = call.arguments.len() as u8;
+        let mut arg_tmps = Vec::with_capacity(call.arguments.len());
+        for arg in &call.arguments {
+            arg_tmps.push(self.compile_expression(arg.to_expression())?);
+        }
+
+        // Build contiguous frame: [obj, arg1, arg2, ...]
+        let frame = self.codegen.alloc_fresh_block(1 + argc);
+        self.codegen.emit(Instruction::Move {
+            dst: frame,
+            src: obj,
+        });
+        for (i, tmp) in arg_tmps.iter().copied().enumerate() {
+            let target = Register(frame.0 + 1 + i as u16);
+            self.codegen.emit(Instruction::Move {
+                dst: target,
+                src: tmp,
+            });
+        }
+
+        let ic_call = self.codegen.alloc_ic();
+        self.codegen.emit(Instruction::CallMethodComputed {
+            dst,
+            obj: frame,
+            key,
+            argc,
+            ic_index: ic_call,
+        });
+
+        self.codegen.free_reg(method_val);
+        self.codegen.free_reg(key);
+        for tmp in arg_tmps {
+            self.codegen.free_reg(tmp);
+        }
+        for i in 0..(1 + argc as u16) {
+            self.codegen.free_reg(Register(frame.0 + i));
+        }
+
+        let end_offset = self.codegen.current_index() as i32 - jump_idx as i32;
+        self.codegen.patch_jump(jump_idx, end_offset);
+
+        self.codegen.free_reg(obj);
+        Ok(dst)
+    }
+
+    /// Compile `obj?.method(args)` — optional member with non-optional call
+    fn compile_optional_member_call(
+        &mut self,
+        call: &CallExpression,
+        member: &oxc_ast::ast::StaticMemberExpression,
+    ) -> CompileResult<Register> {
+        // Compile the object
+        let obj = self.compile_expression(&member.object)?;
+
+        // Pre-set result to undefined for short-circuit
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::LoadUndefined { dst });
+
+        // If obj is nullish, skip the method call
+        let jump_idx = self.codegen.current_index();
+        self.codegen.emit(Instruction::JumpIfNullish {
+            src: obj,
+            offset: JumpOffset(0),
+        });
+
+        // Get method name
+        let method_name = member.property.name.as_str();
+        let method_idx = self.codegen.add_string(method_name);
+
+        // Compile arguments
+        let argc = call.arguments.len() as u8;
+        let mut arg_tmps = Vec::with_capacity(call.arguments.len());
+        for arg in &call.arguments {
+            arg_tmps.push(self.compile_expression(arg.to_expression())?);
+        }
+
+        // Build contiguous frame: [obj, arg1, arg2, ...]
+        let frame = self.codegen.alloc_fresh_block(1 + argc);
+        self.codegen.emit(Instruction::Move {
+            dst: frame,
+            src: obj,
+        });
+        for (i, tmp) in arg_tmps.iter().copied().enumerate() {
+            let target = Register(frame.0 + 1 + i as u16);
+            self.codegen.emit(Instruction::Move {
+                dst: target,
+                src: tmp,
+            });
+        }
+
+        let ic_index = self.codegen.alloc_ic();
+        self.codegen.emit(Instruction::CallMethod {
+            dst,
+            obj: frame,
+            method: method_idx,
+            argc,
+            ic_index,
+        });
+
+        for tmp in arg_tmps {
+            self.codegen.free_reg(tmp);
+        }
+        for i in 0..(1 + argc as u16) {
+            self.codegen.free_reg(Register(frame.0 + i));
+        }
+
+        let end_offset = self.codegen.current_index() as i32 - jump_idx as i32;
+        self.codegen.patch_jump(jump_idx, end_offset);
+
+        self.codegen.free_reg(obj);
+        Ok(dst)
+    }
+
+    /// Compile `obj?.[key](args)` — optional computed member with non-optional call
+    fn compile_optional_computed_member_call(
+        &mut self,
+        call: &CallExpression,
+        member: &oxc_ast::ast::ComputedMemberExpression,
+    ) -> CompileResult<Register> {
+        // Compile the object
+        let obj = self.compile_expression(&member.object)?;
+
+        // Pre-set result to undefined for short-circuit
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::LoadUndefined { dst });
+
+        // If obj is nullish, skip the call
+        let jump_idx = self.codegen.current_index();
+        self.codegen.emit(Instruction::JumpIfNullish {
+            src: obj,
+            offset: JumpOffset(0),
+        });
+
+        // Compile the key
+        let key = self.compile_expression(&member.expression)?;
+
+        // Compile arguments
+        let argc = call.arguments.len() as u8;
+        let mut arg_tmps = Vec::with_capacity(call.arguments.len());
+        for arg in &call.arguments {
+            arg_tmps.push(self.compile_expression(arg.to_expression())?);
+        }
+
+        // Build contiguous frame: [obj, arg1, arg2, ...]
+        let frame = self.codegen.alloc_fresh_block(1 + argc);
+        self.codegen.emit(Instruction::Move {
+            dst: frame,
+            src: obj,
+        });
+        for (i, tmp) in arg_tmps.iter().copied().enumerate() {
+            let target = Register(frame.0 + 1 + i as u16);
+            self.codegen.emit(Instruction::Move {
+                dst: target,
+                src: tmp,
+            });
+        }
+
+        let ic_index = self.codegen.alloc_ic();
+        self.codegen.emit(Instruction::CallMethodComputed {
+            dst,
+            obj: frame,
+            key,
+            argc,
+            ic_index,
+        });
+
+        self.codegen.free_reg(key);
+        for tmp in arg_tmps {
+            self.codegen.free_reg(tmp);
+        }
+        for i in 0..(1 + argc as u16) {
+            self.codegen.free_reg(Register(frame.0 + i));
+        }
+
+        let end_offset = self.codegen.current_index() as i32 - jump_idx as i32;
+        self.codegen.patch_jump(jump_idx, end_offset);
+
+        self.codegen.free_reg(obj);
+        Ok(dst)
     }
 
     fn compile_optional_static_member_expression(

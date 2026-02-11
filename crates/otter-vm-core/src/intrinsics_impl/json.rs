@@ -16,6 +16,7 @@ use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
+use otter_macros::dive;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -924,6 +925,129 @@ fn stringify_object_with_replacer(
     Ok(Some(format_object(&items, indent, depth)))
 }
 
+#[dive(name = "parse", length = 2)]
+fn json_parse(
+    _this_val: &Value,
+    args: &[Value],
+    ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+
+    // Convert to string using ToString (calling toString() if needed)
+    let text = if let Some(s) = arg.as_string() {
+        s.as_str().to_string()
+    } else if let Some(n) = arg.as_number() {
+        format!("{}", n)
+    } else if let Some(n) = arg.as_int32() {
+        format!("{}", n)
+    } else if let Some(b) = arg.as_boolean() {
+        if b { "true" } else { "false" }.to_string()
+    } else if arg.is_null() {
+        "null".to_string()
+    } else if arg.is_undefined() {
+        return Err(VmError::syntax_error("JSON.parse: unexpected input"));
+    } else if let Some(obj) = arg.as_object() {
+        // Try calling toString() on the object
+        if let Some(to_string_fn) = obj.get(&PropertyKey::string("toString")) {
+            if to_string_fn.is_callable() {
+                let result = ncx.call_function(&to_string_fn, Value::object(obj), &[])?;
+                if let Some(s) = result.as_string() {
+                    s.as_str().to_string()
+                } else {
+                    return Err(VmError::syntax_error(
+                        "JSON.parse: toString did not return string",
+                    ));
+                }
+            } else {
+                "[object Object]".to_string()
+            }
+        } else {
+            "[object Object]".to_string()
+        }
+    } else {
+        return Err(VmError::syntax_error("JSON.parse: unexpected input"));
+    };
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| VmError::syntax_error(format!("JSON.parse: {}", e)))?;
+
+    // Get Object.prototype and Array.prototype from global
+    let global = ncx.ctx.global();
+    let object_proto = global
+        .get(&PropertyKey::string("Object"))
+        .and_then(|o| o.as_object())
+        .and_then(|o| o.get(&PropertyKey::string("prototype")))
+        .unwrap_or_else(Value::null);
+    let array_proto = global
+        .get(&PropertyKey::string("Array"))
+        .and_then(|o| o.as_object())
+        .and_then(|o| o.get(&PropertyKey::string("prototype")))
+        .unwrap_or_else(Value::null);
+
+    let mm = ncx.memory_manager().clone();
+    let result = json_to_value(&parsed, &mm, &object_proto, &array_proto);
+
+    // Apply reviver if provided
+    if let Some(reviver) = args.get(1) {
+        if reviver.is_callable() {
+            return apply_reviver(result, reviver, ncx, &mm);
+        }
+    }
+
+    Ok(result)
+}
+
+#[dive(name = "stringify", length = 3)]
+fn json_stringify(
+    _this_val: &Value,
+    args: &[Value],
+    ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    let val = args.first().cloned().unwrap_or(Value::undefined());
+
+    // undefined at top level returns undefined
+    if val.is_undefined() {
+        return Ok(Value::undefined());
+    }
+
+    // Parse replacer argument
+    let (replacer_fn, property_list) = parse_replacer(args.get(1), ncx)?;
+
+    // Parse space argument
+    let space_str = parse_space(args.get(2), ncx)?;
+
+    // Create wrapper object to hold the value
+    // Per spec, wrapper should have Object.prototype as its prototype
+    let global = ncx.ctx.global();
+    let object_proto = global
+        .get(&PropertyKey::string("Object"))
+        .and_then(|o| o.as_object())
+        .and_then(|o| o.get(&PropertyKey::string("prototype")))
+        .unwrap_or_else(Value::null);
+    let wrapper = GcRef::new(JsObject::new(object_proto, ncx.memory_manager().clone()));
+    let _ = wrapper.set(PropertyKey::string(""), val.clone());
+    let wrapper_val = Value::object(wrapper);
+
+    let mut tracker = CircularTracker::new();
+
+    // Serialize
+    let result = stringify_with_replacer(
+        &wrapper_val,
+        "",
+        &replacer_fn,
+        &space_str,
+        &property_list,
+        &mut tracker,
+        0,
+        ncx,
+    )?;
+
+    match result {
+        Some(s) => Ok(Value::string(JsString::intern(&s))),
+        None => Ok(Value::undefined()),
+    }
+}
+
 /// Create and install JSON namespace on global object
 pub fn install_json_namespace(
     global: GcRef<JsObject>,
@@ -933,82 +1057,15 @@ pub fn install_json_namespace(
     let json_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
     // JSON.parse(text, reviver?) — §25.5.1
-    let mm_parse = mm.clone();
-    let parse_fn = Value::native_function(
-        move |_, args, ncx| {
-            let arg = args.first().cloned().unwrap_or(Value::undefined());
-
-            // Convert to string using ToString (calling toString() if needed)
-            let text = if let Some(s) = arg.as_string() {
-                s.as_str().to_string()
-            } else if let Some(n) = arg.as_number() {
-                format!("{}", n)
-            } else if let Some(n) = arg.as_int32() {
-                format!("{}", n)
-            } else if let Some(b) = arg.as_boolean() {
-                if b { "true" } else { "false" }.to_string()
-            } else if arg.is_null() {
-                "null".to_string()
-            } else if arg.is_undefined() {
-                return Err(VmError::syntax_error("JSON.parse: unexpected input"));
-            } else if let Some(obj) = arg.as_object() {
-                // Try calling toString() on the object
-                if let Some(to_string_fn) = obj.get(&PropertyKey::string("toString")) {
-                    if to_string_fn.is_callable() {
-                        let result = ncx.call_function(&to_string_fn, Value::object(obj), &[])?;
-                        if let Some(s) = result.as_string() {
-                            s.as_str().to_string()
-                        } else {
-                            return Err(VmError::syntax_error(
-                                "JSON.parse: toString did not return string",
-                            ));
-                        }
-                    } else {
-                        "[object Object]".to_string()
-                    }
-                } else {
-                    "[object Object]".to_string()
-                }
-            } else {
-                return Err(VmError::syntax_error("JSON.parse: unexpected input"));
-            };
-
-            let parsed: serde_json::Value = serde_json::from_str(&text)
-                .map_err(|e| VmError::syntax_error(format!("JSON.parse: {}", e)))?;
-
-            // Get Object.prototype and Array.prototype from global
-            let global = ncx.ctx.global();
-            let object_proto = global
-                .get(&PropertyKey::string("Object"))
-                .and_then(|o| o.as_object())
-                .and_then(|o| o.get(&PropertyKey::string("prototype")))
-                .unwrap_or_else(Value::null);
-            let array_proto = global
-                .get(&PropertyKey::string("Array"))
-                .and_then(|o| o.as_object())
-                .and_then(|o| o.get(&PropertyKey::string("prototype")))
-                .unwrap_or_else(Value::null);
-
-            let result = json_to_value(&parsed, &mm_parse, &object_proto, &array_proto);
-
-            // Apply reviver if provided
-            if let Some(reviver) = args.get(1) {
-                if reviver.is_callable() {
-                    return apply_reviver(result, reviver, ncx, &mm_parse);
-                }
-            }
-
-            Ok(result)
-        },
-        mm.clone(),
-    );
+    let (parse_name, parse_native, parse_length) = json_parse_decl();
+    let parse_fn = Value::native_function_from_arc(parse_native, mm.clone());
     if let Some(obj) = parse_fn.as_object() {
         // Set Function.prototype as prototype
         obj.set_prototype(Value::object(function_prototype));
         obj.define_property(
             PropertyKey::string("length"),
             PropertyDescriptor::Data {
-                value: Value::int32(2),
+                value: Value::int32(parse_length as i32),
                 attributes: PropertyAttributes {
                     writable: false,
                     enumerable: false,
@@ -1019,7 +1076,7 @@ pub fn install_json_namespace(
         obj.define_property(
             PropertyKey::string("name"),
             PropertyDescriptor::Data {
-                value: Value::string(JsString::intern("parse")),
+                value: Value::string(JsString::intern(parse_name)),
                 attributes: PropertyAttributes {
                     writable: false,
                     enumerable: false,
@@ -1038,61 +1095,15 @@ pub fn install_json_namespace(
     );
 
     // JSON.stringify(value, replacer?, space?) — §25.5.2
-    let stringify_fn = Value::native_function(
-        |_, args, ncx| {
-            let val = args.first().cloned().unwrap_or(Value::undefined());
-
-            // undefined at top level returns undefined
-            if val.is_undefined() {
-                return Ok(Value::undefined());
-            }
-
-            // Parse replacer argument
-            let (replacer_fn, property_list) = parse_replacer(args.get(1), ncx)?;
-
-            // Parse space argument
-            let space_str = parse_space(args.get(2), ncx)?;
-
-            // Create wrapper object to hold the value
-            // Per spec, wrapper should have Object.prototype as its prototype
-            let global = ncx.ctx.global();
-            let object_proto = global
-                .get(&PropertyKey::string("Object"))
-                .and_then(|o| o.as_object())
-                .and_then(|o| o.get(&PropertyKey::string("prototype")))
-                .unwrap_or_else(Value::null);
-            let wrapper = GcRef::new(JsObject::new(object_proto, ncx.memory_manager().clone()));
-            let _ = wrapper.set(PropertyKey::string(""), val.clone());
-            let wrapper_val = Value::object(wrapper);
-
-            let mut tracker = CircularTracker::new();
-
-            // Serialize
-            let result = stringify_with_replacer(
-                &wrapper_val,
-                "",
-                &replacer_fn,
-                &space_str,
-                &property_list,
-                &mut tracker,
-                0,
-                ncx,
-            )?;
-
-            match result {
-                Some(s) => Ok(Value::string(JsString::intern(&s))),
-                None => Ok(Value::undefined()),
-            }
-        },
-        mm.clone(),
-    );
+    let (stringify_name, stringify_native, stringify_length) = json_stringify_decl();
+    let stringify_fn = Value::native_function_from_arc(stringify_native, mm.clone());
     if let Some(obj) = stringify_fn.as_object() {
         // Set Function.prototype as prototype
         obj.set_prototype(Value::object(function_prototype));
         obj.define_property(
             PropertyKey::string("length"),
             PropertyDescriptor::Data {
-                value: Value::int32(3),
+                value: Value::int32(stringify_length as i32),
                 attributes: PropertyAttributes {
                     writable: false,
                     enumerable: false,
@@ -1103,7 +1114,7 @@ pub fn install_json_namespace(
         obj.define_property(
             PropertyKey::string("name"),
             PropertyDescriptor::Data {
-                value: Value::string(JsString::intern("stringify")),
+                value: Value::string(JsString::intern(stringify_name)),
                 attributes: PropertyAttributes {
                     writable: false,
                     enumerable: false,

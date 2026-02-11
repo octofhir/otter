@@ -115,6 +115,23 @@ impl OtterExtension for NodeProcessExtension {
         // process.exitCode (writable, default 0)
         let _ = process_obj.set(PropertyKey::string("exitCode"), Value::int32(0));
 
+        // process.config — needed by common/index.js (hasCrypto check)
+        let config_obj = GcRef::new(JsObject::new(Value::object(ctx.obj_proto()), mm.clone()));
+        let config_vars = GcRef::new(JsObject::new(Value::object(ctx.obj_proto()), mm.clone()));
+        let _ = config_obj.set(PropertyKey::string("variables"), Value::object(config_vars));
+        let _ = config_obj.set(PropertyKey::string("target_defaults"), Value::null());
+        let _ = process_obj.set(PropertyKey::string("config"), Value::object(config_obj));
+
+        // process.features — needed by common/index.js
+        let features_obj = GcRef::new(JsObject::new(Value::object(ctx.obj_proto()), mm.clone()));
+        let _ = features_obj.set(PropertyKey::string("inspector"), Value::boolean(false));
+        let _ = features_obj.set(PropertyKey::string("debug"), Value::boolean(false));
+        let _ = features_obj.set(PropertyKey::string("tls"), Value::boolean(false));
+        let _ = process_obj.set(PropertyKey::string("features"), Value::object(features_obj));
+
+        // process._exiting — needed by common/index.js mustCall
+        let _ = process_obj.set(PropertyKey::string("_exiting"), Value::boolean(false));
+
         // --- Methods ---
 
         register_process_methods(ctx, &process_obj);
@@ -237,6 +254,8 @@ fn register_process_methods(ctx: &RegistrationContext, process_obj: &GcRef<JsObj
         process_memory_usage_decl,
         process_cpu_usage_decl,
         process_next_tick_decl,
+        process_umask_decl,
+        process_kill_decl,
     ];
 
     for decl in fns {
@@ -710,6 +729,20 @@ fn process_next_tick(args: &[Value], ncx: &mut NativeContext) -> Result<Value, V
     }
 
     Ok(Value::undefined())
+}
+
+#[dive(name = "umask", length = 1)]
+fn process_umask(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
+    // Stub: always returns 0o022, ignores argument
+    let _ = args;
+    Ok(Value::int32(0o022))
+}
+
+#[dive(name = "kill", length = 2)]
+fn process_kill(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
+    // Stub: no-op
+    let _ = args;
+    Ok(Value::boolean(true))
 }
 
 #[cfg(test)]

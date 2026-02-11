@@ -459,7 +459,11 @@ impl ModuleLoader {
         eval_mode: bool,
     ) -> Result<Arc<otter_vm_bytecode::Module>, ModuleError> {
         let normalized_url = self.normalize_url_key(url);
-        let is_esm = normalized_url.ends_with(".mjs") || normalized_url.ends_with(".mts");
+        // Treat .mjs, .mts, .ts files as ESM (supports top-level await)
+        let is_esm = normalized_url.ends_with(".mjs")
+            || normalized_url.ends_with(".mts")
+            || normalized_url.ends_with(".ts")
+            || normalized_url.ends_with(".tsx");
         let compiler = Compiler::new();
         let bytecode = compiler
             .compile_ext(source, &normalized_url, eval_mode, is_esm, false)
@@ -738,10 +742,12 @@ impl ModuleLoader {
                     };
                     let compiler = Compiler::new();
                     let bytecode = compiler
-                        .compile(
+                        .compile_ext(
                             &compile_source,
                             &normalized_url,
+                            false,
                             module_type == ModuleType::ESM,
+                            false,
                         )
                         .map_err(|e| ModuleError::CompileError(e.to_string()))?;
 
@@ -791,6 +797,7 @@ impl ModuleLoader {
         };
 
         // Compile
+        let is_esm = module_type == ModuleType::ESM;
         let compile_source =
             if normalized_url.ends_with(".json") || module_type == ModuleType::CommonJS {
                 self.wrap_commonjs_source(&normalized_url, &source)?
@@ -799,11 +806,7 @@ impl ModuleLoader {
             };
         let compiler = Compiler::new();
         let bytecode = compiler
-            .compile(
-                &compile_source,
-                &normalized_url,
-                module_type == ModuleType::ESM,
-            )
+            .compile_ext(&compile_source, &normalized_url, false, is_esm, false)
             .map_err(|e| ModuleError::CompileError(e.to_string()))?;
 
         // Create loaded module
@@ -915,8 +918,13 @@ impl ModuleLoader {
             let resolution = self.resolve_with_context(&import.specifier, &url, module_context)?;
             let resolved = resolution.url;
 
-            // Ensure dependency is loaded
+            // Ensure dependency is loaded and linked (recursive)
             self.load(&resolved, resolution.module_type)?;
+            drop(module_guard);
+            self.link(&resolved)?;
+            module_guard = module
+                .write()
+                .map_err(|_| ModuleError::NotFound(url.clone()))?;
 
             // Build import bindings
             for binding in &import.bindings {
@@ -1001,7 +1009,7 @@ impl ModuleLoader {
         }
     }
 
-    /// Detect module type from file extension and content
+    /// Detect module type from file extension and nearest `package.json` "type" field.
     pub fn detect_module_type(url: &str, _source: &str) -> ModuleType {
         // Check extension first
         if url.ends_with(".mjs") || url.ends_with(".mts") {
@@ -1011,8 +1019,17 @@ impl ModuleLoader {
             return ModuleType::CommonJS;
         }
 
-        // Default to ESM for .js/.ts files
-        // In a full implementation we'd check package.json "type" field
+        // Check nearest package.json "type" field
+        let raw = url.strip_prefix("file://").unwrap_or(url);
+        if let Some(pkg_type) = find_package_type(Path::new(raw)) {
+            return match pkg_type.as_str() {
+                "module" => ModuleType::ESM,
+                "commonjs" => ModuleType::CommonJS,
+                _ => ModuleType::ESM,
+            };
+        }
+
+        // Default to ESM
         ModuleType::ESM
     }
 
@@ -1194,6 +1211,34 @@ impl Default for ModuleLoader {
     fn default() -> Self {
         Self::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     }
+}
+
+/// Walk up from `path` to find the nearest `package.json` and return its "type" field.
+/// Returns `Some("commonjs")` when `package.json` exists but has no "type" field (Node.js default).
+fn find_package_type(path: &Path) -> Option<String> {
+    let mut current = path.parent()?;
+
+    loop {
+        let pkg_path = current.join("package.json");
+        if pkg_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&pkg_path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(type_field) = json.get("type").and_then(|v| v.as_str()) {
+                        return Some(type_field.to_string());
+                    }
+                }
+            }
+            // Found package.json but no "type" field — Node.js defaults to CommonJS
+            return Some("commonjs".to_string());
+        }
+
+        match current.parent() {
+            Some(parent) if parent != current => current = parent,
+            _ => break,
+        }
+    }
+
+    None
 }
 
 /// Normalize `npm:` specifier payload to a bare package specifier usable by resolver.

@@ -289,6 +289,19 @@ impl CodeGen {
         ConstantIndex(self.constants.add(Constant::Symbol(id)))
     }
 
+    /// Add a tagged template literal site constant
+    pub fn add_template_literal(
+        &mut self,
+        site_id: u32,
+        cooked: Vec<Option<Vec<u16>>>,
+        raw: Vec<Vec<u16>>,
+    ) -> ConstantIndex {
+        ConstantIndex(
+            self.constants
+                .add(Constant::template_literal(site_id, cooked, raw)),
+        )
+    }
+
     /// Emit an instruction
     pub fn emit(&mut self, instruction: Instruction) {
         self.current.emit(instruction);
@@ -603,10 +616,17 @@ impl CodeGen {
             }
         }
 
+        // Check if the entry function contains a top-level Await instruction
+        let has_tla = self.functions[entry_point as usize]
+            .instructions
+            .iter()
+            .any(|instr| matches!(instr, Instruction::Await { .. }));
+
         let mut builder = Module::builder(source_url)
             .constants(self.constants)
             .entry_point(entry_point)
-            .is_esm(self.is_esm);
+            .is_esm(self.is_esm)
+            .has_top_level_await(has_tla);
 
         // Add imports
         for import in self.imports {

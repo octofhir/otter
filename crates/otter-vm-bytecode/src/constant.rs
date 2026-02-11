@@ -20,8 +20,15 @@ pub enum Constant {
         /// The regex flags (e.g., "gi")
         flags: Box<str>,
     },
-    /// Template literal parts (UTF-16 code units)
-    TemplateLiteral(Vec<Vec<u16>>),
+    /// Tagged template site data (UTF-16 code units)
+    TemplateLiteral {
+        /// Unique template site id within a compiled module
+        site_id: u32,
+        /// Cooked template parts (`undefined` for invalid escape sequences)
+        cooked: Vec<Option<Vec<u16>>>,
+        /// Raw template parts
+        raw: Vec<Vec<u16>>,
+    },
     /// Symbol ID (for private fields)
     Symbol(u64),
 }
@@ -57,6 +64,20 @@ impl Constant {
         Self::RegExp {
             pattern: pattern.into(),
             flags: flags.into(),
+        }
+    }
+
+    /// Create a tagged template literal constant
+    #[inline]
+    pub fn template_literal(
+        site_id: u32,
+        cooked: Vec<Option<Vec<u16>>>,
+        raw: Vec<Vec<u16>>,
+    ) -> Self {
+        Self::TemplateLiteral {
+            site_id,
+            cooked,
+            raw,
         }
     }
 
@@ -113,8 +134,14 @@ impl Constant {
                 pattern.hash(state);
                 flags.hash(state);
             }
-            Self::TemplateLiteral(parts) => {
-                parts.hash(state);
+            Self::TemplateLiteral {
+                site_id,
+                cooked,
+                raw,
+            } => {
+                site_id.hash(state);
+                cooked.hash(state);
+                raw.hash(state);
             }
             Self::Symbol(id) => {
                 id.hash(state);

@@ -420,7 +420,7 @@ impl Test262Runner {
 
         // Execute - route module tests to separate handler
         if mode == ExecutionMode::Module {
-            self.execute_test_as_module(&test_source, metadata, &test_name, timeout)
+            self.execute_test_as_module(&test_source, metadata, &test_name, timeout, path)
                 .await
         } else {
             self.execute_test(&test_source, metadata, &test_name, timeout)
@@ -436,9 +436,25 @@ impl Test262Runner {
         test_name: &str,
         timeout: Option<Duration>,
     ) -> (TestOutcome, Option<String>) {
+        self.execute_test_with_url(source, metadata, test_name, timeout, "main.js")
+            .await
+    }
+
+    /// Execute a test with a specific source URL and return (outcome, error_message).
+    async fn execute_test_with_url(
+        &mut self,
+        source: &str,
+        metadata: &TestMetadata,
+        test_name: &str,
+        timeout: Option<Duration>,
+        source_url: &str,
+    ) -> (TestOutcome, Option<String>) {
         let is_async = metadata.is_async();
 
-        let outcome = match self.run_with_timeout(source, timeout, test_name).await {
+        let outcome = match self
+            .run_with_timeout(source, timeout, test_name, source_url)
+            .await
+        {
             Ok(value) => {
                 if !value.is_undefined() {
                     // Debug: println!("RESULT {}: {}", test_name, format_value(&value));
@@ -688,21 +704,26 @@ impl Test262Runner {
 
     /// Execute a test as an ES module.
     ///
-    /// Note: Currently uses the same execution path as script tests since the
-    /// engine's eval() already compiles as a module. The main difference is that
-    /// harness files are NOT prepended for module tests, as modules have their
-    /// own scope and top-level semantics.
+    /// The harness code (assert, $DONE, etc.) is concatenated into the module
+    /// source. Function declarations in module scope are accessible within the
+    /// same module, so this works for most tests. Tests that self-import will
+    /// load the raw file from disk without harness — this is a known limitation.
     async fn execute_test_as_module(
         &mut self,
         source: &str,
         metadata: &TestMetadata,
         test_name: &str,
         timeout: Option<Duration>,
+        test_path: &Path,
     ) -> (TestOutcome, Option<String>) {
-        // For module tests, we don't prepend harness files since modules
-        // have strict mode by default and their own scope. We execute the
-        // raw test source directly.
-        self.execute_test(source, metadata, test_name, timeout)
+        // Use the test's real file path with .mjs extension so that:
+        // 1. The compiler parses in module mode (TLA, import/export, strict)
+        // 2. Relative imports in module tests resolve from the test's directory
+        let source_url = test_path
+            .with_extension("mjs")
+            .to_string_lossy()
+            .to_string();
+        self.execute_test_with_url(source, metadata, test_name, timeout, &source_url)
             .await
     }
 
@@ -711,6 +732,7 @@ impl Test262Runner {
         source: &str,
         timeout: Option<Duration>,
         _test_name: &str,
+        source_url: &str,
     ) -> Result<Value, OtterError> {
         let result = if let Some(duration) = timeout {
             // Cooperative timeout: spawn a tokio task as watchdog on a separate
@@ -722,7 +744,7 @@ impl Test262Runner {
                 flag.store(true, Ordering::Relaxed);
             });
 
-            let result = AssertUnwindSafe(self.engine_mut().eval(source, None))
+            let result = AssertUnwindSafe(self.engine_mut().eval(source, Some(source_url)))
                 .catch_unwind()
                 .await;
 
@@ -731,7 +753,7 @@ impl Test262Runner {
 
             result
         } else {
-            AssertUnwindSafe(self.engine_mut().eval(source, None))
+            AssertUnwindSafe(self.engine_mut().eval(source, Some(source_url)))
                 .catch_unwind()
                 .await
         };

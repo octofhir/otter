@@ -43,6 +43,8 @@ pub struct Compiler {
     /// Inferred name for anonymous function expressions (ES2023 §15.1.3).
     /// Set before compiling an expression that might be an anonymous function.
     pending_inferred_name: Option<String>,
+    /// Monotonic tagged template site id within this compilation unit.
+    next_template_site: u32,
 }
 
 /// Context in which an identifier is used, for strict mode error messages
@@ -87,6 +89,7 @@ impl Compiler {
             last_was_return: false,
             eval_mode: false,
             pending_inferred_name: None,
+            next_template_site: 0,
         }
     }
 
@@ -3967,6 +3970,7 @@ impl Compiler {
         func: &oxc_ast::ast::Function,
         field_initializers: Option<&[&PropertyDefinition]>,
     ) -> CompileResult<Register> {
+        let parent_strict = self.codegen.current.flags.is_strict || self.is_strict_mode();
         let name = func
             .id
             .as_ref()
@@ -3981,6 +3985,7 @@ impl Compiler {
         self.codegen.enter_function(name);
         self.codegen.current.flags.is_async = is_async;
         self.codegen.current.flags.is_generator = is_generator;
+        self.literal_validator.set_strict_mode(parent_strict);
         // Mark as derived constructor if we're inside a derived class
         if self.in_derived_class && field_initializers.is_some() {
             // field_initializers is Some only for constructors
@@ -4084,7 +4089,7 @@ impl Compiler {
 
         // Compile function body
         if let Some(body) = &func.body {
-            let saved_strict = self.is_strict_mode();
+            let saved_strict = parent_strict;
             let has_use_strict = body
                 .directives
                 .iter()
@@ -4157,6 +4162,7 @@ impl Compiler {
         &mut self,
         arrow: &ArrowFunctionExpression,
     ) -> CompileResult<Register> {
+        let parent_strict = self.codegen.current.flags.is_strict || self.is_strict_mode();
         let is_async = arrow.r#async;
         let inferred_name = self.pending_inferred_name.take();
 
@@ -4166,6 +4172,7 @@ impl Compiler {
         self.codegen.enter_function(inferred_name);
         self.codegen.current.flags.is_arrow = true;
         self.codegen.current.flags.is_async = is_async;
+        self.literal_validator.set_strict_mode(parent_strict);
 
         // Declare parameters and collect defaults
         let mut param_defaults: Vec<(u16, &Expression)> = Vec::new();
@@ -4257,7 +4264,7 @@ impl Compiler {
 
         // Compile body
         // Compile body
-        let saved_strict = self.is_strict_mode();
+        let saved_strict = parent_strict;
         let has_use_strict = arrow
             .body
             .directives
@@ -4475,6 +4482,9 @@ impl Compiler {
             // Common JS features
             Expression::RegExpLiteral(lit) => self.compile_regexp_literal(lit),
             Expression::TemplateLiteral(template) => self.compile_template_literal(template),
+            Expression::TaggedTemplateExpression(tagged) => {
+                self.compile_tagged_template_expression(tagged)
+            }
             Expression::ThisExpression(_) => {
                 let dst = self.codegen.alloc_reg();
                 self.codegen.emit(Instruction::LoadThis { dst });
@@ -4771,15 +4781,244 @@ impl Compiler {
         }))
     }
 
+    /// Compile a tagged template expression (`tag\`hello ${name}\``).
+    ///
+    /// This lowers to a regular function/method call where arguments are:
+    /// 1. template object (cooked strings array with `.raw` array attached)
+    /// 2. substitution expressions, in order
+    fn compile_tagged_template_expression(
+        &mut self,
+        tagged: &oxc_ast::ast::TaggedTemplateExpression,
+    ) -> CompileResult<Register> {
+        self.literal_validator
+            .validate_tagged_template_literal(&tagged.quasi)?;
+
+        if let Expression::StaticMemberExpression(member) = &tagged.tag {
+            if matches!(&member.object, Expression::Super(_)) {
+                return self.compile_super_tagged_template_call(member, &tagged.quasi);
+            }
+
+            let obj = self.compile_expression(&member.object)?;
+            let arg_tmps = self.compile_tagged_template_arguments(&tagged.quasi)?;
+            let argc = arg_tmps.len() as u8;
+            let method_idx = self.codegen.add_string(member.property.name.as_str());
+
+            let frame = self.codegen.alloc_fresh_block(1 + argc);
+            self.codegen.emit(Instruction::Move {
+                dst: frame,
+                src: obj,
+            });
+            for (i, tmp) in arg_tmps.iter().copied().enumerate() {
+                self.codegen.emit(Instruction::Move {
+                    dst: Register(frame.0 + 1 + i as u16),
+                    src: tmp,
+                });
+            }
+
+            let dst = self.codegen.alloc_reg();
+            let ic_index = self.codegen.alloc_ic();
+            self.codegen.emit(Instruction::CallMethod {
+                dst,
+                obj: frame,
+                method: method_idx,
+                argc,
+                ic_index,
+            });
+
+            self.codegen.free_reg(obj);
+            for tmp in arg_tmps {
+                self.codegen.free_reg(tmp);
+            }
+            for i in 0..(1 + argc as u16) {
+                self.codegen.free_reg(Register(frame.0 + i));
+            }
+
+            return Ok(dst);
+        }
+
+        if let Expression::ComputedMemberExpression(member) = &tagged.tag {
+            let obj = self.compile_expression(&member.object)?;
+            let key = self.compile_expression(&member.expression)?;
+            let arg_tmps = self.compile_tagged_template_arguments(&tagged.quasi)?;
+            let argc = arg_tmps.len() as u8;
+
+            let frame = self.codegen.alloc_fresh_block(2 + argc);
+            self.codegen.emit(Instruction::Move {
+                dst: frame,
+                src: obj,
+            });
+            self.codegen.emit(Instruction::Move {
+                dst: Register(frame.0 + 1),
+                src: key,
+            });
+            for (i, tmp) in arg_tmps.iter().copied().enumerate() {
+                self.codegen.emit(Instruction::Move {
+                    dst: Register(frame.0 + 2 + i as u16),
+                    src: tmp,
+                });
+            }
+
+            let dst = self.codegen.alloc_reg();
+            let ic_index = self.codegen.alloc_ic();
+            self.codegen.emit(Instruction::CallMethodComputed {
+                dst,
+                obj: frame,
+                key: Register(frame.0 + 1),
+                argc,
+                ic_index,
+            });
+
+            self.codegen.free_reg(obj);
+            self.codegen.free_reg(key);
+            for tmp in arg_tmps {
+                self.codegen.free_reg(tmp);
+            }
+            for i in 0..(2 + argc as u16) {
+                self.codegen.free_reg(Register(frame.0 + i));
+            }
+
+            return Ok(dst);
+        }
+
+        // Erase TS type arguments: tag<T>`...` behaves exactly like tag`...` at runtime.
+        let func = self.compile_expression(&tagged.tag)?;
+        let arg_tmps = self.compile_tagged_template_arguments(&tagged.quasi)?;
+        let argc = arg_tmps.len() as u8;
+
+        let frame = self.codegen.alloc_fresh_block(1 + argc);
+        self.codegen.emit(Instruction::Move {
+            dst: frame,
+            src: func,
+        });
+        for (i, tmp) in arg_tmps.iter().copied().enumerate() {
+            self.codegen.emit(Instruction::Move {
+                dst: Register(frame.0 + 1 + i as u16),
+                src: tmp,
+            });
+        }
+
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::Call {
+            dst,
+            func: frame,
+            argc,
+        });
+
+        self.codegen.free_reg(func);
+        for tmp in arg_tmps {
+            self.codegen.free_reg(tmp);
+        }
+        for i in 0..(1 + argc as u16) {
+            self.codegen.free_reg(Register(frame.0 + i));
+        }
+
+        Ok(dst)
+    }
+
+    fn compile_super_tagged_template_call(
+        &mut self,
+        member: &oxc_ast::ast::StaticMemberExpression,
+        template: &oxc_ast::ast::TemplateLiteral,
+    ) -> CompileResult<Register> {
+        let method_idx = self.codegen.add_string(member.property.name.as_str());
+
+        let func_reg = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::GetSuperProp {
+            dst: func_reg,
+            name: method_idx,
+        });
+
+        let this_reg = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::LoadThis { dst: this_reg });
+
+        let arg_tmps = self.compile_tagged_template_arguments(template)?;
+        let argc = arg_tmps.len() as u8;
+        let frame = self.codegen.alloc_fresh_block(1 + argc);
+        self.codegen.emit(Instruction::Move {
+            dst: frame,
+            src: func_reg,
+        });
+        for (i, tmp) in arg_tmps.iter().copied().enumerate() {
+            self.codegen.emit(Instruction::Move {
+                dst: Register(frame.0 + 1 + i as u16),
+                src: tmp,
+            });
+        }
+
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::CallWithReceiver {
+            dst,
+            func: frame,
+            this: this_reg,
+            argc,
+        });
+
+        self.codegen.free_reg(func_reg);
+        self.codegen.free_reg(this_reg);
+        for tmp in arg_tmps {
+            self.codegen.free_reg(tmp);
+        }
+        for i in 0..(1 + argc as u16) {
+            self.codegen.free_reg(Register(frame.0 + i));
+        }
+
+        Ok(dst)
+    }
+
+    fn compile_tagged_template_arguments(
+        &mut self,
+        template: &oxc_ast::ast::TemplateLiteral,
+    ) -> CompileResult<Vec<Register>> {
+        let mut args = Vec::with_capacity(1 + template.expressions.len());
+        args.push(self.compile_template_object(template)?);
+        for expr in &template.expressions {
+            args.push(self.compile_expression(expr)?);
+        }
+        Ok(args)
+    }
+
+    fn compile_template_object(
+        &mut self,
+        template: &oxc_ast::ast::TemplateLiteral,
+    ) -> CompileResult<Register> {
+        let site_id = self.next_template_site;
+        self.next_template_site = self
+            .next_template_site
+            .checked_add(1)
+            .ok_or_else(|| CompileError::unsupported("Too many tagged template sites"))?;
+
+        let cooked = template
+            .quasis
+            .iter()
+            .map(Self::template_element_cooked_units)
+            .collect::<Vec<_>>();
+        let raw = template
+            .quasis
+            .iter()
+            .map(Self::template_element_raw_units)
+            .collect::<Vec<_>>();
+
+        let idx = self.codegen.add_template_literal(site_id, cooked, raw);
+        let dst = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::LoadConst { dst, idx });
+        Ok(dst)
+    }
+
     /// Convert a template element's cooked value to UTF-16 code units.
     fn template_element_units(quasi: &oxc_ast::ast::TemplateElement) -> Vec<u16> {
-        let cooked = quasi
+        Self::template_element_cooked_units(quasi).unwrap_or_default()
+    }
+
+    fn template_element_cooked_units(quasi: &oxc_ast::ast::TemplateElement) -> Option<Vec<u16>> {
+        quasi
             .value
             .cooked
             .as_ref()
-            .map(|v| v.as_str())
-            .unwrap_or("");
-        Self::decode_lone_surrogates(cooked, quasi.lone_surrogates)
+            .map(|cooked| Self::decode_lone_surrogates(cooked.as_str(), quasi.lone_surrogates))
+    }
+
+    fn template_element_raw_units(quasi: &oxc_ast::ast::TemplateElement) -> Vec<u16> {
+        Self::decode_lone_surrogates(quasi.value.raw.as_str(), quasi.lone_surrogates)
     }
 
     /// Decode a cooked string with lone-surrogate encoding into UTF-16 units.
@@ -7830,6 +8069,34 @@ mod tests {
             let result = compiler.compile(code, "test.js", false);
             assert!(result.is_ok(), "Failed to compile: {}", code);
         }
+    }
+
+    #[test]
+    fn test_tagged_template_literal_validation_success() {
+        let test_cases = vec![
+            r#"tag`hello`;"#,
+            r#"tag`hello ${name}`;"#,
+            r#"obj.tag`hello ${name}`;"#,
+            r#"obj["tag"]`hello ${name}`;"#,
+        ];
+
+        for code in test_cases {
+            let compiler = Compiler::new();
+            let result = compiler.compile(code, "test.js", false);
+            assert!(result.is_ok(), "Failed to compile: {}", code);
+        }
+    }
+
+    #[test]
+    fn test_tagged_template_invalid_escape_compiles() {
+        let mut compiler = Compiler::new();
+        compiler.set_strict_mode(true);
+
+        let result = compiler.compile(r#"(strs => strs[0])`\8`;"#, "test.js", false);
+        assert!(
+            result.is_ok(),
+            "Tagged template with invalid escape should compile in strict mode"
+        );
     }
 
     #[test]

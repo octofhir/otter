@@ -116,29 +116,17 @@ fn create_js_promise_wrapper_with_mm(
     ctx: &crate::context::VmContext,
     internal: GcRef<JsPromise>,
 ) -> Value {
-    let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    // Get Promise.prototype so instanceof works correctly
+    let proto_val = ctx
+        .get_global("Promise")
+        .and_then(|v| v.as_object())
+        .and_then(|ctor| ctor.get(&PropertyKey::string("prototype")))
+        .unwrap_or_else(Value::null);
+
+    let obj = GcRef::new(JsObject::new(proto_val, mm.clone()));
 
     // Set _internal to the raw promise
     let _ = obj.set(PropertyKey::string("_internal"), Value::promise(internal));
-
-    // Try to get Promise.prototype and copy its methods
-    if let Some(promise_ctor) = ctx.get_global("Promise").and_then(|v| v.as_object()) {
-        if let Some(proto) = promise_ctor
-            .get(&PropertyKey::string("prototype"))
-            .and_then(|v| v.as_object())
-        {
-            // Copy then, catch, finally from prototype
-            if let Some(then_fn) = proto.get(&PropertyKey::string("then")) {
-                let _ = obj.set(PropertyKey::string("then"), then_fn);
-            }
-            if let Some(catch_fn) = proto.get(&PropertyKey::string("catch")) {
-                let _ = obj.set(PropertyKey::string("catch"), catch_fn);
-            }
-            if let Some(finally_fn) = proto.get(&PropertyKey::string("finally")) {
-                let _ = obj.set(PropertyKey::string("finally"), finally_fn);
-            }
-        }
-    }
 
     Value::object(obj)
 }

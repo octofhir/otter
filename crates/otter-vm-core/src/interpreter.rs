@@ -5,7 +5,7 @@
 use otter_vm_bytecode::{Instruction, Module, Register, TypeFlags, UpvalueCapture};
 
 use crate::async_context::{AsyncContext, VmExecutionResult};
-use crate::context::VmContext;
+use crate::context::{TemplateCacheKey, VmContext};
 use crate::error::{VmError, VmResult};
 use crate::gc::GcRef;
 use crate::generator::{GeneratorFrame, GeneratorState, JsGenerator};
@@ -232,6 +232,31 @@ impl Interpreter {
         ctx.set_running(async_ctx.was_running);
 
         // Continue execution
+        self.run_loop_with_suspension(ctx, async_ctx.result_promise)
+    }
+
+    /// Resume execution from a saved async context with a rejection (throw).
+    ///
+    /// Called when an awaited Promise rejects. Restores frames and processes
+    /// the rejection value through the VM's try-catch machinery.
+    pub fn resume_async_throw(
+        &self,
+        ctx: &mut VmContext,
+        async_ctx: AsyncContext,
+        rejection_value: Value,
+    ) -> VmExecutionResult {
+        // Restore the call stack from saved frames
+        if let Err(e) = ctx.restore_frames(async_ctx.frames) {
+            return VmExecutionResult::Error(e.to_string());
+        }
+
+        ctx.set_running(async_ctx.was_running);
+
+        // Set the pending throw value — the run loop will handle it
+        // through try-catch or propagate it as an uncaught exception
+        ctx.set_pending_throw(Some(rejection_value));
+
+        // Continue execution (the loop will pick up the pending throw)
         self.run_loop_with_suspension(ctx, async_ctx.result_promise)
     }
 
@@ -544,6 +569,35 @@ impl Interpreter {
         // Cache module Arc - only refresh when frame changes
         let mut cached_module: Option<Arc<Module>> = None;
         let mut cached_frame_id: usize = usize::MAX;
+
+        // Check for pending throw (injected by resume_async_throw)
+        if let Some(throw_value) = ctx.take_pending_throw() {
+            // Process through try-catch machinery
+            if let Some(handler) = ctx.take_nearest_try() {
+                while ctx.stack_depth() > handler.0 {
+                    ctx.pop_frame();
+                }
+                if let Some(frame) = ctx.current_frame_mut() {
+                    frame.pc = handler.1;
+                }
+                ctx.set_register(0, throw_value);
+                // Fall through to the main loop
+            } else {
+                // No try-catch — uncaught exception
+                ctx.set_running(false);
+                // Format the error for display
+                let msg = if let Some(s) = throw_value.as_string() {
+                    s.as_str().to_string()
+                } else if let Some(obj) = throw_value.as_object() {
+                    obj.get(&crate::object::PropertyKey::string("message"))
+                        .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
+                        .unwrap_or_else(|| format!("{:?}", throw_value))
+                } else {
+                    format!("{:?}", throw_value)
+                };
+                return VmExecutionResult::Error(format!("Uncaught exception: {}", msg));
+            }
+        }
 
         loop {
             // Periodic interrupt check for responsive timeouts
@@ -4298,11 +4352,9 @@ impl Interpreter {
                             Ok(InstructionResult::Continue)
                         }
                         PromiseState::Rejected(error) => {
-                            // Promise rejected, propagate the error
-                            Err(VmError::type_error(format!(
-                                "Promise rejected: {:?}",
-                                error
-                            )))
+                            // Promise rejected — throw the rejection value as-is
+                            // (ES2023 §27.7.5.3 Await step 5: if rejected, throw reason)
+                            Err(VmError::exception(error))
                         }
                         PromiseState::Pending | PromiseState::PendingThenable(_) => {
                             // Promise is pending, suspend execution
@@ -4312,9 +4364,79 @@ impl Interpreter {
                             })
                         }
                     }
+                } else if let Some(obj) = value.as_object() {
+                    // Check for thenable: object with a .then() method
+                    // Per ES2023 §27.7.5.3: await wraps via PromiseResolve which
+                    // checks for thenables and calls their .then() method.
+                    if let Some(then_fn) = obj.get(&PropertyKey::string("then")) {
+                        if then_fn.is_function() || then_fn.is_native_function() {
+                            // Thenable: create a promise that resolves via .then()
+                            let promise = JsPromise::new();
+                            let promise_ref = promise.clone();
+                            let promise_ref2 = promise.clone();
+                            let mm = ctx.memory_manager().clone();
+
+                            // Call obj.then(resolve, reject)
+                            let resolve_fn = Value::native_function(
+                                move |_this: &Value,
+                                      args: &[Value],
+                                      _ncx: &mut crate::context::NativeContext<'_>| {
+                                    let val =
+                                        args.first().cloned().unwrap_or_else(Value::undefined);
+                                    promise_ref.resolve(val);
+                                    Ok(Value::undefined())
+                                },
+                                mm.clone(),
+                            );
+                            let reject_fn = Value::native_function(
+                                move |_this: &Value,
+                                      args: &[Value],
+                                      _ncx: &mut crate::context::NativeContext<'_>| {
+                                    let val =
+                                        args.first().cloned().unwrap_or_else(Value::undefined);
+                                    promise_ref2.reject(val);
+                                    Ok(Value::undefined())
+                                },
+                                mm,
+                            );
+
+                            if let Err(e) =
+                                self.call_function(ctx, &then_fn, value, &[resolve_fn, reject_fn])
+                            {
+                                // If .then() throws synchronously, reject the wrapper promise
+                                let err_val = match e {
+                                    VmError::Exception(thrown) => thrown.value,
+                                    other => self.make_error(ctx, "TypeError", &other.to_string()),
+                                };
+                                promise.reject(err_val);
+                            }
+
+                            // Now handle the promise state
+                            match promise.state() {
+                                PromiseState::Fulfilled(resolved) => {
+                                    ctx.set_register(dst.0, resolved);
+                                    Ok(InstructionResult::Continue)
+                                }
+                                PromiseState::Rejected(error) => Err(VmError::exception(error)),
+                                PromiseState::Pending | PromiseState::PendingThenable(_) => {
+                                    Ok(InstructionResult::Suspend {
+                                        promise,
+                                        resume_reg: dst.0,
+                                    })
+                                }
+                            }
+                        } else {
+                            // Has .then but it's not callable — not a thenable
+                            ctx.set_register(dst.0, value);
+                            Ok(InstructionResult::Continue)
+                        }
+                    } else {
+                        // No .then property — not a thenable
+                        ctx.set_register(dst.0, value);
+                        Ok(InstructionResult::Continue)
+                    }
                 } else {
-                    // Not a Promise, wrap in resolved promise and return immediately
-                    // Per JS spec: await non-promise returns the value directly
+                    // Primitive non-Promise — return directly
                     ctx.set_register(dst.0, value);
                     Ok(InstructionResult::Continue)
                 }
@@ -4505,9 +4627,14 @@ impl Interpreter {
                     .map(|func| func.flags.is_strict)
                     .unwrap_or(false);
 
-                // Compile eval code into a module
-                let eval_module = ctx.compile_eval(&source, is_strict_context)?;
-                let result = self.execute_eval_module(ctx, &eval_module)?;
+                let injected_eval_bindings = self.inject_eval_bindings(ctx);
+                let eval_result = (|| {
+                    let eval_module = ctx.compile_eval(&source, is_strict_context)?;
+                    self.execute_eval_module(ctx, &eval_module)
+                })();
+                self.cleanup_eval_bindings(ctx, &injected_eval_bindings);
+
+                let result = eval_result?;
                 ctx.set_register(dst.0, result);
                 Ok(InstructionResult::Continue)
             }
@@ -5063,6 +5190,11 @@ impl Interpreter {
                     match obj.get_own_property_descriptor(&key) {
                         Some(crate::object::PropertyDescriptor::Accessor { set, .. }) => {
                             let Some(setter) = set else {
+                                if is_strict {
+                                    return Err(VmError::type_error(
+                                        "Cannot set property which has only a getter",
+                                    ));
+                                }
                                 return Ok(InstructionResult::Continue);
                             };
 
@@ -5088,9 +5220,15 @@ impl Interpreter {
                         None => {
                             // No own property - walk prototype chain (may contain proxy or accessor)
                             let key_value = Value::string(JsString::intern_utf16(name_str));
-                            self.set_with_proxy_chain(
+                            let did_set = self.set_with_proxy_chain(
                                 ctx, &obj, &key, key_value, val_val, &object,
                             )?;
+                            if !did_set && is_strict {
+                                return Err(VmError::type_error(format!(
+                                    "Cannot set property '{}' on object",
+                                    String::from_utf16_lossy(name_str)
+                                )));
+                            }
                             Ok(InstructionResult::Continue)
                         }
                         _ => {
@@ -6037,18 +6175,6 @@ impl Interpreter {
                 }
 
                 if let Some(obj) = array.as_object() {
-                    // Fast path for integer index access on arrays
-                    if obj.is_array() {
-                        if let Some(n) = index.as_int32() {
-                            let idx = n as usize;
-                            let mut elements = obj.get_elements_storage().borrow_mut();
-                            if idx < elements.len() {
-                                elements[idx] = val_val;
-                                return Ok(InstructionResult::Continue);
-                            }
-                        }
-                    }
-
                     // Convert index to property key
                     let key = self.value_to_property_key(ctx, &index)?;
 
@@ -7374,8 +7500,57 @@ impl Interpreter {
                 ));
                 Ok(Value::regex(js_regex))
             }
-            Constant::TemplateLiteral(_) => {
-                Err(VmError::internal("Template literals not yet supported"))
+            Constant::TemplateLiteral {
+                site_id,
+                cooked,
+                raw,
+            } => {
+                let key = {
+                    let frame = ctx
+                        .current_frame()
+                        .ok_or_else(|| VmError::internal("TemplateLiteral without active frame"))?;
+                    TemplateCacheKey {
+                        realm_id: frame.realm_id,
+                        module_ptr: Arc::as_ptr(&frame.module) as usize,
+                        site_id: *site_id,
+                    }
+                };
+
+                if let Some(cached) = ctx.get_cached_template_object(key) {
+                    return Ok(Value::array(cached));
+                }
+
+                let cooked_values = cooked
+                    .iter()
+                    .map(|part| match part {
+                        Some(units) => Value::string(JsString::intern_utf16(units)),
+                        None => Value::undefined(),
+                    })
+                    .collect::<Vec<_>>();
+                let cooked_arr = self.create_template_array(ctx, &cooked_values)?;
+
+                let raw_values = raw
+                    .iter()
+                    .map(|part| Value::string(JsString::intern_utf16(part)))
+                    .collect::<Vec<_>>();
+                let raw_arr = self.create_template_array(ctx, &raw_values)?;
+
+                raw_arr.freeze();
+                cooked_arr.define_property(
+                    PropertyKey::string("raw"),
+                    PropertyDescriptor::data_with_attrs(
+                        Value::array(raw_arr),
+                        PropertyAttributes {
+                            writable: false,
+                            enumerable: false,
+                            configurable: false,
+                        },
+                    ),
+                );
+                cooked_arr.freeze();
+
+                ctx.cache_template_object(key, cooked_arr);
+                Ok(Value::array(cooked_arr))
             }
             Constant::Symbol(id) => {
                 let sym = GcRef::new(crate::value::Symbol {
@@ -7385,6 +7560,28 @@ impl Interpreter {
                 Ok(Value::symbol(sym))
             }
         }
+    }
+
+    fn create_template_array(
+        &self,
+        ctx: &mut VmContext,
+        values: &[Value],
+    ) -> VmResult<GcRef<JsObject>> {
+        let arr = GcRef::new(JsObject::array(values.len(), ctx.memory_manager().clone()));
+        if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
+            && let Some(array_proto) = array_obj
+                .get(&PropertyKey::string("prototype"))
+                .and_then(|v| v.as_object())
+        {
+            arr.set_prototype(Value::object(array_proto));
+        }
+
+        for (index, value) in values.iter().enumerate() {
+            arr.set(PropertyKey::Index(index as u32), value.clone())
+                .map_err(|e| VmError::internal(format!("failed to build template array: {e}")))?;
+        }
+
+        Ok(arr)
     }
 
     /// Execute an eval-compiled module within the current execution context.
@@ -7454,6 +7651,8 @@ impl Interpreter {
                 }
                 Ok(InstructionResult::Return(value)) => {
                     if ctx.stack_depth() <= prev_stack_depth + 1 {
+                        // Capture exports before popping the entry frame
+                        self.capture_module_exports(ctx, &module);
                         ctx.pop_frame();
                         return Ok(value);
                     }
@@ -7573,6 +7772,40 @@ impl Interpreter {
                 }
             }
         }
+    }
+
+    /// Capture module exports from the current frame into `ctx.captured_exports`.
+    ///
+    /// Must be called while the entry frame is still on the stack (before pop_frame).
+    /// Mirrors the export capture logic in `execute()`.
+    fn capture_module_exports(&self, ctx: &mut VmContext, module: &Arc<Module>) {
+        let entry_func = match module.entry_function() {
+            Some(f) => f,
+            None => return,
+        };
+
+        let mut exports = std::collections::HashMap::new();
+        for export in &module.exports {
+            match export {
+                otter_vm_bytecode::module::ExportRecord::Named { local, exported } => {
+                    if let Some(idx) = entry_func.local_names.iter().position(|n| n == local) {
+                        if let Ok(val) = ctx.get_local(idx as u16) {
+                            exports.insert(exported.clone(), val);
+                        }
+                    }
+                }
+                otter_vm_bytecode::module::ExportRecord::Default { local } => {
+                    if let Some(idx) = entry_func.local_names.iter().position(|n| n == local) {
+                        if let Ok(val) = ctx.get_local(idx as u16) {
+                            exports.insert("default".to_string(), val);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        ctx.set_captured_exports(exports);
     }
 
     /// Call a native function with depth tracking to prevent Rust stack overflow.
@@ -8189,6 +8422,50 @@ impl Interpreter {
         }
     }
 
+    fn inject_eval_bindings(&self, ctx: &mut VmContext) -> Vec<PropertyKey> {
+        let mut injected = Vec::new();
+        let Some(frame) = ctx.current_frame() else {
+            return injected;
+        };
+        let Some(func) = frame.module.function(frame.function_index) else {
+            return injected;
+        };
+
+        let local_names = func.local_names.clone();
+        let global = ctx.global();
+
+        for (index, name) in local_names.iter().enumerate() {
+            if name.is_empty() || name.starts_with('$') {
+                continue;
+            }
+
+            let key = PropertyKey::string(name);
+            if matches!(key, PropertyKey::Index(_) | PropertyKey::Symbol(_)) {
+                continue;
+            }
+
+            if global.has_own(&key) {
+                continue;
+            }
+
+            let Ok(value) = ctx.get_local(index as u16) else {
+                continue;
+            };
+            if global.set(key, value).is_ok() {
+                injected.push(key);
+            }
+        }
+
+        injected
+    }
+
+    fn cleanup_eval_bindings(&self, ctx: &mut VmContext, injected: &[PropertyKey]) {
+        let global = ctx.global();
+        for key in injected {
+            let _ = global.delete(key);
+        }
+    }
+
     /// Get a property from an object, walking the prototype chain with proxy trap support.
     /// Unlike `JsObject::get()` which transparently bypasses proxy traps in the prototype chain,
     /// this method properly dispatches to `proxy_get` when a Proxy is encountered.
@@ -8357,9 +8634,9 @@ impl Interpreter {
                 _ => {
                     // Data property or deleted - set directly on receiver
                     if let Some(recv_obj) = receiver.as_object() {
-                        let _ = recv_obj.set(*key, value);
+                        return Ok(recv_obj.set(*key, value).is_ok());
                     }
-                    return Ok(true);
+                    return Ok(false);
                 }
             }
         }
@@ -8370,9 +8647,9 @@ impl Interpreter {
             if idx < elements.len() && !elements[idx].is_hole() {
                 drop(elements);
                 if let Some(recv_obj) = receiver.as_object() {
-                    let _ = recv_obj.set(*key, value);
+                    return Ok(recv_obj.set(*key, value).is_ok());
                 }
-                return Ok(true);
+                return Ok(false);
             }
         }
         // 2. Walk prototype chain looking for proxy or accessor
@@ -8382,9 +8659,9 @@ impl Interpreter {
             if current.is_null() || current.is_undefined() {
                 // Not found in chain - set on receiver
                 if let Some(recv_obj) = receiver.as_object() {
-                    let _ = recv_obj.set(*key, value);
+                    return Ok(recv_obj.set(*key, value).is_ok());
                 }
-                return Ok(true);
+                return Ok(false);
             }
             depth += 1;
             if depth > 256 {
@@ -8414,9 +8691,9 @@ impl Interpreter {
                         _ => {
                             // Data property found in prototype - set on receiver
                             if let Some(recv_obj) = receiver.as_object() {
-                                let _ = recv_obj.set(*key, value);
+                                return Ok(recv_obj.set(*key, value).is_ok());
                             }
-                            return Ok(true);
+                            return Ok(false);
                         }
                     }
                 }
@@ -8427,9 +8704,9 @@ impl Interpreter {
         }
         // Fallback: set directly on receiver
         if let Some(recv_obj) = receiver.as_object() {
-            let _ = recv_obj.set(*key, value);
+            return Ok(recv_obj.set(*key, value).is_ok());
         }
-        Ok(true)
+        Ok(false)
     }
 
     /// Convert value to primitive per ES2023 §7.1.1.

@@ -469,6 +469,12 @@ pub struct VmContext {
     /// Captured exports from the last executed module.
     /// Used by ModuleLoader to populate namespaces.
     captured_module_exports: Option<HashMap<String, Value>>,
+    /// Pending throw value for async rejection propagation.
+    /// When an awaited Promise rejects, the rejection value is stored here
+    /// so that `run_loop_with_suspension` can process it through try-catch.
+    pending_throw: Option<Value>,
+    /// Cached template objects for tagged template sites.
+    template_cache: HashMap<TemplateCacheKey, GcRef<JsObject>>,
 }
 
 /// Trait for JS job queue access (allows runtime to inject the queue)
@@ -487,6 +493,13 @@ pub trait ExternalRootSet {
 struct TryHandler {
     catch_pc: usize,
     frame_depth: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct TemplateCacheKey {
+    pub realm_id: RealmId,
+    pub module_ptr: usize,
+    pub site_id: u32,
 }
 
 /// Lightweight debug snapshot of VM execution state.
@@ -602,7 +615,20 @@ impl VmContext {
             realm_registry: None,
             trace_state: None,
             captured_module_exports: None,
+            pending_throw: None,
+            template_cache: HashMap::new(),
         }
+    }
+
+    pub(crate) fn get_cached_template_object(
+        &self,
+        key: TemplateCacheKey,
+    ) -> Option<GcRef<JsObject>> {
+        self.template_cache.get(&key).copied()
+    }
+
+    pub(crate) fn cache_template_object(&mut self, key: TemplateCacheKey, obj: GcRef<JsObject>) {
+        self.template_cache.insert(key, obj);
     }
 
     /// Set captured module exports.
@@ -618,6 +644,16 @@ impl VmContext {
     /// Take captured module exports (clearing them).
     pub fn take_captured_exports(&mut self) -> Option<HashMap<String, Value>> {
         self.captured_module_exports.take()
+    }
+
+    /// Set a pending throw value for async rejection propagation.
+    pub fn set_pending_throw(&mut self, value: Option<Value>) {
+        self.pending_throw = value;
+    }
+
+    /// Take the pending throw value (if any), clearing it.
+    pub fn take_pending_throw(&mut self) -> Option<Value> {
+        self.pending_throw.take()
     }
 
     /// Get the memory manager
@@ -2157,6 +2193,11 @@ impl VmContext {
             this.trace(&mut |header| roots.push(header));
         }
 
+        // Add cached template objects
+        for template_obj in self.template_cache.values() {
+            roots.push(template_obj.header() as *const _);
+        }
+
         // Add open upvalues
         for cell in self.open_upvalues.values() {
             cell.get().trace(&mut |header| roots.push(header));
@@ -2186,6 +2227,8 @@ impl VmContext {
         let _ = self
             .global
             .set(PropertyKey::string("globalThis"), Value::undefined());
+
+        self.template_cache.clear();
 
         // FORCE clear all properties to break reference cycles.
         // We use DropGuard to iteratively destroy objects and prevent stack overflow.

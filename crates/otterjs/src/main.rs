@@ -340,7 +340,11 @@ async fn run_file(path: &PathBuf, cli: &Cli) -> Result<()> {
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read file: {}", path.display()))?;
 
-    let source_url = path.to_string_lossy();
+    // Use absolute path as source_url so module resolution works correctly
+    // regardless of CWD changes by ResolveBaseDirGuard.
+    let abs_path = std::fs::canonicalize(path)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(path));
+    let source_url = abs_path.to_string_lossy();
     run_code(&source, &source_url, cli).await
 }
 
@@ -419,7 +423,7 @@ async fn run_code(source: &str, source_url: &str, cli: &Cli) -> Result<()> {
     };
 
     // Execute code
-    let result = engine.eval(source, None).await;
+    let result = engine.eval(source, Some(source_url)).await;
 
     // Cancel timeout task if still running
     if let Some(handle) = timeout_handle {

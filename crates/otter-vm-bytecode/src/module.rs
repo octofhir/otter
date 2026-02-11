@@ -136,6 +136,10 @@ pub struct Module {
     /// Is this an ES module (vs CommonJS)
     pub is_esm: bool,
 
+    /// Whether the module's entry function contains a top-level `await` instruction.
+    /// Used by `require()` to reject async ESM modules (Node.js/Bun semantics).
+    pub has_top_level_await: bool,
+
     /// Original source (optional, for debugging)
     pub source: Option<String>,
 }
@@ -234,6 +238,7 @@ pub struct ModuleBuilder {
     exports: Vec<ExportRecord>,
     types: Vec<TypeInfo>,
     is_esm: bool,
+    has_top_level_await: bool,
     source: Option<String>,
 }
 
@@ -250,6 +255,7 @@ impl ModuleBuilder {
             exports: Vec::new(),
             types: Vec::new(),
             is_esm: true,
+            has_top_level_await: false,
             source: None,
         }
     }
@@ -308,6 +314,12 @@ impl ModuleBuilder {
         self
     }
 
+    /// Set top-level await flag
+    pub fn has_top_level_await(mut self, value: bool) -> Self {
+        self.has_top_level_await = value;
+        self
+    }
+
     /// Include source code (for debugging)
     pub fn source(mut self, source: impl Into<String>) -> Self {
         self.source = Some(source.into());
@@ -326,6 +338,7 @@ impl ModuleBuilder {
             exports: self.exports,
             types: self.types,
             is_esm: self.is_esm,
+            has_top_level_await: self.has_top_level_await,
             source: self.source,
         }
     }

@@ -429,14 +429,14 @@ impl Otter {
             Err(e) => return Err(OtterError::Runtime(e.to_string())),
         };
 
-        // Execute all dependencies first (excluding main)
+        // Execute all dependencies first (excluding main), with suspension support
         let normalized_main_url = self.loader.normalize_url(main_url);
         for url in &order {
             if url == main_url || url == &normalized_main_url {
                 continue;
             }
             let m = self.loader.get(url).unwrap();
-            let (bytecode, already_evaluated) = {
+            let (dep_bytecode_arc, already_evaluated) = {
                 let guard = m.read().unwrap();
                 (
                     Arc::clone(&guard.bytecode),
@@ -449,10 +449,23 @@ impl Otter {
                 continue;
             }
 
-            // Execute dependency module
-            if let Err(e) = self.vm.execute_module_with_context(&bytecode, &mut ctx) {
-                return Err(OtterError::Runtime(e.to_string()));
-            }
+            // Resolve imports for this dependency
+            let dep_locals = self.resolve_module_imports(&dep_bytecode_arc, url)?;
+
+            // Execute dependency module with suspension support for TLA
+            let dep_promise = JsPromise::new();
+            let dep_exec_result = self.execute_with_suspension(
+                &mut ctx,
+                dep_bytecode_arc,
+                dep_promise,
+                if dep_locals.is_empty() {
+                    None
+                } else {
+                    Some(dep_locals)
+                },
+            )?;
+            self.run_module_to_completion(&mut ctx, dep_exec_result, dep_promise)
+                .await?;
 
             // Populate namespace
             self.loader.update_namespace(url, &ctx);
@@ -468,74 +481,16 @@ impl Otter {
 
         // Now execute the main module with suspension support
         let result_promise = JsPromise::new();
-        let mut exec_result =
+        let exec_result =
             self.execute_with_suspension(&mut ctx, bytecode, result_promise, locals_opt)?;
 
-        // After main execution starts, we might need a way to update its namespace too if it's imported elsewhere,
-        // but for high-level eval it's usually the end of the chain.
-        self.loader.update_namespace(main_url, &ctx); // 8. Handle execution result with async resume loop
-        let final_value = loop {
-            match exec_result {
-                VmExecutionResult::Complete(value) => {
-                    // Execution completed, resolve result promise and break
-                    result_promise.resolve(value.clone());
-                    // ES spec: Drain microtasks after synchronous execution
-                    self.drain_microtasks(&mut ctx)?;
-                    break value;
-                }
-                VmExecutionResult::Suspended(async_ctx) => {
-                    // Execution suspended waiting for a Promise
-                    // Set up signal for when the promise resolves
-                    let signal = ResumeSignal::new();
-                    self.register_promise_signal(async_ctx.awaited_promise, Arc::clone(&signal));
+        // After main execution starts, update its namespace
+        self.loader.update_namespace(main_url, &ctx);
 
-                    // Wait for the promise to resolve
-                    let resolved_value = loop {
-                        if self.interrupt_flag.load(Ordering::Relaxed) {
-                            return Err(OtterError::Runtime("Test timed out".to_string()));
-                        }
-
-                        // Drain microtasks first (this may resolve promises)
-                        self.drain_microtasks(&mut ctx)?;
-
-                        // Check if our promise resolved
-                        if signal.is_ready() {
-                            match signal.take_value() {
-                                Some(Ok(value)) => break value,
-                                Some(Err(error)) => {
-                                    return Err(OtterError::Runtime(format!(
-                                        "Promise rejected: {:?}",
-                                        error
-                                    )));
-                                }
-                                None => {
-                                    return Err(OtterError::Runtime(
-                                        "Signal ready but no value".to_string(),
-                                    ));
-                                }
-                            }
-                        }
-
-                        // Yield to tokio to let spawned async tasks progress
-                        tokio::task::yield_now().await;
-                    };
-
-                    // Resume VM execution with resolved value
-                    let interpreter = Interpreter::new();
-                    exec_result = interpreter.resume_async(&mut ctx, async_ctx, resolved_value);
-
-                    // Loop will handle the new exec_result
-                }
-                VmExecutionResult::Error(msg) => {
-                    if self.interrupt_flag.load(Ordering::Relaxed) {
-                        return Err(OtterError::Runtime(
-                            "Execution interrupted (timeout)".to_string(),
-                        ));
-                    }
-                    return Err(OtterError::Runtime(msg));
-                }
-            }
-        };
+        // 8. Handle execution result with async resume loop
+        let final_value = self
+            .run_module_to_completion(&mut ctx, exec_result, result_promise)
+            .await?;
 
         if self.interrupt_flag.load(Ordering::Relaxed) {
             return Err(OtterError::Runtime(
@@ -650,11 +605,123 @@ impl Otter {
         }
     }
 
-    /// Execute JS code with suspension support.
+    /// Run a module's execution result to completion, handling suspension/resume for TLA.
     ///
-    /// Compiles as a script (NOT a module) to preserve non-strict mode semantics,
-    /// while still supporting top-level await through the interpreter's suspension machinery.
-    /// ES2023 §16.1.6: Scripts are not automatically strict unless they have "use strict" directive.
+    /// This is the core async resume loop extracted from `eval()`. It handles:
+    /// - `Complete`: capture exports, resolve the result promise, drain microtasks, return value
+    /// - `Suspended`: register promise signal, wait for resolution, resume VM
+    /// - `Error`: propagate as `OtterError`
+    ///
+    /// Used by both dependency module execution and main module execution.
+    async fn run_module_to_completion(
+        &self,
+        ctx: &mut VmContext,
+        mut exec_result: VmExecutionResult,
+        result_promise: GcRef<JsPromise>,
+    ) -> Result<Value, OtterError> {
+        loop {
+            match exec_result {
+                VmExecutionResult::Complete(value) => {
+                    // Capture exports from current frame before popping it.
+                    // The suspension path doesn't call the synchronous execute() which
+                    // normally sets captured_exports, so we do it here.
+                    Self::capture_exports_from_frame(ctx);
+                    // Pop the entry frame (matches the push in execute_with_suspension_and_locals)
+                    ctx.pop_frame();
+
+                    result_promise.resolve(value.clone());
+                    self.drain_microtasks(ctx)?;
+                    return Ok(value);
+                }
+                VmExecutionResult::Suspended(async_ctx) => {
+                    let signal = ResumeSignal::new();
+                    self.register_promise_signal(async_ctx.awaited_promise, Arc::clone(&signal));
+
+                    // Wait for the promise to settle (resolve or reject)
+                    let settlement = loop {
+                        if self.interrupt_flag.load(Ordering::Relaxed) {
+                            return Err(OtterError::Runtime("Test timed out".to_string()));
+                        }
+
+                        self.drain_microtasks(ctx)?;
+
+                        if signal.is_ready() {
+                            match signal.take_value() {
+                                Some(result) => break result,
+                                None => {
+                                    return Err(OtterError::Runtime(
+                                        "Signal ready but no value".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+
+                        tokio::task::yield_now().await;
+                    };
+
+                    let interpreter = Interpreter::new();
+                    exec_result = match settlement {
+                        Ok(value) => interpreter.resume_async(ctx, async_ctx, value),
+                        Err(rejection) => {
+                            // Promise rejected — propagate through VM try-catch
+                            interpreter.resume_async_throw(ctx, async_ctx, rejection)
+                        }
+                    };
+                }
+                VmExecutionResult::Error(msg) => {
+                    if self.interrupt_flag.load(Ordering::Relaxed) {
+                        return Err(OtterError::Runtime(
+                            "Execution interrupted (timeout)".to_string(),
+                        ));
+                    }
+                    return Err(OtterError::Runtime(msg));
+                }
+            }
+        }
+    }
+
+    /// Capture exports from the current entry frame into `ctx.captured_exports`.
+    ///
+    /// When using the suspension-aware execution path (`run_loop_with_suspension`),
+    /// exports are not automatically captured like in the synchronous `execute()`.
+    /// This replicates the export-capture logic from `interpreter.rs:execute()`.
+    fn capture_exports_from_frame(ctx: &mut VmContext) {
+        let frame = match ctx.current_frame() {
+            Some(f) => f,
+            None => return,
+        };
+
+        let module = frame.module.clone();
+        let func_idx = frame.function_index;
+        let entry_func = match module.function(func_idx) {
+            Some(f) => f,
+            None => return,
+        };
+
+        let mut exports = HashMap::new();
+        for export in &module.exports {
+            match export {
+                otter_vm_bytecode::module::ExportRecord::Named { local, exported } => {
+                    if let Some(idx) = entry_func.local_names.iter().position(|n| n == local) {
+                        if let Ok(val) = ctx.get_local(idx as u16) {
+                            exports.insert(exported.clone(), val);
+                        }
+                    }
+                }
+                otter_vm_bytecode::module::ExportRecord::Default { local } => {
+                    if let Some(idx) = entry_func.local_names.iter().position(|n| n == local) {
+                        if let Ok(val) = ctx.get_local(idx as u16) {
+                            exports.insert("default".to_string(), val);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        ctx.set_captured_exports(exports);
+    }
+
     /// Execute pre-compiled bytecode with suspension support.
     fn execute_with_suspension(
         &self,
@@ -1393,9 +1460,22 @@ impl Otter {
                     }
 
                     // 3. Load & compile (CJS wrapper applied automatically for CJS modules)
-                    loader
+                    let loaded_module = loader
                         .load(&resolution.url, resolution.module_type)
                         .map_err(|e| VmError::type_error(e.to_string()))?;
+
+                    // 3b. Guard: reject require() of async ESM (Node.js/Bun semantics)
+                    {
+                        let guard = loaded_module
+                            .read()
+                            .map_err(|_| VmError::type_error("require: lock poisoned"))?;
+                        if guard.bytecode.has_top_level_await && guard.bytecode.is_esm {
+                            return Err(VmError::type_error(format!(
+                                "require() of ES module '{}' not supported when module uses top-level await. Use import() instead.",
+                                resolution.url
+                            )));
+                        }
+                    }
 
                     // 4. Build dependency graph & link
                     let order = loader

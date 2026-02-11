@@ -1279,10 +1279,11 @@ impl JsObject {
         if self.is_array() {
             if let PropertyKey::String(s) = key {
                 if s.as_str() == "length" {
+                    let flags = self.flags.borrow();
                     return Some(PropertyDescriptor::Data {
                         value: Value::number(self.array_length() as f64),
                         attributes: PropertyAttributes {
-                            writable: self.flags.borrow().array_length_writable.unwrap_or(true),
+                            writable: !flags.frozen && flags.array_length_writable.unwrap_or(true),
                             enumerable: false,
                             configurable: false,
                         },
@@ -1372,7 +1373,15 @@ impl JsObject {
             let elements = self.elements.borrow();
             let idx = *i as usize;
             if idx < elements.len() && !elements[idx].is_hole() {
-                return Some(PropertyDescriptor::data(elements[idx].clone()));
+                let flags = self.flags.borrow();
+                return Some(PropertyDescriptor::Data {
+                    value: elements[idx].clone(),
+                    attributes: PropertyAttributes {
+                        writable: !flags.frozen,
+                        enumerable: true,
+                        configurable: !(flags.sealed || flags.frozen),
+                    },
+                });
             }
         }
 
@@ -1406,7 +1415,15 @@ impl JsObject {
                     let idx = *i as usize;
                     let elements = proto_obj.elements.borrow();
                     if idx < elements.len() && !elements[idx].is_hole() {
-                        return Some(PropertyDescriptor::data(elements[idx].clone()));
+                        let flags = proto_obj.flags.borrow();
+                        return Some(PropertyDescriptor::Data {
+                            value: elements[idx].clone(),
+                            attributes: PropertyAttributes {
+                                writable: !flags.frozen,
+                                enumerable: true,
+                                configurable: !(flags.sealed || flags.frozen),
+                            },
+                        });
                     }
                 }
 
@@ -1657,12 +1674,25 @@ impl JsObject {
                 // Configurable descriptor - proceed with deletion below
             }
 
+            // Indexed element properties are non-configurable on sealed/frozen objects.
+            // If the element exists as an own property, deletion must fail.
+            let idx = *i as usize;
+            let element_exists = {
+                let elements = self.elements.borrow();
+                idx < elements.len() && !elements[idx].is_hole()
+            };
+            if element_exists {
+                let flags = self.flags.borrow();
+                if flags.sealed || flags.frozen {
+                    return false;
+                }
+            }
+
             // ES §10.4.2.1 [[Delete]](P): Deleting an indexed property creates
             // a hole but NEVER changes the array's length. We set the element to
             // hole, then compact trailing holes to save memory, but preserve the
             // original length via sparse_array_length so array_length() stays
             // correct.
-            let idx = *i as usize;
             let mut elements = self.elements.borrow_mut();
             if idx < elements.len() {
                 let original_len = elements.len();
@@ -2892,6 +2922,9 @@ impl JsObject {
         flags.frozen = true;
         flags.sealed = true;
         flags.extensible = false;
+        if flags.is_array {
+            flags.array_length_writable = Some(false);
+        }
         drop(flags);
 
         // Make all inline properties non-writable and non-configurable

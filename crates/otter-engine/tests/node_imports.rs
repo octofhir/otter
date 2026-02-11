@@ -98,4 +98,3 @@ fn test_node_safe_profile_blocks_bare_process() {
     let err = result.unwrap_err().to_string();
     assert!(err.contains("process"));
 }
-

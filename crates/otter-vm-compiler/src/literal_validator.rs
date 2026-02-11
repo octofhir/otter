@@ -1121,10 +1121,19 @@ impl LiteralValidator {
             self.validate_template_escape_sequences(raw_content, quasi.span.start, i)?;
         }
 
-        // Validate expressions in the template literal
-        // Note: Expression validation would be handled by the main compiler
-        // Here we just ensure the structure is valid
+        self.validate_template_literal_structure(lit)
+    }
 
+    /// Validate a tagged template literal.
+    ///
+    /// Tagged templates allow invalid escapes in quasis; in that case the cooked
+    /// value is `undefined` and only `.raw` must be preserved.
+    pub fn validate_tagged_template_literal(&self, lit: &TemplateLiteral) -> CompileResult<()> {
+        self.validate_template_literal_structure(lit)
+    }
+
+    /// Validate template literal shape (quasis/expressions alignment).
+    fn validate_template_literal_structure(&self, lit: &TemplateLiteral) -> CompileResult<()> {
         // Check that the number of quasis and expressions is consistent
         let expected_quasis = lit.expressions.len() + 1;
         if lit.quasis.len() != expected_quasis {

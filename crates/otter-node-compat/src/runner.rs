@@ -173,9 +173,18 @@ impl NodeCompatRunner {
         // Compose: harness + test
         // `require` and `module`/`exports` are set up by the engine's module extension
         // (globalThis.require is created automatically from __createRequire).
+        // __filename and __dirname
+        let test_path_abs = test_path.canonicalize().unwrap_or(test_path.to_path_buf());
+        let test_filename = test_path_abs.to_string_lossy().replace("\\", "\\\\");
+        let test_dirname = test_path_abs
+            .parent()
+            .unwrap_or(test_path)
+            .to_string_lossy()
+            .replace("\\", "\\\\");
+
         let full_source = format!(
-            "{}\n\n// --- Test: {} ---\n{}",
-            self.harness_source, rel_path, test_source
+            "var __filename = '{}';\nvar __dirname = '{}';\n{}\n\n// --- Test: {} ---\n{}",
+            test_filename, test_dirname, self.harness_source, rel_path, test_source
         );
 
         // Reset realm for clean test

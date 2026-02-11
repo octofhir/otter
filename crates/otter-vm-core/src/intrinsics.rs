@@ -149,6 +149,10 @@ pub struct Intrinsics {
     pub object_constructor: GcRef<JsObject>,
     /// `Function` constructor
     pub function_constructor: GcRef<JsObject>,
+    /// `AbortController` constructor
+    pub abort_controller_constructor: GcRef<JsObject>,
+    /// `AbortSignal` constructor
+    pub abort_signal_constructor: GcRef<JsObject>,
 
     // ========================================================================
     // Primitive wrapper prototypes
@@ -213,6 +217,10 @@ pub struct Intrinsics {
     pub array_buffer_prototype: GcRef<JsObject>,
     /// `DataView.prototype`
     pub data_view_prototype: GcRef<JsObject>,
+    /// `AbortController.prototype`
+    pub abort_controller_prototype: GcRef<JsObject>,
+    /// `AbortSignal.prototype`
+    pub abort_signal_prototype: GcRef<JsObject>,
 
     // ========================================================================
     // Iterator prototypes
@@ -308,6 +316,8 @@ impl Intrinsics {
             "Date" => Some(self.date_prototype),
             "ArrayBuffer" => Some(self.array_buffer_prototype),
             "DataView" => Some(self.data_view_prototype),
+            "AbortController" => Some(self.abort_controller_prototype),
+            "AbortSignal" => Some(self.abort_signal_prototype),
             "Error" => Some(self.error_prototype),
             "TypeError" => Some(self.type_error_prototype),
             "RangeError" => Some(self.range_error_prototype),
@@ -364,6 +374,8 @@ impl Intrinsics {
             // Core constructors
             object_constructor: alloc(),
             function_constructor: alloc(),
+            abort_controller_constructor: alloc(),
+            abort_signal_constructor: alloc(),
             // Primitive wrappers
             string_prototype: alloc(),
             number_prototype: alloc(),
@@ -391,6 +403,8 @@ impl Intrinsics {
             date_prototype: alloc(),
             array_buffer_prototype: alloc(),
             data_view_prototype: alloc(),
+            abort_controller_prototype: alloc(),
+            abort_signal_prototype: alloc(),
             // Iterators
             iterator_prototype: alloc(),
             async_iterator_prototype: alloc(),
@@ -459,6 +473,8 @@ impl Intrinsics {
             result.date_prototype,
             result.array_buffer_prototype,
             result.data_view_prototype,
+            result.abort_controller_prototype,
+            result.abort_signal_prototype,
             result.iterator_prototype,
             result.async_iterator_prototype,
             result.generator_prototype,
@@ -475,6 +491,8 @@ impl Intrinsics {
             result.float64_array_prototype,
             result.bigint64_array_prototype,
             result.biguint64_array_prototype,
+            result.abort_controller_constructor,
+            result.abort_signal_constructor,
         ];
         for obj in all_intrinsic_objects {
             (*obj).mark_as_intrinsic();
@@ -521,6 +539,8 @@ impl Intrinsics {
             self.date_prototype,
             self.array_buffer_prototype,
             self.data_view_prototype,
+            self.abort_controller_prototype,
+            self.abort_signal_prototype,
             self.iterator_prototype,
         ];
         for proto in &protos_to_obj {
@@ -579,7 +599,12 @@ impl Intrinsics {
         }
 
         // Constructor objects: [[Prototype]] = Function.prototype
-        let ctors = [self.object_constructor, self.function_constructor];
+        let ctors = [
+            self.object_constructor,
+            self.function_constructor,
+            self.abort_controller_constructor,
+            self.abort_signal_constructor,
+        ];
         for ctor in &ctors {
             ctor.set_prototype(Value::object(self.function_prototype));
         }
@@ -797,6 +822,23 @@ impl Intrinsics {
             TypedArrayKind::Uint8,
             well_known::to_string_tag_symbol(),
         );
+
+        // ===================================================================
+        // AbortController / AbortSignal
+        // ===================================================================
+        crate::web_api::abort_controller::init_abort_controller(
+            self.abort_controller_constructor,
+            self.abort_controller_prototype,
+            fn_proto,
+            mm,
+        );
+        crate::web_api::abort_controller::init_abort_signal(
+            self.abort_signal_constructor,
+            self.abort_signal_prototype,
+            fn_proto,
+            mm,
+        );
+
         crate::intrinsics_impl::typed_array::init_specific_typed_array_prototype(
             self.uint8_clamped_array_prototype,
             TypedArrayKind::Uint8Clamped,

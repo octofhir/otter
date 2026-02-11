@@ -24,6 +24,8 @@ const FULL_BUILTIN_MODULES: &[&str] = &[
     "node:process",
     "node:util",
     "node:stream",
+    "node:timers",
+    "node:timers/promises",
     "node:assert",
     "node:assert/strict",
     "node:os",
@@ -41,6 +43,8 @@ const SAFE_BUILTIN_MODULES: &[&str] = &[
     "node:path",
     "node:util",
     "node:stream",
+    "node:timers",
+    "node:timers/promises",
     "node:assert",
     "node:assert/strict",
     "node:test",
@@ -79,6 +83,14 @@ static NODE_MODULES: &[NodeModuleEntry] = &[
     },
     NodeModuleEntry {
         name: "stream",
+        safe_core: true,
+    },
+    NodeModuleEntry {
+        name: "timers",
+        safe_core: true,
+    },
+    NodeModuleEntry {
+        name: "timers/promises",
         safe_core: true,
     },
     NodeModuleEntry {

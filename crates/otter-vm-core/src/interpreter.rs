@@ -660,6 +660,8 @@ impl Interpreter {
                 None
             };
 
+            let (func_idx, pc) = (frame.function_index, frame.pc);
+
             // Execute the instruction
             let instruction_result = match self.execute_instruction(instruction, module_ref, ctx) {
                 Ok(result) => result,
@@ -7705,7 +7707,7 @@ impl Interpreter {
                             if let Some(frame) = ctx.current_frame_mut() {
                                 frame.pc = catch_pc;
                             }
-                            ctx.set_register(0, value);
+                            ctx.set_exception(value);
                             continue;
                         }
                     }
@@ -7735,7 +7737,7 @@ impl Interpreter {
                             if let Some(frame) = ctx.current_frame_mut() {
                                 frame.pc = catch_pc;
                             }
-                            ctx.set_register(0, error_value);
+                            ctx.set_exception(error_value);
                             continue;
                         }
                     }
@@ -7755,7 +7757,7 @@ impl Interpreter {
                             if let Some(frame) = ctx.current_frame_mut() {
                                 frame.pc = catch_pc;
                             }
-                            ctx.set_register(0, error_val);
+                            ctx.set_exception(error_val);
                             continue;
                         }
                     }
@@ -7775,7 +7777,7 @@ impl Interpreter {
                             if let Some(frame) = ctx.current_frame_mut() {
                                 frame.pc = catch_pc;
                             }
-                            ctx.set_register(0, error_val);
+                            ctx.set_exception(error_val);
                             continue;
                         }
                     }
@@ -7795,7 +7797,7 @@ impl Interpreter {
                             if let Some(frame) = ctx.current_frame_mut() {
                                 frame.pc = catch_pc;
                             }
-                            ctx.set_register(0, error_val);
+                            ctx.set_exception(error_val);
                             continue;
                         }
                     }
@@ -7815,7 +7817,7 @@ impl Interpreter {
                             if let Some(frame) = ctx.current_frame_mut() {
                                 frame.pc = catch_pc;
                             }
-                            ctx.set_register(0, error_val);
+                            ctx.set_exception(error_val);
                             continue;
                         }
                     }

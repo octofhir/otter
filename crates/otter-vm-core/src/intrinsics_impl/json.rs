@@ -968,8 +968,8 @@ fn json_parse(
         return Err(VmError::syntax_error("JSON.parse: unexpected input"));
     };
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| VmError::syntax_error(format!("JSON.parse: {}", e)))?;
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| VmError::syntax_error(format!("JSON.parse: {}", e)))?;
 
     // Get Object.prototype and Array.prototype from global
     let global = ncx.ctx.global();

@@ -453,6 +453,15 @@ impl ModuleLoader {
         }
     }
 
+    /// Clear all cached modules.
+    ///
+    /// This is used by `Otter::reset_realm()` to ensure test isolation.
+    pub fn clear(&self) {
+        if let Ok(mut modules) = self.modules.write() {
+            modules.clear();
+        }
+    }
+
     /// Compile source code directly as a module and cache it.
     pub fn compile_source(
         &self,

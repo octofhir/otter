@@ -205,6 +205,8 @@ fn setup_builtin_constructors(
         "Float64Array",
         "BigInt64Array",
         "BigUint64Array",
+        "AbortController",
+        "AbortSignal",
     ];
 
     for name in builtins {
@@ -226,7 +228,10 @@ fn setup_builtin_constructors(
                 "Float32Array" => intrinsics.float32_array_prototype,
                 "Float64Array" => intrinsics.float64_array_prototype,
                 "BigInt64Array" => intrinsics.bigint64_array_prototype,
+
                 "BigUint64Array" => intrinsics.biguint64_array_prototype,
+                "AbortController" => intrinsics.abort_controller_prototype,
+                "AbortSignal" => intrinsics.abort_signal_prototype,
                 _ => GcRef::new(JsObject::new(Value::null(), mm.clone())),
             }
         } else {
@@ -234,7 +239,29 @@ fn setup_builtin_constructors(
         };
 
         // Create constructor based on type — all get fn_proto as [[Prototype]]
-        let ctor = if name == "Boolean" {
+        let ctor = if let Some(intrinsics) =
+            intrinsics_opt.filter(|i| matches!(name, "AbortController" | "AbortSignal"))
+        {
+            match name {
+                "AbortController" => Value::native_function_with_proto_and_object(
+                    Arc::new(crate::web_api::abort_controller::AbortController::constructor),
+                    mm.clone(),
+                    fn_proto,
+                    intrinsics.abort_controller_constructor,
+                ),
+                "AbortSignal" => Value::native_function_with_proto_and_object(
+                    Arc::new(|_, _, _| {
+                        Err(VmError::type_error(
+                            "Constructing an AbortSignal manually is not supported",
+                        ))
+                    }),
+                    mm.clone(),
+                    fn_proto,
+                    intrinsics.abort_signal_constructor,
+                ),
+                _ => unreachable!(),
+            }
+        } else if name == "Boolean" {
             Value::native_function_with_proto(
                 |_this, args: &[Value], _ncx| {
                     let b = if let Some(val) = args.get(0) {

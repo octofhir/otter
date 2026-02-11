@@ -60,6 +60,24 @@ fn test_safe_core_allows_assert_util_events_and_assert_strict() {
 }
 
 #[test]
+fn test_safe_core_allows_timers_modules() {
+    let mut otter = EngineBuilder::new()
+        .with_nodejs_profile(NodeApiProfile::SafeCore)
+        .build();
+    assert_ok(
+        &mut otter,
+        "import timers from 'node:timers'; import * as tp from 'node:timers/promises';\n\
+         if (typeof timers.setTimeout !== 'function') throw new Error('timers.setTimeout');\n\
+         if (typeof timers.setImmediate !== 'function') throw new Error('timers.setImmediate');\n\
+         if (typeof tp.setTimeout !== 'function') throw new Error('timers/promises.setTimeout');\n\
+         if (typeof tp.setImmediate !== 'function') throw new Error('timers/promises.setImmediate');\n\
+         if (typeof tp.setInterval !== 'function') throw new Error('timers/promises.setInterval');\n\
+         if (typeof tp.scheduler?.wait !== 'function') throw new Error('timers/promises.scheduler.wait');\n\
+         'ok';",
+    );
+}
+
+#[test]
 fn test_safe_core_blocks_process_and_fs() {
     let mut otter_process = EngineBuilder::new()
         .with_nodejs_profile(NodeApiProfile::SafeCore)

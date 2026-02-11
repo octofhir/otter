@@ -37,6 +37,8 @@ pub mod provider;
 mod security;
 pub mod stream_ext;
 pub mod test_ext;
+pub mod timers_ext;
+pub mod timers_module_ext;
 pub mod url_ext;
 pub mod util_ext;
 pub mod worker_threads_ext;
@@ -108,6 +110,7 @@ pub fn nodejs_extensions() -> Vec<Box<dyn OtterExtension>> {
         fs_ext::node_fs_extension(),
         events_ext::node_events_extension(),
         stream_ext::node_stream_extension(),
+        timers_module_ext::node_timers_extension(),
         util_ext::node_util_extension(),
         assert_ext::node_assert_extension(),
         buffer_ext::node_buffer_extension(),

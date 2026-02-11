@@ -724,6 +724,29 @@ impl Buffer {
     }
 }
 
+pub fn atob(_this: &Value, args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
+    let s = args
+        .first()
+        .and_then(|v| v.as_string())
+        .map(|s| s.as_str().to_string())
+        .unwrap_or_default();
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s)
+        .map_err(|_| VmError::type_error("Invalid atob input"))?;
+    let result: String = bytes.iter().map(|&b| b as char).collect();
+    Ok(Value::string(JsString::new_gc(&result)))
+}
+
+pub fn btoa(_this: &Value, args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
+    let s = args
+        .first()
+        .and_then(|v| v.as_string())
+        .map(|s| s.as_str().to_string())
+        .unwrap_or_default();
+    let bytes: Vec<u8> = s.chars().map(|c| c as u8).collect();
+    let result = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    Ok(Value::string(JsString::new_gc(&result)))
+}
+
 // ---------------------------------------------------------------------------
 // OtterExtension
 // ---------------------------------------------------------------------------
@@ -753,6 +776,12 @@ impl OtterExtension for NodeBufferExtension {
         // Build Buffer class and set as global
         let ctor = build_buffer_class(ctx);
         ctx.global_value("Buffer", ctor);
+
+        // Install atob/btoa as globals
+        let mm = ctx.mm().clone();
+        ctx.global_value("atob", Value::native_function(atob, mm.clone()));
+        ctx.global_value("btoa", Value::native_function(btoa, mm));
+
         Ok(())
     }
 
@@ -762,11 +791,15 @@ impl OtterExtension for NodeBufferExtension {
         ctx: &mut RegistrationContext,
     ) -> Option<GcRef<JsObject>> {
         let ctor = ctx.global().get(&PropertyKey::string("Buffer"))?;
+        let atob_fn = ctx.global().get(&PropertyKey::string("atob"))?;
+        let btoa_fn = ctx.global().get(&PropertyKey::string("btoa"))?;
 
         let ns = ctx
             .module_namespace()
             .property("default", ctor.clone())
             .property("Buffer", ctor)
+            .property("atob", atob_fn)
+            .property("btoa", btoa_fn)
             .build();
 
         Some(ns)

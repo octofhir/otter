@@ -231,14 +231,20 @@ pub fn define_species_getter(
     let getter_object = GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
     getter_object.define_property(
         PropertyKey::string("name"),
-        PropertyDescriptor::function_length(Value::string(JsString::intern("get [Symbol.species]"))),
+        PropertyDescriptor::function_length(Value::string(JsString::intern(
+            "get [Symbol.species]",
+        ))),
     );
     getter_object.define_property(
         PropertyKey::string("length"),
         PropertyDescriptor::function_length(Value::int32(0)),
     );
-    let getter =
-        Value::native_function_with_proto_and_object(species_native, mm.clone(), fn_proto, getter_object);
+    let getter = Value::native_function_with_proto_and_object(
+        species_native,
+        mm.clone(),
+        fn_proto,
+        getter_object,
+    );
     ctor.define_property(
         PropertyKey::Symbol(well_known::species_symbol()),
         PropertyDescriptor::Accessor {

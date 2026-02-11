@@ -203,6 +203,44 @@ fn test_fs_opendir_sync_and_abort_signal_surface() {
     assert_ok(&mut otter, &code);
 }
 
+#[test]
+fn test_timers_and_timers_promises_surface() {
+    let mut otter = full_engine_for_parity();
+    assert_ok(
+        &mut otter,
+        "import timers from 'node:timers';\n\
+         import * as timersPromises from 'node:timers/promises';\n\
+         if (timers.setTimeout !== globalThis.setTimeout) throw new Error('timers setTimeout binding');\n\
+         if (timers.clearTimeout !== globalThis.clearTimeout) throw new Error('timers clearTimeout binding');\n\
+         if (timers.setInterval !== globalThis.setInterval) throw new Error('timers setInterval binding');\n\
+         if (timers.setImmediate !== globalThis.setImmediate) throw new Error('timers setImmediate binding');\n\
+         const p1 = timersPromises.setTimeout(0, 'ok');\n\
+         const p2 = timersPromises.setImmediate('ok');\n\
+         const it = timersPromises.setInterval(1, 'tick');\n\
+         if (typeof p1?.then !== 'function') throw new Error('timers/promises setTimeout');\n\
+         if (typeof p2?.then !== 'function') throw new Error('timers/promises setImmediate');\n\
+         if (typeof it?.next !== 'function') throw new Error('timers/promises setInterval iterator next');\n\
+         if (typeof it?.return !== 'function') throw new Error('timers/promises setInterval iterator return');\n\
+         if (typeof it?.throw !== 'function') throw new Error('timers/promises setInterval iterator throw');\n\
+         if (it[Symbol.asyncIterator]() !== it) throw new Error('timers/promises setInterval async iterator symbol');\n\
+         const pIntNext = it.next();\n\
+         const pIntReturn = it.return('stop');\n\
+         if (typeof pIntNext?.then !== 'function') throw new Error('timers/promises setInterval next promise');\n\
+         if (typeof pIntReturn?.then !== 'function') throw new Error('timers/promises setInterval return promise');\n\
+         if (typeof timersPromises.scheduler !== 'object') throw new Error('scheduler object');\n\
+         if (typeof timersPromises.scheduler.wait !== 'function') throw new Error('scheduler.wait');\n\
+         if (typeof timersPromises.scheduler.yield !== 'function') throw new Error('scheduler.yield');\n\
+         const p3 = timersPromises.scheduler.wait(0);\n\
+         const p4 = timersPromises.scheduler.yield();\n\
+         if (typeof p3?.then !== 'function' || typeof p4?.then !== 'function') throw new Error('scheduler promises');\n\
+         const ac = new AbortController();\n\
+         ac.abort(new Error('stop'));\n\
+         const p5 = timersPromises.setTimeout(0, 'x', { signal: ac.signal });\n\
+         if (typeof p5?.then !== 'function') throw new Error('abort option promise surface');\n\
+         'ok';",
+    );
+}
+
 #[tokio::test]
 async fn test_eval_waits_for_detached_fs_async_ops() {
     let dir = tempdir().unwrap();

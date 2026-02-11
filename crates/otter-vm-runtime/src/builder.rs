@@ -145,6 +145,11 @@ impl OtterBuilder {
         let caps = self.capabilities.unwrap_or_default();
         runtime.set_capabilities(caps);
 
+        // Register core timer globals (setTimeout/setInterval/setImmediate/queueMicrotask).
+        runtime
+            .register_extension(crate::timers_ext::create_timers_extension(&runtime))
+            .expect("Failed to register runtime timers extension");
+
         // Note: default builtins are NOT registered here to avoid circular dependencies.
         // Use `otter_engine::EngineBuilder` for automatic registration,
         // or register your own extensions manually.

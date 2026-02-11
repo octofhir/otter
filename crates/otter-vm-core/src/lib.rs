@@ -51,6 +51,7 @@ pub mod symbol_registry;
 pub mod trace;
 pub mod typed_array;
 pub mod value;
+pub mod web_api;
 
 pub use array_buffer::JsArrayBuffer;
 pub use async_context::{AsyncContext, SavedFrame, VmExecutionResult};

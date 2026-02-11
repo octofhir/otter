@@ -130,6 +130,9 @@ fn build_fs_module(ctx: &mut RegistrationContext) -> GcRef<JsObject> {
         fs_chmod_sync_decl,
         fs_symlink_sync_decl,
         fs_readlink_sync_decl,
+        fs_open_sync_decl,
+        fs_read_sync_decl,
+        fs_close_sync_decl,
         fs_opendir_sync_decl,
     ];
     let callback_async_fns: &[DeclFn] = &[
@@ -1400,6 +1403,83 @@ fn fs_read_file_sync(args: &[Value], ncx: &mut NativeContext) -> Result<Value, V
     decode_bytes(&bytes, encoding.as_deref(), mm, array_proto)
 }
 
+#[dive(name = "openSync", length = 1)]
+fn fs_open_sync(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
+    let path = get_required_string(args, 0, "openSync")?;
+    let flags = parse_open_options(args.get(1), "openSync")?;
+    let mode = args
+        .get(2)
+        .and_then(|v| v.as_number())
+        .map(|n| n as u32)
+        .unwrap_or(0o666);
+
+    let result = fs_core::execute_sync(FsOp::Open { path, flags, mode })
+        .map_err(|e| VmError::type_error(&e.to_string()))?;
+
+    match result {
+        FsOpResult::FileHandle(handle_id) => Ok(Value::number(handle_id as f64)),
+        _ => Err(VmError::type_error("openSync: invalid fs op result")),
+    }
+}
+
+#[dive(name = "readSync", length = 2)]
+fn fs_read_sync(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
+    let fd = args
+        .first()
+        .and_then(|v| v.as_number())
+        .map(|n| n as u64)
+        .ok_or_else(|| VmError::type_error("readSync requires fd as first argument"))?;
+
+    let buffer_val = args
+        .get(1)
+        .ok_or_else(|| VmError::type_error("readSync requires buffer as second argument"))?;
+    let typed = buffer_val
+        .as_typed_array()
+        .ok_or_else(|| VmError::type_error("readSync: buffer must be a typed array"))?;
+
+    let offset = parse_optional_len(args.get(2), 0, "readSync")?;
+    let length = parse_optional_len(
+        args.get(3),
+        typed.length().saturating_sub(offset),
+        "readSync",
+    )?;
+    let position = parse_optional_position(args.get(4), "readSync")?;
+
+    let result = fs_core::execute_sync(FsOp::ReadHandle {
+        handle_id: fd,
+        length,
+        position,
+    })
+    .map_err(|e| VmError::type_error(&e.to_string()))?;
+
+    let bytes = match result {
+        FsOpResult::Bytes(bytes) => bytes,
+        _ => return Err(VmError::type_error("readSync: invalid fs op result")),
+    };
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if offset + i < typed.length() {
+            typed.set(offset + i, b as f64);
+        }
+    }
+
+    Ok(Value::number(bytes.len() as f64))
+}
+
+#[dive(name = "closeSync", length = 1)]
+fn fs_close_sync(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
+    let fd = args
+        .first()
+        .and_then(|v| v.as_number())
+        .map(|n| n as u64)
+        .ok_or_else(|| VmError::type_error("closeSync requires fd as argument"))?;
+
+    fs_core::execute_sync(FsOp::CloseHandle { handle_id: fd })
+        .map_err(|e| VmError::type_error(&e.to_string()))?;
+
+    Ok(Value::undefined())
+}
+
 #[dive(name = "writeFileSync", length = 2)]
 fn fs_write_file_sync(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
     let path = get_required_string(args, 0, "writeFileSync")?;
@@ -2428,7 +2508,12 @@ fn fs_open_async(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmErr
     let setup = (|| -> Result<FsOp, FsAsyncSetupError> {
         let path = get_required_string(args, 0, "open")?;
         let flags = parse_open_options(args.get(1), "open")?;
-        let op = FsOp::Open { path, flags };
+        let mode = args
+            .get(2)
+            .and_then(|v| v.as_number())
+            .map(|n| n as u32)
+            .unwrap_or(0o666);
+        let op = FsOp::Open { path, flags, mode };
         fs_core::precheck_capabilities(&op)?;
         Ok(op)
     })();

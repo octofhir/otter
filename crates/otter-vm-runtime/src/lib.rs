@@ -25,6 +25,7 @@ pub mod otter_runtime;
 pub mod promise;
 pub mod registration;
 pub mod timer;
+pub mod timers_ext;
 pub mod worker;
 
 // Re-export main types

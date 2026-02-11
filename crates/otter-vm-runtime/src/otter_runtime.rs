@@ -197,6 +197,9 @@ impl Otter {
         // Create fresh realm, swap default, drop old
         self.vm.reset_default_realm();
 
+        // Clear module cache to prevent cross-test pollution
+        self.loader.clear();
+
         // Reset execution state
         self.clear_interrupt();
         *self.debug_snapshot.lock() = VmContextSnapshot::default();
@@ -1440,7 +1443,12 @@ impl Otter {
                     // 1. Resolve specifier
                     let resolution = loader
                         .resolve_require(&specifier, &referrer)
-                        .map_err(|e| VmError::type_error(e.to_string()))?;
+                        .map_err(|e| {
+                            eprintln!("DEBUG: require: failed to resolve '{}' from '{}': {}", specifier, referrer, e);
+                            VmError::type_error(e.to_string())
+                        })?;
+
+                    eprintln!("DEBUG: require: '{}' -> '{}'", specifier, resolution.url);
 
                     // 2. Check if already evaluated or currently evaluating (cycle)
                     if let Some(m) = loader.get(&resolution.url) {
@@ -1527,10 +1535,13 @@ impl Otter {
                         }
                     }
 
-                    // 6. Return module.exports
-                    loader
+                    let res = loader
                         .require_value(&specifier, &referrer, ncx.memory_manager().clone())
-                        .map_err(|e| VmError::type_error(e.to_string()))
+                        .map_err(|e| VmError::type_error(e.to_string()));
+                    if let Ok(val) = &res {
+                        eprintln!("DEBUG: require: '{}' -> return {:?}", specifier, val);
+                    }
+                    res
                 },
                 mm,
                 fn_proto,
@@ -1908,36 +1919,48 @@ impl Otter {
             }
         };
 
+        let mut next_tick_batch = Vec::with_capacity(64);
         loop {
             // Node.js semantics: drain ALL nextTick callbacks before ANY promise microtask.
-            while let Some(tick_job) = self.event_loop.next_tick_queue().dequeue() {
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    interpreter.call_function(
-                        ctx,
-                        &tick_job.callback,
-                        Value::undefined(),
-                        &tick_job.args,
-                    )
-                }));
-                match result {
-                    Ok(Err(e)) => {
-                        if first_error.is_none() {
-                            first_error = Some(e.to_string());
+            loop {
+                next_tick_batch.clear();
+                let drained = self
+                    .event_loop
+                    .next_tick_queue()
+                    .dequeue_batch(64, &mut next_tick_batch);
+                if drained == 0 {
+                    break;
+                }
+
+                for tick_job in next_tick_batch.drain(..) {
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        interpreter.call_function(
+                            ctx,
+                            &tick_job.callback,
+                            Value::undefined(),
+                            &tick_job.args,
+                        )
+                    }));
+                    match result {
+                        Ok(Err(e)) => {
+                            if first_error.is_none() {
+                                first_error = Some(e.to_string());
+                            }
                         }
-                    }
-                    Err(panic) => {
-                        let msg = if let Some(s) = panic.downcast_ref::<&str>() {
-                            format!("nextTick panic: {s}")
-                        } else if let Some(s) = panic.downcast_ref::<String>() {
-                            format!("nextTick panic: {s}")
-                        } else {
-                            "nextTick panic: unknown".to_string()
-                        };
-                        if first_error.is_none() {
-                            first_error = Some(msg);
+                        Err(panic) => {
+                            let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                                format!("nextTick panic: {s}")
+                            } else if let Some(s) = panic.downcast_ref::<String>() {
+                                format!("nextTick panic: {s}")
+                            } else {
+                                "nextTick panic: unknown".to_string()
+                            };
+                            if first_error.is_none() {
+                                first_error = Some(msg);
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
 

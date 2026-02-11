@@ -375,19 +375,10 @@ fn arg_str(args: &[Value], i: usize, _fn_name: &str) -> Result<String, VmError> 
 }
 
 /// Convert a Value to a String.
+/// Convert a Value to a String.
 fn value_to_str(v: &Value) -> Result<String, VmError> {
     if let Some(s) = v.as_string() {
         Ok(s.as_str().to_string())
-    } else if let Some(n) = v.as_number() {
-        Ok(format!("{n}"))
-    } else if let Some(n) = v.as_int32() {
-        Ok(format!("{n}"))
-    } else if v.is_boolean() {
-        Ok(if v.to_boolean() {
-            "true".to_string()
-        } else {
-            "false".to_string()
-        })
     } else {
         Err(VmError::type_error(
             "The \"path\" argument must be of type string",

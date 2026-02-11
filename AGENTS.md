@@ -65,6 +65,27 @@ This separation:
 - **Idiomatic Rust**: Follow Rust best practices, use proper error handling, leverage the type system.
 - **Secure defaults**: deny-by-default permissions; new capabilities must be explicit and testable.
 
+## Macro and Async Agreements
+
+### Macro usage (`#[dive]`)
+
+- Prefer `#[dive]` for simple native bindings where argument mapping is straightforward and improves readability.
+- For module loaders / namespace wiring (`node:*`, profile-gated exports, mixed sync+async APIs), prefer explicit `OtterExtension` + manual module builders instead of hiding behavior behind macros.
+- Keep public JS API shape obvious in Rust code: exported names and arity should be visible in one place (`*_ext.rs` module builder).
+- If a macro-based API surface changes, update the corresponding tests and `.d.ts` declarations in the same patch.
+
+### Async model
+
+- Timers are runtime primitives, not Node-specific APIs:
+  - `setTimeout`, `setInterval`, `setImmediate`, `queueMicrotask` must come from `otter-vm-runtime`.
+  - `node:timers` / `timers` must re-export runtime globals, not maintain a separate timer backend.
+- Promise settlement for async native APIs must go through JS job queues:
+  - Use `JsPromise::with_resolvers(...)` and enqueue through `ncx.js_job_queue()`.
+  - Do not settle promises directly from worker threads.
+- Worker tasks may execute only plain Rust async work (Tokio); VM/JS interaction must be marshalled back onto VM thread via queued jobs.
+- For stream/iterator-like async APIs (e.g. `timers/promises.setInterval()`), use explicit pending queues (for example `VecDeque`) and deterministic delivery semantics.
+- In `otter-nodejs` extension code, prefer `std::sync` primitives (`Mutex`, atomics) plus queue handoff; avoid introducing new `parking_lot` usage there unless explicitly justified.
+
 ## Common Pitfalls to Avoid
 
 ### 1. Wrong Collection Type

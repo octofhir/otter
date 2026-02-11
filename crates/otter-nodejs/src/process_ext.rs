@@ -25,6 +25,8 @@ use std::collections::BTreeSet;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use crate::events_ext::EventEmitter;
+
 static START_INSTANT: OnceLock<Instant> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
@@ -58,6 +60,10 @@ impl OtterExtension for NodeProcessExtension {
 
         let mm = ctx.mm().clone();
         let process_obj = GcRef::new(JsObject::new(Value::object(ctx.obj_proto()), mm.clone()));
+
+        // Set global.global = global (Node.js compatibility)
+        let global = ctx.global();
+        let _ = global.set(PropertyKey::string("global"), Value::object(global.clone()));
 
         // --- Static properties ---
 
@@ -255,7 +261,25 @@ fn register_process_methods(ctx: &RegistrationContext, process_obj: &GcRef<JsObj
         process_cpu_usage_decl,
         process_next_tick_decl,
         process_umask_decl,
+        process_next_tick_decl,
+        process_umask_decl,
         process_kill_decl,
+        // EventEmitter methods
+        EventEmitter::on_decl,
+        EventEmitter::once_decl,
+        EventEmitter::off_decl,
+        EventEmitter::emit_decl,
+        EventEmitter::add_listener_decl,
+        EventEmitter::remove_listener_decl,
+        EventEmitter::remove_all_listeners_decl,
+        EventEmitter::prepend_listener_decl,
+        EventEmitter::prepend_once_listener_decl,
+        EventEmitter::listeners_decl,
+        EventEmitter::raw_listeners_decl,
+        EventEmitter::listener_count_decl,
+        EventEmitter::event_names_decl,
+        EventEmitter::set_max_listeners_decl,
+        EventEmitter::get_max_listeners_method_decl,
     ];
 
     for decl in fns {

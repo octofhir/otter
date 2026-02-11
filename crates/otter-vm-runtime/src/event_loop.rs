@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use serde_json::Value as JsonValue;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -96,6 +96,8 @@ pub struct EventLoop {
     timer_heap: Mutex<BinaryHeap<TimerHeapEntry>>,
     /// Immediate queue (FIFO)
     immediates: Mutex<VecDeque<Immediate>>,
+    /// Number of immediates currently queued (including cancelled entries not yet drained).
+    immediate_queue_len: AtomicUsize,
     /// Microtask queue (Rust closures)
     microtasks: MicrotaskQueue,
     /// JS callback job queue (JavaScript functions)
@@ -140,6 +142,7 @@ impl EventLoop {
             timers: Mutex::new(HashMap::new()),
             timer_heap: Mutex::new(BinaryHeap::new()),
             immediates: Mutex::new(VecDeque::new()),
+            immediate_queue_len: AtomicUsize::new(0),
             microtasks: MicrotaskQueue::with_sequencer(sequencer.clone()),
             js_jobs: Arc::new(JsJobQueue::with_sequencer(sequencer)),
             next_tick: Arc::new(NextTickQueue::new()),
@@ -343,6 +346,7 @@ impl EventLoop {
         };
 
         self.immediates.lock().push_back(immediate);
+        self.immediate_queue_len.fetch_add(1, Ordering::Relaxed);
         id
     }
 
@@ -351,11 +355,9 @@ impl EventLoop {
         {
             let executing = self.executing_immediate_ids.lock();
             if executing.contains(&id.0) {
-                let immediates = self.immediates.lock();
-                if let Some(imm) = immediates.iter().find(|i| i.id == id) {
-                    imm.cancelled.store(true, Ordering::SeqCst);
-                    return true;
-                }
+                // Immediate callbacks are one-shot; if it's already executing,
+                // there is nothing left to cancel.
+                return true;
             }
         }
 
@@ -373,11 +375,10 @@ impl EventLoop {
         {
             let executing = self.executing_immediate_ids.lock();
             if executing.contains(&id.0) {
-                let immediates = self.immediates.lock();
-                if let Some(imm) = immediates.iter().find(|i| i.id == id) {
-                    imm.refed.store(refed, Ordering::SeqCst);
-                    return true;
-                }
+                let _ = refed;
+                // Immediate callbacks are one-shot; if it's already executing,
+                // changing ref state no longer affects loop liveness.
+                return true;
             }
         }
 
@@ -452,7 +453,9 @@ impl EventLoop {
 
     /// Drain all microtasks
     fn drain_microtasks(&self) {
-        while let Some(task) = self.microtasks.dequeue() {
+        let mut batch = Vec::new();
+        self.microtasks.drain_all(&mut batch);
+        for task in batch {
             task();
         }
     }
@@ -587,61 +590,26 @@ impl EventLoop {
 
     /// Run all pending immediates
     fn run_immediates(&self) {
-        // Collect IDs first
-        let due_ids: Vec<u64> = {
-            let queue = self.immediates.lock();
-            queue.iter().map(|i| i.id.0).collect()
-        };
-
-        for immediate_id in due_ids {
-            // Extract immediate info
-            let immediate_info = {
-                let mut queue = self.immediates.lock();
-                let idx = queue.iter().position(|i| i.id.0 == immediate_id);
-                idx.and_then(|i| {
-                    let imm = queue.get_mut(i)?;
-                    if imm.cancelled.load(Ordering::SeqCst) {
-                        return None;
-                    }
-                    Some((imm.callback.take(), imm.cancelled.clone()))
-                })
+        loop {
+            let next = self.immediates.lock().pop_front();
+            let Some(mut immediate) = next else {
+                break;
             };
+            self.immediate_queue_len.fetch_sub(1, Ordering::Relaxed);
 
-            let Some((callback, cancelled_flag)) = immediate_info else {
-                // Remove cancelled immediate
-                let mut queue = self.immediates.lock();
-                if let Some(idx) = queue.iter().position(|i| i.id.0 == immediate_id) {
-                    queue.remove(idx);
-                }
+            if immediate.cancelled.load(Ordering::SeqCst) {
                 continue;
-            };
+            }
 
-            // Register as executing
+            let immediate_id = immediate.id.0;
             self.executing_immediate_ids.lock().insert(immediate_id);
 
-            // Execute callback
-            if let Some(cb) = callback {
+            if let Some(cb) = immediate.callback.take() {
                 cb();
             }
 
-            // Run microtasks after immediate callback
             self.drain_microtasks();
-
-            // Check if cancelled during execution
-            let was_cancelled = cancelled_flag.load(Ordering::SeqCst);
-
-            // Remove from executing
             self.executing_immediate_ids.lock().remove(&immediate_id);
-
-            // Remove from queue (immediates don't repeat)
-            let mut queue = self.immediates.lock();
-            if let Some(idx) = queue.iter().position(|i| i.id.0 == immediate_id) {
-                queue.remove(idx);
-            }
-
-            if was_cancelled {
-                continue;
-            }
         }
     }
 
@@ -849,7 +817,7 @@ impl EventLoop {
             // 7. Small sleep if nothing is immediately ready to prevent busy-loop
             if self.microtasks.is_empty()
                 && self.js_jobs.is_empty()
-                && self.immediates.lock().is_empty()
+                && self.immediate_queue_len.load(Ordering::Relaxed) == 0
                 && !has_servers
                 && let Some(wait) = self.time_until_next_timer()
             {
@@ -870,6 +838,7 @@ impl Default for EventLoop {
             timers: Mutex::new(HashMap::new()),
             timer_heap: Mutex::new(BinaryHeap::new()),
             immediates: Mutex::new(VecDeque::new()),
+            immediate_queue_len: AtomicUsize::new(0),
             microtasks: MicrotaskQueue::with_sequencer(sequencer.clone()),
             js_jobs: Arc::new(JsJobQueue::with_sequencer(sequencer)),
             next_tick: Arc::new(NextTickQueue::new()),

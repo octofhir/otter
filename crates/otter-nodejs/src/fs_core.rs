@@ -232,6 +232,7 @@ pub enum FsOp {
     Open {
         path: String,
         flags: FsOpenOptions,
+        mode: u32,
     },
     CloseHandle {
         handle_id: u64,
@@ -994,7 +995,7 @@ pub fn execute_sync(op: FsOp) -> Result<FsOpResult, FsOpError> {
                 .map_err(|e| FsOpError::from_io_two("rename", &from, &to, e))?;
             Ok(FsOpResult::Unit)
         }
-        FsOp::Open { path, flags } => {
+        FsOp::Open { path, flags, mode } => {
             if flags.requires_read() {
                 crate::security::require_fs_read(&path)
                     .map_err(|e| FsOpError::security("open", &path, e))?;
@@ -1006,6 +1007,11 @@ pub fn execute_sync(op: FsOp) -> Result<FsOpResult, FsOpError> {
 
             let mut options = std::fs::OpenOptions::new();
             flags.apply(&mut options);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(mode);
+            }
             let file = options
                 .open(&path)
                 .map_err(|e| FsOpError::from_io("open", &path, e))?;
@@ -1157,7 +1163,11 @@ pub fn precheck_capabilities(op: &FsOp) -> Result<(), FsOpError> {
                 .map_err(|e| FsOpError::security("rename", from, e))?;
             crate::security::require_fs_write(to).map_err(|e| FsOpError::security("rename", to, e))
         }
-        FsOp::Open { path, flags } => {
+        FsOp::Open {
+            path,
+            flags,
+            mode: _,
+        } => {
             if flags.requires_read() {
                 crate::security::require_fs_read(path)
                     .map_err(|e| FsOpError::security("open", path, e))?;
@@ -1380,11 +1390,16 @@ pub async fn execute_async_unchecked(op: FsOp) -> Result<FsOpResult, FsOpError> 
                 .map_err(|e| FsOpError::from_io_two("rename", &from, &to, e))?;
             Ok(FsOpResult::Unit)
         }
-        FsOp::Open { path, flags } => {
+        FsOp::Open { path, flags, mode } => {
             let path_for_worker = path.clone();
             let file = tokio::task::spawn_blocking(move || {
                 let mut options = std::fs::OpenOptions::new();
                 flags.apply(&mut options);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(mode);
+                }
                 options
                     .open(&path_for_worker)
                     .map_err(|e| FsOpError::from_io("open", &path_for_worker, e))

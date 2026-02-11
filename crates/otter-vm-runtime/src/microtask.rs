@@ -26,7 +26,7 @@
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use otter_vm_core::promise::JsPromiseJob;
 use otter_vm_core::value::Value;
@@ -65,6 +65,7 @@ pub struct JsCallbackJob {
 /// Queue of microtasks (Rust closures)
 pub struct MicrotaskQueue {
     queue: Mutex<VecDeque<(u64, Microtask)>>,
+    len: AtomicUsize,
     sequencer: MicrotaskSequencer,
 }
 
@@ -74,6 +75,7 @@ pub struct MicrotaskQueue {
 /// need to be executed by the interpreter, which requires VM context.
 pub struct JsJobQueue {
     queue: Mutex<VecDeque<(u64, JsCallbackJob)>>,
+    len: AtomicUsize,
     sequencer: MicrotaskSequencer,
 }
 
@@ -87,6 +89,7 @@ impl MicrotaskQueue {
     pub fn with_sequencer(sequencer: MicrotaskSequencer) -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
+            len: AtomicUsize::new(0),
             sequencer,
         }
     }
@@ -98,11 +101,30 @@ impl MicrotaskQueue {
     {
         let seq = self.sequencer.next();
         self.queue.lock().push_back((seq, Box::new(task)));
+        self.len.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Take the next microtask
     pub fn dequeue(&self) -> Option<Microtask> {
-        self.queue.lock().pop_front().map(|(_, task)| task)
+        let task = self.queue.lock().pop_front().map(|(_, task)| task);
+        if task.is_some() {
+            self.len.fetch_sub(1, Ordering::Relaxed);
+        }
+        task
+    }
+
+    /// Drain all currently queued microtasks in FIFO order.
+    pub fn drain_all(&self, out: &mut Vec<Microtask>) -> usize {
+        let mut queue = self.queue.lock();
+        let drained = queue.len();
+        out.reserve(drained);
+        while let Some((_, task)) = queue.pop_front() {
+            out.push(task);
+        }
+        if drained != 0 {
+            self.len.fetch_sub(drained, Ordering::Relaxed);
+        }
+        drained
     }
 
     /// Peek the next microtask sequence number
@@ -112,7 +134,7 @@ impl MicrotaskQueue {
 
     /// Check if queue is empty
     pub fn is_empty(&self) -> bool {
-        self.queue.lock().is_empty()
+        self.len.load(Ordering::Relaxed) == 0
     }
 }
 
@@ -132,6 +154,7 @@ impl JsJobQueue {
     pub fn with_sequencer(sequencer: MicrotaskSequencer) -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
+            len: AtomicUsize::new(0),
             sequencer,
         }
     }
@@ -142,11 +165,37 @@ impl JsJobQueue {
         self.queue
             .lock()
             .push_back((seq, JsCallbackJob { job, args }));
+        self.len.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Dequeue the next JS callback job
     pub fn dequeue(&self) -> Option<JsCallbackJob> {
-        self.queue.lock().pop_front().map(|(_, job)| job)
+        let job = self.queue.lock().pop_front().map(|(_, job)| job);
+        if job.is_some() {
+            self.len.fetch_sub(1, Ordering::Relaxed);
+        }
+        job
+    }
+
+    /// Dequeue up to `max` jobs in FIFO order in a single lock acquisition.
+    pub fn dequeue_batch(&self, max: usize, out: &mut Vec<JsCallbackJob>) -> usize {
+        if max == 0 {
+            return 0;
+        }
+        let mut queue = self.queue.lock();
+        let to_take = max.min(queue.len());
+        out.reserve(to_take);
+        for _ in 0..to_take {
+            if let Some((_, job)) = queue.pop_front() {
+                out.push(job);
+            } else {
+                break;
+            }
+        }
+        if to_take != 0 {
+            self.len.fetch_sub(to_take, Ordering::Relaxed);
+        }
+        to_take
     }
 
     /// Peek the next JS job sequence number
@@ -156,7 +205,7 @@ impl JsJobQueue {
 
     /// Check if queue is empty
     pub fn is_empty(&self) -> bool {
-        self.queue.lock().is_empty()
+        self.len.load(Ordering::Relaxed) == 0
     }
 
     /// Trace GC roots held by queued JS callback jobs
@@ -199,6 +248,7 @@ pub struct NextTickJob {
 /// microtask in the same drain cycle, matching Node.js behavior.
 pub struct NextTickQueue {
     queue: Mutex<VecDeque<NextTickJob>>,
+    len: AtomicUsize,
 }
 
 impl NextTickQueue {
@@ -206,22 +256,49 @@ impl NextTickQueue {
     pub fn new() -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
+            len: AtomicUsize::new(0),
         }
     }
 
     /// Enqueue a nextTick callback.
     pub fn enqueue(&self, callback: Value, args: Vec<Value>) {
         self.queue.lock().push_back(NextTickJob { callback, args });
+        self.len.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Dequeue the next nextTick callback.
     pub fn dequeue(&self) -> Option<NextTickJob> {
-        self.queue.lock().pop_front()
+        let job = self.queue.lock().pop_front();
+        if job.is_some() {
+            self.len.fetch_sub(1, Ordering::Relaxed);
+        }
+        job
+    }
+
+    /// Dequeue up to `max` nextTick jobs in FIFO order in a single lock acquisition.
+    pub fn dequeue_batch(&self, max: usize, out: &mut Vec<NextTickJob>) -> usize {
+        if max == 0 {
+            return 0;
+        }
+        let mut queue = self.queue.lock();
+        let to_take = max.min(queue.len());
+        out.reserve(to_take);
+        for _ in 0..to_take {
+            if let Some(job) = queue.pop_front() {
+                out.push(job);
+            } else {
+                break;
+            }
+        }
+        if to_take != 0 {
+            self.len.fetch_sub(to_take, Ordering::Relaxed);
+        }
+        to_take
     }
 
     /// Check if queue is empty.
     pub fn is_empty(&self) -> bool {
-        self.queue.lock().is_empty()
+        self.len.load(Ordering::Relaxed) == 0
     }
 
     /// Trace GC roots held by queued nextTick jobs.

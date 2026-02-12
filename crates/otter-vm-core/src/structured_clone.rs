@@ -11,6 +11,7 @@
 
 use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyKey};
+use crate::{JsDataView, JsTypedArray};
 use crate::value::{HeapRef, Value};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -137,14 +138,8 @@ impl StructuredCloner {
                     ))
                 }
             }
-            Some(HeapRef::TypedArray(_)) => {
-                // TODO: Implement proper TypedArray cloning (copy underlying buffer)
-                Err(StructuredCloneError::NotCloneable("TypedArray"))
-            }
-            Some(HeapRef::DataView(_)) => {
-                // TODO: Implement proper DataView cloning (copy underlying buffer)
-                Err(StructuredCloneError::NotCloneable("DataView"))
-            }
+            Some(HeapRef::TypedArray(ta)) => self.clone_typed_array(*ta),
+            Some(HeapRef::DataView(dv)) => self.clone_data_view(*dv),
 
             Some(HeapRef::MapData(_)) => Err(StructuredCloneError::NotCloneable("MapData")),
             Some(HeapRef::SetData(_)) => Err(StructuredCloneError::NotCloneable("SetData")),
@@ -209,6 +204,68 @@ impl StructuredCloner {
 
         Ok(new_value)
     }
+
+    fn clone_typed_array(
+        &mut self,
+        ta: GcRef<JsTypedArray>,
+    ) -> Result<Value, StructuredCloneError> {
+        let ptr = ta.as_ptr() as usize;
+        if let Some(cloned) = self.memory.get(&ptr) {
+            return Ok(cloned.clone());
+        }
+
+        if ta.is_detached() {
+            return Err(StructuredCloneError::DataCloneError(
+                "ArrayBuffer is detached",
+            ));
+        }
+
+        let src_buffer = ta.buffer();
+        let buffer_len = src_buffer.byte_length();
+        let new_buffer = src_buffer
+            .slice(0, buffer_len)
+            .ok_or(StructuredCloneError::DataCloneError("ArrayBuffer is detached"))?;
+        let new_buffer = GcRef::new(new_buffer);
+
+        let new_obj = GcRef::new(JsObject::new(ta.object.prototype(), self.memory_manager.clone()));
+        let new_ta = JsTypedArray::new(
+            new_obj,
+            new_buffer,
+            ta.kind(),
+            ta.byte_offset(),
+            ta.length(),
+        )
+        .map_err(StructuredCloneError::DataCloneError)?;
+        let new_value = Value::typed_array(GcRef::new(new_ta));
+        self.memory.insert(ptr, new_value.clone());
+        Ok(new_value)
+    }
+
+    fn clone_data_view(&mut self, dv: GcRef<JsDataView>) -> Result<Value, StructuredCloneError> {
+        let ptr = dv.as_ptr() as usize;
+        if let Some(cloned) = self.memory.get(&ptr) {
+            return Ok(cloned.clone());
+        }
+
+        if dv.is_detached() {
+            return Err(StructuredCloneError::DataCloneError(
+                "ArrayBuffer is detached",
+            ));
+        }
+
+        let src_buffer = dv.buffer();
+        let buffer_len = src_buffer.byte_length();
+        let new_buffer = src_buffer
+            .slice(0, buffer_len)
+            .ok_or(StructuredCloneError::DataCloneError("ArrayBuffer is detached"))?;
+        let new_buffer = GcRef::new(new_buffer);
+
+        let new_dv = JsDataView::new(new_buffer, dv.byte_offset(), Some(dv.byte_length()))
+            .map_err(StructuredCloneError::DataCloneError)?;
+        let new_value = Value::data_view(GcRef::new(new_dv));
+        self.memory.insert(ptr, new_value.clone());
+        Ok(new_value)
+    }
 }
 
 /// Convenience function to clone a value
@@ -222,6 +279,9 @@ pub fn structured_clone(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::array_buffer::JsArrayBuffer;
+    use crate::data_view::JsDataView;
+    use crate::typed_array::{JsTypedArray, TypedArrayKind};
 
     #[test]
     fn test_clone_primitives() {
@@ -316,5 +376,55 @@ mod tests {
             result,
             Err(StructuredCloneError::NotCloneable("function"))
         ));
+    }
+
+    #[test]
+    fn test_clone_typed_array_copies_underlying_buffer() {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let mut cloner = StructuredCloner::new(memory_manager.clone());
+
+        let buffer = GcRef::new(JsArrayBuffer::new(8, None, memory_manager.clone()));
+        let object = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let ta = JsTypedArray::new(object, buffer, TypedArrayKind::Int16, 2, 2).unwrap();
+        let ta = GcRef::new(ta);
+        assert!(ta.set(0, 10.0));
+        assert!(ta.set(1, 20.0));
+
+        let cloned_val = cloner.clone(&Value::typed_array(ta)).unwrap();
+        let cloned_ta = cloned_val.as_typed_array().unwrap();
+
+        assert_eq!(cloned_ta.kind(), TypedArrayKind::Int16);
+        assert_eq!(cloned_ta.byte_offset(), 2);
+        assert_eq!(cloned_ta.length(), 2);
+        assert_eq!(cloned_ta.get(0), Some(10.0));
+        assert_eq!(cloned_ta.get(1), Some(20.0));
+
+        assert!(cloned_ta.set(0, 99.0));
+        assert_eq!(cloned_ta.get(0), Some(99.0));
+        assert_eq!(ta.get(0), Some(10.0));
+    }
+
+    #[test]
+    fn test_clone_data_view_copies_underlying_buffer() {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let mut cloner = StructuredCloner::new(memory_manager.clone());
+
+        let buffer = GcRef::new(JsArrayBuffer::new(8, None, memory_manager.clone()));
+        let dv = JsDataView::new(buffer, 1, Some(4)).unwrap();
+        let dv = GcRef::new(dv);
+        dv.set_uint8(0, 11).unwrap();
+        dv.set_uint8(1, 22).unwrap();
+
+        let cloned_val = cloner.clone(&Value::data_view(dv)).unwrap();
+        let cloned_dv = cloned_val.as_data_view().unwrap();
+
+        assert_eq!(cloned_dv.byte_offset(), 1);
+        assert_eq!(cloned_dv.byte_length(), 4);
+        assert_eq!(cloned_dv.get_uint8(0).unwrap(), 11);
+        assert_eq!(cloned_dv.get_uint8(1).unwrap(), 22);
+
+        cloned_dv.set_uint8(0, 99).unwrap();
+        assert_eq!(cloned_dv.get_uint8(0).unwrap(), 99);
+        assert_eq!(dv.get_uint8(0).unwrap(), 11);
     }
 }

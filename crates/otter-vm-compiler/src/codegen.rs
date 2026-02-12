@@ -3,7 +3,7 @@
 use otter_vm_bytecode::{
     ConstantIndex, ConstantPool, Function, Instruction, JumpOffset, Module, Register,
     UpvalueCapture,
-    function::{FunctionBuilder, FunctionFlags},
+    function::{FunctionBuilder, FunctionFlags, SourceMap},
     module::{ExportRecord, ImportRecord},
 };
 
@@ -146,6 +146,10 @@ pub struct FunctionContext {
     pub upvalues: Vec<UpvalueCapture>,
     /// Number of Inline Cache slots
     pub ic_count: u16,
+    /// Source offsets for each emitted instruction (parallel to `instructions`).
+    pub source_offsets: Vec<u32>,
+    /// Current source offset used for subsequent emitted instructions.
+    pub current_source_offset: u32,
     /// Local variable index holding the 'arguments' object (if created).
     /// Stored as a local (not a register) so it survives inner function calls.
     pub arguments_local: Option<u16>,
@@ -166,6 +170,8 @@ impl FunctionContext {
             param_count: 0,
             upvalues: Vec::new(),
             ic_count: 0,
+            source_offsets: Vec::new(),
+            current_source_offset: 0,
             arguments_local: None,
         }
     }
@@ -173,6 +179,7 @@ impl FunctionContext {
     /// Emit an instruction
     pub fn emit(&mut self, instruction: Instruction) {
         self.instructions.push(instruction);
+        self.source_offsets.push(self.current_source_offset);
     }
 
     /// Get current instruction index (for patching jumps)
@@ -195,7 +202,13 @@ impl FunctionContext {
     }
 
     /// Build the function
-    pub fn build(self) -> Function {
+    pub fn build(self, line_starts: &[u32]) -> Function {
+        let mut source_map = SourceMap::new();
+        for (instruction_index, source_offset) in self.source_offsets.iter().enumerate() {
+            let (line, column) = offset_to_line_column(*source_offset, line_starts);
+            source_map.add(instruction_index as u32, *source_offset, line, column);
+        }
+
         FunctionBuilder::new()
             .name(self.name.unwrap_or_default())
             .param_count(self.param_count)
@@ -206,8 +219,23 @@ impl FunctionContext {
             .upvalues(self.upvalues)
             .instructions(self.instructions)
             .feedback_vector_size(self.ic_count as usize)
+            .source_map(source_map)
             .build()
     }
+}
+
+fn offset_to_line_column(offset: u32, line_starts: &[u32]) -> (u32, u32) {
+    if line_starts.is_empty() {
+        return (1, offset.saturating_add(1));
+    }
+
+    let idx = line_starts.partition_point(|start| *start <= offset);
+    let line_index = idx.saturating_sub(1);
+    let line_start = line_starts[line_index];
+
+    let line = (line_index as u32).saturating_add(1);
+    let column = offset.saturating_sub(line_start).saturating_add(1);
+    (line, column)
 }
 
 /// Code generator state
@@ -228,6 +256,8 @@ pub struct CodeGen {
     is_esm: bool,
     /// Whether to run peephole optimization
     optimize: bool,
+    /// Start offsets for each source line (0-based byte offsets).
+    line_starts: Vec<u32>,
 }
 
 impl CodeGen {
@@ -242,6 +272,7 @@ impl CodeGen {
             exports: Vec::new(),
             is_esm: false,
             optimize: false,
+            line_starts: vec![0],
         }
     }
 
@@ -256,7 +287,23 @@ impl CodeGen {
             exports: Vec::new(),
             is_esm: false,
             optimize,
+            line_starts: vec![0],
         }
+    }
+
+    /// Set source line start offsets for source-map generation.
+    pub fn set_line_starts(&mut self, line_starts: Vec<u32>) {
+        self.line_starts = line_starts;
+    }
+
+    /// Set current source offset for subsequent emitted instructions.
+    pub fn set_current_source_offset(&mut self, source_offset: u32) {
+        self.current.current_source_offset = source_offset;
+    }
+
+    /// Get current source offset used by the active function context.
+    pub fn current_source_offset(&self) -> u32 {
+        self.current.current_source_offset
     }
 
     /// Enable or disable optimization
@@ -455,6 +502,82 @@ impl CodeGen {
         Some(ResolvedBinding::Global(name.to_string()))
     }
 
+    /// Resolve the `arguments` binding when regular lexical resolution falls back to global.
+    ///
+    /// For non-arrow functions, this lazily creates the local `arguments` object slot in the
+    /// current function and emits initialization bytecode.
+    ///
+    /// For arrow functions, this finds the nearest non-arrow parent function, lazily creates
+    /// its `arguments` slot (and initialization bytecode in that parent), then returns an
+    /// upvalue binding from the current function to that slot.
+    pub fn resolve_or_create_arguments_binding(&mut self) -> Option<ResolvedBinding> {
+        if !self.current.flags.is_arrow {
+            // Top-level "main" does not have an own `arguments` binding.
+            if self.func_stack.is_empty() {
+                return None;
+            }
+
+            let local_idx = if let Some(local_idx) = self.current.arguments_local {
+                local_idx
+            } else {
+                let local_idx = self.current.scopes.alloc_anonymous_local()?;
+                let tmp = self.alloc_reg();
+                self.emit(Instruction::CreateArguments { dst: tmp });
+                self.emit(Instruction::SetLocal {
+                    idx: otter_vm_bytecode::LocalIndex(local_idx),
+                    src: tmp,
+                });
+                self.free_reg(tmp);
+                self.current.arguments_local = Some(local_idx);
+                local_idx
+            };
+            return Some(ResolvedBinding::Local(local_idx));
+        }
+
+        for idx in (0..self.func_stack.len()).rev() {
+            // Skip synthetic top-level context (`main`): arrows at module/script top-level
+            // must not capture an implicit `arguments`.
+            if idx == 0 {
+                continue;
+            }
+
+            let parent_ctx = &mut self.func_stack[idx];
+            if parent_ctx.flags.is_arrow {
+                continue;
+            }
+
+            let local_idx = if let Some(local_idx) = parent_ctx.arguments_local {
+                local_idx
+            } else {
+                let local_idx = parent_ctx.scopes.alloc_anonymous_local()?;
+                let tmp = parent_ctx.registers.alloc();
+                parent_ctx
+                    .instructions
+                    .push(Instruction::CreateArguments { dst: tmp });
+                parent_ctx
+                    .source_offsets
+                    .push(parent_ctx.current_source_offset);
+                parent_ctx.instructions.push(Instruction::SetLocal {
+                    idx: otter_vm_bytecode::LocalIndex(local_idx),
+                    src: tmp,
+                });
+                parent_ctx
+                    .source_offsets
+                    .push(parent_ctx.current_source_offset);
+                parent_ctx.registers.free(tmp);
+                parent_ctx.arguments_local = Some(local_idx);
+                local_idx
+            };
+
+            return Some(ResolvedBinding::Upvalue {
+                index: local_idx,
+                depth: self.func_stack.len() - idx,
+            });
+        }
+
+        None
+    }
+
     /// Register an upvalue and return its index in the current function's upvalue array.
     ///
     /// This method handles both direct captures (depth=1) and transitive captures (depth>1).
@@ -565,7 +688,7 @@ impl CodeGen {
             self.func_stack.pop().expect("function stack underflow"),
         );
         let idx = self.functions.len() as u32;
-        self.functions.push(func.build());
+        self.functions.push(func.build(&self.line_starts));
         idx
     }
 
@@ -604,7 +727,7 @@ impl CodeGen {
     /// Finalize compilation
     pub fn finish(mut self, source_url: &str) -> Module {
         // Add main function at the end (don't shift child function indices!)
-        let main = self.current.build();
+        let main = self.current.build(&self.line_starts);
         let entry_point = self.functions.len() as u32;
         self.functions.push(main);
 

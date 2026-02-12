@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 otter-vm-bytecode = { path = "../otter-vm-bytecode" }
-oxc = "0.110"
+oxc = { version = "0.110", features = ["full"] }
 oxc_allocator = "0.110"
 oxc_parser = "0.110"
 oxc_ast = "0.110"

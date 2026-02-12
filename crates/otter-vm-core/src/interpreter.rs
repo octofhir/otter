@@ -13,11 +13,11 @@ use crate::object::{
     JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey, SetPropertyError,
     get_proto_epoch,
 };
-use crate::promise::{JsPromise, PromiseState};
+use crate::promise::{JsPromise, JsPromiseJob, JsPromiseJobKind, PromiseState};
 use crate::realm::RealmId;
 use crate::regexp::JsRegExp;
 use crate::string::JsString;
-use crate::value::{Closure, HeapRef, UpvalueCell, Value};
+use crate::value::{Closure, HeapRef, NativeFn, UpvalueCell, Value};
 
 use num_bigint::BigInt as NumBigInt;
 use num_traits::{One, ToPrimitive, Zero};
@@ -49,6 +49,107 @@ pub(crate) enum PreferredType {
 /// Maximum recursion depth for abstract equality comparison.
 /// Prevents stack overflow from malicious valueOf/toString chains.
 const MAX_ABSTRACT_EQUAL_DEPTH: usize = 128;
+
+fn trace_modified_register_indices(instruction: &Instruction) -> Vec<u16> {
+    match instruction {
+        Instruction::IteratorNext { dst, done, .. } => vec![dst.0, done.0],
+
+        Instruction::LoadUndefined { dst }
+        | Instruction::LoadNull { dst }
+        | Instruction::LoadTrue { dst }
+        | Instruction::LoadFalse { dst }
+        | Instruction::LoadInt8 { dst, .. }
+        | Instruction::LoadInt32 { dst, .. }
+        | Instruction::LoadConst { dst, .. }
+        | Instruction::GetLocal { dst, .. }
+        | Instruction::GetUpvalue { dst, .. }
+        | Instruction::GetGlobal { dst, .. }
+        | Instruction::LoadThis { dst }
+        | Instruction::Add { dst, .. }
+        | Instruction::Sub { dst, .. }
+        | Instruction::Mul { dst, .. }
+        | Instruction::Div { dst, .. }
+        | Instruction::AddI32 { dst, .. }
+        | Instruction::SubI32 { dst, .. }
+        | Instruction::MulI32 { dst, .. }
+        | Instruction::DivI32 { dst, .. }
+        | Instruction::AddF64 { dst, .. }
+        | Instruction::SubF64 { dst, .. }
+        | Instruction::MulF64 { dst, .. }
+        | Instruction::DivF64 { dst, .. }
+        | Instruction::Mod { dst, .. }
+        | Instruction::Pow { dst, .. }
+        | Instruction::Neg { dst, .. }
+        | Instruction::Inc { dst, .. }
+        | Instruction::Dec { dst, .. }
+        | Instruction::BitAnd { dst, .. }
+        | Instruction::BitOr { dst, .. }
+        | Instruction::BitXor { dst, .. }
+        | Instruction::BitNot { dst, .. }
+        | Instruction::Shl { dst, .. }
+        | Instruction::Shr { dst, .. }
+        | Instruction::Ushr { dst, .. }
+        | Instruction::Eq { dst, .. }
+        | Instruction::StrictEq { dst, .. }
+        | Instruction::Ne { dst, .. }
+        | Instruction::StrictNe { dst, .. }
+        | Instruction::Lt { dst, .. }
+        | Instruction::Le { dst, .. }
+        | Instruction::Gt { dst, .. }
+        | Instruction::Ge { dst, .. }
+        | Instruction::Not { dst, .. }
+        | Instruction::TypeOf { dst, .. }
+        | Instruction::TypeOfName { dst, .. }
+        | Instruction::InstanceOf { dst, .. }
+        | Instruction::In { dst, .. }
+        | Instruction::ToNumber { dst, .. }
+        | Instruction::ToString { dst, .. }
+        | Instruction::GetProp { dst, .. }
+        | Instruction::GetPropConst { dst, .. }
+        | Instruction::DeleteProp { dst, .. }
+        | Instruction::NewObject { dst }
+        | Instruction::NewArray { dst, .. }
+        | Instruction::GetElem { dst, .. }
+        | Instruction::Spread { dst, .. }
+        | Instruction::Closure { dst, .. }
+        | Instruction::Call { dst, .. }
+        | Instruction::CallMethod { dst, .. }
+        | Instruction::CreateArguments { dst }
+        | Instruction::CallEval { dst, .. }
+        | Instruction::CallWithReceiver { dst, .. }
+        | Instruction::CallMethodComputed { dst, .. }
+        | Instruction::Construct { dst, .. }
+        | Instruction::CallSpread { dst, .. }
+        | Instruction::ConstructSpread { dst, .. }
+        | Instruction::CallMethodComputedSpread { dst, .. }
+        | Instruction::Catch { dst }
+        | Instruction::GetIterator { dst, .. }
+        | Instruction::GetAsyncIterator { dst, .. }
+        | Instruction::ForInNext { dst, .. }
+        | Instruction::DefineClass { dst, .. }
+        | Instruction::GetSuper { dst }
+        | Instruction::CallSuper { dst, .. }
+        | Instruction::GetSuperProp { dst, .. }
+        | Instruction::CallSuperForward { dst }
+        | Instruction::Yield { dst, .. }
+        | Instruction::Await { dst, .. }
+        | Instruction::AsyncClosure { dst, .. }
+        | Instruction::GeneratorClosure { dst, .. }
+        | Instruction::AsyncGeneratorClosure { dst, .. }
+        | Instruction::Move { dst, .. }
+        | Instruction::Dup { dst, .. }
+        | Instruction::Import { dst, .. } => vec![dst.0],
+
+        _ => vec![],
+    }
+}
+
+fn trace_modified_registers(instruction: &Instruction, ctx: &VmContext) -> Vec<(u16, String)> {
+    trace_modified_register_indices(instruction)
+        .into_iter()
+        .map(|reg| (reg, format!("{:?}", ctx.get_register(reg))))
+        .collect()
+}
 
 impl Interpreter {
     /// Create a new interpreter
@@ -659,6 +760,16 @@ impl Interpreter {
             } else {
                 None
             };
+            let trace_capture_timing = ctx
+                .trace_state
+                .as_ref()
+                .map(|state| state.config.capture_timing)
+                .unwrap_or(false);
+            let trace_start_time = if trace_capture_timing {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
 
             let (func_idx, pc) = (frame.function_index, frame.pc);
 
@@ -685,7 +796,17 @@ impl Interpreter {
 
             // Record trace entry now that ctx is free (after execution, before state update)
             if let Some((pc, function_index, module, instruction)) = trace_data {
-                ctx.record_trace_entry(&instruction, pc, function_index, &module);
+                let modified_registers = trace_modified_registers(&instruction, ctx);
+                let execution_time_ns =
+                    trace_start_time.map(|start| start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                ctx.record_trace_entry(
+                    &instruction,
+                    pc,
+                    function_index,
+                    &module,
+                    modified_registers,
+                    execution_time_ns,
+                );
             }
 
             match instruction_result {
@@ -1065,6 +1186,16 @@ impl Interpreter {
             } else {
                 None
             };
+            let trace_capture_timing = ctx
+                .trace_state
+                .as_ref()
+                .map(|state| state.config.capture_timing)
+                .unwrap_or(false);
+            let trace_start_time = if trace_capture_timing {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
 
             // Execute the instruction
             let instruction_result = match self.execute_instruction(instruction, module_ref, ctx) {
@@ -1089,7 +1220,17 @@ impl Interpreter {
 
             // Record trace entry now that ctx is free (after execution, before state update)
             if let Some((pc, function_index, module, instruction)) = trace_data {
-                ctx.record_trace_entry(&instruction, pc, function_index, &module);
+                let modified_registers = trace_modified_registers(&instruction, ctx);
+                let execution_time_ns =
+                    trace_start_time.map(|start| start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                ctx.record_trace_entry(
+                    &instruction,
+                    pc,
+                    function_index,
+                    &module,
+                    modified_registers,
+                    execution_time_ns,
+                );
             }
 
             match instruction_result {
@@ -3865,100 +4006,15 @@ impl Interpreter {
                             _ => unreachable!(),
                         };
 
-                        // For async generators, wrap result in a Promise
+                        // For async generators, return a Promise that resolves after proper
+                        // resume (including awaited promises inside the generator body).
                         if generator.is_async() {
-                            let promise = JsPromise::new();
-                            let js_queue = ctx.js_job_queue();
-                            match gen_result {
-                                GeneratorResult::Yielded(v) => {
-                                    let iter_result = GcRef::new(JsObject::new(
-                                        Value::null(),
-                                        ctx.memory_manager().clone(),
-                                    ));
-                                    let _ = iter_result.set(PropertyKey::string("value"), v);
-                                    let _ = iter_result
-                                        .set(PropertyKey::string("done"), Value::boolean(false));
-                                    let js_queue = js_queue.clone();
-                                    JsPromise::resolve_with_js_jobs(
-                                        promise,
-                                        Value::object(iter_result),
-                                        move |job, args| {
-                                            if let Some(queue) = &js_queue {
-                                                queue.enqueue(job, args);
-                                            }
-                                        },
-                                    );
-                                }
-                                GeneratorResult::Returned(v) => {
-                                    let iter_result = GcRef::new(JsObject::new(
-                                        Value::null(),
-                                        ctx.memory_manager().clone(),
-                                    ));
-                                    let _ = iter_result.set(PropertyKey::string("value"), v);
-                                    let _ = iter_result
-                                        .set(PropertyKey::string("done"), Value::boolean(true));
-                                    let js_queue = js_queue.clone();
-                                    JsPromise::resolve_with_js_jobs(
-                                        promise,
-                                        Value::object(iter_result),
-                                        move |job, args| {
-                                            if let Some(queue) = &js_queue {
-                                                queue.enqueue(job, args);
-                                            }
-                                        },
-                                    );
-                                }
-                                GeneratorResult::Error(e) => {
-                                    let error_msg = e.to_string();
-                                    let js_queue = js_queue.clone();
-                                    JsPromise::reject_with_js_jobs(
-                                        promise,
-                                        Value::string(JsString::intern(&error_msg)),
-                                        move |job, args| {
-                                            if let Some(queue) = &js_queue {
-                                                queue.enqueue(job, args);
-                                            }
-                                        },
-                                    );
-                                }
-                                GeneratorResult::Suspended {
-                                    promise: awaited_promise,
-                                    resume_reg,
-                                    generator: suspended_gen,
-                                } => {
-                                    // Generator is awaiting a promise
-                                    // Chain onto the awaited promise and resume when it settles
-                                    let result_promise = promise.clone();
-                                    let mm = ctx.memory_manager().clone();
-                                    let js_queue = js_queue.clone();
-                                    awaited_promise.then(move |resolved_value| {
-                                        // When the awaited promise resolves, we would resume the generator
-                                        // For now, just resolve with the awaited value wrapped in an iterator result
-                                        // TODO: Properly resume async generator execution
-                                        let iter_result =
-                                            GcRef::new(JsObject::new(Value::null(), mm.clone()));
-                                        let _ = iter_result
-                                            .set(PropertyKey::string("value"), resolved_value);
-                                        let _ = iter_result.set(
-                                            PropertyKey::string("done"),
-                                            Value::boolean(false),
-                                        );
-                                        let js_queue = js_queue.clone();
-                                        JsPromise::resolve_with_js_jobs(
-                                            result_promise,
-                                            Value::object(iter_result),
-                                            move |job, args| {
-                                                if let Some(queue) = &js_queue {
-                                                    queue.enqueue(job, args);
-                                                }
-                                            },
-                                        );
-                                    });
-                                    // Store the resume_reg and generator for later use
-                                    let _ = (resume_reg, suspended_gen);
-                                }
-                            }
-                            ctx.set_register(dst.0, Value::promise(promise));
+                            let promise_value = async_generator_result_to_promise_value(
+                                gen_result,
+                                ctx.memory_manager().clone(),
+                                ctx.js_job_queue(),
+                            );
+                            ctx.set_register(dst.0, promise_value);
                             return Ok(InstructionResult::Continue);
                         }
 
@@ -6479,93 +6535,13 @@ impl Interpreter {
                             _ => unreachable!(),
                         };
 
-                        // For async generators, wrap result in a Promise
                         if generator.is_async() {
-                            let promise = JsPromise::new();
-                            let js_queue = ctx.js_job_queue();
-                            match gen_result {
-                                GeneratorResult::Yielded(v) => {
-                                    let iter_result = GcRef::new(JsObject::new(
-                                        Value::null(),
-                                        ctx.memory_manager().clone(),
-                                    ));
-                                    let _ = iter_result.set(PropertyKey::string("value"), v);
-                                    let _ = iter_result
-                                        .set(PropertyKey::string("done"), Value::boolean(false));
-                                    let js_queue = js_queue.clone();
-                                    JsPromise::resolve_with_js_jobs(
-                                        promise,
-                                        Value::object(iter_result),
-                                        move |job, args| {
-                                            if let Some(queue) = &js_queue {
-                                                queue.enqueue(job, args);
-                                            }
-                                        },
-                                    );
-                                }
-                                GeneratorResult::Returned(v) => {
-                                    let iter_result = GcRef::new(JsObject::new(
-                                        Value::null(),
-                                        ctx.memory_manager().clone(),
-                                    ));
-                                    let _ = iter_result.set(PropertyKey::string("value"), v);
-                                    let _ = iter_result
-                                        .set(PropertyKey::string("done"), Value::boolean(true));
-                                    let js_queue = js_queue.clone();
-                                    JsPromise::resolve_with_js_jobs(
-                                        promise,
-                                        Value::object(iter_result),
-                                        move |job, args| {
-                                            if let Some(queue) = &js_queue {
-                                                queue.enqueue(job, args);
-                                            }
-                                        },
-                                    );
-                                }
-                                GeneratorResult::Error(e) => {
-                                    let error_msg = e.to_string();
-                                    let js_queue = js_queue.clone();
-                                    JsPromise::reject_with_js_jobs(
-                                        promise,
-                                        Value::string(JsString::intern(&error_msg)),
-                                        move |job, args| {
-                                            if let Some(queue) = &js_queue {
-                                                queue.enqueue(job, args);
-                                            }
-                                        },
-                                    );
-                                }
-                                GeneratorResult::Suspended {
-                                    promise: awaited_promise,
-                                    ..
-                                } => {
-                                    // Generator is awaiting a promise
-                                    let result_promise = promise.clone();
-                                    let mm = ctx.memory_manager().clone();
-                                    let js_queue = js_queue.clone();
-                                    awaited_promise.then(move |resolved_value| {
-                                        let iter_result =
-                                            GcRef::new(JsObject::new(Value::null(), mm.clone()));
-                                        let _ = iter_result
-                                            .set(PropertyKey::string("value"), resolved_value);
-                                        let _ = iter_result.set(
-                                            PropertyKey::string("done"),
-                                            Value::boolean(false),
-                                        );
-                                        let js_queue = js_queue.clone();
-                                        JsPromise::resolve_with_js_jobs(
-                                            result_promise,
-                                            Value::object(iter_result),
-                                            move |job, args| {
-                                                if let Some(queue) = &js_queue {
-                                                    queue.enqueue(job, args);
-                                                }
-                                            },
-                                        );
-                                    });
-                                }
-                            }
-                            ctx.set_register(dst.0, Value::promise(promise));
+                            let promise_value = async_generator_result_to_promise_value(
+                                gen_result,
+                                ctx.memory_manager().clone(),
+                                ctx.js_job_queue(),
+                            );
+                            ctx.set_register(dst.0, promise_value);
                             return Ok(InstructionResult::Continue);
                         }
 
@@ -6824,7 +6800,7 @@ impl Interpreter {
             Instruction::Nop => Ok(InstructionResult::Continue),
 
             Instruction::Debugger => {
-                // TODO: Implement debugger hook
+                ctx.trigger_debugger_hook();
                 Ok(InstructionResult::Continue)
             }
 
@@ -9605,10 +9581,29 @@ impl Interpreter {
                 );
             }
 
-            // TODO: Get line and column from source map if available
-            // For now, just set placeholder values
-            let _ = frame_obj.set(PropertyKey::string("line"), Value::number(0.0));
-            let _ = frame_obj.set(PropertyKey::string("column"), Value::number(0.0));
+            // Resolve source location from function source map if present.
+            // `frame.pc` can point at the next instruction, so also try `pc - 1`.
+            if let Some(func) = frame.module.functions.get(frame.function_index as usize) {
+                let entry = func
+                    .source_map
+                    .as_ref()
+                    .and_then(|map| {
+                        map.find(frame.pc as u32).or_else(|| {
+                            frame
+                                .pc
+                                .checked_sub(1)
+                                .and_then(|prev_pc| map.find(prev_pc as u32))
+                        })
+                    });
+
+                if let Some(loc) = entry {
+                    let _ = frame_obj.set(PropertyKey::string("line"), Value::number(loc.line as f64));
+                    let _ = frame_obj.set(
+                        PropertyKey::string("column"),
+                        Value::number(loc.column as f64),
+                    );
+                }
+            }
 
             let _ = frames_array.set(PropertyKey::Index(i as u32), Value::object(frame_obj));
         }
@@ -9649,6 +9644,140 @@ pub enum GeneratorResult {
         /// The generator (for resumption)
         generator: GcRef<JsGenerator>,
     },
+}
+
+fn make_iterator_result_object(
+    memory_manager: Arc<crate::memory::MemoryManager>,
+    value: Value,
+    done: bool,
+) -> Value {
+    let iter_result = GcRef::new(JsObject::new(Value::null(), memory_manager));
+    let _ = iter_result.set(PropertyKey::string("value"), value);
+    let _ = iter_result.set(PropertyKey::string("done"), Value::boolean(done));
+    Value::object(iter_result)
+}
+
+fn make_async_generator_resume_callback(
+    generator: GcRef<JsGenerator>,
+    is_rejection: bool,
+    memory_manager: Arc<crate::memory::MemoryManager>,
+) -> Value {
+    let native: NativeFn = Arc::new(move |_this, args, ncx| {
+        let input = args.first().cloned().unwrap_or_else(Value::undefined);
+        let gen_result = if is_rejection {
+            generator.set_pending_throw(input);
+            ncx.execute_generator(generator, None)
+        } else {
+            ncx.execute_generator(generator, Some(input))
+        };
+        Ok(async_generator_result_to_promise_value(
+            gen_result,
+            ncx.memory_manager().clone(),
+            ncx.js_job_queue(),
+        ))
+    });
+    Value::native_function_from_decl("__asyncGeneratorResume", native, 1, memory_manager)
+}
+
+fn async_generator_result_to_promise_value(
+    gen_result: GeneratorResult,
+    memory_manager: Arc<crate::memory::MemoryManager>,
+    js_queue: Option<Arc<dyn crate::context::JsJobQueueTrait + Send + Sync>>,
+) -> Value {
+    let promise = JsPromise::new();
+
+    match gen_result {
+        GeneratorResult::Yielded(v) => {
+            let iter_result = make_iterator_result_object(memory_manager, v, false);
+            if let Some(queue) = js_queue.clone() {
+                JsPromise::resolve_with_js_jobs(promise, iter_result, move |job, args| {
+                    queue.enqueue(job, args);
+                });
+            } else {
+                promise.resolve(iter_result);
+            }
+        }
+        GeneratorResult::Returned(v) => {
+            let iter_result = make_iterator_result_object(memory_manager, v, true);
+            if let Some(queue) = js_queue.clone() {
+                JsPromise::resolve_with_js_jobs(promise, iter_result, move |job, args| {
+                    queue.enqueue(job, args);
+                });
+            } else {
+                promise.resolve(iter_result);
+            }
+        }
+        GeneratorResult::Error(e) => {
+            let error_value = Value::string(JsString::intern(&e.to_string()));
+            if let Some(queue) = js_queue.clone() {
+                JsPromise::reject_with_js_jobs(promise, error_value, move |job, args| {
+                    queue.enqueue(job, args);
+                });
+            } else {
+                promise.reject(error_value);
+            }
+        }
+        GeneratorResult::Suspended {
+            promise: awaited_promise,
+            generator,
+            ..
+        } => {
+            if let Some(queue) = js_queue.clone() {
+                let fulfill_callback = make_async_generator_resume_callback(
+                    generator,
+                    false,
+                    memory_manager.clone(),
+                );
+                let reject_callback = make_async_generator_resume_callback(
+                    generator,
+                    true,
+                    memory_manager.clone(),
+                );
+
+                let result_promise = promise.clone();
+                let queue_on_fulfill = queue.clone();
+                awaited_promise.then(move |resolved_value| {
+                    queue_on_fulfill.enqueue(
+                        JsPromiseJob {
+                            kind: JsPromiseJobKind::Fulfill,
+                            callback: fulfill_callback.clone(),
+                            this_arg: Value::undefined(),
+                            result_promise: Some(result_promise.clone()),
+                        },
+                        vec![resolved_value],
+                    );
+                });
+
+                let result_promise = promise.clone();
+                let queue_on_reject = queue.clone();
+                awaited_promise.catch(move |reason| {
+                    queue_on_reject.enqueue(
+                        JsPromiseJob {
+                            kind: JsPromiseJobKind::Reject,
+                            callback: reject_callback.clone(),
+                            this_arg: Value::undefined(),
+                            result_promise: Some(result_promise.clone()),
+                        },
+                        vec![reason],
+                    );
+                });
+            } else {
+                // Fallback for contexts without JS job queue: preserve old best-effort behavior.
+                let result_promise = promise.clone();
+                let mm = memory_manager.clone();
+                awaited_promise.then(move |resolved_value| {
+                    let iter_result = make_iterator_result_object(mm, resolved_value, false);
+                    result_promise.resolve(iter_result);
+                });
+                let result_promise = promise.clone();
+                awaited_promise.catch(move |reason| {
+                    result_promise.reject(reason);
+                });
+            }
+        }
+    }
+
+    Value::promise(promise)
 }
 
 impl Interpreter {
@@ -10024,6 +10153,16 @@ impl Interpreter {
             } else {
                 None
             };
+            let trace_capture_timing = ctx
+                .trace_state
+                .as_ref()
+                .map(|state| state.config.capture_timing)
+                .unwrap_or(false);
+            let trace_start_time = if trace_capture_timing {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
 
             // Execute instruction
             let instruction_result = match self.execute_instruction(instruction, module_ref, ctx) {
@@ -10050,7 +10189,17 @@ impl Interpreter {
 
             // Record trace entry now that ctx is free (after execution, before state update)
             if let Some((pc, function_index, module, instruction)) = trace_data {
-                ctx.record_trace_entry(&instruction, pc, function_index, &module);
+                let modified_registers = trace_modified_registers(&instruction, ctx);
+                let execution_time_ns =
+                    trace_start_time.map(|start| start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                ctx.record_trace_entry(
+                    &instruction,
+                    pc,
+                    function_index,
+                    &module,
+                    modified_registers,
+                    execution_time_ns,
+                );
             }
 
             match instruction_result {
@@ -10389,6 +10538,124 @@ mod tests {
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         assert_eq!(result.as_int32(), Some(42));
+    }
+
+    #[test]
+    fn test_debugger_instruction_triggers_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut builder = Module::builder("test.js");
+        let func = Function::builder()
+            .name("main")
+            .instruction(Instruction::Debugger)
+            .instruction(Instruction::ReturnUndefined)
+            .build();
+        builder.add_function(func);
+        let module = builder.build();
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls_clone = Arc::clone(&hook_calls);
+
+        let mut ctx = create_test_context();
+        ctx.set_debugger_hook(Some(Arc::new(move |_| {
+            hook_calls_clone.fetch_add(1, Ordering::SeqCst);
+        })));
+
+        let mut interpreter = Interpreter::new();
+        let result = interpreter.execute(&module, &mut ctx).unwrap();
+        assert!(result.is_undefined());
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_trace_records_modified_registers() {
+        let mut builder = Module::builder("test.js");
+        let func = Function::builder()
+            .name("main")
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(0),
+                value: 42,
+            })
+            .instruction(Instruction::ReturnUndefined)
+            .build();
+        builder.add_function(func);
+        let module = builder.build();
+
+        let mut ctx = create_test_context();
+        ctx.set_trace_config(crate::trace::TraceConfig {
+            enabled: true,
+            mode: crate::trace::TraceMode::RingBuffer,
+            ring_buffer_size: 16,
+            output_path: None,
+            filter: None,
+            capture_timing: false,
+        });
+
+        let mut interpreter = Interpreter::new();
+        let _ = interpreter.execute(&module, &mut ctx).unwrap();
+
+        let entries: Vec<_> = ctx
+            .get_trace_buffer()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        let load_entry = entries
+            .iter()
+            .find(|entry| entry.opcode == "LoadInt32")
+            .expect("expected LoadInt32 in trace");
+
+        assert!(!load_entry.modified_registers.is_empty());
+        assert_eq!(load_entry.modified_registers[0].0, 0);
+        assert!(load_entry.modified_registers[0].1.contains("42"));
+    }
+
+    #[test]
+    fn test_trace_records_execution_timing_when_enabled() {
+        let mut builder = Module::builder("test.js");
+        let func = Function::builder()
+            .name("main")
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(0),
+                value: 1,
+            })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: 2,
+            })
+            .instruction(Instruction::Add {
+                dst: Register(2),
+                lhs: Register(0),
+                rhs: Register(1),
+                feedback_index: 0,
+            })
+            .instruction(Instruction::Return { src: Register(2) })
+            .build();
+        builder.add_function(func);
+        let module = builder.build();
+
+        let mut ctx = create_test_context();
+        ctx.set_trace_config(crate::trace::TraceConfig {
+            enabled: true,
+            mode: crate::trace::TraceMode::RingBuffer,
+            ring_buffer_size: 16,
+            output_path: None,
+            filter: None,
+            capture_timing: true,
+        });
+
+        let mut interpreter = Interpreter::new();
+        let _ = interpreter.execute(&module, &mut ctx).unwrap();
+
+        let entries: Vec<_> = ctx
+            .get_trace_buffer()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+
+        assert!(!entries.is_empty());
+        assert!(entries.iter().all(|entry| entry.execution_time_ns.is_some()));
     }
 
     #[test]

@@ -428,6 +428,8 @@ pub struct VmContext {
     scope_markers: Vec<usize>,
     /// Optional debug snapshot target for watchdogs
     debug_snapshot: Option<Arc<Mutex<VmContextSnapshot>>>,
+    /// Optional debugger statement hook (`debugger;`).
+    debugger_hook: Option<Arc<dyn Fn(&VmContext) + Send + Sync>>,
     /// Intrinsic `%Function.prototype%` (ES2023 §10.3.1).
     /// Set during context creation from VmRuntime so that the
     /// interpreter can assign it as [[Prototype]] on closures
@@ -601,6 +603,7 @@ impl VmContext {
             root_slots: Vec::new(),
             scope_markers: Vec::new(),
             debug_snapshot: None,
+            debugger_hook: None,
             function_prototype_intrinsic: None,
             generator_prototype_intrinsic: None,
             async_generator_prototype_intrinsic: None,
@@ -761,6 +764,21 @@ impl VmContext {
             .map(|snapshot| snapshot.lock().clone())
     }
 
+    /// Attach a callback for `debugger;` statements.
+    pub fn set_debugger_hook(
+        &mut self,
+        hook: Option<Arc<dyn Fn(&VmContext) + Send + Sync>>,
+    ) {
+        self.debugger_hook = hook;
+    }
+
+    /// Invoke the debugger hook if present.
+    pub fn trigger_debugger_hook(&self) {
+        if let Some(hook) = &self.debugger_hook {
+            hook(self);
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────────
     // Trace management
     // ─────────────────────────────────────────────────────────────────────────────
@@ -786,6 +804,8 @@ impl VmContext {
         pc: usize,
         function_index: u32,
         module: &std::sync::Arc<otter_vm_bytecode::Module>,
+        modified_registers: Vec<(u16, String)>,
+        execution_time_ns: Option<u64>,
     ) {
         let Some(trace_state) = &mut self.trace_state else {
             return;
@@ -809,8 +829,8 @@ impl VmContext {
                 .unwrap_or("Unknown")
                 .to_string(),
             operands,
-            modified_registers: vec![], // TODO: Track register modifications
-            execution_time_ns: None,    // TODO: Add timing support
+            modified_registers,
+            execution_time_ns,
         };
 
         // Check filter

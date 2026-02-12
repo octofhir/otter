@@ -714,13 +714,21 @@ fn setup_builtin_constructors(
                             let source = args.get(0).ok_or_else(|| {
                                 VmError::type_error("TypedArray.from requires a source argument")
                             })?;
+                            let map_fn = args.get(1).cloned().unwrap_or(Value::undefined());
+                            let this_arg = args.get(2).cloned().unwrap_or(Value::undefined());
+                            let has_map = !map_fn.is_undefined();
+                            if has_map && !map_fn.is_callable() {
+                                return Err(VmError::type_error(
+                                    "TypedArray.from: mapFn is not a function",
+                                ));
+                            }
 
                             // Get length of source
                             let length = if let Some(obj) = source.as_object() {
                                 obj.get(&PropertyKey::string("length"))
-                                    .and_then(|v| v.as_int32())
-                                    .unwrap_or(0)
-                                    .max(0) as usize
+                                    .and_then(|v| v.as_number())
+                                    .unwrap_or(0.0)
+                                    .max(0.0) as usize
                             } else {
                                 0
                             };
@@ -739,13 +747,15 @@ fn setup_builtin_constructors(
                                 .map_err(|e| VmError::type_error(e))?;
 
                             // Copy elements (with optional mapping)
-                            let map_fn = args.get(1);
                             if let Some(obj) = source.as_object() {
                                 for i in 0..length {
                                     if let Some(val) = obj.get(&PropertyKey::Index(i as u32)) {
-                                        let final_val = if let Some(_map_fn_val) = map_fn {
-                                            // TODO: Call mapFn(val, i)
-                                            val
+                                        let final_val = if has_map {
+                                            ncx.call_function(
+                                                &map_fn,
+                                                this_arg.clone(),
+                                                &[val, Value::number(i as f64)],
+                                            )?
                                         } else {
                                             val
                                         };
@@ -1480,13 +1490,27 @@ fn to_js_string(value: &Value) -> GcRef<JsString> {
     JsString::intern(&to_string(value))
 }
 
-// TODO: Tests need to be updated to use NativeContext instead of Arc<MemoryManager>
-// This requires creating a proper NativeContext in test setup, which is more involved.
-// Commenting out for now until NativeContext test helpers are available.
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type GlobalFn = fn(
+        &Value,
+        &[Value],
+        &mut crate::context::NativeContext<'_>,
+    ) -> Result<Value, VmError>;
+
+    fn call_global(fn_impl: GlobalFn, args: &[Value]) -> Result<Value, VmError> {
+        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let fn_proto = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        setup_global_object(global, fn_proto, None);
+
+        let mut ctx = crate::context::VmContext::new(global, memory_manager);
+        let interpreter = crate::interpreter::Interpreter::new();
+        let mut ncx = crate::context::NativeContext::new(&mut ctx, &interpreter);
+        fn_impl(&Value::undefined(), args, &mut ncx)
+    }
 
     #[test]
     fn test_global_this_setup() {
@@ -1504,20 +1528,17 @@ mod tests {
         assert!(gt.is_object());
     }
 
-    // TODO: Re-enable these tests after creating NativeContext test helpers
-    /*
     #[test]
     fn test_is_finite() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // Finite numbers
         assert_eq!(
-            global_is_finite(&Value::undefined(), &[Value::number(42.0)], memory_manager.clone())
+            call_global(global_is_finite, &[Value::number(42.0)])
                 .unwrap()
                 .as_boolean(),
             Some(true)
         );
         assert_eq!(
-            global_is_finite(&Value::undefined(), &[Value::number(0.0)], memory_manager.clone())
+            call_global(global_is_finite, &[Value::number(0.0)])
                 .unwrap()
                 .as_boolean(),
             Some(true)
@@ -1525,19 +1546,19 @@ mod tests {
 
         // Non-finite
         assert_eq!(
-            global_is_finite(&Value::undefined(), &[Value::number(f64::INFINITY)], memory_manager.clone())
+            call_global(global_is_finite, &[Value::number(f64::INFINITY)])
                 .unwrap()
                 .as_boolean(),
             Some(false)
         );
         assert_eq!(
-            global_is_finite(&Value::undefined(), &[Value::number(f64::NEG_INFINITY)], memory_manager.clone())
+            call_global(global_is_finite, &[Value::number(f64::NEG_INFINITY)])
                 .unwrap()
                 .as_boolean(),
             Some(false)
         );
         assert_eq!(
-            global_is_finite(&Value::undefined(), &[Value::number(f64::NAN)], memory_manager.clone())
+            call_global(global_is_finite, &[Value::number(f64::NAN)])
                 .unwrap()
                 .as_boolean(),
             Some(false)
@@ -1546,21 +1567,20 @@ mod tests {
 
     #[test]
     fn test_is_nan() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         assert_eq!(
-            global_is_nan(&Value::undefined(), &[Value::number(f64::NAN)], memory_manager.clone())
+            call_global(global_is_nan, &[Value::number(f64::NAN)])
                 .unwrap()
                 .as_boolean(),
             Some(true)
         );
         assert_eq!(
-            global_is_nan(&Value::undefined(), &[Value::number(42.0)], memory_manager.clone())
+            call_global(global_is_nan, &[Value::number(42.0)])
                 .unwrap()
                 .as_boolean(),
             Some(false)
         );
         assert_eq!(
-            global_is_nan(&Value::undefined(), &[Value::undefined()], memory_manager.clone())
+            call_global(global_is_nan, &[Value::undefined()])
                 .unwrap()
                 .as_boolean(),
             Some(true)
@@ -1569,34 +1589,21 @@ mod tests {
 
     #[test]
     fn test_parse_int() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // Basic integers
         assert_eq!(
-            global_parse_int(
-                &Value::undefined(),
-                &[Value::string(JsString::intern("42"))],
-                memory_manager.clone()
-            )
+            call_global(global_parse_int, &[Value::string(JsString::intern("42"))])
             .unwrap()
             .as_number(),
             Some(42.0)
         );
         assert_eq!(
-            global_parse_int(
-                &Value::undefined(),
-                &[Value::string(JsString::intern("-123"))],
-                memory_manager.clone()
-            )
+            call_global(global_parse_int, &[Value::string(JsString::intern("-123"))])
             .unwrap()
             .as_number(),
             Some(-123.0)
         );
         assert_eq!(
-            global_parse_int(
-                &Value::undefined(),
-                &[Value::string(JsString::intern("+456"))],
-                memory_manager.clone()
-            )
+            call_global(global_parse_int, &[Value::string(JsString::intern("+456"))])
             .unwrap()
             .as_number(),
             Some(456.0)
@@ -1604,20 +1611,18 @@ mod tests {
 
         // With radix
         assert_eq!(
-            global_parse_int(
-                &Value::undefined(),
+            call_global(
+                global_parse_int,
                 &[Value::string(JsString::intern("ff")), Value::number(16.0)],
-                memory_manager.clone()
             )
             .unwrap()
             .as_number(),
             Some(255.0)
         );
         assert_eq!(
-            global_parse_int(
-                &Value::undefined(),
+            call_global(
+                global_parse_int,
                 &[Value::string(JsString::intern("1010")), Value::number(2.0)],
-                memory_manager.clone()
             )
             .unwrap()
             .as_number(),
@@ -1626,11 +1631,7 @@ mod tests {
 
         // Hex prefix
         assert_eq!(
-            global_parse_int(
-                &Value::undefined(),
-                &[Value::string(JsString::intern("0xFF"))],
-                memory_manager.clone()
-            )
+            call_global(global_parse_int, &[Value::string(JsString::intern("0xFF"))])
             .unwrap()
             .as_number(),
             Some(255.0)
@@ -1638,66 +1639,41 @@ mod tests {
 
         // Stops at invalid char
         assert_eq!(
-            global_parse_int(
-                &Value::undefined(),
-                &[Value::string(JsString::intern("123abc"))],
-                memory_manager.clone()
-            )
+            call_global(global_parse_int, &[Value::string(JsString::intern("123abc"))])
             .unwrap()
             .as_number(),
             Some(123.0)
         );
 
         // Invalid - returns NaN
-        let result = global_parse_int(
-            &Value::undefined(),
-            &[Value::string(JsString::intern("hello"))],
-            memory_manager.clone(),
-        )
-        .unwrap();
+        let result = call_global(global_parse_int, &[Value::string(JsString::intern("hello"))])
+            .unwrap();
         assert!(result.is_nan());
         assert!(result.as_number().unwrap().is_nan());
     }
 
     #[test]
     fn test_parse_float() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         assert_eq!(
-            global_parse_float(
-                &Value::undefined(),
-                &[Value::string(JsString::intern("3.5"))],
-                memory_manager.clone()
-            )
+            call_global(global_parse_float, &[Value::string(JsString::intern("3.5"))])
             .unwrap()
             .as_number(),
             Some(3.5)
         );
         assert_eq!(
-            global_parse_float(
-                &Value::undefined(),
-                &[Value::string(JsString::intern("-2.5"))],
-                memory_manager.clone()
-            )
+            call_global(global_parse_float, &[Value::string(JsString::intern("-2.5"))])
             .unwrap()
             .as_number(),
             Some(-2.5)
         );
         assert_eq!(
-            global_parse_float(
-                &Value::undefined(),
-                &[Value::string(JsString::intern("  42  "))],
-                memory_manager.clone()
-            )
+            call_global(global_parse_float, &[Value::string(JsString::intern("  42  "))])
             .unwrap()
             .as_number(),
             Some(42.0)
         );
         assert_eq!(
-            global_parse_float(
-                &Value::undefined(),
-                &[Value::string(JsString::intern("Infinity"))],
-                memory_manager.clone()
-            )
+            call_global(global_parse_float, &[Value::string(JsString::intern("Infinity"))])
             .unwrap()
             .as_number(),
             Some(f64::INFINITY)
@@ -1706,19 +1682,16 @@ mod tests {
 
     #[test]
     fn test_encode_uri_component() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let result = global_encode_uri_component(
-            &Value::undefined(),
+        let result = call_global(
+            global_encode_uri_component,
             &[Value::string(JsString::intern("hello world"))],
-            memory_manager.clone(),
         )
         .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "hello%20world");
 
-        let result = global_encode_uri_component(
-            &Value::undefined(),
+        let result = call_global(
+            global_encode_uri_component,
             &[Value::string(JsString::intern("a=1&b=2"))],
-            memory_manager.clone(),
         )
         .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "a%3D1%26b%3D2");
@@ -1726,19 +1699,16 @@ mod tests {
 
     #[test]
     fn test_decode_uri_component() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let result = global_decode_uri_component(
-            &Value::undefined(),
+        let result = call_global(
+            global_decode_uri_component,
             &[Value::string(JsString::intern("hello%20world"))],
-            memory_manager.clone(),
         )
         .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "hello world");
 
-        let result = global_decode_uri_component(
-            &Value::undefined(),
+        let result = call_global(
+            global_decode_uri_component,
             &[Value::string(JsString::intern("a%3D1%26b%3D2"))],
-            memory_manager.clone(),
         )
         .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "a=1&b=2");
@@ -1746,14 +1716,10 @@ mod tests {
 
     #[test]
     fn test_encode_uri() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // encodeURI does not encode reserved characters
-        let result = global_encode_uri(
-            &Value::undefined(),
-            &[Value::string(JsString::intern(
-                "http://example.com/path?q=1",
-            ))],
-            memory_manager.clone(),
+        let result = call_global(
+            global_encode_uri,
+            &[Value::string(JsString::intern("http://example.com/path?q=1"))],
         )
         .unwrap();
         assert_eq!(
@@ -1762,52 +1728,37 @@ mod tests {
         );
 
         // But does encode other special chars
-        let result = global_encode_uri(
-            &Value::undefined(),
-            &[Value::string(JsString::intern("hello world"))],
-            memory_manager.clone(),
-        )
-        .unwrap();
+        let result = call_global(global_encode_uri, &[Value::string(JsString::intern("hello world"))])
+            .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "hello%20world");
     }
 
     #[test]
     fn test_decode_uri() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let result = global_decode_uri(
-            &Value::undefined(),
-            &[Value::string(JsString::intern("hello%20world"))],
-            memory_manager.clone(),
-        )
-        .unwrap();
+        let result =
+            call_global(global_decode_uri, &[Value::string(JsString::intern("hello%20world"))])
+                .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "hello world");
     }
 
     #[test]
     fn test_eval_non_string() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // eval with non-string returns the value unchanged
         assert_eq!(
-            global_eval(&Value::undefined(), &[Value::number(42.0)], memory_manager.clone())
+            call_global(global_eval, &[Value::number(42.0)])
                 .unwrap()
                 .as_number(),
             Some(42.0)
         );
-        assert!(global_eval(&Value::undefined(), &[Value::undefined()], memory_manager.clone())
+        assert!(call_global(global_eval, &[Value::undefined()])
             .unwrap()
             .is_undefined());
     }
 
     #[test]
     fn test_eval_string() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
         // eval with string is not supported
-        let result = global_eval(
-            &Value::undefined(),
-            &[Value::string(JsString::intern("1 + 1"))],
-            memory_manager.clone(),
-        );
+        let result = call_global(global_eval, &[Value::string(JsString::intern("1 + 1"))]);
         assert!(result.is_err());
     }
-    */
 }

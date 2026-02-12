@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/otter-vm-bytecode",
     "crates/otter-vm-core",
+    "crates/otter-vm-jit",
     "crates/otter-vm-compiler",
     "crates/otter-vm-gc",
     "crates/otter-vm-runtime",

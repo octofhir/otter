@@ -13,7 +13,11 @@ fn typed_array_from_applies_mapfn_with_index() {
         "#,
     );
 
-    assert!(result.is_ok(), "eval_sync should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "eval_sync should succeed: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -32,7 +36,11 @@ fn typed_array_from_uses_this_arg_for_mapfn() {
         "#,
     );
 
-    assert!(result.is_ok(), "eval_sync should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "eval_sync should succeed: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -50,5 +58,9 @@ fn typed_array_from_rejects_non_callable_mapfn() {
         "#,
     );
 
-    assert!(result.is_ok(), "eval_sync should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "eval_sync should succeed: {:?}",
+        result.err()
+    );
 }

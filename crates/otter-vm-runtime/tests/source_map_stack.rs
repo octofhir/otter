@@ -32,5 +32,9 @@ fn error_stack_frames_include_line_and_column_from_source_map() {
         "#,
     );
 
-    assert!(result.is_ok(), "eval_sync should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "eval_sync should succeed: {:?}",
+        result.err()
+    );
 }

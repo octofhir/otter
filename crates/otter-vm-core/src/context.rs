@@ -765,10 +765,7 @@ impl VmContext {
     }
 
     /// Attach a callback for `debugger;` statements.
-    pub fn set_debugger_hook(
-        &mut self,
-        hook: Option<Arc<dyn Fn(&VmContext) + Send + Sync>>,
-    ) {
+    pub fn set_debugger_hook(&mut self, hook: Option<Arc<dyn Fn(&VmContext) + Send + Sync>>) {
         self.debugger_hook = hook;
     }
 

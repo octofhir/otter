@@ -33,7 +33,11 @@ fn async_generator_resumes_after_await_fulfillment() {
         "#,
     );
 
-    assert!(result.is_ok(), "eval_sync should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "eval_sync should succeed: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -70,5 +74,9 @@ fn async_generator_resumes_after_await_rejection() {
         "#,
     );
 
-    assert!(result.is_ok(), "eval_sync should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "eval_sync should succeed: {:?}",
+        result.err()
+    );
 }

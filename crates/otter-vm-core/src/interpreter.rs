@@ -187,7 +187,16 @@ impl Interpreter {
             .ok_or_else(|| VmError::internal("no entry function"))?;
 
         // Record the function call for hot function detection
-        let _ = entry_func.record_call();
+        let became_hot = entry_func.record_call();
+        if became_hot {
+            #[cfg(feature = "jit")]
+            {
+                crate::jit_queue::enqueue_hot_function(&module, module.entry_point, entry_func);
+                crate::jit_runtime::compile_one_pending_request();
+            }
+            #[cfg(not(feature = "jit"))]
+            let _ = became_hot;
+        }
 
         // Top-level scripts should have globalThis as `this`.
         ctx.set_pending_this(Value::object(ctx.global()));
@@ -282,7 +291,16 @@ impl Interpreter {
         };
 
         // Record the function call for hot function detection
-        let _ = entry_func.record_call();
+        let became_hot = entry_func.record_call();
+        if became_hot {
+            #[cfg(feature = "jit")]
+            {
+                crate::jit_queue::enqueue_hot_function(&module, module.entry_point, entry_func);
+                crate::jit_runtime::compile_one_pending_request();
+            }
+            #[cfg(not(feature = "jit"))]
+            let _ = became_hot;
+        }
 
         // Top-level scripts should have globalThis as `this`.
         ctx.set_pending_this(Value::object(ctx.global()));
@@ -567,13 +585,13 @@ impl Interpreter {
                     // Record the function call for hot function detection
                     let became_hot = func.record_call();
                     if became_hot {
-                        // JIT trigger hook: function just became hot
-                        // In Phase 3, this will trigger JIT compilation
                         #[cfg(feature = "jit")]
                         {
-                            // TODO: Queue function for JIT compilation
+                            crate::jit_queue::enqueue_hot_function(&module, func_index, func);
+                            crate::jit_runtime::compile_one_pending_request();
                         }
-                        let _ = became_hot; // Silence unused warning when jit feature is off
+                        #[cfg(not(feature = "jit"))]
+                        let _ = became_hot;
                     }
 
                     let local_count = func.local_count;
@@ -797,8 +815,8 @@ impl Interpreter {
             // Record trace entry now that ctx is free (after execution, before state update)
             if let Some((pc, function_index, module, instruction)) = trace_data {
                 let modified_registers = trace_modified_registers(&instruction, ctx);
-                let execution_time_ns =
-                    trace_start_time.map(|start| start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                let execution_time_ns = trace_start_time
+                    .map(|start| start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
                 ctx.record_trace_entry(
                     &instruction,
                     pc,
@@ -1221,8 +1239,8 @@ impl Interpreter {
             // Record trace entry now that ctx is free (after execution, before state update)
             if let Some((pc, function_index, module, instruction)) = trace_data {
                 let modified_registers = trace_modified_registers(&instruction, ctx);
-                let execution_time_ns =
-                    trace_start_time.map(|start| start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                let execution_time_ns = trace_start_time
+                    .map(|start| start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
                 ctx.record_trace_entry(
                     &instruction,
                     pc,
@@ -8043,13 +8061,13 @@ impl Interpreter {
                     // Record the function call for hot function detection
                     let became_hot = func.record_call();
                     if became_hot {
-                        // JIT trigger hook: function just became hot
-                        // In Phase 3, this will trigger JIT compilation
                         #[cfg(feature = "jit")]
                         {
-                            // TODO: Queue function for JIT compilation
+                            crate::jit_queue::enqueue_hot_function(&module, func_index, func);
+                            crate::jit_runtime::compile_one_pending_request();
                         }
-                        let _ = became_hot; // Silence unused warning when jit feature is off
+                        #[cfg(not(feature = "jit"))]
+                        let _ = became_hot;
                     }
 
                     let local_count = func.local_count;
@@ -9584,20 +9602,18 @@ impl Interpreter {
             // Resolve source location from function source map if present.
             // `frame.pc` can point at the next instruction, so also try `pc - 1`.
             if let Some(func) = frame.module.functions.get(frame.function_index as usize) {
-                let entry = func
-                    .source_map
-                    .as_ref()
-                    .and_then(|map| {
-                        map.find(frame.pc as u32).or_else(|| {
-                            frame
-                                .pc
-                                .checked_sub(1)
-                                .and_then(|prev_pc| map.find(prev_pc as u32))
-                        })
-                    });
+                let entry = func.source_map.as_ref().and_then(|map| {
+                    map.find(frame.pc as u32).or_else(|| {
+                        frame
+                            .pc
+                            .checked_sub(1)
+                            .and_then(|prev_pc| map.find(prev_pc as u32))
+                    })
+                });
 
                 if let Some(loc) = entry {
-                    let _ = frame_obj.set(PropertyKey::string("line"), Value::number(loc.line as f64));
+                    let _ =
+                        frame_obj.set(PropertyKey::string("line"), Value::number(loc.line as f64));
                     let _ = frame_obj.set(
                         PropertyKey::string("column"),
                         Value::number(loc.column as f64),
@@ -9723,16 +9739,10 @@ fn async_generator_result_to_promise_value(
             ..
         } => {
             if let Some(queue) = js_queue.clone() {
-                let fulfill_callback = make_async_generator_resume_callback(
-                    generator,
-                    false,
-                    memory_manager.clone(),
-                );
-                let reject_callback = make_async_generator_resume_callback(
-                    generator,
-                    true,
-                    memory_manager.clone(),
-                );
+                let fulfill_callback =
+                    make_async_generator_resume_callback(generator, false, memory_manager.clone());
+                let reject_callback =
+                    make_async_generator_resume_callback(generator, true, memory_manager.clone());
 
                 let result_promise = promise.clone();
                 let queue_on_fulfill = queue.clone();
@@ -10190,8 +10200,8 @@ impl Interpreter {
             // Record trace entry now that ctx is free (after execution, before state update)
             if let Some((pc, function_index, module, instruction)) = trace_data {
                 let modified_registers = trace_modified_registers(&instruction, ctx);
-                let execution_time_ns =
-                    trace_start_time.map(|start| start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                let execution_time_ns = trace_start_time
+                    .map(|start| start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
                 ctx.record_trace_entry(
                     &instruction,
                     pc,
@@ -10594,12 +10604,7 @@ mod tests {
         let mut interpreter = Interpreter::new();
         let _ = interpreter.execute(&module, &mut ctx).unwrap();
 
-        let entries: Vec<_> = ctx
-            .get_trace_buffer()
-            .unwrap()
-            .iter()
-            .cloned()
-            .collect();
+        let entries: Vec<_> = ctx.get_trace_buffer().unwrap().iter().cloned().collect();
         let load_entry = entries
             .iter()
             .find(|entry| entry.opcode == "LoadInt32")
@@ -10647,15 +10652,14 @@ mod tests {
         let mut interpreter = Interpreter::new();
         let _ = interpreter.execute(&module, &mut ctx).unwrap();
 
-        let entries: Vec<_> = ctx
-            .get_trace_buffer()
-            .unwrap()
-            .iter()
-            .cloned()
-            .collect();
+        let entries: Vec<_> = ctx.get_trace_buffer().unwrap().iter().cloned().collect();
 
         assert!(!entries.is_empty());
-        assert!(entries.iter().all(|entry| entry.execution_time_ns.is_some()));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.execution_time_ns.is_some())
+        );
     }
 
     #[test]

@@ -32,6 +32,10 @@ pub mod globals;
 pub mod interpreter;
 pub mod intrinsics;
 pub mod intrinsics_impl;
+#[cfg(feature = "jit")]
+mod jit_queue;
+#[cfg(feature = "jit")]
+mod jit_runtime;
 pub mod map_data;
 pub mod memory;
 pub mod object;

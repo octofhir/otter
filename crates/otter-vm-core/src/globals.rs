@@ -1494,11 +1494,8 @@ fn to_js_string(value: &Value) -> GcRef<JsString> {
 mod tests {
     use super::*;
 
-    type GlobalFn = fn(
-        &Value,
-        &[Value],
-        &mut crate::context::NativeContext<'_>,
-    ) -> Result<Value, VmError>;
+    type GlobalFn =
+        fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>;
 
     fn call_global(fn_impl: GlobalFn, args: &[Value]) -> Result<Value, VmError> {
         let memory_manager = Arc::new(crate::memory::MemoryManager::test());
@@ -1592,20 +1589,20 @@ mod tests {
         // Basic integers
         assert_eq!(
             call_global(global_parse_int, &[Value::string(JsString::intern("42"))])
-            .unwrap()
-            .as_number(),
+                .unwrap()
+                .as_number(),
             Some(42.0)
         );
         assert_eq!(
             call_global(global_parse_int, &[Value::string(JsString::intern("-123"))])
-            .unwrap()
-            .as_number(),
+                .unwrap()
+                .as_number(),
             Some(-123.0)
         );
         assert_eq!(
             call_global(global_parse_int, &[Value::string(JsString::intern("+456"))])
-            .unwrap()
-            .as_number(),
+                .unwrap()
+                .as_number(),
             Some(456.0)
         );
 
@@ -1632,22 +1629,28 @@ mod tests {
         // Hex prefix
         assert_eq!(
             call_global(global_parse_int, &[Value::string(JsString::intern("0xFF"))])
-            .unwrap()
-            .as_number(),
+                .unwrap()
+                .as_number(),
             Some(255.0)
         );
 
         // Stops at invalid char
         assert_eq!(
-            call_global(global_parse_int, &[Value::string(JsString::intern("123abc"))])
+            call_global(
+                global_parse_int,
+                &[Value::string(JsString::intern("123abc"))]
+            )
             .unwrap()
             .as_number(),
             Some(123.0)
         );
 
         // Invalid - returns NaN
-        let result = call_global(global_parse_int, &[Value::string(JsString::intern("hello"))])
-            .unwrap();
+        let result = call_global(
+            global_parse_int,
+            &[Value::string(JsString::intern("hello"))],
+        )
+        .unwrap();
         assert!(result.is_nan());
         assert!(result.as_number().unwrap().is_nan());
     }
@@ -1655,25 +1658,37 @@ mod tests {
     #[test]
     fn test_parse_float() {
         assert_eq!(
-            call_global(global_parse_float, &[Value::string(JsString::intern("3.5"))])
+            call_global(
+                global_parse_float,
+                &[Value::string(JsString::intern("3.5"))]
+            )
             .unwrap()
             .as_number(),
             Some(3.5)
         );
         assert_eq!(
-            call_global(global_parse_float, &[Value::string(JsString::intern("-2.5"))])
+            call_global(
+                global_parse_float,
+                &[Value::string(JsString::intern("-2.5"))]
+            )
             .unwrap()
             .as_number(),
             Some(-2.5)
         );
         assert_eq!(
-            call_global(global_parse_float, &[Value::string(JsString::intern("  42  "))])
+            call_global(
+                global_parse_float,
+                &[Value::string(JsString::intern("  42  "))]
+            )
             .unwrap()
             .as_number(),
             Some(42.0)
         );
         assert_eq!(
-            call_global(global_parse_float, &[Value::string(JsString::intern("Infinity"))])
+            call_global(
+                global_parse_float,
+                &[Value::string(JsString::intern("Infinity"))]
+            )
             .unwrap()
             .as_number(),
             Some(f64::INFINITY)
@@ -1719,7 +1734,9 @@ mod tests {
         // encodeURI does not encode reserved characters
         let result = call_global(
             global_encode_uri,
-            &[Value::string(JsString::intern("http://example.com/path?q=1"))],
+            &[Value::string(JsString::intern(
+                "http://example.com/path?q=1",
+            ))],
         )
         .unwrap();
         assert_eq!(
@@ -1728,16 +1745,21 @@ mod tests {
         );
 
         // But does encode other special chars
-        let result = call_global(global_encode_uri, &[Value::string(JsString::intern("hello world"))])
-            .unwrap();
+        let result = call_global(
+            global_encode_uri,
+            &[Value::string(JsString::intern("hello world"))],
+        )
+        .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "hello%20world");
     }
 
     #[test]
     fn test_decode_uri() {
-        let result =
-            call_global(global_decode_uri, &[Value::string(JsString::intern("hello%20world"))])
-                .unwrap();
+        let result = call_global(
+            global_decode_uri,
+            &[Value::string(JsString::intern("hello%20world"))],
+        )
+        .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "hello world");
     }
 
@@ -1750,9 +1772,11 @@ mod tests {
                 .as_number(),
             Some(42.0)
         );
-        assert!(call_global(global_eval, &[Value::undefined()])
-            .unwrap()
-            .is_undefined());
+        assert!(
+            call_global(global_eval, &[Value::undefined()])
+                .unwrap()
+                .is_undefined()
+        );
     }
 
     #[test]

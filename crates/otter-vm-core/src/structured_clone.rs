@@ -11,8 +11,8 @@
 
 use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyKey};
-use crate::{JsDataView, JsTypedArray};
 use crate::value::{HeapRef, Value};
+use crate::{JsDataView, JsTypedArray};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -222,12 +222,18 @@ impl StructuredCloner {
 
         let src_buffer = ta.buffer();
         let buffer_len = src_buffer.byte_length();
-        let new_buffer = src_buffer
-            .slice(0, buffer_len)
-            .ok_or(StructuredCloneError::DataCloneError("ArrayBuffer is detached"))?;
+        let new_buffer =
+            src_buffer
+                .slice(0, buffer_len)
+                .ok_or(StructuredCloneError::DataCloneError(
+                    "ArrayBuffer is detached",
+                ))?;
         let new_buffer = GcRef::new(new_buffer);
 
-        let new_obj = GcRef::new(JsObject::new(ta.object.prototype(), self.memory_manager.clone()));
+        let new_obj = GcRef::new(JsObject::new(
+            ta.object.prototype(),
+            self.memory_manager.clone(),
+        ));
         let new_ta = JsTypedArray::new(
             new_obj,
             new_buffer,
@@ -255,9 +261,12 @@ impl StructuredCloner {
 
         let src_buffer = dv.buffer();
         let buffer_len = src_buffer.byte_length();
-        let new_buffer = src_buffer
-            .slice(0, buffer_len)
-            .ok_or(StructuredCloneError::DataCloneError("ArrayBuffer is detached"))?;
+        let new_buffer =
+            src_buffer
+                .slice(0, buffer_len)
+                .ok_or(StructuredCloneError::DataCloneError(
+                    "ArrayBuffer is detached",
+                ))?;
         let new_buffer = GcRef::new(new_buffer);
 
         let new_dv = JsDataView::new(new_buffer, dv.byte_offset(), Some(dv.byte_length()))

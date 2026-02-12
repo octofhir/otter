@@ -305,7 +305,8 @@ impl Compiler {
 
         let mut normalized_source = source.to_string();
         if source_type.is_typescript() || source_type.is_jsx() {
-            normalized_source = Self::pre_transform_source(&normalized_source, source_url, source_type)?;
+            normalized_source =
+                Self::pre_transform_source(&normalized_source, source_url, source_type)?;
             source_type = source_type
                 .with_typescript(false)
                 .with_typescript_definition(false)
@@ -3179,7 +3180,8 @@ impl Compiler {
                                 });
                                 kr
                             } else {
-                                if let Some(key_name) = Self::non_computed_property_key_name(&p.name)
+                                if let Some(key_name) =
+                                    Self::non_computed_property_key_name(&p.name)
                                 {
                                     let key_idx = self.codegen.add_string(&key_name);
                                     let ic_index = self.codegen.alloc_ic();
@@ -4697,11 +4699,9 @@ impl Compiler {
             Expression::PrivateFieldExpression(field_expr) => {
                 self.compile_private_field_expression(field_expr)
             }
-            Expression::JSXElement(_) | Expression::JSXFragment(_) => {
-                Err(CompileError::internal(
-                    "JSX expression escaped pre-transform pipeline",
-                ))
-            }
+            Expression::JSXElement(_) | Expression::JSXFragment(_) => Err(CompileError::internal(
+                "JSX expression escaped pre-transform pipeline",
+            )),
             Expression::V8IntrinsicExpression(intrinsic) => {
                 self.compile_v8_intrinsic_expression(intrinsic)
             }
@@ -6336,28 +6336,27 @@ impl Compiler {
                 self.codegen.free_reg(obj);
                 val
             }
-            AssignmentTarget::TSAsExpression(ts) => self.compile_assignment_expression_on_expression_target(
-                op,
-                is_compound,
-                rhs_val,
-                &ts.expression,
-            )?,
-            AssignmentTarget::TSSatisfiesExpression(ts) => {
-                self.compile_assignment_expression_on_expression_target(
+            AssignmentTarget::TSAsExpression(ts) => self
+                .compile_assignment_expression_on_expression_target(
                     op,
                     is_compound,
                     rhs_val,
                     &ts.expression,
-                )?
-            }
-            AssignmentTarget::TSNonNullExpression(ts) => {
-                self.compile_assignment_expression_on_expression_target(
+                )?,
+            AssignmentTarget::TSSatisfiesExpression(ts) => self
+                .compile_assignment_expression_on_expression_target(
                     op,
                     is_compound,
                     rhs_val,
                     &ts.expression,
-                )?
-            }
+                )?,
+            AssignmentTarget::TSNonNullExpression(ts) => self
+                .compile_assignment_expression_on_expression_target(
+                    op,
+                    is_compound,
+                    rhs_val,
+                    &ts.expression,
+                )?,
             AssignmentTarget::TSTypeAssertion(ts) => self
                 .compile_assignment_expression_on_expression_target(
                     op,
@@ -6486,12 +6485,13 @@ impl Compiler {
                     rhs_val,
                     &paren.expression,
                 ),
-            Expression::TSAsExpression(ts) => self.compile_assignment_expression_on_expression_target(
-                op,
-                is_compound,
-                rhs_val,
-                &ts.expression,
-            ),
+            Expression::TSAsExpression(ts) => self
+                .compile_assignment_expression_on_expression_target(
+                    op,
+                    is_compound,
+                    rhs_val,
+                    &ts.expression,
+                ),
             Expression::TSSatisfiesExpression(ts) => self
                 .compile_assignment_expression_on_expression_target(
                     op,
@@ -6499,12 +6499,13 @@ impl Compiler {
                     rhs_val,
                     &ts.expression,
                 ),
-            Expression::TSNonNullExpression(ts) => self.compile_assignment_expression_on_expression_target(
-                op,
-                is_compound,
-                rhs_val,
-                &ts.expression,
-            ),
+            Expression::TSNonNullExpression(ts) => self
+                .compile_assignment_expression_on_expression_target(
+                    op,
+                    is_compound,
+                    rhs_val,
+                    &ts.expression,
+                ),
             Expression::TSTypeAssertion(ts) => self
                 .compile_assignment_expression_on_expression_target(
                     op,
@@ -6823,17 +6824,14 @@ impl Compiler {
                 self.codegen.free_reg(obj);
                 Ok(dst)
             }
-            AssignmentTarget::TSAsExpression(ts) => {
-                self.compile_logical_assignment_on_expression_target(op, &assign.right, &ts.expression)
-            }
+            AssignmentTarget::TSAsExpression(ts) => self
+                .compile_logical_assignment_on_expression_target(op, &assign.right, &ts.expression),
             AssignmentTarget::TSSatisfiesExpression(ts) => self
                 .compile_logical_assignment_on_expression_target(op, &assign.right, &ts.expression),
-            AssignmentTarget::TSNonNullExpression(ts) => {
-                self.compile_logical_assignment_on_expression_target(op, &assign.right, &ts.expression)
-            }
-            AssignmentTarget::TSTypeAssertion(ts) => {
-                self.compile_logical_assignment_on_expression_target(op, &assign.right, &ts.expression)
-            }
+            AssignmentTarget::TSNonNullExpression(ts) => self
+                .compile_logical_assignment_on_expression_target(op, &assign.right, &ts.expression),
+            AssignmentTarget::TSTypeAssertion(ts) => self
+                .compile_logical_assignment_on_expression_target(op, &assign.right, &ts.expression),
             _ => Err(CompileError::InvalidAssignmentTarget),
         }
     }
@@ -6998,14 +6996,14 @@ impl Compiler {
                 self.codegen.free_reg(obj);
                 Ok(dst)
             }
-            Expression::ParenthesizedExpression(paren) => {
-                self.compile_logical_assignment_on_expression_target(op, rhs_expr, &paren.expression)
-            }
+            Expression::ParenthesizedExpression(paren) => self
+                .compile_logical_assignment_on_expression_target(op, rhs_expr, &paren.expression),
             Expression::TSAsExpression(ts) => {
                 self.compile_logical_assignment_on_expression_target(op, rhs_expr, &ts.expression)
             }
-            Expression::TSSatisfiesExpression(ts) => self
-                .compile_logical_assignment_on_expression_target(op, rhs_expr, &ts.expression),
+            Expression::TSSatisfiesExpression(ts) => {
+                self.compile_logical_assignment_on_expression_target(op, rhs_expr, &ts.expression)
+            }
             Expression::TSNonNullExpression(ts) => {
                 self.compile_logical_assignment_on_expression_target(op, rhs_expr, &ts.expression)
             }
@@ -7668,13 +7666,12 @@ impl Compiler {
             SimpleAssignmentTarget::PrivateFieldExpression(field_expr) => {
                 self.compile_update_private_field(field_expr, update.operator, update.prefix)
             }
-            SimpleAssignmentTarget::TSAsExpression(ts) => {
-                self.compile_update_expression_on_expression_target(
+            SimpleAssignmentTarget::TSAsExpression(ts) => self
+                .compile_update_expression_on_expression_target(
                     &ts.expression,
                     update.operator,
                     update.prefix,
-                )
-            }
+                ),
             SimpleAssignmentTarget::TSSatisfiesExpression(ts) => self
                 .compile_update_expression_on_expression_target(
                     &ts.expression,
@@ -7715,24 +7712,26 @@ impl Compiler {
             Expression::PrivateFieldExpression(field_expr) => {
                 self.compile_update_private_field(field_expr, operator, prefix)
             }
-            Expression::ParenthesizedExpression(paren) => {
-                self.compile_update_expression_on_expression_target(
+            Expression::ParenthesizedExpression(paren) => self
+                .compile_update_expression_on_expression_target(
                     &paren.expression,
                     operator,
                     prefix,
-                )
-            }
-            Expression::TSAsExpression(ts) => {
-                self.compile_update_expression_on_expression_target(&ts.expression, operator, prefix)
-            }
+                ),
+            Expression::TSAsExpression(ts) => self.compile_update_expression_on_expression_target(
+                &ts.expression,
+                operator,
+                prefix,
+            ),
             Expression::TSSatisfiesExpression(ts) => self
                 .compile_update_expression_on_expression_target(&ts.expression, operator, prefix),
-            Expression::TSNonNullExpression(ts) => {
-                self.compile_update_expression_on_expression_target(&ts.expression, operator, prefix)
-            }
-            Expression::TSTypeAssertion(ts) => {
-                self.compile_update_expression_on_expression_target(&ts.expression, operator, prefix)
-            }
+            Expression::TSNonNullExpression(ts) => self
+                .compile_update_expression_on_expression_target(&ts.expression, operator, prefix),
+            Expression::TSTypeAssertion(ts) => self.compile_update_expression_on_expression_target(
+                &ts.expression,
+                operator,
+                prefix,
+            ),
             _ => Err(CompileError::InvalidAssignmentTarget),
         }
     }
@@ -8287,7 +8286,9 @@ impl Compiler {
                 if let Some(expr) = other.as_expression() {
                     self.compile_expression(expr)
                 } else {
-                    Err(CompileError::internal("Non-expression property key variant"))
+                    Err(CompileError::internal(
+                        "Non-expression property key variant",
+                    ))
                 }
             }
         }
@@ -8860,7 +8861,11 @@ mod tests {
     fn test_compile_logical_assignment_computed_member() {
         let compiler = Compiler::new();
         let module = compiler
-            .compile("let o = { k: 0 }; let k = 'k'; o[k] ||= 1;", "test.js", false)
+            .compile(
+                "let o = { k: 0 }; let k = 'k'; o[k] ||= 1;",
+                "test.js",
+                false,
+            )
             .unwrap();
 
         assert_eq!(module.functions.len(), 1);
@@ -8932,7 +8937,11 @@ mod tests {
     fn test_compile_optional_chaining_private_field_expression() {
         let compiler = Compiler::new();
         let module = compiler
-            .compile("class C { #x = 1; m(o) { return o?.#x; } }", "test.js", false)
+            .compile(
+                "class C { #x = 1; m(o) { return o?.#x; } }",
+                "test.js",
+                false,
+            )
             .unwrap();
 
         assert!(module.functions.len() >= 2);
@@ -8942,7 +8951,11 @@ mod tests {
     fn test_compile_private_in_expression() {
         let compiler = Compiler::new();
         let module = compiler
-            .compile("class C { #x = 1; has(o) { return #x in o; } }", "test.js", false)
+            .compile(
+                "class C { #x = 1; has(o) { return #x in o; } }",
+                "test.js",
+                false,
+            )
             .unwrap();
 
         assert!(module.functions.len() >= 2);
@@ -9174,9 +9187,10 @@ mod tests {
 
         for func in &module.functions {
             assert!(
-                !func.instructions.iter().any(
-                    |i| matches!(i, otter_vm_bytecode::Instruction::CreateArguments { .. })
-                ),
+                !func
+                    .instructions
+                    .iter()
+                    .any(|i| matches!(i, otter_vm_bytecode::Instruction::CreateArguments { .. })),
                 "top-level + arrow should not synthesize arguments in any function context"
             );
         }
@@ -9238,7 +9252,10 @@ mod tests {
             .source_map
             .as_ref()
             .expect("main function should contain source map");
-        assert!(!map.entries.is_empty(), "source map entries should not be empty");
+        assert!(
+            !map.entries.is_empty(),
+            "source map entries should not be empty"
+        );
 
         let first = map.entries.first().unwrap();
         assert!(first.line >= 1);
@@ -9462,16 +9479,22 @@ mod tests {
                     if is_const(name.0, "__dynamicImport")
             )
         }));
-        assert!(main.instructions.iter().any(
-            |instr| matches!(instr, otter_vm_bytecode::Instruction::Call { argc: 2, .. })
-        ));
+        assert!(
+            main.instructions
+                .iter()
+                .any(|instr| matches!(instr, otter_vm_bytecode::Instruction::Call { argc: 2, .. }))
+        );
     }
 
     #[test]
     fn test_compile_dynamic_import_with_options() {
         let compiler = Compiler::new();
         let module = compiler
-            .compile("import('./dep.js', { with: { type: 'json' } });", "test.js", false)
+            .compile(
+                "import('./dep.js', { with: { type: 'json' } });",
+                "test.js",
+                false,
+            )
             .unwrap();
 
         assert_eq!(module.functions.len(), 1);
@@ -9665,11 +9688,7 @@ mod tests {
     fn test_compile_ts_import_equals_declaration() {
         let compiler = Compiler::new();
         let module = compiler
-            .compile(
-                "import fs = require('fs'); const x = 1;",
-                "test.ts",
-                false,
-            )
+            .compile("import fs = require('fs'); const x = 1;", "test.ts", false)
             .unwrap();
 
         assert_eq!(module.functions.len(), 1);

@@ -12,6 +12,7 @@ use otter_engine::{CapabilitiesBuilder, EngineBuilder, NodeApiProfile, PropertyK
 
 mod commands;
 mod config;
+mod watch;
 
 #[derive(Parser)]
 #[command(
@@ -28,9 +29,13 @@ struct Cli {
     #[arg(value_name = "FILE")]
     file: Option<PathBuf>,
 
-    /// Evaluate argument as a script
+    /// Evaluate argument as a script (silent, use -p to print result)
     #[arg(short = 'e', long = "eval")]
     eval: Option<String>,
+
+    /// Evaluate argument as a script and print the result
+    #[arg(short = 'p', long = "print")]
+    print: Option<String>,
 
     /// Verbose output
     #[arg(short, long, global = true)]
@@ -140,6 +145,10 @@ enum Commands {
         /// Filter tests by name pattern
         #[arg(long, short = 'f')]
         filter: Option<String>,
+
+        /// Watch for changes and re-run tests
+        #[arg(long, short = 'w')]
+        watch: bool,
     },
     /// Type check without running
     Check {
@@ -206,9 +215,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Handle --eval flag
+    // Handle --print flag (evaluate and print result)
+    if let Some(ref code) = cli.print {
+        return run_code(code, "<eval>", &cli, true).await;
+    }
+
+    // Handle --eval flag (evaluate silently, only console.log produces output)
     if let Some(ref code) = cli.eval {
-        return run_code(code, "<eval>", &cli).await;
+        return run_code(code, "<eval>", &cli, false).await;
     }
 
     // Handle direct file argument (otter script.js)
@@ -219,7 +233,7 @@ async fn main() -> Result<()> {
     match &cli.command {
         Some(Commands::Run { file }) => run_file(file, &cli).await,
         Some(Commands::Repl) => run_repl(&cli).await,
-        Some(Commands::Test { paths, filter }) => run_tests(paths, filter.as_deref(), &cli).await,
+        Some(Commands::Test { paths, filter, watch }) => run_tests(paths, filter.as_deref(), *watch, &cli).await,
         Some(Commands::Check { files }) => {
             // Type checking stub - tsgo integration pending
             println!("Type checking: {:?}", files);
@@ -345,11 +359,11 @@ async fn run_file(path: &PathBuf, cli: &Cli) -> Result<()> {
     let abs_path = std::fs::canonicalize(path)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(path));
     let source_url = abs_path.to_string_lossy();
-    run_code(&source, &source_url, cli).await
+    run_code(&source, &source_url, cli, false).await
 }
 
 /// Run JavaScript code using EngineBuilder
-async fn run_code(source: &str, source_url: &str, cli: &Cli) -> Result<()> {
+async fn run_code(source: &str, source_url: &str, cli: &Cli, print_result: bool) -> Result<()> {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
@@ -432,8 +446,8 @@ async fn run_code(source: &str, source_url: &str, cli: &Cli) -> Result<()> {
 
     match result {
         Ok(value) => {
-            // Print result if it's not undefined
-            if !value.is_undefined() {
+            // Print result only when explicitly requested (e.g., -p flag or REPL)
+            if print_result {
                 println!("{}", format_value(&value));
             }
 
@@ -655,7 +669,15 @@ fn print_repl_help() {
 }
 
 /// Run test files
-async fn run_tests(paths: &[PathBuf], filter: Option<&str>, cli: &Cli) -> Result<()> {
+async fn run_tests(paths: &[PathBuf], filter: Option<&str>, watch: bool, cli: &Cli) -> Result<()> {
+    if watch {
+        run_tests_watch(paths, filter, cli).await
+    } else {
+        run_tests_once(paths, filter, cli).await
+    }
+}
+
+async fn run_tests_once(paths: &[PathBuf], filter: Option<&str>, cli: &Cli) -> Result<()> {
     let test_files = find_test_files(paths)?;
 
     if test_files.is_empty() {
@@ -695,6 +717,80 @@ async fn run_tests(paths: &[PathBuf], filter: Option<&str>, cli: &Cli) -> Result
     }
 
     Ok(())
+}
+
+async fn run_tests_watch(paths: &[PathBuf], filter: Option<&str>, cli: &Cli) -> Result<()> {
+    use crate::watch::{FileWatcher, WatchConfig, WatchEvent};
+    use std::io::Write;
+
+    println!("Watch mode enabled. Watching for changes...\n");
+
+    let watch_config = WatchConfig {
+        debounce_ms: 200,
+        extensions: vec![
+            "ts".to_string(),
+            "tsx".to_string(),
+            "js".to_string(),
+            "jsx".to_string(),
+        ],
+        ignore_dirs: vec![
+            "node_modules".to_string(),
+            ".git".to_string(),
+            "dist".to_string(),
+            "build".to_string(),
+            ".otter".to_string(),
+        ],
+        clear_console: true,
+    };
+
+    let mut watcher = FileWatcher::new(watch_config);
+
+    // Watch all provided paths
+    for path in paths {
+        if path.is_dir() {
+            watcher.watch(path).map_err(|e| anyhow::anyhow!(e))?;
+        } else if let Some(parent) = path.parent() {
+            watcher.watch(parent).map_err(|e| anyhow::anyhow!(e))?;
+        }
+    }
+
+    // Run tests initially
+    let _ = run_tests_once(paths, filter, cli).await;
+
+    println!("\n👀 Watching for changes... (Press Ctrl+C to exit)");
+
+    // Watch loop - poll for events
+    loop {
+        // Check for events without blocking
+        if let Some(event) = watcher.try_recv() {
+            match event {
+                WatchEvent::FilesChanged(changed_paths) => {
+                    // Clear console
+                    print!("\x1b[2J\x1b[1;1H");
+                    std::io::stdout().flush().unwrap();
+
+                    println!("🔄 Changes detected:");
+                    for path in &changed_paths {
+                        if let Some(name) = path.file_name() {
+                            println!("  - {}", name.to_string_lossy());
+                        }
+                    }
+                    println!();
+
+                    // Re-run tests
+                    let _ = run_tests_once(paths, filter, cli).await;
+
+                    println!("\n👀 Watching for changes... (Press Ctrl+C to exit)");
+                }
+                WatchEvent::Error(err) => {
+                    eprintln!("❌ Watch error: {}", err);
+                }
+            }
+        }
+
+        // Sleep to avoid busy-waiting
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
 }
 
 fn find_test_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -789,103 +885,73 @@ async fn run_test_file(
         });
     }
 
-    // Inject test framework
-    let filter_json = match filter {
-        Some(f) => format!("\"{}\"", f),
-        None => "null".to_string(),
+    // Build filter pattern for test.run()
+    let filter_opt = match filter {
+        Some(f) => format!("{{ testNamePattern: \"{}\" }}", f.replace('\\', "\\\\").replace('"', "\\\"")),
+        None => "{}".to_string(),
     };
 
+    // Use absolute path for dynamic import
+    let abs_test_path = std::fs::canonicalize(path)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(path));
+    let test_file_url = abs_test_path.to_string_lossy();
+
+    // Test harness that uses node:test module
     let test_harness = format!(
-        r#"
-globalThis.__otter_tests = [];
-globalThis.__otter_results = {{ passed: 0, failed: 0, skipped: 0 }};
-globalThis.__otter_filter = {filter_json};
+        r#"import test from 'node:test';
 
-globalThis.describe = function(name, fn) {{
-    fn();
-}};
+// Make test API globally available for test files that don't import it
+globalThis.test = test;
+globalThis.describe = test.describe;
+globalThis.it = test.it;
+globalThis.before = test.before;
+globalThis.after = test.after;
+globalThis.beforeEach = test.beforeEach;
+globalThis.afterEach = test.afterEach;
 
-globalThis.it = globalThis.test = function(name, fn) {{
-    const filter = globalThis.__otter_filter;
-    if (filter && !name.includes(filter)) {{
-        globalThis.__otter_results.skipped++;
-        return;
-    }}
-    globalThis.__otter_tests.push({{ name, fn }});
-}};
+// Import and execute the test file (registers tests)
+await import("{test_file_url}");
 
-globalThis.expect = function(actual) {{
-    return {{
-        toBe: function(expected) {{
-            if (actual !== expected) {{
-                throw new Error("Expected " + JSON.stringify(expected) + " but got " + JSON.stringify(actual));
-            }}
-        }},
-        toEqual: function(expected) {{
-            if (JSON.stringify(actual) !== JSON.stringify(expected)) {{
-                throw new Error("Expected " + JSON.stringify(expected) + " but got " + JSON.stringify(actual));
-            }}
-        }},
-        toBeTruthy: function() {{
-            if (!actual) {{
-                throw new Error("Expected truthy but got " + JSON.stringify(actual));
-            }}
-        }},
-        toBeFalsy: function() {{
-            if (actual) {{
-                throw new Error("Expected falsy but got " + JSON.stringify(actual));
-            }}
-        }},
-        toThrow: function(message) {{
-            let threw = false;
-            try {{
-                if (typeof actual === 'function') actual();
-            }} catch (e) {{
-                threw = true;
-                if (message && !e.message.includes(message)) {{
-                    throw new Error("Expected error containing '" + message + "' but got '" + e.message + "'");
-                }}
-            }}
-            if (!threw) {{
-                throw new Error("Expected function to throw");
-            }}
-        }},
-        not: {{
-            toBe: function(expected) {{
-                if (actual === expected) {{
-                    throw new Error("Expected not to be " + JSON.stringify(expected));
-                }}
-            }},
-            toEqual: function(expected) {{
-                if (JSON.stringify(actual) === JSON.stringify(expected)) {{
-                    throw new Error("Expected not to equal " + JSON.stringify(expected));
-                }}
-            }},
-        }}
-    }};
-}};
+// Run collected tests and collect results via event stream
+const __otter_results = {{ passed: 0, failed: 0, skipped: 0, todo: 0, failures: [] }};
 
-// Load test file
-{source}
+const stream = test.run({filter_opt});
 
-// Run tests synchronously for now
-for (const test of globalThis.__otter_tests) {{
-    try {{
-        test.fn();
-        globalThis.__otter_results.passed++;
-        console.log("    ✓ " + test.name);
-    }} catch (e) {{
-        globalThis.__otter_results.failed++;
-        console.log("    ✗ " + test.name);
-        console.log("      " + e.message);
-    }}
-}}
+stream.on("test:pass", (event) => {{
+    const name = event && event.data ? event.data.name : "<unknown>";
+    __otter_results.passed++;
+    console.log("    \u{{2713}} " + name);
+}});
 
-globalThis.__otter_results;
-"#
+stream.on("test:fail", (event) => {{
+    const name = event && event.data ? event.data.name : "<unknown>";
+    const error = event && event.data ? event.data.error : "";
+    __otter_results.failed++;
+    __otter_results.failures.push({{ name, error }});
+    console.log("    \u{{2717}} " + name);
+    if (error) console.log("      " + error);
+}});
+
+stream.on("test:diagnostic", (event) => {{
+    const name = event && event.data ? event.data.name : "";
+    __otter_results.todo++;
+}});
+
+(() => __otter_results)();
+"#,
+        test_file_url = test_file_url.replace('\\', "/"),
+        filter_opt = filter_opt,
     );
 
-    match engine.eval(&test_harness, None).await {
+    // Use file:// URL as source_url for the wrapper so imports resolve correctly
+    let wrapper_url = format!("file://{}", abs_test_path.parent()
+        .unwrap_or(abs_test_path.as_path())
+        .join("__test_harness__.js")
+        .to_string_lossy()
+        .replace('\\', "/"));
+
+    // Run the test harness
+    match engine.eval(&test_harness, Some(&wrapper_url)).await {
         Ok(result) => {
             // Try to extract results from the returned object
             if let Some(obj) = result.as_object() {
@@ -901,7 +967,12 @@ globalThis.__otter_results;
                     .get(&PropertyKey::string("skipped"))
                     .and_then(|v| v.as_int32())
                     .unwrap_or(0) as usize;
-                Ok((passed, failed, skipped))
+                let todo = obj
+                    .get(&PropertyKey::string("todo"))
+                    .and_then(|v| v.as_int32())
+                    .unwrap_or(0) as usize;
+
+                Ok((passed, failed, skipped + todo))
             } else {
                 Ok((0, 1, 0))
             }

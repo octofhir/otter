@@ -1278,10 +1278,12 @@ impl Intrinsics {
             dv_getter!("getFloat64", get_float64, f64);
 
             // Setters
-            dv_setter!("setInt8", set_int8, |v: f64| v as i8, no_endian);
-            dv_setter!("setUint8", set_uint8, |v: f64| v as u8, no_endian);
-            dv_setter!("setInt16", set_int16, |v: f64| v as i16);
-            dv_setter!("setUint16", set_uint16, |v: f64| v as u16);
+            // Use wrapping conversions: f64 → i32/u32 → target type
+            // Rust `as i8` saturates, but spec requires modular (wrapping) behavior.
+            dv_setter!("setInt8", set_int8, |v: f64| (v as i32) as i8, no_endian);
+            dv_setter!("setUint8", set_uint8, |v: f64| (v as u32) as u8, no_endian);
+            dv_setter!("setInt16", set_int16, |v: f64| (v as i32) as i16);
+            dv_setter!("setUint16", set_uint16, |v: f64| (v as u32) as u16);
             dv_setter!("setInt32", set_int32, |v: f64| v as i32);
             dv_setter!("setUint32", set_uint32, |v: f64| v as u32);
             dv_setter!("setFloat32", set_float32, |v: f64| v as f32);
@@ -2203,24 +2205,46 @@ impl Intrinsics {
             Some(Box::new(|_this, args: &[Value], ncx| {
                 use crate::data_view::JsDataView;
 
-                let buffer = args
-                    .first()
-                    .and_then(|v| v.as_array_buffer())
-                    .ok_or_else(|| {
-                        VmError::type_error(
-                            "First argument to DataView constructor must be an ArrayBuffer",
-                        )
-                    })?;
+                let first_arg = args.first().cloned().unwrap_or(Value::undefined());
+                // Per spec: first arg must be an ArrayBuffer
+                let buffer = first_arg.as_array_buffer().ok_or_else(|| {
+                    VmError::type_error(
+                        "First argument to DataView constructor must be an ArrayBuffer",
+                    )
+                })?;
 
-                let byte_offset = args
-                    .get(1)
-                    .map(|v| crate::globals::to_number(v) as usize)
-                    .unwrap_or(0);
+                // ToIndex for byteOffset: undefined→0, negative→RangeError
+                let byte_offset = if let Some(v) = args.get(1) {
+                    if v.is_undefined() {
+                        0usize
+                    } else {
+                        let n = crate::globals::to_number(v);
+                        if n.is_nan() || n < 0.0 || n.is_infinite() || n != n.trunc() {
+                            return Err(VmError::range_error("Invalid byte offset"));
+                        }
+                        n as usize
+                    }
+                } else {
+                    0
+                };
 
-                let byte_length = args.get(2).map(|v| crate::globals::to_number(v) as usize);
+                // ToIndex for byteLength: undefined→auto, negative→RangeError
+                let byte_length = if let Some(v) = args.get(2) {
+                    if v.is_undefined() {
+                        None
+                    } else {
+                        let n = crate::globals::to_number(v);
+                        if n.is_nan() || n < 0.0 || n.is_infinite() {
+                            return Err(VmError::range_error("Invalid byte length"));
+                        }
+                        Some(n as usize)
+                    }
+                } else {
+                    None
+                };
 
                 let dv = JsDataView::new(buffer.clone(), byte_offset, byte_length)
-                    .map_err(|e| VmError::type_error(e))?;
+                    .map_err(|e| VmError::range_error(e))?;
                 Ok(Value::data_view(GcRef::new(dv)))
             })),
         );

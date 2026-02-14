@@ -91,10 +91,10 @@ impl JsDataView {
         if self.buffer.is_detached() {
             return Err("ArrayBuffer is detached");
         }
-        if byte_offset + size > self.byte_length {
-            return Err("offset is outside the bounds of the DataView");
+        match byte_offset.checked_add(size) {
+            Some(end) if end <= self.byte_length => Ok(()),
+            _ => Err("offset is outside the bounds of the DataView"),
         }
-        Ok(())
     }
 
     // ===== Getters =====

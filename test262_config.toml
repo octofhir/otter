@@ -7,8 +7,8 @@
 # Pin test262 to a specific commit (optional)
 # test262_commit = "abc123..."
 
-# Default timeout in seconds per test (optional)
-# timeout_secs = 30
+# Default timeout in seconds per test
+timeout_secs = 10
 
 # Directory for saving results
 # results_dir = "test262_results"

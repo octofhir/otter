@@ -13,11 +13,12 @@ Otter is an embeddable TypeScript/JavaScript engine for Rust applications built 
 ## Agent Checklist (per task)
 
 1. **Confirm intent + constraints**: Web API compatibility? sandbox/permissions? performance target? platform?
-2. **Search before adding**: prefer `rg` to find similar code and reuse existing patterns.
-3. **Keep patches surgical**: avoid refactors unless requested; keep public APIs stable.
-4. **Respect safety boundaries**: follow the `unsafe` rules and GC invariants below.
-5. **Update the "triangle" when needed**: runtime behavior ↔ TypeScript `.d.ts` ↔ docs/examples/tests.
-6. **Parse JS/TS with ASTs**: use `oxc`/SWC; never regex-parse JS/TS.
+2. **Check ES conformance status**: Before working on feature implementation or bug fixes, consult `ES_CONFORMANCE.md` to understand the current pass rate for the affected area.
+3. **Search before adding**: prefer `rg` to find similar code and reuse existing patterns.
+4. **Keep patches surgical**: avoid refactors unless requested; keep public APIs stable.
+5. **Respect safety boundaries**: follow the `unsafe` rules and GC invariants below.
+6. **Update the "triangle" when needed**: runtime behavior ↔ TypeScript `.d.ts` ↔ docs/examples/tests.
+7. **Parse JS/TS with ASTs**: use `oxc`/SWC; never regex-parse JS/TS.
 
 ## Repository Map (where to change what)
 
@@ -282,7 +283,34 @@ cargo test -p otter-vm-core
 cargo test -p otter-vm-runtime
 ```
 
+## Conformance Tracking
+
+`ES_CONFORMANCE.md` tracks Test262 conformance by ECMAScript edition and by feature area.
+
+### Before starting work
+
+- Look up the relevant section in `ES_CONFORMANCE.md` for baseline pass rates
+- Run the targeted test262 subset: `just test262-filter "Array/prototype/map"`
+
+### After completing work
+
+- Re-run tests and note the delta (before/after pass rates)
+- If pass rate changed significantly, regenerate:
+
+```bash
+just test262-save && just test262-conformance
+```
+
+- Include before/after rates in commit message or PR description
+
+### Timeout policy
+
+All test262 runs use a 10-second per-test timeout (hardcoded fallback). Tests that hang
+are recorded as `Timeout` in the conformance doc. If you encounter frequent timeouts in
+a specific area, investigate for infinite loops before attempting other fixes.
+
 ## Key Files
 
+- `ES_CONFORMANCE.md` - ECMAScript conformance status by edition and feature
 - `OTTER_VM_PLAN.md` - VM implementation plan and status
 - `ROADMAP.md` - Feature status and API compatibility matrix

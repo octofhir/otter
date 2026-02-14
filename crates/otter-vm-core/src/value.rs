@@ -757,6 +757,9 @@ impl Value {
                 | Some(HeapRef::Promise(_))
                 | Some(HeapRef::Proxy(_))
                 | Some(HeapRef::Generator(_))
+                | Some(HeapRef::ArrayBuffer(_))
+                | Some(HeapRef::TypedArray(_))
+                | Some(HeapRef::DataView(_))
         )
     }
 

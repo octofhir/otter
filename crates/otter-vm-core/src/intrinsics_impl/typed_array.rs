@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use crate::array_buffer::JsArrayBuffer;
 use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::memory::MemoryManager;
@@ -744,6 +745,451 @@ fn init_typed_array_iterators(
             },
             mm.clone(),
             fn_proto_clone3,
+        )),
+    );
+
+    // ========================================================================
+    // Callback-based iteration methods
+    // ========================================================================
+
+    // Helper: create a new typed array of a given kind and length
+    fn create_typed_array(
+        kind: TypedArrayKind,
+        length: usize,
+        proto: Value,
+        mm: Arc<MemoryManager>,
+    ) -> Result<JsTypedArray, VmError> {
+        let byte_len = length
+            .checked_mul(kind.element_size())
+            .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
+        let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None, mm.clone()));
+        let object = GcRef::new(JsObject::new(proto, mm));
+        JsTypedArray::new(object, buffer, kind, 0, length).map_err(|e| VmError::type_error(e))
+    }
+
+    // Helper: get element at index as Value (handles BigInt arrays)
+    fn ta_element_value(ta: &JsTypedArray, index: usize) -> Value {
+        if ta.kind().is_bigint() {
+            if let Some(v) = ta.get_bigint(index) {
+                Value::bigint(v.to_string())
+            } else {
+                Value::undefined()
+            }
+        } else if let Some(v) = ta.get(index) {
+            Value::number(v)
+        } else {
+            Value::undefined()
+        }
+    }
+
+    // Helper: extract a numeric value from a callback result and write to typed array
+    fn ta_set_from_value(ta: &JsTypedArray, index: usize, val: &Value) {
+        if ta.kind().is_bigint() {
+            // Try to get BigInt value
+            if let Some(crate::value::HeapRef::BigInt(b)) = val.heap_ref() {
+                if let Ok(n) = b.value.parse::<i64>() {
+                    ta.set_bigint(index, n);
+                }
+            } else {
+                let n = crate::globals::to_number(val) as i64;
+                ta.set_bigint(index, n);
+            }
+        } else {
+            let n = crate::globals::to_number(val);
+            ta.set(index, n);
+        }
+    }
+
+    // %TypedArray%.prototype.every(callbackfn [, thisArg]) — §22.2.3.8
+    proto.define_property(
+        PropertyKey::string("every"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                let ta = get_typed_array(this_val)?;
+                let callback = args.first().cloned().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+                let len = ta.length();
+                for i in 0..len {
+                    let val = ta_element_value(&ta, i);
+                    let result = ncx.call_function(
+                        &callback,
+                        this_arg.clone(),
+                        &[val, Value::number(i as f64), this_val.clone()],
+                    )?;
+                    if !result.to_boolean() {
+                        return Ok(Value::boolean(false));
+                    }
+                }
+                Ok(Value::boolean(true))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.some(callbackfn [, thisArg]) — §22.2.3.29
+    proto.define_property(
+        PropertyKey::string("some"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                let ta = get_typed_array(this_val)?;
+                let callback = args.first().cloned().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+                let len = ta.length();
+                for i in 0..len {
+                    let val = ta_element_value(&ta, i);
+                    let result = ncx.call_function(
+                        &callback,
+                        this_arg.clone(),
+                        &[val, Value::number(i as f64), this_val.clone()],
+                    )?;
+                    if result.to_boolean() {
+                        return Ok(Value::boolean(true));
+                    }
+                }
+                Ok(Value::boolean(false))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.forEach(callbackfn [, thisArg]) — §22.2.3.13
+    proto.define_property(
+        PropertyKey::string("forEach"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                let ta = get_typed_array(this_val)?;
+                let callback = args.first().cloned().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+                let len = ta.length();
+                for i in 0..len {
+                    let val = ta_element_value(&ta, i);
+                    ncx.call_function(
+                        &callback,
+                        this_arg.clone(),
+                        &[val, Value::number(i as f64), this_val.clone()],
+                    )?;
+                }
+                Ok(Value::undefined())
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.find(predicate [, thisArg]) — §22.2.3.12
+    proto.define_property(
+        PropertyKey::string("find"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                let ta = get_typed_array(this_val)?;
+                let callback = args.first().cloned().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+                let len = ta.length();
+                for i in 0..len {
+                    let val = ta_element_value(&ta, i);
+                    let result = ncx.call_function(
+                        &callback,
+                        this_arg.clone(),
+                        &[val.clone(), Value::number(i as f64), this_val.clone()],
+                    )?;
+                    if result.to_boolean() {
+                        return Ok(val);
+                    }
+                }
+                Ok(Value::undefined())
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.findIndex(predicate [, thisArg]) — §22.2.3.11
+    proto.define_property(
+        PropertyKey::string("findIndex"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                let ta = get_typed_array(this_val)?;
+                let callback = args.first().cloned().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+                let len = ta.length();
+                for i in 0..len {
+                    let val = ta_element_value(&ta, i);
+                    let result = ncx.call_function(
+                        &callback,
+                        this_arg.clone(),
+                        &[val, Value::number(i as f64), this_val.clone()],
+                    )?;
+                    if result.to_boolean() {
+                        return Ok(Value::number(i as f64));
+                    }
+                }
+                Ok(Value::int32(-1))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.findLast(predicate [, thisArg]) — §22.2.3.11.1
+    proto.define_property(
+        PropertyKey::string("findLast"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                let ta = get_typed_array(this_val)?;
+                let callback = args.first().cloned().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+                let len = ta.length();
+                for i in (0..len).rev() {
+                    let val = ta_element_value(&ta, i);
+                    let result = ncx.call_function(
+                        &callback,
+                        this_arg.clone(),
+                        &[val.clone(), Value::number(i as f64), this_val.clone()],
+                    )?;
+                    if result.to_boolean() {
+                        return Ok(val);
+                    }
+                }
+                Ok(Value::undefined())
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.findLastIndex(predicate [, thisArg])
+    proto.define_property(
+        PropertyKey::string("findLastIndex"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                let ta = get_typed_array(this_val)?;
+                let callback = args.first().cloned().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+                let len = ta.length();
+                for i in (0..len).rev() {
+                    let val = ta_element_value(&ta, i);
+                    let result = ncx.call_function(
+                        &callback,
+                        this_arg.clone(),
+                        &[val, Value::number(i as f64), this_val.clone()],
+                    )?;
+                    if result.to_boolean() {
+                        return Ok(Value::number(i as f64));
+                    }
+                }
+                Ok(Value::int32(-1))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.map(callbackfn [, thisArg]) — §22.2.3.20
+    proto.define_property(
+        PropertyKey::string("map"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                let ta = get_typed_array(this_val)?;
+                let callback = args.first().cloned().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+                let len = ta.length();
+                let kind = ta.kind();
+                let src_proto = this_val
+                    .as_object()
+                    .map(|o| o.prototype().clone())
+                    .unwrap_or(Value::null());
+                let new_ta =
+                    create_typed_array(kind, len, src_proto, ncx.memory_manager().clone())?;
+                for i in 0..len {
+                    let val = ta_element_value(&ta, i);
+                    let mapped = ncx.call_function(
+                        &callback,
+                        this_arg.clone(),
+                        &[val, Value::number(i as f64), this_val.clone()],
+                    )?;
+                    ta_set_from_value(&new_ta, i, &mapped);
+                }
+                let obj = new_ta.object;
+                obj.define_property(
+                    PropertyKey::string("__TypedArrayData__"),
+                    PropertyDescriptor::data(Value::typed_array(GcRef::new(new_ta))),
+                );
+                Ok(Value::object(obj))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.filter(callbackfn [, thisArg]) — §22.2.3.10
+    proto.define_property(
+        PropertyKey::string("filter"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                let ta = get_typed_array(this_val)?;
+                let callback = args.first().cloned().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+                let len = ta.length();
+                let kind = ta.kind();
+                let mut kept: Vec<Value> = Vec::new();
+                for i in 0..len {
+                    let val = ta_element_value(&ta, i);
+                    let result = ncx.call_function(
+                        &callback,
+                        this_arg.clone(),
+                        &[val.clone(), Value::number(i as f64), this_val.clone()],
+                    )?;
+                    if result.to_boolean() {
+                        kept.push(val);
+                    }
+                }
+                let src_proto = this_val
+                    .as_object()
+                    .map(|o| o.prototype().clone())
+                    .unwrap_or(Value::null());
+                let new_ta =
+                    create_typed_array(kind, kept.len(), src_proto, ncx.memory_manager().clone())?;
+                for (i, val) in kept.iter().enumerate() {
+                    ta_set_from_value(&new_ta, i, val);
+                }
+                let obj = new_ta.object;
+                obj.define_property(
+                    PropertyKey::string("__TypedArrayData__"),
+                    PropertyDescriptor::data(Value::typed_array(GcRef::new(new_ta))),
+                );
+                Ok(Value::object(obj))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.reduce(callbackfn [, initialValue]) — §22.2.3.22
+    proto.define_property(
+        PropertyKey::string("reduce"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                let ta = get_typed_array(this_val)?;
+                let callback = args.first().cloned().unwrap_or(Value::undefined());
+                let len = ta.length();
+                let mut accumulator;
+                let start;
+                if args.len() >= 2 {
+                    accumulator = args[1].clone();
+                    start = 0;
+                } else {
+                    if len == 0 {
+                        return Err(VmError::type_error(
+                            "Reduce of empty array with no initial value",
+                        ));
+                    }
+                    accumulator = ta_element_value(&ta, 0);
+                    start = 1;
+                }
+                for i in start..len {
+                    let val = ta_element_value(&ta, i);
+                    accumulator = ncx.call_function(
+                        &callback,
+                        Value::undefined(),
+                        &[accumulator, val, Value::number(i as f64), this_val.clone()],
+                    )?;
+                }
+                Ok(accumulator)
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.reduceRight(callbackfn [, initialValue]) — §22.2.3.23
+    proto.define_property(
+        PropertyKey::string("reduceRight"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                let ta = get_typed_array(this_val)?;
+                let callback = args.first().cloned().unwrap_or(Value::undefined());
+                let len = ta.length();
+                let mut accumulator;
+                let start;
+                if args.len() >= 2 {
+                    accumulator = args[1].clone();
+                    start = len;
+                } else {
+                    if len == 0 {
+                        return Err(VmError::type_error(
+                            "Reduce of empty array with no initial value",
+                        ));
+                    }
+                    accumulator = ta_element_value(&ta, len - 1);
+                    start = len - 1;
+                }
+                for i in (0..start).rev() {
+                    let val = ta_element_value(&ta, i);
+                    accumulator = ncx.call_function(
+                        &callback,
+                        Value::undefined(),
+                        &[accumulator, val, Value::number(i as f64), this_val.clone()],
+                    )?;
+                }
+                Ok(accumulator)
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // %TypedArray%.prototype.sort([comparefn]) — §22.2.3.30
+    proto.define_property(
+        PropertyKey::string("sort"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                let ta = get_typed_array(this_val)?;
+                let compare_fn = args.first().cloned().unwrap_or(Value::undefined());
+                let len = ta.length();
+                if len <= 1 {
+                    return Ok(this_val.clone());
+                }
+
+                // Collect values
+                let mut values: Vec<f64> = (0..len).filter_map(|i| ta.get(i)).collect();
+
+                if compare_fn.is_undefined() {
+                    // Default numeric sort
+                    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                } else {
+                    // Custom comparator — use a simple insertion sort to avoid
+                    // issues with sort_by requiring Fn not FnMut
+                    for i in 1..values.len() {
+                        let key = values[i];
+                        let mut j = i;
+                        while j > 0 {
+                            let cmp_result = ncx.call_function(
+                                &compare_fn,
+                                Value::undefined(),
+                                &[Value::number(values[j - 1]), Value::number(key)],
+                            )?;
+                            let cmp_val = crate::globals::to_number(&cmp_result);
+                            if cmp_val > 0.0 {
+                                values[j] = values[j - 1];
+                                j -= 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        values[j] = key;
+                    }
+                }
+
+                // Write back
+                for (i, &v) in values.iter().enumerate() {
+                    ta.set(i, v);
+                }
+                Ok(this_val.clone())
+            },
+            mm.clone(),
+            fn_proto,
         )),
     );
 }

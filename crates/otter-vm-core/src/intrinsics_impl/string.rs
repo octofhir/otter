@@ -61,12 +61,12 @@ fn this_string_value(this_val: &Value) -> Result<GcRef<JsString>, String> {
 // ============================================================================
 
 /// Helper to check if a UTF-16 code unit is a high surrogate
-fn is_high_surrogate(unit: u16) -> bool {
+pub fn is_high_surrogate(unit: u16) -> bool {
     unit >= 0xD800 && unit <= 0xDBFF
 }
 
 /// Helper to check if a UTF-16 code unit is a low surrogate
-fn is_low_surrogate(unit: u16) -> bool {
+pub fn is_low_surrogate(unit: u16) -> bool {
     unit >= 0xDC00 && unit <= 0xDFFF
 }
 
@@ -74,82 +74,19 @@ fn is_low_surrogate(unit: u16) -> bool {
 fn make_string_iterator(
     this_val: &Value,
     mm: Arc<MemoryManager>,
-    fn_proto: GcRef<JsObject>,
-    iter_proto: GcRef<JsObject>,
+    _fn_proto: GcRef<JsObject>,
+    string_iter_proto: GcRef<JsObject>,
 ) -> Result<Value, VmError> {
     // Extract string value (handles both primitives and String objects)
     let string = this_string_value(this_val).map_err(|e| VmError::type_error(&e))?;
 
-    // Create iterator object with %IteratorPrototype% as prototype
-    let iter = GcRef::new(JsObject::new(Value::object(iter_proto), mm.clone()));
+    // Create iterator object with %StringIteratorPrototype% as prototype
+    let iter = GcRef::new(JsObject::new(Value::object(string_iter_proto), mm));
 
     // Store the string reference and current index
     let _ = iter.set(PropertyKey::string("__string_ref__"), Value::string(string));
     let _ = iter.set(PropertyKey::string("__string_index__"), Value::number(0.0));
 
-    // Define next() method
-    let fn_proto_for_next = fn_proto;
-    iter.define_property(
-        PropertyKey::string("next"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, ncx| {
-                let iter_obj = this_val
-                    .as_object()
-                    .ok_or_else(|| "not an iterator object".to_string())?;
-                let string = iter_obj
-                    .get(&PropertyKey::string("__string_ref__"))
-                    .and_then(|v| v.as_string())
-                    .ok_or_else(|| "iterator: missing string ref".to_string())?;
-                let idx = iter_obj
-                    .get(&PropertyKey::string("__string_index__"))
-                    .and_then(|v| v.as_number())
-                    .unwrap_or(0.0) as usize;
-
-                // Get UTF-16 code units
-                let units = string.as_utf16();
-                let len = units.len();
-
-                if idx >= len {
-                    // Done
-                    let result =
-                        GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                    let _ = result.set(PropertyKey::string("value"), Value::undefined());
-                    let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
-                    return Ok(Value::object(result));
-                }
-
-                // Read code point(s), handling surrogate pairs
-                let first = units[idx];
-                let (char_string, next_idx) = if is_high_surrogate(first)
-                    && idx + 1 < len
-                    && is_low_surrogate(units[idx + 1])
-                {
-                    // Surrogate pair: combine into single code point
-                    let pair = vec![first, units[idx + 1]];
-                    let char_str = String::from_utf16_lossy(&pair);
-                    (JsString::intern(&char_str), idx + 2)
-                } else {
-                    // Single code unit (either BMP character or unpaired surrogate)
-                    let single = vec![first];
-                    let char_str = String::from_utf16_lossy(&single);
-                    (JsString::intern(&char_str), idx + 1)
-                };
-
-                // Advance index
-                let _ = iter_obj.set(
-                    PropertyKey::string("__string_index__"),
-                    Value::number(next_idx as f64),
-                );
-
-                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                let _ = result.set(PropertyKey::string("value"), Value::string(char_string));
-                let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
-                Ok(Value::object(result))
-            },
-            mm,
-            fn_proto_for_next,
-        )),
-    );
     Ok(Value::object(iter))
 }
 
@@ -158,7 +95,7 @@ pub fn init_string_prototype(
     string_proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
-    iterator_proto: GcRef<JsObject>,
+    string_iterator_proto: GcRef<JsObject>,
     symbol_iterator: crate::gc::GcRef<crate::value::Symbol>,
 ) {
     string_proto.define_property(
@@ -989,8 +926,81 @@ pub fn init_string_prototype(
             )),
         );
 
+    // String.prototype.codePointAt(pos) — §22.1.3.3
+    string_proto.define_property(
+        PropertyKey::string("codePointAt"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _ncx| {
+                let s = this_string_value(this_val).map_err(|e| VmError::type_error(&e))?;
+                let str_val = s.as_str();
+                let pos = args
+                    .first()
+                    .and_then(|v| v.as_number().or_else(|| v.as_int32().map(|i| i as f64)))
+                    .unwrap_or(0.0) as usize;
+
+                let utf16: Vec<u16> = str_val.encode_utf16().collect();
+                if pos >= utf16.len() {
+                    return Ok(Value::undefined());
+                }
+
+                let first = utf16[pos];
+                if is_high_surrogate(first) && pos + 1 < utf16.len() {
+                    let second = utf16[pos + 1];
+                    if is_low_surrogate(second) {
+                        // Combine surrogate pair into code point
+                        let cp = ((first as u32 - 0xD800) * 0x400
+                            + (second as u32 - 0xDC00)
+                            + 0x10000) as f64;
+                        return Ok(Value::number(cp));
+                    }
+                }
+                Ok(Value::number(first as f64))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
+    // String.prototype.normalize([form]) — §22.1.3.13
+    string_proto.define_property(
+        PropertyKey::string("normalize"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |this_val, args, _ncx| {
+                use unicode_normalization::UnicodeNormalization;
+                let s = this_string_value(this_val).map_err(|e| VmError::type_error(&e))?;
+                let str_val = s.as_str();
+                let form = if let Some(f) = args.first() {
+                    if f.is_undefined() {
+                        "NFC"
+                    } else {
+                        let f_str = crate::globals::to_string(f);
+                        match f_str.as_str() {
+                            "NFC" | "NFD" | "NFKC" | "NFKD" => {},
+                            _ => return Err(VmError::range_error(
+                                &format!("The normalization form should be one of NFC, NFD, NFKC, NFKD. Got: {}", f_str)
+                            )),
+                        }
+                        // Leak-free: match again to return &'static str
+                        return match f_str.as_str() {
+                            "NFD" => Ok(Value::string(JsString::intern(&str_val.nfd().collect::<String>()))),
+                            "NFKC" => Ok(Value::string(JsString::intern(&str_val.nfkc().collect::<String>()))),
+                            "NFKD" => Ok(Value::string(JsString::intern(&str_val.nfkd().collect::<String>()))),
+                            _ => Ok(Value::string(JsString::intern(&str_val.nfc().collect::<String>()))),
+                        };
+                    }
+                } else {
+                    "NFC"
+                };
+                let _ = form; // suppress unused warning
+                Ok(Value::string(JsString::intern(&str_val.nfc().collect::<String>())))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
+
     // String.prototype[Symbol.iterator]
-    let iter_proto_for_symbol = iterator_proto;
+    let iter_proto_for_symbol = string_iterator_proto;
     let mm_for_symbol = mm.clone();
     let fn_proto_for_symbol = fn_proto;
     string_proto.define_property(

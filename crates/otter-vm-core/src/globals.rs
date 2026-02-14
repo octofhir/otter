@@ -138,6 +138,10 @@ pub fn setup_global_object(
         1,
     );
 
+    // Annex B legacy functions
+    define_global_fn(&global, &mm, fn_proto, global_escape, "escape", 1);
+    define_global_fn(&global, &mm, fn_proto, global_unescape, "unescape", 1);
+
     // Standard built-in objects
     setup_builtin_constructors(global, fn_proto, intrinsics_opt);
 }
@@ -318,7 +322,10 @@ fn setup_builtin_constructors(
                 move |_this, args: &[Value], ncx| {
                     let len = if let Some(arg) = args.get(0) {
                         let n = to_number(arg);
-                        if n.is_nan() { 0 } else { n as usize }
+                        if n.is_nan() || n < 0.0 || n > 1_073_741_824.0 {
+                            return Err(VmError::range_error("Invalid array buffer length"));
+                        }
+                        n as usize
                     } else {
                         0
                     };
@@ -430,8 +437,11 @@ fn setup_builtin_constructors(
                     // Check if arg0 is another TypedArray
                     if let Some(other_ta) = arg0.as_typed_array() {
                         let length = other_ta.length();
+                        let byte_len = length
+                            .checked_mul(kind.element_size())
+                            .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
                         let buffer = GcRef::new(JsArrayBuffer::new(
-                            length * kind.element_size(),
+                            byte_len,
                             None,
                             ncx.memory_manager().clone(),
                         ));
@@ -454,13 +464,18 @@ fn setup_builtin_constructors(
 
                     // Check if arg0 is a number (length)
                     if let Some(length_num) = arg0.as_number() {
-                        let length = if length_num < 0.0 {
-                            0
+                        let length = if length_num < 0.0 || length_num.is_nan() {
+                            return Err(VmError::range_error("Invalid typed array length"));
+                        } else if length_num > (usize::MAX / 8) as f64 {
+                            return Err(VmError::range_error("Invalid typed array length"));
                         } else {
                             length_num as usize
                         };
+                        let byte_len = length
+                            .checked_mul(kind.element_size())
+                            .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
                         let buffer = GcRef::new(JsArrayBuffer::new(
-                            length * kind.element_size(),
+                            byte_len,
                             None,
                             ncx.memory_manager().clone(),
                         ));
@@ -474,9 +489,15 @@ fn setup_builtin_constructors(
                     }
 
                     if let Some(length_int) = arg0.as_int32() {
-                        let length = length_int.max(0) as usize;
+                        if length_int < 0 {
+                            return Err(VmError::range_error("Invalid typed array length"));
+                        }
+                        let length = length_int as usize;
+                        let byte_len = length
+                            .checked_mul(kind.element_size())
+                            .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
                         let buffer = GcRef::new(JsArrayBuffer::new(
-                            length * kind.element_size(),
+                            byte_len,
                             None,
                             ncx.memory_manager().clone(),
                         ));
@@ -973,24 +994,26 @@ fn global_eval(
 }
 
 /// `isFinite(number)` - Determines whether the passed value is a finite number.
+/// Per §19.2.2, calls ToNumber which invokes ToPrimitive on objects.
 fn global_is_finite(
     _this: &Value,
     args: &[Value],
-    _ncx: &mut crate::context::NativeContext<'_>,
+    ncx: &mut crate::context::NativeContext<'_>,
 ) -> Result<Value, VmError> {
     let value = get_arg(args, 0);
-    let num = to_number(&value);
+    let num = ncx.to_number_value(&value)?;
     Ok(Value::boolean(num.is_finite()))
 }
 
 /// `isNaN(number)` - Determines whether a value is NaN.
+/// Per §19.2.3, calls ToNumber which invokes ToPrimitive on objects.
 fn global_is_nan(
     _this: &Value,
     args: &[Value],
-    _ncx: &mut crate::context::NativeContext<'_>,
+    ncx: &mut crate::context::NativeContext<'_>,
 ) -> Result<Value, VmError> {
     let value = get_arg(args, 0);
-    let num = to_number(&value);
+    let num = ncx.to_number_value(&value)?;
     Ok(Value::boolean(num.is_nan()))
 }
 
@@ -1239,6 +1262,136 @@ fn decode_uri_impl(encoded: &str, preserve_reserved: bool) -> Result<Value, VmEr
         String::from_utf8(result).map_err(|_| "URIError: malformed URI sequence".to_string())?;
 
     Ok(Value::string(JsString::intern(&decoded)))
+}
+
+// =============================================================================
+// Annex B: escape / unescape (§B.2.1, §B.2.2)
+// =============================================================================
+
+/// `escape(string)` — Annex B §B.2.1
+/// Encodes a string, replacing all characters except `A-Z a-z 0-9 @ * _ + - . /`
+/// with `%XX` or `%uXXXX` escape sequences.
+fn global_escape(
+    _this: &Value,
+    args: &[Value],
+    _ncx: &mut crate::context::NativeContext<'_>,
+) -> Result<Value, VmError> {
+    let input = to_string(&get_arg(args, 0));
+    let mut result = String::with_capacity(input.len());
+    for ch in input.encode_utf16() {
+        let c = ch;
+        // Characters that are NOT escaped
+        if matches!(c, 0x41..=0x5A | 0x61..=0x7A | 0x30..=0x39) // A-Z, a-z, 0-9
+            || matches!(c, 0x40 | 0x2A | 0x5F | 0x2B | 0x2D | 0x2E | 0x2F)
+        // @ * _ + - . /
+        {
+            result.push(char::from(c as u8));
+        } else if c < 256 {
+            result.push_str(&format!("%{:02X}", c));
+        } else {
+            result.push_str(&format!("%u{:04X}", c));
+        }
+    }
+    Ok(Value::string(JsString::intern(&result)))
+}
+
+/// `unescape(string)` — Annex B §B.2.2
+/// Decodes a string produced by `escape()`.
+fn global_unescape(
+    _this: &Value,
+    args: &[Value],
+    _ncx: &mut crate::context::NativeContext<'_>,
+) -> Result<Value, VmError> {
+    let input = to_string(&get_arg(args, 0));
+    // Work with UTF-16 code units per spec, then convert back
+    let units: Vec<u16> = input.encode_utf16().collect();
+    let len = units.len();
+    let mut result_units: Vec<u16> = Vec::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        if units[i] == b'%' as u16 {
+            // Try %uXXXX first (6 code units total)
+            if i + 5 < len && units[i + 1] == b'u' as u16 {
+                if let Some(code) = parse_hex4_u16(&units[i + 2..i + 6]) {
+                    result_units.push(code);
+                    i += 6;
+                    continue;
+                }
+            }
+            // Try %XX (3 code units total)
+            if i + 2 < len {
+                if let Some(code) = parse_hex2_u16(&units[i + 1..i + 3]) {
+                    result_units.push(code);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        result_units.push(units[i]);
+        i += 1;
+    }
+    let decoded = String::from_utf16_lossy(&result_units);
+    Ok(Value::string(JsString::intern(&decoded)))
+}
+
+fn parse_hex2(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 2 {
+        return None;
+    }
+    let high = hex_digit(bytes[0])?;
+    let low = hex_digit(bytes[1])?;
+    Some((high as u16) * 16 + low as u16)
+}
+
+fn parse_hex4(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let a = hex_digit(bytes[0])? as u16;
+    let b = hex_digit(bytes[1])? as u16;
+    let c = hex_digit(bytes[2])? as u16;
+    let d = hex_digit(bytes[3])? as u16;
+    Some(a * 4096 + b * 256 + c * 16 + d)
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Parse two hex digit code units (u16) into a byte value
+fn parse_hex2_u16(units: &[u16]) -> Option<u16> {
+    if units.len() < 2 {
+        return None;
+    }
+    let high = hex_digit_u16(units[0])?;
+    let low = hex_digit_u16(units[1])?;
+    Some((high as u16) * 16 + low as u16)
+}
+
+/// Parse four hex digit code units (u16) into a u16 value
+fn parse_hex4_u16(units: &[u16]) -> Option<u16> {
+    if units.len() < 4 {
+        return None;
+    }
+    let a = hex_digit_u16(units[0])? as u16;
+    let b = hex_digit_u16(units[1])? as u16;
+    let c = hex_digit_u16(units[2])? as u16;
+    let d = hex_digit_u16(units[3])? as u16;
+    Some(a * 4096 + b * 256 + c * 16 + d)
+}
+
+fn hex_digit_u16(u: u16) -> Option<u8> {
+    match u {
+        0x30..=0x39 => Some((u - 0x30) as u8), // '0'-'9'
+        0x41..=0x46 => Some((u - 0x41) as u8 + 10), // 'A'-'F'
+        0x61..=0x66 => Some((u - 0x61) as u8 + 10), // 'a'-'f'
+        _ => None,
+    }
 }
 
 // =============================================================================

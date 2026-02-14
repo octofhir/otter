@@ -1,4 +1,9 @@
 //! Bytecode to Cranelift IR translation.
+//!
+//! All values are i64 in Cranelift. The baseline translator handles a small
+//! instruction subset. When a runtime condition can't be handled (e.g.,
+//! division by zero), the generated code returns `BAILOUT_SENTINEL` instead
+//! of trapping, allowing the caller to re-execute in the interpreter.
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{InstBuilder, StackSlotData, StackSlotKind, types};
@@ -8,6 +13,7 @@ use otter_vm_bytecode::instruction::Instruction;
 use otter_vm_bytecode::operand::Register;
 
 use crate::JitError;
+use crate::bailout::BAILOUT_SENTINEL;
 
 fn jump_target(pc: usize, offset: i32, instruction_count: usize) -> Result<usize, JitError> {
     let target = pc as i64 + offset as i64;
@@ -22,7 +28,6 @@ fn jump_target(pc: usize, offset: i32, instruction_count: usize) -> Result<usize
 }
 
 fn unsupported(pc: usize, instruction: &Instruction) -> JitError {
-    // Extract the variant name from Debug output (e.g. "Add { dst: ... }" -> "Add")
     let debug = format!("{:?}", instruction);
     let opcode = debug.split([' ', '{', '(']).next().unwrap_or("unknown");
     JitError::UnsupportedInstruction {
@@ -52,13 +57,23 @@ fn write_reg(
         .stack_store(value, slots[reg.index() as usize], 0);
 }
 
+/// Emit a `return BAILOUT_SENTINEL` — signals the caller to re-execute
+/// in the interpreter.
+fn emit_bailout_return(builder: &mut FunctionBuilder<'_>) {
+    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+    builder.ins().return_(&[sentinel]);
+}
+
 /// Translate a bytecode function into Cranelift IR.
 ///
 /// Supported instruction subset:
 /// - `LoadInt8`, `LoadInt32`, `Move`
-/// - `Add`, `Sub`, `Mul`, `Div`
+/// - `Add`, `Sub`, `Mul`, `Div` (div bails out on divide-by-zero)
 /// - `Jump`, `JumpIfTrue`, `JumpIfFalse`
 /// - `Return`, `ReturnUndefined`, `Nop`
+///
+/// Unsupported instructions are rejected at compile time.
+/// Runtime failures (e.g., div by zero) return `BAILOUT_SENTINEL`.
 pub fn translate_function(
     builder: &mut FunctionBuilder<'_>,
     function: &Function,
@@ -130,8 +145,22 @@ pub fn translate_function(
                 write_reg(builder, &slots, *dst, out);
             }
             Instruction::Div { dst, lhs, rhs, .. } => {
+                // Division: bail out on divide-by-zero instead of trapping
                 let left = read_reg(builder, &slots, *lhs);
                 let right = read_reg(builder, &slots, *rhs);
+                let rhs_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, right, 0);
+                let safe_block = builder.create_block();
+                let bailout_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(rhs_nonzero, safe_block, &[], bailout_block, &[]);
+
+                // Bailout path: return sentinel
+                builder.switch_to_block(bailout_block);
+                emit_bailout_return(builder);
+
+                // Safe path: perform division
+                builder.switch_to_block(safe_block);
                 let out = builder.ins().sdiv(left, right);
                 write_reg(builder, &slots, *dst, out);
             }

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use otter_macros::{js_class, js_static};
+use otter_vm_core::MemoryManager;
 use otter_vm_core::context::NativeContext;
 use otter_vm_core::error::{ThrownValue, VmError};
 use otter_vm_core::gc::GcRef;
@@ -22,7 +23,6 @@ use otter_vm_core::object::{JsObject, PropertyDescriptor, PropertyKey};
 use otter_vm_core::promise::{JsPromise, JsPromiseJob, JsPromiseJobKind};
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
-use otter_vm_core::MemoryManager;
 use otter_vm_runtime::extension_v2::{OtterExtension, Profile};
 use otter_vm_runtime::registration::RegistrationContext;
 use regex::Regex;
@@ -188,7 +188,10 @@ fn build_tracked_mock_fn(
 
     // Build the .mock object
     let mock_obj = GcRef::new(JsObject::new(Value::object(obj_proto.clone()), mm.clone()));
-    let _ = mock_obj.set(PropertyKey::string("calls"), Value::object(calls_arr.clone()));
+    let _ = mock_obj.set(
+        PropertyKey::string("calls"),
+        Value::object(calls_arr.clone()),
+    );
     let _ = mock_obj.set(
         PropertyKey::string("contexts"),
         Value::object(contexts_arr.clone()),
@@ -225,14 +228,10 @@ fn build_tracked_mock_fn(
             let new_contexts = GcRef::new(JsObject::array(0, mm_for_reset.clone()));
             let new_results = GcRef::new(JsObject::array(0, mm_for_reset.clone()));
             let _ = mock_obj_for_reset.set(PropertyKey::string("calls"), Value::object(new_calls));
-            let _ = mock_obj_for_reset.set(
-                PropertyKey::string("contexts"),
-                Value::object(new_contexts),
-            );
-            let _ = mock_obj_for_reset.set(
-                PropertyKey::string("results"),
-                Value::object(new_results),
-            );
+            let _ = mock_obj_for_reset
+                .set(PropertyKey::string("contexts"), Value::object(new_contexts));
+            let _ =
+                mock_obj_for_reset.set(PropertyKey::string("results"), Value::object(new_results));
             Ok(Value::undefined())
         },
         mm.clone(),
@@ -714,10 +713,7 @@ fn build_test_context_from_ncx(
     let _ = state.set(PropertyKey::string("__todo"), Value::boolean(false));
     // -1 means "no plan set"
     let _ = state.set(PropertyKey::string("__plan_count"), Value::number(-1.0));
-    let _ = state.set(
-        PropertyKey::string("__assertion_count"),
-        Value::number(0.0),
-    );
+    let _ = state.set(PropertyKey::string("__assertion_count"), Value::number(0.0));
 
     // t.name
     let _ = obj.set(
@@ -787,14 +783,8 @@ fn build_test_context_from_ncx(
     let plan_fn: Arc<
         dyn Fn(&Value, &[Value], &mut NativeContext) -> Result<Value, VmError> + Send + Sync,
     > = Arc::new(move |_this, args, _ncx| {
-        let count = args
-            .first()
-            .and_then(|v| v.as_number())
-            .unwrap_or(0.0);
-        let _ = state_plan.set(
-            PropertyKey::string("__plan_count"),
-            Value::number(count),
-        );
+        let count = args.first().and_then(|v| v.as_number()).unwrap_or(0.0);
+        let _ = state_plan.set(PropertyKey::string("__plan_count"), Value::number(count));
         Ok(Value::undefined())
     });
     let _ = obj.set(
@@ -873,9 +863,7 @@ fn build_test_context_from_ncx(
 
     // Helper: build assertion function that increments counter
     let build_assert_fn = |state_ref: GcRef<JsObject>,
-                           check: Arc<
-        dyn Fn(&[Value]) -> Result<(), String> + Send + Sync,
-    >,
+                           check: Arc<dyn Fn(&[Value]) -> Result<(), String> + Send + Sync>,
                            fname: &str,
                            length: u32| {
         let f: Arc<
@@ -1235,10 +1223,7 @@ enum LifecycleHookType {
     AfterEach,
 }
 
-fn register_lifecycle_hook(
-    args: &[Value],
-    hook_type: LifecycleHookType,
-) -> Result<Value, VmError> {
+fn register_lifecycle_hook(args: &[Value], hook_type: LifecycleHookType) -> Result<Value, VmError> {
     // Parse arguments: can be (name, fn) or just (fn)
     let (name, callback) = if args.len() >= 2 {
         // (name, fn)
@@ -1323,7 +1308,8 @@ fn execute_lifecycle_hook(
                     move |_this, args, _ncx| {
                         let reason = args.first().cloned().unwrap_or(Value::undefined());
                         let _ = holder_err.set(PropertyKey::string("error"), reason);
-                        let _ = holder_err.set(PropertyKey::string("settled"), Value::boolean(true));
+                        let _ =
+                            holder_err.set(PropertyKey::string("settled"), Value::boolean(true));
                         Ok(Value::undefined())
                     },
                     mm,
@@ -1334,11 +1320,8 @@ fn execute_lifecycle_hook(
                     .as_object()
                     .and_then(|o| o.get(&PropertyKey::string("then")))
                 {
-                    let _ = ncx.call_function(
-                        &then_fn,
-                        return_val,
-                        &[fulfill_handler, reject_handler],
-                    );
+                    let _ =
+                        ncx.call_function(&then_fn, return_val, &[fulfill_handler, reject_handler]);
                 }
 
                 // Check if the rejection handler was called (synchronous promise)
@@ -1649,10 +1632,7 @@ fn build_tests_stream_instance(
     ));
 
     // Initialize EventEmitter storage (listeners map)
-    let listeners_map = GcRef::new(JsObject::new(
-        Value::null(),
-        ncx.memory_manager().clone(),
-    ));
+    let listeners_map = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
     let _ = stream.set(
         PropertyKey::string("__ee_listeners"),
         Value::object(listeners_map),
@@ -1746,15 +1726,16 @@ fn execute_tests_sequentially(
     ncx: &mut NativeContext,
 ) -> Result<(), VmError> {
     // Get lifecycle hooks from registry
-    let (before_hooks, after_hooks, before_each_hooks, after_each_hooks) = TEST_REGISTRY.with(|reg| {
-        let registry = reg.borrow();
-        (
-            registry.before_hooks.clone(),
-            registry.after_hooks.clone(),
-            registry.before_each_hooks.clone(),
-            registry.after_each_hooks.clone(),
-        )
-    });
+    let (before_hooks, after_hooks, before_each_hooks, after_each_hooks) =
+        TEST_REGISTRY.with(|reg| {
+            let registry = reg.borrow();
+            (
+                registry.before_hooks.clone(),
+                registry.after_hooks.clone(),
+                registry.before_each_hooks.clone(),
+                registry.after_each_hooks.clone(),
+            )
+        });
 
     // Execute before hooks (once before all tests)
     for hook in &before_hooks {
@@ -1846,7 +1827,15 @@ fn execute_tests_sequentially(
                             )?;
                         } else if is_thenable(&return_val) {
                             // Async test - need to wait for promise to settle
-                            handle_async_test_result(stream, test, return_val, timeout_ms, test_number, duration_ms, ncx)?;
+                            handle_async_test_result(
+                                stream,
+                                test,
+                                return_val,
+                                timeout_ms,
+                                test_number,
+                                duration_ms,
+                                ncx,
+                            )?;
                         } else {
                             // Sync test - passed
                             emit_test_pass_event(stream, test, test_number, 0, duration_ms, ncx)?;
@@ -1927,10 +1916,7 @@ fn emit_test_event(
     ncx.call_function(
         &emit_fn,
         stream.clone(),
-        &[
-            Value::string(JsString::intern(event_type)),
-            data,
-        ],
+        &[Value::string(JsString::intern(event_type)), data],
     )?;
 
     Ok(())
@@ -1944,19 +1930,13 @@ fn build_test_event_data(
     duration_ms: f64,
     ncx: &NativeContext,
 ) -> Value {
-    let event = GcRef::new(JsObject::new(
-        Value::null(),
-        ncx.memory_manager().clone(),
-    ));
+    let event = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
     let _ = event.set(
         PropertyKey::string("type"),
         Value::string(JsString::intern(event_type)),
     );
 
-    let data = GcRef::new(JsObject::new(
-        Value::null(),
-        ncx.memory_manager().clone(),
-    ));
+    let data = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
     let _ = data.set(
         PropertyKey::string("name"),
         Value::string(JsString::new_gc(&test.name)),
@@ -1984,19 +1964,13 @@ fn emit_test_diagnostic_event(
     test: &TestEntry,
     ncx: &mut NativeContext,
 ) -> Result<(), VmError> {
-    let event = GcRef::new(JsObject::new(
-        Value::null(),
-        ncx.memory_manager().clone(),
-    ));
+    let event = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
     let _ = event.set(
         PropertyKey::string("type"),
         Value::string(JsString::intern("test:diagnostic")),
     );
 
-    let data = GcRef::new(JsObject::new(
-        Value::null(),
-        ncx.memory_manager().clone(),
-    ));
+    let data = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
     let _ = data.set(
         PropertyKey::string("name"),
         Value::string(JsString::new_gc(&test.name)),
@@ -2049,19 +2023,13 @@ fn emit_test_skip_event(
     duration_ms: f64,
     ncx: &mut NativeContext,
 ) -> Result<(), VmError> {
-    let event = GcRef::new(JsObject::new(
-        Value::null(),
-        ncx.memory_manager().clone(),
-    ));
+    let event = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
     let _ = event.set(
         PropertyKey::string("type"),
         Value::string(JsString::intern("test:skip")),
     );
 
-    let data = GcRef::new(JsObject::new(
-        Value::null(),
-        ncx.memory_manager().clone(),
-    ));
+    let data = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
     let _ = data.set(
         PropertyKey::string("name"),
         Value::string(JsString::new_gc(&test.name)),
@@ -2101,10 +2069,7 @@ fn emit_test_skip_event(
     ncx.call_function(
         &emit_fn,
         stream.clone(),
-        &[
-            Value::string(JsString::intern("test:skip")),
-            event_val,
-        ],
+        &[Value::string(JsString::intern("test:skip")), event_val],
     )?;
 
     Ok(())
@@ -2118,7 +2083,15 @@ fn emit_test_pass_event(
     duration_ms: f64,
     ncx: &mut NativeContext,
 ) -> Result<(), VmError> {
-    emit_test_event(stream, "test:pass", test, test_number, nesting, duration_ms, ncx)
+    emit_test_event(
+        stream,
+        "test:pass",
+        test,
+        test_number,
+        nesting,
+        duration_ms,
+        ncx,
+    )
 }
 
 fn emit_test_fail_event(
@@ -2131,19 +2104,13 @@ fn emit_test_fail_event(
     failure_type: &str,
     ncx: &mut NativeContext,
 ) -> Result<(), VmError> {
-    let event = GcRef::new(JsObject::new(
-        Value::null(),
-        ncx.memory_manager().clone(),
-    ));
+    let event = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
     let _ = event.set(
         PropertyKey::string("type"),
         Value::string(JsString::intern("test:fail")),
     );
 
-    let data = GcRef::new(JsObject::new(
-        Value::null(),
-        ncx.memory_manager().clone(),
-    ));
+    let data = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
     let _ = data.set(
         PropertyKey::string("name"),
         Value::string(JsString::new_gc(&test.name)),
@@ -2189,10 +2156,7 @@ fn emit_test_fail_event(
     );
 
     // Feature 4: details with failure type
-    let details = GcRef::new(JsObject::new(
-        Value::null(),
-        ncx.memory_manager().clone(),
-    ));
+    let details = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
     let _ = details.set(
         PropertyKey::string("type"),
         Value::string(JsString::intern(failure_type)),
@@ -2221,10 +2185,7 @@ fn emit_test_fail_event(
     ncx.call_function(
         &emit_fn,
         stream.clone(),
-        &[
-            Value::string(JsString::intern("test:fail")),
-            event_val,
-        ],
+        &[Value::string(JsString::intern("test:fail")), event_val],
     )?;
 
     Ok(())
@@ -2266,7 +2227,14 @@ fn handle_async_test_result(
 
     // Setup timeout
     if timeout_ms > 0.0 && timeout_ms.is_finite() {
-        setup_test_timeout(&stream_clone, test, timeout_ms, timed_out.clone(), test_number, ncx)?;
+        setup_test_timeout(
+            &stream_clone,
+            test,
+            timeout_ms,
+            timed_out.clone(),
+            test_number,
+            ncx,
+        )?;
     }
 
     // Create promise fulfillment handler
@@ -2284,7 +2252,14 @@ fn handle_async_test_result(
             }
 
             // Test passed
-            let _ = emit_test_pass_event(&stream_fulfill, &test_fulfill, test_number, 0, duration_ms, ncx);
+            let _ = emit_test_pass_event(
+                &stream_fulfill,
+                &test_fulfill,
+                test_number,
+                0,
+                duration_ms,
+                ncx,
+            );
             Ok(Value::undefined())
         },
         mm.clone(),
@@ -2331,7 +2306,16 @@ fn handle_async_test_result(
                 stack: vec![],
             }));
 
-            let _ = emit_test_fail_event(&stream_reject, &test_reject, &error, test_number, 0, duration_ms, "testCodeFailure", ncx);
+            let _ = emit_test_fail_event(
+                &stream_reject,
+                &test_reject,
+                &error,
+                test_number,
+                0,
+                duration_ms,
+                "testCodeFailure",
+                ncx,
+            );
             Ok(Value::undefined())
         },
         mm,
@@ -2389,11 +2373,18 @@ fn setup_test_timeout(
                 let _ = flag.set(PropertyKey::string("value"), Value::boolean(true));
 
                 // Emit test:fail with timeout error
-                let timeout_error = VmError::type_error(&format!(
-                    "test timed out after {}ms",
-                    timeout_ms
-                ));
-                let _ = emit_test_fail_event(&stream_clone, &test_clone, &timeout_error, test_number, 0, timeout_ms, "testCodeFailure", ncx);
+                let timeout_error =
+                    VmError::type_error(&format!("test timed out after {}ms", timeout_ms));
+                let _ = emit_test_fail_event(
+                    &stream_clone,
+                    &test_clone,
+                    &timeout_error,
+                    test_number,
+                    0,
+                    timeout_ms,
+                    "testCodeFailure",
+                    ncx,
+                );
             }
 
             Ok(Value::undefined())

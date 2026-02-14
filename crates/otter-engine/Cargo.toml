@@ -10,6 +10,10 @@ keywords = ["typescript", "javascript", "runtime", "engine", "vm"]
 categories = ["development-tools", "compilers"]
 readme = "README.md"
 
+[features]
+default = []
+jit = ["otter-vm-core/jit"]
+
 [dependencies]
 # VM crates (re-exported for convenience)
 otter-vm-runtime = { path = "../otter-vm-runtime" }

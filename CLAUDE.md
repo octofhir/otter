@@ -202,6 +202,7 @@ fn process(value: &Value, depth: usize) -> Result<(), Error> {
 3. **Safety boundaries**: Follow `unsafe` rules and GC invariants in AGENTS.md
 4. **Update the triangle**: Keep runtime ↔ TypeScript `.d.ts` ↔ tests in sync
 5. **AST-first parsing**: Use `oxc` for JS/TS analysis; never regex parsing
+6. **Conformance first**: Check `ES_CONFORMANCE.md` before and after feature work. Track pass rate deltas.
 
 ## Current Work
 

@@ -233,7 +233,11 @@ async fn main() -> Result<()> {
     match &cli.command {
         Some(Commands::Run { file }) => run_file(file, &cli).await,
         Some(Commands::Repl) => run_repl(&cli).await,
-        Some(Commands::Test { paths, filter, watch }) => run_tests(paths, filter.as_deref(), *watch, &cli).await,
+        Some(Commands::Test {
+            paths,
+            filter,
+            watch,
+        }) => run_tests(paths, filter.as_deref(), *watch, &cli).await,
         Some(Commands::Check { files }) => {
             // Type checking stub - tsgo integration pending
             println!("Type checking: {:?}", files);
@@ -887,7 +891,10 @@ async fn run_test_file(
 
     // Build filter pattern for test.run()
     let filter_opt = match filter {
-        Some(f) => format!("{{ testNamePattern: \"{}\" }}", f.replace('\\', "\\\\").replace('"', "\\\"")),
+        Some(f) => format!(
+            "{{ testNamePattern: \"{}\" }}",
+            f.replace('\\', "\\\\").replace('"', "\\\"")
+        ),
         None => "{}".to_string(),
     };
 
@@ -944,11 +951,15 @@ stream.on("test:diagnostic", (event) => {{
     );
 
     // Use file:// URL as source_url for the wrapper so imports resolve correctly
-    let wrapper_url = format!("file://{}", abs_test_path.parent()
-        .unwrap_or(abs_test_path.as_path())
-        .join("__test_harness__.js")
-        .to_string_lossy()
-        .replace('\\', "/"));
+    let wrapper_url = format!(
+        "file://{}",
+        abs_test_path
+            .parent()
+            .unwrap_or(abs_test_path.as_path())
+            .join("__test_harness__.js")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
 
     // Run the test harness
     match engine.eval(&test_harness, Some(&wrapper_url)).await {

@@ -130,6 +130,7 @@ mod tests {
     fn basic_compile() {
         let function = Function::builder()
             .name("basic_compile")
+            .register_count(1)
             .instruction(Instruction::LoadInt32 {
                 dst: Register(0),
                 value: 7,

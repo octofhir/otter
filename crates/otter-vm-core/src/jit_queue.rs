@@ -27,15 +27,20 @@ fn queue_state() -> &'static Mutex<JitQueueState> {
     JIT_QUEUE.get_or_init(|| Mutex::new(JitQueueState::default()))
 }
 
+/// Lock the queue state, recovering from poisoned mutex (test resilience).
+fn lock_queue() -> std::sync::MutexGuard<'static, JitQueueState> {
+    queue_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(crate) fn enqueue_hot_function(
     module: &Arc<Module>,
     function_index: u32,
     function: &Function,
 ) -> bool {
     let key = (Arc::as_ptr(module) as usize, function_index);
-    let mut state = queue_state()
-        .lock()
-        .expect("jit queue mutex should not be poisoned");
+    let mut state = lock_queue();
 
     if !state.enqueued.insert(key) {
         return false;
@@ -53,9 +58,7 @@ pub(crate) fn enqueue_hot_function(
 }
 
 pub(crate) fn pop_next_request() -> Option<JitCompileRequest> {
-    let mut state = queue_state()
-        .lock()
-        .expect("jit queue mutex should not be poisoned");
+    let mut state = lock_queue();
 
     let next = state.pending.pop_front()?;
     state
@@ -65,17 +68,13 @@ pub(crate) fn pop_next_request() -> Option<JitCompileRequest> {
 }
 
 pub(crate) fn pending_count() -> usize {
-    let state = queue_state()
-        .lock()
-        .expect("jit queue mutex should not be poisoned");
+    let state = lock_queue();
     state.pending.len()
 }
 
 #[cfg(test)]
 pub(crate) fn clear_for_tests() {
-    let mut state = queue_state()
-        .lock()
-        .expect("jit queue mutex should not be poisoned");
+    let mut state = lock_queue();
     state.pending.clear();
     state.enqueued.clear();
 }

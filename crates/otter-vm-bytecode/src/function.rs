@@ -381,6 +381,14 @@ pub struct Function {
     /// Whether this function has been marked as hot (candidate for JIT)
     #[serde(skip)]
     pub is_hot: std::sync::atomic::AtomicBool,
+
+    /// Number of times JIT code bailed out to the interpreter
+    #[serde(skip)]
+    pub bailout_count: AtomicU32,
+
+    /// Whether this function has been deoptimized (JIT code invalidated permanently)
+    #[serde(skip)]
+    pub is_deoptimized: std::sync::atomic::AtomicBool,
 }
 
 impl Function {
@@ -462,6 +470,33 @@ impl Function {
     pub fn mark_hot(&self) {
         self.is_hot.store(true, Ordering::Release);
     }
+
+    /// Record a JIT bailout. Returns `true` if this bailout caused deoptimization
+    /// (bailout count crossed the threshold).
+    #[inline]
+    pub fn record_bailout(&self, deopt_threshold: u32) -> bool {
+        let prev = self.bailout_count.fetch_add(1, Ordering::Relaxed);
+        let new_count = prev.saturating_add(1);
+        if new_count >= deopt_threshold {
+            self.is_deoptimized
+                .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+        } else {
+            false
+        }
+    }
+
+    /// Get the current bailout count
+    #[inline]
+    pub fn get_bailout_count(&self) -> u32 {
+        self.bailout_count.load(Ordering::Relaxed)
+    }
+
+    /// Check if this function has been deoptimized
+    #[inline]
+    pub fn is_deoptimized(&self) -> bool {
+        self.is_deoptimized.load(Ordering::Relaxed)
+    }
 }
 
 impl Clone for Function {
@@ -481,6 +516,11 @@ impl Clone for Function {
             // Clone resets call statistics (new clone starts fresh)
             call_count: AtomicU32::new(0),
             is_hot: std::sync::atomic::AtomicBool::new(false),
+            // Preserve bailout state — deoptimized functions must stay deoptimized
+            bailout_count: AtomicU32::new(self.bailout_count.load(Ordering::Relaxed)),
+            is_deoptimized: std::sync::atomic::AtomicBool::new(
+                self.is_deoptimized.load(Ordering::Relaxed),
+            ),
         }
     }
 }
@@ -637,6 +677,8 @@ impl FunctionBuilder {
             local_names: self.local_names,
             call_count: AtomicU32::new(0),
             is_hot: std::sync::atomic::AtomicBool::new(false),
+            bailout_count: AtomicU32::new(0),
+            is_deoptimized: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }

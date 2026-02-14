@@ -199,6 +199,8 @@ pub struct Intrinsics {
     pub uri_error_prototype: GcRef<JsObject>,
     /// `EvalError.prototype`
     pub eval_error_prototype: GcRef<JsObject>,
+    /// `AggregateError.prototype`
+    pub aggregate_error_prototype: GcRef<JsObject>,
 
     // ========================================================================
     // Async/Promise
@@ -227,6 +229,10 @@ pub struct Intrinsics {
     // ========================================================================
     /// `%IteratorPrototype%` — base for all iterator prototypes
     pub iterator_prototype: GcRef<JsObject>,
+    /// `%StringIteratorPrototype%` — prototype for string iterators
+    pub string_iterator_prototype: GcRef<JsObject>,
+    /// `%ArrayIteratorPrototype%` — prototype for array iterators
+    pub array_iterator_prototype: GcRef<JsObject>,
     /// `%AsyncIteratorPrototype%`
     pub async_iterator_prototype: GcRef<JsObject>,
 
@@ -325,6 +331,7 @@ impl Intrinsics {
             "SyntaxError" => Some(self.syntax_error_prototype),
             "URIError" => Some(self.uri_error_prototype),
             "EvalError" => Some(self.eval_error_prototype),
+            "AggregateError" => Some(self.aggregate_error_prototype),
             "String" => Some(self.string_prototype),
             "Number" => Some(self.number_prototype),
             "Boolean" => Some(self.boolean_prototype),
@@ -396,6 +403,7 @@ impl Intrinsics {
             syntax_error_prototype: alloc(),
             uri_error_prototype: alloc(),
             eval_error_prototype: alloc(),
+            aggregate_error_prototype: alloc(),
             // Promise
             promise_prototype: alloc(),
             // Other
@@ -407,6 +415,8 @@ impl Intrinsics {
             abort_signal_prototype: alloc(),
             // Iterators
             iterator_prototype: alloc(),
+            string_iterator_prototype: alloc(),
+            array_iterator_prototype: alloc(),
             async_iterator_prototype: alloc(),
             // Generators
             generator_prototype: alloc(),
@@ -468,6 +478,7 @@ impl Intrinsics {
             result.syntax_error_prototype,
             result.uri_error_prototype,
             result.eval_error_prototype,
+            result.aggregate_error_prototype,
             result.promise_prototype,
             result.regexp_prototype,
             result.date_prototype,
@@ -476,6 +487,8 @@ impl Intrinsics {
             result.abort_controller_prototype,
             result.abort_signal_prototype,
             result.iterator_prototype,
+            result.string_iterator_prototype,
+            result.array_iterator_prototype,
             result.async_iterator_prototype,
             result.generator_prototype,
             result.async_generator_prototype,
@@ -559,6 +572,7 @@ impl Intrinsics {
             self.syntax_error_prototype,
             self.uri_error_prototype,
             self.eval_error_prototype,
+            self.aggregate_error_prototype,
         ];
         for proto in &error_protos {
             proto.set_prototype(Value::object(self.error_prototype));
@@ -640,6 +654,7 @@ impl Intrinsics {
             self.syntax_error_prototype,
             self.uri_error_prototype,
             self.eval_error_prototype,
+            self.aggregate_error_prototype,
             fn_proto,
             mm,
         );
@@ -662,7 +677,7 @@ impl Intrinsics {
             self.string_prototype,
             fn_proto,
             mm,
-            self.iterator_prototype,
+            self.string_iterator_prototype,
             well_known::iterator_symbol(),
         );
 
@@ -718,6 +733,229 @@ impl Intrinsics {
         }
 
         // ====================================================================
+        // %StringIteratorPrototype% — prototype = %IteratorPrototype%
+        // ====================================================================
+        self.string_iterator_prototype
+            .set_prototype(Value::object(self.iterator_prototype));
+        {
+            use crate::object::{PropertyAttributes, PropertyDescriptor, PropertyKey};
+            use crate::string::JsString;
+            // next() method
+            self.string_iterator_prototype.define_property(
+                PropertyKey::string("next"),
+                PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                    |this_val, _args, ncx| {
+                        let iter_obj = this_val
+                            .as_object()
+                            .ok_or_else(|| VmError::type_error("not an iterator object"))?;
+                        let string = iter_obj
+                            .get(&PropertyKey::string("__string_ref__"))
+                            .and_then(|v| v.as_string())
+                            .ok_or_else(|| VmError::type_error("iterator: missing string ref"))?;
+                        let idx = iter_obj
+                            .get(&PropertyKey::string("__string_index__"))
+                            .and_then(|v| v.as_number())
+                            .unwrap_or(0.0) as usize;
+
+                        let units = string.as_utf16();
+                        let len = units.len();
+
+                        if idx >= len {
+                            let result = GcRef::new(JsObject::new(
+                                Value::null(),
+                                ncx.memory_manager().clone(),
+                            ));
+                            let _ = result.set(PropertyKey::string("value"), Value::undefined());
+                            let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
+                            return Ok(Value::object(result));
+                        }
+
+                        let first = units[idx];
+                        let (char_string, next_idx) =
+                            if crate::intrinsics_impl::string::is_high_surrogate(first)
+                                && idx + 1 < len
+                                && crate::intrinsics_impl::string::is_low_surrogate(units[idx + 1])
+                            {
+                                let pair = vec![first, units[idx + 1]];
+                                let char_str = String::from_utf16_lossy(&pair);
+                                (JsString::intern(&char_str), idx + 2)
+                            } else {
+                                let single = vec![first];
+                                let char_str = String::from_utf16_lossy(&single);
+                                (JsString::intern(&char_str), idx + 1)
+                            };
+
+                        let _ = iter_obj.set(
+                            PropertyKey::string("__string_index__"),
+                            Value::number(next_idx as f64),
+                        );
+
+                        let result =
+                            GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                        let _ =
+                            result.set(PropertyKey::string("value"), Value::string(char_string));
+                        let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
+                        Ok(Value::object(result))
+                    },
+                    mm.clone(),
+                    fn_proto,
+                )),
+            );
+            // Symbol.toStringTag
+            {
+                let tag_sym = well_known::to_string_tag_symbol();
+                self.string_iterator_prototype.define_property(
+                    PropertyKey::Symbol(tag_sym),
+                    PropertyDescriptor::Data {
+                        value: Value::string(JsString::intern("String Iterator")),
+                        attributes: PropertyAttributes {
+                            writable: false,
+                            enumerable: false,
+                            configurable: true,
+                        },
+                    },
+                );
+            }
+        }
+
+        // ====================================================================
+        // %ArrayIteratorPrototype% — prototype = %IteratorPrototype%
+        // ====================================================================
+        self.array_iterator_prototype
+            .set_prototype(Value::object(self.iterator_prototype));
+        {
+            use crate::object::{PropertyAttributes, PropertyDescriptor, PropertyKey};
+            use crate::string::JsString;
+            // next() method
+            self.array_iterator_prototype.define_property(
+                PropertyKey::string("next"),
+                PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                    |this_val, _args, ncx| {
+                        let iter_obj = this_val
+                            .as_object()
+                            .ok_or_else(|| VmError::type_error("not an iterator object"))?;
+                        let arr_val = iter_obj
+                            .get(&PropertyKey::string("__array_ref__"))
+                            .ok_or_else(|| VmError::type_error("iterator: missing array ref"))?;
+                        let idx = iter_obj
+                            .get(&PropertyKey::string("__array_index__"))
+                            .and_then(|v| v.as_number())
+                            .unwrap_or(0.0) as usize;
+                        let len = {
+                            let key = PropertyKey::string("length");
+                            let len_val = if let Some(proxy) = arr_val.as_proxy() {
+                                let key_value = Value::string(JsString::intern("length"));
+                                crate::proxy_operations::proxy_get(
+                                    ncx,
+                                    proxy,
+                                    &key,
+                                    key_value,
+                                    arr_val.clone(),
+                                )?
+                            } else if let Some(arr_obj) = arr_val.as_object() {
+                                arr_obj.get(&key).unwrap_or(Value::undefined())
+                            } else {
+                                return Err(VmError::type_error("iterator: missing array ref"));
+                            };
+                            len_val.as_number().unwrap_or(0.0).max(0.0) as usize
+                        };
+                        let kind = iter_obj
+                            .get(&PropertyKey::string("__iter_kind__"))
+                            .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
+                            .unwrap_or_else(|| "value".to_string());
+
+                        if idx >= len {
+                            let result = GcRef::new(JsObject::new(
+                                Value::null(),
+                                ncx.memory_manager().clone(),
+                            ));
+                            let _ = result.set(PropertyKey::string("value"), Value::undefined());
+                            let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
+                            return Ok(Value::object(result));
+                        }
+
+                        let _ = iter_obj.set(
+                            PropertyKey::string("__array_index__"),
+                            Value::number((idx + 1) as f64),
+                        );
+
+                        let result =
+                            GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                        match kind.as_str() {
+                            "key" => {
+                                let _ = result
+                                    .set(PropertyKey::string("value"), Value::number(idx as f64));
+                            }
+                            "entry" => {
+                                let entry =
+                                    GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
+                                let _ = entry.set(PropertyKey::Index(0), Value::number(idx as f64));
+                                let elem_val = if let Some(proxy) = arr_val.as_proxy() {
+                                    let key = PropertyKey::Index(idx as u32);
+                                    let key_value = Value::number(idx as f64);
+                                    crate::proxy_operations::proxy_get(
+                                        ncx,
+                                        proxy,
+                                        &key,
+                                        key_value,
+                                        arr_val.clone(),
+                                    )?
+                                } else if let Some(arr_obj) = arr_val.as_object() {
+                                    arr_obj
+                                        .get(&PropertyKey::Index(idx as u32))
+                                        .unwrap_or(Value::undefined())
+                                } else {
+                                    Value::undefined()
+                                };
+                                let _ = entry.set(PropertyKey::Index(1), elem_val);
+                                let _ =
+                                    result.set(PropertyKey::string("value"), Value::array(entry));
+                            }
+                            _ => {
+                                // "value" kind
+                                let elem_val = if let Some(proxy) = arr_val.as_proxy() {
+                                    let key = PropertyKey::Index(idx as u32);
+                                    let key_value = Value::number(idx as f64);
+                                    crate::proxy_operations::proxy_get(
+                                        ncx,
+                                        proxy,
+                                        &key,
+                                        key_value,
+                                        arr_val.clone(),
+                                    )?
+                                } else if let Some(arr_obj) = arr_val.as_object() {
+                                    arr_obj
+                                        .get(&PropertyKey::Index(idx as u32))
+                                        .unwrap_or(Value::undefined())
+                                } else {
+                                    Value::undefined()
+                                };
+                                let _ = result.set(PropertyKey::string("value"), elem_val);
+                            }
+                        }
+                        let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
+                        Ok(Value::object(result))
+                    },
+                    mm.clone(),
+                    fn_proto,
+                )),
+            );
+            // Symbol.toStringTag
+            {
+                let tag_sym = well_known::to_string_tag_symbol();
+                self.array_iterator_prototype.define_property(
+                    PropertyKey::Symbol(tag_sym),
+                    PropertyDescriptor::Data {
+                        value: Value::string(JsString::intern("Array Iterator")),
+                        attributes: PropertyAttributes {
+                            writable: false,
+                            enumerable: false,
+                            configurable: true,
+                        },
+                    },
+                );
+            }
+        }
 
         // ===================================================================
         // Array.prototype methods (extracted to intrinsics_impl/array.rs)
@@ -729,7 +967,7 @@ impl Intrinsics {
             self.array_prototype,
             fn_proto,
             mm,
-            self.iterator_prototype,
+            self.array_iterator_prototype,
             well_known::iterator_symbol(),
         );
 
@@ -822,6 +1060,397 @@ impl Intrinsics {
             TypedArrayKind::Uint8,
             well_known::to_string_tag_symbol(),
         );
+
+        // ===================================================================
+        // ArrayBuffer.prototype
+        // ===================================================================
+        {
+            use crate::object::{PropertyAttributes, PropertyDescriptor, PropertyKey};
+            use crate::string::JsString;
+            let ab_proto = self.array_buffer_prototype;
+            // byteLength getter
+            ab_proto.define_property(
+                PropertyKey::string("byteLength"),
+                PropertyDescriptor::Accessor {
+                    get: Some(Value::native_function_with_proto(
+                        |this_val, _, _ncx| {
+                            if let Some(ab) = this_val.as_array_buffer() {
+                                Ok(Value::number(ab.byte_length() as f64))
+                            } else {
+                                Err(VmError::type_error("not an ArrayBuffer"))
+                            }
+                        },
+                        mm.clone(),
+                        fn_proto,
+                    )),
+                    set: None,
+                    attributes: PropertyAttributes::builtin_method(),
+                },
+            );
+            // slice method
+            ab_proto.define_property(
+                PropertyKey::string("slice"),
+                PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                    |this_val, args, ncx| {
+                        use crate::array_buffer::JsArrayBuffer;
+                        let ab = this_val
+                            .as_array_buffer()
+                            .ok_or_else(|| VmError::type_error("not an ArrayBuffer"))?;
+                        let len = ab.byte_length();
+                        let start = args
+                            .first()
+                            .map(|v| {
+                                let n = crate::globals::to_number(v) as isize;
+                                if n < 0 {
+                                    (len as isize + n).max(0) as usize
+                                } else {
+                                    n.min(len as isize) as usize
+                                }
+                            })
+                            .unwrap_or(0);
+                        let end = args
+                            .get(1)
+                            .map(|v| {
+                                let n = crate::globals::to_number(v) as isize;
+                                if n < 0 {
+                                    (len as isize + n).max(0) as usize
+                                } else {
+                                    n.min(len as isize) as usize
+                                }
+                            })
+                            .unwrap_or(len);
+                        let new_len = if end > start { end - start } else { 0 };
+                        let new_ab = GcRef::new(JsArrayBuffer::new(
+                            new_len,
+                            None,
+                            ncx.memory_manager().clone(),
+                        ));
+                        if new_len > 0 {
+                            ab.with_data(|src| {
+                                new_ab.with_data_mut(|dst| {
+                                    dst[..new_len].copy_from_slice(&src[start..start + new_len]);
+                                });
+                            });
+                        }
+                        Ok(Value::array_buffer(new_ab))
+                    },
+                    mm.clone(),
+                    fn_proto,
+                )),
+            );
+            // Symbol.toStringTag
+            ab_proto.define_property(
+                PropertyKey::Symbol(well_known::to_string_tag_symbol()),
+                PropertyDescriptor::data_with_attrs(
+                    Value::string(JsString::intern("ArrayBuffer")),
+                    PropertyAttributes {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                ),
+            );
+        }
+
+        // ===================================================================
+        // DataView.prototype
+        // ===================================================================
+        {
+            use crate::object::{PropertyAttributes, PropertyDescriptor, PropertyKey};
+            use crate::string::JsString;
+            let dv_proto = self.data_view_prototype;
+
+            // Helper macro for DataView getter/setter method wiring
+            macro_rules! dv_getter {
+                ($name:expr, $method:ident, $size:ty) => {
+                    dv_proto.define_property(
+                        PropertyKey::string($name),
+                        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                            |this_val, args, _ncx| {
+                                let dv = this_val
+                                    .as_data_view()
+                                    .ok_or_else(|| VmError::type_error("not a DataView"))?;
+                                let offset = args
+                                    .first()
+                                    .map(|v| crate::globals::to_number(v) as usize)
+                                    .unwrap_or(0);
+                                let little_endian =
+                                    args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
+                                let val = dv
+                                    .$method(offset, little_endian)
+                                    .map_err(|e| VmError::type_error(e))?;
+                                Ok(Value::number(val as f64))
+                            },
+                            mm.clone(),
+                            fn_proto,
+                        )),
+                    );
+                };
+                // 1-byte variants (no endianness parameter)
+                ($name:expr, $method:ident) => {
+                    dv_proto.define_property(
+                        PropertyKey::string($name),
+                        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                            |this_val, args, _ncx| {
+                                let dv = this_val
+                                    .as_data_view()
+                                    .ok_or_else(|| VmError::type_error("not a DataView"))?;
+                                let offset = args
+                                    .first()
+                                    .map(|v| crate::globals::to_number(v) as usize)
+                                    .unwrap_or(0);
+                                let val = dv.$method(offset).map_err(|e| VmError::type_error(e))?;
+                                Ok(Value::number(val as f64))
+                            },
+                            mm.clone(),
+                            fn_proto,
+                        )),
+                    );
+                };
+            }
+
+            macro_rules! dv_setter {
+                ($name:expr, $method:ident, $conv:expr) => {
+                    dv_proto.define_property(
+                        PropertyKey::string($name),
+                        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                            |this_val, args, _ncx| {
+                                let dv = this_val
+                                    .as_data_view()
+                                    .ok_or_else(|| VmError::type_error("not a DataView"))?;
+                                let offset = args
+                                    .first()
+                                    .map(|v| crate::globals::to_number(v) as usize)
+                                    .unwrap_or(0);
+                                let raw = args
+                                    .get(1)
+                                    .map(|v| crate::globals::to_number(v))
+                                    .unwrap_or(0.0);
+                                let little_endian =
+                                    args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
+                                let val = ($conv)(raw);
+                                dv.$method(offset, val, little_endian)
+                                    .map_err(|e| VmError::type_error(e))?;
+                                Ok(Value::undefined())
+                            },
+                            mm.clone(),
+                            fn_proto,
+                        )),
+                    );
+                };
+                // 1-byte variants (no endianness parameter)
+                ($name:expr, $method:ident, $conv:expr, no_endian) => {
+                    dv_proto.define_property(
+                        PropertyKey::string($name),
+                        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                            |this_val, args, _ncx| {
+                                let dv = this_val
+                                    .as_data_view()
+                                    .ok_or_else(|| VmError::type_error("not a DataView"))?;
+                                let offset = args
+                                    .first()
+                                    .map(|v| crate::globals::to_number(v) as usize)
+                                    .unwrap_or(0);
+                                let raw = args
+                                    .get(1)
+                                    .map(|v| crate::globals::to_number(v))
+                                    .unwrap_or(0.0);
+                                let val = ($conv)(raw);
+                                dv.$method(offset, val)
+                                    .map_err(|e| VmError::type_error(e))?;
+                                Ok(Value::undefined())
+                            },
+                            mm.clone(),
+                            fn_proto,
+                        )),
+                    );
+                };
+            }
+
+            // Getters
+            dv_getter!("getInt8", get_int8);
+            dv_getter!("getUint8", get_uint8);
+            dv_getter!("getInt16", get_int16, i16);
+            dv_getter!("getUint16", get_uint16, u16);
+            dv_getter!("getInt32", get_int32, i32);
+            dv_getter!("getUint32", get_uint32, u32);
+            dv_getter!("getFloat32", get_float32, f32);
+            dv_getter!("getFloat64", get_float64, f64);
+
+            // Setters
+            dv_setter!("setInt8", set_int8, |v: f64| v as i8, no_endian);
+            dv_setter!("setUint8", set_uint8, |v: f64| v as u8, no_endian);
+            dv_setter!("setInt16", set_int16, |v: f64| v as i16);
+            dv_setter!("setUint16", set_uint16, |v: f64| v as u16);
+            dv_setter!("setInt32", set_int32, |v: f64| v as i32);
+            dv_setter!("setUint32", set_uint32, |v: f64| v as u32);
+            dv_setter!("setFloat32", set_float32, |v: f64| v as f32);
+            dv_setter!("setFloat64", set_float64, |v: f64| v as f64);
+
+            // BigInt getters — return BigInt values
+            dv_proto.define_property(
+                PropertyKey::string("getBigInt64"),
+                PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                    |this_val, args, _ncx| {
+                        let dv = this_val
+                            .as_data_view()
+                            .ok_or_else(|| VmError::type_error("not a DataView"))?;
+                        let offset = args
+                            .first()
+                            .map(|v| crate::globals::to_number(v) as usize)
+                            .unwrap_or(0);
+                        let little_endian =
+                            args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
+                        let val = dv
+                            .get_big_int64(offset, little_endian)
+                            .map_err(|e| VmError::type_error(e))?;
+                        Ok(Value::bigint(val.to_string()))
+                    },
+                    mm.clone(),
+                    fn_proto,
+                )),
+            );
+            dv_proto.define_property(
+                PropertyKey::string("getBigUint64"),
+                PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                    |this_val, args, _ncx| {
+                        let dv = this_val
+                            .as_data_view()
+                            .ok_or_else(|| VmError::type_error("not a DataView"))?;
+                        let offset = args
+                            .first()
+                            .map(|v| crate::globals::to_number(v) as usize)
+                            .unwrap_or(0);
+                        let little_endian =
+                            args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
+                        let val = dv
+                            .get_big_uint64(offset, little_endian)
+                            .map_err(|e| VmError::type_error(e))?;
+                        Ok(Value::bigint(val.to_string()))
+                    },
+                    mm.clone(),
+                    fn_proto,
+                )),
+            );
+
+            // BigInt setters
+            dv_proto.define_property(
+                PropertyKey::string("setBigInt64"),
+                PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                    |this_val, args, _ncx| {
+                        let dv = this_val
+                            .as_data_view()
+                            .ok_or_else(|| VmError::type_error("not a DataView"))?;
+                        let offset = args
+                            .first()
+                            .map(|v| crate::globals::to_number(v) as usize)
+                            .unwrap_or(0);
+                        let val = args
+                            .get(1)
+                            .map(|v| crate::globals::to_number(v) as i64)
+                            .unwrap_or(0);
+                        let little_endian =
+                            args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
+                        dv.set_big_int64(offset, val, little_endian)
+                            .map_err(|e| VmError::type_error(e))?;
+                        Ok(Value::undefined())
+                    },
+                    mm.clone(),
+                    fn_proto,
+                )),
+            );
+            dv_proto.define_property(
+                PropertyKey::string("setBigUint64"),
+                PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                    |this_val, args, _ncx| {
+                        let dv = this_val
+                            .as_data_view()
+                            .ok_or_else(|| VmError::type_error("not a DataView"))?;
+                        let offset = args
+                            .first()
+                            .map(|v| crate::globals::to_number(v) as usize)
+                            .unwrap_or(0);
+                        let val = args
+                            .get(1)
+                            .map(|v| crate::globals::to_number(v) as u64)
+                            .unwrap_or(0);
+                        let little_endian =
+                            args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
+                        dv.set_big_uint64(offset, val, little_endian)
+                            .map_err(|e| VmError::type_error(e))?;
+                        Ok(Value::undefined())
+                    },
+                    mm.clone(),
+                    fn_proto,
+                )),
+            );
+
+            // Property getters: buffer, byteLength, byteOffset
+            dv_proto.define_property(
+                PropertyKey::string("buffer"),
+                PropertyDescriptor::Accessor {
+                    get: Some(Value::native_function_with_proto(
+                        |this_val, _, _ncx| {
+                            let dv = this_val
+                                .as_data_view()
+                                .ok_or_else(|| VmError::type_error("not a DataView"))?;
+                            Ok(Value::array_buffer(dv.buffer()))
+                        },
+                        mm.clone(),
+                        fn_proto,
+                    )),
+                    set: None,
+                    attributes: PropertyAttributes::builtin_method(),
+                },
+            );
+            dv_proto.define_property(
+                PropertyKey::string("byteLength"),
+                PropertyDescriptor::Accessor {
+                    get: Some(Value::native_function_with_proto(
+                        |this_val, _, _ncx| {
+                            let dv = this_val
+                                .as_data_view()
+                                .ok_or_else(|| VmError::type_error("not a DataView"))?;
+                            Ok(Value::number(dv.byte_length() as f64))
+                        },
+                        mm.clone(),
+                        fn_proto,
+                    )),
+                    set: None,
+                    attributes: PropertyAttributes::builtin_method(),
+                },
+            );
+            dv_proto.define_property(
+                PropertyKey::string("byteOffset"),
+                PropertyDescriptor::Accessor {
+                    get: Some(Value::native_function_with_proto(
+                        |this_val, _, _ncx| {
+                            let dv = this_val
+                                .as_data_view()
+                                .ok_or_else(|| VmError::type_error("not a DataView"))?;
+                            Ok(Value::number(dv.byte_offset() as f64))
+                        },
+                        mm.clone(),
+                        fn_proto,
+                    )),
+                    set: None,
+                    attributes: PropertyAttributes::builtin_method(),
+                },
+            );
+
+            // Symbol.toStringTag
+            dv_proto.define_property(
+                PropertyKey::Symbol(well_known::to_string_tag_symbol()),
+                PropertyDescriptor::data_with_attrs(
+                    Value::string(JsString::intern("DataView")),
+                    PropertyAttributes {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                ),
+            );
+        }
 
         // ===================================================================
         // AbortController / AbortSignal
@@ -1205,6 +1834,46 @@ impl Intrinsics {
             )),
         );
 
+        // String.raw(template, ...substitutions) — §22.1.2.4
+        string_ctor.define_property(
+            PropertyKey::string("raw"),
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                |_this, args, _ncx| {
+                    let template = args.first().and_then(|v| v.as_object()).ok_or_else(|| {
+                        VmError::type_error("String.raw requires a template object")
+                    })?;
+                    let raw = template
+                        .get(&PropertyKey::string("raw"))
+                        .ok_or_else(|| VmError::type_error("Template must have a raw property"))?;
+                    let raw_obj = raw
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("raw must be an object"))?;
+                    let len = raw_obj
+                        .get(&PropertyKey::string("length"))
+                        .and_then(|v| v.as_number())
+                        .unwrap_or(0.0) as usize;
+                    if len == 0 {
+                        return Ok(Value::string(JsString::intern("")));
+                    }
+                    let mut result = String::new();
+                    for i in 0..len {
+                        if i > 0 {
+                            // Insert substitution
+                            if let Some(sub) = args.get(i) {
+                                result.push_str(&crate::globals::to_string(sub));
+                            }
+                        }
+                        if let Some(segment) = raw_obj.get(&PropertyKey::Index(i as u32)) {
+                            result.push_str(&crate::globals::to_string(&segment));
+                        }
+                    }
+                    Ok(Value::string(JsString::intern(&result)))
+                },
+                mm.clone(),
+                fn_proto,
+            )),
+        );
+
         // Number
         let number_ctor = alloc_ctor();
         let number_ctor_fn: Box<
@@ -1437,6 +2106,14 @@ impl Intrinsics {
             )),
         );
 
+        let aggregate_error_ctor = alloc_ctor();
+        install(
+            "AggregateError",
+            aggregate_error_ctor,
+            self.aggregate_error_prototype,
+            Some(crate::intrinsics_impl::error::create_aggregate_error_constructor()),
+        );
+
         // ====================================================================
         // Other builtins
         // ====================================================================
@@ -1447,7 +2124,12 @@ impl Intrinsics {
             self.promise_prototype,
             Some(crate::intrinsics_impl::promise::create_promise_constructor()),
         );
-        crate::intrinsics_impl::promise::install_promise_statics(promise_ctor, fn_proto, mm);
+        crate::intrinsics_impl::promise::install_promise_statics(
+            promise_ctor,
+            fn_proto,
+            mm,
+            self.aggregate_error_prototype,
+        );
         crate::intrinsics_impl::helpers::define_species_getter(promise_ctor, fn_proto, mm);
 
         let regexp_ctor = alloc_ctor();
@@ -1488,11 +2170,60 @@ impl Intrinsics {
             "ArrayBuffer",
             array_buffer_ctor,
             self.array_buffer_prototype,
-            None,
+            Some(Box::new(|this, args: &[Value], ncx| {
+                use crate::array_buffer::JsArrayBuffer;
+                use crate::globals::to_number;
+
+                let len = if let Some(arg) = args.first() {
+                    let n = to_number(arg);
+                    if n.is_nan() || n < 0.0 || n > 1_073_741_824.0 {
+                        return Err(VmError::range_error("Invalid array buffer length"));
+                    }
+                    n as usize
+                } else {
+                    0
+                };
+
+                // Get prototype from `this` (set by Construct handler)
+                let proto = this.as_object().map(|o| o.prototype());
+                let ab = GcRef::new(JsArrayBuffer::new(len, None, ncx.memory_manager().clone()));
+                // Set the correct prototype on the ArrayBuffer's internal object
+                if let Some(p) = proto {
+                    ab.object.set_prototype(p);
+                }
+                Ok(Value::array_buffer(ab))
+            })),
         );
 
         let data_view_ctor = alloc_ctor();
-        install("DataView", data_view_ctor, self.data_view_prototype, None);
+        install(
+            "DataView",
+            data_view_ctor,
+            self.data_view_prototype,
+            Some(Box::new(|_this, args: &[Value], ncx| {
+                use crate::data_view::JsDataView;
+
+                let buffer = args
+                    .first()
+                    .and_then(|v| v.as_array_buffer())
+                    .ok_or_else(|| {
+                        VmError::type_error(
+                            "First argument to DataView constructor must be an ArrayBuffer",
+                        )
+                    })?;
+
+                let byte_offset = args
+                    .get(1)
+                    .map(|v| crate::globals::to_number(v) as usize)
+                    .unwrap_or(0);
+
+                let byte_length = args.get(2).map(|v| crate::globals::to_number(v) as usize);
+
+                let dv = JsDataView::new(buffer.clone(), byte_offset, byte_length)
+                    .map_err(|e| VmError::type_error(e))?;
+                Ok(Value::data_view(GcRef::new(dv)))
+            })),
+        );
 
         // ====================================================================
         // Non-constructor namespace objects

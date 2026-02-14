@@ -3689,7 +3689,15 @@ impl Interpreter {
                         Ok(v) => v,
                         Err(e) => return Err(e),
                     };
-                    let final_value = if result.is_object() {
+                    // Per spec, if the constructor returns an object, use it;
+                    // otherwise use the newly created `this` object.
+                    // DataView, ArrayBuffer, and TypedArray are object-like
+                    // heap values that must be recognized here too.
+                    let final_value = if result.is_object()
+                        || result.is_data_view()
+                        || result.is_array_buffer()
+                        || result.is_typed_array()
+                    {
                         result
                     } else {
                         new_obj_value
@@ -4126,6 +4134,18 @@ impl Interpreter {
                     proto
                         .get(&Self::utf16_key(method_name))
                         .unwrap_or_else(Value::undefined)
+                } else if receiver.is_data_view() {
+                    let dv_ctor = ctx
+                        .get_global("DataView")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("DataView is not defined"))?;
+                    let proto = dv_ctor
+                        .get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("DataView.prototype is not defined"))?;
+                    proto
+                        .get(&Self::utf16_key(method_name))
+                        .unwrap_or_else(Value::undefined)
                 } else if let Some(regex) = receiver.as_regex() {
                     // RegExp: look up method on the regex's internal object (which has the prototype chain)
                     regex
@@ -4362,7 +4382,11 @@ impl Interpreter {
 
                     let result =
                         self.call_native_fn_construct(ctx, native_fn, &new_obj_value, &args)?;
-                    let final_value = if result.is_object() {
+                    let final_value = if result.is_object()
+                        || result.is_data_view()
+                        || result.is_array_buffer()
+                        || result.is_typed_array()
+                    {
                         result
                     } else {
                         new_obj_value
@@ -4991,6 +5015,40 @@ impl Interpreter {
                     return Ok(InstructionResult::Continue);
                 }
 
+                // DataView property access — no internal object, lookup on DataView.prototype
+                if object.is_data_view() {
+                    let key = Self::utf16_key(name_str);
+                    let receiver = object.clone();
+                    if let Some(dv_ctor) = ctx.get_global("DataView").and_then(|v| v.as_object()) {
+                        if let Some(proto) = dv_ctor
+                            .get(&PropertyKey::string("prototype"))
+                            .and_then(|v| v.as_object())
+                        {
+                            // Check for accessor properties (byteLength, buffer, byteOffset)
+                            match proto.lookup_property_descriptor(&key) {
+                                Some(crate::object::PropertyDescriptor::Accessor { get, .. }) => {
+                                    let Some(getter) = get else {
+                                        ctx.set_register(dst.0, Value::undefined());
+                                        return Ok(InstructionResult::Continue);
+                                    };
+                                    if let Some(native_fn) = getter.as_native_function() {
+                                        let result = self.call_native_fn(ctx, native_fn, &receiver, &[])?;
+                                        ctx.set_register(dst.0, result);
+                                        return Ok(InstructionResult::Continue);
+                                    }
+                                }
+                                _ => {
+                                    let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                                    ctx.set_register(dst.0, value);
+                                    return Ok(InstructionResult::Continue);
+                                }
+                            }
+                        }
+                    }
+                    ctx.set_register(dst.0, Value::undefined());
+                    return Ok(InstructionResult::Continue);
+                }
+
                 if let Some(obj) = object.as_object() {
                     let receiver = object.clone();
                     let key = Self::utf16_key(name_str);
@@ -5579,6 +5637,39 @@ impl Interpreter {
                         if let Some(val) = proto.get(&key) {
                             ctx.set_register(dst.0, val);
                             return Ok(InstructionResult::Continue);
+                        }
+                    }
+                    ctx.set_register(dst.0, Value::undefined());
+                    return Ok(InstructionResult::Continue);
+                }
+
+                // DataView property access — no internal object, lookup on DataView.prototype
+                if object.is_data_view() {
+                    let key = self.value_to_property_key(ctx, &key_value)?;
+                    let receiver = object.clone();
+                    if let Some(dv_ctor) = ctx.get_global("DataView").and_then(|v| v.as_object()) {
+                        if let Some(proto) = dv_ctor
+                            .get(&PropertyKey::string("prototype"))
+                            .and_then(|v| v.as_object())
+                        {
+                            match proto.lookup_property_descriptor(&key) {
+                                Some(crate::object::PropertyDescriptor::Accessor { get, .. }) => {
+                                    let Some(getter) = get else {
+                                        ctx.set_register(dst.0, Value::undefined());
+                                        return Ok(InstructionResult::Continue);
+                                    };
+                                    if let Some(native_fn) = getter.as_native_function() {
+                                        let result = self.call_native_fn(ctx, native_fn, &receiver, &[])?;
+                                        ctx.set_register(dst.0, result);
+                                        return Ok(InstructionResult::Continue);
+                                    }
+                                }
+                                _ => {
+                                    let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                                    ctx.set_register(dst.0, value);
+                                    return Ok(InstructionResult::Continue);
+                                }
+                            }
                         }
                     }
                     ctx.set_register(dst.0, Value::undefined());
@@ -6586,6 +6677,36 @@ impl Interpreter {
                 let key = self.value_to_property_key(ctx, &key_value)?;
                 let method_value = if let Some(obj_ref) = receiver.as_object() {
                     obj_ref.get(&key).unwrap_or_else(Value::undefined)
+                } else if receiver.is_string() {
+                    let string_obj = ctx
+                        .get_global("String")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("String is not defined"))?;
+                    let proto = string_obj
+                        .get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("String.prototype is not defined"))?;
+                    proto.get(&key).unwrap_or_else(Value::undefined)
+                } else if receiver.is_number() {
+                    let number_obj = ctx
+                        .get_global("Number")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("Number is not defined"))?;
+                    let proto = number_obj
+                        .get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("Number.prototype is not defined"))?;
+                    proto.get(&key).unwrap_or_else(Value::undefined)
+                } else if receiver.is_boolean() {
+                    let boolean_obj = ctx
+                        .get_global("Boolean")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("Boolean is not defined"))?;
+                    let proto = boolean_obj
+                        .get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("Boolean.prototype is not defined"))?;
+                    proto.get(&key).unwrap_or_else(Value::undefined)
                 } else if receiver.is_symbol() {
                     if let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object()) {
                         if let Some(proto) = symbol_obj
@@ -6599,6 +6720,28 @@ impl Interpreter {
                     } else {
                         Value::undefined()
                     }
+                } else if receiver.is_bigint() {
+                    let bigint_obj = ctx
+                        .get_global("BigInt")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("BigInt is not defined"))?;
+                    let proto = bigint_obj
+                        .get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("BigInt.prototype is not defined"))?;
+                    proto.get(&key).unwrap_or_else(Value::undefined)
+                } else if receiver.is_promise() {
+                    let promise_obj = ctx
+                        .get_global("Promise")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("Promise is not defined"))?;
+                    let proto = promise_obj
+                        .get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("Promise.prototype is not defined"))?;
+                    proto.get(&key).unwrap_or_else(Value::undefined)
+                } else if let Some(regex) = receiver.as_regex() {
+                    regex.object.get(&key).unwrap_or_else(Value::undefined)
                 } else {
                     Value::undefined()
                 };
@@ -6713,6 +6856,36 @@ impl Interpreter {
                 let key = self.value_to_property_key(ctx, &key_value)?;
                 let method_value = if let Some(obj_ref) = receiver.as_object() {
                     obj_ref.get(&key).unwrap_or_else(Value::undefined)
+                } else if receiver.is_string() {
+                    let string_obj = ctx
+                        .get_global("String")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("String is not defined"))?;
+                    let proto = string_obj
+                        .get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("String.prototype is not defined"))?;
+                    proto.get(&key).unwrap_or_else(Value::undefined)
+                } else if receiver.is_number() {
+                    let number_obj = ctx
+                        .get_global("Number")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("Number is not defined"))?;
+                    let proto = number_obj
+                        .get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("Number.prototype is not defined"))?;
+                    proto.get(&key).unwrap_or_else(Value::undefined)
+                } else if receiver.is_boolean() {
+                    let boolean_obj = ctx
+                        .get_global("Boolean")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("Boolean is not defined"))?;
+                    let proto = boolean_obj
+                        .get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("Boolean.prototype is not defined"))?;
+                    proto.get(&key).unwrap_or_else(Value::undefined)
                 } else if receiver.is_symbol() {
                     if let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object()) {
                         if let Some(proto) = symbol_obj
@@ -6726,6 +6899,28 @@ impl Interpreter {
                     } else {
                         Value::undefined()
                     }
+                } else if receiver.is_bigint() {
+                    let bigint_obj = ctx
+                        .get_global("BigInt")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("BigInt is not defined"))?;
+                    let proto = bigint_obj
+                        .get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("BigInt.prototype is not defined"))?;
+                    proto.get(&key).unwrap_or_else(Value::undefined)
+                } else if receiver.is_promise() {
+                    let promise_obj = ctx
+                        .get_global("Promise")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("Promise is not defined"))?;
+                    let proto = promise_obj
+                        .get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("Promise.prototype is not defined"))?;
+                    proto.get(&key).unwrap_or_else(Value::undefined)
+                } else if let Some(regex) = receiver.as_regex() {
+                    regex.object.get(&key).unwrap_or_else(Value::undefined)
                 } else {
                     Value::undefined()
                 };
@@ -6841,6 +7036,17 @@ impl Interpreter {
                         key_value,
                         obj.clone(),
                     )?)
+                } else if obj.is_string() {
+                    // String primitives: look up Symbol.iterator on String.prototype
+                    let string_obj = ctx
+                        .get_global("String")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("String is not defined"))?;
+                    let proto = string_obj
+                        .get(&PropertyKey::string("prototype"))
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| VmError::type_error("String.prototype is not defined"))?;
+                    proto.get(&PropertyKey::Symbol(iterator_sym))
                 } else {
                     match obj.heap_ref() {
                         Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
@@ -8933,18 +9139,14 @@ impl Interpreter {
             value.clone()
         };
         if prim.is_symbol() {
-            return Err(VmError::type_error("Cannot convert to number"));
+            return Err(VmError::type_error(
+                "Cannot convert a Symbol value to a number",
+            ));
         }
-        if let Some(HeapRef::BigInt(b)) = prim.heap_ref() {
-            let bigint = self.parse_bigint_str(&b.value)?;
-            if let Some(n) = bigint.to_f64() {
-                return Ok(n);
-            }
-            return Ok(if bigint.sign() == num_bigint::Sign::Minus {
-                f64::NEG_INFINITY
-            } else {
-                f64::INFINITY
-            });
+        if prim.is_bigint() {
+            return Err(VmError::type_error(
+                "Cannot convert a BigInt value to a number",
+            ));
         }
         Ok(self.to_number(&prim))
     }
@@ -12306,6 +12508,7 @@ mod tests {
         // Simple function that returns immediately
         let func = Function::builder()
             .name("hot_candidate")
+            .register_count(1)
             .instruction(Instruction::LoadInt32 {
                 dst: Register(0),
                 value: 42,

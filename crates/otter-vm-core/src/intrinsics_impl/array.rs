@@ -180,126 +180,20 @@ fn make_array_iterator(
     this_val: &Value,
     kind: &str,
     mm: &Arc<MemoryManager>,
-    fn_proto: GcRef<JsObject>,
-    iter_proto: GcRef<JsObject>,
+    _fn_proto: GcRef<JsObject>,
+    array_iter_proto: GcRef<JsObject>,
 ) -> Result<Value, crate::error::VmError> {
     if this_val.as_object().is_none() && this_val.as_proxy().is_none() {
         return Err("Array iterator: this is not an object".to_string().into());
     }
-    let iter = GcRef::new(JsObject::new(Value::object(iter_proto), mm.clone()));
-    // Store the array reference, current index, length, and kind
+    // Create iterator with %ArrayIteratorPrototype% as prototype (has next() on it)
+    let iter = GcRef::new(JsObject::new(Value::object(array_iter_proto), mm.clone()));
+    // Store the array reference, current index, and kind
     let _ = iter.set(PropertyKey::string("__array_ref__"), this_val.clone());
     let _ = iter.set(PropertyKey::string("__array_index__"), Value::number(0.0));
     let _ = iter.set(
         PropertyKey::string("__iter_kind__"),
         Value::string(JsString::intern(kind)),
-    );
-    // next() method
-    let fn_proto_for_next = fn_proto;
-    iter.define_property(
-        PropertyKey::string("next"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, ncx| {
-                let iter_obj = this_val
-                    .as_object()
-                    .ok_or_else(|| "not an iterator object".to_string())?;
-                let arr_val = iter_obj
-                    .get(&PropertyKey::string("__array_ref__"))
-                    .ok_or_else(|| "iterator: missing array ref".to_string())?;
-                let idx = iter_obj
-                    .get(&PropertyKey::string("__array_index__"))
-                    .and_then(|v| v.as_number())
-                    .unwrap_or(0.0) as usize;
-                let len = {
-                    let key = PropertyKey::string("length");
-                    let len_val = if let Some(proxy) = arr_val.as_proxy() {
-                        let key_value = Value::string(JsString::intern("length"));
-                        crate::proxy_operations::proxy_get(
-                            ncx,
-                            proxy,
-                            &key,
-                            key_value,
-                            arr_val.clone(),
-                        )?
-                    } else if let Some(arr_obj) = arr_val.as_object() {
-                        arr_obj.get(&key).unwrap_or(Value::undefined())
-                    } else {
-                        return Err("iterator: missing array ref".to_string().into());
-                    };
-                    len_val.as_number().unwrap_or(0.0).max(0.0) as usize
-                };
-                let kind = iter_obj
-                    .get(&PropertyKey::string("__iter_kind__"))
-                    .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
-                    .unwrap_or_else(|| "value".to_string());
-
-                if idx >= len {
-                    // Done
-                    let result =
-                        GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                    let _ = result.set(PropertyKey::string("value"), Value::undefined());
-                    let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
-                    return Ok(Value::object(result));
-                }
-
-                // Advance index
-                let _ = iter_obj.set(
-                    PropertyKey::string("__array_index__"),
-                    Value::number((idx + 1) as f64),
-                );
-
-                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                match kind.as_str() {
-                    "key" => {
-                        let _ = result.set(PropertyKey::string("value"), Value::number(idx as f64));
-                    }
-                    "entry" => {
-                        let entry = GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
-                        let _ = entry.set(PropertyKey::Index(0), Value::number(idx as f64));
-                        let val = if let Some(proxy) = arr_val.as_proxy() {
-                            let key = PropertyKey::Index(idx as u32);
-                            let key_value = Value::string(JsString::intern(&idx.to_string()));
-                            crate::proxy_operations::proxy_get(
-                                ncx,
-                                proxy,
-                                &key,
-                                key_value,
-                                arr_val.clone(),
-                            )?
-                        } else if let Some(arr_obj) = arr_val.as_object() {
-                            js_get(&arr_obj, &PropertyKey::Index(idx as u32), ncx)?
-                        } else {
-                            Value::undefined()
-                        };
-                        let _ = entry.set(PropertyKey::Index(1), val);
-                        let _ = result.set(PropertyKey::string("value"), Value::array(entry));
-                    }
-                    _ => {
-                        // "value"
-                        let val = if let Some(proxy) = arr_val.as_proxy() {
-                            let key = PropertyKey::Index(idx as u32);
-                            let key_value = Value::string(JsString::intern(&idx.to_string()));
-                            crate::proxy_operations::proxy_get(
-                                ncx,
-                                proxy,
-                                &key,
-                                key_value,
-                                arr_val.clone(),
-                            )?
-                        } else if let Some(arr_obj) = arr_val.as_object() {
-                            js_get(&arr_obj, &PropertyKey::Index(idx as u32), ncx)?
-                        } else {
-                            Value::undefined()
-                        };
-                        let _ = result.set(PropertyKey::string("value"), val);
-                    }
-                }
-                let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
-                Ok(Value::object(result))
-            },
-            mm.clone(),
-            fn_proto_for_next,
-        )),
     );
     Ok(Value::object(iter))
 }
@@ -309,7 +203,7 @@ pub fn init_array_prototype(
     arr_proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
-    iterator_proto: GcRef<JsObject>,
+    array_iterator_proto: GcRef<JsObject>,
     symbol_iterator: crate::gc::GcRef<crate::value::Symbol>,
 ) {
     // Array.prototype.push
@@ -1679,7 +1573,7 @@ pub fn init_array_prototype(
     // Array.prototype.values / keys / entries / [Symbol.iterator]
     // ================================================================
     {
-        let iter_proto = iterator_proto;
+        let iter_proto = array_iterator_proto;
         let sym_ref = symbol_iterator;
 
         // Array.prototype.values()

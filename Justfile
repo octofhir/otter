@@ -109,6 +109,14 @@ test262-save *args:
 test262-compare base new:
     cargo run -p otter-test262 --bin test262 -- compare --base {{base}} --current {{new}}
 
+# Run full test262 in crash-safe batches, merge results, generate conformance doc
+test262-full *args:
+    bash scripts/test262-full-run.sh {{args}}
+
+# Generate ES_CONFORMANCE.md from latest test262 results
+test262-conformance:
+    cargo run -p otter-test262 --bin gen-conformance
+
 # Run Test262 with TOML config override
 test262-config config *args:
     cargo run -p otter-test262 --bin test262 -- run --config {{config}} {{args}}

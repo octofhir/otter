@@ -2306,6 +2306,7 @@ dependencies = [
  "rustc-hash",
  "serde_json",
  "thiserror 2.0.17",
+ "unicode-normalization",
 ]
 
 [[package]]

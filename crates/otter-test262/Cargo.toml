@@ -10,6 +10,10 @@ publish = false
 name = "test262"
 path = "src/main.rs"
 
+[[bin]]
+name = "gen-conformance"
+path = "src/bin/gen_conformance.rs"
+
 [dependencies]
 otter-engine = { path = "../otter-engine", version = "0.1.3" }
 otter-vm-core = { path = "../otter-vm-core", version = "0.1.0" }

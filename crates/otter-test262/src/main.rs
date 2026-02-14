@@ -497,10 +497,10 @@ async fn run_tests(cli: Cli) {
     let max_failures = if cli.json { 50000 } else { 200 };
     let mut summary = RunSummary::new(max_failures);
 
-    let timeout = cli
-        .timeout
-        .or(config.timeout_secs)
-        .map(std::time::Duration::from_secs);
+    // Always enforce a timeout to prevent hangs. Default: 10s per test.
+    let timeout = Some(std::time::Duration::from_secs(
+        cli.timeout.or(config.timeout_secs).unwrap_or(10),
+    ));
 
     for path in tests {
         // Check ignored/known-panic via config
@@ -594,6 +594,35 @@ async fn run_tests(cli: Cli) {
             && summary.total.is_multiple_of(100)
         {
             tracker.update();
+        }
+
+        // Incremental save every 500 tests to survive crashes
+        if save_results && summary.total.is_multiple_of(500) {
+            if let Some(ref save_path) = save_path {
+                let interim_report = TestReport {
+                    total: summary.total,
+                    passed: summary.passed,
+                    failed: summary.failed,
+                    skipped: summary.skipped,
+                    timeout: summary.timeout,
+                    crashed: summary.crashed,
+                    pass_rate: {
+                        let run = summary.passed + summary.failed + summary.timeout + summary.crashed;
+                        if run > 0 { (summary.passed as f64 / run as f64) * 100.0 } else { 0.0 }
+                    },
+                    by_feature: summary.by_feature.clone(),
+                    failures: summary.failures.clone(),
+                };
+                let persisted = PersistedReport {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    otter_version: env!("CARGO_PKG_VERSION").to_string(),
+                    test262_commit: None,
+                    duration_secs: run_start.elapsed().as_secs_f64(),
+                    summary: interim_report,
+                    results: summary.all_results.clone(),
+                };
+                let _ = persisted.save(save_path);
+            }
         }
     }
 

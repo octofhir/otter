@@ -449,6 +449,7 @@ pub fn install_promise_statics(
     ctor: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
+    aggregate_error_proto: GcRef<JsObject>,
 ) {
     // Promise.resolve(value) — §27.2.4.7
     ctor.define_property(
@@ -785,17 +786,34 @@ pub fn install_promise_statics(
     ctor.define_property(
         PropertyKey::string("any"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, ncx| {
+            move |_this, args, ncx| {
                 let items = extract_array_items(args.first())?;
                 let result_promise = JsPromise::new();
                 let mm = ncx.memory_manager().clone();
 
                 // Empty array rejects with AggregateError
                 if items.is_empty() {
-                    let err = Value::string(JsString::intern("All promises were rejected"));
-                    JsPromise::reject_with_js_jobs(result_promise, err, |job, args| {
-                        ncx.enqueue_js_job(job, args);
-                    });
+                    let agg = GcRef::new(JsObject::new(
+                        Value::object(aggregate_error_proto),
+                        mm.clone(),
+                    ));
+                    let _ = agg.set(
+                        PropertyKey::string("message"),
+                        Value::string(JsString::intern("All promises were rejected")),
+                    );
+                    let _ = agg.set(
+                        PropertyKey::string("name"),
+                        Value::string(JsString::intern("AggregateError")),
+                    );
+                    let empty_arr = GcRef::new(JsObject::array(0, mm.clone()));
+                    let _ = agg.set(PropertyKey::string("errors"), Value::array(empty_arr));
+                    JsPromise::reject_with_js_jobs(
+                        result_promise,
+                        Value::object(agg),
+                        |job, args| {
+                            ncx.enqueue_js_job(job, args);
+                        },
+                    );
                     return Ok(create_js_promise_wrapper(ncx, result_promise));
                 }
 
@@ -819,6 +837,7 @@ pub fn install_promise_statics(
                     let remaining = remaining.clone();
                     let errors = errors.clone();
                     let mm_err = mm.clone();
+                    let agg_proto = aggregate_error_proto;
                     let enqueue_fulfill = enqueue.clone();
                     let enqueue_reject = enqueue.clone();
 
@@ -856,12 +875,17 @@ pub fn install_promise_statics(
                             for (i, e) in errs.iter().enumerate() {
                                 let _ = arr.set(PropertyKey::Index(i as u32), e.clone());
                             }
-                            let agg = GcRef::new(JsObject::new(Value::null(), mm_err.clone()));
+                            let agg =
+                                GcRef::new(JsObject::new(Value::object(agg_proto), mm_err.clone()));
                             let _ = agg.set(
-                                "message".into(),
+                                PropertyKey::string("name"),
+                                Value::string(JsString::intern("AggregateError")),
+                            );
+                            let _ = agg.set(
+                                PropertyKey::string("message"),
                                 Value::string(JsString::intern("All promises were rejected")),
                             );
-                            let _ = agg.set("errors".into(), Value::array(arr));
+                            let _ = agg.set(PropertyKey::string("errors"), Value::array(arr));
                             JsPromise::reject_with_js_jobs(
                                 result_p2,
                                 Value::object(agg),

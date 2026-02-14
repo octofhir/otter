@@ -148,6 +148,7 @@ pub fn init_error_prototypes(
     syntax_error_proto: GcRef<JsObject>,
     uri_error_proto: GcRef<JsObject>,
     eval_error_proto: GcRef<JsObject>,
+    aggregate_error_proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
@@ -205,6 +206,7 @@ pub fn init_error_prototypes(
         (syntax_error_proto, "SyntaxError"),
         (uri_error_proto, "URIError"),
         (eval_error_proto, "EvalError"),
+        (aggregate_error_proto, "AggregateError"),
     ];
     for (proto, name) in &error_names {
         proto.define_property(
@@ -252,6 +254,70 @@ pub fn create_error_constructor(
             );
         }
         // Return undefined so Construct uses new_obj_value with correct prototype
+        Ok(Value::undefined())
+    })
+}
+
+/// Create AggregateError constructor: `new AggregateError(errors, message, options)`
+///
+/// Per §20.5.7.1, the first argument is an iterable of errors stored in `.errors`.
+pub fn create_aggregate_error_constructor() -> Box<
+    dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
+        + Send
+        + Sync,
+> {
+    Box::new(|this, args, _ncx| {
+        if let Some(obj) = this.as_object() {
+            // arg0: errors (iterable) — for now, convert to array
+            let errors_arg = args.first().cloned().unwrap_or(Value::undefined());
+            let errors_array = if let Some(arr_obj) = errors_arg.as_object() {
+                // If it's already array-like, copy elements into a new array
+                let len = arr_obj
+                    .get(&PropertyKey::string("length"))
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as u32;
+                let mm = obj.memory_manager();
+                let result_arr = GcRef::new(JsObject::array(len as usize, mm.clone()));
+                for i in 0..len {
+                    if let Some(val) = arr_obj.get(&PropertyKey::Index(i)) {
+                        let _ = result_arr.set(PropertyKey::Index(i), val);
+                    }
+                }
+                Value::array(result_arr)
+            } else {
+                // Non-object: create empty array (spec says iterate, but non-iterable = TypeError;
+                // for robustness, just use empty)
+                let mm = obj.memory_manager();
+                Value::array(GcRef::new(JsObject::array(0, mm.clone())))
+            };
+
+            // Store .errors as a data property
+            let _ = obj.set(PropertyKey::string("errors"), errors_array);
+
+            // arg1: message (optional)
+            if let Some(msg) = args.get(1) {
+                if !msg.is_undefined() {
+                    let _ = obj.set(
+                        PropertyKey::string("message"),
+                        Value::string(JsString::intern(&crate::globals::to_string(msg))),
+                    );
+                }
+            }
+
+            // arg2: options (optional) — extract .cause if present
+            if let Some(options) = args.get(2) {
+                if let Some(opts_obj) = options.as_object() {
+                    if let Some(cause) = opts_obj.get(&PropertyKey::string("cause")) {
+                        let _ = obj.set(PropertyKey::string("cause"), cause);
+                    }
+                }
+            }
+
+            let _ = obj.set(
+                PropertyKey::string("name"),
+                Value::string(JsString::intern("AggregateError")),
+            );
+        }
         Ok(Value::undefined())
     })
 }

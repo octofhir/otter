@@ -32,7 +32,8 @@ pub struct StringTable {
 }
 
 // SAFETY: StringTable is only accessed from the single VM thread.
-// Thread confinement is enforced at the VmRuntime/VmContext level.
+// Thread confinement is enforced by the Isolate abstraction: each Isolate
+// is `Send` but `!Sync`, ensuring single-thread access to the string table.
 unsafe impl Send for StringTable {}
 unsafe impl Sync for StringTable {}
 

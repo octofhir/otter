@@ -84,7 +84,8 @@ struct LargeAllocation {
 }
 
 // SAFETY: LargeAllocation contains raw pointers but they are managed exclusively
-// by the AllocationRegistry on a single thread (thread_local storage).
+// by the AllocationRegistry on a single thread. Thread confinement is enforced
+// by the Isolate abstraction (one isolate = one thread at a time).
 unsafe impl Send for LargeAllocation {}
 unsafe impl Sync for LargeAllocation {}
 
@@ -812,23 +813,67 @@ pub struct RegistryStats {
     pub last_pause_time: Duration,
 }
 
-// Thread-local allocation registry for the GC.
+// Thread-local allocation registry pointer for the GC.
 //
-// Each thread gets its own registry so that GC collections in one thread
-// (with that thread's roots) don't sweep objects belonging to another thread.
-// This prevents use-after-free when multiple VmContexts run in parallel
-// (e.g. in test suites).
+// Set by VmRuntime::with_config() or Isolate::enter() to point to
+// the owning runtime's registry. Each VmRuntime creates its own
+// AllocationRegistry (Box-owned, dropped with VmRuntime).
 //
-// The registry is leaked (Box::leak) to produce a `&'static` reference that
-// matches the existing API. Each thread leaks exactly one AllocationRegistry
-// for the lifetime of the process — a bounded, negligible leak.
+// Panics if gc_alloc() is called without a registry set — this means
+// the caller forgot to create a VmRuntime or Isolate first.
 thread_local! {
-    static THREAD_REGISTRY: &'static AllocationRegistry = Box::leak(Box::new(AllocationRegistry::new()));
+    static THREAD_REGISTRY: std::cell::Cell<*const AllocationRegistry> = const { std::cell::Cell::new(std::ptr::null()) };
 }
 
-/// Get the thread-local allocation registry
+/// Set the thread-local allocation registry.
+///
+/// Called by `Isolate::enter()` to install the isolate's own registry.
+///
+/// # Safety
+///
+/// The caller must ensure the registry pointer remains valid for the
+/// duration it is set (i.e., until `clear_thread_registry()` is called).
+pub unsafe fn set_thread_registry(registry: &AllocationRegistry) {
+    THREAD_REGISTRY.with(|r| r.set(registry as *const AllocationRegistry));
+}
+
+/// Clear the thread-local allocation registry.
+///
+/// Called by `IsolateGuard::drop()` when exiting an isolate.
+pub fn clear_thread_registry() {
+    THREAD_REGISTRY.with(|r| r.set(std::ptr::null()));
+}
+
+/// Clear the thread-local registry only if it points to the given registry.
+///
+/// Used by `VmRuntime::drop()` to avoid clearing another runtime's registry.
+pub fn clear_thread_registry_if(registry: *const AllocationRegistry) {
+    THREAD_REGISTRY.with(|r| {
+        if r.get() == registry {
+            r.set(std::ptr::null());
+        }
+    });
+}
+
+/// Get the thread-local allocation registry.
+///
+/// # Panics
+///
+/// Panics if no registry has been set via `set_thread_registry()`.
+/// This means the caller must create a `VmRuntime` or `Isolate` first.
 pub fn global_registry() -> &'static AllocationRegistry {
-    THREAD_REGISTRY.with(|r| *r)
+    THREAD_REGISTRY.with(|r| {
+        let ptr = r.get();
+        assert!(
+            !ptr.is_null(),
+            "No GC allocation registry set on this thread. \
+             Create a VmRuntime or Isolate before allocating GC objects."
+        );
+        // SAFETY: set_thread_registry guarantees the pointer is valid
+        // for the duration it is set. VmRuntime::drop() clears the pointer
+        // before freeing the registry.
+        unsafe { &*ptr }
+    })
 }
 
 /// Allocate a GC-managed value

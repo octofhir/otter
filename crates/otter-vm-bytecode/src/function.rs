@@ -281,7 +281,7 @@ pub struct FeedbackVector {
 }
 
 // SAFETY: FeedbackVector is only accessed from a single VM thread.
-// Thread confinement is enforced at the VmRuntime level.
+// Thread confinement is enforced by the Isolate abstraction.
 #[allow(unsafe_code)]
 unsafe impl Send for FeedbackVector {}
 #[allow(unsafe_code)]

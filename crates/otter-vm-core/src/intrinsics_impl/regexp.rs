@@ -1318,7 +1318,7 @@ pub fn init_regexp_prototype(
 
                 // Get namedCaptures
                 let named_captures_val = obj_get(&result_obj, "groups", ncx)?;
-                let named_captures_obj = if named_captures_val.is_undefined() {
+                let _named_captures_obj = if named_captures_val.is_undefined() {
                     None
                 } else {
                     named_captures_val.as_object()

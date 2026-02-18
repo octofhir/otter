@@ -32,6 +32,7 @@ pub mod globals;
 pub mod interpreter;
 pub mod intrinsics;
 pub mod intrinsics_impl;
+pub mod isolate;
 #[cfg(feature = "jit")]
 mod jit_queue;
 #[cfg(feature = "jit")]
@@ -72,6 +73,7 @@ pub use generator::{
 };
 pub use interpreter::{GeneratorResult, Interpreter};
 pub use intrinsics::Intrinsics;
+pub use isolate::{Isolate, IsolateConfig, IsolateGuard, IsolateHandle};
 pub use memory::MemoryManager;
 pub use object::{JsObject, PropertyKey, SetPropertyError};
 pub use promise::{JsPromise, PromiseState, PromiseWithResolvers};

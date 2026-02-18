@@ -28,7 +28,7 @@ var $262 = {
     global: this,
     // Minimal host emulation for AnnexB IsHTMLDDA feature.
     // It must be present and callable (used as a method in a number of tests).
-    IsHTMLDDA: function() { return undefined; },
+    IsHTMLDDA: function() { return null; },
     gc: function() {
         if (typeof __test262_gc === 'function') {
             __test262_gc();

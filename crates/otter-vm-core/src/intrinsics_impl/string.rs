@@ -418,7 +418,7 @@ pub fn init_string_prototype(
         PropertyDescriptor::getter(Value::native_function_with_proto(
             |this_val, _args, _ncx| {
                 if let Some(s) = this_val.as_string() {
-                    Ok(Value::number(s.as_str().encode_utf16().count() as f64))
+                    Ok(Value::number(s.len_utf16() as f64))
                 } else {
                     Ok(Value::number(0.0))
                 }
@@ -437,17 +437,12 @@ pub fn init_string_prototype(
             let s = require_object_coercible_to_string(this_val, ncx)?;
             let pos_val = args.first().cloned().unwrap_or(Value::undefined());
             let pos = to_integer_or_infinity(&pos_val, ncx)?;
-            let utf16: Vec<u16> = s.as_str().encode_utf16().collect();
+            let utf16 = s.as_utf16();
             if pos < 0.0 || pos >= utf16.len() as f64 || pos.is_infinite() {
                 return Ok(Value::string(JsString::intern("")));
             }
             let idx = pos as usize;
-            let ch = char::decode_utf16(std::iter::once(utf16[idx]))
-                .next()
-                .and_then(|r| r.ok())
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| String::from_utf16_lossy(&[utf16[idx]]));
-            Ok(Value::string(JsString::intern(&ch)))
+            Ok(Value::string(JsString::intern_utf16(&utf16[idx..idx + 1])))
         },
         &mm,
         fn_proto,
@@ -462,7 +457,7 @@ pub fn init_string_prototype(
             let s = require_object_coercible_to_string(this_val, ncx)?;
             let pos_val = args.first().cloned().unwrap_or(Value::undefined());
             let pos = to_integer_or_infinity(&pos_val, ncx)?;
-            let utf16: Vec<u16> = s.as_str().encode_utf16().collect();
+            let utf16 = s.as_utf16();
             if pos < 0.0 || pos >= utf16.len() as f64 || pos.is_infinite() {
                 return Ok(Value::number(f64::NAN));
             }
@@ -479,7 +474,7 @@ pub fn init_string_prototype(
         2,
         |this_val, args, ncx| {
             let s = require_object_coercible_to_string(this_val, ncx)?;
-            let utf16: Vec<u16> = s.as_str().encode_utf16().collect();
+            let utf16 = s.as_utf16();
             let len = utf16.len() as f64;
             let int_start =
                 to_integer_or_infinity(&args.first().cloned().unwrap_or(Value::undefined()), ncx)?;
@@ -499,8 +494,7 @@ pub fn init_string_prototype(
                 int_end.min(len) as usize
             };
             if to > from {
-                let result = String::from_utf16_lossy(&utf16[from..to]);
-                Ok(Value::string(JsString::intern(&result)))
+                Ok(Value::string(JsString::intern_utf16(&utf16[from..to])))
             } else {
                 Ok(Value::string(JsString::intern("")))
             }
@@ -516,7 +510,7 @@ pub fn init_string_prototype(
         2,
         |this_val, args, ncx| {
             let s = require_object_coercible_to_string(this_val, ncx)?;
-            let utf16: Vec<u16> = s.as_str().encode_utf16().collect();
+            let utf16 = s.as_utf16();
             let len = utf16.len() as f64;
             let int_start =
                 to_integer_or_infinity(&args.first().cloned().unwrap_or(Value::undefined()), ncx)?;
@@ -529,8 +523,7 @@ pub fn init_string_prototype(
             let final_end = int_end.clamp(0.0, len) as usize;
             let from = final_start.min(final_end);
             let to = final_start.max(final_end);
-            let result = String::from_utf16_lossy(&utf16[from..to]);
-            Ok(Value::string(JsString::intern(&result)))
+            Ok(Value::string(JsString::intern_utf16(&utf16[from..to])))
         },
         &mm,
         fn_proto,
@@ -549,6 +542,21 @@ pub fn init_string_prototype(
         fn_proto,
     );
 
+    // String.prototype.toLocaleLowerCase (length=0)
+    define_method(
+        string_proto,
+        "toLocaleLowerCase",
+        0,
+        |this_val, args, ncx| {
+            let s = require_object_coercible_to_string(this_val, ncx)?;
+            let lowered =
+                crate::web_api::intl::to_locale_lowercase(s.as_str(), args.first(), ncx)?;
+            Ok(Value::string(JsString::intern(&lowered)))
+        },
+        &mm,
+        fn_proto,
+    );
+
     // String.prototype.toUpperCase (length=0)
     define_method(
         string_proto,
@@ -557,6 +565,40 @@ pub fn init_string_prototype(
         |this_val, _args, ncx| {
             let s = require_object_coercible_to_string(this_val, ncx)?;
             Ok(Value::string(JsString::intern(&s.as_str().to_uppercase())))
+        },
+        &mm,
+        fn_proto,
+    );
+
+    // String.prototype.toLocaleUpperCase (length=0)
+    define_method(
+        string_proto,
+        "toLocaleUpperCase",
+        0,
+        |this_val, args, ncx| {
+            let s = require_object_coercible_to_string(this_val, ncx)?;
+            let uppered =
+                crate::web_api::intl::to_locale_uppercase(s.as_str(), args.first(), ncx)?;
+            Ok(Value::string(JsString::intern(&uppered)))
+        },
+        &mm,
+        fn_proto,
+    );
+
+    // String.prototype.localeCompare (length=1)
+    define_method(
+        string_proto,
+        "localeCompare",
+        1,
+        |this_val, args, ncx| {
+            let s = require_object_coercible_to_string(this_val, ncx)?;
+            let that_val = args.first().cloned().unwrap_or(Value::undefined());
+            let that = arg_to_string(&that_val, ncx)?;
+            let locales = args.get(1);
+            let options = args.get(2);
+            let out =
+                crate::web_api::intl::locale_compare(s.as_str(), &that, locales, options, ncx)?;
+            Ok(Value::number(out))
         },
         &mm,
         fn_proto,
@@ -654,7 +696,7 @@ pub fn init_string_prototype(
                 }
                 let search_val = args.first().cloned().unwrap_or(Value::undefined());
                 let search = arg_to_string(&search_val, ncx)?;
-                let utf16: Vec<u16> = s.as_str().encode_utf16().collect();
+                let utf16 = s.as_utf16();
                 let len = utf16.len() as f64;
                 let pos = if args.get(1).map_or(true, |v| v.is_undefined()) {
                     0.0
@@ -689,7 +731,7 @@ pub fn init_string_prototype(
                 }
                 let search_val = args.first().cloned().unwrap_or(Value::undefined());
                 let search = arg_to_string(&search_val, ncx)?;
-                let utf16: Vec<u16> = s.as_str().encode_utf16().collect();
+                let utf16 = s.as_utf16();
                 let len = utf16.len() as f64;
                 let end_pos = if args.get(1).map_or(true, |v| v.is_undefined()) {
                     len
@@ -725,7 +767,7 @@ pub fn init_string_prototype(
                 }
                 let search_val = args.first().cloned().unwrap_or(Value::undefined());
                 let search = arg_to_string(&search_val, ncx)?;
-                let utf16: Vec<u16> = s.as_str().encode_utf16().collect();
+                let utf16 = s.as_utf16();
                 let len = utf16.len() as f64;
                 let pos = if args.get(1).map_or(true, |v| v.is_undefined()) {
                     0.0
@@ -779,8 +821,8 @@ pub fn init_string_prototype(
                     &args.first().cloned().unwrap_or(Value::undefined()),
                     ncx,
                 )?;
-                let str_val = s.as_str();
-                let str_utf16_len = str_val.encode_utf16().count();
+                let str_utf16 = s.as_utf16();
+                let str_utf16_len = str_utf16.len();
                 let target_len = max_length as usize;
                 if max_length <= str_utf16_len as f64 {
                     return Ok(Value::string(s));
@@ -802,12 +844,10 @@ pub fn init_string_prototype(
                     .cycle()
                     .take(pad_units_needed)
                     .collect();
-                let str_utf16: Vec<u16> = str_val.encode_utf16().collect();
                 let mut result_utf16 = Vec::with_capacity(str_utf16.len() + pad_utf16.len());
                 result_utf16.extend_from_slice(&pad_utf16);
-                result_utf16.extend_from_slice(&str_utf16);
-                let result = String::from_utf16_lossy(&result_utf16);
-                Ok(Value::string(JsString::intern(&result)))
+                result_utf16.extend_from_slice(str_utf16);
+                Ok(Value::string(JsString::intern_utf16(&result_utf16)))
             },
             mm.clone(),
             fn_proto,
@@ -824,8 +864,8 @@ pub fn init_string_prototype(
                     &args.first().cloned().unwrap_or(Value::undefined()),
                     ncx,
                 )?;
-                let str_val = s.as_str();
-                let str_utf16_len = str_val.encode_utf16().count();
+                let str_utf16 = s.as_utf16();
+                let str_utf16_len = str_utf16.len();
                 let target_len = max_length as usize;
                 if max_length <= str_utf16_len as f64 {
                     return Ok(Value::string(s));
@@ -846,12 +886,10 @@ pub fn init_string_prototype(
                     .cycle()
                     .take(pad_units_needed)
                     .collect();
-                let str_utf16: Vec<u16> = str_val.encode_utf16().collect();
                 let mut result_utf16 = Vec::with_capacity(str_utf16.len() + pad_utf16.len());
-                result_utf16.extend_from_slice(&str_utf16);
+                result_utf16.extend_from_slice(str_utf16);
                 result_utf16.extend_from_slice(&pad_utf16);
-                let result = String::from_utf16_lossy(&result_utf16);
-                Ok(Value::string(JsString::intern(&result)))
+                Ok(Value::string(JsString::intern_utf16(&result_utf16)))
             },
             mm.clone(),
             fn_proto,
@@ -864,7 +902,7 @@ pub fn init_string_prototype(
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, ncx| {
                 let s = require_object_coercible_to_string(this_val, ncx)?;
-                let utf16: Vec<u16> = s.as_str().encode_utf16().collect();
+                let utf16 = s.as_utf16();
                 let len = utf16.len() as f64;
                 let rel_idx = to_integer_or_infinity(
                     &args.first().cloned().unwrap_or(Value::undefined()),
@@ -879,8 +917,7 @@ pub fn init_string_prototype(
                     return Ok(Value::undefined());
                 }
                 let idx = k as usize;
-                let result = String::from_utf16_lossy(&utf16[idx..idx + 1]);
-                Ok(Value::string(JsString::intern(&result)))
+                Ok(Value::string(JsString::intern_utf16(&utf16[idx..idx + 1])))
             },
             mm.clone(),
             fn_proto,
@@ -895,7 +932,7 @@ pub fn init_string_prototype(
                 let s = require_object_coercible_to_string(this_val, ncx)?;
                 let search_val = args.first().cloned().unwrap_or(Value::undefined());
                 let search = arg_to_string(&search_val, ncx)?;
-                let utf16: Vec<u16> = s.as_str().encode_utf16().collect();
+                let utf16 = s.as_utf16();
                 let len = utf16.len() as f64;
                 let pos = if args.get(1).map_or(true, |v| v.is_undefined()) {
                     0.0
@@ -930,7 +967,7 @@ pub fn init_string_prototype(
                 let s = require_object_coercible_to_string(this_val, ncx)?;
                 let search_val = args.first().cloned().unwrap_or(Value::undefined());
                 let search = arg_to_string(&search_val, ncx)?;
-                let utf16: Vec<u16> = s.as_str().encode_utf16().collect();
+                let utf16 = s.as_utf16();
                 let len = utf16.len();
                 let num_pos = if args.get(1).map_or(true, |v| v.is_undefined()) {
                     f64::NAN
@@ -1619,7 +1656,7 @@ pub fn init_string_prototype(
         0,
         |this_val, _args, ncx| {
             let s = require_object_coercible_to_string(this_val, ncx)?;
-            let utf16: Vec<u16> = s.as_str().encode_utf16().collect();
+            let utf16 = s.as_utf16();
             let mut i = 0;
             while i < utf16.len() {
                 let code = utf16[i];
@@ -1647,7 +1684,7 @@ pub fn init_string_prototype(
         0,
         |this_val, _args, ncx| {
             let s = require_object_coercible_to_string(this_val, ncx)?;
-            let utf16: Vec<u16> = s.as_str().encode_utf16().collect();
+            let utf16 = s.as_utf16();
             let mut result: Vec<u16> = Vec::with_capacity(utf16.len());
             let mut i = 0;
             while i < utf16.len() {
@@ -1669,8 +1706,7 @@ pub fn init_string_prototype(
                     i += 1;
                 }
             }
-            let s = String::from_utf16_lossy(&result);
-            Ok(Value::string(JsString::intern(&s)))
+            Ok(Value::string(JsString::intern_utf16(&result)))
         },
         &mm,
         fn_proto,

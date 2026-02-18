@@ -389,7 +389,7 @@ fn make_date(day: f64, time: f64) -> f64 {
 pub fn create_date_constructor()
 -> Box<dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync> {
     Box::new(|this, args, ncx| {
-        use chrono::{Local, NaiveDate, TimeZone};
+        use chrono::Local;
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let is_constructor_call = this.as_object().map_or(false, |obj| {
@@ -644,7 +644,7 @@ pub fn install_date_statics(
 }
 
 fn parse_date_string(s: &str) -> f64 {
-    use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
+    use chrono::TimeZone;
     let s = s.trim();
 
     if s.contains("-000000") {
@@ -753,7 +753,7 @@ fn parse_extended_year(year: i64, rest: &str) -> f64 {
 }
 
 fn parse_date_string_internal(s: &str) -> f64 {
-    use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
+    use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         dt.timestamp_millis() as f64
     } else if s.ends_with('Z') {
@@ -2239,7 +2239,7 @@ pub fn init_date_prototype(
             } else {
                 None
             };
-            let (cur_y, cur_m, cur_d, h, min, sec, ms) = local_components(t);
+            let (_cur_y, cur_m, cur_d, h, min, sec, ms) = local_components(t);
             let m = mon_arg.unwrap_or(cur_m);
             let d = date_arg.unwrap_or(cur_d);
             let new_date = local_to_utc_ms(y, m, d, h, min, sec, ms);
@@ -2266,7 +2266,7 @@ pub fn init_date_prototype(
             } else {
                 None
             };
-            let (cur_y, cur_m, cur_d, h, min, sec, ms) = utc_components(t);
+            let (_cur_y, cur_m, cur_d, h, min, sec, ms) = utc_components(t);
             let m = mon_arg.unwrap_or(cur_m);
             let d = date_arg.unwrap_or(cur_d);
             // UTC version: no local conversion needed

@@ -13,21 +13,20 @@ use otter_vm_core::VmContext;
 use otter_vm_core::gc::{GcRef, HandleScope};
 use otter_vm_core::memory::MemoryManager;
 use otter_vm_core::object::{JsObject, PropertyKey};
+use otter_vm_core::runtime::VmRuntime;
 use otter_vm_core::value::Value;
 use std::sync::{Arc, Mutex};
 
 /// Global mutex to ensure GC tests run serially.
 static GC_LOCK: Mutex<()> = Mutex::new(());
 
-/// Helper function to create a test VM context
-fn create_test_context() -> (VmContext, Arc<MemoryManager>) {
-    // Force a GC to clean up any lingering allocations from previous tests
-    let _ = otter_vm_gc::global_registry().collect(&[]);
-
-    let mm = Arc::new(MemoryManager::new(10_000_000));
-    let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-    let ctx = VmContext::new(global, mm.clone());
-    (ctx, mm)
+/// Helper function to create a test VM context.
+/// Returns VmRuntime to keep the GC registry alive.
+fn create_test_context() -> (VmContext, Arc<MemoryManager>, VmRuntime) {
+    let runtime = VmRuntime::new();
+    let mm = runtime.memory_manager().clone();
+    let ctx = runtime.create_context();
+    (ctx, mm, runtime)
 }
 
 // ============================================================================
@@ -37,7 +36,7 @@ fn create_test_context() -> (VmContext, Arc<MemoryManager>) {
 #[test]
 fn test_circular_reference_two_objects() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm) = create_test_context();
+    let (ctx, mm, _rt) = create_test_context();
 
     let initial_stats = ctx.gc_stats();
 
@@ -76,7 +75,7 @@ fn test_circular_reference_two_objects() {
 #[test]
 fn test_circular_reference_chain() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm) = create_test_context();
+    let (ctx, mm, _rt) = create_test_context();
 
     {
         let obj_a = GcRef::new(JsObject::new(Value::null(), mm.clone()));
@@ -97,7 +96,7 @@ fn test_circular_reference_chain() {
 #[test]
 fn test_self_referencing_object() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm) = create_test_context();
+    let (ctx, mm, _rt) = create_test_context();
 
     {
         let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
@@ -117,7 +116,7 @@ fn test_self_referencing_object() {
 #[test]
 fn test_gc_stress_many_objects() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm) = create_test_context();
+    let (ctx, mm, _rt) = create_test_context();
 
     const NUM_OBJECTS: usize = 10_000;
 
@@ -139,7 +138,7 @@ fn test_gc_stress_many_objects() {
 #[test]
 fn test_gc_stress_with_properties() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm) = create_test_context();
+    let (ctx, mm, _rt) = create_test_context();
 
     for _ in 0..1000 {
         let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
@@ -159,7 +158,7 @@ fn test_gc_stress_with_properties() {
 #[test]
 fn test_gc_stress_nested_objects() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm) = create_test_context();
+    let (ctx, mm, _rt) = create_test_context();
 
     for _ in 0..100 {
         let root = GcRef::new(JsObject::new(Value::null(), mm.clone()));
@@ -186,7 +185,7 @@ fn test_gc_stress_nested_objects() {
 #[test]
 #[ignore = "SIGSEGV: GC rooting bug — rooted object freed during collection"]
 fn test_gc_retains_rooted_objects() {
-    let (mut ctx, mm) = create_test_context();
+    let (mut ctx, mm, _rt) = create_test_context();
 
     let scope = HandleScope::new(&mut ctx);
 
@@ -223,7 +222,7 @@ fn test_gc_retains_rooted_objects() {
 #[test]
 #[ignore = "SIGSEGV: GC rooting bug"]
 fn test_gc_retains_objects_reachable_from_roots() {
-    let (mut ctx, mm) = create_test_context();
+    let (mut ctx, mm, _rt) = create_test_context();
 
     let scope = HandleScope::new(&mut ctx);
 
@@ -296,7 +295,7 @@ fn test_gc_retains_objects_reachable_from_roots() {
 
 #[test]
 fn test_gc_nested_handle_scopes() {
-    let (mut ctx, mm) = create_test_context();
+    let (mut ctx, mm, _rt) = create_test_context();
 
     let scope1 = HandleScope::new(&mut ctx);
     let obj1 = GcRef::new(JsObject::new(Value::null(), mm.clone()));
@@ -334,7 +333,7 @@ fn test_gc_nested_handle_scopes() {
 #[test]
 fn test_gc_stats_tracking() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm) = create_test_context();
+    let (ctx, mm, _rt) = create_test_context();
 
     let initial_stats = ctx.gc_stats();
 
@@ -367,7 +366,7 @@ fn test_gc_stats_tracking() {
 #[ignore = "SIGSEGV: GC rooting bug"]
 fn test_gc_pause_time_recorded() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm) = create_test_context();
+    let (ctx, mm, _rt) = create_test_context();
 
     for _ in 0..1000 {
         let _obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
@@ -389,7 +388,7 @@ fn test_gc_pause_time_recorded() {
 #[test]
 fn test_gc_threshold_trigger() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm) = create_test_context();
+    let (ctx, mm, _rt) = create_test_context();
 
     ctx.set_gc_threshold(1024); // 1KB
 
@@ -411,7 +410,7 @@ fn test_gc_threshold_trigger() {
 #[test]
 fn test_heap_size_reporting() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm) = create_test_context();
+    let (ctx, mm, _rt) = create_test_context();
 
     let initial_heap = ctx.heap_size();
 

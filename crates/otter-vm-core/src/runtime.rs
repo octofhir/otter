@@ -36,6 +36,10 @@ pub struct VmRuntime {
     config: RuntimeConfig,
     /// Memory manager for this runtime
     memory_manager: Arc<crate::memory::MemoryManager>,
+    /// Per-runtime GC allocation registry.
+    /// Box-owned — dropped when VmRuntime drops.
+    /// Thread-local pointer is cleared in Drop before the Box is freed.
+    gc_registry: Box<otter_vm_gc::AllocationRegistry>,
     /// Intrinsic `%Function.prototype%` object (ES2023 §10.3.1).
     /// Created once at runtime init, shared across contexts.
     function_prototype: GcRef<JsObject>,
@@ -77,7 +81,17 @@ impl VmRuntime {
 
     /// Create a new runtime with custom configuration
     pub fn with_config(config: RuntimeConfig) -> Self {
+        // Create per-runtime GC registry. Box-owned by VmRuntime.
+        // Thread-local pointer is set for the duration of construction,
+        // and cleared in VmRuntime::drop() before the Box is freed.
+        let gc_registry = Box::new(otter_vm_gc::AllocationRegistry::new());
+        // SAFETY: pointer remains valid as long as this VmRuntime is alive.
+        // VmRuntime::drop() clears the thread-local before freeing the Box.
+        unsafe { otter_vm_gc::set_thread_registry(&*gc_registry) };
+
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(config.max_heap_size));
+        // Set thread-local MM so allocations during construction are tracked.
+        crate::memory::MemoryManager::set_thread_default(memory_manager.clone());
         let realm_registry = RealmRegistry::new();
         let default_realm_id = realm_registry.allocate_id();
 
@@ -123,6 +137,7 @@ impl VmRuntime {
             function_prototype,
             intrinsics,
             memory_manager,
+            gc_registry,
             config,
             realm_registry,
             default_realm_id,
@@ -238,9 +253,7 @@ impl VmRuntime {
     pub fn execute_module(&self, module: &Module) -> VmResult<Value> {
         let mut ctx = self.create_context();
         let interpreter = Interpreter::new();
-        let result = interpreter.execute(module, &mut ctx);
-        ctx.teardown();
-        result
+        interpreter.execute(module, &mut ctx)
     }
 
     /// Execute a module with an existing context
@@ -276,6 +289,11 @@ impl VmRuntime {
     /// Get the memory manager for this runtime
     pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
         &self.memory_manager
+    }
+
+    /// Get the per-runtime GC allocation registry.
+    pub fn gc_registry(&self) -> &otter_vm_gc::AllocationRegistry {
+        &self.gc_registry
     }
 
     /// Replace the default realm with a freshly created one.
@@ -319,7 +337,33 @@ impl Default for VmRuntime {
     }
 }
 
-// SAFETY: VmRuntime uses thread-safe containers
+impl Drop for VmRuntime {
+    fn drop(&mut self) {
+        // Ensure registry thread-local is set so dealloc_all can use
+        // GC_DEALLOC_IN_PROGRESS flag (which is thread-local).
+        let our_ptr = &*self.gc_registry as *const otter_vm_gc::AllocationRegistry;
+        unsafe { otter_vm_gc::set_thread_registry(&*self.gc_registry) };
+
+        // Free all GC-allocated objects. This sets GC_DEALLOC_IN_PROGRESS
+        // which prevents VmContext::teardown from running (if it hasn't
+        // already been dropped).
+        self.gc_registry.dealloc_all();
+
+        // Clear thread-local GC registry. MUST happen before Box drops.
+        otter_vm_gc::clear_thread_registry_if(our_ptr);
+
+        // Clear thread-local MM only if it's ours
+        crate::memory::MemoryManager::clear_thread_default_if(&self.memory_manager);
+
+        // Now Box<AllocationRegistry> drops (struct freed, memory already deallocated).
+    }
+}
+
+// SAFETY: VmRuntime uses Mutex<IndexMap> (thread-safe) for modules and
+// Arc<RealmRegistry> (thread-safe) for realms. The GcRef fields
+// (global_template, function_prototype) are thread-confined by the Isolate
+// abstraction. VmRuntime is `Sync` because the Mutex protects the mutable
+// state, and GcRef fields are read-only after construction.
 unsafe impl Send for VmRuntime {}
 unsafe impl Sync for VmRuntime {}
 

@@ -262,6 +262,19 @@ impl MemoryManager {
             *cell.borrow_mut() = None;
         });
     }
+
+    /// Clear the thread-local MemoryManager only if it matches the given one.
+    /// Used by VmRuntime::drop() to avoid clearing another runtime's MM.
+    pub fn clear_thread_default_if(mm: &Arc<MemoryManager>) {
+        THREAD_MEMORY_MANAGER.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            if let Some(current) = guard.as_ref() {
+                if Arc::ptr_eq(current, mm) {
+                    *guard = None;
+                }
+            }
+        });
+    }
 }
 
 /// A wrapper around a type that records its size in a MemoryManager on drop

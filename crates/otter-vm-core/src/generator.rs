@@ -302,7 +302,10 @@ pub struct JsGenerator {
 }
 
 // SAFETY: JsGenerator is only accessed from the single VM thread.
-// Thread confinement is enforced at the VmRuntime/VmContext level.
+// Thread confinement is enforced by the Isolate abstraction: each Isolate
+// is `Send` but `!Sync`. RefCell fields (frame, initial_args, etc.) are
+// never accessed from multiple threads. The `Sync` impl is required for
+// `GcRef<JsGenerator>` to be `Send` (per GcRef bounds: `T: Send + Sync`).
 unsafe impl Send for JsGenerator {}
 unsafe impl Sync for JsGenerator {}
 

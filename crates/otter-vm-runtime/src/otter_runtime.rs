@@ -2480,7 +2480,8 @@ impl Default for Otter {
     }
 }
 
-// SAFETY: Otter uses thread-safe types
+// SAFETY: Otter uses thread-safe types (Arc, Mutex, AtomicBool).
+// Thread confinement is enforced by the Isolate abstraction.
 unsafe impl Send for Otter {}
 
 /// Convert VM Value to JSON

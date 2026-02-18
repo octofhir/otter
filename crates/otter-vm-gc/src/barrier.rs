@@ -158,7 +158,7 @@ impl Default for WriteBarrierBuffer {
 }
 
 // SAFETY: WriteBarrierBuffer is only accessed from the single VM thread.
-// Thread confinement is enforced at the VmRuntime/VmContext level.
+// Thread confinement is enforced by the Isolate abstraction.
 unsafe impl Send for WriteBarrierBuffer {}
 unsafe impl Sync for WriteBarrierBuffer {}
 
@@ -222,7 +222,7 @@ impl Default for RememberedSet {
 }
 
 // SAFETY: RememberedSet is only accessed from the single VM thread.
-// Thread confinement is enforced at the VmRuntime/VmContext level.
+// Thread confinement is enforced by the Isolate abstraction.
 unsafe impl Send for RememberedSet {}
 unsafe impl Sync for RememberedSet {}
 

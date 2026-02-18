@@ -34,6 +34,7 @@ pub struct TimerCallbackRoots {
 // SAFETY: `TimerCallbackRoots` is accessed only from the single VM thread.
 // `parking_lot::Mutex` provides the interior-mutability needed for shared access
 // between timer Op handlers (which insert/remove) and the GC tracer (which reads).
+// Thread confinement is enforced by the Isolate abstraction.
 unsafe impl Send for TimerCallbackRoots {}
 unsafe impl Sync for TimerCallbackRoots {}
 

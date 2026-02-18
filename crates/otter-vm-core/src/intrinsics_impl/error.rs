@@ -230,7 +230,7 @@ pub fn init_error_prototypes(
 
 /// Create Error constructor function
 pub fn create_error_constructor(
-    error_name: &'static str,
+    _error_name: &'static str,
 ) -> Box<
     dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
         + Send

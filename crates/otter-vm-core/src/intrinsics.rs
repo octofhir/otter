@@ -818,13 +818,9 @@ impl Intrinsics {
                                 && idx + 1 < len
                                 && crate::intrinsics_impl::string::is_low_surrogate(units[idx + 1])
                             {
-                                let pair = vec![first, units[idx + 1]];
-                                let char_str = String::from_utf16_lossy(&pair);
-                                (JsString::intern(&char_str), idx + 2)
+                                (JsString::intern_utf16(&[first, units[idx + 1]]), idx + 2)
                             } else {
-                                let single = vec![first];
-                                let char_str = String::from_utf16_lossy(&single);
-                                (JsString::intern(&char_str), idx + 1)
+                                (JsString::intern_utf16(&[first]), idx + 1)
                             };
 
                         let _ = iter_obj.set(
@@ -1753,7 +1749,6 @@ impl Intrinsics {
         let object_rest_fn =
             crate::intrinsics_impl::object::create_object_rest_helper(fn_proto, mm);
         let _ = global.set(PropertyKey::string("__Object_rest"), object_rest_fn);
-
         // ====================================================================
         // Primitive wrapper constructors
         // ====================================================================
@@ -1947,7 +1942,7 @@ impl Intrinsics {
                     let len = if len_num.is_nan() || len_num < 0.0 {
                         0usize
                     } else {
-                        (len_num.min(9007199254740991.0) as usize) // 2^53 - 1
+                        len_num.min(9007199254740991.0) as usize // 2^53 - 1
                     };
                     if len == 0 {
                         return Ok(Value::string(JsString::intern("")));
@@ -2303,7 +2298,7 @@ impl Intrinsics {
             "DataView",
             data_view_ctor,
             self.data_view_prototype,
-            Some(Box::new(|_this, args: &[Value], ncx| {
+            Some(Box::new(|_this, args: &[Value], _ncx| {
                 use crate::data_view::JsDataView;
 
                 let first_arg = args.first().cloned().unwrap_or(Value::undefined());
@@ -2382,6 +2377,8 @@ impl Intrinsics {
             install_sym("species", &self.symbol_species);
             install_sym("unscopables", &self.symbol_unscopables);
         }
+
+        crate::web_api::intl::install_intl(global, self.object_prototype, fn_proto, mm);
 
         // ====================================================================
         // Temporal namespace (extracted to intrinsics_impl/temporal.rs)

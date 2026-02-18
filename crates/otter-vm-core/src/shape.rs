@@ -35,7 +35,10 @@ pub struct Shape {
 }
 
 // SAFETY: Shape is only accessed from a single VM thread.
-// RefCell is !Sync, but our VM is thread-confined.
+// Thread confinement is enforced by the Isolate abstraction: each Isolate
+// is `Send` but `!Sync`, ensuring only one thread accesses shapes at any time.
+// The `Sync` impl is required for `GcRef<Shape>` bounds (`T: Send + Sync`)
+// and for Arc<Shape> to be `Send`. RefCell transitions are thread-confined.
 unsafe impl Send for Shape {}
 unsafe impl Sync for Shape {}
 

@@ -48,7 +48,7 @@ struct EphemeronEntry {
 }
 
 // SAFETY: EphemeronEntry is only accessed from the single VM thread.
-// Thread confinement is enforced at the VmRuntime/VmContext level.
+// Thread confinement is enforced by the Isolate abstraction.
 unsafe impl Send for EphemeronEntry {}
 unsafe impl Sync for EphemeronEntry {}
 
@@ -64,7 +64,7 @@ pub struct EphemeronTable {
 }
 
 // SAFETY: EphemeronTable is only accessed from the single VM thread.
-// Thread confinement is enforced at the VmRuntime/VmContext level.
+// Thread confinement is enforced by the Isolate abstraction.
 unsafe impl Send for EphemeronTable {}
 unsafe impl Sync for EphemeronTable {}
 

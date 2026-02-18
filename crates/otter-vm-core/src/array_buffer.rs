@@ -24,7 +24,7 @@ pub struct JsArrayBuffer {
 }
 
 // SAFETY: JsArrayBuffer is only accessed from the single VM thread.
-// Thread confinement is enforced at the VmRuntime/VmContext level.
+// Thread confinement is enforced by the Isolate abstraction.
 // (SharedArrayBuffer correctly uses AtomicU8 and is NOT changed.)
 unsafe impl Send for JsArrayBuffer {}
 unsafe impl Sync for JsArrayBuffer {}

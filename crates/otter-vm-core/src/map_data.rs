@@ -25,7 +25,7 @@ pub struct MapData {
 }
 
 // SAFETY: MapData is only accessed from the single VM thread.
-// Thread confinement is enforced at the VmRuntime/VmContext level.
+// Thread confinement is enforced by the Isolate abstraction.
 unsafe impl Send for MapData {}
 unsafe impl Sync for MapData {}
 
@@ -195,7 +195,7 @@ pub struct SetData {
 }
 
 // SAFETY: SetData is only accessed from the single VM thread.
-// Thread confinement is enforced at the VmRuntime/VmContext level.
+// Thread confinement is enforced by the Isolate abstraction.
 unsafe impl Send for SetData {}
 unsafe impl Sync for SetData {}
 

@@ -27,6 +27,17 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 static DUMPED_ASSERT_RT: AtomicBool = AtomicBool::new(false);
 use std::sync::Arc;
 
+/// Extract a human-readable message from a panic payload.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        format!("internal panic: {}", s)
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        format!("internal panic: {}", s)
+    } else {
+        "internal panic: <unknown>".to_string()
+    }
+}
+
 /// The bytecode interpreter
 pub struct Interpreter {
     /// Current module being executed
@@ -222,8 +233,17 @@ impl Interpreter {
 
         ctx.set_running(true);
 
-        // Execute loop
-        let result = self.run_loop(ctx);
+        // Execute loop with panic protection.
+        // Panics in the interpreter (from unwrap/expect on corrupted state)
+        // are caught and converted to VmError::InternalError, preventing
+        // the entire process from aborting.
+        let result = {
+            use std::panic::{AssertUnwindSafe, catch_unwind};
+            match catch_unwind(AssertUnwindSafe(|| self.run_loop(ctx))) {
+                Ok(result) => result,
+                Err(panic_payload) => Err(VmError::internal(&panic_message(&panic_payload))),
+            }
+        };
 
         // Capture exports from the current frame before popping it
         if result.is_ok() {
@@ -328,8 +348,19 @@ impl Interpreter {
 
         ctx.set_running(true);
 
-        // Execute loop with suspension support
-        self.run_loop_with_suspension(ctx, result_promise)
+        // Execute loop with suspension support and panic protection
+        {
+            use std::panic::{AssertUnwindSafe, catch_unwind};
+            match catch_unwind(AssertUnwindSafe(|| {
+                self.run_loop_with_suspension(ctx, result_promise)
+            })) {
+                Ok(result) => result,
+                Err(panic_payload) => {
+                    ctx.set_running(false);
+                    VmExecutionResult::Error(panic_message(&panic_payload))
+                }
+            }
+        }
     }
 
     /// Resume execution from a saved async context
@@ -351,8 +382,19 @@ impl Interpreter {
         ctx.set_register(async_ctx.resume_register, resolved_value);
         ctx.set_running(async_ctx.was_running);
 
-        // Continue execution
-        self.run_loop_with_suspension(ctx, async_ctx.result_promise)
+        // Continue execution with panic protection
+        {
+            use std::panic::{AssertUnwindSafe, catch_unwind};
+            match catch_unwind(AssertUnwindSafe(|| {
+                self.run_loop_with_suspension(ctx, async_ctx.result_promise)
+            })) {
+                Ok(result) => result,
+                Err(panic_payload) => {
+                    ctx.set_running(false);
+                    VmExecutionResult::Error(panic_message(&panic_payload))
+                }
+            }
+        }
     }
 
     /// Resume execution from a saved async context with a rejection (throw).
@@ -376,8 +418,19 @@ impl Interpreter {
         // through try-catch or propagate it as an uncaught exception
         ctx.set_pending_throw(Some(rejection_value));
 
-        // Continue execution (the loop will pick up the pending throw)
-        self.run_loop_with_suspension(ctx, async_ctx.result_promise)
+        // Continue execution with panic protection
+        {
+            use std::panic::{AssertUnwindSafe, catch_unwind};
+            match catch_unwind(AssertUnwindSafe(|| {
+                self.run_loop_with_suspension(ctx, async_ctx.result_promise)
+            })) {
+                Ok(result) => result,
+                Err(panic_payload) => {
+                    ctx.set_running(false);
+                    VmExecutionResult::Error(panic_message(&panic_payload))
+                }
+            }
+        }
     }
 
     /// Call a function value (native or closure) with arguments
@@ -530,14 +583,40 @@ impl Interpreter {
 
             let instruction = &func.instructions[frame.pc];
 
-            match self.execute_instruction(instruction, &current_module, ctx) {
-                Ok(InstructionResult::Continue) => {
+            let instruction_result = match self.execute_instruction(instruction, &current_module, ctx) {
+                Ok(result) => result,
+                Err(err) => match err {
+                    VmError::Exception(thrown) => InstructionResult::Throw(thrown.value),
+                    VmError::TypeError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
+                    }
+                    VmError::RangeError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "RangeError", &message))
+                    }
+                    VmError::ReferenceError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "ReferenceError", &message))
+                    }
+                    VmError::SyntaxError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
+                    }
+                    other => {
+                        while ctx.stack_depth() > prev_stack_depth {
+                            ctx.pop_frame();
+                        }
+                        ctx.set_running(was_running);
+                        return Err(other);
+                    }
+                },
+            };
+
+            match instruction_result {
+                InstructionResult::Continue => {
                     ctx.advance_pc();
                 }
-                Ok(InstructionResult::Jump(offset)) => {
+                InstructionResult::Jump(offset) => {
                     ctx.jump(offset);
                 }
-                Ok(InstructionResult::Return(value)) => {
+                InstructionResult::Return(value) => {
                     let (return_reg, is_construct, construct_this, is_async) = {
                         let frame = ctx
                             .current_frame()
@@ -569,7 +648,7 @@ impl Interpreter {
                         ctx.set_register(0, value);
                     }
                 }
-                Ok(InstructionResult::Call {
+                InstructionResult::Call {
                     func_index,
                     module,
                     argc,
@@ -577,7 +656,7 @@ impl Interpreter {
                     is_construct,
                     is_async,
                     upvalues,
-                }) => {
+                } => {
                     ctx.advance_pc();
                     let func = module
                         .function(func_index)
@@ -607,14 +686,14 @@ impl Interpreter {
                         argc as usize,
                     )?;
                 }
-                Ok(InstructionResult::TailCall {
+                InstructionResult::TailCall {
                     func_index,
                     module,
                     argc,
                     return_reg,
                     is_async,
                     upvalues,
-                }) => {
+                } => {
                     // Tail call: pop current frame and push new one
                     ctx.pop_frame();
                     let local_count = module
@@ -632,29 +711,36 @@ impl Interpreter {
                         argc as usize,
                     )?;
                 }
-                Ok(InstructionResult::Suspend { .. }) => {
+                InstructionResult::Suspend { .. } => {
                     // Can't handle suspension in direct call, return undefined
                     break Value::undefined();
                 }
-                Ok(InstructionResult::Yield { .. }) => {
+                InstructionResult::Yield { .. } => {
                     // Can't handle yield in direct call, return undefined
                     break Value::undefined();
                 }
-                Ok(InstructionResult::Throw(error)) => {
+                InstructionResult::Throw(error) => {
+                    // Handle throws caught inside the function(s) started by this call.
+                    if let Some((target_depth, catch_pc)) = ctx.peek_nearest_try()
+                        && target_depth > prev_stack_depth
+                    {
+                        let _ = ctx.take_nearest_try();
+                        while ctx.stack_depth() > target_depth {
+                            ctx.pop_frame();
+                        }
+                        if let Some(frame) = ctx.current_frame_mut() {
+                            frame.pc = catch_pc;
+                        }
+                        ctx.set_exception(error);
+                        continue;
+                    }
+
                     // Pop the frame we pushed and unwind to original depth
                     while ctx.stack_depth() > prev_stack_depth {
                         ctx.pop_frame();
                     }
                     ctx.set_running(was_running);
                     return Err(VmError::exception(error));
-                }
-                Err(e) => {
-                    // Pop the frame we pushed and unwind to original depth
-                    while ctx.stack_depth() > prev_stack_depth {
-                        ctx.pop_frame();
-                    }
-                    ctx.set_running(was_running);
-                    return Err(e);
                 }
             }
         };
@@ -790,7 +876,7 @@ impl Interpreter {
                 None
             };
 
-            let (func_idx, pc) = (frame.function_index, frame.pc);
+            let (_func_idx, _pc) = (frame.function_index, frame.pc);
 
             // Execute the instruction
             let instruction_result = match self.execute_instruction(instruction, module_ref, ctx) {
@@ -10281,8 +10367,19 @@ impl Interpreter {
             return GeneratorResult::Error(e);
         }
 
-        // Run until yield or return
-        self.run_generator_loop(generator, ctx, initial_depth)
+        // Run until yield or return (with panic protection)
+        {
+            use std::panic::{AssertUnwindSafe, catch_unwind};
+            match catch_unwind(AssertUnwindSafe(|| {
+                self.run_generator_loop(generator, ctx, initial_depth)
+            })) {
+                Ok(result) => result,
+                Err(panic_payload) => {
+                    generator.complete();
+                    GeneratorResult::Error(VmError::internal(&panic_message(&panic_payload)))
+                }
+            }
+        }
     }
 
     /// Resume generator execution from saved frame
@@ -10374,8 +10471,19 @@ impl Interpreter {
             }
         }
 
-        // Run until yield or return
-        self.run_generator_loop(generator, ctx, initial_depth)
+        // Run until yield or return (with panic protection)
+        {
+            use std::panic::{AssertUnwindSafe, catch_unwind};
+            match catch_unwind(AssertUnwindSafe(|| {
+                self.run_generator_loop(generator, ctx, initial_depth)
+            })) {
+                Ok(result) => result,
+                Err(panic_payload) => {
+                    generator.complete();
+                    GeneratorResult::Error(VmError::internal(&panic_message(&panic_payload)))
+                }
+            }
+        }
     }
 
     /// Restore a generator frame to the context
@@ -10932,7 +11040,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         assert_eq!(result.as_int32(), Some(42));
@@ -10959,7 +11067,7 @@ mod tests {
             hook_calls_clone.fetch_add(1, Ordering::SeqCst);
         })));
 
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
         assert!(result.is_undefined());
         assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
@@ -10989,7 +11097,7 @@ mod tests {
             capture_timing: false,
         });
 
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let _ = interpreter.execute(&module, &mut ctx).unwrap();
 
         let entries: Vec<_> = ctx.get_trace_buffer().unwrap().iter().cloned().collect();
@@ -11037,7 +11145,7 @@ mod tests {
             capture_timing: true,
         });
 
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let _ = interpreter.execute(&module, &mut ctx).unwrap();
 
         let entries: Vec<_> = ctx.get_trace_buffer().unwrap().iter().cloned().collect();
@@ -11077,7 +11185,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         assert_eq!(result.as_number(), Some(15.0));
@@ -11109,7 +11217,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         assert_eq!(result.as_boolean(), Some(true));
@@ -11153,7 +11261,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         assert_eq!(result.as_int32(), Some(42));
@@ -11203,7 +11311,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         assert_eq!(result.as_int32(), Some(10));
@@ -11252,7 +11360,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         assert_eq!(result.as_int32(), Some(99));
@@ -11292,7 +11400,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         // typeof function === "function"
@@ -11356,7 +11464,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         assert_eq!(result.as_number(), Some(10.0)); // 5 + 5 = 10
@@ -11418,7 +11526,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         assert_eq!(result.as_number(), Some(10.0)); // 3 + 7 = 10
@@ -11512,7 +11620,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         // outer(2) = inner(2) * 2 = (2*2) * 2 = 8
@@ -11578,7 +11686,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         assert_eq!(result.as_int32(), Some(42));
@@ -11673,7 +11781,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         // For now, just verify we can define a setter without crashing
@@ -11722,7 +11830,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         assert_eq!(result.as_int32(), Some(42));
@@ -11767,7 +11875,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         assert_eq!(result.as_int32(), Some(100));
@@ -11812,7 +11920,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         assert_eq!(result.as_boolean(), Some(true));
@@ -11822,7 +11930,7 @@ mod tests {
     fn test_ic_coverage_instanceof() {
         // Test InstanceOf IC - caches prototype lookup on constructor
         // This test uses Construct to properly create an instance
-        use otter_vm_bytecode::{ConstantIndex, FunctionIndex};
+        use otter_vm_bytecode::FunctionIndex;
 
         let mut builder = Module::builder("test.js");
         builder.constants_mut().add_string("prototype");
@@ -11864,7 +11972,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         assert_eq!(result.as_boolean(), Some(true));
@@ -11912,7 +12020,7 @@ mod tests {
         let module = builder.build();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
         assert_eq!(result.as_int32(), Some(42));
@@ -11959,7 +12067,7 @@ mod tests {
         let module = std::sync::Arc::new(module);
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
 
         assert_eq!(result.as_int32(), Some(42));
@@ -12053,7 +12161,7 @@ mod tests {
         let module = std::sync::Arc::new(module);
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
 
         assert_eq!(result.as_int32(), Some(30)); // 10 + 20
@@ -12253,7 +12361,7 @@ mod tests {
         let module = std::sync::Arc::new(module);
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
 
         assert_eq!(result.as_int32(), Some(15)); // 1+2+3+4+5
@@ -12348,7 +12456,7 @@ mod tests {
         let epoch_before = get_proto_epoch();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
 
         assert_eq!(result.as_int32(), Some(42));
@@ -12412,7 +12520,7 @@ mod tests {
         let module = std::sync::Arc::new(module);
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
         assert_eq!(result.as_int32(), Some(42));
 
@@ -12518,7 +12626,7 @@ mod tests {
         let epoch_before = get_proto_epoch();
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
 
         assert_eq!(result.as_int32(), Some(30)); // 10 + 20
@@ -12714,7 +12822,7 @@ mod tests {
         // Execute the function multiple times
         for _ in 0..100 {
             let mut ctx = create_test_context();
-            let mut interpreter = Interpreter::new();
+            let interpreter = Interpreter::new();
             let _ = interpreter.execute_arc(module.clone(), &mut ctx);
         }
 
@@ -12725,7 +12833,7 @@ mod tests {
         // Execute until we cross the threshold
         for _ in 0..(HOT_FUNCTION_THRESHOLD - 100) {
             let mut ctx = create_test_context();
-            let mut interpreter = Interpreter::new();
+            let interpreter = Interpreter::new();
             let _ = interpreter.execute_arc(module.clone(), &mut ctx);
         }
 
@@ -12846,7 +12954,7 @@ mod tests {
         let module = Arc::new(module);
 
         let mut ctx = create_test_context();
-        let mut interpreter = Interpreter::new();
+        let interpreter = Interpreter::new();
         let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
 
         assert_eq!(result.as_int32(), Some(100));

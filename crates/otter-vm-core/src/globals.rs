@@ -493,7 +493,7 @@ fn setup_builtin_constructors(
 
         // Create constructor based on type — all get fn_proto as [[Prototype]]
         let ctor = if let Some(intrinsics) =
-            intrinsics_opt.filter(|i| matches!(name, "AbortController" | "AbortSignal"))
+            intrinsics_opt.filter(|_i| matches!(name, "AbortController" | "AbortSignal"))
         {
             match name {
                 "AbortController" => Value::native_function_with_proto_and_object(
@@ -955,6 +955,12 @@ fn setup_builtin_constructors(
                     ctor_obj.set_prototype(Value::object(parent_ta_ctor));
                 }
                 // These native typed array constructors are constructible in this runtime.
+                let _ = ctor_obj.set(
+                    PropertyKey::string("__non_constructor"),
+                    Value::boolean(false),
+                );
+            } else if name == "Proxy" {
+                // Proxy is constructible (`new Proxy(...)`) but intentionally has no `.prototype`.
                 let _ = ctor_obj.set(
                     PropertyKey::string("__non_constructor"),
                     Value::boolean(false),

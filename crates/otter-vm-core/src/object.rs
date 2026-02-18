@@ -772,10 +772,8 @@ impl JsObject {
     pub fn setup_string_exotic(&self, s: &str) {
         let mut elements = self.elements.borrow_mut();
         elements.clear();
-        for ch in s.chars() {
-            let mut buf = [0u8; 4];
-            let cs = ch.encode_utf8(&mut buf);
-            elements.push(Value::string(JsString::intern(cs)));
+        for unit in s.encode_utf16() {
+            elements.push(Value::string(JsString::intern_utf16(&[unit])));
         }
         drop(elements);
         self.flags.borrow_mut().is_string_exotic = true;
@@ -3226,8 +3224,12 @@ impl std::fmt::Debug for JsObject {
 }
 
 // SAFETY: JsObject uses ObjectCell (UnsafeCell) for interior mutability.
-// Thread confinement is enforced at the VmRuntime/VmContext level.
-// Send+Sync is inherited from ObjectCell's explicit impls.
+// Thread confinement is enforced by the Isolate abstraction: each Isolate
+// is `Send` but `!Sync`, ensuring only one thread accesses its object graph
+// at any time. JsObject is `Sync` because it is never actually shared between
+// threads — all sharing goes through structured clone (copy semantics).
+// The `Sync` impl is required for `GcRef<JsObject>` to be `Send` (per
+// GcRef's bounds: `T: Send + Sync`), enabling Isolate thread migration.
 unsafe impl Send for JsObject {}
 unsafe impl Sync for JsObject {}
 

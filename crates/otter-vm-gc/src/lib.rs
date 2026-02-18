@@ -27,7 +27,8 @@ pub use barrier::{
 };
 pub use ephemeron::EphemeronTable;
 pub use mark_sweep::{
-    AllocationRegistry, GcPhase, GcTraceable, RegistryStats, barrier_push, gc_alloc, gc_alloc_in,
-    global_registry, is_dealloc_in_progress,
+    AllocationRegistry, GcPhase, GcTraceable, RegistryStats, barrier_push, clear_thread_registry,
+    clear_thread_registry_if, gc_alloc, gc_alloc_in, global_registry, is_dealloc_in_progress,
+    set_thread_registry,
 };
 pub use object::{GcHeader, GcObject};

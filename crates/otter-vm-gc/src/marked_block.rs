@@ -86,7 +86,7 @@ pub struct MarkedBlock {
 }
 
 // SAFETY: MarkedBlock is only accessed from the single VM/GC thread.
-// Thread confinement is enforced at the AllocationRegistry level (thread_local).
+// Thread confinement is enforced by the Isolate abstraction.
 unsafe impl Send for MarkedBlock {}
 unsafe impl Sync for MarkedBlock {}
 
@@ -428,7 +428,7 @@ pub struct BlockDirectory {
     cursor: Cell<usize>,
 }
 
-// SAFETY: Same thread confinement as MarkedBlock.
+// SAFETY: Same thread confinement as MarkedBlock (Isolate abstraction).
 unsafe impl Send for BlockDirectory {}
 unsafe impl Sync for BlockDirectory {}
 

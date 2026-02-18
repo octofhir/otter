@@ -57,7 +57,11 @@ use std::sync::Arc;
 pub struct UpvalueCell(Arc<RefCell<Value>>);
 
 // SAFETY: UpvalueCell is only accessed from the single VM thread.
-// Thread confinement is enforced at the VmRuntime/VmContext level.
+// Thread confinement is enforced by the Isolate abstraction: each Isolate
+// is `Send` but `!Sync`. UpvalueCell is never shared between threads.
+// Arc<RefCell<Value>> allows shared ownership within a single-threaded isolate
+// (closures sharing upvalue cells). The `Sync` impl enables containing types
+// to be `Send` per Rust's auto-trait rules.
 unsafe impl Send for UpvalueCell {}
 unsafe impl Sync for UpvalueCell {}
 
@@ -111,7 +115,10 @@ pub struct Value {
     heap_ref: Option<HeapRef>,
 }
 
-// SAFETY: Value contains only u64 bits and Arc (which is Send+Sync)
+// SAFETY: Value contains only u64 bits and HeapRef (Arc-based).
+// Thread confinement is enforced by the Isolate abstraction.
+// Pointer-tagged values (GcRef) are safe because they are confined
+// to a single Isolate, which is `Send` but `!Sync`.
 unsafe impl Send for Value {}
 unsafe impl Sync for Value {}
 

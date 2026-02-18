@@ -176,7 +176,7 @@ unsafe impl Sync for SharedArrayBuffer {}
 mod tests {
     use super::*;
     use crate::gc::GcRef;
-    use std::sync::Arc;
+    
     use std::thread;
 
     #[test]

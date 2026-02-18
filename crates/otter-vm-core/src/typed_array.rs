@@ -116,7 +116,7 @@ impl JsTypedArray {
         }
 
         // Validate bounds
-        let byte_length = length * elem_size;
+        let byte_length = length.checked_mul(elem_size).ok_or("TypedArray length overflow")?;
         if byte_offset + byte_length > buffer.byte_length() {
             return Err("TypedArray would extend past end of buffer");
         }

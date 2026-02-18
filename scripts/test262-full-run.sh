@@ -50,7 +50,7 @@ for dir in "${DIRS[@]}"; do
     printf "\r[%3d/%d] %-50s" "$BATCH" "$TOTAL" "$dir"
 
     # Run batch (may crash — that's OK, continue with next)
-    cargo run -p otter-test262 --bin test262 -- run \
+    cargo run --profile test262 -p otter-test262 --bin test262 -- run \
         --subdir "$dir" --timeout "$TIMEOUT" --save "$BATCH_FILE" \
         2>/dev/null 1>/dev/null
     EXIT_CODE=$?
@@ -133,7 +133,7 @@ print(f'Failed: {failed}, Timeout: {timeout}, Skipped: {skipped}')
 
 echo ""
 echo "=== Generating ES_CONFORMANCE.md ==="
-cargo run -p otter-test262 --bin gen-conformance 2>&1 | grep "Generated"
+cargo run --profile test262 -p otter-test262 --bin gen-conformance 2>&1 | grep "Generated"
 
 echo ""
 echo "Done! Results in $MERGED, conformance in ES_CONFORMANCE.md"

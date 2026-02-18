@@ -12,9 +12,10 @@ pub mod config;
 pub mod editions;
 pub mod harness;
 pub mod metadata;
+pub mod parallel;
 pub mod report;
 pub mod runner;
 
 pub use metadata::ExecutionMode;
-pub use report::{FailureInfo, FeatureReport, PersistedReport, TestReport};
+pub use report::{FailureInfo, FeatureReport, PersistedReport, RunSummary, TestReport};
 pub use runner::{Test262Runner, TestOutcome, TestResult};

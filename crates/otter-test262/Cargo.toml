@@ -22,6 +22,9 @@ otter-kv = { path = "../otter-kv", version = "0.1.0" }
 otter-pm = { path = "../otter-pm", version = "0.1.1" }
 otter-sql = { path = "../otter-sql", version = "0.1.0" }
 
+crossbeam-channel = "0.5"
+num_cpus = "1.16"
+
 thiserror.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

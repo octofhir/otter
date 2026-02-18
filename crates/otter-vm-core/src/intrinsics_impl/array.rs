@@ -18,11 +18,51 @@ use crate::string::JsString;
 use crate::value::Value;
 use std::sync::Arc;
 
-/// Helper: get array length from an object (spec-compliant, no cap).
+/// Helper: get array length from an object (fast path, no coercion).
 fn get_len(obj: &GcRef<JsObject>) -> usize {
     obj.get(&PropertyKey::string("length"))
         .and_then(|v| v.as_number())
         .unwrap_or(0.0) as usize
+}
+
+/// Spec-compliant Get(O, P) that invokes getters for accessor properties.
+/// Use this instead of `obj.get()` in array methods to handle `Object.defineProperty`
+/// with getters correctly.
+fn get_value(
+    obj: &GcRef<JsObject>,
+    key: &PropertyKey,
+    ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    crate::object::get_value_full(obj, key, ncx)
+}
+
+/// Spec-compliant ToLength via NativeContext, supports accessor `length`.
+/// Handles strings, objects with valueOf, NaN, etc.
+/// Returns value clamped to [0, 2^53-1].
+fn get_len_ncx(obj: &GcRef<JsObject>, ncx: &mut NativeContext<'_>) -> Result<usize, VmError> {
+    let len_val = get_value(obj, &PropertyKey::string("length"), ncx)?;
+    // Fast path: already a number
+    if let Some(n) = len_val.as_number() {
+        return Ok(to_length(n));
+    }
+    if let Some(i) = len_val.as_int32() {
+        return Ok(if i < 0 { 0 } else { i as usize });
+    }
+    if len_val.is_undefined() {
+        return Ok(0);
+    }
+    // Slow path: ToNumber coercion via NativeContext
+    let n = ncx.to_number_value(&len_val)?;
+    Ok(to_length(n))
+}
+
+/// ES2024 §7.1.15 ToLength: clamp to [0, 2^53-1]
+fn to_length(n: f64) -> usize {
+    if n.is_nan() || n <= 0.0 {
+        0
+    } else {
+        (n.min(9007199254740991.0)) as usize // 2^53 - 1
+    }
 }
 
 /// Helper: convert value to string for default sort comparison
@@ -78,6 +118,16 @@ fn js_get(
 }
 
 /// Create a new array with the correct Array.prototype from the global.
+/// Maximum array length per ES2024 §10.4.2.2 ArrayCreate.
+const MAX_ARRAY_LENGTH: usize = (1u64 << 32) as usize - 1; // 2^32 - 1
+
+fn array_create(length: usize, ncx: &mut NativeContext<'_>) -> Result<GcRef<JsObject>, VmError> {
+    if length > MAX_ARRAY_LENGTH {
+        return Err(VmError::range_error("Invalid array length"));
+    }
+    Ok(create_default_array(length, ncx))
+}
+
 fn create_default_array(length: usize, ncx: &mut NativeContext<'_>) -> GcRef<JsObject> {
     let arr = GcRef::new(JsObject::array(length, ncx.memory_manager().clone()));
     // Set Array.prototype so methods like .map(), .filter() work on the result
@@ -106,7 +156,7 @@ fn array_species_create(
 ) -> Result<GcRef<JsObject>, VmError> {
     // 2. If IsArray(originalArray) is false, return ArrayCreate(length)
     if !original_array.is_array() {
-        return Ok(create_default_array(length, ncx));
+        return array_create(length, ncx);
     }
     // 3. Let C = Get(originalArray, "constructor")
     let c = original_array
@@ -114,7 +164,7 @@ fn array_species_create(
         .unwrap_or(Value::undefined());
     // 4. If C is undefined, return ArrayCreate(length)
     if c.is_undefined() {
-        return Ok(create_default_array(length, ncx));
+        return array_create(length, ncx);
     }
     // 5. If Type(C) is Object, let S = Get(C, @@species)
     if let Some(c_obj) = c.as_object().or_else(|| c.native_function_object()) {
@@ -142,7 +192,7 @@ fn array_species_create(
         };
         // 6. If S is undefined or null, return ArrayCreate(length)
         if s.is_undefined() || s.is_null() {
-            return Ok(create_default_array(length, ncx));
+            return array_create(length, ncx);
         }
         // 7. If IsConstructor(S), return Construct(S, [length])
         if s.is_callable() {
@@ -209,7 +259,7 @@ pub fn init_array_prototype(
     // Array.prototype.push
     arr_proto.define_property(
         PropertyKey::string("push"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, _ncx| {
                 let obj = this_val
                     .as_object()
@@ -224,13 +274,15 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "push",
+            1,
         )),
     );
 
     // Array.prototype.pop
     arr_proto.define_property(
         PropertyKey::string("pop"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, _args, _ncx| {
                 let obj = this_val
                     .as_object()
@@ -248,13 +300,15 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "pop",
+            0,
         )),
     );
 
     // Array.prototype.shift
     arr_proto.define_property(
         PropertyKey::string("shift"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, _args, _ncx| {
                 let obj = this_val
                     .as_object()
@@ -279,13 +333,15 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "shift",
+            0,
         )),
     );
 
     // Array.prototype.unshift
     arr_proto.define_property(
         PropertyKey::string("unshift"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
@@ -312,20 +368,24 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "unshift",
+            1,
         )),
     );
 
     // Array.prototype.indexOf
     arr_proto.define_property(
         PropertyKey::string("indexOf"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| "Array.prototype.indexOf: not an object".to_string())?;
-                let len = get_len(&obj);
+                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let len = get_len_ncx(&obj, ncx)?;
                 let search = args.first().cloned().unwrap_or(Value::undefined());
-                let from = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i64;
+                let from = if let Some(v) = args.get(1) {
+                    ncx.to_number_value(v)? as i64
+                } else {
+                    0i64
+                };
                 let start = if from < 0 {
                     (len as i64 + from).max(0) as usize
                 } else {
@@ -339,36 +399,36 @@ pub fn init_array_prototype(
                     if !obj.has(&PropertyKey::Index(i as u32)) {
                         continue;
                     }
-                    if let Some(val) = obj.get(&PropertyKey::Index(i as u32)) {
-                        if strict_equal(&val, &search) {
-                            return Ok(Value::number(i as f64));
-                        }
+                    let val = get_value(&obj, &PropertyKey::Index(i as u32), ncx)?;
+                    if strict_equal(&val, &search) {
+                        return Ok(Value::number(i as f64));
                     }
                 }
                 Ok(Value::number(-1.0))
             },
             mm.clone(),
             fn_proto,
+            "indexOf",
+            1,
         )),
     );
 
     // Array.prototype.lastIndexOf
     arr_proto.define_property(
         PropertyKey::string("lastIndexOf"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| "Array.prototype.lastIndexOf: not an object".to_string())?;
-                let len = get_len(&obj);
+                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let len = get_len_ncx(&obj, ncx)?;
                 if len == 0 {
                     return Ok(Value::number(-1.0));
                 }
                 let search = args.first().cloned().unwrap_or(Value::undefined());
-                let from = args
-                    .get(1)
-                    .and_then(|v| v.as_number())
-                    .unwrap_or((len as f64) - 1.0) as i64;
+                let from = if let Some(v) = args.get(1) {
+                    ncx.to_number_value(v)? as i64
+                } else {
+                    (len as i64) - 1
+                };
                 let start = if from < 0 {
                     (len as i64 + from) as usize
                 } else {
@@ -382,30 +442,33 @@ pub fn init_array_prototype(
                     if !obj.has(&PropertyKey::Index(i as u32)) {
                         continue;
                     }
-                    if let Some(val) = obj.get(&PropertyKey::Index(i as u32)) {
-                        if strict_equal(&val, &search) {
-                            return Ok(Value::number(i as f64));
-                        }
+                    let val = get_value(&obj, &PropertyKey::Index(i as u32), ncx)?;
+                    if strict_equal(&val, &search) {
+                        return Ok(Value::number(i as f64));
                     }
                 }
                 Ok(Value::number(-1.0))
             },
             mm.clone(),
             fn_proto,
+            "lastIndexOf",
+            1,
         )),
     );
 
     // Array.prototype.includes
     arr_proto.define_property(
         PropertyKey::string("includes"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| "Array.prototype.includes: not an object".to_string())?;
-                let len = get_len(&obj);
+                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let len = get_len_ncx(&obj, ncx)?;
                 let search = args.first().cloned().unwrap_or(Value::undefined());
-                let from = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i64;
+                let from = if let Some(v) = args.get(1) {
+                    ncx.to_number_value(v)? as i64
+                } else {
+                    0i64
+                };
                 let start = if from < 0 {
                     (len as i64 + from).max(0) as usize
                 } else {
@@ -418,9 +481,7 @@ pub fn init_array_prototype(
                     // Note: includes does NOT skip holes when searching for undefined
                     // Per ES2023 §23.1.3.16, includes uses Get which returns undefined
                     // for holes, then SameValueZero(undefined, searchElement).
-                    let val = obj
-                        .get(&PropertyKey::Index(i as u32))
-                        .unwrap_or(Value::undefined());
+                    let val = get_value(&obj, &PropertyKey::Index(i as u32), ncx)?;
                     if same_value_zero(&val, &search) {
                         return Ok(Value::boolean(true));
                     }
@@ -429,13 +490,15 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "includes",
+            1,
         )),
     );
 
     // Array.prototype.join
     arr_proto.define_property(
         PropertyKey::string("join"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
@@ -458,9 +521,7 @@ pub fn init_array_prototype(
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
                     }
-                    let val = obj
-                        .get(&PropertyKey::Index(i as u32))
-                        .unwrap_or(Value::undefined());
+                    let val = get_value(&obj, &PropertyKey::Index(i as u32), ncx)?;
                     if val.is_undefined() || val.is_null() {
                         parts.push(String::new());
                     } else {
@@ -471,13 +532,15 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "join",
+            1,
         )),
     );
 
     // Array.prototype.toString
     arr_proto.define_property(
         PropertyKey::string("toString"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, _args, ncx| {
                 // toString delegates to join
                 let obj = this_val
@@ -489,9 +552,7 @@ pub fn init_array_prototype(
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
                     }
-                    let val = obj
-                        .get(&PropertyKey::Index(i as u32))
-                        .unwrap_or(Value::undefined());
+                    let val = get_value(&obj, &PropertyKey::Index(i as u32), ncx)?;
                     if val.is_undefined() || val.is_null() {
                         parts.push(String::new());
                     } else {
@@ -502,13 +563,59 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "toString",
+            0,
+        )),
+    );
+
+    // Array.prototype.toLocaleString
+    arr_proto.define_property(
+        PropertyKey::string("toLocaleString"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
+            |this_val, _args, ncx| {
+                let obj = this_val
+                    .as_object()
+                    .ok_or_else(|| {
+                        "Array.prototype.toLocaleString: not an object".to_string()
+                    })?;
+                let len = get_len(&obj);
+                let mut parts = Vec::with_capacity(len.min(1024));
+                for i in 0..len {
+                    if i & 0x3FF == 0 {
+                        ncx.check_for_interrupt()?;
+                    }
+                    let val = get_value(&obj, &PropertyKey::Index(i as u32), ncx)?;
+                    if val.is_undefined() || val.is_null() {
+                        parts.push(String::new());
+                    } else if let Some(elem_obj) = val.as_object() {
+                        // Call toLocaleString() on each element
+                        let tls_fn = elem_obj
+                            .get(&PropertyKey::string("toLocaleString"))
+                            .unwrap_or(Value::undefined());
+                        if tls_fn.is_callable() {
+                            let result =
+                                ncx.call_function(&tls_fn, Value::object(elem_obj), &[])?;
+                            parts.push(ncx.to_string_value(&result)?);
+                        } else {
+                            parts.push(ncx.to_string_value(&val)?);
+                        }
+                    } else {
+                        parts.push(ncx.to_string_value(&val)?);
+                    }
+                }
+                Ok(Value::string(JsString::intern(&parts.join(","))))
+            },
+            mm.clone(),
+            fn_proto,
+            "toLocaleString",
+            0,
         )),
     );
 
     // Array.prototype.slice
     arr_proto.define_property(
         PropertyKey::string("slice"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
@@ -543,9 +650,7 @@ pub fn init_array_prototype(
                     }
                     // Per spec, preserve holes: only set if present in source
                     if obj.has(&PropertyKey::Index((from + i) as u32)) {
-                        let val = obj
-                            .get(&PropertyKey::Index((from + i) as u32))
-                            .unwrap_or(Value::undefined());
+                        let val = get_value(&obj, &PropertyKey::Index((from + i) as u32), ncx)?;
                         let _ = result.set(PropertyKey::Index(i as u32), val);
                     }
                 }
@@ -558,13 +663,15 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "slice",
+            2,
         )),
     );
 
     // Array.prototype.concat
     arr_proto.define_property(
         PropertyKey::string("concat"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
                 let this_obj = this_val
                     .as_object()
@@ -587,29 +694,43 @@ pub fn init_array_prototype(
                     }
                 }
                 // Copy elements from each argument
+                // §23.1.3.1: check Symbol.isConcatSpreadable, then IsArray
+                let spreadable_sym = crate::intrinsics::well_known::is_concat_spreadable_symbol();
                 for arg in args {
-                    if let Some(arr) = arg.as_object() {
-                        // Check if it's an array (has length)
-                        if arr.get(&PropertyKey::string("length")).is_some() {
-                            let len = get_len(&arr);
-                            for i in 0..len {
-                                if i & 0x3FF == 0 {
-                                    ncx.check_for_interrupt()?;
-                                }
-                                if arr.has(&PropertyKey::Index(i as u32)) {
-                                    let val = arr
-                                        .get(&PropertyKey::Index(i as u32))
-                                        .unwrap_or(Value::undefined());
-                                    let _ = result.set(PropertyKey::Index(idx), val);
-                                }
-                                idx += 1;
+                    let spreadable = if let Some(obj) = arg.as_object() {
+                        // Check @@isConcatSpreadable first
+                        let spread_val = obj.get(&PropertyKey::Symbol(spreadable_sym.clone()));
+                        if let Some(sv) = spread_val {
+                            if !sv.is_undefined() {
+                                sv.to_boolean()
+                            } else {
+                                obj.is_array()
                             }
-                            continue;
+                        } else {
+                            obj.is_array()
                         }
+                    } else {
+                        false
+                    };
+
+                    if spreadable {
+                        let arr = arg.as_object().unwrap();
+                        let len = get_len(&arr);
+                        for i in 0..len {
+                            if i & 0x3FF == 0 {
+                                ncx.check_for_interrupt()?;
+                            }
+                            if arr.has(&PropertyKey::Index(i as u32)) {
+                                let val = get_value(&arr, &PropertyKey::Index(i as u32), ncx)?;
+                                let _ = result.set(PropertyKey::Index(idx), val);
+                            }
+                            idx += 1;
+                        }
+                    } else {
+                        // Non-spreadable: push as single element
+                        let _ = result.set(PropertyKey::Index(idx), arg.clone());
+                        idx += 1;
                     }
-                    // Non-array: push as single element
-                    let _ = result.set(PropertyKey::Index(idx), arg.clone());
-                    idx += 1;
                 }
                 set_len(&result, idx as usize);
                 Ok(if result.is_array() {
@@ -620,13 +741,15 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "concat",
+            1,
         )),
     );
 
     // Array.prototype.reverse
     arr_proto.define_property(
         PropertyKey::string("reverse"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, _args, ncx| {
                 let obj = this_val
                     .as_object()
@@ -638,14 +761,31 @@ pub fn init_array_prototype(
                     if lo & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
                     }
-                    let lo_val = obj
-                        .get(&PropertyKey::Index(lo as u32))
-                        .unwrap_or(Value::undefined());
-                    let hi_val = obj
-                        .get(&PropertyKey::Index(hi as u32))
-                        .unwrap_or(Value::undefined());
-                    let _ = obj.set(PropertyKey::Index(lo as u32), hi_val);
-                    let _ = obj.set(PropertyKey::Index(hi as u32), lo_val);
+                    let lo_key = PropertyKey::Index(lo as u32);
+                    let hi_key = PropertyKey::Index(hi as u32);
+                    let lo_exists = obj.has(&lo_key);
+                    let hi_exists = obj.has(&hi_key);
+                    match (lo_exists, hi_exists) {
+                        (true, true) => {
+                            let lo_val = obj.get(&lo_key).unwrap_or(Value::undefined());
+                            let hi_val = obj.get(&hi_key).unwrap_or(Value::undefined());
+                            let _ = obj.set(lo_key, hi_val);
+                            let _ = obj.set(hi_key, lo_val);
+                        }
+                        (true, false) => {
+                            let lo_val = obj.get(&lo_key).unwrap_or(Value::undefined());
+                            let _ = obj.set(hi_key, lo_val);
+                            obj.delete(&lo_key);
+                        }
+                        (false, true) => {
+                            let hi_val = obj.get(&hi_key).unwrap_or(Value::undefined());
+                            let _ = obj.set(lo_key, hi_val);
+                            obj.delete(&hi_key);
+                        }
+                        (false, false) => {
+                            // Both holes — nothing to do
+                        }
+                    }
                     lo += 1;
                     hi -= 1;
                 }
@@ -653,13 +793,15 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "reverse",
+            0,
         )),
     );
 
     // Array.prototype.at
     arr_proto.define_property(
         PropertyKey::string("at"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, _ncx| {
                 let obj = this_val
                     .as_object()
@@ -676,13 +818,15 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "at",
+            1,
         )),
     );
 
     // Array.prototype.fill
     arr_proto.define_property(
         PropertyKey::string("fill"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
@@ -720,13 +864,15 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "fill",
+            1,
         )),
     );
 
     // Array.prototype.splice
     arr_proto.define_property(
         PropertyKey::string("splice"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
@@ -751,9 +897,7 @@ pub fn init_array_prototype(
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
                     }
-                    let val = obj
-                        .get(&PropertyKey::Index((actual_start + i) as u32))
-                        .unwrap_or(Value::undefined());
+                    let val = get_value(&obj, &PropertyKey::Index((actual_start + i) as u32), ncx)?;
                     let _ = removed.set(PropertyKey::Index(i as u32), val);
                 }
                 set_len(&removed, delete_count);
@@ -768,9 +912,7 @@ pub fn init_array_prototype(
                         if i & 0x3FF == 0 {
                             ncx.check_for_interrupt()?;
                         }
-                        let val = obj
-                            .get(&PropertyKey::Index(i as u32))
-                            .unwrap_or(Value::undefined());
+                        let val = get_value(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         let _ = obj.set(PropertyKey::Index((i - diff) as u32), val);
                     }
                     for i in (ulen - diff)..ulen {
@@ -783,9 +925,7 @@ pub fn init_array_prototype(
                         if i & 0x3FF == 0 {
                             ncx.check_for_interrupt()?;
                         }
-                        let val = obj
-                            .get(&PropertyKey::Index(i as u32))
-                            .unwrap_or(Value::undefined());
+                        let val = get_value(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         let _ = obj.set(PropertyKey::Index((i + diff) as u32), val);
                     }
                 }
@@ -805,42 +945,49 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "splice",
+            2,
         )),
     );
 
     // Array.prototype.flat (depth = 1 by default)
     arr_proto.define_property(
         PropertyKey::string("flat"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| "Array.prototype.flat: not an object".to_string())?;
                 let depth = args.first().and_then(|v| v.as_number()).unwrap_or(1.0) as i32;
 
-                fn flatten(source: &GcRef<JsObject>, depth: i32, result: &mut Vec<Value>) {
+                fn flatten(
+                    source: &GcRef<JsObject>,
+                    depth: i32,
+                    result: &mut Vec<Value>,
+                    ncx: &mut NativeContext<'_>,
+                ) -> Result<(), VmError> {
                     let len = get_len(source);
                     for i in 0..len {
                         // Per spec, skip holes
                         if !source.has(&PropertyKey::Index(i as u32)) {
                             continue;
                         }
-                        if let Some(val) = source.get(&PropertyKey::Index(i as u32)) {
-                            if depth > 0 {
-                                if let Some(inner) = val.as_object() {
-                                    if inner.get(&PropertyKey::string("length")).is_some() {
-                                        flatten(&inner, depth - 1, result);
-                                        continue;
-                                    }
+                        let val = get_value(source, &PropertyKey::Index(i as u32), ncx)?;
+                        if depth > 0 {
+                            if let Some(inner) = val.as_object() {
+                                if inner.get(&PropertyKey::string("length")).is_some() {
+                                    flatten(&inner, depth - 1, result, ncx)?;
+                                    continue;
                                 }
                             }
-                            result.push(val);
                         }
+                        result.push(val);
                     }
+                    Ok(())
                 }
 
                 let mut items = Vec::new();
-                flatten(&obj, depth, &mut items);
+                flatten(&obj, depth, &mut items, ncx)?;
                 let items_len = items.len();
                 let result_arr = array_species_create(&obj, 0, ncx)?;
                 for (i, item) in items.into_iter().enumerate() {
@@ -855,6 +1002,8 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "flat",
+            0,
         )),
     );
 
@@ -867,11 +1016,10 @@ pub fn init_array_prototype(
     // Array.prototype.forEach(callback [, thisArg])
     arr_proto.define_property(
         PropertyKey::string("forEach"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = this_val.as_object().ok_or_else(|| {
-                    VmError::type_error("Array.prototype.forEach: this is not an object")
-                })?;
+                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
@@ -880,7 +1028,6 @@ pub fn init_array_prototype(
                         "Array.prototype.forEach: callback is not a function",
                     ));
                 }
-                let len = get_len(&obj);
                 for i in 0..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -893,24 +1040,25 @@ pub fn init_array_prototype(
                     ncx.call_function(
                         &callback,
                         this_arg.clone(),
-                        &[val, Value::number(i as f64), this_val.clone()],
+                        &[val, Value::number(i as f64), Value::object(obj.clone())],
                     )?;
                 }
                 Ok(Value::undefined())
             },
             mm.clone(),
             fn_proto,
+            "forEach",
+            1,
         )),
     );
 
     // Array.prototype.map(callback [, thisArg])
     arr_proto.define_property(
         PropertyKey::string("map"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = this_val.as_object().ok_or_else(|| {
-                    VmError::type_error("Array.prototype.map: this is not an object")
-                })?;
+                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
@@ -919,7 +1067,6 @@ pub fn init_array_prototype(
                         "Array.prototype.map: callback is not a function",
                     ));
                 }
-                let len = get_len(&obj);
                 let result = array_species_create(&obj, len, ncx)?;
                 for i in 0..len {
                     if i & 0x3FF == 0 {
@@ -933,7 +1080,7 @@ pub fn init_array_prototype(
                     let mapped = ncx.call_function(
                         &callback,
                         this_arg.clone(),
-                        &[val, Value::number(i as f64), this_val.clone()],
+                        &[val, Value::number(i as f64), Value::object(obj.clone())],
                     )?;
                     let _ = result.set(PropertyKey::Index(i as u32), mapped);
                 }
@@ -945,17 +1092,18 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "map",
+            1,
         )),
     );
 
     // Array.prototype.filter(callback [, thisArg])
     arr_proto.define_property(
         PropertyKey::string("filter"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = this_val.as_object().ok_or_else(|| {
-                    VmError::type_error("Array.prototype.filter: this is not an object")
-                })?;
+                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
@@ -964,7 +1112,6 @@ pub fn init_array_prototype(
                         "Array.prototype.filter: callback is not a function",
                     ));
                 }
-                let len = get_len(&obj);
                 let result = array_species_create(&obj, 0, ncx)?;
                 let mut out_idx = 0u32;
                 for i in 0..len {
@@ -979,7 +1126,7 @@ pub fn init_array_prototype(
                     let keep = ncx.call_function(
                         &callback,
                         this_arg.clone(),
-                        &[val.clone(), Value::number(i as f64), this_val.clone()],
+                        &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
                     )?;
                     if keep.to_boolean() {
                         let _ = result.set(PropertyKey::Index(out_idx), val);
@@ -995,17 +1142,18 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "filter",
+            1,
         )),
     );
 
     // Array.prototype.find(callback [, thisArg])
     arr_proto.define_property(
         PropertyKey::string("find"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = this_val.as_object().ok_or_else(|| {
-                    VmError::type_error("Array.prototype.find: this is not an object")
-                })?;
+                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
@@ -1014,7 +1162,6 @@ pub fn init_array_prototype(
                         "Array.prototype.find: callback is not a function",
                     ));
                 }
-                let len = get_len(&obj);
                 for i in 0..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -1023,7 +1170,7 @@ pub fn init_array_prototype(
                     let test = ncx.call_function(
                         &callback,
                         this_arg.clone(),
-                        &[val.clone(), Value::number(i as f64), this_val.clone()],
+                        &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
                     )?;
                     if test.to_boolean() {
                         return Ok(val);
@@ -1033,17 +1180,18 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "find",
+            1,
         )),
     );
 
     // Array.prototype.findIndex(callback [, thisArg])
     arr_proto.define_property(
         PropertyKey::string("findIndex"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = this_val.as_object().ok_or_else(|| {
-                    VmError::type_error("Array.prototype.findIndex: this is not an object")
-                })?;
+                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
@@ -1052,7 +1200,6 @@ pub fn init_array_prototype(
                         "Array.prototype.findIndex: callback is not a function",
                     ));
                 }
-                let len = get_len(&obj);
                 for i in 0..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -1061,7 +1208,7 @@ pub fn init_array_prototype(
                     let test = ncx.call_function(
                         &callback,
                         this_arg.clone(),
-                        &[val, Value::number(i as f64), this_val.clone()],
+                        &[val, Value::number(i as f64), Value::object(obj.clone())],
                     )?;
                     if test.to_boolean() {
                         return Ok(Value::number(i as f64));
@@ -1071,17 +1218,18 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "findIndex",
+            1,
         )),
     );
 
     // Array.prototype.findLast(callback [, thisArg])
     arr_proto.define_property(
         PropertyKey::string("findLast"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = this_val.as_object().ok_or_else(|| {
-                    VmError::type_error("Array.prototype.findLast: this is not an object")
-                })?;
+                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
@@ -1090,7 +1238,6 @@ pub fn init_array_prototype(
                         "Array.prototype.findLast: callback is not a function",
                     ));
                 }
-                let len = get_len(&obj);
                 for i in (0..len).rev() {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -1099,7 +1246,7 @@ pub fn init_array_prototype(
                     let test = ncx.call_function(
                         &callback,
                         this_arg.clone(),
-                        &[val.clone(), Value::number(i as f64), this_val.clone()],
+                        &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
                     )?;
                     if test.to_boolean() {
                         return Ok(val);
@@ -1109,17 +1256,18 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "findLast",
+            1,
         )),
     );
 
     // Array.prototype.findLastIndex(callback [, thisArg])
     arr_proto.define_property(
         PropertyKey::string("findLastIndex"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = this_val.as_object().ok_or_else(|| {
-                    VmError::type_error("Array.prototype.findLastIndex: this is not an object")
-                })?;
+                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
@@ -1128,7 +1276,6 @@ pub fn init_array_prototype(
                         "Array.prototype.findLastIndex: callback is not a function",
                     ));
                 }
-                let len = get_len(&obj);
                 for i in (0..len).rev() {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -1137,7 +1284,7 @@ pub fn init_array_prototype(
                     let test = ncx.call_function(
                         &callback,
                         this_arg.clone(),
-                        &[val, Value::number(i as f64), this_val.clone()],
+                        &[val, Value::number(i as f64), Value::object(obj.clone())],
                     )?;
                     if test.to_boolean() {
                         return Ok(Value::number(i as f64));
@@ -1147,17 +1294,18 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "findLastIndex",
+            1,
         )),
     );
 
     // Array.prototype.every(callback [, thisArg])
     arr_proto.define_property(
         PropertyKey::string("every"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = this_val.as_object().ok_or_else(|| {
-                    VmError::type_error("Array.prototype.every: this is not an object")
-                })?;
+                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
@@ -1166,7 +1314,6 @@ pub fn init_array_prototype(
                         "Array.prototype.every: callback is not a function",
                     ));
                 }
-                let len = get_len(&obj);
                 for i in 0..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -1179,7 +1326,7 @@ pub fn init_array_prototype(
                     let test = ncx.call_function(
                         &callback,
                         this_arg.clone(),
-                        &[val, Value::number(i as f64), this_val.clone()],
+                        &[val, Value::number(i as f64), Value::object(obj.clone())],
                     )?;
                     if !test.to_boolean() {
                         return Ok(Value::boolean(false));
@@ -1189,17 +1336,18 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "every",
+            1,
         )),
     );
 
     // Array.prototype.some(callback [, thisArg])
     arr_proto.define_property(
         PropertyKey::string("some"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = this_val.as_object().ok_or_else(|| {
-                    VmError::type_error("Array.prototype.some: this is not an object")
-                })?;
+                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
@@ -1208,7 +1356,6 @@ pub fn init_array_prototype(
                         "Array.prototype.some: callback is not a function",
                     ));
                 }
-                let len = get_len(&obj);
                 for i in 0..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -1221,7 +1368,7 @@ pub fn init_array_prototype(
                     let test = ncx.call_function(
                         &callback,
                         this_arg.clone(),
-                        &[val, Value::number(i as f64), this_val.clone()],
+                        &[val, Value::number(i as f64), Value::object(obj.clone())],
                     )?;
                     if test.to_boolean() {
                         return Ok(Value::boolean(true));
@@ -1231,17 +1378,18 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "some",
+            1,
         )),
     );
 
     // Array.prototype.reduce(callback [, initialValue])
     arr_proto.define_property(
         PropertyKey::string("reduce"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = this_val.as_object().ok_or_else(|| {
-                    VmError::type_error("Array.prototype.reduce: this is not an object")
-                })?;
+                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
 
                 if !callback.is_callable() {
@@ -1249,7 +1397,6 @@ pub fn init_array_prototype(
                         "Array.prototype.reduce: callback is not a function",
                     ));
                 }
-                let len = get_len(&obj);
                 let has_initial = args.len() > 1;
                 let mut accumulator;
                 let mut start;
@@ -1290,24 +1437,25 @@ pub fn init_array_prototype(
                     accumulator = ncx.call_function(
                         &callback,
                         Value::undefined(),
-                        &[accumulator, val, Value::number(i as f64), this_val.clone()],
+                        &[accumulator, val, Value::number(i as f64), Value::object(obj.clone())],
                     )?;
                 }
                 Ok(accumulator)
             },
             mm.clone(),
             fn_proto,
+            "reduce",
+            1,
         )),
     );
 
     // Array.prototype.reduceRight(callback [, initialValue])
     arr_proto.define_property(
         PropertyKey::string("reduceRight"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = this_val.as_object().ok_or_else(|| {
-                    VmError::type_error("Array.prototype.reduceRight: this is not an object")
-                })?;
+                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
 
                 if !callback.is_callable() {
@@ -1315,7 +1463,6 @@ pub fn init_array_prototype(
                         "Array.prototype.reduceRight: callback is not a function",
                     ));
                 }
-                let len = get_len(&obj);
                 let has_initial = args.len() > 1;
                 let mut accumulator;
                 let mut end;
@@ -1356,24 +1503,27 @@ pub fn init_array_prototype(
                     accumulator = ncx.call_function(
                         &callback,
                         Value::undefined(),
-                        &[accumulator, val, Value::number(i as f64), this_val.clone()],
+                        &[accumulator, val, Value::number(i as f64), Value::object(obj.clone())],
                     )?;
                 }
                 Ok(accumulator)
             },
             mm.clone(),
             fn_proto,
+            "reduceRight",
+            1,
         )),
     );
 
     // Array.prototype.flatMap(callback [, thisArg])
     arr_proto.define_property(
         PropertyKey::string("flatMap"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
                 let obj = this_val.as_object().ok_or_else(|| {
                     VmError::type_error("Array.prototype.flatMap: this is not an object")
                 })?;
+                let len = get_len(&obj);
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
@@ -1382,7 +1532,6 @@ pub fn init_array_prototype(
                         "Array.prototype.flatMap: callback is not a function",
                     ));
                 }
-                let len = get_len(&obj);
                 let result = array_species_create(&obj, 0, ncx)?;
                 let mut out_idx = 0u32;
                 for i in 0..len {
@@ -1397,7 +1546,7 @@ pub fn init_array_prototype(
                     let mapped = ncx.call_function(
                         &callback,
                         this_arg.clone(),
-                        &[val, Value::number(i as f64), this_val.clone()],
+                        &[val, Value::number(i as f64), Value::object(obj.clone())],
                     )?;
                     // Flatten one level
                     if let Some(inner) = mapped.as_object() {
@@ -1423,40 +1572,64 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "flatMap",
+            1,
         )),
     );
 
     // Array.prototype.sort([compareFn])
     arr_proto.define_property(
         PropertyKey::string("sort"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
                 let obj = this_val.as_object().ok_or_else(|| {
                     VmError::type_error("Array.prototype.sort: this is not an object")
                 })?;
                 let compare_fn = args.first().cloned().unwrap_or(Value::undefined());
+
+                // Validate comparefn before doing anything
+                if !compare_fn.is_undefined() && !compare_fn.is_callable() {
+                    return Err(VmError::type_error(
+                        "Array.prototype.sort: comparator is not a function",
+                    ));
+                }
+
                 let len = get_len(&obj);
 
-                // Collect elements
-                let mut elements: Vec<Value> = Vec::with_capacity(len.min(1024));
+                // Collect concrete values, undefineds, and count holes (§23.1.3.30)
+                let mut concrete: Vec<Value> = Vec::with_capacity(len.min(1024));
+                let mut num_undefineds: usize = 0;
+                let mut num_holes: usize = 0;
                 for i in 0..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
                     }
-                    elements.push(js_get(&obj, &PropertyKey::Index(i as u32), ncx)?);
+                    if !obj.has(&PropertyKey::Index(i as u32)) {
+                        num_holes += 1;
+                    } else {
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
+                        if val.is_undefined() {
+                            num_undefineds += 1;
+                        } else {
+                            concrete.push(val);
+                        }
+                    }
                 }
 
                 if compare_fn.is_undefined() {
-                    // Default: sort by toString
-                    elements.sort_by(|a, b| {
-                        let sa = value_to_sort_string(a);
-                        let sb = value_to_sort_string(b);
-                        sa.cmp(&sb)
-                    });
-                } else if compare_fn.is_callable() {
-                    // Custom comparator (closure or native function)
+                    // Default: sort by ToString (spec §23.1.3.30.2)
+                    let mut string_pairs: Vec<(String, Value)> =
+                        Vec::with_capacity(concrete.len());
+                    for val in concrete {
+                        let s = ncx.to_string_value(&val)?;
+                        string_pairs.push((s, val));
+                    }
+                    string_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                    concrete = string_pairs.into_iter().map(|(_, v)| v).collect();
+                } else {
+                    // Custom comparator
                     let mut err: Option<VmError> = None;
-                    elements.sort_by(|a, b| {
+                    concrete.sort_by(|a, b| {
                         if err.is_some() {
                             return std::cmp::Ordering::Equal;
                         }
@@ -1484,27 +1657,34 @@ pub fn init_array_prototype(
                     if let Some(e) = err {
                         return Err(e);
                     }
-                } else {
-                    return Err(VmError::type_error(
-                        "Array.prototype.sort: comparator is not a function",
-                    ));
                 }
 
-                // Write sorted elements back
-                for (i, val) in elements.into_iter().enumerate() {
-                    let _ = obj.set(PropertyKey::Index(i as u32), val);
+                // Write back: sorted values, then undefineds, then delete holes
+                let mut idx = 0usize;
+                for val in concrete {
+                    let _ = obj.set(PropertyKey::Index(idx as u32), val);
+                    idx += 1;
+                }
+                for _ in 0..num_undefineds {
+                    let _ = obj.set(PropertyKey::Index(idx as u32), Value::undefined());
+                    idx += 1;
+                }
+                for i in idx..len {
+                    obj.delete(&PropertyKey::Index(i as u32));
                 }
                 Ok(this_val.clone())
             },
             mm.clone(),
             fn_proto,
+            "sort",
+            1,
         )),
     );
 
     // Array.prototype.copyWithin(target, start [, end])
     arr_proto.define_property(
         PropertyKey::string("copyWithin"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
                 let obj = this_val.as_object().ok_or_else(|| {
                     VmError::type_error("Array.prototype.copyWithin: this is not an object")
@@ -1546,9 +1726,7 @@ pub fn init_array_prototype(
                         if i & 0x3FF == 0 {
                             ncx.check_for_interrupt()?;
                         }
-                        let val = obj
-                            .get(&PropertyKey::Index((from + i) as u32))
-                            .unwrap_or(Value::undefined());
+                        let val = get_value(&obj, &PropertyKey::Index((from + i) as u32), ncx)?;
                         let _ = obj.set(PropertyKey::Index((to + i) as u32), val);
                     }
                 } else {
@@ -1556,9 +1734,7 @@ pub fn init_array_prototype(
                         if i & 0x3FF == 0 {
                             ncx.check_for_interrupt()?;
                         }
-                        let val = obj
-                            .get(&PropertyKey::Index((from + i) as u32))
-                            .unwrap_or(Value::undefined());
+                        let val = get_value(&obj, &PropertyKey::Index((from + i) as u32), ncx)?;
                         let _ = obj.set(PropertyKey::Index((to + i) as u32), val);
                     }
                 }
@@ -1566,6 +1742,8 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "copyWithin",
+            2,
         )),
     );
 
@@ -1581,12 +1759,14 @@ pub fn init_array_prototype(
         let ip = iter_proto;
         arr_proto.define_property(
             PropertyKey::string("values"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
                 move |this_val, _args, ncx| {
                     make_array_iterator(this_val, "value", ncx.memory_manager(), fn_p, ip)
                 },
                 mm.clone(),
                 fn_proto,
+                "values",
+                0,
             )),
         );
 
@@ -1595,12 +1775,14 @@ pub fn init_array_prototype(
         let ip = iter_proto;
         arr_proto.define_property(
             PropertyKey::string("keys"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
                 move |this_val, _args, ncx| {
                     make_array_iterator(this_val, "key", ncx.memory_manager(), fn_p, ip)
                 },
                 mm.clone(),
                 fn_proto,
+                "keys",
+                0,
             )),
         );
 
@@ -1609,12 +1791,14 @@ pub fn init_array_prototype(
         let ip = iter_proto;
         arr_proto.define_property(
             PropertyKey::string("entries"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
                 move |this_val, _args, ncx| {
                     make_array_iterator(this_val, "entry", ncx.memory_manager(), fn_p, ip)
                 },
                 mm.clone(),
                 fn_proto,
+                "entries",
+                0,
             )),
         );
 
@@ -1623,12 +1807,14 @@ pub fn init_array_prototype(
         let ip = iter_proto;
         arr_proto.define_property(
             PropertyKey::Symbol(sym_ref),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
                 move |this_val, _args, ncx| {
                     make_array_iterator(this_val, "value", ncx.memory_manager(), fn_p, ip)
                 },
                 mm.clone(),
                 fn_proto,
+                "values",
+                0,
             )),
         );
     }
@@ -1640,7 +1826,7 @@ pub fn init_array_prototype(
     // Array.prototype.toReversed() — §23.1.3.33
     arr_proto.define_property(
         PropertyKey::string("toReversed"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, _args, ncx| {
                 let obj = this_val.as_object().ok_or_else(|| {
                     VmError::type_error("Array.prototype.toReversed: this is not an object")
@@ -1659,13 +1845,15 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "toReversed",
+            0,
         )),
     );
 
     // Array.prototype.toSorted([compareFn]) — §23.1.3.34
     arr_proto.define_property(
         PropertyKey::string("toSorted"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
                 let obj = this_val.as_object().ok_or_else(|| {
                     VmError::type_error("Array.prototype.toSorted: this is not an object")
@@ -1733,13 +1921,15 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "toSorted",
+            1,
         )),
     );
 
     // Array.prototype.toSpliced(start, deleteCount, ...items) — §23.1.3.35
     arr_proto.define_property(
         PropertyKey::string("toSpliced"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
                 let obj = this_val.as_object().ok_or_else(|| {
                     VmError::type_error("Array.prototype.toSpliced: this is not an object")
@@ -1797,13 +1987,15 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "toSpliced",
+            2,
         )),
     );
 
     // Array.prototype.with(index, value) — §23.1.3.39
     arr_proto.define_property(
         PropertyKey::string("with"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
                 let obj = this_val.as_object().ok_or_else(|| {
                     VmError::type_error("Array.prototype.with: this is not an object")
@@ -1838,8 +2030,50 @@ pub fn init_array_prototype(
             },
             mm.clone(),
             fn_proto,
+            "with",
+            2,
         )),
     );
+
+    // §23.1.3.40 Array.prototype[@@unscopables]
+    {
+        let unscopables_sym = crate::intrinsics::well_known::unscopables_symbol();
+        let unscopables_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        for method_name in &[
+            "at",
+            "copyWithin",
+            "entries",
+            "fill",
+            "find",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "flat",
+            "flatMap",
+            "includes",
+            "keys",
+            "toReversed",
+            "toSorted",
+            "toSpliced",
+            "values",
+        ] {
+            let _ = unscopables_obj.set(
+                PropertyKey::string(method_name),
+                Value::boolean(true),
+            );
+        }
+        arr_proto.define_property(
+            PropertyKey::Symbol(unscopables_sym),
+            PropertyDescriptor::Data {
+                value: Value::object(unscopables_obj),
+                attributes: crate::object::PropertyAttributes {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            },
+        );
+    }
 }
 
 /// Install static methods on the Array constructor.
@@ -1863,7 +2097,7 @@ pub fn install_array_statics(
         Ok(false)
     }
 
-    let is_array_fn = Value::native_function_with_proto(
+    let is_array_fn = Value::native_function_with_proto_named(
         |_this, args, _ncx| {
             let arg = args.first().cloned().unwrap_or(Value::undefined());
             let is_arr = is_array_value(&arg)?;
@@ -1871,6 +2105,8 @@ pub fn install_array_statics(
         },
         mm.clone(),
         fn_proto,
+        "isArray",
+        1,
     );
     // Set function name and length, mark as non-constructor
     if let Some(obj) = is_array_fn.as_object() {
@@ -1898,7 +2134,7 @@ pub fn install_array_statics(
     // Array.from(items [, mapFn [, thisArg]]) — §23.1.2.1
     ctor.define_property(
         PropertyKey::string("from"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |_this, args, ncx| {
                 let source = args.first().cloned().unwrap_or(Value::undefined());
                 let map_fn = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1980,9 +2216,7 @@ pub fn install_array_statics(
                             if i & 0x3FF == 0 {
                                 ncx.check_for_interrupt()?;
                             }
-                            let val = obj
-                                .get(&PropertyKey::Index(i as u32))
-                                .unwrap_or(Value::undefined());
+                            let val = get_value(&obj, &PropertyKey::Index(i as u32), ncx)?;
                             let mapped = if has_map {
                                 ncx.call_function(
                                     &map_fn,
@@ -2026,13 +2260,15 @@ pub fn install_array_statics(
             },
             mm.clone(),
             fn_proto,
+            "from",
+            1,
         )),
     );
 
     // Array.of(...items) — §23.1.2.3
     ctor.define_property(
         PropertyKey::string("of"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |_this, args, ncx| {
                 let result = GcRef::new(JsObject::array(args.len(), ncx.memory_manager().clone()));
                 for (i, arg) in args.iter().enumerate() {
@@ -2042,6 +2278,8 @@ pub fn install_array_statics(
             },
             mm.clone(),
             fn_proto,
+            "of",
+            0,
         )),
     );
 }

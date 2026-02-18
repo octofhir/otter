@@ -2,8 +2,8 @@
 //!
 //! The runtime manages module loading, context creation, and execution.
 
-use dashmap::DashMap;
-use std::sync::Arc;
+use indexmap::IndexMap;
+use std::sync::{Arc, Mutex};
 
 use otter_vm_bytecode::Module;
 
@@ -17,13 +17,18 @@ use crate::object::JsObject;
 use crate::realm::{RealmId, RealmRecord, RealmRegistry};
 use crate::value::Value;
 
+/// Maximum number of compiled modules to cache before evicting the oldest (FIFO).
+const MAX_MODULE_CACHE_SIZE: usize = 512;
+
 /// The VM runtime
 ///
 /// This is the main entry point for executing JavaScript.
 /// It is `Send + Sync` and can be shared across threads.
 pub struct VmRuntime {
-    /// Loaded modules
-    modules: DashMap<String, Arc<Module>>,
+    /// Loaded modules — bounded FIFO cache.
+    /// Oldest entry is evicted when the cache exceeds `MAX_MODULE_CACHE_SIZE`.
+    /// Closures holding `Arc<Module>` extend the module's lifetime beyond eviction.
+    modules: Mutex<IndexMap<String, Arc<Module>>>,
     /// Global object template
     #[allow(dead_code)]
     global_template: GcRef<JsObject>,
@@ -113,7 +118,7 @@ impl VmRuntime {
         });
 
         Self {
-            modules: DashMap::new(),
+            modules: Mutex::new(IndexMap::new()),
             global_template: global,
             function_prototype,
             intrinsics,
@@ -124,17 +129,27 @@ impl VmRuntime {
         }
     }
 
-    /// Load a module from bytecode
+    /// Load a module from bytecode.
+    ///
+    /// Inserts the module into the bounded FIFO cache.  When the cache reaches
+    /// `MAX_MODULE_CACHE_SIZE` the oldest entry is evicted before insertion.
+    /// Closures that have already captured an `Arc<Module>` reference keep the
+    /// module alive beyond its eviction from the cache.
     pub fn load_module(&self, module: Module) -> Arc<Module> {
         let url = module.source_url.clone();
         let module = Arc::new(module);
-        self.modules.insert(url, module.clone());
+        let mut cache = self.modules.lock().unwrap();
+        // Evict oldest entry if at capacity (but not if the URL already exists).
+        if !cache.contains_key(&url) && cache.len() >= MAX_MODULE_CACHE_SIZE {
+            cache.shift_remove_index(0);
+        }
+        cache.insert(url, module.clone());
         module
     }
 
     /// Get a loaded module by URL
     pub fn get_module(&self, url: &str) -> Option<Arc<Module>> {
-        self.modules.get(url).map(|m| m.clone())
+        self.modules.lock().unwrap().get(url).cloned()
     }
 
     /// Create a new execution context
@@ -255,7 +270,7 @@ impl VmRuntime {
 
     /// Get number of loaded modules
     pub fn module_count(&self) -> usize {
-        self.modules.len()
+        self.modules.lock().unwrap().len()
     }
 
     /// Get the memory manager for this runtime
@@ -294,7 +309,7 @@ impl VmRuntime {
         self.realm_registry.remove(old_realm_id);
 
         // Clear module cache (compiled modules may reference old realm state)
-        self.modules.clear();
+        self.modules.lock().unwrap().clear();
     }
 }
 

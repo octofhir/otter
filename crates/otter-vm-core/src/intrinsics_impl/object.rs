@@ -608,7 +608,7 @@ pub fn init_object_constructor(
                                 receiver.clone(),
                             )?
                         } else {
-                            obj.unwrap().get(&key).unwrap_or(Value::undefined())
+                            crate::object::get_value_full(obj.as_ref().unwrap(), &key, ncx)?
                         };
                         values.push(value);
                     }
@@ -683,7 +683,7 @@ pub fn init_object_constructor(
                                 receiver.clone(),
                             )?
                         } else {
-                            obj.unwrap().get(&key).unwrap_or(Value::undefined())
+                            crate::object::get_value_full(obj.as_ref().unwrap(), &key, ncx_inner)?
                         };
                         let key_str = match &key {
                             PropertyKey::String(s) => Value::string(*s),
@@ -739,7 +739,7 @@ pub fn init_object_constructor(
     object_ctor.define_property(
         PropertyKey::string("assign"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |_this, args, _ncx| {
+            |_this, args, ncx| {
                 let target_val = args
                     .first()
                     .ok_or_else(|| "Object.assign requires at least one argument".to_string())?;
@@ -754,9 +754,8 @@ pub fn init_object_constructor(
                         for key in source.own_keys() {
                             if let Some(desc) = source.get_own_property_descriptor(&key) {
                                 if desc.enumerable() {
-                                    if let Some(value) = source.get(&key) {
-                                        let _ = target.set(key, value);
-                                    }
+                                    let value = crate::object::get_value_full(&source, &key, ncx)?;
+                                    let _ = target.set(key, value);
                                 }
                             }
                         }
@@ -1235,7 +1234,7 @@ pub fn init_object_constructor(
                             } else {
                                 continue;
                             }
-                            let descriptor = props.get(&key).unwrap_or(Value::undefined());
+                            let descriptor = crate::object::get_value_full(&props, &key, ncx_inner)?;
                             let attr_obj = descriptor.as_object().ok_or_else(|| {
                                 VmError::type_error("Property description must be an object")
                             })?;
@@ -1534,7 +1533,7 @@ pub fn init_object_constructor(
                     } else {
                         continue;
                     }
-                    let descriptor = props.get(&key).unwrap_or(Value::undefined());
+                    let descriptor = crate::object::get_value_full(&props, &key, ncx)?;
                     // Per spec: ToPropertyDescriptor throws TypeError if not an object
                     let attr_obj = descriptor.as_object().ok_or_else(|| {
                         VmError::type_error("Property description must be an object")

@@ -55,6 +55,36 @@ impl Shape {
         // Note: transitions are not traced directly for GC as they are weak
     }
 
+    /// Trace all GC-managed property keys in this shape for the garbage collector.
+    ///
+    /// Property keys (`GcRef<JsString>` and `GcRef<Symbol>`) are stored in
+    /// the shape's key maps (Arc-managed, not GC-managed). Without explicit
+    /// tracing here, the GC would collect these strings/symbols while they
+    /// are still needed for property lookup in live objects.
+    ///
+    /// Uses the raw GcTraceable tracer signature to integrate with JsObject::trace.
+    pub fn trace_keys(&self, tracer: &mut dyn FnMut(*const crate::gc::GcHeader)) {
+        // Trace all accumulated property keys (from root shape to this shape).
+        // `keys_ordered` contains the full cumulative set of property names.
+        for key in &self.keys_ordered {
+            match key {
+                PropertyKey::String(s) => tracer(s.header() as *const _),
+                PropertyKey::Symbol(sym) => tracer(sym.header() as *const _),
+                PropertyKey::Index(_) => {}
+            }
+        }
+        // Also trace keys cached in the transitions map.
+        // These are property names that have been used at least once to extend
+        // this shape; keeping them alive avoids re-interning on every transition.
+        for (key, _) in self.transitions.borrow().iter() {
+            match key {
+                PropertyKey::String(s) => tracer(s.header() as *const _),
+                PropertyKey::Symbol(sym) => tracer(sym.header() as *const _),
+                PropertyKey::Index(_) => {}
+            }
+        }
+    }
+
     /// Create a new root (empty) shape.
     pub fn root() -> Arc<Self> {
         Arc::new(Self {
@@ -88,6 +118,9 @@ impl Shape {
                 return shape;
             }
         }
+
+        // Prune dead Weak entries so the map is bounded by currently live shapes.
+        transitions.retain(|_, w| w.strong_count() > 0);
 
         let next_offset = self.offset.map(|o| o + 1).unwrap_or(0);
 

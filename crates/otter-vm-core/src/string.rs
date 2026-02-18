@@ -562,8 +562,10 @@ impl otter_vm_gc::GcTraceable for JsString {
 
 /// Trace all interned strings in the thread-local STRING_TABLE
 ///
-/// This must be called during GC root collection to prevent
-/// interned strings from being incorrectly collected.
+/// Called during GC root collection to keep ALL interned strings alive.
+/// **Only use this when the weak-ref eviction path (`prune_dead_string_table_entries`)
+/// is not in effect.**  The two approaches are mutually exclusive: calling this
+/// re-roots all strings and defeats the weak-ref eviction.
 pub fn trace_global_string_table(tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
     STRING_TABLE.with(|table| {
         let borrowed = table.borrow();
@@ -572,5 +574,32 @@ pub fn trace_global_string_table(tracer: &mut dyn FnMut(*const otter_vm_gc::GcHe
                 tracer(js_str.header() as *const _);
             }
         }
+    });
+}
+
+/// Prune dead entries from the thread-local STRING_TABLE.
+///
+/// **Must be called after the mark phase and before the sweep phase** of a
+/// full GC cycle.  At that point every `GcBox<JsString>` is still in memory
+/// (sweep has not run yet), so reading the GC header is safe.  Entries whose
+/// mark color is `White` were not reached from any GC root — they will be
+/// freed by the upcoming sweep, so they must be removed from the table now to
+/// prevent dangling `GcRef`s.
+///
+/// Callers that use this pruning approach MUST NOT also call
+/// `trace_global_string_table()` for the same GC cycle — doing so would
+/// re-root all strings and defeat eviction.
+pub fn prune_dead_string_table_entries() {
+    use otter_vm_gc::object::MarkColor;
+    STRING_TABLE.with(|table| {
+        let mut borrowed = table.borrow_mut();
+        for bucket in borrowed.values_mut() {
+            // SAFETY: called after mark, before sweep — all GcBox memory is still
+            // valid.  Objects with mark() == White will be freed by sweep; we
+            // remove them here to prevent dangling GcRefs in the table.
+            bucket.retain(|js_str| js_str.header().mark() != MarkColor::White);
+        }
+        // Remove hash buckets that became empty after pruning.
+        borrowed.retain(|_, bucket| !bucket.is_empty());
     });
 }

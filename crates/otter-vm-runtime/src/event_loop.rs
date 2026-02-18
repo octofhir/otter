@@ -4,6 +4,7 @@
 
 use crate::microtask::{JsJobQueue, MicrotaskQueue, MicrotaskSequencer, NextTickQueue};
 use crate::timer::{Immediate, ImmediateId, Timer, TimerCallback, TimerHeapEntry, TimerId};
+use crate::timer_root_set::TimerCallbackRoots;
 use parking_lot::Mutex;
 use serde_json::Value as JsonValue;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -132,6 +133,12 @@ pub struct EventLoop {
     pending_async_ops: Arc<AtomicU64>,
     /// Handles for spawned async tasks (for cancellation if needed)
     async_task_handles: Mutex<Vec<JoinHandle<()>>>,
+
+    // === GC root tracking ===
+    /// GC roots for active timer callbacks.
+    /// Timer closures capture `Value`s (containing `GcRef<Closure>`) which would
+    /// otherwise be invisible to `collect_gc_roots`. This set keeps them alive.
+    timer_callback_roots: Arc<TimerCallbackRoots>,
 }
 
 impl EventLoop {
@@ -160,12 +167,19 @@ impl EventLoop {
             // Async ops support
             pending_async_ops: Arc::new(AtomicU64::new(0)),
             async_task_handles: Mutex::new(Vec::new()),
+            // GC root tracking
+            timer_callback_roots: TimerCallbackRoots::new(),
         })
     }
 
     /// Get the pending async ops counter (for sharing with async op handlers)
     pub fn get_pending_async_ops_count(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.pending_async_ops)
+    }
+
+    /// Get the timer callback GC root set (for registering with `VmContext`).
+    pub fn timer_callback_roots(&self) -> Arc<TimerCallbackRoots> {
+        Arc::clone(&self.timer_callback_roots)
     }
 
     /// Check if there are pending async operations
@@ -857,6 +871,8 @@ impl Default for EventLoop {
             // Async ops support
             pending_async_ops: Arc::new(AtomicU64::new(0)),
             async_task_handles: Mutex::new(Vec::new()),
+            // GC root tracking
+            timer_callback_roots: TimerCallbackRoots::new(),
         }
     }
 }

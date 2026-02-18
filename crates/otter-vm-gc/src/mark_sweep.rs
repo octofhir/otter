@@ -119,8 +119,6 @@ pub struct AllocationRegistry {
     gc_phase: Cell<GcPhase>,
     /// Persistent worklist for incremental marking (gray objects to process)
     mark_worklist: RefCell<VecDeque<*const GcHeader>>,
-    /// Visited set to prevent re-adding objects to worklist
-    mark_visited: RefCell<HashSet<usize>>,
     /// Cached trace function lookup table (built once when marking starts)
     trace_lookup: RefCell<Option<FxHashMap<usize, Option<TraceFn>>>>,
     /// Timestamp when incremental marking started (for pause time tracking)
@@ -146,7 +144,6 @@ impl AllocationRegistry {
             last_pause_nanos: AtomicU64::new(0),
             gc_phase: Cell::new(GcPhase::Idle),
             mark_worklist: RefCell::new(VecDeque::new()),
-            mark_visited: RefCell::new(HashSet::new()),
             trace_lookup: RefCell::new(None),
             mark_start: Cell::new(None),
         }
@@ -250,6 +247,21 @@ impl AllocationRegistry {
 
     /// Perform a full mark/sweep collection
     pub fn collect(&self, roots: &[*const GcHeader]) -> usize {
+        self.collect_with_pre_sweep_hook(roots, || {})
+    }
+
+    /// Perform a full mark/sweep collection, calling `pre_sweep` between the
+    /// mark and sweep phases.
+    ///
+    /// `pre_sweep` is invoked after marking completes (all live objects are
+    /// Gray/Black) and before sweeping (White objects are still in memory).
+    /// Use this hook to prune weak/soft data structures — such as string intern
+    /// tables — whose entries point to objects that may have become unreachable.
+    pub fn collect_with_pre_sweep_hook<F: FnOnce()>(
+        &self,
+        roots: &[*const GcHeader],
+        pre_sweep: F,
+    ) -> usize {
         let start = Instant::now();
 
         #[cfg(feature = "gc_logging")]
@@ -271,6 +283,9 @@ impl AllocationRegistry {
 
         // Phase 2: Mark from roots
         self.mark(roots);
+
+        // Pre-sweep hook (e.g., prune interned string table dead entries)
+        pre_sweep();
 
         // Phase 3: Sweep unmarked objects
         let reclaimed = self.sweep();
@@ -316,6 +331,17 @@ impl AllocationRegistry {
         &self,
         roots: &[*const GcHeader],
         ephemeron_tables: &[&crate::ephemeron::EphemeronTable],
+    ) -> usize {
+        self.collect_with_ephemerons_and_pre_sweep_hook(roots, ephemeron_tables, || {})
+    }
+
+    /// Like `collect_with_ephemerons` but calls `pre_sweep` after all marking
+    /// (including ephemeron fixpoint) and before the final sweep.
+    pub fn collect_with_ephemerons_and_pre_sweep_hook<F: FnOnce()>(
+        &self,
+        roots: &[*const GcHeader],
+        ephemeron_tables: &[&crate::ephemeron::EphemeronTable],
+        pre_sweep: F,
     ) -> usize {
         let start = Instant::now();
 
@@ -399,6 +425,9 @@ impl AllocationRegistry {
                 }
             }
         }
+
+        // Pre-sweep hook (e.g., prune interned string table dead entries)
+        pre_sweep();
 
         // Phase 5: Sweep unmarked objects
         let reclaimed = self.sweep();
@@ -589,13 +618,13 @@ impl AllocationRegistry {
         // Initialize worklist from roots
         let mut worklist = self.mark_worklist.borrow_mut();
         worklist.clear();
-        let mut visited = self.mark_visited.borrow_mut();
-        visited.clear();
 
         for &root in roots {
             if !root.is_null() {
-                let addr = root as usize;
-                if visited.insert(addr) {
+                // Use Gray mark bit as "in-worklist" sentinel — no HashSet needed.
+                // After reset_marks() all objects are White, so this check reliably
+                // deduplicates roots without an auxiliary visited set.
+                if unsafe { (*root).mark() } == MarkColor::White {
                     unsafe {
                         (*root).set_mark(MarkColor::Gray);
                     }
@@ -627,11 +656,11 @@ impl AllocationRegistry {
         let barrier_entries = barrier_drain();
         if !barrier_entries.is_empty() {
             let mut worklist = self.mark_worklist.borrow_mut();
-            let mut visited = self.mark_visited.borrow_mut();
             for ptr in barrier_entries {
                 if !ptr.is_null() {
-                    let addr = ptr as usize;
-                    if visited.insert(addr) {
+                    // Only add to worklist if still White (not already Gray or Black).
+                    if unsafe { (*ptr).mark() } == MarkColor::White {
+                        unsafe { (*ptr).set_mark(MarkColor::Gray) };
                         worklist.push_back(ptr);
                     }
                 }
@@ -645,7 +674,6 @@ impl AllocationRegistry {
         };
 
         let mut worklist = self.mark_worklist.borrow_mut();
-        let mut visited = self.mark_visited.borrow_mut();
         let mut processed = 0;
 
         while processed < budget {
@@ -657,7 +685,9 @@ impl AllocationRegistry {
             unsafe {
                 let header = &*ptr;
 
-                // Skip if already black (fully processed)
+                // Skip if already black (fully processed).
+                // This can happen when an object is added via write barrier after
+                // already being processed in a previous step.
                 if header.mark() == MarkColor::Black {
                     continue;
                 }
@@ -667,8 +697,9 @@ impl AllocationRegistry {
                     let data_ptr = (ptr as *const u8).add(std::mem::size_of::<GcHeader>());
                     trace_fn(data_ptr, &mut |child_header| {
                         if !child_header.is_null() {
-                            let child_addr = child_header as usize;
-                            if visited.insert(child_addr) {
+                            // Use mark color as "in-worklist" sentinel instead of HashSet.
+                            // Only add White objects (not yet seen this cycle).
+                            if (*child_header).mark() == MarkColor::White {
                                 (*child_header).set_mark(MarkColor::Gray);
                                 worklist.push_back(child_header);
                             }
@@ -691,6 +722,15 @@ impl AllocationRegistry {
     /// Call this after `incremental_mark_step()` returns `true`.
     /// Returns bytes reclaimed.
     pub fn finish_gc(&self) -> usize {
+        self.finish_gc_with_pre_sweep_hook(|| {})
+    }
+
+    /// Like `finish_gc` but calls `pre_sweep` between mark completion and sweep.
+    ///
+    /// Use this to prune weak data structures (e.g., string intern tables)
+    /// after the mark phase has determined which objects are live.
+    pub fn finish_gc_with_pre_sweep_hook<F: FnOnce()>(&self, pre_sweep: F) -> usize {
+        pre_sweep();
         let reclaimed = self.sweep();
 
         // Measure total time (from start_incremental_gc to finish_gc)
@@ -708,7 +748,6 @@ impl AllocationRegistry {
 
         // Clean up incremental state
         self.mark_worklist.borrow_mut().clear();
-        self.mark_visited.borrow_mut().clear();
         *self.trace_lookup.borrow_mut() = None;
         self.mark_start.set(None);
         self.gc_phase.set(GcPhase::Idle);

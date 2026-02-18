@@ -35,6 +35,7 @@ opt-level = 3          # Maximum optimization
 [profile.test262]
 inherits = "release"
 panic = "unwind"
+split-debuginfo = "off"  # Keep debug symbols in the binary (required for samply on macOS)
 
 # Fast release for development iteration
 [profile.release-fast]

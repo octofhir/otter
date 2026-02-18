@@ -98,22 +98,19 @@ fn function_apply(
     let call_args = if args_array_val.is_undefined() || args_array_val.is_null() {
         vec![]
     } else if let Some(arr_obj) = args_array_val.as_object() {
-        if arr_obj.is_array() {
-            let len = arr_obj.array_length();
-            let mut extracted = Vec::with_capacity(len);
-            for i in 0..len {
-                extracted.push(
-                    arr_obj
-                        .get(&PropertyKey::Index(i as u32))
-                        .unwrap_or(Value::undefined()),
-                );
-            }
-            extracted
-        } else {
-            return Err(VmError::type_error(
-                "Function.prototype.apply: argumentsList must be an array",
-            ));
+        // CreateListFromArrayLike: works with any object that has a length property
+        let len = arr_obj
+            .get(&PropertyKey::string("length"))
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0) as usize;
+        let mut extracted = Vec::with_capacity(len.min(1024));
+        for i in 0..len {
+            extracted.push(
+                crate::object::get_value_full(&arr_obj, &PropertyKey::Index(i as u32), ncx)
+                    .unwrap_or(Value::undefined()),
+            );
         }
+        extracted
     } else {
         return Err(VmError::type_error(
             "Function.prototype.apply: argumentsList must be an object",
@@ -137,6 +134,13 @@ fn function_bind(
     args: &[Value],
     ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
+    // Step 1: If IsCallable(Target) is false, throw a TypeError
+    if !this_val.is_callable() {
+        return Err(VmError::type_error(
+            "Function.prototype.bind requires a callable target",
+        ));
+    }
+
     let this_arg = args.first().cloned().unwrap_or(Value::undefined());
     let fn_proto = ncx
         .ctx
@@ -160,17 +164,46 @@ fn function_bind(
         let _ = bound.set(PropertyKey::string("__boundArgs__"), Value::object(arr));
     }
 
-    let _ = bound.set(
-        PropertyKey::string("__boundName__"),
-        Value::string(JsString::intern("bound ")),
+    // Step 5: Get target function name for bound name
+    let target_name = if let Some(obj) = this_val.as_object() {
+        obj.get(&PropertyKey::string("name"))
+            .and_then(|v| v.as_string())
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_default()
+    } else if this_val.is_native_function() || this_val.is_function() {
+        String::new()
+    } else {
+        String::new()
+    };
+    let bound_name = format!("bound {}", target_name);
+    bound.define_property(
+        PropertyKey::string("name"),
+        crate::object::PropertyDescriptor::function_length(Value::string(JsString::intern(
+            &bound_name,
+        ))),
     );
 
+    // Step 6: Calculate length = max(0, targetLen - bound args count)
     let bound_args_len = if args.len() > 1 { args.len() - 1 } else { 0 };
-    let new_length = 0i32.saturating_sub(bound_args_len as i32).max(0);
-    let _ = bound.set(
-        PropertyKey::string("__boundLength__"),
-        Value::int32(new_length),
+    let target_len = if let Some(closure) = this_val.as_function() {
+        closure
+            .object
+            .get(&PropertyKey::string("length"))
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0) as i32
+    } else if let Some(obj) = this_val.as_object() {
+        obj.get(&PropertyKey::string("length"))
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0) as i32
+    } else {
+        0
+    };
+    let new_length = (target_len - bound_args_len as i32).max(0);
+    bound.define_property(
+        PropertyKey::string("length"),
+        crate::object::PropertyDescriptor::function_length(Value::int32(new_length)),
     );
+
     let _ = bound.set(PropertyKey::string("__isCallable__"), Value::boolean(true));
 
     Ok(Value::object(bound))

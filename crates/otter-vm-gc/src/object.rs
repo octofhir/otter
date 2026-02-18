@@ -1,16 +1,19 @@
 //! GC object layout
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 /// Global mark version counter.
 /// Bumped at the start of each GC cycle instead of iterating all objects
 /// to reset marks to White. An object is "white" (unmarked) if its
 /// `mark_version` doesn't match this global counter — O(1) phase reset.
-static MARK_VERSION: AtomicU8 = AtomicU8::new(0);
+///
+/// u32 (4 billion cycles) prevents the wrap-around correctness bug that
+/// u8 had after 256 incremental GC cycles.
+static MARK_VERSION: AtomicU32 = AtomicU32::new(0);
 
 /// Get the current global mark version.
 #[inline]
-pub fn current_mark_version() -> u8 {
+pub fn current_mark_version() -> u32 {
     MARK_VERSION.load(Ordering::Acquire)
 }
 
@@ -19,22 +22,23 @@ pub fn current_mark_version() -> u8 {
 /// After bumping, all objects are effectively "white" because their
 /// `mark_version` no longer matches the new global version.
 #[inline]
-pub fn bump_mark_version() -> u8 {
+pub fn bump_mark_version() -> u32 {
     MARK_VERSION.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
 }
 
-/// GC object header
+/// GC object header (8 bytes, repr(C), alignment 4)
 #[repr(C)]
 pub struct GcHeader {
     /// Mark bits for tri-color marking (White=0, Gray=1, Black=2)
     mark: AtomicU8,
     /// Object type tag
     tag: u8,
+    /// Explicit padding to align `mark_version` to a 4-byte boundary.
+    _pad: [u8; 2],
     /// Logical mark version. Object is "white" if
-    /// this doesn't match `MARK_VERSION`.
-    mark_version: AtomicU8,
-    /// Reserved
-    _reserved: [u8; 5],
+    /// this doesn't match `MARK_VERSION`. u32 prevents wrap-around after
+    /// 256 GC cycles that u8 was susceptible to.
+    mark_version: AtomicU32,
 }
 
 /// Mark color for tri-color marking
@@ -55,8 +59,8 @@ impl GcHeader {
         Self {
             mark: AtomicU8::new(MarkColor::White as u8),
             tag,
-            mark_version: AtomicU8::new(0),
-            _reserved: [0; 5],
+            _pad: [0; 2],
+            mark_version: AtomicU32::new(0),
         }
     }
 
@@ -99,8 +103,8 @@ impl Clone for GcHeader {
         Self {
             mark: AtomicU8::new(MarkColor::White as u8),
             tag: self.tag,
-            mark_version: AtomicU8::new(0),
-            _reserved: [0; 5],
+            _pad: [0; 2],
+            mark_version: AtomicU32::new(0),
         }
     }
 }

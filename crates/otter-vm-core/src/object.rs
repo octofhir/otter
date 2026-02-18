@@ -527,7 +527,7 @@ impl PartialDescriptor {
 ///
 /// Unlike `JsObject::get()` which returns `None` for accessor properties,
 /// this function invokes the getter function when the property is an accessor.
-pub(crate) fn get_value_full(
+pub fn get_value_full(
     obj: &crate::gc::GcRef<JsObject>,
     key: &PropertyKey,
     ncx: &mut crate::context::NativeContext<'_>,
@@ -749,10 +749,8 @@ pub struct ObjectFlags {
 impl JsObject {
     /// Create a new empty object (prototype can be object, proxy, or null)
     pub fn new(prototype: Value, memory_manager: Arc<crate::memory::MemoryManager>) -> Self {
-        // Assume basic object size for now
-        let size = std::mem::size_of::<Self>();
-        let _ = memory_manager.alloc(size); // ignore err in basic constructor for now or return Result
-
+        // Note: allocation tracking is handled by GcRef::new() which calls mm.alloc().
+        // Do NOT call mm.alloc() here to avoid double-counting.
         Self {
             shape: ObjectCell::new(Shape::root()),
             inline_properties: ObjectCell::new([None, None, None, None]),
@@ -2649,7 +2647,12 @@ impl JsObject {
             let key = PropertyKey::Index(index);
             // Delegate to ordinary [[DefineOwnProperty]] on this key
             // but bypass our array check (already handled)
-            return self.ordinary_define_own_property(key, desc);
+            let result = self.ordinary_define_own_property(key, desc);
+            // Step 3.f: If index >= oldLen, update length
+            if result && index >= old_len {
+                self.set_array_length(index + 1);
+            }
+            return result;
         }
 
         // For simple data properties on arrays, store in elements array
@@ -3516,6 +3519,14 @@ impl otter_vm_gc::GcTraceable for JsObject {
         // Trace prototype (now a Value)
         self.prototype.borrow().trace(tracer);
 
+        // Trace shape property keys.
+        //
+        // Shapes are Arc-managed (not GC-managed), but they hold GcRef<JsString>
+        // and GcRef<Symbol> as property key identifiers.  Without this call the
+        // GC sees those strings/symbols as unreachable and collects them, turning
+        // every subsequent property-name lookup into a use-after-free.
+        self.shape.borrow().trace_keys(tracer);
+
         // Trace values in inline properties
         for entry_opt in self.inline_properties.borrow().iter() {
             if let Some(entry) = entry_opt {
@@ -3528,9 +3539,16 @@ impl otter_vm_gc::GcTraceable for JsObject {
             entry.desc.trace(tracer);
         }
 
-        // Trace values in dictionary properties
+        // Trace keys AND values in dictionary properties.
+        // Keys are GcRef<JsString>/GcRef<Symbol> just like shape keys and must
+        // be kept alive for the same reason.
         if let Some(dict) = self.dictionary_properties.borrow().as_ref() {
-            for entry in dict.values() {
+            for (key, entry) in dict.iter() {
+                match key {
+                    PropertyKey::String(s) => tracer(s.header() as *const _),
+                    PropertyKey::Symbol(sym) => tracer(sym.header() as *const _),
+                    PropertyKey::Index(_) => {}
+                }
                 entry.desc.trace(tracer);
             }
         }
@@ -3538,6 +3556,15 @@ impl otter_vm_gc::GcTraceable for JsObject {
         // Trace array elements
         for value in self.elements.borrow().iter() {
             value.trace(tracer);
+        }
+
+        // Trace argument mapping upvalue cells (sloppy mode mapped arguments)
+        if let Some(mapping) = self.argument_mapping.borrow().as_ref() {
+            for cell_opt in &mapping.cells {
+                if let Some(cell) = cell_opt {
+                    cell.get().trace(tracer);
+                }
+            }
         }
     }
 }

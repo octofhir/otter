@@ -60,12 +60,12 @@ pub fn to_property_key(value: &Value) -> PropertyKey {
 }
 
 /// Get object from value
-fn get_target_object(value: &Value) -> Result<GcRef<JsObject>, String> {
+fn get_target_object(value: &Value) -> Result<GcRef<JsObject>, VmError> {
     value.as_object().ok_or_else(|| {
-        format!(
+        VmError::type_error(&format!(
             "Reflect method requires an object target (got {})",
             value.type_of()
-        )
+        ))
     })
 }
 
@@ -212,23 +212,43 @@ fn descriptor_to_value(desc: PropertyDescriptor, ncx: &NativeContext) -> Value {
     }
 }
 
+/// CreateListFromArrayLike(obj) — ES2024 §7.3.18
+/// Accepts any object with a numeric `length` property (not just arrays).
+/// Throws TypeError for non-objects (null, undefined, primitives).
 fn value_to_array_args(args_list: &Value) -> Result<Vec<Value>, VmError> {
+    if args_list.is_null() || args_list.is_undefined() {
+        return Err(VmError::type_error(
+            "CreateListFromArrayLike called on null or undefined",
+        ));
+    }
     if let Some(arr_obj) = args_list.as_object() {
-        if arr_obj.is_array() {
-            let len = arr_obj.array_length();
-            let mut call_args = Vec::with_capacity(len);
-            for i in 0..len {
-                let val = arr_obj
-                    .get(&PropertyKey::Index(i as u32))
-                    .unwrap_or(Value::undefined());
-                call_args.push(val);
-            }
-            Ok(call_args)
+        let len = if arr_obj.is_array() {
+            arr_obj.array_length()
         } else {
-            Err(VmError::type_error("argumentsList must be an array"))
+            arr_obj
+                .get(&PropertyKey::string("length"))
+                .and_then(|v| v.as_number())
+                .map(|n| {
+                    if n.is_nan() || n < 0.0 {
+                        0
+                    } else {
+                        n as usize
+                    }
+                })
+                .unwrap_or(0)
+        };
+        let mut call_args = Vec::with_capacity(len.min(65536));
+        for i in 0..len {
+            let val = arr_obj
+                .get(&PropertyKey::Index(i as u32))
+                .unwrap_or(Value::undefined());
+            call_args.push(val);
         }
+        Ok(call_args)
     } else {
-        Err(VmError::type_error("argumentsList must be an object"))
+        Err(VmError::type_error(
+            "CreateListFromArrayLike called on non-object",
+        ))
     }
 }
 
@@ -259,7 +279,23 @@ fn reflect_get(
 
     let obj = get_target_object(target)?;
     let key = to_property_key(property_key);
-    Ok(obj.get(&key).unwrap_or(Value::undefined()))
+    // Use get_value_full to invoke getters; pass receiver as `this` for accessor calls
+    if let Some(desc) = obj.lookup_property_descriptor(&key) {
+        match desc {
+            PropertyDescriptor::Data { value, .. } => Ok(value),
+            PropertyDescriptor::Accessor { get, .. } => {
+                if let Some(getter) = get {
+                    if !getter.is_undefined() {
+                        return ncx.call_function(&getter, receiver, &[]);
+                    }
+                }
+                Ok(Value::undefined())
+            }
+            PropertyDescriptor::Deleted => Ok(Value::undefined()),
+        }
+    } else {
+        Ok(Value::undefined())
+    }
 }
 
 #[dive(name = "set", length = 3)]
@@ -402,42 +438,17 @@ fn reflect_get_own_property_descriptor(
     let key = to_property_key(property_key);
 
     if let Some(prop_desc) = obj.lookup_property_descriptor(&key) {
-        match prop_desc {
-            PropertyDescriptor::Data { value, attributes } => {
-                let desc = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                let _ = desc.set("value".into(), value);
-                let _ = desc.set("writable".into(), Value::boolean(attributes.writable));
-                let _ = desc.set("enumerable".into(), Value::boolean(attributes.enumerable));
-                let _ = desc.set(
-                    "configurable".into(),
-                    Value::boolean(attributes.configurable),
-                );
-                Ok(Value::object(desc))
-            }
-            PropertyDescriptor::Accessor {
-                get,
-                set,
-                attributes,
-            } => {
-                let desc = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                let _ = desc.set("get".into(), get.unwrap_or(Value::undefined()));
-                let _ = desc.set("set".into(), set.unwrap_or(Value::undefined()));
-                let _ = desc.set("enumerable".into(), Value::boolean(attributes.enumerable));
-                let _ = desc.set(
-                    "configurable".into(),
-                    Value::boolean(attributes.configurable),
-                );
-                Ok(Value::object(desc))
-            }
-            PropertyDescriptor::Deleted => Ok(Value::undefined()),
-        }
+        Ok(descriptor_to_value(prop_desc, ncx))
     } else if let Some(value) = obj.get(&key) {
-        let desc = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-        let _ = desc.set("value".into(), value);
-        let _ = desc.set("writable".into(), Value::boolean(true));
-        let _ = desc.set("enumerable".into(), Value::boolean(true));
-        let _ = desc.set("configurable".into(), Value::boolean(true));
-        Ok(Value::object(desc))
+        let fallback_desc = PropertyDescriptor::data_with_attrs(
+            value,
+            PropertyAttributes {
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        Ok(descriptor_to_value(fallback_desc, ncx))
     } else {
         Ok(Value::undefined())
     }
@@ -623,14 +634,13 @@ fn reflect_apply(
 ) -> Result<Value, VmError> {
     let target = args
         .first()
-        .ok_or("Reflect.apply requires a target argument")?;
+        .ok_or_else(|| VmError::type_error("Reflect.apply requires a target argument"))?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let args_list = args
-        .get(2)
-        .ok_or("Reflect.apply requires an argumentsList argument")?;
+    // argumentsList defaults to undefined if missing → CreateListFromArrayLike will throw TypeError
+    let args_list = args.get(2).cloned().unwrap_or(Value::undefined());
 
     if let Some(proxy) = target.as_proxy() {
-        let args_array = value_to_array_args(args_list)?;
+        let args_array = value_to_array_args(&args_list)?;
         let result = crate::proxy_operations::proxy_apply(ncx, proxy, this_arg, &args_array)?;
         return Ok(result);
     }
@@ -641,7 +651,7 @@ fn reflect_apply(
         ));
     }
 
-    let args_array = value_to_array_args(args_list)?;
+    let args_array = value_to_array_args(&args_list)?;
     ncx.call_function(target, this_arg, &args_array)
 }
 
@@ -701,7 +711,12 @@ fn reflect_construct(
 
 /// Create and install Reflect namespace on global object
 pub fn install_reflect_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManager>) {
-    let reflect_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let obj_proto = global
+        .get(&PropertyKey::string("Object"))
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get(&PropertyKey::string("prototype")))
+        .unwrap_or(Value::null());
+    let reflect_obj = GcRef::new(JsObject::new(obj_proto, mm.clone()));
 
     let methods: &[(&str, crate::value::NativeFn, u32)] = &[
         reflect_get_decl(),
@@ -719,10 +734,18 @@ pub fn install_reflect_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManager
         reflect_construct_decl(),
     ];
 
-    for (name, native_fn, _length) in methods {
-        let _ = reflect_obj.set(
+    for (name, native_fn, length) in methods {
+        let func = Value::native_function_from_decl(name, native_fn.clone(), *length, mm.clone());
+        reflect_obj.define_property(
             PropertyKey::string(name),
-            Value::native_function_from_arc(native_fn.clone(), mm.clone()),
+            PropertyDescriptor::data_with_attrs(
+                func,
+                PropertyAttributes {
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
         );
     }
 

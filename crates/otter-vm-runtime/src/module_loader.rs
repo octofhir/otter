@@ -453,12 +453,19 @@ impl ModuleLoader {
         }
     }
 
-    /// Clear all cached modules.
+    /// Clear all cached modules and native module GcRef entries.
     ///
     /// This is used by `Otter::reset_realm()` to ensure test isolation.
+    /// Clearing `native_modules` is required to prevent dangling `GcRef<JsObject>`
+    /// pointers: after a GC sweep, objects stored here from the previous eval
+    /// cycle may have been collected. They are re-registered by
+    /// `bootstrap_native_extensions()` at the start of each new eval.
     pub fn clear(&self) {
         if let Ok(mut modules) = self.modules.write() {
             modules.clear();
+        }
+        if let Ok(mut native) = self.native_modules.write() {
+            native.clear();
         }
     }
 
@@ -1466,6 +1473,32 @@ globalThis.__getFilename = function(url) {{
             base_dir_lit = serde_json::to_string(&loader.base_dir().to_string_lossy().to_string())
                 .unwrap_or_else(|_| "\"file:///\"".to_string()),
         ))
+}
+
+/// GC root tracing for `ModuleLoader`.
+///
+/// All `Value`s stored in every loaded module's `ModuleNamespace::exports`
+/// contain `GcRef<T>` (closures, objects) that must be kept alive for the
+/// duration of module lifetime.  Without this impl the GC could collect an
+/// exported closure while the namespace still holds the raw `GcRef` pointer.
+impl otter_vm_core::context::ExternalRootSet for ModuleLoader {
+    fn trace_roots(&self, tracer: &mut dyn FnMut(*const otter_vm_core::gc::GcHeader)) {
+        // `try_read()` avoids blocking the GC if a write-lock is held
+        // by a module-loading operation on the same thread.
+        let modules = match self.modules.try_read() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        for module_lock in modules.values() {
+            let guard = match module_lock.try_read() {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            for (_, value) in guard.namespace.entries() {
+                value.trace(tracer);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

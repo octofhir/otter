@@ -7,7 +7,7 @@ use otter_vm_bytecode::{Function, Module};
 
 #[derive(Debug, Clone)]
 pub(crate) struct JitCompileRequest {
-    pub(crate) module_ptr: usize,
+    pub(crate) module_id: u64,
     pub(crate) module_source_url: String,
     pub(crate) function_index: u32,
     pub(crate) function_name: Option<String>,
@@ -18,7 +18,7 @@ pub(crate) struct JitCompileRequest {
 #[derive(Default)]
 struct JitQueueState {
     pending: VecDeque<JitCompileRequest>,
-    enqueued: HashSet<(usize, u32)>,
+    enqueued: HashSet<(u64, u32)>,
 }
 
 static JIT_QUEUE: OnceLock<Mutex<JitQueueState>> = OnceLock::new();
@@ -39,7 +39,7 @@ pub(crate) fn enqueue_hot_function(
     function_index: u32,
     function: &Function,
 ) -> bool {
-    let key = (Arc::as_ptr(module) as usize, function_index);
+    let key = (module.module_id, function_index);
     let mut state = lock_queue();
 
     if !state.enqueued.insert(key) {
@@ -47,7 +47,7 @@ pub(crate) fn enqueue_hot_function(
     }
 
     state.pending.push_back(JitCompileRequest {
-        module_ptr: key.0,
+        module_id: key.0,
         module_source_url: module.source_url.clone(),
         function_index,
         function_name: function.name.clone(),
@@ -63,7 +63,7 @@ pub(crate) fn pop_next_request() -> Option<JitCompileRequest> {
     let next = state.pending.pop_front()?;
     state
         .enqueued
-        .remove(&(next.module_ptr, next.function_index));
+        .remove(&(next.module_id, next.function_index));
     Some(next)
 }
 

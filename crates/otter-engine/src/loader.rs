@@ -7,7 +7,7 @@
 use crate::error::{EngineError, EngineResult};
 use otter_nodejs::{NodeApiProfile, get_builtin_entry_for_profile, is_builtin_for_profile};
 use oxc_resolver::{ResolveOptions, Resolver};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -142,6 +142,50 @@ pub enum ImportContext {
     CJS,
 }
 
+/// Maximum number of source files to cache before evicting the oldest (FIFO).
+const MAX_SOURCE_CACHE_SIZE: usize = 256;
+
+/// Bounded in-memory source cache (module source text per canonical URL).
+struct SourceCache {
+    map: HashMap<String, ResolvedModule>,
+    /// Insertion order for FIFO eviction; mirrors `map` keys.
+    order: VecDeque<String>,
+}
+
+impl SourceCache {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, url: &str) -> Option<&ResolvedModule> {
+        self.map.get(url)
+    }
+
+    /// Insert an entry.  If `url` already exists the entry is refreshed in-place.
+    /// If the cache is at capacity the oldest entry is evicted first.
+    fn insert(&mut self, url: String, module: ResolvedModule) {
+        if self.map.contains_key(&url) {
+            self.map.insert(url, module);
+            return;
+        }
+        if self.map.len() >= MAX_SOURCE_CACHE_SIZE {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+        self.order.push_back(url.clone());
+        self.map.insert(url, module);
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
+
 /// Module loader with caching and oxc-resolver integration
 pub struct ModuleLoader {
     config: LoaderConfig,
@@ -149,7 +193,7 @@ pub struct ModuleLoader {
     esm_resolver: Resolver,
     /// Resolver for CJS requires (uses cjs_conditions)
     cjs_resolver: Resolver,
-    cache: Arc<RwLock<HashMap<String, ResolvedModule>>>,
+    cache: Arc<RwLock<SourceCache>>,
 }
 
 impl ModuleLoader {
@@ -172,7 +216,7 @@ impl ModuleLoader {
             esm_resolver: Resolver::new(esm_options),
             cjs_resolver: Resolver::new(cjs_options),
             config,
-            cache: Arc::new(RwLock::new(HashMap::new())),
+            cache: Arc::new(RwLock::new(SourceCache::new())),
         }
     }
 
@@ -208,7 +252,7 @@ impl ModuleLoader {
         // Load the module
         let module = self.load_url(&resolved_url).await?;
 
-        // Cache the result
+        // Cache the result (bounded FIFO; evicts oldest entry at MAX_SOURCE_CACHE_SIZE)
         {
             let mut cache = self.cache.write().await;
             cache.insert(resolved_url, module.clone());
@@ -496,10 +540,9 @@ impl ModuleLoader {
         }
     }
 
-    /// Clear the in-memory cache
+    /// Clear the in-memory source cache
     pub async fn clear_cache(&self) {
-        let mut cache = self.cache.write().await;
-        cache.clear();
+        self.cache.write().await.clear();
     }
 
     /// Get the loader configuration

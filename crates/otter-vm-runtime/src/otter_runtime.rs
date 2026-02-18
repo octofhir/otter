@@ -370,6 +370,8 @@ impl Otter {
         Self::configure_js_job_queue(&mut ctx, &self.event_loop);
         Self::configure_next_tick_queue(&mut ctx, &self.event_loop);
         Self::configure_pending_async_ops(&mut ctx, &self.event_loop);
+        Self::configure_timer_roots(&mut ctx, &self.event_loop);
+        Self::configure_module_namespace_roots(&mut ctx, &self.loader);
 
         // 4. Register extension ops as global native functions
         self.register_ops_in_context(&mut ctx);
@@ -2375,6 +2377,26 @@ impl Otter {
 
     fn configure_pending_async_ops(ctx: &mut VmContext, event_loop: &Arc<EventLoop>) {
         ctx.set_pending_async_ops(event_loop.get_pending_async_ops_count());
+    }
+
+    /// Register timer callback Values as GC roots so the GC cannot collect a
+    /// `Closure` captured inside a `Box<dyn FnOnce()>` timer while it is still pending.
+    fn configure_timer_roots(ctx: &mut VmContext, event_loop: &Arc<EventLoop>) {
+        ctx.register_external_root_set(event_loop.timer_callback_roots());
+    }
+
+    /// Register `ModuleLoader` namespace exports as GC roots so that Values
+    /// stored in `ModuleNamespace::exports` (closures, objects) are traced each
+    /// GC cycle and cannot be prematurely collected while still reachable via
+    /// module namespace lookup.
+    fn configure_module_namespace_roots(
+        ctx: &mut VmContext,
+        loader: &Arc<crate::module_loader::ModuleLoader>,
+    ) {
+        ctx.register_external_root_set(
+            loader.clone()
+                as Arc<dyn otter_vm_core::context::ExternalRootSet + Send + Sync>,
+        );
     }
 
     /// Execute JS code with eval semantics (returns last expression value)

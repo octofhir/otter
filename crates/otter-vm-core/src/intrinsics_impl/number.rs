@@ -24,6 +24,19 @@ fn number_this_value(this_val: &Value, method: &str) -> Result<f64, VmError> {
         Ok(num)
     } else if let Some(i) = this_val.as_int32() {
         Ok(i as f64)
+    } else if let Some(obj) = this_val.as_object() {
+        // Number object: unwrap the [[NumberData]] internal slot
+        if let Some(val) = obj.get(&PropertyKey::string("__value__")) {
+            if let Some(num) = val.as_number() {
+                return Ok(num);
+            }
+            if let Some(i) = val.as_int32() {
+                return Ok(i as f64);
+            }
+        }
+        Err(VmError::type_error(format!(
+            "Number.prototype.{method} requires a number"
+        )))
     } else {
         Err(VmError::type_error(format!(
             "Number.prototype.{method} requires a number"
@@ -320,6 +333,9 @@ pub fn init_number_prototype(
     _fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
+    // Per spec §20.1.3: Number.prototype has [[NumberData]] = +0
+    let _ = number_proto.set(PropertyKey::string("__value__"), Value::number(0.0));
+
     let methods: &[(&str, crate::value::NativeFn, u32)] = &[
         number_value_of_decl(),
         number_to_string_decl(),

@@ -482,15 +482,39 @@ impl BlockDirectory {
         ptr
     }
 
+    /// Maximum number of empty blocks to retain per `BlockDirectory` as a
+    /// burst buffer. Additional empty blocks are freed to keep RSS bounded.
+    const MAX_EMPTY_BLOCKS: usize = 2;
+
     /// Sweep all blocks, returning bytes reclaimed.
     ///
-    /// Empty blocks are NOT removed (they're kept for reuse).
+    /// After sweeping, excess empty blocks (beyond `MAX_EMPTY_BLOCKS`) are
+    /// freed to prevent RSS from growing to the historical allocation peak.
+    /// Two empty blocks are kept as a burst buffer for future allocations.
     pub fn sweep(&self) -> usize {
-        let blocks = self.blocks.borrow();
         let mut reclaimed = 0;
-        for block in blocks.iter() {
-            reclaimed += block.sweep();
+        {
+            let blocks = self.blocks.borrow();
+            for block in blocks.iter() {
+                reclaimed += block.sweep();
+            }
         }
+
+        // Free excess empty blocks to bound RSS.
+        let mut empty_kept = 0usize;
+        self.blocks.borrow_mut().retain(|block| {
+            if block.live_count() == 0 {
+                if empty_kept < Self::MAX_EMPTY_BLOCKS {
+                    empty_kept += 1;
+                    true // keep as burst buffer
+                } else {
+                    false // drop block, freeing its 16 KB slab
+                }
+            } else {
+                true // keep live blocks unconditionally
+            }
+        });
+
         // Reset cursor to 0 to search from start after sweep
         self.cursor.set(0);
         reclaimed

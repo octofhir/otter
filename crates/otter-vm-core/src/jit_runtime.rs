@@ -11,7 +11,10 @@ use crate::jit_queue;
 #[derive(Default)]
 struct JitRuntimeState {
     compiler: Option<JitCompiler>,
-    compiled_code_ptrs: HashMap<(usize, u32), usize>,
+    /// Keyed by `(module_id, function_index)`.  `module_id` is the stable
+    /// unique ID assigned at `Module` construction — unlike `Arc::as_ptr`,
+    /// it cannot be reused after the `Arc` is dropped.
+    compiled_code_ptrs: HashMap<(u64, u32), usize>,
     compile_errors: u64,
     total_bailouts: u64,
     total_deoptimizations: u64,
@@ -45,7 +48,7 @@ pub(crate) enum JitExecResult {
 /// Returns `Ok(value)` on success, `Bailout` if a runtime condition caused
 /// the JIT code to bail out, or `NotCompiled` if no code exists.
 pub(crate) fn try_execute_jit(
-    module_ptr: usize,
+    module_id: u64,
     function_index: u32,
     function: &Function,
 ) -> JitExecResult {
@@ -57,7 +60,7 @@ pub(crate) fn try_execute_jit(
         let state = lock_state();
         state
             .compiled_code_ptrs
-            .get(&(module_ptr, function_index))
+            .get(&(module_id, function_index))
             .copied()
     };
 
@@ -78,7 +81,7 @@ pub(crate) fn try_execute_jit(
         if deoptimized {
             state
                 .compiled_code_ptrs
-                .remove(&(module_ptr, function_index));
+                .remove(&(module_id, function_index));
             state.total_deoptimizations = state.total_deoptimizations.saturating_add(1);
         }
 
@@ -90,13 +93,13 @@ pub(crate) fn try_execute_jit(
 
 /// Invalidate JIT code for a specific function.
 #[allow(dead_code)]
-pub(crate) fn invalidate_jit_code(module_ptr: usize, function_index: u32) {
+pub(crate) fn invalidate_jit_code(module_id: u64, function_index: u32) {
     let mut state = runtime_state()
         .lock()
         .expect("jit runtime mutex should not be poisoned");
     state
         .compiled_code_ptrs
-        .remove(&(module_ptr, function_index));
+        .remove(&(module_id, function_index));
 }
 
 /// Compile one pending JIT request, if present.
@@ -130,7 +133,7 @@ pub(crate) fn compile_one_pending_request() {
     match compiler.compile_function(&request.function) {
         Ok(artifact) => {
             state.compiled_code_ptrs.insert(
-                (request.module_ptr, request.function_index),
+                (request.module_id, request.function_index),
                 artifact.code_ptr as usize,
             );
         }
@@ -143,7 +146,7 @@ pub(crate) fn compile_one_pending_request() {
 /// Directly compile and register a function (bypasses queue).
 /// Used for testing and eager compilation.
 #[cfg(test)]
-fn compile_and_register(module_ptr: usize, function_index: u32, function: &Function) -> bool {
+fn compile_and_register(module_id: u64, function_index: u32, function: &Function) -> bool {
     let mut state = runtime_state()
         .lock()
         .expect("jit runtime mutex should not be poisoned");
@@ -160,7 +163,7 @@ fn compile_and_register(module_ptr: usize, function_index: u32, function: &Funct
         Ok(artifact) => {
             state
                 .compiled_code_ptrs
-                .insert((module_ptr, function_index), artifact.code_ptr as usize);
+                .insert((module_id, function_index), artifact.code_ptr as usize);
             true
         }
         Err(_) => false,
@@ -205,9 +208,9 @@ mod tests {
 
         assert_eq!(crate::jit_queue::pending_count(), 0);
         // Verify compilation happened by checking the code is accessible
-        let module_ptr = Arc::as_ptr(&module) as usize;
+        let module_id = module.module_id;
         let state = runtime_state().lock().unwrap();
-        assert!(state.compiled_code_ptrs.contains_key(&(module_ptr, 0)));
+        assert!(state.compiled_code_ptrs.contains_key(&(module_id, 0)));
     }
 
     #[test]
@@ -219,7 +222,7 @@ mod tests {
             .build();
 
         // Use a unique key that can't collide
-        match try_execute_jit(0xCAFE_0001, 99, &f) {
+        match try_execute_jit(0xCAFE_0001_u64, 99, &f) {
             JitExecResult::NotCompiled => {}
             _ => panic!("expected NotCompiled"),
         }
@@ -248,7 +251,7 @@ mod tests {
             .feedback_vector_size(1)
             .build();
 
-        let key = 0xBEEF_0001_usize;
+        let key = 0xBEEF_0001_u64;
         assert!(compile_and_register(key, 0, &f));
 
         match try_execute_jit(key, 0, &f) {
@@ -280,7 +283,7 @@ mod tests {
             .feedback_vector_size(1)
             .build();
 
-        let key = 0xBEEF_0002_usize;
+        let key = 0xBEEF_0002_u64;
         assert!(compile_and_register(key, 0, &f));
 
         match try_execute_jit(key, 0, &f) {
@@ -315,7 +318,7 @@ mod tests {
             .feedback_vector_size(1)
             .build();
 
-        let key = 0xBEEF_0003_usize;
+        let key = 0xBEEF_0003_u64;
         assert!(compile_and_register(key, 0, &f));
 
         // Bail out until deoptimized
@@ -378,10 +381,10 @@ mod tests {
         compile_one_pending_request();
 
         // Should NOT have compiled
-        let module_ptr = Arc::as_ptr(&module) as usize;
+        let module_id = module.module_id;
         let state = runtime_state().lock().unwrap();
         assert!(
-            !state.compiled_code_ptrs.contains_key(&(module_ptr, 0)),
+            !state.compiled_code_ptrs.contains_key(&(module_id, 0)),
             "deoptimized function should not be compiled"
         );
     }

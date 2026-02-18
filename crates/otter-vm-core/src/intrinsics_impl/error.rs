@@ -240,18 +240,36 @@ pub fn create_error_constructor(
         // Set properties on `this` (the new object created by Construct
         // which already has the correct ErrorType.prototype)
         if let Some(obj) = this.as_object() {
+            // §20.5.1.1: Only set message if first arg is not undefined
             if let Some(msg) = args.first() {
                 if !msg.is_undefined() {
-                    let _ = obj.set(
+                    // message: { writable: true, enumerable: false, configurable: true }
+                    obj.define_property(
                         PropertyKey::string("message"),
-                        Value::string(JsString::intern(&crate::globals::to_string(msg))),
+                        PropertyDescriptor::data_with_attrs(
+                            Value::string(JsString::intern(&crate::globals::to_string(msg))),
+                            PropertyAttributes::builtin_method(),
+                        ),
                     );
                 }
             }
-            let _ = obj.set(
-                PropertyKey::string("name"),
-                Value::string(JsString::intern(error_name)),
-            );
+            // §20.5.1.1 step 5: InstallErrorCause(O, options)
+            if let Some(options) = args.get(1) {
+                if let Some(opts_obj) = options.as_object() {
+                    if opts_obj.has(&PropertyKey::string("cause")) {
+                        if let Some(cause) = opts_obj.get(&PropertyKey::string("cause")) {
+                            obj.define_property(
+                                PropertyKey::string("cause"),
+                                PropertyDescriptor::data_with_attrs(
+                                    cause,
+                                    PropertyAttributes::builtin_method(),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            // Note: `name` is inherited from prototype, NOT set on instances
         }
         // Return undefined so Construct uses new_obj_value with correct prototype
         Ok(Value::undefined())
@@ -266,40 +284,112 @@ pub fn create_aggregate_error_constructor() -> Box<
         + Send
         + Sync,
 > {
-    Box::new(|this, args, _ncx| {
+    Box::new(|this, args, ncx| {
         if let Some(obj) = this.as_object() {
-            // arg0: errors (iterable) — for now, convert to array
+            // arg0: errors (iterable) — iterate via iterator protocol
             let errors_arg = args.first().cloned().unwrap_or(Value::undefined());
+            let mm = obj.memory_manager().clone();
             let errors_array = if let Some(arr_obj) = errors_arg.as_object() {
-                // If it's already array-like, copy elements into a new array
-                let len = arr_obj
-                    .get(&PropertyKey::string("length"))
-                    .and_then(|v| v.as_number())
-                    .unwrap_or(0.0) as u32;
-                let mm = obj.memory_manager();
-                let result_arr = GcRef::new(JsObject::array(len as usize, mm.clone()));
-                for i in 0..len {
-                    if let Some(val) = arr_obj.get(&PropertyKey::Index(i)) {
-                        let _ = result_arr.set(PropertyKey::Index(i), val);
+                // Try to use Symbol.iterator for proper iteration
+                let iter_sym = crate::intrinsics::well_known::iterator_symbol();
+                let iter_fn = arr_obj.get(&PropertyKey::Symbol(iter_sym));
+                if let Some(iter_method) = iter_fn {
+                    if iter_method.is_callable() {
+                        // Use iterator protocol
+                        let iterator = ncx.call_function(
+                            &iter_method,
+                            Value::object(arr_obj.clone()),
+                            &[],
+                        )?;
+                        let result_arr = GcRef::new(JsObject::array(0, mm.clone()));
+                        let mut idx = 0u32;
+                        if let Some(iter_obj) = iterator.as_object() {
+                            let next_fn = iter_obj
+                                .get(&PropertyKey::string("next"))
+                                .unwrap_or(Value::undefined());
+                            loop {
+                                let step = ncx.call_function(
+                                    &next_fn,
+                                    Value::object(iter_obj.clone()),
+                                    &[],
+                                )?;
+                                if let Some(step_obj) = step.as_object() {
+                                    let done = step_obj
+                                        .get(&PropertyKey::string("done"))
+                                        .map(|v| v.to_boolean())
+                                        .unwrap_or(false);
+                                    if done {
+                                        break;
+                                    }
+                                    let value = step_obj
+                                        .get(&PropertyKey::string("value"))
+                                        .unwrap_or(Value::undefined());
+                                    let _ = result_arr.set(PropertyKey::Index(idx), value);
+                                    idx += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        let _ = result_arr.set(
+                            PropertyKey::string("length"),
+                            Value::number(idx as f64),
+                        );
+                        Value::array(result_arr)
+                    } else {
+                        // No iterator, fall back to array-like
+                        let len = arr_obj
+                            .get(&PropertyKey::string("length"))
+                            .and_then(|v| v.as_number())
+                            .unwrap_or(0.0) as u32;
+                        let result_arr = GcRef::new(JsObject::array(len as usize, mm.clone()));
+                        for i in 0..len {
+                            if let Some(val) = arr_obj.get(&PropertyKey::Index(i)) {
+                                let _ = result_arr.set(PropertyKey::Index(i), val);
+                            }
+                        }
+                        Value::array(result_arr)
                     }
+                } else {
+                    // No Symbol.iterator, try array-like
+                    let len = arr_obj
+                        .get(&PropertyKey::string("length"))
+                        .and_then(|v| v.as_number())
+                        .unwrap_or(0.0) as u32;
+                    let result_arr = GcRef::new(JsObject::array(len as usize, mm.clone()));
+                    for i in 0..len {
+                        if let Some(val) = arr_obj.get(&PropertyKey::Index(i)) {
+                            let _ = result_arr.set(PropertyKey::Index(i), val);
+                        }
+                    }
+                    Value::array(result_arr)
                 }
-                Value::array(result_arr)
             } else {
-                // Non-object: create empty array (spec says iterate, but non-iterable = TypeError;
-                // for robustness, just use empty)
-                let mm = obj.memory_manager();
-                Value::array(GcRef::new(JsObject::array(0, mm.clone())))
+                // Non-object: spec says TypeError for non-iterable
+                return Err(VmError::type_error(
+                    "AggregateError: errors argument is not iterable",
+                ));
             };
 
-            // Store .errors as a data property
-            let _ = obj.set(PropertyKey::string("errors"), errors_array);
+            // Store .errors as a data property { writable: true, enumerable: false, configurable: true }
+            obj.define_property(
+                PropertyKey::string("errors"),
+                PropertyDescriptor::data_with_attrs(
+                    errors_array,
+                    PropertyAttributes::builtin_method(),
+                ),
+            );
 
             // arg1: message (optional)
             if let Some(msg) = args.get(1) {
                 if !msg.is_undefined() {
-                    let _ = obj.set(
+                    let msg_str = ncx.to_string_value(msg)?;
+                    obj.define_property(
                         PropertyKey::string("message"),
-                        Value::string(JsString::intern(&crate::globals::to_string(msg))),
+                        PropertyDescriptor::data_with_attrs(
+                            Value::string(JsString::intern(&msg_str)),
+                            PropertyAttributes::builtin_method(),
+                        ),
                     );
                 }
             }
@@ -307,16 +397,21 @@ pub fn create_aggregate_error_constructor() -> Box<
             // arg2: options (optional) — extract .cause if present
             if let Some(options) = args.get(2) {
                 if let Some(opts_obj) = options.as_object() {
-                    if let Some(cause) = opts_obj.get(&PropertyKey::string("cause")) {
-                        let _ = obj.set(PropertyKey::string("cause"), cause);
+                    if opts_obj.has(&PropertyKey::string("cause")) {
+                        if let Some(cause) = opts_obj.get(&PropertyKey::string("cause")) {
+                            obj.define_property(
+                                PropertyKey::string("cause"),
+                                PropertyDescriptor::data_with_attrs(
+                                    cause,
+                                    PropertyAttributes::builtin_method(),
+                                ),
+                            );
+                        }
                     }
                 }
             }
 
-            let _ = obj.set(
-                PropertyKey::string("name"),
-                Value::string(JsString::intern("AggregateError")),
-            );
+            // Note: `name` is inherited from AggregateError.prototype, NOT set on instances
         }
         Ok(Value::undefined())
     })

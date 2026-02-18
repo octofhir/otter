@@ -1,15 +1,16 @@
 use clap::{ArgAction, Parser, Subcommand};
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::HashMap;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tracing_subscriber::filter::EnvFilter;
 
 use otter_test262::{
-    FeatureReport, PersistedReport, Test262Runner, TestOutcome, TestReport, compare,
-    config::Test262Config, editions, report::FailureInfo,
+    PersistedReport, RunSummary, Test262Runner, TestOutcome, TestReport, compare,
+    config::Test262Config, editions, parallel::ParallelConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -72,8 +73,8 @@ struct Cli {
     #[arg(value_name = "FILES", global = true)]
     files: Vec<String>,
 
-    /// Dump debug snapshot on timeout (default: true)
-    #[arg(long, global = true, default_value = "true")]
+    /// Dump debug snapshot on timeout
+    #[arg(long, global = true, default_value = "false")]
     dump_on_timeout: bool,
 
     /// File path for timeout dumps (default: stderr)
@@ -83,6 +84,18 @@ struct Cli {
     /// Number of instructions to keep in ring buffer (default: 100)
     #[arg(long, global = true, default_value = "100")]
     dump_buffer_size: usize,
+
+    /// Number of parallel workers (default: num_cpus; 1 = sequential)
+    #[arg(short = 'j', long = "jobs", global = true)]
+    jobs: Option<usize>,
+
+    /// Path for JSONL result log (one JSON object per test result per line)
+    #[arg(long, global = true)]
+    log: Option<PathBuf>,
+
+    /// Append to the JSONL log instead of truncating at run start
+    #[arg(long, global = true)]
+    log_append: bool,
 
     /// Enable full execution trace for tests
     #[arg(long, global = true)]
@@ -192,121 +205,7 @@ impl MemoryTracker {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Run summary (streaming accumulator)
-// ---------------------------------------------------------------------------
-
-struct RunSummary {
-    total: usize,
-    passed: usize,
-    failed: usize,
-    skipped: usize,
-    timeout: usize,
-    crashed: usize,
-    by_feature: HashMap<String, FeatureReport>,
-    by_edition: HashMap<editions::EsEdition, editions::EditionReport>,
-    failures: Vec<FailureInfo>,
-    all_results: Vec<otter_test262::TestResult>,
-    max_failures: usize,
-}
-
-impl RunSummary {
-    fn new(max_failures: usize) -> Self {
-        Self {
-            total: 0,
-            passed: 0,
-            failed: 0,
-            skipped: 0,
-            timeout: 0,
-            crashed: 0,
-            by_feature: HashMap::new(),
-            by_edition: HashMap::new(),
-            failures: Vec::new(),
-            all_results: Vec::new(),
-            max_failures,
-        }
-    }
-
-    fn record(&mut self, result: &otter_test262::TestResult, save_all: bool) {
-        self.total += 1;
-        match result.outcome {
-            TestOutcome::Pass => self.passed += 1,
-            TestOutcome::Fail => {
-                self.failed += 1;
-                if self.failures.len() < self.max_failures {
-                    self.failures.push(FailureInfo {
-                        path: result.path.clone(),
-                        mode: result.mode,
-                        error: result.error.clone().unwrap_or_default(),
-                    });
-                }
-            }
-            TestOutcome::Skip => self.skipped += 1,
-            TestOutcome::Timeout => self.timeout += 1,
-            TestOutcome::Crash => self.crashed += 1,
-        }
-
-        // Track by feature
-        for feature in &result.features {
-            let feature_report = self.by_feature.entry(feature.clone()).or_default();
-            feature_report.total += 1;
-            match result.outcome {
-                TestOutcome::Pass => feature_report.passed += 1,
-                TestOutcome::Fail => feature_report.failed += 1,
-                TestOutcome::Skip => feature_report.skipped += 1,
-                _ => {}
-            }
-
-            // Track by edition
-            let edition = editions::feature_edition(feature);
-            let edition_report = self.by_edition.entry(edition).or_default();
-            edition_report.total += 1;
-            match result.outcome {
-                TestOutcome::Pass => edition_report.passed += 1,
-                TestOutcome::Fail => edition_report.failed += 1,
-                TestOutcome::Skip => edition_report.skipped += 1,
-                _ => {}
-            }
-        }
-
-        // For tests with no features, classify as ES5
-        if result.features.is_empty() {
-            let edition_report = self.by_edition.entry(editions::EsEdition::ES5).or_default();
-            edition_report.total += 1;
-            match result.outcome {
-                TestOutcome::Pass => edition_report.passed += 1,
-                TestOutcome::Fail => edition_report.failed += 1,
-                TestOutcome::Skip => edition_report.skipped += 1,
-                _ => {}
-            }
-        }
-
-        if save_all {
-            self.all_results.push(result.clone());
-        }
-    }
-
-    fn into_report(self) -> TestReport {
-        let run_count = self.passed + self.failed + self.timeout + self.crashed;
-        let pass_rate = if run_count > 0 {
-            (self.passed as f64 / run_count as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        TestReport {
-            total: self.total,
-            passed: self.passed,
-            failed: self.failed,
-            skipped: self.skipped,
-            timeout: self.timeout,
-            crashed: self.crashed,
-            pass_rate,
-            by_feature: self.by_feature,
-            failures: self.failures,
-        }
-    }
-}
+// RunSummary is defined in otter_test262::report and re-exported from the library.
 
 // ---------------------------------------------------------------------------
 // Main
@@ -495,12 +394,121 @@ async fn run_tests(cli: Cli) {
 
     let run_start = Instant::now();
     let max_failures = if cli.json { 50000 } else { 200 };
-    let mut summary = RunSummary::new(max_failures);
 
     // Always enforce a timeout to prevent hangs. Default: 10s per test.
     let timeout = Some(std::time::Duration::from_secs(
         cli.timeout.or(config.timeout_secs).unwrap_or(10),
     ));
+
+    // -------------------------------------------------------------------------
+    // Parallel path — dispatch to worker threads when -j > 1
+    // -------------------------------------------------------------------------
+    let num_jobs = cli.jobs.unwrap_or_else(num_cpus::get).max(1);
+    if num_jobs > 1 {
+        if !cli.json {
+            eprintln!("Running with {} parallel workers", num_jobs);
+        }
+        let par_config = Arc::new(ParallelConfig {
+            test_dir: cli.test_dir.clone(),
+            skip_features: config.skip_features.clone(),
+            timeout,
+            ignored_tests: config.ignored_tests.clone(),
+            known_panics: config.known_panics.clone(),
+            max_failures,
+            save_results,
+            verbose: cli.verbose,
+            json_mode: cli.json,
+            log_path: cli.log.clone(),
+            log_append: cli.log_append,
+        });
+        let pb_for_par = pb.clone();
+        let summary = tokio::task::spawn_blocking(move || {
+            otter_test262::parallel::run_parallel(tests, par_config, num_jobs, pb_for_par)
+        })
+        .await
+        .expect("parallel runner panicked");
+
+        let run_duration = run_start.elapsed();
+        let by_edition = summary.by_edition.clone();
+        let all_results = if save_results { summary.all_results.clone() } else { Vec::new() };
+        let report = summary.into_report();
+
+        // Report
+        if cli.json {
+            match report.to_json() {
+                Ok(json) => println!("{}", json),
+                Err(e) => eprintln!("Failed to generate JSON: {}", e),
+            }
+        } else {
+            report.print_summary();
+            if !by_edition.is_empty() {
+                editions::print_edition_table(&by_edition);
+            }
+            if cli.verbose >= 1 && !report.failures.is_empty() {
+                println!();
+                println!("{}", "=== All Failures ===".bold().red());
+                for failure in &report.failures {
+                    println!(
+                        "{} ({}) - {}",
+                        failure.path.yellow(),
+                        failure.mode,
+                        failure.error
+                    );
+                }
+            }
+        }
+
+        // Save results if requested
+        if let Some(save_path) = save_path {
+            let persisted = PersistedReport {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                otter_version: env!("CARGO_PKG_VERSION").to_string(),
+                test262_commit: None,
+                duration_secs: run_duration.as_secs_f64(),
+                summary: report.clone(),
+                results: all_results,
+            };
+            match persisted.save(&save_path) {
+                Ok(()) => {
+                    if !cli.json {
+                        eprintln!("Results saved to {}", save_path.display());
+                    }
+                }
+                Err(e) => eprintln!("Failed to save results: {}", e),
+            }
+            if let Some(parent) = save_path.parent() {
+                let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+                let timestamped = parent.join(format!("run_{}.json", ts));
+                let _ = persisted.save(&timestamped);
+            }
+        }
+
+        if report.failed > 0 {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // Sequential path (single worker, existing behaviour)
+    // -------------------------------------------------------------------------
+
+    // Open JSONL log if requested
+    let mut log_writer: Option<BufWriter<std::fs::File>> = cli.log.as_ref().and_then(|p| {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(!cli.log_append)
+            .append(cli.log_append)
+            .open(p)
+            .ok()
+            .map(BufWriter::new)
+    });
+
+    let mut summary = RunSummary::new(max_failures);
 
     for path in tests {
         // Check ignored/known-panic via config
@@ -577,6 +585,13 @@ async fn run_tests(cli: Cli) {
                 }
             }
 
+            // JSONL log
+            if let Some(ref mut writer) = log_writer {
+                if let Ok(line) = serde_json::to_string(result) {
+                    let _ = writeln!(writer, "{}", line);
+                }
+            }
+
             summary.record(result, save_results);
         }
 
@@ -624,6 +639,11 @@ async fn run_tests(cli: Cli) {
                 let _ = persisted.save(save_path);
             }
         }
+    }
+
+    // Flush JSONL log
+    if let Some(ref mut writer) = log_writer {
+        let _ = writer.flush();
     }
 
     // Finish progress

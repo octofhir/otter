@@ -252,9 +252,13 @@ impl otter_vm_gc::GcTraceable for NativeFunctionObject {
         // Trace the attached object
         tracer(self.object.header() as *const _);
 
-        // NativeFn is Arc<dyn Fn>, which is opaque to GC
-        // Any Value references are passed through arguments, not captured in the closure
-        // Native functions are created by Rust code and don't capture GC-managed values
+        // NativeFn is Arc<dyn Fn>, which is opaque to GC.
+        // CONVENTION: NativeFn closures MUST NOT capture `GcRef<T>` or `Value`
+        // containing heap references.  Values are received through the `this`/`args`
+        // parameters on each call, not stored in the closure.  Violating this
+        // convention can cause use-after-free if the GC collects the referenced
+        // object while the closure is still alive.  See `promise.rs` for the only
+        // known exception, which is documented with a SAFETY comment there.
     }
 }
 
@@ -654,6 +658,65 @@ impl Value {
             crate::object::PropertyDescriptor::function_length(Value::string(
                 crate::string::JsString::intern(""),
             )),
+        );
+        // Built-in methods are not constructors (ES2023 §17)
+        let _ = object.set(
+            crate::object::PropertyKey::string("__non_constructor"),
+            Value::boolean(true),
+        );
+        if let Some(realm_id) = prototype
+            .get(&crate::object::PropertyKey::string("__realm_id__"))
+            .and_then(|v| v.as_int32())
+        {
+            object.define_property(
+                crate::object::PropertyKey::string("__realm_id__"),
+                crate::object::PropertyDescriptor::builtin_data(Value::int32(realm_id)),
+            );
+        }
+        let native = GcRef::new(NativeFunctionObject { func, object });
+        Self {
+            bits: TAG_POINTER | (native.as_ptr() as u64 & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::NativeFunction(native)),
+        }
+    }
+
+    /// Create a native function value with a specific [[Prototype]], name, and length.
+    ///
+    /// Like `native_function_with_proto` but sets correct `name`, `length`, and
+    /// `__non_constructor` per ES2023 §10.2.8 / §17.
+    pub fn native_function_with_proto_named<F>(
+        f: F,
+        memory_manager: Arc<crate::memory::MemoryManager>,
+        prototype: GcRef<JsObject>,
+        name: &str,
+        length: u32,
+    ) -> Self
+    where
+        F: Fn(
+                &Value,
+                &[Value],
+                &mut crate::context::NativeContext<'_>,
+            ) -> Result<Value, crate::error::VmError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let func: NativeFn = Arc::new(f);
+        let object = GcRef::new(JsObject::new(Value::object(prototype.clone()), memory_manager));
+        object.define_property(
+            crate::object::PropertyKey::string("length"),
+            crate::object::PropertyDescriptor::function_length(Value::int32(length as i32)),
+        );
+        object.define_property(
+            crate::object::PropertyKey::string("name"),
+            crate::object::PropertyDescriptor::function_length(Value::string(
+                crate::string::JsString::intern(name),
+            )),
+        );
+        // Built-in methods are not constructors (ES2023 §17)
+        let _ = object.set(
+            crate::object::PropertyKey::string("__non_constructor"),
+            Value::boolean(true),
         );
         if let Some(realm_id) = prototype
             .get(&crate::object::PropertyKey::string("__realm_id__"))
@@ -1421,8 +1484,9 @@ impl Value {
                 HeapRef::SetData(s) => {
                     otter_vm_gc::GcTraceable::trace(&**s, tracer);
                 }
-                // Other types use Arc, not GcRef, so no GC tracing needed
-                _ => {}
+                HeapRef::EphemeronTable(e) => {
+                    tracer(e.header() as *const _);
+                }
             }
         }
     }

@@ -193,6 +193,15 @@ impl JsPromise {
         let promise = JsPromise::new();
         let enqueue = Arc::new(enqueue);
 
+        // SAFETY: `p` is a `GcRef<JsPromise>` captured inside an `Arc<dyn Fn>` that
+        // may outlive the GC context (e.g., moved into a tokio task).  This is safe
+        // ONLY when the caller ensures the `JsPromise` is simultaneously kept alive
+        // through a GC-visible reference (e.g., `Value::promise(resolvers.promise)`)
+        // for the entire lifetime of the `resolve`/`reject` closures.
+        //
+        // Callers MUST NOT drop all GC-rooted references to the promise before calling
+        // these closures.  The typical `await expr` pattern satisfies this because the
+        // `AsyncContext` holds a `GcRef<JsPromise>` that is traced by `collect_gc_roots`.
         let resolve = {
             let p = promise.clone();
             let enqueue = Arc::clone(&enqueue);

@@ -313,30 +313,64 @@ pub fn init_string_prototype(
         )),
     );
 
-    // String.prototype.trimStart (ES2019)
+    // String.prototype.trimStart (ES2019) + trimLeft (AnnexB alias, same function object)
+    let trim_start_fn = Value::native_function_with_proto(
+        |this_val, _args, _ncx| {
+            let s = this_string_value(this_val)?;
+            Ok(Value::string(JsString::intern(s.as_str().trim_start())))
+        },
+        mm.clone(),
+        fn_proto,
+    );
+    // Set name and length on the shared function object (trimLeft.name === "trimStart" per spec)
+    if let Some(obj) = trim_start_fn.as_object() {
+        obj.define_property(
+            PropertyKey::string("name"),
+            PropertyDescriptor::function_length(Value::string(JsString::intern("trimStart"))),
+        );
+        obj.define_property(
+            PropertyKey::string("length"),
+            PropertyDescriptor::function_length(Value::number(0.0)),
+        );
+    }
     string_proto.define_property(
         PropertyKey::string("trimStart"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _ncx| {
-                let s = this_string_value(this_val)?;
-                Ok(Value::string(JsString::intern(s.as_str().trim_start())))
-            },
-            mm.clone(),
-            fn_proto,
-        )),
+        PropertyDescriptor::builtin_method(trim_start_fn.clone()),
+    );
+    // AnnexB §B.2.3.16: trimLeft must be the same function object as trimStart
+    string_proto.define_property(
+        PropertyKey::string("trimLeft"),
+        PropertyDescriptor::builtin_method(trim_start_fn),
     );
 
-    // String.prototype.trimEnd (ES2019)
+    // String.prototype.trimEnd (ES2019) + trimRight (AnnexB alias, same function object)
+    let trim_end_fn = Value::native_function_with_proto(
+        |this_val, _args, _ncx| {
+            let s = this_string_value(this_val)?;
+            Ok(Value::string(JsString::intern(s.as_str().trim_end())))
+        },
+        mm.clone(),
+        fn_proto,
+    );
+    // Set name and length on the shared function object (trimRight.name === "trimEnd" per spec)
+    if let Some(obj) = trim_end_fn.as_object() {
+        obj.define_property(
+            PropertyKey::string("name"),
+            PropertyDescriptor::function_length(Value::string(JsString::intern("trimEnd"))),
+        );
+        obj.define_property(
+            PropertyKey::string("length"),
+            PropertyDescriptor::function_length(Value::number(0.0)),
+        );
+    }
     string_proto.define_property(
         PropertyKey::string("trimEnd"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-            |this_val, _args, _ncx| {
-                let s = this_string_value(this_val)?;
-                Ok(Value::string(JsString::intern(s.as_str().trim_end())))
-            },
-            mm.clone(),
-            fn_proto,
-        )),
+        PropertyDescriptor::builtin_method(trim_end_fn.clone()),
+    );
+    // AnnexB §B.2.3.17: trimRight must be the same function object as trimEnd
+    string_proto.define_property(
+        PropertyKey::string("trimRight"),
+        PropertyDescriptor::builtin_method(trim_end_fn),
     );
 
     // String.prototype.startsWith (ES2015)
@@ -998,6 +1032,373 @@ pub fn init_string_prototype(
             fn_proto,
         )),
     );
+
+    // ========================================================================
+    // Annex B: String.prototype.substr (§B.2.3.1)
+    // ========================================================================
+    {
+        let func = Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                // 1. RequireObjectCoercible(this)
+                if this_val.is_null() || this_val.is_undefined() {
+                    return Err(VmError::type_error(
+                        "String.prototype.substr called on null or undefined",
+                    ));
+                }
+                // 2. Let S = ToString(this) — propagates toString() exceptions
+                let s = ncx.to_string_value(this_val)?;
+                // Work in UTF-16 code units for spec-correct indexing
+                let utf16: Vec<u16> = s.encode_utf16().collect();
+                let size = utf16.len() as i64;
+
+                // 3. ToIntegerOrInfinity(start)
+                let start_val = args.first().cloned().unwrap_or(Value::undefined());
+                let start_num = ncx.to_number_value(&start_val)?;
+                let int_start: i64 = if start_num.is_nan() {
+                    0
+                } else if start_num == f64::INFINITY {
+                    size // min(+∞, size)
+                } else if start_num == f64::NEG_INFINITY {
+                    0 // max(size + -∞, 0) = 0
+                } else {
+                    start_num.trunc() as i64
+                };
+
+                // 4. ToIntegerOrInfinity(length); undefined → treat as +∞
+                let length_val = args.get(1).cloned().unwrap_or(Value::undefined());
+                let int_length: Option<i64> = if length_val.is_undefined() {
+                    None // +∞: go to end
+                } else {
+                    let n = ncx.to_number_value(&length_val)?;
+                    if n.is_nan() {
+                        Some(0)
+                    } else if n == f64::INFINITY {
+                        None // +∞
+                    } else if n == f64::NEG_INFINITY {
+                        Some(i64::MIN) // -∞ → length 0 or negative
+                    } else {
+                        Some(n.trunc() as i64)
+                    }
+                };
+
+                // 5. Clamp intStart
+                let start = if int_start < 0 {
+                    (size + int_start).max(0)
+                } else {
+                    int_start.min(size)
+                } as usize;
+
+                // 6. Compute end
+                let end = match int_length {
+                    None => size as usize,
+                    Some(l) if l <= 0 => {
+                        return Ok(Value::string(JsString::intern("")));
+                    }
+                    Some(l) => {
+                        let raw = start as i64 + l;
+                        if raw <= 0 {
+                            return Ok(Value::string(JsString::intern("")));
+                        }
+                        raw.min(size) as usize
+                    }
+                };
+
+                if end <= start {
+                    return Ok(Value::string(JsString::intern("")));
+                }
+
+                // Use intern_utf16 to preserve lone surrogates (e.g. substr(1)
+                // on '\ud834\udf06' must return the lone low surrogate '\udf06').
+                // from_utf16_lossy would replace lone surrogates with U+FFFD.
+                Ok(Value::string(JsString::intern_utf16(&utf16[start..end])))
+            },
+            mm.clone(),
+            fn_proto,
+        );
+        if let Some(obj) = func.as_object() {
+            obj.define_property(
+                PropertyKey::string("name"),
+                PropertyDescriptor::function_length(Value::string(JsString::intern("substr"))),
+            );
+            obj.define_property(
+                PropertyKey::string("length"),
+                PropertyDescriptor::function_length(Value::number(2.0)),
+            );
+        }
+        string_proto.define_property(
+            PropertyKey::string("substr"),
+            PropertyDescriptor::builtin_method(func),
+        );
+    }
+
+    // ========================================================================
+    // Annex B: String.prototype HTML wrapper methods (§B.2.3.2)
+    // All follow the CreateHTML abstract operation:
+    //   1. RequireObjectCoercible(this)  → TypeError for null/undefined
+    //   2. ToString(this)               → calls toString(), propagates errors
+    //   3. Return "<tag>" + S + "</tag>"
+    // ========================================================================
+
+    // No-argument methods (length = 0)
+    {
+        let func = Value::native_function_with_proto(
+            |this_val, _args, ncx| {
+                if this_val.is_null() || this_val.is_undefined() {
+                    return Err(VmError::type_error("String.prototype.big called on null or undefined"));
+                }
+                let s = ncx.to_string_value(this_val)?;
+                Ok(Value::string(JsString::intern(&format!("<big>{s}</big>"))))
+            },
+            mm.clone(),
+            fn_proto,
+        );
+        if let Some(obj) = func.as_object() {
+            obj.define_property(PropertyKey::string("name"), PropertyDescriptor::function_length(Value::string(JsString::intern("big"))));
+            obj.define_property(PropertyKey::string("length"), PropertyDescriptor::function_length(Value::number(0.0)));
+        }
+        string_proto.define_property(PropertyKey::string("big"), PropertyDescriptor::builtin_method(func));
+    }
+
+    {
+        let func = Value::native_function_with_proto(
+            |this_val, _args, ncx| {
+                if this_val.is_null() || this_val.is_undefined() {
+                    return Err(VmError::type_error("String.prototype.blink called on null or undefined"));
+                }
+                let s = ncx.to_string_value(this_val)?;
+                Ok(Value::string(JsString::intern(&format!("<blink>{s}</blink>"))))
+            },
+            mm.clone(),
+            fn_proto,
+        );
+        if let Some(obj) = func.as_object() {
+            obj.define_property(PropertyKey::string("name"), PropertyDescriptor::function_length(Value::string(JsString::intern("blink"))));
+            obj.define_property(PropertyKey::string("length"), PropertyDescriptor::function_length(Value::number(0.0)));
+        }
+        string_proto.define_property(PropertyKey::string("blink"), PropertyDescriptor::builtin_method(func));
+    }
+
+    {
+        let func = Value::native_function_with_proto(
+            |this_val, _args, ncx| {
+                if this_val.is_null() || this_val.is_undefined() {
+                    return Err(VmError::type_error("String.prototype.bold called on null or undefined"));
+                }
+                let s = ncx.to_string_value(this_val)?;
+                Ok(Value::string(JsString::intern(&format!("<b>{s}</b>"))))
+            },
+            mm.clone(),
+            fn_proto,
+        );
+        if let Some(obj) = func.as_object() {
+            obj.define_property(PropertyKey::string("name"), PropertyDescriptor::function_length(Value::string(JsString::intern("bold"))));
+            obj.define_property(PropertyKey::string("length"), PropertyDescriptor::function_length(Value::number(0.0)));
+        }
+        string_proto.define_property(PropertyKey::string("bold"), PropertyDescriptor::builtin_method(func));
+    }
+
+    {
+        let func = Value::native_function_with_proto(
+            |this_val, _args, ncx| {
+                if this_val.is_null() || this_val.is_undefined() {
+                    return Err(VmError::type_error("String.prototype.fixed called on null or undefined"));
+                }
+                let s = ncx.to_string_value(this_val)?;
+                Ok(Value::string(JsString::intern(&format!("<tt>{s}</tt>"))))
+            },
+            mm.clone(),
+            fn_proto,
+        );
+        if let Some(obj) = func.as_object() {
+            obj.define_property(PropertyKey::string("name"), PropertyDescriptor::function_length(Value::string(JsString::intern("fixed"))));
+            obj.define_property(PropertyKey::string("length"), PropertyDescriptor::function_length(Value::number(0.0)));
+        }
+        string_proto.define_property(PropertyKey::string("fixed"), PropertyDescriptor::builtin_method(func));
+    }
+
+    {
+        let func = Value::native_function_with_proto(
+            |this_val, _args, ncx| {
+                if this_val.is_null() || this_val.is_undefined() {
+                    return Err(VmError::type_error("String.prototype.italics called on null or undefined"));
+                }
+                let s = ncx.to_string_value(this_val)?;
+                Ok(Value::string(JsString::intern(&format!("<i>{s}</i>"))))
+            },
+            mm.clone(),
+            fn_proto,
+        );
+        if let Some(obj) = func.as_object() {
+            obj.define_property(PropertyKey::string("name"), PropertyDescriptor::function_length(Value::string(JsString::intern("italics"))));
+            obj.define_property(PropertyKey::string("length"), PropertyDescriptor::function_length(Value::number(0.0)));
+        }
+        string_proto.define_property(PropertyKey::string("italics"), PropertyDescriptor::builtin_method(func));
+    }
+
+    {
+        let func = Value::native_function_with_proto(
+            |this_val, _args, ncx| {
+                if this_val.is_null() || this_val.is_undefined() {
+                    return Err(VmError::type_error("String.prototype.small called on null or undefined"));
+                }
+                let s = ncx.to_string_value(this_val)?;
+                Ok(Value::string(JsString::intern(&format!("<small>{s}</small>"))))
+            },
+            mm.clone(),
+            fn_proto,
+        );
+        if let Some(obj) = func.as_object() {
+            obj.define_property(PropertyKey::string("name"), PropertyDescriptor::function_length(Value::string(JsString::intern("small"))));
+            obj.define_property(PropertyKey::string("length"), PropertyDescriptor::function_length(Value::number(0.0)));
+        }
+        string_proto.define_property(PropertyKey::string("small"), PropertyDescriptor::builtin_method(func));
+    }
+
+    {
+        let func = Value::native_function_with_proto(
+            |this_val, _args, ncx| {
+                if this_val.is_null() || this_val.is_undefined() {
+                    return Err(VmError::type_error("String.prototype.strike called on null or undefined"));
+                }
+                let s = ncx.to_string_value(this_val)?;
+                Ok(Value::string(JsString::intern(&format!("<strike>{s}</strike>"))))
+            },
+            mm.clone(),
+            fn_proto,
+        );
+        if let Some(obj) = func.as_object() {
+            obj.define_property(PropertyKey::string("name"), PropertyDescriptor::function_length(Value::string(JsString::intern("strike"))));
+            obj.define_property(PropertyKey::string("length"), PropertyDescriptor::function_length(Value::number(0.0)));
+        }
+        string_proto.define_property(PropertyKey::string("strike"), PropertyDescriptor::builtin_method(func));
+    }
+
+    {
+        let func = Value::native_function_with_proto(
+            |this_val, _args, ncx| {
+                if this_val.is_null() || this_val.is_undefined() {
+                    return Err(VmError::type_error("String.prototype.sub called on null or undefined"));
+                }
+                let s = ncx.to_string_value(this_val)?;
+                Ok(Value::string(JsString::intern(&format!("<sub>{s}</sub>"))))
+            },
+            mm.clone(),
+            fn_proto,
+        );
+        if let Some(obj) = func.as_object() {
+            obj.define_property(PropertyKey::string("name"), PropertyDescriptor::function_length(Value::string(JsString::intern("sub"))));
+            obj.define_property(PropertyKey::string("length"), PropertyDescriptor::function_length(Value::number(0.0)));
+        }
+        string_proto.define_property(PropertyKey::string("sub"), PropertyDescriptor::builtin_method(func));
+    }
+
+    {
+        let func = Value::native_function_with_proto(
+            |this_val, _args, ncx| {
+                if this_val.is_null() || this_val.is_undefined() {
+                    return Err(VmError::type_error("String.prototype.sup called on null or undefined"));
+                }
+                let s = ncx.to_string_value(this_val)?;
+                Ok(Value::string(JsString::intern(&format!("<sup>{s}</sup>"))))
+            },
+            mm.clone(),
+            fn_proto,
+        );
+        if let Some(obj) = func.as_object() {
+            obj.define_property(PropertyKey::string("name"), PropertyDescriptor::function_length(Value::string(JsString::intern("sup"))));
+            obj.define_property(PropertyKey::string("length"), PropertyDescriptor::function_length(Value::number(0.0)));
+        }
+        string_proto.define_property(PropertyKey::string("sup"), PropertyDescriptor::builtin_method(func));
+    }
+
+    // Methods with one attribute argument (length = 1) — attribute value has " escaped to &quot;
+    {
+        let func = Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                if this_val.is_null() || this_val.is_undefined() {
+                    return Err(VmError::type_error("String.prototype.anchor called on null or undefined"));
+                }
+                let s = ncx.to_string_value(this_val)?;
+                let name_val = args.first().cloned().unwrap_or(Value::undefined());
+                let name = ncx.to_string_value(&name_val)?;
+                let escaped = name.replace('"', "&quot;");
+                Ok(Value::string(JsString::intern(&format!("<a name=\"{escaped}\">{s}</a>"))))
+            },
+            mm.clone(),
+            fn_proto,
+        );
+        if let Some(obj) = func.as_object() {
+            obj.define_property(PropertyKey::string("name"), PropertyDescriptor::function_length(Value::string(JsString::intern("anchor"))));
+            obj.define_property(PropertyKey::string("length"), PropertyDescriptor::function_length(Value::number(1.0)));
+        }
+        string_proto.define_property(PropertyKey::string("anchor"), PropertyDescriptor::builtin_method(func));
+    }
+
+    {
+        let func = Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                if this_val.is_null() || this_val.is_undefined() {
+                    return Err(VmError::type_error("String.prototype.fontcolor called on null or undefined"));
+                }
+                let s = ncx.to_string_value(this_val)?;
+                let color_val = args.first().cloned().unwrap_or(Value::undefined());
+                let color = ncx.to_string_value(&color_val)?;
+                let escaped = color.replace('"', "&quot;");
+                Ok(Value::string(JsString::intern(&format!("<font color=\"{escaped}\">{s}</font>"))))
+            },
+            mm.clone(),
+            fn_proto,
+        );
+        if let Some(obj) = func.as_object() {
+            obj.define_property(PropertyKey::string("name"), PropertyDescriptor::function_length(Value::string(JsString::intern("fontcolor"))));
+            obj.define_property(PropertyKey::string("length"), PropertyDescriptor::function_length(Value::number(1.0)));
+        }
+        string_proto.define_property(PropertyKey::string("fontcolor"), PropertyDescriptor::builtin_method(func));
+    }
+
+    {
+        let func = Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                if this_val.is_null() || this_val.is_undefined() {
+                    return Err(VmError::type_error("String.prototype.fontsize called on null or undefined"));
+                }
+                let s = ncx.to_string_value(this_val)?;
+                let size_val = args.first().cloned().unwrap_or(Value::undefined());
+                let size = ncx.to_string_value(&size_val)?;
+                let escaped = size.replace('"', "&quot;");
+                Ok(Value::string(JsString::intern(&format!("<font size=\"{escaped}\">{s}</font>"))))
+            },
+            mm.clone(),
+            fn_proto,
+        );
+        if let Some(obj) = func.as_object() {
+            obj.define_property(PropertyKey::string("name"), PropertyDescriptor::function_length(Value::string(JsString::intern("fontsize"))));
+            obj.define_property(PropertyKey::string("length"), PropertyDescriptor::function_length(Value::number(1.0)));
+        }
+        string_proto.define_property(PropertyKey::string("fontsize"), PropertyDescriptor::builtin_method(func));
+    }
+
+    {
+        let func = Value::native_function_with_proto(
+            |this_val, args, ncx| {
+                if this_val.is_null() || this_val.is_undefined() {
+                    return Err(VmError::type_error("String.prototype.link called on null or undefined"));
+                }
+                let s = ncx.to_string_value(this_val)?;
+                let href_val = args.first().cloned().unwrap_or(Value::undefined());
+                let href = ncx.to_string_value(&href_val)?;
+                let escaped = href.replace('"', "&quot;");
+                Ok(Value::string(JsString::intern(&format!("<a href=\"{escaped}\">{s}</a>"))))
+            },
+            mm.clone(),
+            fn_proto,
+        );
+        if let Some(obj) = func.as_object() {
+            obj.define_property(PropertyKey::string("name"), PropertyDescriptor::function_length(Value::string(JsString::intern("link"))));
+            obj.define_property(PropertyKey::string("length"), PropertyDescriptor::function_length(Value::number(1.0)));
+        }
+        string_proto.define_property(PropertyKey::string("link"), PropertyDescriptor::builtin_method(func));
+    }
 
     // String.prototype[Symbol.iterator]
     let iter_proto_for_symbol = string_iterator_proto;

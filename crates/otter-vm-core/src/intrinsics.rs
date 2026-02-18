@@ -740,14 +740,47 @@ impl Intrinsics {
         {
             use crate::object::{PropertyAttributes, PropertyDescriptor, PropertyKey};
             use crate::string::JsString;
+            // Helper: create iterator result with Object.prototype
+            fn create_string_iter_result(
+                value: Value,
+                done: bool,
+                ncx: &mut crate::context::NativeContext<'_>,
+            ) -> Value {
+                let proto = ncx
+                    .global()
+                    .get(&PropertyKey::string("Object"))
+                    .and_then(|o| {
+                        o.as_object()
+                            .or_else(|| o.native_function_object())
+                    })
+                    .and_then(|o| o.get(&PropertyKey::string("prototype")))
+                    .and_then(|v| v.as_object())
+                    .map(Value::object)
+                    .unwrap_or(Value::null());
+                let result = GcRef::new(JsObject::new(proto, ncx.memory_manager().clone()));
+                let _ = result.set(PropertyKey::string("value"), value);
+                let _ = result.set(PropertyKey::string("done"), Value::boolean(done));
+                Value::object(result)
+            }
+
             // next() method
             self.string_iterator_prototype.define_property(
                 PropertyKey::string("next"),
-                PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
                     |this_val, _args, ncx| {
                         let iter_obj = this_val
                             .as_object()
                             .ok_or_else(|| VmError::type_error("not an iterator object"))?;
+
+                        // Check if iterator is already done
+                        if iter_obj
+                            .get(&PropertyKey::string("__iter_done__"))
+                            .and_then(|v| v.as_boolean())
+                            .unwrap_or(false)
+                        {
+                            return Ok(create_string_iter_result(Value::undefined(), true, ncx));
+                        }
+
                         let string = iter_obj
                             .get(&PropertyKey::string("__string_ref__"))
                             .and_then(|v| v.as_string())
@@ -761,13 +794,11 @@ impl Intrinsics {
                         let len = units.len();
 
                         if idx >= len {
-                            let result = GcRef::new(JsObject::new(
-                                Value::null(),
-                                ncx.memory_manager().clone(),
-                            ));
-                            let _ = result.set(PropertyKey::string("value"), Value::undefined());
-                            let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
-                            return Ok(Value::object(result));
+                            let _ = iter_obj.set(
+                                PropertyKey::string("__iter_done__"),
+                                Value::boolean(true),
+                            );
+                            return Ok(create_string_iter_result(Value::undefined(), true, ncx));
                         }
 
                         let first = units[idx];
@@ -790,15 +821,12 @@ impl Intrinsics {
                             Value::number(next_idx as f64),
                         );
 
-                        let result =
-                            GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                        let _ =
-                            result.set(PropertyKey::string("value"), Value::string(char_string));
-                        let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
-                        Ok(Value::object(result))
+                        Ok(create_string_iter_result(Value::string(char_string), false, ncx))
                     },
                     mm.clone(),
                     fn_proto,
+                    "next",
+                    0,
                 )),
             );
             // Symbol.toStringTag
@@ -826,14 +854,48 @@ impl Intrinsics {
         {
             use crate::object::{PropertyAttributes, PropertyDescriptor, PropertyKey};
             use crate::string::JsString;
+            // Helper: create iterator result with Object.prototype
+            fn create_iter_result(
+                value: Value,
+                done: bool,
+                ncx: &mut crate::context::NativeContext<'_>,
+            ) -> Value {
+                // Get Object.prototype for iterator results
+                let proto = ncx
+                    .global()
+                    .get(&PropertyKey::string("Object"))
+                    .and_then(|o| {
+                        o.as_object()
+                            .or_else(|| o.native_function_object())
+                    })
+                    .and_then(|o| o.get(&PropertyKey::string("prototype")))
+                    .and_then(|v| v.as_object())
+                    .map(Value::object)
+                    .unwrap_or(Value::null());
+                let result = GcRef::new(JsObject::new(proto, ncx.memory_manager().clone()));
+                let _ = result.set(PropertyKey::string("value"), value);
+                let _ = result.set(PropertyKey::string("done"), Value::boolean(done));
+                Value::object(result)
+            }
+
             // next() method
             self.array_iterator_prototype.define_property(
                 PropertyKey::string("next"),
-                PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
                     |this_val, _args, ncx| {
                         let iter_obj = this_val
                             .as_object()
                             .ok_or_else(|| VmError::type_error("not an iterator object"))?;
+
+                        // Check if iterator is already done (§23.1.5.1 step 3)
+                        if iter_obj
+                            .get(&PropertyKey::string("__iter_done__"))
+                            .map(|v| v.to_boolean())
+                            .unwrap_or(false)
+                        {
+                            return Ok(create_iter_result(Value::undefined(), true, ncx));
+                        }
+
                         let arr_val = iter_obj
                             .get(&PropertyKey::string("__array_ref__"))
                             .ok_or_else(|| VmError::type_error("iterator: missing array ref"))?;
@@ -865,13 +927,12 @@ impl Intrinsics {
                             .unwrap_or_else(|| "value".to_string());
 
                         if idx >= len {
-                            let result = GcRef::new(JsObject::new(
-                                Value::null(),
-                                ncx.memory_manager().clone(),
-                            ));
-                            let _ = result.set(PropertyKey::string("value"), Value::undefined());
-                            let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
-                            return Ok(Value::object(result));
+                            // Mark as permanently done
+                            let _ = iter_obj.set(
+                                PropertyKey::string("__iter_done__"),
+                                Value::boolean(true),
+                            );
+                            return Ok(create_iter_result(Value::undefined(), true, ncx));
                         }
 
                         let _ = iter_obj.set(
@@ -879,13 +940,8 @@ impl Intrinsics {
                             Value::number((idx + 1) as f64),
                         );
 
-                        let result =
-                            GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                        match kind.as_str() {
-                            "key" => {
-                                let _ = result
-                                    .set(PropertyKey::string("value"), Value::number(idx as f64));
-                            }
+                        let value = match kind.as_str() {
+                            "key" => Value::number(idx as f64),
                             "entry" => {
                                 let entry =
                                     GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
@@ -908,12 +964,11 @@ impl Intrinsics {
                                     Value::undefined()
                                 };
                                 let _ = entry.set(PropertyKey::Index(1), elem_val);
-                                let _ =
-                                    result.set(PropertyKey::string("value"), Value::array(entry));
+                                Value::array(entry)
                             }
                             _ => {
                                 // "value" kind
-                                let elem_val = if let Some(proxy) = arr_val.as_proxy() {
+                                if let Some(proxy) = arr_val.as_proxy() {
                                     let key = PropertyKey::Index(idx as u32);
                                     let key_value = Value::number(idx as f64);
                                     crate::proxy_operations::proxy_get(
@@ -929,15 +984,15 @@ impl Intrinsics {
                                         .unwrap_or(Value::undefined())
                                 } else {
                                     Value::undefined()
-                                };
-                                let _ = result.set(PropertyKey::string("value"), elem_val);
+                                }
                             }
-                        }
-                        let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
-                        Ok(Value::object(result))
+                        };
+                        Ok(create_iter_result(value, false, ncx))
                     },
                     mm.clone(),
                     fn_proto,
+                    "next",
+                    0,
                 )),
             );
             // Symbol.toStringTag

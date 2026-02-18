@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::panic::AssertUnwindSafe;
@@ -24,7 +25,9 @@ pub struct Test262Runner {
     /// Filter pattern
     filter: Option<String>,
     /// Features to skip
-    skip_features: Vec<String>,
+    skip_features: HashSet<String>,
+    /// Cached harness file contents (filename -> content)
+    harness_cache: HashMap<String, String>,
     /// Shared harness state for capturing async test results
     harness_state: TestHarnessState,
     /// Reusable engine (Option to allow safe drop-before-reset in post-panic rebuild)
@@ -119,10 +122,27 @@ impl Test262Runner {
             });
         }
 
+        // Pre-cache all harness files
+        let harness_dir = test_dir.as_ref().join("harness");
+        let mut harness_cache = HashMap::new();
+        if let Ok(entries) = fs::read_dir(&harness_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map(|e| e == "js").unwrap_or(false) {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if let Ok(content) = fs::read_to_string(&path) {
+                            harness_cache.insert(name.to_string(), content);
+                        }
+                    }
+                }
+            }
+        }
+
         Self {
             test_dir: test_dir.as_ref().to_path_buf(),
             filter: None,
-            skip_features: Vec::new(),
+            skip_features: HashSet::new(),
+            harness_cache,
             harness_state,
             engine: Some(engine),
             dump_on_timeout,
@@ -139,17 +159,45 @@ impl Test262Runner {
     /// Rebuild engine after a panic to restore consistent state.
     ///
     /// Only called after a panic — normal test runs reuse the same engine.
-    /// Uses Option to safely drop the old engine before resetting GC,
-    /// avoiding the dangling-GcRef crash.
     fn rebuild_engine(&mut self) {
-        // Phase 1: Drop old engine cleanly (dealloc flag guards VmContext::Drop).
-        // Setting to None ensures no live Otter holds GcRefs when we reset.
-        self.engine = None;
+        // Phase 1: Drop old engine in a panic-safe way.
+        //
+        // After a VM panic the engine's internal data structures (property maps,
+        // string table, etc.) may be left in a corrupted state.  Calling
+        // VmContext::teardown() on corrupt state can trigger a second panic which,
+        // being outside any catch_unwind boundary, would abort the process.
+        //
+        // Wrapping the drop in catch_unwind ensures any secondary panics are
+        // silenced.  The GC objects on the thread-local heap are still alive
+        // (dealloc_all is NOT called — see Phase 2 comment below).
+        let old_engine = self.engine.take();
+        if let Err(_) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(old_engine);
+        })) {
+            // teardown panicked on corrupted state — silently ignored.
+        }
 
-        // Phase 2: Now that Rust-side references are gone, wipe all GC memory.
-        Otter::reset_gc();
-
-        // Phase 3: Build the real engine from scratch on a clean GC heap.
+        // Phase 2: Create a fresh engine WITHOUT clearing the string intern table.
+        //
+        // We must NOT call clear_global_string_table() nor dealloc_all() here:
+        //
+        // * dealloc_all() would free GC memory while `well_known` thread-local
+        //   statics (LENGTH, PROTOTYPE, …) still hold GcRef<JsString> pointers
+        //   to those objects → dangling pointers → SIGSEGV.
+        //
+        // * clear_global_string_table() removes the old strings from the intern
+        //   table.  The new engine would then intern fresh copies.  The
+        //   well_known statics still point at the OLD copies.  On the next GC
+        //   cycle the old copies are unreachable from any root → freed →
+        //   well_known statics dangle → SIGSEGV.
+        //
+        // The correct approach: keep the STRING_TABLE intact.  The new engine
+        // calls JsString::intern("length") etc. during intrinsics setup, finds
+        // the existing entries in the table, and reuses those same GcRefs that
+        // the well_known statics hold.  The GC keeps those strings alive because
+        // they are reachable through the new engine's property maps.  The
+        // prune_dead_string_table_entries hook then evicts only truly unreachable
+        // entries on subsequent GC cycles.
         let (harness_ext, harness_state) = crate::harness::create_harness_extension_with_state();
         let mut engine = EngineBuilder::new().extension(harness_ext).build();
 
@@ -198,13 +246,13 @@ impl Test262Runner {
 
     /// Replace the skip features list entirely
     pub fn with_skip_features(mut self, features: Vec<String>) -> Self {
-        self.skip_features = features;
+        self.skip_features = features.into_iter().collect();
         self
     }
 
     /// Add feature to skip list
     pub fn skip_feature(mut self, feature: impl Into<String>) -> Self {
-        self.skip_features.push(feature.into());
+        self.skip_features.insert(feature.into());
         self
     }
 
@@ -390,21 +438,16 @@ impl Test262Runner {
             }
         }
 
-        // Add harness files to source
+        // Add harness files to source (from cache)
         for include in &includes {
-            let harness_path = self.test_dir.join("harness").join(include);
-            match fs::read_to_string(&harness_path) {
-                Ok(harness_content) => {
-                    test_source.push_str(&harness_content);
-                    test_source.push('\n');
-                }
-                Err(e) => {
-                    eprintln!(
-                        "ERROR: Failed to read harness file {} (required by test): {}",
-                        harness_path.display(),
-                        e
-                    );
-                }
+            if let Some(harness_content) = self.harness_cache.get(include) {
+                test_source.push_str(harness_content);
+                test_source.push('\n');
+            } else {
+                eprintln!(
+                    "ERROR: Harness file '{}' not found in cache (required by test)",
+                    include
+                );
             }
         }
 
@@ -762,8 +805,11 @@ impl Test262Runner {
             Ok(val) => val,
             Err(panic) => {
                 let msg = extract_panic_message(&panic);
-                // Engine state may be corrupted after a panic — rebuild it.
-                self.rebuild_engine();
+                // Report the crash and keep going — do NOT rebuild the engine.
+                // Rebuilding masks the real bug and complicates debugging.
+                // The engine state may be corrupted; subsequent tests on this
+                // worker will likely also panic/crash, which is expected and
+                // acceptable for a debug session.
                 Err(OtterError::Runtime(format!("VM panic: {}", msg)))
             }
         }

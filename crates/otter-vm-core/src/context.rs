@@ -66,6 +66,13 @@ impl<'a> NativeContext<'a> {
         self.is_construct
     }
 
+    /// Check if the VM has been interrupted (e.g. by a timeout watchdog).
+    /// Native methods with loops should call this periodically and return
+    /// an error if true, so the cooperative timeout actually works.
+    pub fn is_interrupted(&self) -> bool {
+        self.ctx.is_interrupted()
+    }
+
     /// Call a JavaScript function (closure or native) with full VM context.
     ///
     /// This is the key method that eliminates the need for interception signals.
@@ -1985,10 +1992,15 @@ impl VmContext {
         let ephemeron_tables = self.collect_ephemeron_tables();
 
         let reclaimed = if ephemeron_tables.is_empty() {
-            otter_vm_gc::global_registry().collect(&roots)
+            otter_vm_gc::global_registry()
+                .collect_with_pre_sweep_hook(&roots, crate::string::prune_dead_string_table_entries)
         } else {
             let table_refs: Vec<_> = ephemeron_tables.iter().map(|t| t.as_ref()).collect();
-            otter_vm_gc::global_registry().collect_with_ephemerons(&roots, &table_refs)
+            otter_vm_gc::global_registry().collect_with_ephemerons_and_pre_sweep_hook(
+                &roots,
+                &table_refs,
+                crate::string::prune_dead_string_table_entries,
+            )
         };
 
         // Update memory manager with post-GC state
@@ -2099,7 +2111,9 @@ impl VmContext {
         if registry.is_marking() {
             let done = registry.incremental_mark_step(MARKING_BUDGET);
             if done {
-                let _reclaimed = registry.finish_gc();
+                let _reclaimed = registry.finish_gc_with_pre_sweep_hook(
+                    crate::string::prune_dead_string_table_entries,
+                );
                 let live_bytes = registry.total_bytes();
                 self.memory_manager.on_gc_complete(live_bytes);
             }
@@ -2117,14 +2131,20 @@ impl VmContext {
                 // Do first step immediately
                 let done = registry.incremental_mark_step(MARKING_BUDGET);
                 if done {
-                    let _reclaimed = registry.finish_gc();
+                    let _reclaimed = registry.finish_gc_with_pre_sweep_hook(
+                        crate::string::prune_dead_string_table_entries,
+                    );
                     let live_bytes = registry.total_bytes();
                     self.memory_manager.on_gc_complete(live_bytes);
                 }
             } else {
                 // Ephemerons: full STW (fixpoint needs complete worklist)
                 let table_refs: Vec<_> = ephemeron_tables.iter().map(|t| t.as_ref()).collect();
-                registry.collect_with_ephemerons(&roots, &table_refs);
+                registry.collect_with_ephemerons_and_pre_sweep_hook(
+                    &roots,
+                    &table_refs,
+                    crate::string::prune_dead_string_table_entries,
+                );
                 let live_bytes = registry.total_bytes();
                 self.memory_manager.on_gc_complete(live_bytes);
             }
@@ -2188,6 +2208,18 @@ impl VmContext {
             }
             // This value
             frame.this_value.trace(&mut |header| roots.push(header));
+            // Home object (for super calls)
+            if let Some(ho) = &frame.home_object {
+                roots.push(ho.header() as *const _);
+            }
+            // New target proto (for constructor chains)
+            if let Some(ntp) = &frame.new_target_proto {
+                roots.push(ntp.header() as *const _);
+            }
+            // Callee value (for arguments.callee)
+            if let Some(cv) = &frame.callee_value {
+                cv.trace(&mut |header| roots.push(header));
+            }
         }
 
         // Add root slots (HandleScope roots)
@@ -2210,6 +2242,26 @@ impl VmContext {
             this.trace(&mut |header| roots.push(header));
         }
 
+        // Add pending home object
+        if let Some(ho) = &self.pending_home_object {
+            roots.push(ho.header() as *const _);
+        }
+
+        // Add pending new target proto
+        if let Some(ntp) = &self.pending_new_target_proto {
+            roots.push(ntp.header() as *const _);
+        }
+
+        // Add pending callee value
+        if let Some(cv) = &self.pending_callee_value {
+            cv.trace(&mut |header| roots.push(header));
+        }
+
+        // Add pending upvalues
+        for cell in self.pending_upvalues.iter() {
+            cell.get().trace(&mut |header| roots.push(header));
+        }
+
         // Add cached template objects
         for template_obj in self.template_cache.values() {
             roots.push(template_obj.header() as *const _);
@@ -2229,9 +2281,12 @@ impl VmContext {
         self.symbol_registry
             .trace_roots(&mut |header| roots.push(header));
 
-        // Add global string intern table
-        // Interned strings are used by Shape property keys and must survive GC
-        crate::string::trace_global_string_table(&mut |header| roots.push(header));
+        // NOTE: The global string intern table is NOT added as a root here.
+        // Instead, `prune_dead_string_table_entries()` is called as a pre-sweep
+        // hook (see `collect_garbage` / `maybe_collect_garbage`).  This implements
+        // weak-ref interning: strings survive only while referenced by live GC
+        // objects; unreachable interned strings are pruned before sweep and then
+        // freed by the sweeper.  This prevents monotonic STRING_TABLE growth.
 
         roots
     }

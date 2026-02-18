@@ -86,28 +86,29 @@ check-project project:
 # === Test262 Conformance Tests ===
 
 # Run Test262 tests (all). Pass extra args: just test262 --filter foo -vv
+# Always writes a JSONL result log to test262_results/run.jsonl
 test262 *args:
-    cargo run -p otter-test262 --bin test262 -- run {{args}}
+    cargo run --profile test262 -p otter-test262 --bin test262 -- run --log test262_results/run.jsonl {{args}}
 
 # Run Test262 tests with filter (e.g., "literals")
 test262-filter filter:
-    cargo run -p otter-test262 --bin test262 -- run --filter {{filter}} -vv
+    cargo run --profile test262 -p otter-test262 --bin test262 -- run --filter {{filter}} -vv --log test262_results/run.jsonl
 
 # Run Test262 for specific directory (e.g., "language/expressions")
 test262-dir dir:
-    cargo run -p otter-test262 --bin test262 -- run --subdir {{dir}} -vv
+    cargo run --profile test262 -p otter-test262 --bin test262 -- run --subdir {{dir}} -vv --log test262_results/run.jsonl
 
 # List Test262 tests (with optional filter)
 test262-list filter="":
-    cargo run -p otter-test262 -- run --list-only {{ if filter != "" { "--filter " + filter } else { "" } }}
+    cargo run --profile test262 -p otter-test262 -- run --list-only {{ if filter != "" { "--filter " + filter } else { "" } }}
 
 # Run Test262 tests and save results to JSON
 test262-save *args:
-    cargo run -p otter-test262 --bin test262 -- run --save {{args}}
+    cargo run -p otter-test262 --bin test262 -- run --save --log test262_results/run.jsonl {{args}}
 
 # Compare two saved Test262 result files
 test262-compare base new:
-    cargo run -p otter-test262 --bin test262 -- compare --base {{base}} --current {{new}}
+    cargo run --profile test262 -p otter-test262 --bin test262 -- compare --base {{base}} --current {{new}}
 
 # Run full test262 in crash-safe batches, merge results, generate conformance doc
 test262-full *args:
@@ -115,11 +116,11 @@ test262-full *args:
 
 # Generate ES_CONFORMANCE.md from latest test262 results
 test262-conformance:
-    cargo run -p otter-test262 --bin gen-conformance
+    cargo run --profile test262 -p otter-test262 --bin gen-conformance
 
 # Run Test262 with TOML config override
 test262-config config *args:
-    cargo run -p otter-test262 --bin test262 -- run --config {{config}} {{args}}
+    cargo run --profile test262 -p otter-test262 --bin test262 -- run --config {{config}} {{args}}
 
 # === Node.js Compatibility Tests ===
 

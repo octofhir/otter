@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::editions;
 use crate::metadata::ExecutionMode;
 use crate::runner::{TestOutcome, TestResult};
 
@@ -179,6 +180,125 @@ impl PersistedReport {
         let content = std::fs::read_to_string(path)?;
         serde_json::from_str(&content)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RunSummary — streaming accumulator used by both sequential and parallel paths
+// ---------------------------------------------------------------------------
+
+/// Streaming accumulator for test run results.
+///
+/// Collects results incrementally as tests complete — suitable for both the
+/// sequential runner loop and the parallel worker result collector.
+pub struct RunSummary {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub timeout: usize,
+    pub crashed: usize,
+    pub by_feature: HashMap<String, FeatureReport>,
+    pub by_edition: HashMap<editions::EsEdition, editions::EditionReport>,
+    pub failures: Vec<FailureInfo>,
+    pub all_results: Vec<TestResult>,
+    pub max_failures: usize,
+}
+
+impl RunSummary {
+    pub fn new(max_failures: usize) -> Self {
+        Self {
+            total: 0,
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            timeout: 0,
+            crashed: 0,
+            by_feature: HashMap::new(),
+            by_edition: HashMap::new(),
+            failures: Vec::new(),
+            all_results: Vec::new(),
+            max_failures,
+        }
+    }
+
+    pub fn record(&mut self, result: &TestResult, save_all: bool) {
+        self.total += 1;
+        match result.outcome {
+            TestOutcome::Pass => self.passed += 1,
+            TestOutcome::Fail => {
+                self.failed += 1;
+                if self.failures.len() < self.max_failures {
+                    self.failures.push(FailureInfo {
+                        path: result.path.clone(),
+                        mode: result.mode,
+                        error: result.error.clone().unwrap_or_default(),
+                    });
+                }
+            }
+            TestOutcome::Skip => self.skipped += 1,
+            TestOutcome::Timeout => self.timeout += 1,
+            TestOutcome::Crash => self.crashed += 1,
+        }
+
+        // Track by feature
+        for feature in &result.features {
+            let feature_report = self.by_feature.entry(feature.clone()).or_default();
+            feature_report.total += 1;
+            match result.outcome {
+                TestOutcome::Pass => feature_report.passed += 1,
+                TestOutcome::Fail => feature_report.failed += 1,
+                TestOutcome::Skip => feature_report.skipped += 1,
+                _ => {}
+            }
+
+            // Track by edition
+            let edition = editions::feature_edition(feature);
+            let edition_report = self.by_edition.entry(edition).or_default();
+            edition_report.total += 1;
+            match result.outcome {
+                TestOutcome::Pass => edition_report.passed += 1,
+                TestOutcome::Fail => edition_report.failed += 1,
+                TestOutcome::Skip => edition_report.skipped += 1,
+                _ => {}
+            }
+        }
+
+        // Tests with no features are classified as ES5
+        if result.features.is_empty() {
+            let ed = self.by_edition.entry(editions::EsEdition::ES5).or_default();
+            ed.total += 1;
+            match result.outcome {
+                TestOutcome::Pass => ed.passed += 1,
+                TestOutcome::Fail => ed.failed += 1,
+                TestOutcome::Skip => ed.skipped += 1,
+                _ => {}
+            }
+        }
+
+        if save_all {
+            self.all_results.push(result.clone());
+        }
+    }
+
+    pub fn into_report(self) -> TestReport {
+        let run_count = self.passed + self.failed + self.timeout + self.crashed;
+        let pass_rate = if run_count > 0 {
+            (self.passed as f64 / run_count as f64) * 100.0
+        } else {
+            0.0
+        };
+        TestReport {
+            total: self.total,
+            passed: self.passed,
+            failed: self.failed,
+            skipped: self.skipped,
+            timeout: self.timeout,
+            crashed: self.crashed,
+            pass_rate,
+            by_feature: self.by_feature,
+            failures: self.failures,
+        }
     }
 }
 

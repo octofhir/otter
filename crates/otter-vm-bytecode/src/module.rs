@@ -2,6 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonically increasing counter for stable module IDs.
+/// Each `Module` gets a unique ID at construction time (via `ModuleBuilder::build`).
+/// IDs start at 1; 0 is reserved as "unassigned".
+static MODULE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate the next stable module ID.
+fn next_module_id() -> u64 {
+    MODULE_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 use crate::constant::ConstantPool;
 use crate::error::{BytecodeError, Result};
@@ -109,6 +120,14 @@ pub enum TypeKind {
 /// A compiled bytecode module
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Module {
+    /// Stable unique ID assigned at construction time (via `ModuleBuilder::build`).
+    /// Not serialized — a fresh ID is assigned whenever a `Module` is built or
+    /// deserialized, so the same bytecode file loaded twice gets two distinct IDs.
+    /// Used to key JIT caches instead of the raw `Arc` pointer, which can be
+    /// reused after the original `Arc` is dropped.
+    #[serde(skip, default = "next_module_id")]
+    pub module_id: u64,
+
     /// Source URL/path
     pub source_url: String,
 
@@ -329,6 +348,7 @@ impl ModuleBuilder {
     /// Build the module
     pub fn build(self) -> Module {
         Module {
+            module_id: next_module_id(),
             source_url: self.source_url,
             source_hash: self.source_hash,
             constants: self.constants,

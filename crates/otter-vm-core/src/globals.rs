@@ -44,6 +44,11 @@ fn define_global_fn<F>(
         PropertyKey::string("name"),
         PropertyDescriptor::function_length(Value::string(JsString::intern(name))),
     );
+    // Built-in global functions are not constructors (ES2023 §17)
+    let _ = fn_obj.set(
+        PropertyKey::string("__non_constructor"),
+        Value::boolean(true),
+    );
     let native_fn: Arc<
         dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
             + Send

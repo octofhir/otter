@@ -418,11 +418,6 @@ impl Test262Runner {
         // Build test source with harness
         let mut test_source = String::new();
 
-        // Add strict mode prefix if needed
-        if mode == ExecutionMode::Strict {
-            test_source.push_str("\"use strict\";\n");
-        }
-
         // Add default harness files (sta.js and assert.js)
         let mut includes = vec!["sta.js".to_string(), "assert.js".to_string()];
 
@@ -438,7 +433,9 @@ impl Test262Runner {
             }
         }
 
-        // Add harness files to source (from cache)
+        // Add harness files to source (from cache) — always in sloppy mode
+        // to avoid duplicate function declaration errors (e.g. isPrimitive in
+        // both assert.js and testTypedArray.js).
         for include in &includes {
             if let Some(harness_content) = self.harness_cache.get(include) {
                 test_source.push_str(harness_content);
@@ -449,6 +446,11 @@ impl Test262Runner {
                     include
                 );
             }
+        }
+
+        // Add strict mode prefix AFTER harness files, before test content
+        if mode == ExecutionMode::Strict {
+            test_source.push_str("\"use strict\";\n");
         }
 
         // Add test content (strip metadata)

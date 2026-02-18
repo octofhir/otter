@@ -130,6 +130,24 @@ pub fn init_object_prototype(
                     "DataView"
                 } else if this_val.as_regex().is_some() {
                     "RegExp"
+                } else if this_val
+                    .as_object()
+                    .and_then(|o| o.get(&PropertyKey::string("__primitiveValue__")))
+                    .map_or(false, |v| v.is_string())
+                {
+                    "String"
+                } else if this_val
+                    .as_object()
+                    .and_then(|o| o.get(&PropertyKey::string("__primitiveValue__")))
+                    .map_or(false, |v| v.is_boolean())
+                {
+                    "Boolean"
+                } else if this_val
+                    .as_object()
+                    .and_then(|o| o.get(&PropertyKey::string("__primitiveValue__")))
+                    .map_or(false, |v| v.as_number().is_some())
+                {
+                    "Number"
                 } else {
                     "Object"
                 };
@@ -1637,6 +1655,131 @@ pub fn init_object_constructor(
                         }
                     }
                 }
+                Ok(Value::object(result))
+            },
+            mm.clone(),
+            fn_proto.clone(),
+        )),
+    );
+
+    // Object.groupBy ( items, callbackfn ) — ES2024
+    object_ctor.define_property(
+        PropertyKey::string("groupBy"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+            |_this, args, ncx| {
+                let items = args.first().cloned().unwrap_or(Value::undefined());
+                let callback = args.get(1).cloned().unwrap_or(Value::undefined());
+
+                if !callback.is_callable() {
+                    return Err(VmError::type_error(
+                        "Object.groupBy: callbackfn is not a function",
+                    ));
+                }
+
+                let mm = ncx.ctx.memory_manager().clone();
+                let result = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+
+                // Iterate items using the iterable protocol
+                let iter_sym = crate::intrinsics::well_known::iterator_symbol();
+                let iter_key = PropertyKey::Symbol(iter_sym);
+
+                let iter_fn = if let Some(obj) =
+                    items.as_object().or_else(|| items.as_array())
+                {
+                    obj.get(&iter_key).unwrap_or(Value::undefined())
+                } else if items.as_string().is_some() {
+                    ncx.ctx
+                        .get_global("String")
+                        .and_then(|v| v.as_object())
+                        .and_then(|c| c.get(&PropertyKey::string("prototype")))
+                        .and_then(|v| v.as_object())
+                        .and_then(|proto| proto.get(&iter_key))
+                        .unwrap_or(Value::undefined())
+                } else {
+                    Value::undefined()
+                };
+
+                if !iter_fn.is_callable() {
+                    return Err(VmError::type_error("object is not iterable"));
+                }
+
+                let iterator = ncx.call_function(&iter_fn, items.clone(), &[])?;
+                let iterator_obj = iterator
+                    .as_object()
+                    .ok_or_else(|| VmError::type_error("Iterator result is not an object"))?;
+                let next_fn = iterator_obj
+                    .get(&PropertyKey::string("next"))
+                    .unwrap_or(Value::undefined());
+
+                let mut k: u32 = 0;
+                loop {
+                    let iter_result = ncx.call_function(&next_fn, iterator.clone(), &[])?;
+                    let iter_obj = iter_result
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("Iterator result is not an object"))?;
+                    let done = iter_obj
+                        .get(&PropertyKey::string("done"))
+                        .unwrap_or(Value::undefined());
+                    if done.to_boolean() {
+                        break;
+                    }
+                    let value = iter_obj
+                        .get(&PropertyKey::string("value"))
+                        .unwrap_or(Value::undefined());
+
+                    let group_key = ncx.call_function(
+                        &callback,
+                        Value::undefined(),
+                        &[value.clone(), Value::number(k as f64)],
+                    )?;
+                    k += 1;
+
+                    // Convert key to property key (string)
+                    let prop_key = if let Some(s) = group_key.as_string() {
+                        PropertyKey::String(s)
+                    } else if let Some(n) = group_key.as_number() {
+                        PropertyKey::String(JsString::intern(
+                            &crate::globals::js_number_to_string(n),
+                        ))
+                    } else if group_key.is_undefined() {
+                        PropertyKey::string("undefined")
+                    } else if group_key.is_null() {
+                        PropertyKey::string("null")
+                    } else if let Some(b) = group_key.as_boolean() {
+                        PropertyKey::string(if b { "true" } else { "false" })
+                    } else if let Some(sym) = group_key.as_symbol() {
+                        PropertyKey::Symbol(sym)
+                    } else {
+                        PropertyKey::string("[object Object]")
+                    };
+
+                    if let Some(existing) = result.get(&prop_key) {
+                        if let Some(arr) = existing.as_array().or_else(|| existing.as_object()) {
+                            let len = arr
+                                .get(&PropertyKey::string("length"))
+                                .and_then(|v| v.as_number())
+                                .unwrap_or(0.0) as u32;
+                            let _ = arr.set(PropertyKey::Index(len), value);
+                            let _ =
+                                arr.set(PropertyKey::string("length"), Value::number((len + 1) as f64));
+                        }
+                    } else {
+                        let arr = JsObject::array(4, mm.clone());
+                        if let Some(array_proto) = ncx
+                            .ctx
+                            .get_global("Array")
+                            .and_then(|v| v.as_object())
+                            .and_then(|c| c.get(&PropertyKey::string("prototype")))
+                            .and_then(|v| v.as_object())
+                        {
+                            arr.set_prototype(Value::object(array_proto));
+                        }
+                        let _ = arr.set(PropertyKey::Index(0), value);
+                        let _ = arr.set(PropertyKey::string("length"), Value::number(1.0));
+                        let _ = result.set(prop_key, Value::array(GcRef::new(arr)));
+                    }
+                }
+
                 Ok(Value::object(result))
             },
             mm.clone(),

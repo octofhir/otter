@@ -220,6 +220,8 @@ pub enum Opcode {
     SetHomeObject = 0xC4,
     /// Forward all arguments from current frame to super constructor (default derived constructor)
     CallSuperForward = 0xC5,
+    /// Call super constructor with spread args array
+    CallSuperSpread = 0xC6,
 
     // ==================== Generators/Async ====================
     /// Yield value
@@ -361,6 +363,7 @@ impl Opcode {
             0xC3 => Some(Self::GetSuperProp),
             0xC4 => Some(Self::SetHomeObject),
             0xC5 => Some(Self::CallSuperForward),
+            0xC6 => Some(Self::CallSuperSpread),
 
             0xD0 => Some(Self::Yield),
             0xD1 => Some(Self::Await),
@@ -495,6 +498,7 @@ impl Opcode {
             Self::GetSuperProp => "GetSuperProp",
             Self::SetHomeObject => "SetHomeObject",
             Self::CallSuperForward => "CallSuperForward",
+            Self::CallSuperSpread => "CallSuperSpread",
             // Generators/Async
             Self::Yield => "Yield",
             Self::Await => "Await",
@@ -1057,6 +1061,12 @@ pub enum Instruction {
     /// Used for default derived constructors: constructor(...args) { super(...args); }
     CallSuperForward {
         dst: Register,
+    },
+    /// Call super constructor with spread arguments array
+    CallSuperSpread {
+        dst: Register,
+        /// Register containing the array of arguments
+        args: Register,
     },
 
     // Generators/Async

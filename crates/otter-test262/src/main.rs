@@ -45,6 +45,10 @@ struct Cli {
     #[arg(short, long, action = ArgAction::Count, global = true)]
     verbose: u8,
 
+    /// Number of tests to skip from the beginning
+    #[arg(short = 's', long, global = true)]
+    skip: Option<usize>,
+
     /// Maximum number of tests to run
     #[arg(short = 'n', long, global = true)]
     max_tests: Option<usize>,
@@ -367,12 +371,23 @@ async fn run_tests(cli: Cli) {
         runner.list_tests()
     };
 
+    if let Some(skip) = cli.skip {
+        if skip < tests.len() {
+            tests = tests.split_off(skip);
+        } else {
+            tests.clear();
+        }
+    }
+
     if let Some(max) = cli.max_tests {
         tests.truncate(max);
     }
 
     let test_count = tests.len();
     if !cli.json {
+        if let Some(skip) = cli.skip {
+            eprintln!("Skipping first {} tests", skip);
+        }
         eprintln!("Found {} test files", test_count);
     }
 

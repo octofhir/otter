@@ -1646,6 +1646,14 @@ impl JsObject {
 
     /// Delete property
     pub fn delete(&self, key: &PropertyKey) -> bool {
+        // String exotic objects: "length" property is non-configurable
+        if self.flags.borrow().is_string_exotic {
+            if let PropertyKey::String(s) = key {
+                if s.as_str() == "length" {
+                    return false;
+                }
+            }
+        }
         // For mapped arguments: unmap the index on delete
         if let PropertyKey::Index(i) = key {
             self.unmap_argument(*i as usize);
@@ -1672,9 +1680,20 @@ impl JsObject {
                 // Configurable descriptor - proceed with deletion below
             }
 
+            // String exotic objects: indexed properties within string length are non-configurable
+            let idx = *i as usize;
+            {
+                let flags = self.flags.borrow();
+                if flags.is_string_exotic {
+                    let elements = self.elements.borrow();
+                    if idx < elements.len() {
+                        return false; // Cannot delete string character indices
+                    }
+                }
+            }
+
             // Indexed element properties are non-configurable on sealed/frozen objects.
             // If the element exists as an own property, deletion must fail.
-            let idx = *i as usize;
             let element_exists = {
                 let elements = self.elements.borrow();
                 idx < elements.len() && !elements[idx].is_hole()

@@ -1026,13 +1026,13 @@ fn global_is_nan(
 fn global_parse_int(
     _this: &Value,
     args: &[Value],
-    _ncx: &mut crate::context::NativeContext<'_>,
+    ncx: &mut crate::context::NativeContext<'_>,
 ) -> Result<Value, VmError> {
     let input = get_arg(args, 0);
     let radix_arg = args.get(1);
 
-    // Convert input to string
-    let input_str = to_string(&input);
+    // Convert input to string via JS ToString (handles objects, BigInt, etc.)
+    let input_str = ncx.to_string_value(&input)?;
     let trimmed = input_str.trim();
 
     if trimmed.is_empty() {
@@ -1041,23 +1041,24 @@ fn global_parse_int(
 
     // Determine sign
     let (sign, rest) = if let Some(s) = trimmed.strip_prefix('-') {
-        (-1i64, s)
+        (-1.0f64, s)
     } else if let Some(s) = trimmed.strip_prefix('+') {
-        (1i64, s)
+        (1.0f64, s)
     } else {
-        (1i64, trimmed)
+        (1.0f64, trimmed)
     };
 
-    // Determine radix
+    // Determine radix via ToInt32 (ES spec 7.1.6)
     let mut radix: u32 = match radix_arg {
         Some(r) => {
-            let n = to_number(r) as i32;
-            if n == 0 {
+            let n = ncx.to_number_value(r)?;
+            let n_i32 = to_int32(n);
+            if n_i32 == 0 {
                 10 // default
-            } else if !(2..=36).contains(&n) {
+            } else if !(2..=36).contains(&n_i32) {
                 return Ok(Value::number(f64::NAN));
             } else {
-                n as u32
+                n_i32 as u32
             }
         }
         None => 10,
@@ -1079,34 +1080,35 @@ fn global_parse_int(
         return Ok(Value::number(f64::NAN));
     }
 
-    // Parse digits one by one until we hit an invalid character
-    let mut result: i64 = 0;
+    // Parse digits one by one until we hit an invalid character.
+    // Use f64 to handle arbitrarily large integers (matching JS behavior).
+    let mut result: f64 = 0.0;
     let mut any_valid = false;
 
     for c in digits.chars() {
         let digit = match c.to_digit(radix) {
-            Some(d) => d as i64,
+            Some(d) => d as f64,
             None => break, // Stop at first invalid character
         };
         any_valid = true;
-        result = result.saturating_mul(radix as i64).saturating_add(digit);
+        result = result * (radix as f64) + digit;
     }
 
     if !any_valid {
         return Ok(Value::number(f64::NAN));
     }
 
-    Ok(Value::number((sign * result) as f64))
+    Ok(Value::number(sign * result))
 }
 
 /// `parseFloat(string)` - Parses a string and returns a floating point number.
 fn global_parse_float(
     _this: &Value,
     args: &[Value],
-    _ncx: &mut crate::context::NativeContext<'_>,
+    ncx: &mut crate::context::NativeContext<'_>,
 ) -> Result<Value, VmError> {
     let input = get_arg(args, 0);
-    let input_str = to_string(&input);
+    let input_str = ncx.to_string_value(&input)?;
     let trimmed = input_str.trim();
 
     if trimmed.is_empty() {
@@ -1279,9 +1281,9 @@ fn decode_uri_impl(encoded: &str, preserve_reserved: bool) -> Result<Value, VmEr
 fn global_escape(
     _this: &Value,
     args: &[Value],
-    _ncx: &mut crate::context::NativeContext<'_>,
+    ncx: &mut crate::context::NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    let input = to_string(&get_arg(args, 0));
+    let input = ncx.to_string_value(&get_arg(args, 0))?;
     let mut result = String::with_capacity(input.len());
     for ch in input.encode_utf16() {
         let c = ch;
@@ -1305,9 +1307,9 @@ fn global_escape(
 fn global_unescape(
     _this: &Value,
     args: &[Value],
-    _ncx: &mut crate::context::NativeContext<'_>,
+    ncx: &mut crate::context::NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    let input = to_string(&get_arg(args, 0));
+    let input = ncx.to_string_value(&get_arg(args, 0))?;
     // Work with UTF-16 code units per spec, then convert back
     let units: Vec<u16> = input.encode_utf16().collect();
     let len = units.len();
@@ -1404,6 +1406,15 @@ fn hex_digit_u16(u: u16) -> Option<u8> {
 // =============================================================================
 
 /// Convert a Value to a number (ToNumber abstract operation)
+/// ES2023 ToInt32 abstract operation (7.1.6).
+pub fn to_int32(n: f64) -> i32 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    let i = n.trunc() as i64;
+    (i % (1_i64 << 32)) as i32
+}
+
 pub fn to_number(value: &Value) -> f64 {
     if let Some(n) = value.as_number() {
         return n;
@@ -1503,13 +1514,22 @@ pub fn js_number_to_string(n: f64) -> String {
 
     // Integer check: if no fractional part AND magnitude < 10^21
     if abs_n.fract() == 0.0 && abs_n < 1e21 {
-        // Safe to cast — all integers < 10^21 fit in i64 (max ~9.2e18) or u64
-        // Actually 10^21 > i64::MAX (~9.2e18), so use u64 for the absolute value
-        let int_val = abs_n as u64;
+        // For values that fit in u64, use integer formatting directly
+        if abs_n <= u64::MAX as f64 {
+            let int_val = abs_n as u64;
+            return if negative {
+                format!("-{}", int_val)
+            } else {
+                format!("{}", int_val)
+            };
+        }
+        // For large integers (> u64::MAX but < 1e21), format as fixed-point
+        // and strip the trailing ".0" that Rust adds
+        let s = format!("{:.0}", abs_n);
         return if negative {
-            format!("-{}", int_val)
+            format!("-{}", s)
         } else {
-            format!("{}", int_val)
+            s
         };
     }
 

@@ -131,6 +131,7 @@ fn trace_modified_register_indices(instruction: &Instruction) -> Vec<u16> {
         | Instruction::CallSuper { dst, .. }
         | Instruction::GetSuperProp { dst, .. }
         | Instruction::CallSuperForward { dst }
+        | Instruction::CallSuperSpread { dst, .. }
         | Instruction::Yield { dst, .. }
         | Instruction::Await { dst, .. }
         | Instruction::AsyncClosure { dst, .. }
@@ -4702,6 +4703,20 @@ impl Interpreter {
                     }
                 }
 
+                // @@toStringTag = "Arguments" (non-enumerable, configurable)
+                let to_string_tag_sym = crate::intrinsics::well_known::to_string_tag_symbol();
+                args_obj.define_property(
+                    PropertyKey::Symbol(to_string_tag_sym),
+                    PropertyDescriptor::data_with_attrs(
+                        Value::string(JsString::intern("Arguments")),
+                        PropertyAttributes {
+                            writable: false,
+                            enumerable: false,
+                            configurable: true,
+                        },
+                    ),
+                );
+
                 ctx.set_register(dst.0, Value::object(args_obj));
                 Ok(InstructionResult::Continue)
             }
@@ -7405,9 +7420,29 @@ impl Interpreter {
                     } else {
                         Value::undefined()
                     }
+                } else if super_ctor_val.as_native_function().is_some() {
+                    // Base case: super constructor is a native built-in (Array, RegExp, etc.)
+                    // Create object with correct prototype, then call as constructor.
+                    let new_obj =
+                        GcRef::new(JsObject::new(Value::object(new_target_proto.clone()), mm.clone()));
+                    let new_obj_value = Value::object(new_obj);
+
+                    let result =
+                        self.call_function_construct(ctx, &super_ctor_val, new_obj_value.clone(), &args)?;
+
+                    // Native constructors may return a different object (e.g., Array creates a new array).
+                    // Fix its prototype to new_target_proto for proper subclassing.
+                    let this_obj = if result.is_object() {
+                        if let Some(obj) = result.as_object() {
+                            obj.set_prototype(Value::object(new_target_proto));
+                        }
+                        result
+                    } else {
+                        new_obj_value
+                    };
+                    this_obj
                 } else {
-                    // Base case: super constructor is NOT derived.
-                    // Create the object with new_target_proto as [[Prototype]].
+                    // Base case: super constructor is a regular (non-derived) closure.
                     let new_obj =
                         GcRef::new(JsObject::new(Value::object(new_target_proto), mm.clone()));
                     let new_obj_value = Value::object(new_obj);
@@ -7489,6 +7524,23 @@ impl Interpreter {
                     } else {
                         Value::undefined()
                     }
+                } else if super_ctor_val.as_native_function().is_some() {
+                    // Native built-in constructor (Array, RegExp, etc.)
+                    let new_obj =
+                        GcRef::new(JsObject::new(Value::object(new_target_proto.clone()), mm.clone()));
+                    let new_obj_value = Value::object(new_obj);
+                    let result =
+                        self.call_function_construct(ctx, &super_ctor_val, new_obj_value.clone(), &args)?;
+                    // Fix prototype for proper subclassing
+                    let this_obj = if result.is_object() {
+                        if let Some(obj) = result.as_object() {
+                            obj.set_prototype(Value::object(new_target_proto));
+                        }
+                        result
+                    } else {
+                        new_obj_value
+                    };
+                    this_obj
                 } else {
                     let new_obj =
                         GcRef::new(JsObject::new(Value::object(new_target_proto), mm.clone()));
@@ -7500,6 +7552,99 @@ impl Interpreter {
                     } else {
                         new_obj_value
                     }
+                };
+
+                if let Some(frame) = ctx.current_frame_mut() {
+                    frame.this_value = this_value.clone();
+                    frame.this_initialized = true;
+                }
+                ctx.set_register(dst.0, this_value);
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::CallSuperSpread { dst, args } => {
+                // Like CallSuper but arguments come from a spread array
+                let spread_arr = ctx.get_register(args.0).clone();
+
+                // Extract args from the array
+                let mut call_args = Vec::new();
+                if let Some(arr_obj) = spread_arr.as_object() {
+                    let len = arr_obj
+                        .get(&PropertyKey::string("length"))
+                        .and_then(|v| v.as_int32())
+                        .unwrap_or(0) as u32;
+                    for i in 0..len {
+                        if let Some(elem) = arr_obj.get(&PropertyKey::Index(i)) {
+                            call_args.push(elem);
+                        } else {
+                            call_args.push(Value::undefined());
+                        }
+                    }
+                }
+
+                let frame = ctx
+                    .current_frame()
+                    .ok_or_else(|| VmError::internal("no frame for CallSuperSpread"))?;
+
+                let home_object = frame.home_object.clone().ok_or_else(|| {
+                    VmError::ReferenceError("'super' keyword unexpected here".to_string())
+                })?;
+                let new_target_proto = frame
+                    .new_target_proto
+                    .clone()
+                    .unwrap_or_else(|| home_object.clone());
+
+                let super_proto = home_object.prototype().as_object().ok_or_else(|| {
+                    VmError::TypeError("Super constructor is not a constructor".to_string())
+                })?;
+                let ctor_key = PropertyKey::string("constructor");
+                let super_ctor_val = super_proto.get(&ctor_key).unwrap_or_else(Value::undefined);
+                let mm = ctx.memory_manager().clone();
+
+                let super_is_derived = super_ctor_val
+                    .as_function()
+                    .and_then(|c| {
+                        c.module
+                            .function(c.function_index)
+                            .map(|f| f.flags.is_derived)
+                    })
+                    .unwrap_or(false);
+
+                let this_value = if super_is_derived {
+                    if let Some(super_closure) = super_ctor_val.as_function() {
+                        ctx.set_pending_is_derived(true);
+                        ctx.set_pending_new_target_proto(new_target_proto);
+                        let proto_key = PropertyKey::string("prototype");
+                        if let Some(proto_val) = super_closure.object.get(&proto_key) {
+                            if let Some(proto_obj) = proto_val.as_object() {
+                                ctx.set_pending_home_object(proto_obj);
+                            }
+                        }
+                    }
+                    let result =
+                        self.call_function(ctx, &super_ctor_val, Value::undefined(), &call_args)?;
+                    if result.is_object() { result } else { Value::undefined() }
+                } else if super_ctor_val.as_native_function().is_some() {
+                    let new_obj =
+                        GcRef::new(JsObject::new(Value::object(new_target_proto.clone()), mm.clone()));
+                    let new_obj_value = Value::object(new_obj);
+                    let result =
+                        self.call_function_construct(ctx, &super_ctor_val, new_obj_value.clone(), &call_args)?;
+                    if result.is_object() {
+                        if let Some(obj) = result.as_object() {
+                            obj.set_prototype(Value::object(new_target_proto));
+                        }
+                        result
+                    } else {
+                        new_obj_value
+                    }
+                } else {
+                    let new_obj =
+                        GcRef::new(JsObject::new(Value::object(new_target_proto), mm.clone()));
+                    let new_obj_value = Value::object(new_obj);
+                    let result =
+                        self.call_function(ctx, &super_ctor_val, new_obj_value.clone(), &call_args)?;
+                    if result.is_object() { result } else { new_obj_value }
                 };
 
                 if let Some(frame) = ctx.current_frame_mut() {
@@ -9187,6 +9332,11 @@ impl Interpreter {
 
         if radix != 10 {
             if digits.is_empty() {
+                return f64::NAN;
+            }
+            // Numeric separators (_) are only valid in source code literals,
+            // not in Number() string conversion (ToNumber)
+            if digits.contains('_') {
                 return f64::NAN;
             }
             if let Some(bigint) = NumBigInt::parse_bytes(digits.as_bytes(), radix) {

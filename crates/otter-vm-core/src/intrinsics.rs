@@ -680,6 +680,11 @@ impl Intrinsics {
             self.string_iterator_prototype,
             well_known::iterator_symbol(),
         );
+        // String.prototype is a String exotic object with [[StringData]] = ""
+        let _ = self.string_prototype.set(
+            PropertyKey::string("__primitiveValue__"),
+            Value::string(crate::string::JsString::intern("")),
+        );
 
         // ====================================================================
 
@@ -771,6 +776,15 @@ impl Intrinsics {
                         let iter_obj = this_val
                             .as_object()
                             .ok_or_else(|| VmError::type_error("not an iterator object"))?;
+
+                        // §22.1.5.2.1: If O does not have all internal slots of a
+                        // String Iterator Instance, throw a TypeError.
+                        // We simulate internal slots with own properties.
+                        if !iter_obj.has_own(&PropertyKey::string("__string_ref__")) {
+                            return Err(VmError::type_error(
+                                "StringIterator.prototype.next requires that 'this' be a String Iterator object",
+                            ));
+                        }
 
                         // Check if iterator is already done
                         if iter_obj
@@ -1781,7 +1795,14 @@ impl Intrinsics {
                 };
 
                 if let Some(sym) = arg.as_symbol() {
-                    symbol_to_string(&sym)
+                    // §22.1.1.1 step 2a: If NewTarget is undefined and Type(value) is Symbol,
+                    // return SymbolDescriptiveString. Otherwise fall through to ToString (which throws).
+                    if !ncx.is_construct() {
+                        symbol_to_string(&sym)
+                    } else {
+                        // new String(symbol) → ToString(symbol) → TypeError
+                        ncx.to_string_value(arg)?
+                    }
                 } else if arg.is_object() {
                     let prim = ncx.to_primitive(arg, crate::interpreter::PreferredType::String)?;
                     if let Some(sym) = prim.as_symbol() {
@@ -1813,73 +1834,52 @@ impl Intrinsics {
             Some(string_ctor_fn),
         );
 
-        // String.fromCharCode(...codeUnits)
+        // String.fromCharCode(...codeUnits) — §22.1.2.1
         string_ctor.define_property(
             PropertyKey::string("fromCharCode"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, _ncx| {
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
+                |_this, args, ncx| {
                     let mut result = String::new();
                     for arg in args {
-                        // Per ES2023 §22.1.2.1: ToUint16(ToNumber(arg))
-                        let n = if let Some(n) = arg.as_number() {
-                            n
-                        } else if let Some(i) = arg.as_int32() {
-                            i as f64
-                        } else if let Some(s) = arg.as_string() {
-                            let trimmed = s.as_str().trim();
-                            if trimmed.is_empty() {
-                                0.0
-                            } else {
-                                trimmed.parse::<f64>().unwrap_or(f64::NAN)
-                            }
-                        } else if let Some(b) = arg.as_boolean() {
-                            if b { 1.0 } else { 0.0 }
-                        } else if arg.is_null() {
-                            0.0
-                        } else {
-                            f64::NAN
-                        };
+                        let n = ncx.to_number_value(arg)?;
                         let code = if n.is_nan() || n.is_infinite() {
                             0u16
                         } else {
                             (n.trunc() as i64 as u32 & 0xFFFF) as u16
                         };
-                        if let Some(ch) = char::from_u32(code as u32) {
-                            result.push(ch);
-                        }
+                        // Push as raw UTF-16 code unit (may be lone surrogate)
+                        let s = String::from_utf16_lossy(&[code]);
+                        result.push_str(&s);
                     }
                     Ok(Value::string(JsString::intern(&result)))
                 },
                 mm.clone(),
                 fn_proto,
+                "fromCharCode",
+                1,
             )),
         );
 
-        // String.fromCodePoint(...codePoints)
+        // String.fromCodePoint(...codePoints) — §22.1.2.2
         string_ctor.define_property(
             PropertyKey::string("fromCodePoint"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, _ncx| {
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
+                |_this, args, ncx| {
                     let mut result = String::new();
                     for arg in args {
-                        let code = if let Some(n) = arg.as_number() {
-                            n as u32
-                        } else if let Some(i) = arg.as_int32() {
-                            i as u32
-                        } else {
-                            0
-                        };
-                        if code > 0x10FFFF {
-                            return Err(VmError::type_error(format!(
-                                "Invalid code point: {}",
-                                code
+                        let n = ncx.to_number_value(arg)?;
+                        if n != n.trunc() || n < 0.0 || n > 0x10FFFF as f64 || n.is_infinite() {
+                            return Err(VmError::range_error(&format!(
+                                "Invalid code point {}",
+                                n
                             )));
                         }
+                        let code = n as u32;
                         if let Some(ch) = char::from_u32(code) {
                             result.push(ch);
                         } else {
-                            return Err(VmError::type_error(format!(
-                                "Invalid code point: {}",
+                            return Err(VmError::range_error(&format!(
+                                "Invalid code point {}",
                                 code
                             )));
                         }
@@ -1888,46 +1888,95 @@ impl Intrinsics {
                 },
                 mm.clone(),
                 fn_proto,
+                "fromCodePoint",
+                1,
             )),
         );
 
         // String.raw(template, ...substitutions) — §22.1.2.4
         string_ctor.define_property(
             PropertyKey::string("raw"),
-            PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                |_this, args, _ncx| {
-                    let template = args.first().and_then(|v| v.as_object()).ok_or_else(|| {
+            PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
+                |_this, args, ncx| {
+                    // Helper to get property with getter support
+                    fn get_prop(
+                        obj: &GcRef<JsObject>,
+                        obj_val: &Value,
+                        key: &PropertyKey,
+                        ncx: &mut crate::context::NativeContext<'_>,
+                    ) -> Result<Value, VmError> {
+                        if let Some(desc) = obj.lookup_property_descriptor(key) {
+                            match desc {
+                                PropertyDescriptor::Data { value, .. } => Ok(value),
+                                PropertyDescriptor::Accessor { get, .. } => {
+                                    if let Some(getter) = get {
+                                        if !getter.is_undefined() {
+                                            return ncx.call_function(&getter, obj_val.clone(), &[]);
+                                        }
+                                    }
+                                    Ok(Value::undefined())
+                                }
+                                PropertyDescriptor::Deleted => Ok(Value::undefined()),
+                            }
+                        } else {
+                            // Check elements (for array-like objects)
+                            if let PropertyKey::Index(i) = key {
+                                let elements = obj.elements.borrow();
+                                if (*i as usize) < elements.len() {
+                                    return Ok(elements[*i as usize].clone());
+                                }
+                            }
+                            Ok(Value::undefined())
+                        }
+                    }
+
+                    // 1. Let cooked be ? ToObject(template)
+                    let template_val = args.first().cloned().unwrap_or(Value::undefined());
+                    if template_val.is_undefined() || template_val.is_null() {
+                        return Err(VmError::type_error("Cannot convert undefined or null to object"));
+                    }
+                    let template = template_val.as_object().ok_or_else(|| {
                         VmError::type_error("String.raw requires a template object")
                     })?;
-                    let raw = template
-                        .get(&PropertyKey::string("raw"))
-                        .ok_or_else(|| VmError::type_error("Template must have a raw property"))?;
-                    let raw_obj = raw
+                    // 2. Let raw be ? ToObject(? Get(cooked, "raw"))
+                    let raw_val = get_prop(&template, &template_val, &PropertyKey::string("raw"), ncx)?;
+                    if raw_val.is_undefined() || raw_val.is_null() {
+                        return Err(VmError::type_error("Cannot convert undefined or null to object"));
+                    }
+                    let raw_obj = raw_val
                         .as_object()
                         .ok_or_else(|| VmError::type_error("raw must be an object"))?;
-                    let len = raw_obj
-                        .get(&PropertyKey::string("length"))
-                        .and_then(|v| v.as_number())
-                        .unwrap_or(0.0) as usize;
+                    // 3. Let literalSegments be ? ToLength(? Get(raw, "length"))
+                    let len_val = get_prop(&raw_obj, &raw_val, &PropertyKey::string("length"), ncx)?;
+                    let len_num = ncx.to_number_value(&len_val)?;
+                    let len = if len_num.is_nan() || len_num < 0.0 {
+                        0usize
+                    } else {
+                        (len_num.min(9007199254740991.0) as usize) // 2^53 - 1
+                    };
                     if len == 0 {
                         return Ok(Value::string(JsString::intern("")));
                     }
                     let mut result = String::new();
                     for i in 0..len {
                         if i > 0 {
-                            // Insert substitution
+                            // Insert substitution (ToString)
                             if let Some(sub) = args.get(i) {
-                                result.push_str(&crate::globals::to_string(sub));
+                                let sub_str = ncx.to_string_value(sub)?;
+                                result.push_str(&sub_str);
                             }
                         }
-                        if let Some(segment) = raw_obj.get(&PropertyKey::Index(i as u32)) {
-                            result.push_str(&crate::globals::to_string(&segment));
-                        }
+                        // Get raw segment via ? Get(raw, ! ToString(nextIndex))
+                        let segment = get_prop(&raw_obj, &raw_val, &PropertyKey::Index(i as u32), ncx)?;
+                        let seg_str = ncx.to_string_value(&segment)?;
+                        result.push_str(&seg_str);
                     }
                     Ok(Value::string(JsString::intern(&result)))
                 },
                 mm.clone(),
                 fn_proto,
+                "raw",
+                1,
             )),
         );
 
@@ -2056,6 +2105,7 @@ impl Intrinsics {
         let map_ctor_fn = crate::intrinsics_impl::map_set::create_map_constructor();
         install("Map", map_ctor, self.map_prototype, Some(map_ctor_fn));
         crate::intrinsics_impl::helpers::define_species_getter(map_ctor, fn_proto, mm);
+        crate::intrinsics_impl::map_set::install_map_statics(map_ctor, fn_proto, mm);
 
         let set_ctor = alloc_ctor();
         let set_ctor_fn = crate::intrinsics_impl::map_set::create_set_constructor();

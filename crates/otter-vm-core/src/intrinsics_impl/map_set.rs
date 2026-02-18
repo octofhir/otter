@@ -235,9 +235,18 @@ fn iterate_with_protocol(
     let iter_key = PropertyKey::Symbol(iter_sym);
 
     // Get the @@iterator method
-    let iter_obj = iterable.as_object().or_else(|| iterable.as_array());
-    let iter_fn = if let Some(obj) = &iter_obj {
+    // For strings, look up Symbol.iterator on the String prototype
+    let iter_fn = if let Some(obj) = iterable.as_object().or_else(|| iterable.as_array()) {
         obj.get(&iter_key).unwrap_or(Value::undefined())
+    } else if iterable.as_string().is_some() {
+        // String primitive: get Symbol.iterator from String.prototype
+        ncx.ctx
+            .get_global("String")
+            .and_then(|v| v.as_object())
+            .and_then(|c| c.get(&pk("prototype")))
+            .and_then(|v| v.as_object())
+            .and_then(|proto| proto.get(&iter_key))
+            .unwrap_or(Value::undefined())
     } else {
         Value::undefined()
     };
@@ -1969,4 +1978,89 @@ pub fn create_weak_set_constructor() -> Box<
             Err(VmError::type_error("Constructor WeakSet requires 'new'"))
         }
     })
+}
+
+/// Install static methods on the Map constructor (e.g. Map.groupBy).
+pub fn install_map_statics(
+    map_ctor: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+) {
+    // Map.groupBy ( items, callbackfn ) — ES2024
+    map_ctor.define_property(
+        pk("groupBy"),
+        PropertyDescriptor::builtin_method(make_builtin(
+            "groupBy",
+            2,
+            |_this, args, ncx| {
+                let items = args.first().cloned().unwrap_or(Value::undefined());
+                let callback = args.get(1).cloned().unwrap_or(Value::undefined());
+
+                if !callback.is_callable() {
+                    return Err(VmError::type_error(
+                        "Map.groupBy: callbackfn is not a function",
+                    ));
+                }
+
+                // Create a new Map
+                let mm = ncx.ctx.memory_manager().clone();
+                let map_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                // Set Map prototype
+                if let Some(map_proto) = ncx
+                    .ctx
+                    .get_global("Map")
+                    .and_then(|v| v.as_object())
+                    .and_then(|c| c.get(&pk("prototype")))
+                    .and_then(|v| v.as_object())
+                {
+                    map_obj.set_prototype(Value::object(map_proto));
+                }
+                init_map_slots(&map_obj);
+                let map_data = get_map_data(&map_obj).unwrap();
+
+                // Iterate items
+                let mut k: u32 = 0;
+                iterate_with_protocol(&items, ncx, |value, ncx| {
+                    let key =
+                        ncx.call_function(&callback, Value::undefined(), &[value.clone(), Value::number(k as f64)])?;
+                    k += 1;
+
+                    // If key already exists in map, push to existing array; else create new array
+                    let map_key = MapKey(key.clone());
+                    if let Some(existing) = map_data.get(&map_key) {
+                        // Push to existing array
+                        if let Some(arr) = existing.as_array().or_else(|| existing.as_object()) {
+                            let len = arr
+                                .get(&pk("length"))
+                                .and_then(|v| v.as_number())
+                                .unwrap_or(0.0) as u32;
+                            let _ = arr.set(PropertyKey::Index(len), value);
+                            let _ = arr.set(pk("length"), Value::number((len + 1) as f64));
+                        }
+                    } else {
+                        // Create new array with this value
+                        let arr = JsObject::array(4, mm.clone());
+                        // Set Array prototype
+                        if let Some(array_proto) = ncx
+                            .ctx
+                            .get_global("Array")
+                            .and_then(|v| v.as_object())
+                            .and_then(|c| c.get(&pk("prototype")))
+                            .and_then(|v| v.as_object())
+                        {
+                            arr.set_prototype(Value::object(array_proto));
+                        }
+                        let _ = arr.set(PropertyKey::Index(0), value);
+                        let _ = arr.set(pk("length"), Value::number(1.0));
+                        let _ = map_data.set(map_key, Value::array(GcRef::new(arr)));
+                    }
+                    Ok(())
+                })?;
+
+                Ok(Value::object(map_obj))
+            },
+            mm.clone(),
+            fn_proto,
+        )),
+    );
 }

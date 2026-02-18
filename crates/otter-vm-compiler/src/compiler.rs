@@ -466,12 +466,14 @@ impl Compiler {
         self.hoist_var_declarations(statements)?;
 
         // Phase 1: Declare all function names first
-        // This ensures that all functions can reference each other
+        // This ensures that all functions can reference each other.
+        // Use Var kind so duplicate function declarations are allowed (sloppy mode).
         for (idx, stmt) in statements.iter().enumerate() {
             if let Statement::FunctionDeclaration(func) = stmt {
                 if let Some(id) = &func.id {
                     let name = id.name.to_string();
-                    self.codegen.declare_variable(&name, false)?;
+                    self.codegen
+                        .declare_variable_with_kind(&name, crate::scope::VariableKind::Var)?;
                 }
                 hoisted_indices.push(idx);
             }
@@ -3675,9 +3677,11 @@ impl Compiler {
 
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
 
-        // Declare function in current scope
+        // Declare function in current scope using Var kind so duplicate
+        // function declarations are allowed in sloppy mode (ES spec §B.3.2).
         if let Some(ref n) = name {
-            self.codegen.declare_variable(n, false)?;
+            self.codegen
+                .declare_variable_with_kind(n, crate::scope::VariableKind::Var)?;
         }
 
         // Enter function context
@@ -7031,6 +7035,9 @@ impl Compiler {
 
         // Check for computed member call (obj[key]())
         if let Expression::ComputedMemberExpression(member) = &call.callee {
+            if matches!(&member.object, Expression::Super(_)) {
+                return self.compile_super_computed_method_call(call, member);
+            }
             return self.compile_computed_method_call(call, member);
         }
 
@@ -7111,37 +7118,97 @@ impl Compiler {
 
     /// Compile a super() call in a derived constructor
     fn compile_super_call(&mut self, call: &CallExpression) -> CompileResult<Register> {
-        let argc = call.arguments.len() as u8;
+        // Check for spread arguments
+        let has_spread = call
+            .arguments
+            .iter()
+            .any(|arg| matches!(arg, Argument::SpreadElement(_)));
 
-        // Allocate a contiguous block for arguments
-        let args_base = self.codegen.alloc_fresh_block(argc.max(1));
+        if has_spread {
+            // Build a spread array from arguments, then use CallSuperForward-style handling
+            // For now, build the array and use CallSuper with the expanded args
+            let args_arr = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::NewArray {
+                dst: args_arr,
+                len: 0,
+            });
 
-        // Compile arguments into contiguous registers
-        for (i, arg) in call.arguments.iter().enumerate() {
-            let arg_reg = self.compile_expression(arg.to_expression())?;
-            if arg_reg.0 != args_base.0 + i as u16 {
-                self.codegen.emit(Instruction::Move {
-                    dst: Register(args_base.0 + i as u16),
-                    src: arg_reg,
-                });
+            for arg in &call.arguments {
+                match arg {
+                    Argument::SpreadElement(spread) => {
+                        let spread_val = self.compile_expression(&spread.argument)?;
+                        self.codegen.emit(Instruction::Spread {
+                            dst: args_arr,
+                            src: spread_val,
+                        });
+                        self.codegen.free_reg(spread_val);
+                    }
+                    _ => {
+                        let arg_val = self.compile_expression(arg.to_expression())?;
+                        let len_name = self.codegen.add_string("length");
+                        let len_reg = self.codegen.alloc_reg();
+                        let ic_index = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::GetPropConst {
+                            dst: len_reg,
+                            obj: args_arr,
+                            name: len_name,
+                            ic_index,
+                        });
+                        let ic_set = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::SetProp {
+                            obj: args_arr,
+                            key: len_reg,
+                            val: arg_val,
+                            ic_index: ic_set,
+                        });
+                        self.codegen.free_reg(len_reg);
+                        self.codegen.free_reg(arg_val);
+                    }
+                }
             }
-            self.codegen.free_reg(arg_reg);
+
+            // Use CallSuperSpread instruction (same as CallSuperForward but with explicit args)
+            let dst = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::CallSuperSpread {
+                dst,
+                args: args_arr,
+            });
+
+            self.codegen.free_reg(args_arr);
+            Ok(dst)
+        } else {
+            let argc = call.arguments.len() as u8;
+
+            // Allocate a contiguous block for arguments
+            let args_base = self.codegen.alloc_fresh_block(argc.max(1));
+
+            // Compile arguments into contiguous registers
+            for (i, arg) in call.arguments.iter().enumerate() {
+                let arg_reg = self.compile_expression(arg.to_expression())?;
+                if arg_reg.0 != args_base.0 + i as u16 {
+                    self.codegen.emit(Instruction::Move {
+                        dst: Register(args_base.0 + i as u16),
+                        src: arg_reg,
+                    });
+                }
+                self.codegen.free_reg(arg_reg);
+            }
+
+            // Emit CallSuper instruction
+            let dst = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::CallSuper {
+                dst,
+                args: args_base,
+                argc,
+            });
+
+            // Free arg block
+            for i in 0..argc.max(1) as u16 {
+                self.codegen.free_reg(Register(args_base.0 + i));
+            }
+
+            Ok(dst)
         }
-
-        // Emit CallSuper instruction
-        let dst = self.codegen.alloc_reg();
-        self.codegen.emit(Instruction::CallSuper {
-            dst,
-            args: args_base,
-            argc,
-        });
-
-        // Free arg block
-        for i in 0..argc.max(1) as u16 {
-            self.codegen.free_reg(Register(args_base.0 + i));
-        }
-
-        Ok(dst)
     }
 
     /// Compile a super.method() call
@@ -7164,45 +7231,143 @@ impl Compiler {
         let this_reg = self.codegen.alloc_reg();
         self.codegen.emit(Instruction::LoadThis { dst: this_reg });
 
-        // Compile arguments
-        let argc = call.arguments.len() as u8;
-        let mut arg_regs = Vec::with_capacity(call.arguments.len());
-        for arg in &call.arguments {
-            arg_regs.push(self.compile_expression(arg.to_expression())?);
-        }
+        // Check for spread arguments
+        let has_spread = call
+            .arguments
+            .iter()
+            .any(|arg| matches!(arg, Argument::SpreadElement(_)));
 
-        // Set up call convention: func, this, args in contiguous registers
-        let frame = self.codegen.alloc_fresh_block(1 + argc);
-        self.codegen.emit(Instruction::Move {
-            dst: frame,
-            src: func_reg,
-        });
-        for (i, arg_reg) in arg_regs.iter().copied().enumerate() {
-            self.codegen.emit(Instruction::Move {
-                dst: Register(frame.0 + 1 + i as u16),
-                src: arg_reg,
+        if has_spread {
+            // For super method calls with spread, use func.apply(this, argsArray)
+            // 1. Build the spread array
+            let args_arr = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::NewArray {
+                dst: args_arr,
+                len: 0,
             });
-        }
 
-        let dst = self.codegen.alloc_reg();
-        self.codegen.emit(Instruction::CallWithReceiver {
-            dst,
-            func: frame,
-            this: this_reg,
-            argc,
-        });
+            for arg in &call.arguments {
+                match arg {
+                    Argument::SpreadElement(spread) => {
+                        let spread_val = self.compile_expression(&spread.argument)?;
+                        self.codegen.emit(Instruction::Spread {
+                            dst: args_arr,
+                            src: spread_val,
+                        });
+                        self.codegen.free_reg(spread_val);
+                    }
+                    _ => {
+                        let arg_val = self.compile_expression(arg.to_expression())?;
+                        let len_name = self.codegen.add_string("length");
+                        let len_reg = self.codegen.alloc_reg();
+                        let ic_index = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::GetPropConst {
+                            dst: len_reg,
+                            obj: args_arr,
+                            name: len_name,
+                            ic_index,
+                        });
+                        let ic_set = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::SetProp {
+                            obj: args_arr,
+                            key: len_reg,
+                            val: arg_val,
+                            ic_index: ic_set,
+                        });
+                        self.codegen.free_reg(len_reg);
+                        self.codegen.free_reg(arg_val);
+                    }
+                }
+            }
 
-        // Free temporaries
-        self.codegen.free_reg(func_reg);
-        self.codegen.free_reg(this_reg);
-        for reg in &arg_regs {
-            self.codegen.free_reg(*reg);
-        }
-        for i in 0..(1 + argc as u16) {
-            self.codegen.free_reg(Register(frame.0 + i));
-        }
+            // 2. Get func.apply
+            let apply_name = self.codegen.add_string("apply");
+            let apply_reg = self.codegen.alloc_reg();
+            let ic_index = self.codegen.alloc_ic();
+            self.codegen.emit(Instruction::GetPropConst {
+                dst: apply_reg,
+                obj: func_reg,
+                name: apply_name,
+                ic_index,
+            });
 
-        Ok(dst)
+            // 3. Call apply(this, argsArray) with receiver=func
+            // CallWithReceiver layout: func_val=frame[0], args=frame[1..1+argc]
+            let apply_frame = self.codegen.alloc_fresh_block(3);
+            // frame[0] = apply function
+            self.codegen.emit(Instruction::Move {
+                dst: apply_frame,
+                src: apply_reg,
+            });
+            // frame[1] = first arg to apply = this value
+            self.codegen.emit(Instruction::Move {
+                dst: Register(apply_frame.0 + 1),
+                src: this_reg,
+            });
+            // frame[2] = second arg to apply = argsArray
+            self.codegen.emit(Instruction::Move {
+                dst: Register(apply_frame.0 + 2),
+                src: args_arr,
+            });
+
+            let dst = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::CallWithReceiver {
+                dst,
+                func: apply_frame,    // points to apply function
+                this: func_reg,       // receiver for apply = the original function
+                argc: 2,              // two args: this_val and argsArray
+            });
+
+            self.codegen.free_reg(apply_reg);
+            self.codegen.free_reg(func_reg);
+            self.codegen.free_reg(this_reg);
+            self.codegen.free_reg(args_arr);
+            for i in 0..3u16 {
+                self.codegen.free_reg(Register(apply_frame.0 + i));
+            }
+
+            Ok(dst)
+        } else {
+            // Compile arguments
+            let argc = call.arguments.len() as u8;
+            let mut arg_regs = Vec::with_capacity(call.arguments.len());
+            for arg in &call.arguments {
+                arg_regs.push(self.compile_expression(arg.to_expression())?);
+            }
+
+            // Set up call convention: func, this, args in contiguous registers
+            let frame = self.codegen.alloc_fresh_block(1 + argc);
+            self.codegen.emit(Instruction::Move {
+                dst: frame,
+                src: func_reg,
+            });
+            for (i, arg_reg) in arg_regs.iter().copied().enumerate() {
+                self.codegen.emit(Instruction::Move {
+                    dst: Register(frame.0 + 1 + i as u16),
+                    src: arg_reg,
+                });
+            }
+
+            let dst = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::CallWithReceiver {
+                dst,
+                func: frame,
+                this: this_reg,
+                argc,
+            });
+
+            // Free temporaries
+            self.codegen.free_reg(func_reg);
+            self.codegen.free_reg(this_reg);
+            for reg in &arg_regs {
+                self.codegen.free_reg(*reg);
+            }
+            for i in 0..(1 + argc as u16) {
+                self.codegen.free_reg(Register(frame.0 + i));
+            }
+
+            Ok(dst)
+        }
     }
 
     /// Compile a method call (obj.method(...))
@@ -7273,6 +7438,166 @@ impl Compiler {
             self.codegen.free_reg(obj);
             for tmp in arg_tmps {
                 self.codegen.free_reg(tmp);
+            }
+            for i in 0..(1 + argc as u16) {
+                self.codegen.free_reg(Register(frame.0 + i));
+            }
+
+            Ok(dst)
+        }
+    }
+
+    /// Compile a super[computed]() call (e.g., super[Symbol.replace](...))
+    fn compile_super_computed_method_call(
+        &mut self,
+        call: &CallExpression,
+        member: &oxc_ast::ast::ComputedMemberExpression,
+    ) -> CompileResult<Register> {
+        // Get the super prototype
+        let super_reg = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::GetSuper { dst: super_reg });
+
+        // Compile the computed key
+        let key_reg = self.compile_expression(&member.expression)?;
+
+        // Get the method from super prototype using the computed key
+        let func_reg = self.codegen.alloc_reg();
+        let ic_index = self.codegen.alloc_ic();
+        self.codegen.emit(Instruction::GetProp {
+            dst: func_reg,
+            obj: super_reg,
+            key: key_reg,
+            ic_index,
+        });
+
+        self.codegen.free_reg(super_reg);
+        self.codegen.free_reg(key_reg);
+
+        // Get `this` for the call receiver
+        let this_reg = self.codegen.alloc_reg();
+        self.codegen.emit(Instruction::LoadThis { dst: this_reg });
+
+        // Check for spread arguments
+        let has_spread = call
+            .arguments
+            .iter()
+            .any(|arg| matches!(arg, Argument::SpreadElement(_)));
+
+        if has_spread {
+            // Build spread array
+            let args_arr = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::NewArray {
+                dst: args_arr,
+                len: 0,
+            });
+
+            for arg in &call.arguments {
+                match arg {
+                    Argument::SpreadElement(spread) => {
+                        let spread_val = self.compile_expression(&spread.argument)?;
+                        self.codegen.emit(Instruction::Spread {
+                            dst: args_arr,
+                            src: spread_val,
+                        });
+                        self.codegen.free_reg(spread_val);
+                    }
+                    _ => {
+                        let arg_val = self.compile_expression(arg.to_expression())?;
+                        let len_name = self.codegen.add_string("length");
+                        let len_reg = self.codegen.alloc_reg();
+                        let ic_index = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::GetPropConst {
+                            dst: len_reg,
+                            obj: args_arr,
+                            name: len_name,
+                            ic_index,
+                        });
+                        let ic_set = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::SetProp {
+                            obj: args_arr,
+                            key: len_reg,
+                            val: arg_val,
+                            ic_index: ic_set,
+                        });
+                        self.codegen.free_reg(len_reg);
+                        self.codegen.free_reg(arg_val);
+                    }
+                }
+            }
+
+            // Use func.apply(this, argsArray) pattern
+            let apply_name = self.codegen.add_string("apply");
+            let apply_reg = self.codegen.alloc_reg();
+            let ic_index = self.codegen.alloc_ic();
+            self.codegen.emit(Instruction::GetPropConst {
+                dst: apply_reg,
+                obj: func_reg,
+                name: apply_name,
+                ic_index,
+            });
+
+            let apply_frame = self.codegen.alloc_fresh_block(3);
+            self.codegen.emit(Instruction::Move {
+                dst: apply_frame,
+                src: apply_reg,
+            });
+            self.codegen.emit(Instruction::Move {
+                dst: Register(apply_frame.0 + 1),
+                src: this_reg,
+            });
+            self.codegen.emit(Instruction::Move {
+                dst: Register(apply_frame.0 + 2),
+                src: args_arr,
+            });
+
+            let dst = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::CallWithReceiver {
+                dst,
+                func: apply_frame,
+                this: func_reg,
+                argc: 2,
+            });
+
+            self.codegen.free_reg(apply_reg);
+            self.codegen.free_reg(func_reg);
+            self.codegen.free_reg(this_reg);
+            self.codegen.free_reg(args_arr);
+            for i in 0..3u16 {
+                self.codegen.free_reg(Register(apply_frame.0 + i));
+            }
+
+            Ok(dst)
+        } else {
+            let argc = call.arguments.len() as u8;
+            let mut arg_regs = Vec::with_capacity(call.arguments.len());
+            for arg in &call.arguments {
+                arg_regs.push(self.compile_expression(arg.to_expression())?);
+            }
+
+            let frame = self.codegen.alloc_fresh_block(1 + argc);
+            self.codegen.emit(Instruction::Move {
+                dst: frame,
+                src: func_reg,
+            });
+            for (i, arg_reg) in arg_regs.iter().copied().enumerate() {
+                self.codegen.emit(Instruction::Move {
+                    dst: Register(frame.0 + 1 + i as u16),
+                    src: arg_reg,
+                });
+            }
+
+            let dst = self.codegen.alloc_reg();
+            self.codegen.emit(Instruction::CallWithReceiver {
+                dst,
+                func: frame,
+                this: this_reg,
+                argc,
+            });
+
+            self.codegen.free_reg(func_reg);
+            self.codegen.free_reg(this_reg);
+            for reg in &arg_regs {
+                self.codegen.free_reg(*reg);
             }
             for i in 0..(1 + argc as u16) {
                 self.codegen.free_reg(Register(frame.0 + i));

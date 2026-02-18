@@ -1252,7 +1252,8 @@ pub fn init_object_constructor(
                             } else {
                                 continue;
                             }
-                            let descriptor = crate::object::get_value_full(&props, &key, ncx_inner)?;
+                            let descriptor =
+                                crate::object::get_value_full(&props, &key, ncx_inner)?;
                             let attr_obj = descriptor.as_object().ok_or_else(|| {
                                 VmError::type_error("Property description must be an object")
                             })?;
@@ -1683,9 +1684,7 @@ pub fn init_object_constructor(
                 let iter_sym = crate::intrinsics::well_known::iterator_symbol();
                 let iter_key = PropertyKey::Symbol(iter_sym);
 
-                let iter_fn = if let Some(obj) =
-                    items.as_object().or_else(|| items.as_array())
-                {
+                let iter_fn = if let Some(obj) = items.as_object().or_else(|| items.as_array()) {
                     obj.get(&iter_key).unwrap_or(Value::undefined())
                 } else if items.as_string().is_some() {
                     ncx.ctx
@@ -1738,9 +1737,9 @@ pub fn init_object_constructor(
                     let prop_key = if let Some(s) = group_key.as_string() {
                         PropertyKey::String(s)
                     } else if let Some(n) = group_key.as_number() {
-                        PropertyKey::String(JsString::intern(
-                            &crate::globals::js_number_to_string(n),
-                        ))
+                        PropertyKey::String(JsString::intern(&crate::globals::js_number_to_string(
+                            n,
+                        )))
                     } else if group_key.is_undefined() {
                         PropertyKey::string("undefined")
                     } else if group_key.is_null() {
@@ -1760,8 +1759,10 @@ pub fn init_object_constructor(
                                 .and_then(|v| v.as_number())
                                 .unwrap_or(0.0) as u32;
                             let _ = arr.set(PropertyKey::Index(len), value);
-                            let _ =
-                                arr.set(PropertyKey::string("length"), Value::number((len + 1) as f64));
+                            let _ = arr.set(
+                                PropertyKey::string("length"),
+                                Value::number((len + 1) as f64),
+                            );
                         }
                     } else {
                         let arr = JsObject::array(4, mm.clone());

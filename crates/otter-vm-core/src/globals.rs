@@ -172,6 +172,250 @@ fn setup_builtin_constructors(
             );
         }
     };
+    let is_typed_array_ctor_name = |name: &str| {
+        matches!(
+            name,
+            "Int8Array"
+                | "Uint8Array"
+                | "Uint8ClampedArray"
+                | "Int16Array"
+                | "Uint16Array"
+                | "Int32Array"
+                | "Uint32Array"
+                | "Float32Array"
+                | "Float64Array"
+                | "BigInt64Array"
+                | "BigUint64Array"
+        )
+    };
+
+    // Shared %TypedArray% constructor object for constructor inheritance:
+    // Object.getPrototypeOf(Int8Array) === %TypedArray%.
+    let typed_array_ctor = Value::native_function_with_proto(
+        |_this, _args, _ncx| Err(VmError::type_error("TypedArray constructor is abstract")),
+        mm.clone(),
+        fn_proto,
+    );
+    tag_builtin(&typed_array_ctor, "TypedArray");
+    if let Some(typed_array_ctor_obj) = typed_array_ctor.as_object() {
+        let _ = typed_array_ctor_obj.set(
+            PropertyKey::string("from"),
+            Value::native_function_with_proto_named(
+                move |this_val, args, ncx| {
+                    let source = args.first().ok_or_else(|| {
+                        VmError::type_error("TypedArray.from requires a source argument")
+                    })?;
+                    let map_fn = args.get(1).cloned().unwrap_or(Value::undefined());
+                    let this_arg = args.get(2).cloned().unwrap_or(Value::undefined());
+                    let has_map = !map_fn.is_undefined();
+                    if has_map && !map_fn.is_callable() {
+                        return Err(VmError::type_error(
+                            "TypedArray.from: mapFn is not a function",
+                        ));
+                    }
+
+                    // %TypedArray%.from requires a constructor as `this`.
+                    let this_obj = this_val.as_object().ok_or_else(|| {
+                        VmError::type_error("TypedArray.from: this is not a constructor")
+                    })?;
+                    if !this_val.is_callable()
+                        || this_obj
+                            .get(&PropertyKey::string("prototype"))
+                            .and_then(|v| v.as_object())
+                            .is_none()
+                    {
+                        return Err(VmError::type_error(
+                            "TypedArray.from: this is not a constructor",
+                        ));
+                    }
+
+                    // Collect source values first (iterable path preferred).
+                    // mapFn is applied later during writes into targetObj.
+                    let mut values: Vec<Value> = Vec::new();
+                    let iterator_sym = crate::intrinsics::well_known::iterator_symbol();
+                    let using_iterator = if let Some(obj) = source.as_object() {
+                        crate::object::get_value_full(
+                            &obj,
+                            &PropertyKey::Symbol(iterator_sym),
+                            ncx,
+                        )?
+                    } else {
+                        Value::undefined()
+                    };
+
+                    if !using_iterator.is_undefined() {
+                        if !using_iterator.is_callable() {
+                            return Err(VmError::type_error(
+                                "TypedArray.from: @@iterator is not callable",
+                            ));
+                        }
+
+                        let iterator = ncx.call_function(&using_iterator, source.clone(), &[])?;
+                        let iter_obj = iterator.as_object().ok_or_else(|| {
+                            VmError::type_error("TypedArray.from: iterator is not an object")
+                        })?;
+                        loop {
+                            let next_fn = crate::object::get_value_full(
+                                &iter_obj,
+                                &PropertyKey::string("next"),
+                                ncx,
+                            )?;
+                            if !next_fn.is_callable() {
+                                return Err(VmError::type_error(
+                                    "TypedArray.from: iterator.next is not callable",
+                                ));
+                            }
+                            let next_result = ncx.call_function(&next_fn, iterator.clone(), &[])?;
+                            let next_obj = next_result.as_object().ok_or_else(|| {
+                                VmError::type_error(
+                                    "TypedArray.from: iterator result is not an object",
+                                )
+                            })?;
+                            let done = crate::object::get_value_full(
+                                &next_obj,
+                                &PropertyKey::string("done"),
+                                ncx,
+                            )?
+                            .to_boolean();
+                            if done {
+                                break;
+                            }
+
+                            let value = crate::object::get_value_full(
+                                &next_obj,
+                                &PropertyKey::string("value"),
+                                ncx,
+                            )?;
+                            values.push(value);
+                        }
+                    } else if let Some(obj) = source.as_object() {
+                        let len_value = crate::object::get_value_full(
+                            &obj,
+                            &PropertyKey::string("length"),
+                            ncx,
+                        )?;
+                        let len_number = if let Some(n) = len_value.as_number() {
+                            n
+                        } else if let Some(i) = len_value.as_int32() {
+                            i as f64
+                        } else if len_value.is_undefined() {
+                            0.0
+                        } else {
+                            ncx.to_number_value(&len_value)?
+                        };
+                        let length = if len_number.is_nan() || len_number <= 0.0 {
+                            0
+                        } else {
+                            len_number.min(9007199254740991.0) as usize
+                        };
+                        values.reserve(length);
+                        for i in 0..length {
+                            let value = crate::object::get_value_full(
+                                &obj,
+                                &PropertyKey::Index(i as u32),
+                                ncx,
+                            )?;
+                            values.push(value);
+                        }
+                    }
+
+                    let target = ncx.call_function_construct(
+                        this_val,
+                        Value::undefined(),
+                        &[Value::number(values.len() as f64)],
+                    )?;
+                    let target_obj = target.as_object().ok_or_else(|| {
+                        VmError::type_error("TypedArray.from: constructor did not return an object")
+                    })?;
+
+                    let ta_data = target_obj
+                        .get(&PropertyKey::string("__TypedArrayData__"))
+                        .ok_or_else(|| {
+                            VmError::type_error(
+                                "TypedArray.from: constructor did not create a TypedArray",
+                            )
+                        })?;
+                    let target_ta = ta_data.as_typed_array().ok_or_else(|| {
+                        VmError::type_error(
+                            "TypedArray.from: constructor did not create a TypedArray",
+                        )
+                    })?;
+
+                    if values.len() > target_ta.length() {
+                        return Err(VmError::type_error(
+                            "TypedArray.from: constructor returned a smaller TypedArray",
+                        ));
+                    }
+
+                    for (i, value) in values.into_iter().enumerate() {
+                        let mapped = if has_map {
+                            ncx.call_function(
+                                &map_fn,
+                                this_arg.clone(),
+                                &[value, Value::number(i as f64)],
+                            )?
+                        } else {
+                            value
+                        };
+
+                        if target_ta.kind().is_bigint() {
+                            let bigint = if let Some(crate::value::HeapRef::BigInt(b)) =
+                                mapped.heap_ref()
+                            {
+                                b.value.parse::<i64>().map_err(|_| {
+                                    VmError::type_error("TypedArray.from: invalid BigInt value")
+                                })?
+                            } else {
+                                let prim = if mapped.is_object() {
+                                    ncx.to_primitive(
+                                        &mapped,
+                                        crate::interpreter::PreferredType::Number,
+                                    )?
+                                } else {
+                                    mapped.clone()
+                                };
+                                if let Some(crate::value::HeapRef::BigInt(b)) = prim.heap_ref() {
+                                    b.value.parse::<i64>().map_err(|_| {
+                                        VmError::type_error("TypedArray.from: invalid BigInt value")
+                                    })?
+                                } else {
+                                    return Err(VmError::type_error(
+                                        "Cannot convert value to BigInt",
+                                    ));
+                                }
+                            };
+                            if !target_ta.set_bigint(i, bigint) {
+                                return Err(VmError::type_error(
+                                    "TypedArray.from: value does not fit in target typed array",
+                                ));
+                            }
+                            let _ = target_obj.set(
+                                PropertyKey::Index(i as u32),
+                                Value::bigint(bigint.to_string()),
+                            );
+                        } else {
+                            let number = ncx.to_number_value(&mapped)?;
+                            if !target_ta.set(i, number) {
+                                return Err(VmError::type_error(
+                                    "TypedArray.from: value does not fit in target typed array",
+                                ));
+                            }
+                            if let Some(stored) = target_ta.get(i) {
+                                let _ = target_obj
+                                    .set(PropertyKey::Index(i as u32), Value::number(stored));
+                            }
+                        }
+                    }
+
+                    Ok(target)
+                },
+                mm.clone(),
+                fn_proto,
+                "from",
+                1,
+            ),
+        );
+    }
     let builtins = [
         "Object",
         "Function",
@@ -517,6 +761,85 @@ fn setup_builtin_constructors(
 
                     // Array-like object
                     if let Some(obj) = arg0.as_object() {
+                        let iterator_sym = crate::intrinsics::well_known::iterator_symbol();
+                        if let Some(iter_fn) = obj.get(&PropertyKey::Symbol(iterator_sym))
+                            && iter_fn.is_callable()
+                        {
+                            let iterator = ncx.call_function(&iter_fn, arg0.clone(), &[])?;
+                            let iter_obj = iterator.as_object().ok_or_else(|| {
+                                VmError::type_error(
+                                    "TypedArray constructor: iterator is not an object",
+                                )
+                            })?;
+                            let mut values: Vec<Value> = Vec::new();
+                            loop {
+                                let next_fn = iter_obj
+                                    .get(&PropertyKey::string("next"))
+                                    .ok_or_else(|| {
+                                        VmError::type_error(
+                                            "TypedArray constructor: iterator.next is not defined",
+                                        )
+                                    })?;
+                                if !next_fn.is_callable() {
+                                    return Err(VmError::type_error(
+                                        "TypedArray constructor: iterator.next is not callable",
+                                    ));
+                                }
+                                let next_result =
+                                    ncx.call_function(&next_fn, iterator.clone(), &[])?;
+                                let next_obj = next_result.as_object().ok_or_else(|| {
+                                    VmError::type_error(
+                                        "TypedArray constructor: iterator result is not an object",
+                                    )
+                                })?;
+                                let done = next_obj
+                                    .get(&PropertyKey::string("done"))
+                                    .unwrap_or(Value::boolean(false))
+                                    .to_boolean();
+                                if done {
+                                    break;
+                                }
+                                values.push(
+                                    next_obj
+                                        .get(&PropertyKey::string("value"))
+                                        .unwrap_or(Value::undefined()),
+                                );
+                            }
+
+                            let length = values.len();
+                            let byte_len =
+                                length.checked_mul(kind.element_size()).ok_or_else(|| {
+                                    VmError::range_error("Invalid typed array length")
+                                })?;
+                            let buffer = GcRef::new(JsArrayBuffer::new(
+                                byte_len,
+                                None,
+                                ncx.memory_manager().clone(),
+                            ));
+                            let object = GcRef::new(JsObject::new(
+                                Value::object(proto_clone),
+                                ncx.memory_manager().clone(),
+                            ));
+                            let ta = JsTypedArray::new(object, buffer, kind, 0, length)
+                                .map_err(|e| VmError::type_error(e))?;
+
+                            for (i, val) in values.into_iter().enumerate() {
+                                if kind.is_bigint() {
+                                    if let Some(crate::value::HeapRef::BigInt(b)) = val.heap_ref()
+                                        && let Ok(bigint) = b.value.parse::<i64>()
+                                    {
+                                        let _ = ta.set_bigint(i, bigint);
+                                    }
+                                } else if let Some(num) = val.as_number() {
+                                    let _ = ta.set(i, num);
+                                } else if let Some(num_int) = val.as_int32() {
+                                    let _ = ta.set(i, num_int as f64);
+                                }
+                            }
+
+                            return Ok(make_typed_array(ta));
+                        }
+
                         if let Some(length_val) = obj.get(&PropertyKey::string("length")) {
                             if let Some(length) = length_val.as_int32() {
                                 let length = length.max(0) as usize;
@@ -627,6 +950,17 @@ fn setup_builtin_constructors(
         }
 
         if let Some(ctor_obj) = ctor.as_object() {
+            if is_typed_array_ctor_name(name) {
+                if let Some(parent_ta_ctor) = typed_array_ctor.as_object() {
+                    ctor_obj.set_prototype(Value::object(parent_ta_ctor));
+                }
+                // These native typed array constructors are constructible in this runtime.
+                let _ = ctor_obj.set(
+                    PropertyKey::string("__non_constructor"),
+                    Value::boolean(false),
+                );
+            }
+
             if name != "Proxy" {
                 let _ = ctor_obj.set(
                     PropertyKey::string("prototype"),
@@ -728,83 +1062,6 @@ fn setup_builtin_constructors(
                 let _ = ctor_obj.set(
                     PropertyKey::string("BYTES_PER_ELEMENT"),
                     Value::int32(kind.element_size() as i32),
-                );
-
-                // TypedArray.from(source, mapFn?, thisArg?) - ES2026 §22.2.2.1
-                let mm_from = mm.clone();
-                let proto_from = proto.clone();
-                let _ = ctor_obj.set(
-                    PropertyKey::string("from"),
-                    Value::native_function_with_proto(
-                        move |_this, args, ncx| {
-                            let source = args.get(0).ok_or_else(|| {
-                                VmError::type_error("TypedArray.from requires a source argument")
-                            })?;
-                            let map_fn = args.get(1).cloned().unwrap_or(Value::undefined());
-                            let this_arg = args.get(2).cloned().unwrap_or(Value::undefined());
-                            let has_map = !map_fn.is_undefined();
-                            if has_map && !map_fn.is_callable() {
-                                return Err(VmError::type_error(
-                                    "TypedArray.from: mapFn is not a function",
-                                ));
-                            }
-
-                            // Get length of source
-                            let length = if let Some(obj) = source.as_object() {
-                                obj.get(&PropertyKey::string("length"))
-                                    .and_then(|v| v.as_number())
-                                    .unwrap_or(0.0)
-                                    .max(0.0) as usize
-                            } else {
-                                0
-                            };
-
-                            // Create new TypedArray
-                            let buffer = GcRef::new(JsArrayBuffer::new(
-                                length * kind.element_size(),
-                                None,
-                                ncx.memory_manager().clone(),
-                            ));
-                            let object = GcRef::new(JsObject::new(
-                                Value::object(proto_from),
-                                ncx.memory_manager().clone(),
-                            ));
-                            let ta = JsTypedArray::new(object, buffer, kind, 0, length)
-                                .map_err(|e| VmError::type_error(e))?;
-
-                            // Copy elements (with optional mapping)
-                            if let Some(obj) = source.as_object() {
-                                for i in 0..length {
-                                    if let Some(val) = obj.get(&PropertyKey::Index(i as u32)) {
-                                        let final_val = if has_map {
-                                            ncx.call_function(
-                                                &map_fn,
-                                                this_arg.clone(),
-                                                &[val, Value::number(i as f64)],
-                                            )?
-                                        } else {
-                                            val
-                                        };
-
-                                        if let Some(num) = final_val.as_number() {
-                                            let _ = ta.set(i, num);
-                                        } else if let Some(num_int) = final_val.as_int32() {
-                                            let _ = ta.set(i, num_int as f64);
-                                        }
-                                    }
-                                }
-                            }
-
-                            let ta_arc = GcRef::new(ta);
-                            object.define_property(
-                                PropertyKey::string("__TypedArrayData__"),
-                                PropertyDescriptor::data(Value::typed_array(ta_arc)),
-                            );
-                            Ok(Value::object(object))
-                        },
-                        mm_from,
-                        fn_proto,
-                    ),
                 );
 
                 // TypedArray.of(...items) - ES2026 §22.2.2.2
@@ -1394,7 +1651,7 @@ fn parse_hex4_u16(units: &[u16]) -> Option<u16> {
 
 fn hex_digit_u16(u: u16) -> Option<u8> {
     match u {
-        0x30..=0x39 => Some((u - 0x30) as u8), // '0'-'9'
+        0x30..=0x39 => Some((u - 0x30) as u8),      // '0'-'9'
         0x41..=0x46 => Some((u - 0x41) as u8 + 10), // 'A'-'F'
         0x61..=0x66 => Some((u - 0x61) as u8 + 10), // 'a'-'f'
         _ => None,
@@ -1526,11 +1783,7 @@ pub fn js_number_to_string(n: f64) -> String {
         // For large integers (> u64::MAX but < 1e21), format as fixed-point
         // and strip the trailing ".0" that Rust adds
         let s = format!("{:.0}", abs_n);
-        return if negative {
-            format!("-{}", s)
-        } else {
-            s
-        };
+        return if negative { format!("-{}", s) } else { s };
     }
 
     // For all other numbers, use shortest representation matching JS semantics.

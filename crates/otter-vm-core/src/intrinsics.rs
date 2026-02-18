@@ -754,10 +754,7 @@ impl Intrinsics {
                 let proto = ncx
                     .global()
                     .get(&PropertyKey::string("Object"))
-                    .and_then(|o| {
-                        o.as_object()
-                            .or_else(|| o.native_function_object())
-                    })
+                    .and_then(|o| o.as_object().or_else(|| o.native_function_object()))
                     .and_then(|o| o.get(&PropertyKey::string("prototype")))
                     .and_then(|v| v.as_object())
                     .map(Value::object)
@@ -878,10 +875,7 @@ impl Intrinsics {
                 let proto = ncx
                     .global()
                     .get(&PropertyKey::string("Object"))
-                    .and_then(|o| {
-                        o.as_object()
-                            .or_else(|| o.native_function_object())
-                    })
+                    .and_then(|o| o.as_object().or_else(|| o.native_function_object()))
                     .and_then(|o| o.get(&PropertyKey::string("prototype")))
                     .and_then(|v| v.as_object())
                     .map(Value::object)
@@ -942,10 +936,8 @@ impl Intrinsics {
 
                         if idx >= len {
                             // Mark as permanently done
-                            let _ = iter_obj.set(
-                                PropertyKey::string("__iter_done__"),
-                                Value::boolean(true),
-                            );
+                            let _ = iter_obj
+                                .set(PropertyKey::string("__iter_done__"), Value::boolean(true));
                             return Ok(create_iter_result(Value::undefined(), true, ncx));
                         }
 
@@ -1370,8 +1362,7 @@ impl Intrinsics {
                             .first()
                             .map(|v| crate::globals::to_number(v) as usize)
                             .unwrap_or(0);
-                        let little_endian =
-                            args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
+                        let little_endian = args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
                         let val = dv
                             .get_big_int64(offset, little_endian)
                             .map_err(|e| VmError::type_error(e))?;
@@ -1392,8 +1383,7 @@ impl Intrinsics {
                             .first()
                             .map(|v| crate::globals::to_number(v) as usize)
                             .unwrap_or(0);
-                        let little_endian =
-                            args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
+                        let little_endian = args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
                         let val = dv
                             .get_big_uint64(offset, little_endian)
                             .map_err(|e| VmError::type_error(e))?;
@@ -1420,8 +1410,7 @@ impl Intrinsics {
                             .get(1)
                             .map(|v| crate::globals::to_number(v) as i64)
                             .unwrap_or(0);
-                        let little_endian =
-                            args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
+                        let little_endian = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
                         dv.set_big_int64(offset, val, little_endian)
                             .map_err(|e| VmError::type_error(e))?;
                         Ok(Value::undefined())
@@ -1445,8 +1434,7 @@ impl Intrinsics {
                             .get(1)
                             .map(|v| crate::globals::to_number(v) as u64)
                             .unwrap_or(0);
-                        let little_endian =
-                            args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
+                        let little_endian = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
                         dv.set_big_uint64(offset, val, little_endian)
                             .map_err(|e| VmError::type_error(e))?;
                         Ok(Value::undefined())
@@ -1869,10 +1857,7 @@ impl Intrinsics {
                     for arg in args {
                         let n = ncx.to_number_value(arg)?;
                         if n != n.trunc() || n < 0.0 || n > 0x10FFFF as f64 || n.is_infinite() {
-                            return Err(VmError::range_error(&format!(
-                                "Invalid code point {}",
-                                n
-                            )));
+                            return Err(VmError::range_error(&format!("Invalid code point {}", n)));
                         }
                         let code = n as u32;
                         if let Some(ch) = char::from_u32(code) {
@@ -1911,7 +1896,11 @@ impl Intrinsics {
                                 PropertyDescriptor::Accessor { get, .. } => {
                                     if let Some(getter) = get {
                                         if !getter.is_undefined() {
-                                            return ncx.call_function(&getter, obj_val.clone(), &[]);
+                                            return ncx.call_function(
+                                                &getter,
+                                                obj_val.clone(),
+                                                &[],
+                                            );
                                         }
                                     }
                                     Ok(Value::undefined())
@@ -1933,21 +1922,27 @@ impl Intrinsics {
                     // 1. Let cooked be ? ToObject(template)
                     let template_val = args.first().cloned().unwrap_or(Value::undefined());
                     if template_val.is_undefined() || template_val.is_null() {
-                        return Err(VmError::type_error("Cannot convert undefined or null to object"));
+                        return Err(VmError::type_error(
+                            "Cannot convert undefined or null to object",
+                        ));
                     }
                     let template = template_val.as_object().ok_or_else(|| {
                         VmError::type_error("String.raw requires a template object")
                     })?;
                     // 2. Let raw be ? ToObject(? Get(cooked, "raw"))
-                    let raw_val = get_prop(&template, &template_val, &PropertyKey::string("raw"), ncx)?;
+                    let raw_val =
+                        get_prop(&template, &template_val, &PropertyKey::string("raw"), ncx)?;
                     if raw_val.is_undefined() || raw_val.is_null() {
-                        return Err(VmError::type_error("Cannot convert undefined or null to object"));
+                        return Err(VmError::type_error(
+                            "Cannot convert undefined or null to object",
+                        ));
                     }
                     let raw_obj = raw_val
                         .as_object()
                         .ok_or_else(|| VmError::type_error("raw must be an object"))?;
                     // 3. Let literalSegments be ? ToLength(? Get(raw, "length"))
-                    let len_val = get_prop(&raw_obj, &raw_val, &PropertyKey::string("length"), ncx)?;
+                    let len_val =
+                        get_prop(&raw_obj, &raw_val, &PropertyKey::string("length"), ncx)?;
                     let len_num = ncx.to_number_value(&len_val)?;
                     let len = if len_num.is_nan() || len_num < 0.0 {
                         0usize
@@ -1967,7 +1962,8 @@ impl Intrinsics {
                             }
                         }
                         // Get raw segment via ? Get(raw, ! ToString(nextIndex))
-                        let segment = get_prop(&raw_obj, &raw_val, &PropertyKey::Index(i as u32), ncx)?;
+                        let segment =
+                            get_prop(&raw_obj, &raw_val, &PropertyKey::Index(i as u32), ncx)?;
                         let seg_str = ncx.to_string_value(&segment)?;
                         result.push_str(&seg_str);
                     }

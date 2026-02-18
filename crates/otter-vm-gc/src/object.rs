@@ -1,6 +1,6 @@
 //! GC object layout
 
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 /// Global mark version counter.
 /// Bumped at the start of each GC cycle instead of iterating all objects

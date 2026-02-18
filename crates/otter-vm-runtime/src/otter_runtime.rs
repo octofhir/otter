@@ -2394,8 +2394,7 @@ impl Otter {
         loader: &Arc<crate::module_loader::ModuleLoader>,
     ) {
         ctx.register_external_root_set(
-            loader.clone()
-                as Arc<dyn otter_vm_core::context::ExternalRootSet + Send + Sync>,
+            loader.clone() as Arc<dyn otter_vm_core::context::ExternalRootSet + Send + Sync>
         );
     }
 

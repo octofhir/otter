@@ -228,13 +228,7 @@ fn value_to_array_args(args_list: &Value) -> Result<Vec<Value>, VmError> {
             arr_obj
                 .get(&PropertyKey::string("length"))
                 .and_then(|v| v.as_number())
-                .map(|n| {
-                    if n.is_nan() || n < 0.0 {
-                        0
-                    } else {
-                        n as usize
-                    }
-                })
+                .map(|n| if n.is_nan() || n < 0.0 { 0 } else { n as usize })
                 .unwrap_or(0)
         };
         let mut call_args = Vec::with_capacity(len.min(65536));

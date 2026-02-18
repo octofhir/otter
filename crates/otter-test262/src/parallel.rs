@@ -101,20 +101,19 @@ pub fn run_parallel(
     // -------------------------------------------------------------------------
     // Open JSONL log file if requested (truncate or append per flag).
     // -------------------------------------------------------------------------
-    let mut log_writer: Option<BufWriter<std::fs::File>> =
-        config.log_path.as_ref().and_then(|p| {
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(!config.log_append)
-                .append(config.log_append)
-                .open(p)
-                .ok()
-                .map(BufWriter::new)
-        });
+    let mut log_writer: Option<BufWriter<std::fs::File>> = config.log_path.as_ref().and_then(|p| {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(!config.log_append)
+            .append(config.log_append)
+            .open(p)
+            .ok()
+            .map(BufWriter::new)
+    });
 
     // -------------------------------------------------------------------------
     // Collect results on the calling thread.

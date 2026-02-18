@@ -26,6 +26,9 @@ var $DONE = function(err) {
 // $262 host object (test262 host-defined)
 var $262 = {
     global: this,
+    // Minimal host emulation for AnnexB IsHTMLDDA feature.
+    // It must be present and callable (used as a method in a number of tests).
+    IsHTMLDDA: function() { return undefined; },
     gc: function() {
         if (typeof __test262_gc === 'function') {
             __test262_gc();

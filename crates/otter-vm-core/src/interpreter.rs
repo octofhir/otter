@@ -5041,13 +5041,16 @@ impl Interpreter {
                         {
                             // Check for accessor properties (byteLength, buffer, byteOffset)
                             match proto.lookup_property_descriptor(&key) {
-                                Some(crate::object::PropertyDescriptor::Accessor { get, .. }) => {
+                                Some(crate::object::PropertyDescriptor::Accessor {
+                                    get, ..
+                                }) => {
                                     let Some(getter) = get else {
                                         ctx.set_register(dst.0, Value::undefined());
                                         return Ok(InstructionResult::Continue);
                                     };
                                     if let Some(native_fn) = getter.as_native_function() {
-                                        let result = self.call_native_fn(ctx, native_fn, &receiver, &[])?;
+                                        let result =
+                                            self.call_native_fn(ctx, native_fn, &receiver, &[])?;
                                         ctx.set_register(dst.0, result);
                                         return Ok(InstructionResult::Continue);
                                     }
@@ -5668,13 +5671,16 @@ impl Interpreter {
                             .and_then(|v| v.as_object())
                         {
                             match proto.lookup_property_descriptor(&key) {
-                                Some(crate::object::PropertyDescriptor::Accessor { get, .. }) => {
+                                Some(crate::object::PropertyDescriptor::Accessor {
+                                    get, ..
+                                }) => {
                                     let Some(getter) = get else {
                                         ctx.set_register(dst.0, Value::undefined());
                                         return Ok(InstructionResult::Continue);
                                     };
                                     if let Some(native_fn) = getter.as_native_function() {
-                                        let result = self.call_native_fn(ctx, native_fn, &receiver, &[])?;
+                                        let result =
+                                            self.call_native_fn(ctx, native_fn, &receiver, &[])?;
                                         ctx.set_register(dst.0, result);
                                         return Ok(InstructionResult::Continue);
                                     }
@@ -7423,12 +7429,18 @@ impl Interpreter {
                 } else if super_ctor_val.as_native_function().is_some() {
                     // Base case: super constructor is a native built-in (Array, RegExp, etc.)
                     // Create object with correct prototype, then call as constructor.
-                    let new_obj =
-                        GcRef::new(JsObject::new(Value::object(new_target_proto.clone()), mm.clone()));
+                    let new_obj = GcRef::new(JsObject::new(
+                        Value::object(new_target_proto.clone()),
+                        mm.clone(),
+                    ));
                     let new_obj_value = Value::object(new_obj);
 
-                    let result =
-                        self.call_function_construct(ctx, &super_ctor_val, new_obj_value.clone(), &args)?;
+                    let result = self.call_function_construct(
+                        ctx,
+                        &super_ctor_val,
+                        new_obj_value.clone(),
+                        &args,
+                    )?;
 
                     // Native constructors may return a different object (e.g., Array creates a new array).
                     // Fix its prototype to new_target_proto for proper subclassing.
@@ -7526,11 +7538,17 @@ impl Interpreter {
                     }
                 } else if super_ctor_val.as_native_function().is_some() {
                     // Native built-in constructor (Array, RegExp, etc.)
-                    let new_obj =
-                        GcRef::new(JsObject::new(Value::object(new_target_proto.clone()), mm.clone()));
+                    let new_obj = GcRef::new(JsObject::new(
+                        Value::object(new_target_proto.clone()),
+                        mm.clone(),
+                    ));
                     let new_obj_value = Value::object(new_obj);
-                    let result =
-                        self.call_function_construct(ctx, &super_ctor_val, new_obj_value.clone(), &args)?;
+                    let result = self.call_function_construct(
+                        ctx,
+                        &super_ctor_val,
+                        new_obj_value.clone(),
+                        &args,
+                    )?;
                     // Fix prototype for proper subclassing
                     let this_obj = if result.is_object() {
                         if let Some(obj) = result.as_object() {
@@ -7623,13 +7641,23 @@ impl Interpreter {
                     }
                     let result =
                         self.call_function(ctx, &super_ctor_val, Value::undefined(), &call_args)?;
-                    if result.is_object() { result } else { Value::undefined() }
+                    if result.is_object() {
+                        result
+                    } else {
+                        Value::undefined()
+                    }
                 } else if super_ctor_val.as_native_function().is_some() {
-                    let new_obj =
-                        GcRef::new(JsObject::new(Value::object(new_target_proto.clone()), mm.clone()));
+                    let new_obj = GcRef::new(JsObject::new(
+                        Value::object(new_target_proto.clone()),
+                        mm.clone(),
+                    ));
                     let new_obj_value = Value::object(new_obj);
-                    let result =
-                        self.call_function_construct(ctx, &super_ctor_val, new_obj_value.clone(), &call_args)?;
+                    let result = self.call_function_construct(
+                        ctx,
+                        &super_ctor_val,
+                        new_obj_value.clone(),
+                        &call_args,
+                    )?;
                     if result.is_object() {
                         if let Some(obj) = result.as_object() {
                             obj.set_prototype(Value::object(new_target_proto));
@@ -7642,9 +7670,17 @@ impl Interpreter {
                     let new_obj =
                         GcRef::new(JsObject::new(Value::object(new_target_proto), mm.clone()));
                     let new_obj_value = Value::object(new_obj);
-                    let result =
-                        self.call_function(ctx, &super_ctor_val, new_obj_value.clone(), &call_args)?;
-                    if result.is_object() { result } else { new_obj_value }
+                    let result = self.call_function(
+                        ctx,
+                        &super_ctor_val,
+                        new_obj_value.clone(),
+                        &call_args,
+                    )?;
+                    if result.is_object() {
+                        result
+                    } else {
+                        new_obj_value
+                    }
                 };
 
                 if let Some(frame) = ctx.current_frame_mut() {

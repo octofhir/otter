@@ -8,9 +8,9 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 
+use otter_test262::config::Test262Config;
 use otter_test262::editions::{self, EsEdition};
 use otter_test262::{PersistedReport, TestOutcome};
-use otter_test262::config::Test262Config;
 
 /// Stats accumulator for a category (edition, built-in, language feature).
 #[derive(Default)]
@@ -78,11 +78,17 @@ fn main() {
 
         // Per-edition (same logic as RunSummary::record in main.rs)
         if result.features.is_empty() {
-            by_edition.entry(EsEdition::ES5).or_default().record(&result.outcome);
+            by_edition
+                .entry(EsEdition::ES5)
+                .or_default()
+                .record(&result.outcome);
         } else {
             for feature in &result.features {
                 let edition = editions::feature_edition(feature);
-                by_edition.entry(edition).or_default().record(&result.outcome);
+                by_edition
+                    .entry(edition)
+                    .or_default()
+                    .record(&result.outcome);
             }
         }
 
@@ -129,12 +135,7 @@ fn main() {
 
     writeln!(f, "# ECMAScript Conformance Status").unwrap();
     writeln!(f).unwrap();
-    writeln!(
-        f,
-        "Last updated: {} (commit: {})",
-        today, git_commit
-    )
-    .unwrap();
+    writeln!(f, "Last updated: {} (commit: {})", today, git_commit).unwrap();
     writeln!(
         f,
         "Overall: {}/{} tests passing ({:.1}%)",
@@ -150,8 +151,16 @@ fn main() {
     writeln!(f, "## How to update").unwrap();
     writeln!(f).unwrap();
     writeln!(f, "```bash").unwrap();
-    writeln!(f, "just test262-save              # Run full suite, save results").unwrap();
-    writeln!(f, "just test262-conformance        # Regenerate this document").unwrap();
+    writeln!(
+        f,
+        "just test262-save              # Run full suite, save results"
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "just test262-conformance        # Regenerate this document"
+    )
+    .unwrap();
     writeln!(f, "```").unwrap();
     writeln!(f).unwrap();
 
@@ -248,7 +257,11 @@ fn main() {
     // Skipped Features
     writeln!(f, "## Skipped Features (not yet implemented)").unwrap();
     writeln!(f).unwrap();
-    writeln!(f, "These test262 features are skipped via `test262_config.toml`:").unwrap();
+    writeln!(
+        f,
+        "These test262 features are skipped via `test262_config.toml`:"
+    )
+    .unwrap();
     writeln!(f).unwrap();
     writeln!(f, "| Feature | Edition |").unwrap();
     writeln!(f, "|---------|---------|").unwrap();

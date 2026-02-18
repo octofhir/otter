@@ -2111,9 +2111,8 @@ impl VmContext {
         if registry.is_marking() {
             let done = registry.incremental_mark_step(MARKING_BUDGET);
             if done {
-                let _reclaimed = registry.finish_gc_with_pre_sweep_hook(
-                    crate::string::prune_dead_string_table_entries,
-                );
+                let _reclaimed = registry
+                    .finish_gc_with_pre_sweep_hook(crate::string::prune_dead_string_table_entries);
                 let live_bytes = registry.total_bytes();
                 self.memory_manager.on_gc_complete(live_bytes);
             }

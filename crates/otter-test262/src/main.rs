@@ -445,7 +445,11 @@ async fn run_tests(cli: Cli) {
 
         let run_duration = run_start.elapsed();
         let by_edition = summary.by_edition.clone();
-        let all_results = if save_results { summary.all_results.clone() } else { Vec::new() };
+        let all_results = if save_results {
+            summary.all_results.clone()
+        } else {
+            Vec::new()
+        };
         let report = summary.into_report();
 
         // Report
@@ -637,8 +641,13 @@ async fn run_tests(cli: Cli) {
                     timeout: summary.timeout,
                     crashed: summary.crashed,
                     pass_rate: {
-                        let run = summary.passed + summary.failed + summary.timeout + summary.crashed;
-                        if run > 0 { (summary.passed as f64 / run as f64) * 100.0 } else { 0.0 }
+                        let run =
+                            summary.passed + summary.failed + summary.timeout + summary.crashed;
+                        if run > 0 {
+                            (summary.passed as f64 / run as f64) * 100.0
+                        } else {
+                            0.0
+                        }
                     },
                     by_feature: summary.by_feature.clone(),
                     failures: summary.failures.clone(),

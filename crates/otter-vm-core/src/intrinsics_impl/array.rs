@@ -575,9 +575,7 @@ pub fn init_array_prototype(
             |this_val, _args, ncx| {
                 let obj = this_val
                     .as_object()
-                    .ok_or_else(|| {
-                        "Array.prototype.toLocaleString: not an object".to_string()
-                    })?;
+                    .ok_or_else(|| "Array.prototype.toLocaleString: not an object".to_string())?;
                 let len = get_len(&obj);
                 let mut parts = Vec::with_capacity(len.min(1024));
                 for i in 0..len {
@@ -1126,7 +1124,11 @@ pub fn init_array_prototype(
                     let keep = ncx.call_function(
                         &callback,
                         this_arg.clone(),
-                        &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
+                        &[
+                            val.clone(),
+                            Value::number(i as f64),
+                            Value::object(obj.clone()),
+                        ],
                     )?;
                     if keep.to_boolean() {
                         let _ = result.set(PropertyKey::Index(out_idx), val);
@@ -1170,7 +1172,11 @@ pub fn init_array_prototype(
                     let test = ncx.call_function(
                         &callback,
                         this_arg.clone(),
-                        &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
+                        &[
+                            val.clone(),
+                            Value::number(i as f64),
+                            Value::object(obj.clone()),
+                        ],
                     )?;
                     if test.to_boolean() {
                         return Ok(val);
@@ -1246,7 +1252,11 @@ pub fn init_array_prototype(
                     let test = ncx.call_function(
                         &callback,
                         this_arg.clone(),
-                        &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
+                        &[
+                            val.clone(),
+                            Value::number(i as f64),
+                            Value::object(obj.clone()),
+                        ],
                     )?;
                     if test.to_boolean() {
                         return Ok(val);
@@ -1437,7 +1447,12 @@ pub fn init_array_prototype(
                     accumulator = ncx.call_function(
                         &callback,
                         Value::undefined(),
-                        &[accumulator, val, Value::number(i as f64), Value::object(obj.clone())],
+                        &[
+                            accumulator,
+                            val,
+                            Value::number(i as f64),
+                            Value::object(obj.clone()),
+                        ],
                     )?;
                 }
                 Ok(accumulator)
@@ -1503,7 +1518,12 @@ pub fn init_array_prototype(
                     accumulator = ncx.call_function(
                         &callback,
                         Value::undefined(),
-                        &[accumulator, val, Value::number(i as f64), Value::object(obj.clone())],
+                        &[
+                            accumulator,
+                            val,
+                            Value::number(i as f64),
+                            Value::object(obj.clone()),
+                        ],
                     )?;
                 }
                 Ok(accumulator)
@@ -1618,8 +1638,7 @@ pub fn init_array_prototype(
 
                 if compare_fn.is_undefined() {
                     // Default: sort by ToString (spec §23.1.3.30.2)
-                    let mut string_pairs: Vec<(String, Value)> =
-                        Vec::with_capacity(concrete.len());
+                    let mut string_pairs: Vec<(String, Value)> = Vec::with_capacity(concrete.len());
                     for val in concrete {
                         let s = ncx.to_string_value(&val)?;
                         string_pairs.push((s, val));
@@ -2057,10 +2076,7 @@ pub fn init_array_prototype(
             "toSpliced",
             "values",
         ] {
-            let _ = unscopables_obj.set(
-                PropertyKey::string(method_name),
-                Value::boolean(true),
-            );
+            let _ = unscopables_obj.set(PropertyKey::string(method_name), Value::boolean(true));
         }
         arr_proto.define_property(
             PropertyKey::Symbol(unscopables_sym),
@@ -2156,7 +2172,7 @@ pub fn install_array_statics(
                     if iter_fn.is_callable() {
                         // Call [Symbol.iterator]() to get iterator
                         let iterator = ncx.call_function(&iter_fn, source.clone(), &[])?;
-                        let result = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+                        let result = create_default_array(0, ncx);
                         let mut k: u32 = 0;
 
                         loop {
@@ -2211,7 +2227,7 @@ pub fn install_array_statics(
                 if let Some(obj) = source.as_object() {
                     if let Some(len_val) = obj.get(&PropertyKey::string("length")) {
                         let len = len_val.as_number().unwrap_or(0.0).max(0.0) as usize;
-                        let result = GcRef::new(JsObject::array(len, ncx.memory_manager().clone()));
+                        let result = create_default_array(len, ncx);
                         for i in 0..len {
                             if i & 0x3FF == 0 {
                                 ncx.check_for_interrupt()?;
@@ -2236,7 +2252,7 @@ pub fn install_array_statics(
                 if let Some(s) = source.as_string() {
                     let chars: Vec<char> = s.as_str().chars().collect();
                     let len = chars.len();
-                    let result = GcRef::new(JsObject::array(len, ncx.memory_manager().clone()));
+                    let result = create_default_array(len, ncx);
                     for (i, ch) in chars.iter().enumerate() {
                         let val = Value::string(JsString::intern(&ch.to_string()));
                         let mapped = if has_map {
@@ -2253,10 +2269,7 @@ pub fn install_array_statics(
                     return Ok(Value::array(result));
                 }
 
-                Ok(Value::array(GcRef::new(JsObject::array(
-                    0,
-                    ncx.memory_manager().clone(),
-                ))))
+                Ok(Value::array(create_default_array(0, ncx)))
             },
             mm.clone(),
             fn_proto,

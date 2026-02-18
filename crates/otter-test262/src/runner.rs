@@ -448,17 +448,27 @@ impl Test262Runner {
             }
         }
 
-        // Add strict mode prefix AFTER harness files, before test content
-        if mode == ExecutionMode::Strict {
-            test_source.push_str("\"use strict\";\n");
-        }
-
         // Add test content (strip metadata)
         let test_content = content
             .find("---*/")
             .map(|i| &content[i + 5..])
             .unwrap_or(content);
-        test_source.push_str(test_content);
+        if mode == ExecutionMode::Strict {
+            // Run strict-mode test body via indirect eval so strictness applies
+            // to test code only (not to prepended harness files).
+            let strict_body = format!("\"use strict\";\n{}", test_content);
+            if let Ok(encoded) = serde_json::to_string(&strict_body) {
+                test_source.push_str("(0, eval)(");
+                test_source.push_str(&encoded);
+                test_source.push_str(");\n");
+            } else {
+                // Fallback: old behavior if encoding unexpectedly fails.
+                test_source.push_str("\"use strict\";\n");
+                test_source.push_str(test_content);
+            }
+        } else {
+            test_source.push_str(test_content);
+        }
 
         // Clear harness state before running the test
         self.harness_state.clear();

@@ -702,7 +702,10 @@ impl Value {
             + 'static,
     {
         let func: NativeFn = Arc::new(f);
-        let object = GcRef::new(JsObject::new(Value::object(prototype.clone()), memory_manager));
+        let object = GcRef::new(JsObject::new(
+            Value::object(prototype.clone()),
+            memory_manager,
+        ));
         object.define_property(
             crate::object::PropertyKey::string("length"),
             crate::object::PropertyDescriptor::function_length(Value::int32(length as i32)),

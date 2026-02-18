@@ -2021,8 +2021,11 @@ pub fn install_map_statics(
                 // Iterate items
                 let mut k: u32 = 0;
                 iterate_with_protocol(&items, ncx, |value, ncx| {
-                    let key =
-                        ncx.call_function(&callback, Value::undefined(), &[value.clone(), Value::number(k as f64)])?;
+                    let key = ncx.call_function(
+                        &callback,
+                        Value::undefined(),
+                        &[value.clone(), Value::number(k as f64)],
+                    )?;
                     k += 1;
 
                     // If key already exists in map, push to existing array; else create new array

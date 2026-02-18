@@ -296,11 +296,8 @@ pub fn create_aggregate_error_constructor() -> Box<
                 if let Some(iter_method) = iter_fn {
                     if iter_method.is_callable() {
                         // Use iterator protocol
-                        let iterator = ncx.call_function(
-                            &iter_method,
-                            Value::object(arr_obj.clone()),
-                            &[],
-                        )?;
+                        let iterator =
+                            ncx.call_function(&iter_method, Value::object(arr_obj.clone()), &[])?;
                         let result_arr = GcRef::new(JsObject::array(0, mm.clone()));
                         let mut idx = 0u32;
                         if let Some(iter_obj) = iterator.as_object() {
@@ -331,10 +328,8 @@ pub fn create_aggregate_error_constructor() -> Box<
                                 }
                             }
                         }
-                        let _ = result_arr.set(
-                            PropertyKey::string("length"),
-                            Value::number(idx as f64),
-                        );
+                        let _ = result_arr
+                            .set(PropertyKey::string("length"), Value::number(idx as f64));
                         Value::array(result_arr)
                     } else {
                         // No iterator, fall back to array-like

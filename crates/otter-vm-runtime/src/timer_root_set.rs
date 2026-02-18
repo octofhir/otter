@@ -50,9 +50,13 @@ impl TimerCallbackRoots {
     /// Call this immediately after the timer is created (before any JS executes),
     /// using the `u64` numeric timer ID returned by the event loop.
     pub fn register(&self, id: u64, callback: Value, extra_args: Vec<Value>) {
-        self.entries
-            .lock()
-            .insert(id, TimerEntry { callback, extra_args });
+        self.entries.lock().insert(
+            id,
+            TimerEntry {
+                callback,
+                extra_args,
+            },
+        );
     }
 
     /// Remove `id` from GC roots.

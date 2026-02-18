@@ -7313,9 +7313,9 @@ impl Compiler {
             let dst = self.codegen.alloc_reg();
             self.codegen.emit(Instruction::CallWithReceiver {
                 dst,
-                func: apply_frame,    // points to apply function
-                this: func_reg,       // receiver for apply = the original function
-                argc: 2,              // two args: this_val and argsArray
+                func: apply_frame, // points to apply function
+                this: func_reg,    // receiver for apply = the original function
+                argc: 2,           // two args: this_val and argsArray
             });
 
             self.codegen.free_reg(apply_reg);

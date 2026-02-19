@@ -37,6 +37,7 @@ pub fn init_typed_array_prototype(
     mm: &Arc<MemoryManager>,
     symbol_iterator: crate::gc::GcRef<crate::value::Symbol>,
     symbol_to_string_tag: crate::gc::GcRef<crate::value::Symbol>,
+    array_iter_proto: GcRef<JsObject>,
 ) {
     // Getters (ES2026 §22.2.3.1-4)
     init_typed_array_getters(proto, fn_proto, mm);
@@ -45,7 +46,7 @@ pub fn init_typed_array_prototype(
     init_typed_array_methods(proto, fn_proto, mm);
 
     // Iterators (ES2026 §22.2.3.6, 11, 29, 31)
-    init_typed_array_iterators(proto, fn_proto, mm, symbol_iterator);
+    init_typed_array_iterators(proto, fn_proto, mm, symbol_iterator, array_iter_proto);
 
     // %TypedArray%.prototype[Symbol.toStringTag] = "TypedArray"
     proto.define_property(
@@ -516,77 +517,18 @@ fn init_typed_array_iterators(
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
     symbol_iterator: crate::gc::GcRef<crate::value::Symbol>,
+    array_iter_proto: GcRef<JsObject>,
 ) {
-    let fn_proto_clone1 = fn_proto;
-    let fn_proto_clone2 = fn_proto;
-    let fn_proto_clone3 = fn_proto;
-
-    // %TypedArray%.prototype.values() — ES2026 §22.2.3.31
-    // This is the iterator method that returns an iterator
+    // %TypedArray%.prototype.values() — uses shared %ArrayIteratorPrototype%
+    let aip = array_iter_proto;
     let values_method = Value::native_function_with_proto(
         move |this_val, _args, ncx| {
-            let _ta = get_typed_array(this_val)?;
-
-            // Create an iterator object (simplified - would need proper iterator protocol)
-            let iter_obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-
-            // Store the typed array reference and current index
-            let _ = iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
-            let _ = iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
-
-            // Add next method
-            let _ = iter_obj.set(
-                PropertyKey::string("next"),
-                Value::native_function_with_proto(
-                    move |iter_this, _args, ncx_inner| {
-                        let iter_obj = iter_this
-                            .as_object()
-                            .ok_or_else(|| VmError::internal("iterator is not an object"))?;
-
-                        let ta_val = iter_obj
-                            .get(&PropertyKey::string("_typedArray"))
-                            .ok_or_else(|| VmError::internal("iterator missing _typedArray"))?;
-                        let ta = ta_val
-                            .as_typed_array()
-                            .ok_or_else(|| VmError::internal("_typedArray is not a TypedArray"))?;
-
-                        let index_val = iter_obj
-                            .get(&PropertyKey::string("_index"))
-                            .ok_or_else(|| VmError::internal("iterator missing _index"))?;
-                        let index = index_val.as_int32().unwrap_or(0) as usize;
-
-                        let result = GcRef::new(JsObject::new(
-                            Value::null(),
-                            ncx_inner.memory_manager().clone(),
-                        ));
-
-                        if index >= ta.length() {
-                            let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
-                            let _ = result.set(PropertyKey::string("value"), Value::undefined());
-                        } else {
-                            let val = ta
-                                .get(index)
-                                .map(Value::number)
-                                .unwrap_or(Value::undefined());
-                            let _ = result.set(PropertyKey::string("value"), val);
-                            let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
-                            let _ = iter_obj.set(
-                                PropertyKey::string("_index"),
-                                Value::int32((index + 1) as i32),
-                            );
-                        }
-
-                        Ok(Value::object(result))
-                    },
-                    ncx.memory_manager().clone(),
-                    fn_proto_clone1,
-                ),
-            );
-
-            Ok(Value::object(iter_obj))
+            let ta = get_typed_array(this_val)?;
+            let ta_val = Value::typed_array(ta);
+            super::array::make_array_iterator(&ta_val, "value", ncx.memory_manager(), fn_proto, aip)
         },
         mm.clone(),
-        fn_proto_clone1,
+        fn_proto,
     );
 
     proto.define_property(
@@ -600,151 +542,33 @@ fn init_typed_array_iterators(
         PropertyDescriptor::builtin_method(values_method),
     );
 
-    // %TypedArray%.prototype.keys() — ES2026 §22.2.3.16 (different from lastIndexOf!)
+    // %TypedArray%.prototype.keys()
+    let aip = array_iter_proto;
     proto.define_property(
         PropertyKey::string("keys"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             move |this_val, _args, ncx| {
-                let _ta = get_typed_array(this_val)?;
-
-                let iter_obj =
-                    GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                let _ = iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
-                let _ = iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
-
-                let _ = iter_obj.set(
-                    PropertyKey::string("next"),
-                    Value::native_function_with_proto(
-                        move |iter_this, _args, ncx_inner| {
-                            let iter_obj = iter_this
-                                .as_object()
-                                .ok_or_else(|| VmError::internal("iterator is not an object"))?;
-
-                            let ta_val = iter_obj
-                                .get(&PropertyKey::string("_typedArray"))
-                                .ok_or_else(|| VmError::internal("iterator missing _typedArray"))?;
-                            let ta = ta_val.as_typed_array().ok_or_else(|| {
-                                VmError::internal("_typedArray is not a TypedArray")
-                            })?;
-
-                            let index = iter_obj
-                                .get(&PropertyKey::string("_index"))
-                                .and_then(|v| v.as_int32())
-                                .unwrap_or(0) as usize;
-
-                            let result = GcRef::new(JsObject::new(
-                                Value::null(),
-                                ncx_inner.memory_manager().clone(),
-                            ));
-
-                            if index >= ta.length() {
-                                let _ =
-                                    result.set(PropertyKey::string("done"), Value::boolean(true));
-                                let _ =
-                                    result.set(PropertyKey::string("value"), Value::undefined());
-                            } else {
-                                let _ = result
-                                    .set(PropertyKey::string("value"), Value::int32(index as i32));
-                                let _ =
-                                    result.set(PropertyKey::string("done"), Value::boolean(false));
-                                let _ = iter_obj.set(
-                                    PropertyKey::string("_index"),
-                                    Value::int32((index + 1) as i32),
-                                );
-                            }
-
-                            Ok(Value::object(result))
-                        },
-                        ncx.memory_manager().clone(),
-                        fn_proto_clone2,
-                    ),
-                );
-
-                Ok(Value::object(iter_obj))
+                let ta = get_typed_array(this_val)?;
+                let ta_val = Value::typed_array(ta);
+                super::array::make_array_iterator(&ta_val, "key", ncx.memory_manager(), fn_proto, aip)
             },
             mm.clone(),
-            fn_proto_clone2,
+            fn_proto,
         )),
     );
 
-    // %TypedArray%.prototype.entries() — ES2026 §22.2.3.9
+    // %TypedArray%.prototype.entries()
+    let aip = array_iter_proto;
     proto.define_property(
         PropertyKey::string("entries"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             move |this_val, _args, ncx| {
-                let _ta = get_typed_array(this_val)?;
-
-                let iter_obj =
-                    GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
-                let _ = iter_obj.set(PropertyKey::string("_typedArray"), this_val.clone());
-                let _ = iter_obj.set(PropertyKey::string("_index"), Value::int32(0));
-
-                let _ = iter_obj.set(
-                    PropertyKey::string("next"),
-                    Value::native_function_with_proto(
-                        move |iter_this, _args, ncx_inner| {
-                            let iter_obj = iter_this
-                                .as_object()
-                                .ok_or_else(|| VmError::internal("iterator is not an object"))?;
-
-                            let ta_val = iter_obj
-                                .get(&PropertyKey::string("_typedArray"))
-                                .ok_or_else(|| VmError::internal("iterator missing _typedArray"))?;
-                            let ta = ta_val.as_typed_array().ok_or_else(|| {
-                                VmError::internal("_typedArray is not a TypedArray")
-                            })?;
-
-                            let index = iter_obj
-                                .get(&PropertyKey::string("_index"))
-                                .and_then(|v| v.as_int32())
-                                .unwrap_or(0) as usize;
-
-                            let result = GcRef::new(JsObject::new(
-                                Value::null(),
-                                ncx_inner.memory_manager().clone(),
-                            ));
-
-                            if index >= ta.length() {
-                                let _ =
-                                    result.set(PropertyKey::string("done"), Value::boolean(true));
-                                let _ =
-                                    result.set(PropertyKey::string("value"), Value::undefined());
-                            } else {
-                                let val = ta
-                                    .get(index)
-                                    .map(Value::number)
-                                    .unwrap_or(Value::undefined());
-
-                                // Create [index, value] array
-                                let entry = GcRef::new(JsObject::new(
-                                    Value::null(),
-                                    ncx_inner.memory_manager().clone(),
-                                ));
-                                let _ =
-                                    entry.set(PropertyKey::Index(0), Value::int32(index as i32));
-                                let _ = entry.set(PropertyKey::Index(1), val);
-
-                                let _ =
-                                    result.set(PropertyKey::string("value"), Value::object(entry));
-                                let _ =
-                                    result.set(PropertyKey::string("done"), Value::boolean(false));
-                                let _ = iter_obj.set(
-                                    PropertyKey::string("_index"),
-                                    Value::int32((index + 1) as i32),
-                                );
-                            }
-
-                            Ok(Value::object(result))
-                        },
-                        ncx.memory_manager().clone(),
-                        fn_proto_clone3,
-                    ),
-                );
-
-                Ok(Value::object(iter_obj))
+                let ta = get_typed_array(this_val)?;
+                let ta_val = Value::typed_array(ta);
+                super::array::make_array_iterator(&ta_val, "entry", ncx.memory_manager(), fn_proto, aip)
             },
             mm.clone(),
-            fn_proto_clone3,
+            fn_proto,
         )),
     );
 

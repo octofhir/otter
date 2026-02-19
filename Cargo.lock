@@ -2400,6 +2400,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "dunce",
+ "otter-macros",
  "otter-profiler",
  "otter-vm-bytecode",
  "otter-vm-compiler",

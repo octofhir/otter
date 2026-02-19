@@ -14,46 +14,67 @@ timeout_secs = 10
 # results_dir = "test262_results"
 
 # Features to skip (tests requiring these features will be skipped).
-# These features are not yet implemented in Otter.
+# Only skip features we truly cannot support (infra gaps or active proposals).
 skip_features = [
-    # Atomics & shared memory
+    # Atomics & shared memory (requires SharedArrayBuffer infra)
     "Atomics",
+    "Atomics.pause",
     "SharedArrayBuffer",
-    # Decorators proposal
+
+    # Decorators (Stage 3, not yet standardized)
     "decorators",
-    # Import assertions / attributes
+
+    # Module system (requires module loader in test262 harness)
     "import-assertions",
     "import-attributes",
-    # FinalizationRegistry / WeakRef
-    "FinalizationRegistry",
-    "WeakRef",
-    # ShadowRealm
-    "ShadowRealm",
-    # Explicit resource management (using/await using)
-    "explicit-resource-management",
-    # Tail calls
-    "tail-call-optimization",
-    # Import / export (module system)
+    "import-bytes",
+    "import-defer",
     "dynamic-import",
     "import.meta",
-    # Resizable ArrayBuffer
+    "json-modules",
+    "source-phase-imports",
+    "source-phase-imports-module-source",
+    "export-star-as-namespace-from-module",
+    "top-level-await",
+
+    # FinalizationRegistry / WeakRef (GC-dependent, not yet implemented)
+    "FinalizationRegistry",
+    "WeakRef",
+    "host-gc-required",
+
+    # ShadowRealm (proposal)
+    "ShadowRealm",
+    "cross-realm",
+
+    # Explicit resource management (using/await using)
+    "explicit-resource-management",
+
+    # Tail calls (engine architecture)
+    "tail-call-optimization",
+
+    # Resizable / immutable ArrayBuffer (not yet implemented)
     "resizable-arraybuffer",
     "arraybuffer-transfer",
-    # JSON modules
-    "json-modules",
-    # Iterator helpers
+    "immutable-arraybuffer",
+
+    # Iterator helpers & sequencing (ES2025, not yet implemented)
     "iterator-helpers",
-    # Hashbang
+    "iterator-sequencing",
+    "joint-iteration",
+
+    # Hashbang (parser feature)
     "hashbang",
-    # Class features
-    "class-fields-public",
-    "class-methods-private",
-    "class-static-block",
-    "class-static-fields-private",
-    "class-static-fields-public",
-    "class-static-methods-private",
-    # Other proposals
+
+    # Active proposals (not yet standardized)
     "Array.fromAsync",
+    "Error.isError",
+    "Float16Array",
+    "Math.sumPrecise",
+    "RegExp.escape",
+    "upsert",
+    "uint8array-base64",
+    "import-bytes",
+    "import-defer",
 ]
 
 # Test path patterns to ignore (tests matching these patterns will be skipped)

@@ -1584,11 +1584,10 @@ pub fn init_string_prototype(
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |this_val, args, ncx| {
                 let s = require_object_coercible_to_string(this_val, ncx)?;
-                let str_val = s.as_str();
                 let pos_val = args.first().cloned().unwrap_or(Value::undefined());
                 let pos = to_integer_or_infinity(&pos_val, ncx)?;
 
-                let utf16: Vec<u16> = str_val.encode_utf16().collect();
+                let utf16 = s.as_utf16();
                 if pos < 0.0 || pos >= utf16.len() as f64 {
                     return Ok(Value::undefined());
                 }

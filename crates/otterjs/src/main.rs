@@ -853,7 +853,7 @@ async fn run_test_file(
 ) -> Result<(usize, usize, usize)> {
     println!("  {}", path.display());
 
-    let source = std::fs::read_to_string(path)?;
+    let _source = std::fs::read_to_string(path)?;
     let caps = build_capabilities(cli);
 
     let mut engine = {

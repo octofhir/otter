@@ -389,6 +389,10 @@ pub struct Function {
     /// Whether this function has been deoptimized (JIT code invalidated permanently)
     #[serde(skip)]
     pub is_deoptimized: std::sync::atomic::AtomicBool,
+
+    /// For derived constructors: index of an inner function that initializes
+    /// instance fields. Called on `this` after `super()` returns.
+    pub field_init_func: Option<u32>,
 }
 
 impl Function {
@@ -521,6 +525,7 @@ impl Clone for Function {
             is_deoptimized: std::sync::atomic::AtomicBool::new(
                 self.is_deoptimized.load(Ordering::Relaxed),
             ),
+            field_init_func: self.field_init_func,
         }
     }
 }
@@ -679,6 +684,7 @@ impl FunctionBuilder {
             is_hot: std::sync::atomic::AtomicBool::new(false),
             bailout_count: AtomicU32::new(0),
             is_deoptimized: std::sync::atomic::AtomicBool::new(false),
+            field_init_func: None,
         }
     }
 }

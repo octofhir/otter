@@ -15,6 +15,7 @@ otter-vm-core = { path = "../otter-vm-core" }
 otter-vm-gc = { path = "../otter-vm-gc" }
 otter-vm-bytecode = { path = "../otter-vm-bytecode" }
 otter-vm-compiler = { path = "../otter-vm-compiler" }
+otter-macros = { path = "../otter-macros" }
 otter-profiler = { path = "../otter-profiler", optional = true }
 dunce = "1"
 oxc_resolver = "11"

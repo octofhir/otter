@@ -226,14 +226,18 @@ fn array_species_create(
 }
 
 /// Create an array iterator object with the given kind ("value", "key", or "entry").
-fn make_array_iterator(
+/// Works for both regular arrays/objects and TypedArrays.
+pub(crate) fn make_array_iterator(
     this_val: &Value,
     kind: &str,
     mm: &Arc<MemoryManager>,
     _fn_proto: GcRef<JsObject>,
     array_iter_proto: GcRef<JsObject>,
 ) -> Result<Value, crate::error::VmError> {
-    if this_val.as_object().is_none() && this_val.as_proxy().is_none() {
+    if this_val.as_object().is_none()
+        && this_val.as_proxy().is_none()
+        && this_val.as_typed_array().is_none()
+    {
         return Err("Array iterator: this is not an object".to_string().into());
     }
     // Create iterator with %ArrayIteratorPrototype% as prototype (has next() on it)

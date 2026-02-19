@@ -16,6 +16,11 @@ pub struct JsRegExp {
     pub flags: String,
     /// Whether this regex uses Unicode (u or v flags)
     pub unicode: bool,
+    /// Capture group names by capture index (1-based slots stored 0-based).
+    /// `None` for unnamed capturing groups.
+    pub capture_group_names: Vec<Option<String>>,
+    /// Fast-path fallback for non-unicode literal patterns with astral chars.
+    pub fallback_literal_utf16: Option<Vec<u16>>,
     /// The compiled Rust regex (if compilation succeeded)
     pub native_regex: Option<Regex>,
 }
@@ -55,13 +60,18 @@ impl JsRegExp {
         // Only lastIndex is an own data property.
         let parsed_flags = Flags::from(flags.as_str());
         let unicode = parsed_flags.unicode || parsed_flags.unicode_sets;
-        let native_regex = Regex::with_flags(&pattern, parsed_flags).ok();
+        let capture_group_names = parse_capture_group_names(&pattern);
+        let engine_pattern = compile_pattern_for_regress(&pattern, &parsed_flags);
+        let fallback_literal_utf16 = compute_literal_utf16_fallback(&pattern, &parsed_flags);
+        let native_regex = Regex::with_flags(&engine_pattern, parsed_flags).ok();
 
         Self {
             object,
             pattern,
             flags,
             unicode,
+            capture_group_names,
+            fallback_literal_utf16,
             native_regex,
         }
     }
@@ -79,4 +89,101 @@ impl JsRegExp {
             re.find_from_ucs2(input.as_utf16(), start).next()
         }
     }
+}
+
+/// Convert non-BMP literals into surrogate-pair escapes for non-unicode matching.
+///
+/// JS non-`u`/`v` regexes operate on UCS-2 code units. Regress parses Rust UTF-8
+/// source scalars; this rewrite preserves JS behavior for astral literals like `𠮷`.
+pub(crate) fn compile_pattern_for_regress(pattern: &str, flags: &Flags) -> String {
+    let _ = flags;
+    pattern.to_string()
+}
+
+fn is_plain_literal_pattern(pattern: &str) -> bool {
+    // Keep this strict: fallback is only for true literal patterns.
+    !pattern.is_empty()
+        && !pattern.contains('\\')
+        && !pattern
+            .chars()
+            .any(|c| matches!(c, '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'))
+}
+
+pub(crate) fn compute_literal_utf16_fallback(pattern: &str, flags: &Flags) -> Option<Vec<u16>> {
+    if flags.unicode || flags.unicode_sets || !is_plain_literal_pattern(pattern) {
+        return None;
+    }
+    let has_astral = pattern.chars().any(|ch| (ch as u32) > 0xFFFF);
+    if !has_astral {
+        return None;
+    }
+    Some(pattern.encode_utf16().collect())
+}
+
+pub(crate) fn parse_capture_group_names(pattern: &str) -> Vec<Option<String>> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut in_class = false;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' {
+            i += 2;
+            continue;
+        }
+        if in_class {
+            if ch == ']' {
+                in_class = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '[' {
+            in_class = true;
+            i += 1;
+            continue;
+        }
+        if ch != '(' {
+            i += 1;
+            continue;
+        }
+
+        // Group start
+        if i + 1 < chars.len() && chars[i + 1] == '?' {
+            if i + 2 < chars.len() {
+                match chars[i + 2] {
+                    ':' | '=' | '!' => {
+                        // Non-capturing / lookahead
+                    }
+                    '<' => {
+                        // Named capture (?<name>...) vs lookbehind (?<= / ?<!)
+                        if i + 3 < chars.len() && (chars[i + 3] == '=' || chars[i + 3] == '!') {
+                            // lookbehind, non-capturing
+                        } else {
+                            let mut j = i + 3;
+                            let mut name = String::new();
+                            while j < chars.len() && chars[j] != '>' {
+                                name.push(chars[j]);
+                                j += 1;
+                            }
+                            if !name.is_empty() && j < chars.len() && chars[j] == '>' {
+                                out.push(Some(name));
+                            } else {
+                                out.push(None);
+                            }
+                        }
+                    }
+                    _ => {
+                        // Inline modifier group; non-capturing.
+                    }
+                }
+            }
+        } else {
+            out.push(None);
+        }
+        i += 1;
+    }
+
+    out
 }

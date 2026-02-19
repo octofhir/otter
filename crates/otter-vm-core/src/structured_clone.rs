@@ -10,13 +10,14 @@
 //! - Throws on non-cloneable values (functions, symbols, etc.)
 
 use crate::gc::GcRef;
+use crate::intrinsics_impl::helpers::MapKey;
+use crate::map_data::{MapData, SetData};
 use crate::object::{JsObject, PropertyKey};
 use crate::value::{HeapRef, Value};
 use crate::{JsDataView, JsTypedArray};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-// Re-export for tests
 #[cfg(test)]
 use crate::shared_buffer::SharedArrayBuffer;
 #[cfg(test)]
@@ -141,8 +142,8 @@ impl StructuredCloner {
             Some(HeapRef::TypedArray(ta)) => self.clone_typed_array(*ta),
             Some(HeapRef::DataView(dv)) => self.clone_data_view(*dv),
 
-            Some(HeapRef::MapData(_)) => Err(StructuredCloneError::NotCloneable("MapData")),
-            Some(HeapRef::SetData(_)) => Err(StructuredCloneError::NotCloneable("SetData")),
+            Some(HeapRef::MapData(md)) => self.clone_map_data(*md),
+            Some(HeapRef::SetData(sd)) => self.clone_set_data(*sd),
             Some(HeapRef::EphemeronTable(_)) => {
                 Err(StructuredCloneError::NotCloneable("EphemeronTable"))
             }
@@ -159,19 +160,227 @@ impl StructuredCloner {
             return Ok(cloned.clone());
         }
 
-        // Create new object
-        let new_obj = GcRef::new(JsObject::new(Value::null(), self.memory_manager.clone()));
-        let new_value = Value::object(new_obj);
+        // Detect special object types via marker properties.
+        // Must happen before generic property cloning because these objects have
+        // internal slots (__map_data__, __set_data__) that contain non-cloneable
+        // Value types when treated generically.
 
-        // Register before cloning properties (to handle circular refs)
+        // Date: has __timestamp__ (f64 ms since epoch)
+        if let Some(ts) = obj.get(&PropertyKey::string("__timestamp__")) {
+            return self.clone_date(obj, ptr, ts);
+        }
+
+        // Map: has __is_map__ and __map_data__
+        if obj
+            .get(&PropertyKey::string("__is_map__"))
+            .and_then(|v| v.as_boolean())
+            == Some(true)
+        {
+            if let Some(map_data) = obj
+                .get(&PropertyKey::string("__map_data__"))
+                .and_then(|v| v.as_map_data())
+            {
+                return self.clone_map(obj, ptr, map_data);
+            }
+        }
+
+        // Set: has __is_set__ and __set_data__
+        if obj
+            .get(&PropertyKey::string("__is_set__"))
+            .and_then(|v| v.as_boolean())
+            == Some(true)
+        {
+            if let Some(set_data) = obj
+                .get(&PropertyKey::string("__set_data__"))
+                .and_then(|v| v.as_set_data())
+            {
+                return self.clone_set(obj, ptr, set_data);
+            }
+        }
+
+        // Error: has __is_error__
+        if obj
+            .get(&PropertyKey::string("__is_error__"))
+            .and_then(|v| v.as_boolean())
+            == Some(true)
+        {
+            return self.clone_error(obj, ptr);
+        }
+
+        // Generic object: clone all own properties
+        let new_obj = GcRef::new(JsObject::new(obj.prototype(), self.memory_manager.clone()));
+        let new_value = Value::object(new_obj);
         self.memory.insert(ptr, new_value.clone());
 
-        // Clone all own properties
         for key in obj.own_keys() {
             if let Some(val) = obj.get(&key) {
                 let cloned_val = self.internal_clone(&val)?;
                 let _ = new_obj.set(key, cloned_val);
             }
+        }
+
+        Ok(new_value)
+    }
+
+    /// Clone a Date object — preserves __timestamp__ and prototype.
+    fn clone_date(
+        &mut self,
+        obj: GcRef<JsObject>,
+        ptr: usize,
+        timestamp: Value,
+    ) -> Result<Value, StructuredCloneError> {
+        let new_obj = GcRef::new(JsObject::new(obj.prototype(), self.memory_manager.clone()));
+        let _ = new_obj.set(PropertyKey::string("__timestamp__"), timestamp);
+        let new_value = Value::object(new_obj);
+        self.memory.insert(ptr, new_value.clone());
+        Ok(new_value)
+    }
+
+    /// Clone a Map object — creates a new MapData with recursively cloned entries.
+    fn clone_map(
+        &mut self,
+        obj: GcRef<JsObject>,
+        ptr: usize,
+        source_data: GcRef<MapData>,
+    ) -> Result<Value, StructuredCloneError> {
+        let new_data = GcRef::new(MapData::new());
+        let new_obj = GcRef::new(JsObject::new(obj.prototype(), self.memory_manager.clone()));
+        let _ = new_obj.set(
+            PropertyKey::string("__is_map__"),
+            Value::boolean(true),
+        );
+        let _ = new_obj.set(
+            PropertyKey::string("__map_data__"),
+            Value::map_data(new_data),
+        );
+        let new_value = Value::object(new_obj);
+        self.memory.insert(ptr, new_value.clone());
+
+        // Iterate source entries and clone each key-value pair
+        let entries = source_data.for_each_entries();
+        for (key, value) in entries {
+            let cloned_key = self.internal_clone(&key)?;
+            let cloned_value = self.internal_clone(&value)?;
+            new_data.set(MapKey(cloned_key), cloned_value);
+        }
+
+        Ok(new_value)
+    }
+
+    /// Clone a Set object — creates a new SetData with recursively cloned entries.
+    fn clone_set(
+        &mut self,
+        obj: GcRef<JsObject>,
+        ptr: usize,
+        source_data: GcRef<SetData>,
+    ) -> Result<Value, StructuredCloneError> {
+        let new_data = GcRef::new(SetData::new());
+        let new_obj = GcRef::new(JsObject::new(obj.prototype(), self.memory_manager.clone()));
+        let _ = new_obj.set(
+            PropertyKey::string("__is_set__"),
+            Value::boolean(true),
+        );
+        let _ = new_obj.set(
+            PropertyKey::string("__set_data__"),
+            Value::set_data(new_data),
+        );
+        let new_value = Value::object(new_obj);
+        self.memory.insert(ptr, new_value.clone());
+
+        // Iterate source entries and clone each value
+        let entries = source_data.for_each_entries();
+        for value in entries {
+            let cloned_value = self.internal_clone(&value)?;
+            new_data.add(MapKey(cloned_value));
+        }
+
+        Ok(new_value)
+    }
+
+    /// Clone an Error object — preserves name, message, cause, and stack frames.
+    fn clone_error(
+        &mut self,
+        obj: GcRef<JsObject>,
+        ptr: usize,
+    ) -> Result<Value, StructuredCloneError> {
+        let new_obj = GcRef::new(JsObject::new(obj.prototype(), self.memory_manager.clone()));
+        let _ = new_obj.set(
+            PropertyKey::string("__is_error__"),
+            Value::boolean(true),
+        );
+        let new_value = Value::object(new_obj);
+        self.memory.insert(ptr, new_value.clone());
+
+        // Copy standard Error properties
+        if let Some(name) = obj.get(&PropertyKey::string("name")) {
+            let cloned_name = self.internal_clone(&name)?;
+            let _ = new_obj.set(PropertyKey::string("name"), cloned_name);
+        }
+        if let Some(message) = obj.get(&PropertyKey::string("message")) {
+            let cloned_message = self.internal_clone(&message)?;
+            let _ = new_obj.set(PropertyKey::string("message"), cloned_message);
+        }
+        // cause can be any value — recursively clone it
+        if let Some(cause) = obj.get(&PropertyKey::string("cause")) {
+            let cloned_cause = self.internal_clone(&cause)?;
+            let _ = new_obj.set(PropertyKey::string("cause"), cloned_cause);
+        }
+        // Stack frames (internal array of frame objects)
+        if let Some(frames) = obj.get(&PropertyKey::string("__stack_frames__")) {
+            let cloned_frames = self.internal_clone(&frames)?;
+            let _ = new_obj.set(PropertyKey::string("__stack_frames__"), cloned_frames);
+        }
+        // stack (lazy string, may not be present)
+        if let Some(stack) = obj.get(&PropertyKey::string("stack")) {
+            let cloned_stack = self.internal_clone(&stack)?;
+            let _ = new_obj.set(PropertyKey::string("stack"), cloned_stack);
+        }
+
+        Ok(new_value)
+    }
+
+    /// Clone a standalone MapData value (can appear in nested contexts).
+    fn clone_map_data(
+        &mut self,
+        source: GcRef<MapData>,
+    ) -> Result<Value, StructuredCloneError> {
+        let ptr = source.as_ptr() as usize;
+        if let Some(cloned) = self.memory.get(&ptr) {
+            return Ok(cloned.clone());
+        }
+
+        let new_data = GcRef::new(MapData::new());
+        let new_value = Value::map_data(new_data);
+        self.memory.insert(ptr, new_value.clone());
+
+        let entries = source.for_each_entries();
+        for (key, value) in entries {
+            let cloned_key = self.internal_clone(&key)?;
+            let cloned_value = self.internal_clone(&value)?;
+            new_data.set(MapKey(cloned_key), cloned_value);
+        }
+
+        Ok(new_value)
+    }
+
+    /// Clone a standalone SetData value (can appear in nested contexts).
+    fn clone_set_data(
+        &mut self,
+        source: GcRef<SetData>,
+    ) -> Result<Value, StructuredCloneError> {
+        let ptr = source.as_ptr() as usize;
+        if let Some(cloned) = self.memory.get(&ptr) {
+            return Ok(cloned.clone());
+        }
+
+        let new_data = GcRef::new(SetData::new());
+        let new_value = Value::set_data(new_data);
+        self.memory.insert(ptr, new_value.clone());
+
+        let entries = source.for_each_entries();
+        for value in entries {
+            let cloned_value = self.internal_clone(&value)?;
+            new_data.add(MapKey(cloned_value));
         }
 
         Ok(new_value)
@@ -290,6 +499,8 @@ mod tests {
     use super::*;
     use crate::array_buffer::JsArrayBuffer;
     use crate::data_view::JsDataView;
+    use crate::intrinsics_impl::helpers::MapKey;
+    use crate::map_data::{MapData, SetData};
     use crate::typed_array::{JsTypedArray, TypedArrayKind};
 
     #[test]
@@ -442,5 +653,287 @@ mod tests {
         cloned_dv.set_uint8(0, 99).unwrap();
         assert_eq!(cloned_dv.get_uint8(0).unwrap(), 99);
         assert_eq!(dv.get_uint8(0).unwrap(), 11);
+    }
+
+    #[test]
+    fn test_clone_date() {
+        let _rt = crate::runtime::VmRuntime::new();
+        let mm = _rt.memory_manager().clone();
+        let mut cloner = StructuredCloner::new(mm.clone());
+
+        // Simulate a Date object: JsObject with __timestamp__
+        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let timestamp = 1700000000000.0_f64; // 2023-11-14T22:13:20Z
+        let _ = obj.set(
+            PropertyKey::string("__timestamp__"),
+            Value::number(timestamp),
+        );
+
+        let val = Value::object(obj);
+        let cloned = cloner.clone(&val).unwrap();
+
+        let cloned_obj = cloned.as_object().unwrap();
+        let cloned_ts = cloned_obj
+            .get(&PropertyKey::string("__timestamp__"))
+            .unwrap();
+        assert_eq!(cloned_ts.as_number(), Some(timestamp));
+
+        // Verify independence: changing original doesn't affect clone
+        let _ = obj.set(
+            PropertyKey::string("__timestamp__"),
+            Value::number(0.0),
+        );
+        let still_ts = cloned_obj
+            .get(&PropertyKey::string("__timestamp__"))
+            .unwrap();
+        assert_eq!(still_ts.as_number(), Some(timestamp));
+    }
+
+    #[test]
+    fn test_clone_date_nan() {
+        let _rt = crate::runtime::VmRuntime::new();
+        let mm = _rt.memory_manager().clone();
+        let mut cloner = StructuredCloner::new(mm.clone());
+
+        // Invalid Date has NaN timestamp
+        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let _ = obj.set(
+            PropertyKey::string("__timestamp__"),
+            Value::nan(),
+        );
+
+        let val = Value::object(obj);
+        let cloned = cloner.clone(&val).unwrap();
+        let cloned_obj = cloned.as_object().unwrap();
+        let ts = cloned_obj
+            .get(&PropertyKey::string("__timestamp__"))
+            .unwrap();
+        assert!(ts.as_number().unwrap().is_nan());
+    }
+
+    #[test]
+    fn test_clone_map() {
+        let _rt = crate::runtime::VmRuntime::new();
+        let mm = _rt.memory_manager().clone();
+        let mut cloner = StructuredCloner::new(mm.clone());
+
+        // Build a Map-like object
+        let data = GcRef::new(MapData::new());
+        data.set(MapKey(Value::string(JsString::intern("a"))), Value::int32(1));
+        data.set(MapKey(Value::string(JsString::intern("b"))), Value::int32(2));
+
+        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let _ = obj.set(PropertyKey::string("__is_map__"), Value::boolean(true));
+        let _ = obj.set(
+            PropertyKey::string("__map_data__"),
+            Value::map_data(data),
+        );
+
+        let val = Value::object(obj);
+        let cloned = cloner.clone(&val).unwrap();
+
+        let cloned_obj = cloned.as_object().unwrap();
+        assert_eq!(
+            cloned_obj
+                .get(&PropertyKey::string("__is_map__"))
+                .and_then(|v| v.as_boolean()),
+            Some(true)
+        );
+
+        let cloned_data = cloned_obj
+            .get(&PropertyKey::string("__map_data__"))
+            .unwrap()
+            .as_map_data()
+            .unwrap();
+        assert_eq!(cloned_data.size(), 2);
+        assert_eq!(
+            cloned_data.get(&MapKey(Value::string(JsString::intern("a")))),
+            Some(Value::int32(1))
+        );
+        assert_eq!(
+            cloned_data.get(&MapKey(Value::string(JsString::intern("b")))),
+            Some(Value::int32(2))
+        );
+
+        // Verify independence
+        data.set(MapKey(Value::string(JsString::intern("c"))), Value::int32(3));
+        assert_eq!(cloned_data.size(), 2); // clone unaffected
+    }
+
+    #[test]
+    fn test_clone_set() {
+        let _rt = crate::runtime::VmRuntime::new();
+        let mm = _rt.memory_manager().clone();
+        let mut cloner = StructuredCloner::new(mm.clone());
+
+        let data = GcRef::new(SetData::new());
+        data.add(MapKey(Value::int32(10)));
+        data.add(MapKey(Value::int32(20)));
+        data.add(MapKey(Value::int32(30)));
+
+        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let _ = obj.set(PropertyKey::string("__is_set__"), Value::boolean(true));
+        let _ = obj.set(
+            PropertyKey::string("__set_data__"),
+            Value::set_data(data),
+        );
+
+        let val = Value::object(obj);
+        let cloned = cloner.clone(&val).unwrap();
+
+        let cloned_obj = cloned.as_object().unwrap();
+        let cloned_data = cloned_obj
+            .get(&PropertyKey::string("__set_data__"))
+            .unwrap()
+            .as_set_data()
+            .unwrap();
+        assert_eq!(cloned_data.size(), 3);
+        assert!(cloned_data.has(&MapKey(Value::int32(10))));
+        assert!(cloned_data.has(&MapKey(Value::int32(20))));
+        assert!(cloned_data.has(&MapKey(Value::int32(30))));
+
+        // Verify independence
+        data.add(MapKey(Value::int32(40)));
+        assert_eq!(cloned_data.size(), 3);
+    }
+
+    #[test]
+    fn test_clone_error() {
+        let _rt = crate::runtime::VmRuntime::new();
+        let mm = _rt.memory_manager().clone();
+        let mut cloner = StructuredCloner::new(mm.clone());
+
+        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let _ = obj.set(PropertyKey::string("__is_error__"), Value::boolean(true));
+        let _ = obj.set(
+            PropertyKey::string("name"),
+            Value::string(JsString::intern("TypeError")),
+        );
+        let _ = obj.set(
+            PropertyKey::string("message"),
+            Value::string(JsString::intern("something went wrong")),
+        );
+
+        let val = Value::object(obj);
+        let cloned = cloner.clone(&val).unwrap();
+
+        let cloned_obj = cloned.as_object().unwrap();
+        assert_eq!(
+            cloned_obj
+                .get(&PropertyKey::string("__is_error__"))
+                .and_then(|v| v.as_boolean()),
+            Some(true)
+        );
+        assert_eq!(
+            cloned_obj
+                .get(&PropertyKey::string("name"))
+                .and_then(|v| v.as_string())
+                .map(|s| s.as_str().to_string()),
+            Some("TypeError".to_string())
+        );
+        assert_eq!(
+            cloned_obj
+                .get(&PropertyKey::string("message"))
+                .and_then(|v| v.as_string())
+                .map(|s| s.as_str().to_string()),
+            Some("something went wrong".to_string())
+        );
+    }
+
+    #[test]
+    fn test_clone_error_with_cause() {
+        let _rt = crate::runtime::VmRuntime::new();
+        let mm = _rt.memory_manager().clone();
+        let mut cloner = StructuredCloner::new(mm.clone());
+
+        // Inner cause error
+        let cause_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let _ = cause_obj.set(PropertyKey::string("__is_error__"), Value::boolean(true));
+        let _ = cause_obj.set(
+            PropertyKey::string("name"),
+            Value::string(JsString::intern("Error")),
+        );
+        let _ = cause_obj.set(
+            PropertyKey::string("message"),
+            Value::string(JsString::intern("root cause")),
+        );
+
+        // Outer error with cause
+        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let _ = obj.set(PropertyKey::string("__is_error__"), Value::boolean(true));
+        let _ = obj.set(
+            PropertyKey::string("name"),
+            Value::string(JsString::intern("Error")),
+        );
+        let _ = obj.set(
+            PropertyKey::string("message"),
+            Value::string(JsString::intern("wrapper")),
+        );
+        let _ = obj.set(
+            PropertyKey::string("cause"),
+            Value::object(cause_obj),
+        );
+
+        let val = Value::object(obj);
+        let cloned = cloner.clone(&val).unwrap();
+
+        let cloned_obj = cloned.as_object().unwrap();
+        let cloned_cause = cloned_obj
+            .get(&PropertyKey::string("cause"))
+            .unwrap();
+        let cloned_cause_obj = cloned_cause.as_object().unwrap();
+        assert_eq!(
+            cloned_cause_obj
+                .get(&PropertyKey::string("message"))
+                .and_then(|v| v.as_string())
+                .map(|s| s.as_str().to_string()),
+            Some("root cause".to_string())
+        );
+    }
+
+    #[test]
+    fn test_clone_map_with_object_values() {
+        let _rt = crate::runtime::VmRuntime::new();
+        let mm = _rt.memory_manager().clone();
+        let mut cloner = StructuredCloner::new(mm.clone());
+
+        // Map with object values that should be deeply cloned
+        let inner_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let _ = inner_obj.set(PropertyKey::string("x"), Value::int32(42));
+
+        let data = GcRef::new(MapData::new());
+        data.set(
+            MapKey(Value::string(JsString::intern("key"))),
+            Value::object(inner_obj),
+        );
+
+        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let _ = obj.set(PropertyKey::string("__is_map__"), Value::boolean(true));
+        let _ = obj.set(PropertyKey::string("__map_data__"), Value::map_data(data));
+
+        let cloned = cloner.clone(&Value::object(obj)).unwrap();
+
+        let cloned_data = cloned
+            .as_object()
+            .unwrap()
+            .get(&PropertyKey::string("__map_data__"))
+            .unwrap()
+            .as_map_data()
+            .unwrap();
+        let cloned_inner = cloned_data
+            .get(&MapKey(Value::string(JsString::intern("key"))))
+            .unwrap();
+        let cloned_inner_obj = cloned_inner.as_object().unwrap();
+        assert_eq!(
+            cloned_inner_obj.get(&PropertyKey::string("x")),
+            Some(Value::int32(42))
+        );
+
+        // Verify deep independence
+        let _ = inner_obj.set(PropertyKey::string("x"), Value::int32(999));
+        assert_eq!(
+            cloned_inner_obj.get(&PropertyKey::string("x")),
+            Some(Value::int32(42))
+        );
     }
 }

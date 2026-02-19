@@ -14,9 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::capabilities::Capabilities;
 use crate::env_store::IsolatedEnvStore;
-use crate::module_provider::ModuleType;
-use otter_vm_bytecode::module::{ImportBinding, ImportRecord};
-use otter_vm_bytecode::{Instruction, Module, Register, TypeFlags, UpvalueCapture};
+use otter_vm_bytecode::module::ImportBinding;
 use otter_vm_compiler::Compiler;
 use otter_vm_core::async_context::VmExecutionResult;
 use otter_vm_core::context::{VmContext, VmContextSnapshot};
@@ -74,7 +72,7 @@ impl ResumeSignal {
 /// High-level runtime that integrates VM, event loop, and extensions
 pub struct Otter {
     /// Isolate wrapping the bytecode VM with RAII thread-local management
-    isolate: Isolate,
+    pub(crate) isolate: Isolate,
     /// Event loop (shared)
     event_loop: Arc<EventLoop>,
     /// Module loader for resolving and loading ES modules

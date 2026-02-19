@@ -446,7 +446,15 @@ impl Interpreter {
     ) -> VmResult<Value> {
         // Check if it's a native function
         if let Some(native_fn) = func.as_native_function() {
-            return self.call_native_fn(ctx, native_fn, &this_value, args);
+            let realm_id = self.realm_id_for_function(ctx, func);
+            return self.call_native_fn_with_realm(
+                ctx,
+                native_fn,
+                &this_value,
+                args,
+                Some(realm_id),
+                false,
+            );
         }
 
         // Regular closure call
@@ -5919,6 +5927,19 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
+            Instruction::DefineMethod { obj, key, val } => {
+                let object = ctx.get_register(obj.0).clone();
+                let key_value = ctx.get_register(key.0).clone();
+                let value = ctx.get_register(val.0).clone();
+
+                if let Some(obj) = object.as_object() {
+                    let prop_key = self.value_to_property_key(ctx, &key_value)?;
+                    obj.define_property(prop_key, PropertyDescriptor::builtin_method(value));
+                }
+
+                Ok(InstructionResult::Continue)
+            }
+
             // ==================== Arrays ====================
             Instruction::NewArray { dst, len } => {
                 let arr = GcRef::new(JsObject::array(*len as usize, ctx.memory_manager().clone()));
@@ -6765,6 +6786,37 @@ impl Interpreter {
                         PropertyKey::string("length"),
                         Value::int32((dst_len + src_len) as i32),
                     );
+                } else if let (Some(dst_obj), Some(src_str)) = (dst_arr.as_object(), src_arr.as_string())
+                {
+                    // Spread string primitives by Unicode code point.
+                    let mut out_index = dst_obj
+                        .get(&PropertyKey::string("length"))
+                        .and_then(|v| v.as_int32())
+                        .unwrap_or(0) as u32;
+
+                    let units = src_str.as_utf16();
+                    let mut idx = 0usize;
+                    while idx < units.len() {
+                        let first = units[idx];
+                        let (ch, next_idx) =
+                            if crate::intrinsics_impl::string::is_high_surrogate(first)
+                                && idx + 1 < units.len()
+                                && crate::intrinsics_impl::string::is_low_surrogate(units[idx + 1])
+                            {
+                                (crate::string::JsString::intern_utf16(&[first, units[idx + 1]]), idx + 2)
+                            } else {
+                                (crate::string::JsString::intern_utf16(&[first]), idx + 1)
+                            };
+
+                        let _ = dst_obj.set(PropertyKey::Index(out_index), Value::string(ch));
+                        out_index += 1;
+                        idx = next_idx;
+                    }
+
+                    let _ = dst_obj.set(
+                        PropertyKey::string("length"),
+                        Value::int32(out_index as i32),
+                    );
                 }
 
                 Ok(InstructionResult::Continue)
@@ -7262,6 +7314,9 @@ impl Interpreter {
                     frame.this_initialized = true;
                 }
 
+                // Run field initializers (if any) now that `this` is ready
+                self.run_field_initializers(ctx, &this_value)?;
+
                 ctx.set_register(dst.0, this_value);
                 Ok(InstructionResult::Continue)
             }
@@ -7363,6 +7418,10 @@ impl Interpreter {
                     frame.this_value = this_value.clone();
                     frame.this_initialized = true;
                 }
+
+                // Run field initializers (if any) now that `this` is ready
+                self.run_field_initializers(ctx, &this_value)?;
+
                 ctx.set_register(dst.0, this_value);
                 Ok(InstructionResult::Continue)
             }
@@ -7474,6 +7533,10 @@ impl Interpreter {
                     frame.this_value = this_value.clone();
                     frame.this_initialized = true;
                 }
+
+                // Run field initializers (if any) now that `this` is ready
+                self.run_field_initializers(ctx, &this_value)?;
+
                 ctx.set_register(dst.0, this_value);
                 Ok(InstructionResult::Continue)
             }
@@ -8051,13 +8114,56 @@ impl Interpreter {
         this_value: &Value,
         args: &[Value],
     ) -> VmResult<Value> {
+        self.call_native_fn_with_realm(ctx, native_fn, this_value, args, None, false)
+    }
+
+    fn call_native_fn_with_realm(
+        &self,
+        ctx: &mut VmContext,
+        native_fn: &crate::value::NativeFn,
+        this_value: &Value,
+        args: &[Value],
+        target_realm: Option<RealmId>,
+        as_construct: bool,
+    ) -> VmResult<Value> {
+        let previous_realm = ctx.realm_id();
+        if let Some(realm_id) = target_realm {
+            if realm_id != previous_realm {
+                ctx.switch_realm(realm_id);
+            }
+        }
+
         ctx.enter_native_call()?;
         let result = {
-            let mut ncx = crate::context::NativeContext::new(ctx, self);
+            let mut ncx = if as_construct {
+                crate::context::NativeContext::new_construct(ctx, self)
+            } else {
+                crate::context::NativeContext::new(ctx, self)
+            };
             native_fn(this_value, args, &mut ncx)
         };
-        // ncx dropped here — ctx borrow released
         ctx.exit_native_call();
+
+        let result = match result {
+            Err(VmError::TypeError(message)) => {
+                Err(VmError::exception(self.make_error(ctx, "TypeError", &message)))
+            }
+            Err(VmError::RangeError(message)) => {
+                Err(VmError::exception(self.make_error(ctx, "RangeError", &message)))
+            }
+            Err(VmError::ReferenceError(message)) => Err(VmError::exception(
+                self.make_error(ctx, "ReferenceError", &message),
+            )),
+            Err(VmError::SyntaxError(message)) => {
+                Err(VmError::exception(self.make_error(ctx, "SyntaxError", &message)))
+            }
+            other => other,
+        };
+
+        if ctx.realm_id() != previous_realm {
+            ctx.switch_realm(previous_realm);
+        }
+
         result
     }
 
@@ -8085,7 +8191,15 @@ impl Interpreter {
 
         // Check if it's a native function
         if let Some(native_fn) = func.as_native_function() {
-            return self.call_native_fn_construct(ctx, native_fn, &this_value, args);
+            let realm_id = self.realm_id_for_function(ctx, func);
+            return self.call_native_fn_with_realm(
+                ctx,
+                native_fn,
+                &this_value,
+                args,
+                Some(realm_id),
+                true,
+            );
         }
 
         // Regular closure call
@@ -8321,13 +8435,7 @@ impl Interpreter {
         this_value: &Value,
         args: &[Value],
     ) -> VmResult<Value> {
-        ctx.enter_native_call()?;
-        let result = {
-            let mut ncx = crate::context::NativeContext::new_construct(ctx, self);
-            native_fn(this_value, args, &mut ncx)
-        };
-        ctx.exit_native_call();
-        result
+        self.call_native_fn_with_realm(ctx, native_fn, this_value, args, None, true)
     }
 
     /// Handle a function call value (native or closure)
@@ -8383,8 +8491,16 @@ impl Interpreter {
 
         // 2. Handle native functions
         if let Some(native_fn) = current_func.as_native_function() {
+            let realm_id = self.realm_id_for_function(ctx, &current_func);
             // Native function execution
-            match self.call_native_fn(ctx, native_fn, &current_this, &current_args) {
+            match self.call_native_fn_with_realm(
+                ctx,
+                native_fn,
+                &current_this,
+                &current_args,
+                Some(realm_id),
+                false,
+            ) {
                 Ok(result) => {
                     ctx.set_register(return_reg, result);
                     return Ok(InstructionResult::Continue);
@@ -8497,10 +8613,9 @@ impl Interpreter {
 
         // String concatenation
         if left_prim.is_string() || right_prim.is_string() {
-            let left_str = self.to_string_value(ctx, &left_prim)?;
-            let right_str = self.to_string_value(ctx, &right_prim)?;
-            let result = format!("{}{}", left_str, right_str);
-            let js_str = JsString::intern(&result);
+            let mut units = self.to_string_utf16_units(ctx, &left_prim)?;
+            units.extend(self.to_string_utf16_units(ctx, &right_prim)?);
+            let js_str = JsString::intern_utf16(&units);
             return Ok(Value::string(js_str));
         }
 
@@ -9097,6 +9212,15 @@ impl Interpreter {
             return self.to_string_value(ctx, &prim);
         }
         Ok("[object Object]".to_string())
+    }
+
+    /// Convert value to UTF-16 code units of ToString(value), preserving lone surrogates
+    /// for existing JS string values.
+    fn to_string_utf16_units(&self, ctx: &mut VmContext, value: &Value) -> VmResult<Vec<u16>> {
+        if let Some(s) = value.as_string() {
+            return Ok(s.as_utf16().to_vec());
+        }
+        Ok(self.to_string_value(ctx, value)?.encode_utf16().collect())
     }
 
     /// Convert value to number per ES2023 §7.1.4.
@@ -9697,6 +9821,53 @@ impl Interpreter {
         }
 
         Ok(captured)
+    }
+
+    /// Run the field initializer function for derived constructors after super() returns.
+    /// The field_init_func is compiled as an inner function of the constructor.
+    /// It is called with `this` bound to the newly created instance.
+    fn run_field_initializers(
+        &self,
+        ctx: &mut VmContext,
+        this_value: &Value,
+    ) -> VmResult<()> {
+        // Get the current frame's module and function index
+        let (module, function_index) = {
+            let frame = ctx.current_frame()
+                .ok_or_else(|| VmError::internal("no frame for field init"))?;
+            (frame.module.clone(), frame.function_index)
+        };
+
+        // Look up the constructor's field_init_func
+        let field_init_idx = match module.function(function_index) {
+            Some(func) => func.field_init_func,
+            None => None,
+        };
+
+        if let Some(init_idx) = field_init_idx {
+            // Get the field init function definition
+            let init_func = module.function(init_idx)
+                .ok_or_else(|| VmError::internal("field init function not found"))?;
+
+            // Capture upvalues from the current frame (the constructor)
+            let captured = self.capture_upvalues(ctx, &init_func.upvalues)?;
+
+            // Create a minimal closure for the field init function
+            let closure = GcRef::new(Closure {
+                module: module.clone(),
+                function_index: init_idx,
+                upvalues: captured,
+                object: GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone())),
+                is_async: false,
+                is_generator: false,
+                home_object: None,
+            });
+
+            let func_val = Value::function(closure);
+            self.call_function(ctx, &func_val, this_value.clone(), &[])?;
+        }
+
+        Ok(())
     }
 
     fn utf16_key(units: &[u16]) -> PropertyKey {

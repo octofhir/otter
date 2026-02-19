@@ -221,11 +221,9 @@ fn worker_main(
     result_tx: crossbeam_channel::Sender<Vec<TestResult>>,
     cfg: Arc<ParallelConfig>,
 ) {
-    // Multi-thread runtime with 1 extra worker thread so that the timeout
-    // watchdog (tokio::spawn inside run_with_timeout) can preempt the
-    // synchronous JS eval from a separate OS thread.
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+    // Keep each worker fully thread-confined. Timeout watchdog is handled by
+    // a dedicated std thread inside Test262Runner, so Tokio can stay single-threaded.
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("worker tokio runtime");

@@ -1,29 +1,42 @@
 //! GC object layout
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-/// Global mark version counter.
-/// Bumped at the start of each GC cycle instead of iterating all objects
-/// to reset marks to White. An object is "white" (unmarked) if its
-/// `mark_version` doesn't match this global counter — O(1) phase reset.
-///
-/// u32 (4 billion cycles) prevents the wrap-around correctness bug that
-/// u8 had after 256 incremental GC cycles.
-static MARK_VERSION: AtomicU32 = AtomicU32::new(0);
-
-/// Get the current global mark version.
-#[inline]
-pub fn current_mark_version() -> u32 {
-    MARK_VERSION.load(Ordering::Acquire)
+// Thread-local mark version counter.
+//
+// Each isolate/worker runs its GC cycle on its own thread, so mark-version
+// state must be isolated per thread. A single process-global counter causes
+// concurrent collections in different isolates to invalidate each other's
+// mark versions (cross-isolate corruption).
+//
+// Bumped at the start of each GC cycle instead of iterating all objects
+// to reset marks to White. An object is "white" (unmarked) if its
+// `mark_version` doesn't match this thread's counter — O(1) phase reset.
+//
+// u32 (4 billion cycles) prevents the wrap-around correctness bug that
+// u8 had after 256 incremental GC cycles.
+thread_local! {
+    static MARK_VERSION: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Bump the global mark version (O(1) mark reset).
+/// Get the current thread-local mark version.
+#[inline]
+pub fn current_mark_version() -> u32 {
+    MARK_VERSION.with(Cell::get)
+}
+
+/// Bump the thread-local mark version (O(1) mark reset).
 ///
 /// After bumping, all objects are effectively "white" because their
-/// `mark_version` no longer matches the new global version.
+/// `mark_version` no longer matches the new thread-local version.
 #[inline]
 pub fn bump_mark_version() -> u32 {
-    MARK_VERSION.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+    MARK_VERSION.with(|v| {
+        let next = v.get().wrapping_add(1);
+        v.set(next);
+        next
+    })
 }
 
 /// GC object header (8 bytes, repr(C), alignment 4)

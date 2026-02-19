@@ -3,7 +3,10 @@ use std::fs;
 use std::io::Write;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
@@ -48,6 +51,102 @@ pub struct Test262Runner {
     trace_failures_only: bool,
     /// Trace only timeouts
     trace_timeouts_only: bool,
+    /// Per-runner timeout watchdog (one thread per worker runner)
+    timeout_watchdog: TimeoutWatchdog,
+}
+
+enum WatchdogCommand {
+    Arm {
+        token: u64,
+        duration: Duration,
+        interrupt_flag: Arc<std::sync::atomic::AtomicBool>,
+    },
+    Disarm {
+        token: u64,
+    },
+    Stop,
+}
+
+struct TimeoutWatchdog {
+    tx: mpsc::Sender<WatchdogCommand>,
+    next_token: AtomicU64,
+}
+
+impl TimeoutWatchdog {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel::<WatchdogCommand>();
+        thread::Builder::new()
+            .name("test262-timeout-watchdog".to_string())
+            .spawn(move || {
+                let mut armed: Option<(u64, std::time::Instant, Arc<std::sync::atomic::AtomicBool>)> =
+                    None;
+                loop {
+                    if let Some((token, deadline, flag)) = armed.take() {
+                        let now = std::time::Instant::now();
+                        if deadline <= now {
+                            flag.store(true, Ordering::Relaxed);
+                            continue;
+                        }
+                        match rx.recv_timeout(deadline.saturating_duration_since(now)) {
+                            Ok(WatchdogCommand::Arm {
+                                token,
+                                duration,
+                                interrupt_flag,
+                            }) => {
+                                armed = Some((token, std::time::Instant::now() + duration, interrupt_flag));
+                            }
+                            Ok(WatchdogCommand::Disarm { token: disarm_token }) => {
+                                if disarm_token != token {
+                                    armed = Some((token, deadline, flag));
+                                }
+                            }
+                            Ok(WatchdogCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                flag.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    } else {
+                        match rx.recv() {
+                            Ok(WatchdogCommand::Arm {
+                                token,
+                                duration,
+                                interrupt_flag,
+                            }) => {
+                                armed =
+                                    Some((token, std::time::Instant::now() + duration, interrupt_flag));
+                            }
+                            Ok(WatchdogCommand::Disarm { .. }) => {}
+                            Ok(WatchdogCommand::Stop) | Err(_) => break,
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn timeout watchdog");
+        Self {
+            tx,
+            next_token: AtomicU64::new(1),
+        }
+    }
+
+    fn arm(&self, duration: Duration, interrupt_flag: Arc<std::sync::atomic::AtomicBool>) -> u64 {
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        let _ = self.tx.send(WatchdogCommand::Arm {
+            token,
+            duration,
+            interrupt_flag,
+        });
+        token
+    }
+
+    fn disarm(&self, token: u64) {
+        let _ = self.tx.send(WatchdogCommand::Disarm { token });
+    }
+}
+
+impl Drop for TimeoutWatchdog {
+    fn drop(&mut self) {
+        let _ = self.tx.send(WatchdogCommand::Stop);
+    }
 }
 
 /// Result of running a single test (in one execution mode)
@@ -153,6 +252,7 @@ impl Test262Runner {
             trace_filter,
             trace_failures_only,
             trace_timeouts_only,
+            timeout_watchdog: TimeoutWatchdog::new(),
         }
     }
 
@@ -291,11 +391,6 @@ impl Test262Runner {
         let relative_path = path.strip_prefix(&self.test_dir).unwrap_or(path);
         let relative_path_str = relative_path.to_string_lossy().to_string();
 
-        if relative_path_str.ends_with("intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-timezone.js")
-        {
-            self.rebuild_engine();
-        }
-
         // Read test file
         let content = match fs::read_to_string(path) {
             Ok(c) => c,
@@ -432,19 +527,9 @@ impl Test262Runner {
             .map(|i| &content[i + 5..])
             .unwrap_or(content);
         if mode == ExecutionMode::Strict {
-            // Run strict-mode test body via direct eval so strictness applies
-            // to test code only (not to prepended harness files) while keeping
-            // script-level `this` semantics aligned with test262 expectations.
-            let strict_body = format!("\"use strict\";\n{}", test_content);
-            if let Ok(encoded) = serde_json::to_string(&strict_body) {
-                test_source.push_str("eval(");
-                test_source.push_str(&encoded);
-                test_source.push_str(");\n");
-            } else {
-                // Fallback: old behavior if encoding unexpectedly fails.
-                test_source.push_str("\"use strict\";\n");
-                test_source.push_str(test_content);
-            }
+            // Keep strict semantics without an extra eval scope.
+            test_source.push_str("\"use strict\";\n");
+            test_source.push_str(test_content);
         } else {
             test_source.push_str(test_content);
         }
@@ -769,21 +854,16 @@ impl Test262Runner {
         source_url: &str,
     ) -> Result<Value, OtterError> {
         let result = if let Some(duration) = timeout {
-            // Cooperative timeout: spawn a tokio task as watchdog on a separate
-            // worker thread (runtime is multi-threaded). It sets the interrupt
-            // flag after the deadline; the VM checks it every ~10K instructions.
+            // Cooperative timeout via dedicated watchdog thread.
             let flag = self.engine().interrupt_flag();
-            let watchdog = tokio::spawn(async move {
-                tokio::time::sleep(duration).await;
-                flag.store(true, Ordering::Relaxed);
-            });
+            let token = self.timeout_watchdog.arm(duration, flag);
 
             let result = AssertUnwindSafe(self.engine_mut().eval(source, Some(source_url)))
                 .catch_unwind()
                 .await;
 
-            // Cancel watchdog if test finished before timeout
-            watchdog.abort();
+            // Disarm watchdog if test finished before timeout
+            self.timeout_watchdog.disarm(token);
 
             result
         } else {
@@ -796,11 +876,11 @@ impl Test262Runner {
             Ok(val) => val,
             Err(panic) => {
                 let msg = extract_panic_message(&panic);
-                // Report the crash and keep going — do NOT rebuild the engine.
-                // Rebuilding masks the real bug and complicates debugging.
-                // The engine state may be corrupted; subsequent tests on this
-                // worker will likely also panic/crash, which is expected and
-                // acceptable for a debug session.
+                // Rebuild the engine after a panic to restore clean thread-local
+                // state (GC registry, MemoryManager, StringTable). Without this,
+                // subsequent tests on the same worker would run on corrupted
+                // state and cascade-fail.
+                self.rebuild_engine();
                 Err(OtterError::Runtime(format!("VM panic: {}", msg)))
             }
         }

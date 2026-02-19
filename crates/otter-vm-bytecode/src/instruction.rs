@@ -138,6 +138,8 @@ pub enum Opcode {
     DefineGetter = 0x67,
     /// Define setter on object: Object.defineProperty(obj, key, {set: fn})
     DefineSetter = 0x68,
+    /// Define method on object (non-enumerable, writable, configurable)
+    DefineMethod = 0x69,
 
     // ==================== Arrays ====================
     /// Create empty array: dst = \[\]
@@ -322,6 +324,7 @@ impl Opcode {
             0x66 => Some(Self::DefineProperty),
             0x67 => Some(Self::DefineGetter),
             0x68 => Some(Self::DefineSetter),
+            0x69 => Some(Self::DefineMethod),
 
             0x70 => Some(Self::NewArray),
             0x71 => Some(Self::GetElem),
@@ -457,6 +460,7 @@ impl Opcode {
             Self::DefineProperty => "DefineProperty",
             Self::DefineGetter => "DefineGetter",
             Self::DefineSetter => "DefineSetter",
+            Self::DefineMethod => "DefineMethod",
             // Arrays
             Self::NewArray => "NewArray",
             Self::GetElem => "GetElem",
@@ -865,6 +869,12 @@ pub enum Instruction {
         obj: Register,
         key: Register,
         func: Register,
+    },
+    /// Define method on object (non-enumerable, writable, configurable)
+    DefineMethod {
+        obj: Register,
+        key: Register,
+        val: Register,
     },
 
     // Arrays

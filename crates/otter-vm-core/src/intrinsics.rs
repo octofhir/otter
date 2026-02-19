@@ -907,7 +907,11 @@ impl Intrinsics {
                             .get(&PropertyKey::string("__array_index__"))
                             .and_then(|v| v.as_number())
                             .unwrap_or(0.0) as usize;
-                        let len = {
+
+                        // Get length — handle TypedArray, Proxy, and regular objects
+                        let len = if let Some(ta) = arr_val.as_typed_array() {
+                            ta.length()
+                        } else {
                             let key = PropertyKey::string("length");
                             let len_val = if let Some(proxy) = arr_val.as_proxy() {
                                 let key_value = Value::string(JsString::intern("length"));
@@ -925,6 +929,7 @@ impl Intrinsics {
                             };
                             len_val.as_number().unwrap_or(0.0).max(0.0) as usize
                         };
+
                         let kind = iter_obj
                             .get(&PropertyKey::string("__iter_kind__"))
                             .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
@@ -942,51 +947,43 @@ impl Intrinsics {
                             Value::number((idx + 1) as f64),
                         );
 
+                        // Helper: get element at index from array-like value
+                        let get_element =
+                            |arr: &Value, i: usize, ncx: &mut crate::context::NativeContext| -> Result<Value, VmError> {
+                                if let Some(ta) = arr.as_typed_array() {
+                                    Ok(ta.get(i).map(Value::number).unwrap_or(Value::undefined()))
+                                } else if let Some(proxy) = arr.as_proxy() {
+                                    let key = PropertyKey::Index(i as u32);
+                                    let key_value = Value::number(i as f64);
+                                    crate::proxy_operations::proxy_get(
+                                        ncx,
+                                        proxy,
+                                        &key,
+                                        key_value,
+                                        arr.clone(),
+                                    )
+                                } else if let Some(arr_obj) = arr.as_object() {
+                                    Ok(arr_obj
+                                        .get(&PropertyKey::Index(i as u32))
+                                        .unwrap_or(Value::undefined()))
+                                } else {
+                                    Ok(Value::undefined())
+                                }
+                            };
+
                         let value = match kind.as_str() {
                             "key" => Value::number(idx as f64),
                             "entry" => {
                                 let entry =
                                     GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
                                 let _ = entry.set(PropertyKey::Index(0), Value::number(idx as f64));
-                                let elem_val = if let Some(proxy) = arr_val.as_proxy() {
-                                    let key = PropertyKey::Index(idx as u32);
-                                    let key_value = Value::number(idx as f64);
-                                    crate::proxy_operations::proxy_get(
-                                        ncx,
-                                        proxy,
-                                        &key,
-                                        key_value,
-                                        arr_val.clone(),
-                                    )?
-                                } else if let Some(arr_obj) = arr_val.as_object() {
-                                    arr_obj
-                                        .get(&PropertyKey::Index(idx as u32))
-                                        .unwrap_or(Value::undefined())
-                                } else {
-                                    Value::undefined()
-                                };
+                                let elem_val = get_element(&arr_val, idx, ncx)?;
                                 let _ = entry.set(PropertyKey::Index(1), elem_val);
                                 Value::array(entry)
                             }
                             _ => {
                                 // "value" kind
-                                if let Some(proxy) = arr_val.as_proxy() {
-                                    let key = PropertyKey::Index(idx as u32);
-                                    let key_value = Value::number(idx as f64);
-                                    crate::proxy_operations::proxy_get(
-                                        ncx,
-                                        proxy,
-                                        &key,
-                                        key_value,
-                                        arr_val.clone(),
-                                    )?
-                                } else if let Some(arr_obj) = arr_val.as_object() {
-                                    arr_obj
-                                        .get(&PropertyKey::Index(idx as u32))
-                                        .unwrap_or(Value::undefined())
-                                } else {
-                                    Value::undefined()
-                                }
+                                get_element(&arr_val, idx, ncx)?
                             }
                         };
                         Ok(create_iter_result(value, false, ncx))
@@ -1103,6 +1100,7 @@ impl Intrinsics {
             mm,
             well_known::iterator_symbol(),
             well_known::to_string_tag_symbol(),
+            self.array_iterator_prototype,
         );
 
         // Initialize each specific typed array prototype

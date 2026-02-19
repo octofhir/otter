@@ -28,6 +28,7 @@ pub mod timer;
 pub mod timer_root_set;
 pub mod timers_ext;
 pub mod worker;
+pub mod worker_ext;
 
 // Re-export main types
 pub use builder::OtterBuilder;
@@ -57,6 +58,7 @@ pub type OtterRuntime = Otter;
 pub use promise::Promise;
 pub use timer::{Immediate, ImmediateId, Timer, TimerCallback, TimerHeapEntry, TimerId};
 pub use worker::{Worker, WorkerContext, WorkerError, WorkerMessage, WorkerPool};
+pub use worker_ext::{WorkerExtension, worker_extension};
 
 // Re-export capabilities and env store
 pub use capabilities::{Capabilities, CapabilitiesBuilder, PermissionDenied};

@@ -1774,6 +1774,7 @@ mod tests {
 
     #[test]
     fn test_commit_cjs_exports_populates_esm_view() {
+        let _rt = crate::otter_runtime::Otter::new(); // GC registry setup
         let dir = tempdir().unwrap();
         let loader = ModuleLoader::new(dir.path());
 
@@ -1802,6 +1803,7 @@ mod tests {
 
     #[test]
     fn test_require_value_returns_cjs_module_exports_identity() {
+        let _rt = crate::otter_runtime::Otter::new(); // GC registry setup
         let dir = tempdir().unwrap();
         let loader = ModuleLoader::new(dir.path());
 
@@ -1846,6 +1848,7 @@ mod tests {
 
     #[test]
     fn test_require_value_returns_esm_namespace_object() {
+        let _rt = crate::otter_runtime::Otter::new(); // GC registry setup
         let dir = tempdir().unwrap();
         let loader = ModuleLoader::new(dir.path());
 

@@ -104,11 +104,15 @@ pub struct MemoryManager {
     allocation_count_threshold: AtomicUsize,
     /// Cached GC threshold (updated after each GC)
     cached_gc_threshold: AtomicUsize,
+    /// GC stress mode: collect on every `should_collect_garbage()` check.
+    /// Enable with `GC_STRESS=1` environment variable.
+    gc_stress: bool,
 }
 
 impl MemoryManager {
     /// Create a new memory manager with the specified limit
     pub fn new(limit: usize) -> Self {
+        let gc_stress = std::env::var("GC_STRESS").map(|v| v == "1").unwrap_or(false);
         Self {
             allocated: AtomicUsize::new(0),
             limit,
@@ -117,6 +121,7 @@ impl MemoryManager {
             gc_requested: AtomicBool::new(false),
             allocation_count_threshold: AtomicUsize::new(DEFAULT_ALLOCATION_COUNT_THRESHOLD),
             cached_gc_threshold: AtomicUsize::new(MIN_GC_THRESHOLD),
+            gc_stress,
         }
     }
 
@@ -195,6 +200,11 @@ impl MemoryManager {
     /// Optimized with early exits and cached threshold for performance.
     #[inline]
     pub fn should_collect_garbage(&self) -> bool {
+        // GC stress mode: always collect
+        if self.gc_stress {
+            return true;
+        }
+
         // Fast path: check explicit request first (single atomic load, most urgent)
         if self.gc_requested.load(Ordering::Relaxed) {
             return true;

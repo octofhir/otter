@@ -2211,6 +2211,37 @@ impl Intrinsics {
             self.aggregate_error_prototype,
             Some(crate::intrinsics_impl::error::create_aggregate_error_constructor()),
         );
+        // §20.5.7.2: AggregateError.length = 2
+        if let Some(ae_obj) = global
+            .get(&PropertyKey::string("AggregateError"))
+            .and_then(|v| v.as_object())
+        {
+            ae_obj.define_property(
+                PropertyKey::string("length"),
+                PropertyDescriptor::function_length(Value::number(2.0)),
+            );
+        }
+
+        // §20.5.6.1: NativeError constructors have [[Prototype]] = %Error%
+        // Object.getPrototypeOf(TypeError) === Error, etc.
+        if let Some(error_ctor_val) = global.get(&PropertyKey::string("Error")) {
+            for name in &[
+                "TypeError",
+                "RangeError",
+                "ReferenceError",
+                "SyntaxError",
+                "URIError",
+                "EvalError",
+                "AggregateError",
+            ] {
+                if let Some(ctor_obj) = global
+                    .get(&PropertyKey::string(name))
+                    .and_then(|v| v.as_object())
+                {
+                    ctor_obj.set_prototype(error_ctor_val.clone());
+                }
+            }
+        }
 
         // ====================================================================
         // Other builtins

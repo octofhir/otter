@@ -527,6 +527,7 @@ mod tests {
     fn test_shared_array_buffer_between_workers() {
         use otter_vm_core::SharedArrayBuffer;
 
+        let _rt = crate::otter_runtime::Otter::new(); // GC registry setup
         let sab = GcRef::new(SharedArrayBuffer::new(4));
         let sab_clone = sab; // GcRef is Copy
 

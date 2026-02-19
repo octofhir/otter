@@ -33,17 +33,6 @@ skip_features = [
     "explicit-resource-management",
     # Tail calls
     "tail-call-optimization",
-    # Intl (internationalization)
-    "Intl",
-    "Intl.DateTimeFormat",
-    "Intl.DisplayNames",
-    "Intl.ListFormat",
-    "Intl.Locale",
-    "Intl.NumberFormat",
-    "Intl.PluralRules",
-    "Intl.RelativeTimeFormat",
-    "Intl.Segmenter",
-    "Intl-enumeration",
     # Import / export (module system)
     "dynamic-import",
     "import.meta",

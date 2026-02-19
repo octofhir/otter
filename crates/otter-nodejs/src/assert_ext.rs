@@ -568,6 +568,7 @@ mod tests {
 
     #[test]
     fn test_assert_ok_passes() {
+        let _rt = otter_vm_core::runtime::VmRuntime::new();
         assert!(assert_ok_impl(&[Value::boolean(true)]).is_ok());
         assert!(assert_ok_impl(&[Value::number(1.0)]).is_ok());
         assert!(assert_ok_impl(&[Value::string(JsString::intern("hello"))]).is_ok());

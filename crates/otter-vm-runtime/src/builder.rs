@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use otter_vm_core::isolate::IsolateConfig;
+
 use crate::capabilities::Capabilities;
 use crate::env_store::{EnvStoreBuilder, IsolatedEnvStore};
 
@@ -47,6 +49,7 @@ pub struct OtterBuilder {
     with_http: bool,
     env_store: Option<Arc<IsolatedEnvStore>>,
     capabilities: Option<Capabilities>,
+    isolate_config: Option<IsolateConfig>,
 }
 
 impl OtterBuilder {
@@ -58,6 +61,7 @@ impl OtterBuilder {
             with_http: false,
             env_store: None,
             capabilities: None,
+            isolate_config: None,
         }
     }
 
@@ -67,6 +71,14 @@ impl OtterBuilder {
     /// This flag only enables the HTTP server functionality.
     pub fn with_http(mut self) -> Self {
         self.with_http = true;
+        self
+    }
+
+    /// Set isolate configuration (stack depth, heap size, strict mode).
+    ///
+    /// If not set, uses `IsolateConfig::default()`.
+    pub fn isolate_config(mut self, config: IsolateConfig) -> Self {
+        self.isolate_config = Some(config);
         self
     }
 
@@ -133,7 +145,9 @@ impl OtterBuilder {
 
     /// Build the runtime
     pub fn build(self) -> Otter {
-        let mut runtime = Otter::new();
+        let mut runtime = Otter::with_isolate_config(
+            self.isolate_config.unwrap_or_default(),
+        );
 
         // Set env store (defaults to empty/secure)
         let env_store = self

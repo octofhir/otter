@@ -44,6 +44,7 @@ pub use module_provider::{
     MediaType, ModuleProvider, ModuleResolution, ModuleSource, ModuleType, ProviderRegistry,
 };
 pub use otter_runtime::{Otter, OtterError};
+pub use otter_vm_core::isolate::IsolateConfig;
 
 // Native extension system
 pub use extension_state::ExtensionState;

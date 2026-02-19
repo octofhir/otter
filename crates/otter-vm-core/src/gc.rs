@@ -907,15 +907,21 @@ mod tests {
     use super::*;
     use crate::context::VmContext;
     use crate::memory::MemoryManager;
+    use crate::runtime::VmRuntime;
+
+    fn create_gc_test_context() -> (VmContext, Arc<MemoryManager>, VmRuntime) {
+        let runtime = VmRuntime::new();
+        let mm = runtime.memory_manager().clone();
+        let ctx = runtime.create_context();
+        (ctx, mm, runtime)
+    }
     use crate::object::JsObject;
     use crate::value::Value;
     use std::sync::Arc;
 
     #[test]
     fn test_handle_scope_basic() {
-        let mm = Arc::new(MemoryManager::new(10_000_000));
-        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-        let mut ctx = VmContext::new(global, mm.clone());
+        let (mut ctx, mm, _rt) = create_gc_test_context();
 
         {
             let scope = HandleScope::new(&mut ctx);
@@ -935,9 +941,7 @@ mod tests {
 
     #[test]
     fn test_handle_scope_multiple_values() {
-        let mm = Arc::new(MemoryManager::new(10_000_000));
-        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-        let mut ctx = VmContext::new(global, mm.clone());
+        let (mut ctx, mm, _rt) = create_gc_test_context();
 
         {
             let scope = HandleScope::new(&mut ctx);
@@ -969,9 +973,7 @@ mod tests {
 
     #[test]
     fn test_handle_scope_nested() {
-        let mm = Arc::new(MemoryManager::new(10_000_000));
-        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-        let mut ctx = VmContext::new(global, mm.clone());
+        let (mut ctx, mm, _rt) = create_gc_test_context();
 
         {
             let scope1 = HandleScope::new(&mut ctx);
@@ -1014,9 +1016,7 @@ mod tests {
 
     #[test]
     fn test_handle_scope_with_objects() {
-        let mm = Arc::new(MemoryManager::new(10_000_000));
-        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-        let mut ctx = VmContext::new(global, mm.clone());
+        let (mut ctx, mm, _rt) = create_gc_test_context();
 
         {
             let scope = HandleScope::new(&mut ctx);
@@ -1038,7 +1038,8 @@ mod tests {
 
     #[test]
     fn test_gc_ref_basic() {
-        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let _rt = VmRuntime::new();
+        let mm = _rt.memory_manager().clone();
         let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
         // Set a property
@@ -1050,7 +1051,8 @@ mod tests {
 
     #[test]
     fn test_gc_ref_clone() {
-        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let _rt = VmRuntime::new();
+        let mm = _rt.memory_manager().clone();
         let obj1 = GcRef::new(JsObject::new(Value::null(), mm.clone()));
         obj1.set("value".into(), Value::int32(99));
 
@@ -1067,7 +1069,8 @@ mod tests {
 
     #[test]
     fn test_gc_ref_equality() {
-        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let _rt = VmRuntime::new();
+        let mm = _rt.memory_manager().clone();
         let obj1 = GcRef::new(JsObject::new(Value::null(), mm.clone()));
         let obj2 = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
@@ -1081,7 +1084,8 @@ mod tests {
 
     #[test]
     fn test_gc_ref_pointer_identity() {
-        let mm = Arc::new(MemoryManager::new(10_000_000));
+        let _rt = VmRuntime::new();
+        let mm = _rt.memory_manager().clone();
         let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
         // Clone and verify pointer identity
@@ -1096,9 +1100,7 @@ mod tests {
 
     #[test]
     fn test_handle_is_valid() {
-        let mm = Arc::new(MemoryManager::new(10_000_000));
-        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-        let mut ctx = VmContext::new(global, mm.clone());
+        let (mut ctx, mm, _rt) = create_gc_test_context();
 
         let scope = HandleScope::new(&mut ctx);
         let handle = scope.root_value(Value::int32(42));
@@ -1110,9 +1112,7 @@ mod tests {
 
     #[test]
     fn test_handle_copy_semantics() {
-        let mm = Arc::new(MemoryManager::new(10_000_000));
-        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-        let mut ctx = VmContext::new(global, mm.clone());
+        let (mut ctx, mm, _rt) = create_gc_test_context();
 
         let scope = HandleScope::new(&mut ctx);
         let h1 = scope.root_value(Value::int32(42));
@@ -1142,9 +1142,7 @@ mod tests {
 
     #[test]
     fn test_handle_scope_marker_stack() {
-        let mm = Arc::new(MemoryManager::new(10_000_000));
-        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-        let mut ctx = VmContext::new(global, mm.clone());
+        let (mut ctx, mm, _rt) = create_gc_test_context();
 
         // Create scopes and verify they clean up properly
         // We can't directly test scope_markers since there's no public accessor,
@@ -1177,9 +1175,7 @@ mod tests {
 
     #[test]
     fn test_handle_survives_gc_safepoint() {
-        let mm = Arc::new(MemoryManager::new(10_000_000));
-        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-        let mut ctx = VmContext::new(global, mm.clone());
+        let (mut ctx, mm, _rt) = create_gc_test_context();
 
         let scope = HandleScope::new(&mut ctx);
         let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));

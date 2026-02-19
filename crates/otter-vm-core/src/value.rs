@@ -1426,7 +1426,8 @@ mod tests {
             Ok(Value::undefined())
         }
 
-        let mm = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let mm = _rt.memory_manager().clone();
         let v1 = Value::native_function(noop, mm.clone());
         let v2 = Value::native_function(noop, mm.clone());
 
@@ -1476,8 +1477,7 @@ impl Value {
                     p.trace_roots(tracer);
                 }
                 HeapRef::Proxy(p) => {
-                    p.target.trace(tracer);
-                    p.handler.trace(tracer);
+                    tracer(p.header() as *const _);
                 }
                 HeapRef::Symbol(s) => {
                     tracer(s.header() as *const _);

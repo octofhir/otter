@@ -337,6 +337,19 @@ pub fn proxy_get(
     key_value: Value,
     receiver: Value,
 ) -> VmResult<Value> {
+    ncx.ctx.enter_native_call()?;
+    let result = proxy_get_impl(ncx, proxy, key, key_value, receiver);
+    ncx.ctx.exit_native_call();
+    result
+}
+
+fn proxy_get_impl(
+    ncx: &mut NativeContext,
+    proxy: GcRef<JsProxy>,
+    key: &PropertyKey,
+    key_value: Value,
+    receiver: Value,
+) -> VmResult<Value> {
     // Get target
     let target = proxy_target_value(proxy)?;
 
@@ -407,6 +420,20 @@ fn validate_get_trap_invariants(
 ///
 /// Implements the `set` trap with proper invariant validation.
 pub fn proxy_set(
+    ncx: &mut NativeContext,
+    proxy: GcRef<JsProxy>,
+    key: &PropertyKey,
+    key_value: Value,
+    value: Value,
+    receiver: Value,
+) -> VmResult<bool> {
+    ncx.ctx.enter_native_call()?;
+    let result = proxy_set_impl(ncx, proxy, key, key_value, value, receiver);
+    ncx.ctx.exit_native_call();
+    result
+}
+
+fn proxy_set_impl(
     ncx: &mut NativeContext,
     proxy: GcRef<JsProxy>,
     key: &PropertyKey,
@@ -500,6 +527,18 @@ pub fn proxy_has(
     key: &PropertyKey,
     key_value: Value,
 ) -> VmResult<bool> {
+    ncx.ctx.enter_native_call()?;
+    let result = proxy_has_impl(ncx, proxy, key, key_value);
+    ncx.ctx.exit_native_call();
+    result
+}
+
+fn proxy_has_impl(
+    ncx: &mut NativeContext,
+    proxy: GcRef<JsProxy>,
+    key: &PropertyKey,
+    key_value: Value,
+) -> VmResult<bool> {
     // Get target
     let target = proxy_target_value(proxy)?;
 
@@ -563,6 +602,18 @@ pub fn proxy_delete_property(
     key: &PropertyKey,
     key_value: Value,
 ) -> VmResult<bool> {
+    ncx.ctx.enter_native_call()?;
+    let result = proxy_delete_property_impl(ncx, proxy, key, key_value);
+    ncx.ctx.exit_native_call();
+    result
+}
+
+fn proxy_delete_property_impl(
+    ncx: &mut NativeContext,
+    proxy: GcRef<JsProxy>,
+    key: &PropertyKey,
+    key_value: Value,
+) -> VmResult<bool> {
     // Get target
     let target = proxy_target_value(proxy)?;
 
@@ -611,6 +662,16 @@ fn validate_delete_trap_invariants(
 ///
 /// Implements the `ownKeys` trap with proper invariant validation.
 pub fn proxy_own_keys(
+    ncx: &mut NativeContext,
+    proxy: GcRef<JsProxy>,
+) -> VmResult<Vec<PropertyKey>> {
+    ncx.ctx.enter_native_call()?;
+    let result = proxy_own_keys_impl(ncx, proxy);
+    ncx.ctx.exit_native_call();
+    result
+}
+
+fn proxy_own_keys_impl(
     ncx: &mut NativeContext,
     proxy: GcRef<JsProxy>,
 ) -> VmResult<Vec<PropertyKey>> {
@@ -722,6 +783,18 @@ fn validate_own_keys_trap_invariants(
 ///
 /// Implements the `getOwnPropertyDescriptor` trap with proper invariant validation.
 pub fn proxy_get_own_property_descriptor(
+    ncx: &mut NativeContext,
+    proxy: GcRef<JsProxy>,
+    key: &PropertyKey,
+    key_value: Value,
+) -> VmResult<Option<PropertyDescriptor>> {
+    ncx.ctx.enter_native_call()?;
+    let result = proxy_get_own_property_descriptor_impl(ncx, proxy, key, key_value);
+    ncx.ctx.exit_native_call();
+    result
+}
+
+fn proxy_get_own_property_descriptor_impl(
     ncx: &mut NativeContext,
     proxy: GcRef<JsProxy>,
     key: &PropertyKey,
@@ -855,6 +928,19 @@ fn validate_get_own_property_descriptor_invariants(
 ///
 /// Implements the `defineProperty` trap with proper invariant validation.
 pub fn proxy_define_property(
+    ncx: &mut NativeContext,
+    proxy: GcRef<JsProxy>,
+    key: &PropertyKey,
+    key_value: Value,
+    desc: &PropertyDescriptor,
+) -> VmResult<bool> {
+    ncx.ctx.enter_native_call()?;
+    let result = proxy_define_property_impl(ncx, proxy, key, key_value, desc);
+    ncx.ctx.exit_native_call();
+    result
+}
+
+fn proxy_define_property_impl(
     ncx: &mut NativeContext,
     proxy: GcRef<JsProxy>,
     key: &PropertyKey,
@@ -1037,6 +1123,16 @@ pub fn proxy_get_prototype_of(
     ncx: &mut NativeContext,
     proxy: GcRef<JsProxy>,
 ) -> VmResult<Option<GcRef<JsObject>>> {
+    ncx.ctx.enter_native_call()?;
+    let result = proxy_get_prototype_of_impl(ncx, proxy);
+    ncx.ctx.exit_native_call();
+    result
+}
+
+fn proxy_get_prototype_of_impl(
+    ncx: &mut NativeContext,
+    proxy: GcRef<JsProxy>,
+) -> VmResult<Option<GcRef<JsObject>>> {
     // Get target
     let target = proxy_target_value(proxy)?;
 
@@ -1103,6 +1199,17 @@ pub fn proxy_set_prototype_of(
     proxy: GcRef<JsProxy>,
     proto: Option<GcRef<JsObject>>,
 ) -> VmResult<bool> {
+    ncx.ctx.enter_native_call()?;
+    let result = proxy_set_prototype_of_impl(ncx, proxy, proto);
+    ncx.ctx.exit_native_call();
+    result
+}
+
+fn proxy_set_prototype_of_impl(
+    ncx: &mut NativeContext,
+    proxy: GcRef<JsProxy>,
+    proto: Option<GcRef<JsObject>>,
+) -> VmResult<bool> {
     // Get target
     let target = proxy_target_value(proxy)?;
 
@@ -1162,6 +1269,13 @@ fn validate_set_prototype_of_invariants(
 ///
 /// Implements the `isExtensible` trap with proper invariant validation.
 pub fn proxy_is_extensible(ncx: &mut NativeContext, proxy: GcRef<JsProxy>) -> VmResult<bool> {
+    ncx.ctx.enter_native_call()?;
+    let result = proxy_is_extensible_impl(ncx, proxy);
+    ncx.ctx.exit_native_call();
+    result
+}
+
+fn proxy_is_extensible_impl(ncx: &mut NativeContext, proxy: GcRef<JsProxy>) -> VmResult<bool> {
     // Get target
     let target = proxy_target_value(proxy)?;
 
@@ -1192,6 +1306,16 @@ pub fn proxy_is_extensible(ncx: &mut NativeContext, proxy: GcRef<JsProxy>) -> Vm
 ///
 /// Implements the `preventExtensions` trap with proper invariant validation.
 pub fn proxy_prevent_extensions(ncx: &mut NativeContext, proxy: GcRef<JsProxy>) -> VmResult<bool> {
+    ncx.ctx.enter_native_call()?;
+    let result = proxy_prevent_extensions_impl(ncx, proxy);
+    ncx.ctx.exit_native_call();
+    result
+}
+
+fn proxy_prevent_extensions_impl(
+    ncx: &mut NativeContext,
+    proxy: GcRef<JsProxy>,
+) -> VmResult<bool> {
     // Get target
     let target = proxy_target_value(proxy)?;
 
@@ -1226,6 +1350,18 @@ pub fn proxy_apply(
     this_value: Value,
     args: &[Value],
 ) -> VmResult<Value> {
+    ncx.ctx.enter_native_call()?;
+    let result = proxy_apply_impl(ncx, proxy, this_value, args);
+    ncx.ctx.exit_native_call();
+    result
+}
+
+fn proxy_apply_impl(
+    ncx: &mut NativeContext,
+    proxy: GcRef<JsProxy>,
+    this_value: Value,
+    args: &[Value],
+) -> VmResult<Value> {
     // Get target
     let target = proxy_target_value(proxy)?;
 
@@ -1249,10 +1385,7 @@ pub fn proxy_apply(
         None => {
             // Default behavior: call target function
             if let Some(proxy) = target.as_proxy() {
-                ncx.ctx.enter_native_call()?;
-                let result = proxy_apply(ncx, proxy, this_value, args);
-                ncx.ctx.exit_native_call();
-                return result;
+                return proxy_apply(ncx, proxy, this_value, args);
             }
             ncx.call_function(&target, this_value, args)
         }
@@ -1263,6 +1396,18 @@ pub fn proxy_apply(
 ///
 /// Implements the `construct` trap for constructor calls.
 pub fn proxy_construct(
+    ncx: &mut NativeContext,
+    proxy: GcRef<JsProxy>,
+    args: &[Value],
+    new_target: Value,
+) -> VmResult<Value> {
+    ncx.ctx.enter_native_call()?;
+    let result = proxy_construct_impl(ncx, proxy, args, new_target);
+    ncx.ctx.exit_native_call();
+    result
+}
+
+fn proxy_construct_impl(
     ncx: &mut NativeContext,
     proxy: GcRef<JsProxy>,
     args: &[Value],
@@ -1291,10 +1436,7 @@ pub fn proxy_construct(
         None => {
             // Default behavior: Construct(target, argumentsList, newTarget)
             if let Some(proxy) = target.as_proxy() {
-                ncx.ctx.enter_native_call()?;
-                let result = proxy_construct(ncx, proxy, args, new_target);
-                ncx.ctx.exit_native_call();
-                return result;
+                return proxy_construct(ncx, proxy, args, new_target);
             }
             return ncx.call_function_construct(&target, Value::undefined(), args);
         }

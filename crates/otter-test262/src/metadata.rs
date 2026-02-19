@@ -147,7 +147,7 @@ impl TestMetadata {
             return vec![ExecutionMode::NonStrict];
         }
         // Default: run in both modes
-        vec![ExecutionMode::Strict, ExecutionMode::NonStrict]
+        vec![ExecutionMode::NonStrict, ExecutionMode::Strict]
     }
 
     /// Check if test expects a runtime error

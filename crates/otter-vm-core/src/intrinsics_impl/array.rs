@@ -1066,27 +1066,31 @@ pub fn init_array_prototype(
                     ));
                 }
                 let result = array_species_create(&obj, len, ncx)?;
-                for i in 0..len {
-                    if i & 0x3FF == 0 {
-                        ncx.check_for_interrupt()?;
+                // Root result across call_function GC points
+                let result_val = if result.is_array() { Value::array(result) } else { Value::object(result) };
+                ncx.ctx.push_root_slot(result_val.clone());
+                let loop_result: Result<(), VmError> = (|| {
+                    for i in 0..len {
+                        if i & 0x3FF == 0 {
+                            ncx.check_for_interrupt()?;
+                        }
+                        // Per spec, skip holes (absent elements) — hole stays in result
+                        if !obj.has(&PropertyKey::Index(i as u32)) {
+                            continue;
+                        }
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
+                        let mapped = ncx.call_function(
+                            &callback,
+                            this_arg.clone(),
+                            &[val, Value::number(i as f64), Value::object(obj.clone())],
+                        )?;
+                        let _ = result.set(PropertyKey::Index(i as u32), mapped);
                     }
-                    // Per spec, skip holes (absent elements) — hole stays in result
-                    if !obj.has(&PropertyKey::Index(i as u32)) {
-                        continue;
-                    }
-                    let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
-                    let mapped = ncx.call_function(
-                        &callback,
-                        this_arg.clone(),
-                        &[val, Value::number(i as f64), Value::object(obj.clone())],
-                    )?;
-                    let _ = result.set(PropertyKey::Index(i as u32), mapped);
-                }
-                Ok(if result.is_array() {
-                    Value::array(result)
-                } else {
-                    Value::object(result)
-                })
+                    Ok(())
+                })();
+                ncx.ctx.pop_root_slots(1);
+                loop_result?;
+                Ok(result_val)
             },
             mm.clone(),
             fn_proto,
@@ -1111,36 +1115,40 @@ pub fn init_array_prototype(
                     ));
                 }
                 let result = array_species_create(&obj, 0, ncx)?;
+                // Root result across call_function GC points
+                let result_val = if result.is_array() { Value::array(result) } else { Value::object(result) };
+                ncx.ctx.push_root_slot(result_val.clone());
                 let mut out_idx = 0u32;
-                for i in 0..len {
-                    if i & 0x3FF == 0 {
-                        ncx.check_for_interrupt()?;
+                let loop_result: Result<(), VmError> = (|| {
+                    for i in 0..len {
+                        if i & 0x3FF == 0 {
+                            ncx.check_for_interrupt()?;
+                        }
+                        // Per spec, skip holes
+                        if !obj.has(&PropertyKey::Index(i as u32)) {
+                            continue;
+                        }
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
+                        let keep = ncx.call_function(
+                            &callback,
+                            this_arg.clone(),
+                            &[
+                                val.clone(),
+                                Value::number(i as f64),
+                                Value::object(obj.clone()),
+                            ],
+                        )?;
+                        if keep.to_boolean() {
+                            let _ = result.set(PropertyKey::Index(out_idx), val);
+                            out_idx += 1;
+                        }
                     }
-                    // Per spec, skip holes
-                    if !obj.has(&PropertyKey::Index(i as u32)) {
-                        continue;
-                    }
-                    let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
-                    let keep = ncx.call_function(
-                        &callback,
-                        this_arg.clone(),
-                        &[
-                            val.clone(),
-                            Value::number(i as f64),
-                            Value::object(obj.clone()),
-                        ],
-                    )?;
-                    if keep.to_boolean() {
-                        let _ = result.set(PropertyKey::Index(out_idx), val);
-                        out_idx += 1;
-                    }
-                }
+                    Ok(())
+                })();
+                ncx.ctx.pop_root_slots(1);
+                loop_result?;
                 set_len(&result, out_idx as usize);
-                Ok(if result.is_array() {
-                    Value::array(result)
-                } else {
-                    Value::object(result)
-                })
+                Ok(result_val)
             },
             mm.clone(),
             fn_proto,
@@ -1553,42 +1561,46 @@ pub fn init_array_prototype(
                     ));
                 }
                 let result = array_species_create(&obj, 0, ncx)?;
+                // Root result across call_function GC points
+                let result_val = if result.is_array() { Value::array(result) } else { Value::object(result) };
+                ncx.ctx.push_root_slot(result_val.clone());
                 let mut out_idx = 0u32;
-                for i in 0..len {
-                    if i & 0x3FF == 0 {
-                        ncx.check_for_interrupt()?;
-                    }
-                    // Per spec, skip holes
-                    if !obj.has(&PropertyKey::Index(i as u32)) {
-                        continue;
-                    }
-                    let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
-                    let mapped = ncx.call_function(
-                        &callback,
-                        this_arg.clone(),
-                        &[val, Value::number(i as f64), Value::object(obj.clone())],
-                    )?;
-                    // Flatten one level
-                    if let Some(inner) = mapped.as_object() {
-                        if inner.get(&PropertyKey::string("length")).is_some() {
-                            let inner_len = get_len(&inner);
-                            for j in 0..inner_len {
-                                let item = js_get(&inner, &PropertyKey::Index(j as u32), ncx)?;
-                                let _ = result.set(PropertyKey::Index(out_idx), item);
-                                out_idx += 1;
-                            }
+                let loop_result: Result<(), VmError> = (|| {
+                    for i in 0..len {
+                        if i & 0x3FF == 0 {
+                            ncx.check_for_interrupt()?;
+                        }
+                        // Per spec, skip holes
+                        if !obj.has(&PropertyKey::Index(i as u32)) {
                             continue;
                         }
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
+                        let mapped = ncx.call_function(
+                            &callback,
+                            this_arg.clone(),
+                            &[val, Value::number(i as f64), Value::object(obj.clone())],
+                        )?;
+                        // Flatten one level
+                        if let Some(inner) = mapped.as_object() {
+                            if inner.get(&PropertyKey::string("length")).is_some() {
+                                let inner_len = get_len(&inner);
+                                for j in 0..inner_len {
+                                    let item = js_get(&inner, &PropertyKey::Index(j as u32), ncx)?;
+                                    let _ = result.set(PropertyKey::Index(out_idx), item);
+                                    out_idx += 1;
+                                }
+                                continue;
+                            }
+                        }
+                        let _ = result.set(PropertyKey::Index(out_idx), mapped);
+                        out_idx += 1;
                     }
-                    let _ = result.set(PropertyKey::Index(out_idx), mapped);
-                    out_idx += 1;
-                }
+                    Ok(())
+                })();
+                ncx.ctx.pop_root_slots(1);
+                loop_result?;
                 set_len(&result, out_idx as usize);
-                Ok(if result.is_array() {
-                    Value::array(result)
-                } else {
-                    Value::object(result)
-                })
+                Ok(result_val)
             },
             mm.clone(),
             fn_proto,
@@ -2173,53 +2185,67 @@ pub fn install_array_statics(
                         // Call [Symbol.iterator]() to get iterator
                         let iterator = ncx.call_function(&iter_fn, source.clone(), &[])?;
                         let result = create_default_array(0, ncx);
+                        // Root result across call_function GC points
+                        ncx.ctx.push_root_slot(Value::array(result));
                         let mut k: u32 = 0;
 
-                        loop {
-                            if k & 0x3FF == 0 {
-                                ncx.check_for_interrupt()?;
-                            }
-                            // Call iterator.next()
-                            let iter_obj = iterator.as_object().ok_or_else(|| {
-                                VmError::type_error("Array.from: iterator is not an object")
-                            })?;
-                            let next_fn =
-                                iter_obj.get(&PropertyKey::string("next")).ok_or_else(|| {
-                                    VmError::type_error("Array.from: iterator.next is not defined")
+                        let loop_result: Result<(), VmError> = (|| {
+                            loop {
+                                if k & 0x3FF == 0 {
+                                    ncx.check_for_interrupt()?;
+                                }
+                                // Call iterator.next()
+                                let iter_obj = iterator.as_object().ok_or_else(|| {
+                                    VmError::type_error("Array.from: iterator is not an object")
                                 })?;
-                            let next_result = ncx.call_function(&next_fn, iterator.clone(), &[])?;
-                            let next_obj = next_result.as_object().ok_or_else(|| {
-                                VmError::type_error("Array.from: iterator result is not an object")
-                            })?;
+                                let next_fn =
+                                    iter_obj.get(&PropertyKey::string("next")).ok_or_else(|| {
+                                        VmError::type_error(
+                                            "Array.from: iterator.next is not defined",
+                                        )
+                                    })?;
+                                let next_result =
+                                    ncx.call_function(&next_fn, iterator.clone(), &[])?;
+                                let next_obj = next_result.as_object().ok_or_else(|| {
+                                    VmError::type_error(
+                                        "Array.from: iterator result is not an object",
+                                    )
+                                })?;
 
-                            // Check done
-                            let done = next_obj
-                                .get(&PropertyKey::string("done"))
-                                .unwrap_or(Value::boolean(false));
-                            if done.to_boolean() {
-                                set_len(&result, k as usize);
-                                return Ok(Value::array(result));
+                                // Check done
+                                let done = next_obj
+                                    .get(&PropertyKey::string("done"))
+                                    .unwrap_or(Value::boolean(false));
+                                if done.to_boolean() {
+                                    break;
+                                }
+
+                                // Get value
+                                let val = next_obj
+                                    .get(&PropertyKey::string("value"))
+                                    .unwrap_or(Value::undefined());
+
+                                // Apply mapFn if provided
+                                let mapped = if has_map {
+                                    ncx.call_function(
+                                        &map_fn,
+                                        this_arg.clone(),
+                                        &[val, Value::number(k as f64)],
+                                    )?
+                                } else {
+                                    val
+                                };
+
+                                let _ = result.set(PropertyKey::Index(k), mapped);
+                                k += 1;
                             }
+                            Ok(())
+                        })();
 
-                            // Get value
-                            let val = next_obj
-                                .get(&PropertyKey::string("value"))
-                                .unwrap_or(Value::undefined());
-
-                            // Apply mapFn if provided
-                            let mapped = if has_map {
-                                ncx.call_function(
-                                    &map_fn,
-                                    this_arg.clone(),
-                                    &[val, Value::number(k as f64)],
-                                )?
-                            } else {
-                                val
-                            };
-
-                            let _ = result.set(PropertyKey::Index(k), mapped);
-                            k += 1;
-                        }
+                        ncx.ctx.pop_root_slots(1);
+                        loop_result?;
+                        set_len(&result, k as usize);
+                        return Ok(Value::array(result));
                     }
                 }
 

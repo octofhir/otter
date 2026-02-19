@@ -278,7 +278,14 @@ pub fn create_error_constructor(
 
 /// Create AggregateError constructor: `new AggregateError(errors, message, options)`
 ///
-/// Per §20.5.7.1, the first argument is an iterable of errors stored in `.errors`.
+/// Per §20.5.7.1 AggregateError ( errors, message [ , options ] ):
+/// 1. If NewTarget is undefined, let newTarget be the active function object
+/// 2. Let O = OrdinaryCreateFromConstructor(newTarget, "%AggregateError.prototype%")
+/// 3. If message is not undefined, let msg = ToString(message), set O.[[message]]
+/// 4. InstallErrorCause(O, options)
+/// 5. Let errorsList = IterableToList(errors)   ← AFTER message
+/// 6. Perform ! DefinePropertyOrThrow(O, "errors", { [[Value]]: errorsList, ... })
+/// 7. Return O
 pub fn create_aggregate_error_constructor() -> Box<
     dyn Fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>
         + Send
@@ -286,96 +293,10 @@ pub fn create_aggregate_error_constructor() -> Box<
 > {
     Box::new(|this, args, ncx| {
         if let Some(obj) = this.as_object() {
-            // arg0: errors (iterable) — iterate via iterator protocol
             let errors_arg = args.first().cloned().unwrap_or(Value::undefined());
             let mm = obj.memory_manager().clone();
-            let errors_array = if let Some(arr_obj) = errors_arg.as_object() {
-                // Try to use Symbol.iterator for proper iteration
-                let iter_sym = crate::intrinsics::well_known::iterator_symbol();
-                let iter_fn = arr_obj.get(&PropertyKey::Symbol(iter_sym));
-                if let Some(iter_method) = iter_fn {
-                    if iter_method.is_callable() {
-                        // Use iterator protocol
-                        let iterator =
-                            ncx.call_function(&iter_method, Value::object(arr_obj.clone()), &[])?;
-                        let result_arr = GcRef::new(JsObject::array(0, mm.clone()));
-                        let mut idx = 0u32;
-                        if let Some(iter_obj) = iterator.as_object() {
-                            let next_fn = iter_obj
-                                .get(&PropertyKey::string("next"))
-                                .unwrap_or(Value::undefined());
-                            loop {
-                                let step = ncx.call_function(
-                                    &next_fn,
-                                    Value::object(iter_obj.clone()),
-                                    &[],
-                                )?;
-                                if let Some(step_obj) = step.as_object() {
-                                    let done = step_obj
-                                        .get(&PropertyKey::string("done"))
-                                        .map(|v| v.to_boolean())
-                                        .unwrap_or(false);
-                                    if done {
-                                        break;
-                                    }
-                                    let value = step_obj
-                                        .get(&PropertyKey::string("value"))
-                                        .unwrap_or(Value::undefined());
-                                    let _ = result_arr.set(PropertyKey::Index(idx), value);
-                                    idx += 1;
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
-                        let _ = result_arr
-                            .set(PropertyKey::string("length"), Value::number(idx as f64));
-                        Value::array(result_arr)
-                    } else {
-                        // No iterator, fall back to array-like
-                        let len = arr_obj
-                            .get(&PropertyKey::string("length"))
-                            .and_then(|v| v.as_number())
-                            .unwrap_or(0.0) as u32;
-                        let result_arr = GcRef::new(JsObject::array(len as usize, mm.clone()));
-                        for i in 0..len {
-                            if let Some(val) = arr_obj.get(&PropertyKey::Index(i)) {
-                                let _ = result_arr.set(PropertyKey::Index(i), val);
-                            }
-                        }
-                        Value::array(result_arr)
-                    }
-                } else {
-                    // No Symbol.iterator, try array-like
-                    let len = arr_obj
-                        .get(&PropertyKey::string("length"))
-                        .and_then(|v| v.as_number())
-                        .unwrap_or(0.0) as u32;
-                    let result_arr = GcRef::new(JsObject::array(len as usize, mm.clone()));
-                    for i in 0..len {
-                        if let Some(val) = arr_obj.get(&PropertyKey::Index(i)) {
-                            let _ = result_arr.set(PropertyKey::Index(i), val);
-                        }
-                    }
-                    Value::array(result_arr)
-                }
-            } else {
-                // Non-object: spec says TypeError for non-iterable
-                return Err(VmError::type_error(
-                    "AggregateError: errors argument is not iterable",
-                ));
-            };
 
-            // Store .errors as a data property { writable: true, enumerable: false, configurable: true }
-            obj.define_property(
-                PropertyKey::string("errors"),
-                PropertyDescriptor::data_with_attrs(
-                    errors_array,
-                    PropertyAttributes::builtin_method(),
-                ),
-            );
-
-            // arg1: message (optional)
+            // Step 3: message (BEFORE errors per spec)
             if let Some(msg) = args.get(1) {
                 if !msg.is_undefined() {
                     let msg_str = ncx.to_string_value(msg)?;
@@ -389,7 +310,7 @@ pub fn create_aggregate_error_constructor() -> Box<
                 }
             }
 
-            // arg2: options (optional) — extract .cause if present
+            // Step 4: InstallErrorCause(O, options)
             if let Some(options) = args.get(2) {
                 if let Some(opts_obj) = options.as_object() {
                     if opts_obj.has(&PropertyKey::string("cause")) {
@@ -406,8 +327,100 @@ pub fn create_aggregate_error_constructor() -> Box<
                 }
             }
 
-            // Note: `name` is inherited from AggregateError.prototype, NOT set on instances
+            // Step 5: IterableToList(errors)
+            let errors_array = iterable_to_list(ncx, &errors_arg, &mm)?;
+
+            // Step 6: Define .errors property
+            obj.define_property(
+                PropertyKey::string("errors"),
+                PropertyDescriptor::data_with_attrs(
+                    errors_array,
+                    PropertyAttributes::builtin_method(),
+                ),
+            );
         }
         Ok(Value::undefined())
     })
+}
+
+/// Implements IterableToList (§7.4.7) — iterate an iterable and collect values into an array.
+///
+/// Uses `get_value_full` to properly invoke accessor getters on iterator protocol objects.
+fn iterable_to_list(
+    ncx: &mut NativeContext<'_>,
+    iterable: &Value,
+    mm: &Arc<MemoryManager>,
+) -> Result<Value, VmError> {
+    use crate::object::get_value_full;
+
+    // GetMethod(obj, @@iterator) — §7.3.10
+    let iter_sym = crate::intrinsics::well_known::iterator_symbol();
+    let iter_method = if let Some(obj) = iterable.as_object() {
+        // Use get_value_full to invoke getter if @@iterator is an accessor
+        let val = get_value_full(&obj, &PropertyKey::Symbol(iter_sym), ncx)?;
+        if val.is_undefined() || val.is_null() {
+            None
+        } else {
+            Some(val)
+        }
+    } else {
+        None
+    };
+
+    let iter_method = match iter_method {
+        Some(m) if m.is_callable() => m,
+        Some(_) => {
+            return Err(VmError::type_error(
+                "Result of the Symbol.iterator method is not callable",
+            ));
+        }
+        None => {
+            return Err(VmError::type_error(
+                "object is not iterable",
+            ));
+        }
+    };
+
+    // Call(method, obj) — get iterator
+    let iterator = ncx.call_function(&iter_method, iterable.clone(), &[])?;
+    let iter_obj = iterator.as_object().ok_or_else(|| {
+        VmError::type_error("Result of the Symbol.iterator method is not an object")
+    })?;
+
+    // GetV(iterator, "next")
+    let next_fn = get_value_full(&iter_obj, &PropertyKey::string("next"), ncx)?;
+    if !next_fn.is_callable() {
+        return Err(VmError::type_error("iterator.next is not a function"));
+    }
+
+    let result_arr = GcRef::new(JsObject::array(0, mm.clone()));
+    // Root the result array across call_function GC points
+    ncx.ctx.push_root_slot(Value::array(result_arr));
+    let mut idx = 0u32;
+
+    let loop_result: Result<(), VmError> = (|| {
+        loop {
+            // IteratorStep: call next()
+            let step = ncx.call_function(&next_fn, Value::object(iter_obj.clone()), &[])?;
+            let step_obj = step.as_object().ok_or_else(|| {
+                VmError::type_error("Iterator result is not an object")
+            })?;
+            // IteratorComplete: Get(result, "done")
+            let done = get_value_full(&step_obj, &PropertyKey::string("done"), ncx)?;
+            if done.to_boolean() {
+                break;
+            }
+            // IteratorValue: Get(result, "value")
+            let value = get_value_full(&step_obj, &PropertyKey::string("value"), ncx)?;
+            let _ = result_arr.set(PropertyKey::Index(idx), value);
+            idx += 1;
+        }
+        Ok(())
+    })();
+
+    ncx.ctx.pop_root_slots(1);
+    loop_result?;
+
+    let _ = result_arr.set(PropertyKey::string("length"), Value::number(idx as f64));
+    Ok(Value::array(result_arr))
 }

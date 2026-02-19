@@ -519,6 +519,7 @@ mod tests {
 
     #[test]
     fn test_console_log() {
+        let _rt = otter_vm_core::runtime::VmRuntime::new();
         let capture = Arc::new(CaptureConsole::new());
         let ops = console_ops_with_adapter(capture.clone());
 
@@ -543,6 +544,7 @@ mod tests {
 
     #[test]
     fn test_console_error() {
+        let _rt = otter_vm_core::runtime::VmRuntime::new();
         let capture = Arc::new(CaptureConsole::new());
         let ops = console_ops_with_adapter(capture.clone());
 
@@ -563,6 +565,7 @@ mod tests {
 
     #[test]
     fn test_console_count() {
+        let _rt = otter_vm_core::runtime::VmRuntime::new();
         let capture = Arc::new(CaptureConsole::new());
         let ops = console_ops_with_adapter(capture.clone());
 
@@ -612,6 +615,7 @@ mod tests {
 
     #[test]
     fn test_console_assert_fail() {
+        let _rt = otter_vm_core::runtime::VmRuntime::new();
         let capture = Arc::new(CaptureConsole::new());
         let ops = console_ops_with_adapter(capture.clone());
 
@@ -638,6 +642,7 @@ mod tests {
 
     #[test]
     fn test_format_args() {
+        let _rt = otter_vm_core::runtime::VmRuntime::new();
         let args = vec![
             Value::string(otter_vm_core::JsString::intern("hello")),
             Value::number(42.0),

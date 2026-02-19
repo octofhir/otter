@@ -2889,7 +2889,7 @@ impl Interpreter {
                 dst,
                 lhs,
                 rhs,
-                ic_index,
+                ic_index: _ic_index,
             } => {
                 let left = ctx.get_register(lhs.0).clone();
                 let right = ctx.get_register(rhs.0).clone();
@@ -2930,123 +2930,6 @@ impl Interpreter {
                     let idx_str = self.to_string(&left);
                     PropertyKey::string(&idx_str)
                 };
-
-                // IC Fast Path - only for string keys
-                // For 'in' operator, we cache whether the property exists on a shape
-                // The offset field is reused: 0 = property doesn't exist, non-zero = exists
-                if matches!(&key, PropertyKey::String(_)) {
-                    let mut cached_result = None;
-                    {
-                        let frame = ctx
-                            .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let func = frame
-                            .module
-                            .function(frame.function_index)
-                            .ok_or_else(|| VmError::internal("no function"))?;
-                        let feedback = func.feedback_vector.read();
-                        if let Some(ic) = feedback.get(*ic_index as usize) {
-                            use otter_vm_bytecode::function::InlineCacheState;
-                            let obj_shape_ptr = std::sync::Arc::as_ptr(&right_obj.shape()) as u64;
-
-                            if ic.proto_epoch_matches(get_proto_epoch()) {
-                                match &ic.ic_state {
-                                    InlineCacheState::Monomorphic { shape_id, offset } => {
-                                        if obj_shape_ptr == *shape_id {
-                                            // offset encodes: 1 = exists, 0 = doesn't exist
-                                            cached_result = Some(*offset != 0);
-                                        }
-                                    }
-                                    InlineCacheState::Polymorphic { count, entries } => {
-                                        for i in 0..(*count as usize) {
-                                            if obj_shape_ptr == entries[i].0 {
-                                                cached_result = Some(entries[i].1 != 0);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-
-                    if let Some(result) = cached_result {
-                        ctx.set_register(dst.0, Value::boolean(result));
-                        return Ok(InstructionResult::Continue);
-                    }
-
-                    // Slow path with IC update (proxy-aware)
-                    let has_property =
-                        self.has_with_proxy_chain(ctx, &right_obj, &key, left.clone())?;
-                    {
-                        let frame = ctx
-                            .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let func = frame
-                            .module
-                            .function(frame.function_index)
-                            .ok_or_else(|| VmError::internal("no function"))?;
-                        let feedback = func.feedback_vector.write();
-                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            use otter_vm_bytecode::function::InlineCacheState;
-                            // Skip IC for dictionary mode objects
-                            if right_obj.is_dictionary_mode() {
-                                ic.ic_state = InlineCacheState::Megamorphic;
-                            } else {
-                                let shape_ptr = std::sync::Arc::as_ptr(&right_obj.shape()) as u64;
-                                let exists_marker = if has_property { 1u32 } else { 0u32 };
-                                let current_epoch = get_proto_epoch();
-
-                                match &mut ic.ic_state {
-                                    InlineCacheState::Uninitialized => {
-                                        ic.ic_state = InlineCacheState::Monomorphic {
-                                            shape_id: shape_ptr,
-                                            offset: exists_marker,
-                                        };
-                                        ic.proto_epoch = current_epoch;
-                                    }
-                                    InlineCacheState::Monomorphic {
-                                        shape_id: old_shape,
-                                        offset: old_exists,
-                                    } => {
-                                        if *old_shape != shape_ptr {
-                                            let mut entries = [(0u64, 0u32); 4];
-                                            entries[0] = (*old_shape, *old_exists);
-                                            entries[1] = (shape_ptr, exists_marker);
-                                            ic.ic_state =
-                                                InlineCacheState::Polymorphic { count: 2, entries };
-                                            ic.proto_epoch = current_epoch;
-                                        }
-                                    }
-                                    InlineCacheState::Polymorphic { count, entries } => {
-                                        let mut found = false;
-                                        for i in 0..(*count as usize) {
-                                            if entries[i].0 == shape_ptr {
-                                                found = true;
-                                                break;
-                                            }
-                                        }
-                                        if !found {
-                                            if (*count as usize) < 4 {
-                                                entries[*count as usize] =
-                                                    (shape_ptr, exists_marker);
-                                                *count += 1;
-                                                ic.proto_epoch = current_epoch;
-                                            } else {
-                                                ic.ic_state = InlineCacheState::Megamorphic;
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-
-                    ctx.set_register(dst.0, Value::boolean(has_property));
-                    return Ok(InstructionResult::Continue);
-                }
 
                 let result = self.has_with_proxy_chain(ctx, &right_obj, &key, left.clone())?;
                 ctx.set_register(dst.0, Value::boolean(result));
@@ -4828,6 +4711,10 @@ impl Interpreter {
                     .map(|func| func.flags.is_strict)
                     .unwrap_or(false);
 
+                // Direct eval inherits the caller's this binding.
+                let caller_this = ctx.this_value();
+                ctx.set_pending_this(caller_this);
+
                 let injected_eval_bindings = self.inject_eval_bindings(ctx);
                 let eval_result = (|| {
                     let eval_module = ctx.compile_eval(&source, is_strict_context)?;
@@ -5472,6 +5359,9 @@ impl Interpreter {
                         _ => {
                             // Own data property: set directly
                             if let Err(e) = obj.set(key, val_val) {
+                                if matches!(e, SetPropertyError::InvalidArrayLength) {
+                                    return Err(VmError::range_error(e.to_string()));
+                                }
                                 if is_strict {
                                     return Err(VmError::type_error(e.to_string()));
                                 }
@@ -5643,7 +5533,7 @@ impl Interpreter {
                 dst,
                 obj,
                 key,
-                ic_index,
+                ic_index: _ic_index,
             } => {
                 let object = ctx.get_register(obj.0).clone();
                 let key_value = ctx.get_register(key.0).clone();
@@ -5789,50 +5679,6 @@ impl Interpreter {
                     // Convert key to property key
                     let key = self.value_to_property_key(ctx, &key_value)?;
 
-                    // IC Fast Path - only for string keys (not index or symbol)
-                    if matches!(&key, PropertyKey::String(_)) {
-                        let mut cached_val = None;
-                        {
-                            let frame = ctx
-                                .current_frame()
-                                .ok_or_else(|| VmError::internal("no frame"))?;
-                            let func = frame
-                                .module
-                                .function(frame.function_index)
-                                .ok_or_else(|| VmError::internal("no function"))?;
-                            let feedback = func.feedback_vector.read();
-                            if let Some(ic) = feedback.get(*ic_index as usize) {
-                                use otter_vm_bytecode::function::InlineCacheState;
-                                let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
-
-                                if ic.proto_epoch_matches(get_proto_epoch()) {
-                                    match &ic.ic_state {
-                                        InlineCacheState::Monomorphic { shape_id, offset } => {
-                                            if obj_shape_ptr == *shape_id {
-                                                cached_val = obj.get_by_offset(*offset as usize);
-                                            }
-                                        }
-                                        InlineCacheState::Polymorphic { count, entries } => {
-                                            for i in 0..(*count as usize) {
-                                                if obj_shape_ptr == entries[i].0 {
-                                                    cached_val =
-                                                        obj.get_by_offset(entries[i].1 as usize);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some(val) = cached_val {
-                            ctx.set_register(dst.0, val);
-                            return Ok(InstructionResult::Continue);
-                        }
-                    }
-
                     match obj.lookup_property_descriptor(&key) {
                         Some(crate::object::PropertyDescriptor::Accessor { get, .. }) => {
                             let Some(getter) = get else {
@@ -5861,70 +5707,6 @@ impl Interpreter {
                             }
                         }
                         _ => {
-                            // Slow path: full lookup and IC update (only for string keys, skip dictionary mode)
-                            if matches!(&key, PropertyKey::String(_)) && !obj.is_dictionary_mode() {
-                                if let Some(offset) = obj.shape().get_offset(&key) {
-                                    let frame = ctx
-                                        .current_frame()
-                                        .ok_or_else(|| VmError::internal("no frame"))?;
-                                    let func = frame
-                                        .module
-                                        .function(frame.function_index)
-                                        .ok_or_else(|| VmError::internal("no function"))?;
-                                    let feedback = func.feedback_vector.write();
-                                    if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                        use otter_vm_bytecode::function::InlineCacheState;
-                                        let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
-                                        let current_epoch = get_proto_epoch();
-
-                                        match &mut ic.ic_state {
-                                            InlineCacheState::Uninitialized => {
-                                                ic.ic_state = InlineCacheState::Monomorphic {
-                                                    shape_id: shape_ptr,
-                                                    offset: offset as u32,
-                                                };
-                                                ic.proto_epoch = current_epoch;
-                                            }
-                                            InlineCacheState::Monomorphic {
-                                                shape_id: old_shape,
-                                                offset: old_offset,
-                                            } => {
-                                                if *old_shape != shape_ptr {
-                                                    let mut entries = [(0u64, 0u32); 4];
-                                                    entries[0] = (*old_shape, *old_offset);
-                                                    entries[1] = (shape_ptr, offset as u32);
-                                                    ic.ic_state = InlineCacheState::Polymorphic {
-                                                        count: 2,
-                                                        entries,
-                                                    };
-                                                    ic.proto_epoch = current_epoch;
-                                                }
-                                            }
-                                            InlineCacheState::Polymorphic { count, entries } => {
-                                                let mut found = false;
-                                                for i in 0..(*count as usize) {
-                                                    if entries[i].0 == shape_ptr {
-                                                        found = true;
-                                                        break;
-                                                    }
-                                                }
-                                                if !found {
-                                                    if (*count as usize) < 4 {
-                                                        entries[*count as usize] =
-                                                            (shape_ptr, offset as u32);
-                                                        *count += 1;
-                                                        ic.proto_epoch = current_epoch;
-                                                    } else {
-                                                        ic.ic_state = InlineCacheState::Megamorphic;
-                                                    }
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-
                             let value = self.get_with_proxy_chain(
                                 ctx,
                                 &obj,
@@ -5992,7 +5774,7 @@ impl Interpreter {
                 obj,
                 key,
                 val,
-                ic_index,
+                ic_index: _ic_index,
             } => {
                 let object = ctx.get_register(obj.0).clone();
                 let key_value = ctx.get_register(key.0).clone();
@@ -6024,71 +5806,6 @@ impl Interpreter {
                 if let Some(obj) = object.as_object() {
                     let key = self.value_to_property_key(ctx, &key_value)?;
 
-                    // IC Fast Path
-                    let mut cached = false;
-                    {
-                        let frame = ctx
-                            .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let func = frame
-                            .module
-                            .function(frame.function_index)
-                            .ok_or_else(|| VmError::internal("no function"))?;
-                        let feedback = func.feedback_vector.read();
-                        if let Some(ic) = feedback.get(*ic_index as usize) {
-                            use otter_vm_bytecode::function::InlineCacheState;
-                            let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
-
-                            if ic.proto_epoch_matches(get_proto_epoch()) {
-                                match &ic.ic_state {
-                                    InlineCacheState::Monomorphic { shape_id, offset } => {
-                                        if obj_shape_ptr == *shape_id {
-                                            match obj
-                                                .set_by_offset(*offset as usize, val_val.clone())
-                                            {
-                                                Ok(()) => cached = true,
-                                                // Accessor: fall through to slow path to call setter
-                                                Err(SetPropertyError::AccessorWithoutSetter) => {}
-                                                Err(e) if is_strict => {
-                                                    return Err(VmError::type_error(e.to_string()));
-                                                }
-                                                Err(_) => {}
-                                            }
-                                        }
-                                    }
-                                    InlineCacheState::Polymorphic { count, entries } => {
-                                        for i in 0..(*count as usize) {
-                                            if obj_shape_ptr == entries[i].0 {
-                                                match obj.set_by_offset(
-                                                    entries[i].1 as usize,
-                                                    val_val.clone(),
-                                                ) {
-                                                    Ok(()) => cached = true,
-                                                    // Accessor: fall through to slow path to call setter
-                                                    Err(
-                                                        SetPropertyError::AccessorWithoutSetter,
-                                                    ) => {}
-                                                    Err(e) if is_strict => {
-                                                        return Err(VmError::type_error(
-                                                            e.to_string(),
-                                                        ));
-                                                    }
-                                                    Err(_) => {}
-                                                }
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-
-                    if cached {
-                        return Ok(InstructionResult::Continue);
-                    }
-
                     match obj.lookup_property_descriptor(&key) {
                         Some(crate::object::PropertyDescriptor::Accessor { set, .. }) => {
                             let Some(setter) = set else {
@@ -6115,72 +5832,13 @@ impl Interpreter {
                             }
                         }
                         _ => {
-                            // Slow path: update IC (skip for dictionary mode)
+                            // Slow path
                             if let Err(e) = obj.set(key.clone(), val_val) {
+                                if matches!(e, SetPropertyError::InvalidArrayLength) {
+                                    return Err(VmError::range_error(e.to_string()));
+                                }
                                 if is_strict {
                                     return Err(VmError::type_error(e.to_string()));
-                                }
-                            }
-                            if !obj.is_dictionary_mode() {
-                                if let Some(offset) = obj.shape().get_offset(&key) {
-                                    let frame = ctx
-                                        .current_frame()
-                                        .ok_or_else(|| VmError::internal("no frame"))?;
-                                    let func = frame
-                                        .module
-                                        .function(frame.function_index)
-                                        .ok_or_else(|| VmError::internal("no function"))?;
-                                    let feedback = func.feedback_vector.write();
-                                    if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                        use otter_vm_bytecode::function::InlineCacheState;
-                                        let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
-                                        let current_epoch = get_proto_epoch();
-
-                                        match &mut ic.ic_state {
-                                            InlineCacheState::Uninitialized => {
-                                                ic.ic_state = InlineCacheState::Monomorphic {
-                                                    shape_id: shape_ptr,
-                                                    offset: offset as u32,
-                                                };
-                                                ic.proto_epoch = current_epoch;
-                                            }
-                                            InlineCacheState::Monomorphic {
-                                                shape_id: old_shape,
-                                                offset: old_offset,
-                                            } => {
-                                                if *old_shape != shape_ptr {
-                                                    let mut entries = [(0u64, 0u32); 4];
-                                                    entries[0] = (*old_shape, *old_offset);
-                                                    entries[1] = (shape_ptr, offset as u32);
-                                                    ic.ic_state = InlineCacheState::Polymorphic {
-                                                        count: 2,
-                                                        entries,
-                                                    };
-                                                    ic.proto_epoch = current_epoch;
-                                                }
-                                            }
-                                            InlineCacheState::Polymorphic { count, entries } => {
-                                                let mut found = false;
-                                                for i in 0..(*count as usize) {
-                                                    if entries[i].0 == shape_ptr {
-                                                        found = true;
-                                                        break;
-                                                    }
-                                                }
-                                                if !found {
-                                                    if (*count as usize) < 4 {
-                                                        entries[*count as usize] =
-                                                            (shape_ptr, offset as u32);
-                                                        *count += 1;
-                                                        ic.proto_epoch = current_epoch;
-                                                    } else {
-                                                        ic.ic_state = InlineCacheState::Megamorphic;
-                                                    }
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
                                 }
                             }
                             Ok(InstructionResult::Continue)
@@ -6243,6 +5901,19 @@ impl Interpreter {
                         attributes: PropertyAttributes::accessor(),
                     };
                     obj.define_property(prop_key, desc);
+                }
+
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::DefineProperty { obj, key, val } => {
+                let object = ctx.get_register(obj.0).clone();
+                let key_value = ctx.get_register(key.0).clone();
+                let value = ctx.get_register(val.0).clone();
+
+                if let Some(obj) = object.as_object() {
+                    let prop_key = self.value_to_property_key(ctx, &key_value)?;
+                    obj.define_property(prop_key, PropertyDescriptor::data(value));
                 }
 
                 Ok(InstructionResult::Continue)
@@ -6621,6 +6292,9 @@ impl Interpreter {
                         }
                         _ => {
                             if let Err(e) = obj.set(key, val_val) {
+                                if matches!(e, SetPropertyError::InvalidArrayLength) {
+                                    return Err(VmError::range_error(e.to_string()));
+                                }
                                 if is_strict {
                                     return Err(VmError::type_error(e.to_string()));
                                 }
@@ -7159,6 +6833,15 @@ impl Interpreter {
                         Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
                             o.get(&PropertyKey::Symbol(iterator_sym))
                         }
+                        Some(HeapRef::Function(f)) => {
+                            f.object.get(&PropertyKey::Symbol(iterator_sym))
+                        }
+                        Some(HeapRef::NativeFunction(f)) => {
+                            f.object.get(&PropertyKey::Symbol(iterator_sym))
+                        }
+                        Some(HeapRef::Generator(g)) => {
+                            g.object.get(&PropertyKey::Symbol(iterator_sym))
+                        }
                         _ => None,
                     }
                 };
@@ -7215,6 +6898,15 @@ impl Interpreter {
                         Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
                             o.get(&PropertyKey::Symbol(async_iterator_sym))
                         }
+                        Some(HeapRef::Function(f)) => {
+                            f.object.get(&PropertyKey::Symbol(async_iterator_sym))
+                        }
+                        Some(HeapRef::NativeFunction(f)) => {
+                            f.object.get(&PropertyKey::Symbol(async_iterator_sym))
+                        }
+                        Some(HeapRef::Generator(g)) => {
+                            g.object.get(&PropertyKey::Symbol(async_iterator_sym))
+                        }
                         _ => None,
                     }
                 };
@@ -7236,6 +6928,15 @@ impl Interpreter {
                         iterator_method = match obj.heap_ref() {
                             Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
                                 o.get(&PropertyKey::Symbol(iterator_sym))
+                            }
+                            Some(HeapRef::Function(f)) => {
+                                f.object.get(&PropertyKey::Symbol(iterator_sym))
+                            }
+                            Some(HeapRef::NativeFunction(f)) => {
+                                f.object.get(&PropertyKey::Symbol(iterator_sym))
+                            }
+                            Some(HeapRef::Generator(g)) => {
+                                g.object.get(&PropertyKey::Symbol(iterator_sym))
                             }
                             _ => None,
                         };
@@ -11017,10 +10718,14 @@ mod tests {
     use otter_vm_bytecode::operand::Register;
     use otter_vm_bytecode::{Function, Module};
 
-    fn create_test_context() -> VmContext {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
-        let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
-        VmContext::new(global, memory_manager)
+    fn create_test_runtime() -> crate::runtime::VmRuntime {
+        crate::runtime::VmRuntime::new()
+    }
+
+    fn create_test_context_with_runtime() -> (VmContext, crate::runtime::VmRuntime) {
+        let runtime = create_test_runtime();
+        let ctx = runtime.create_context();
+        (ctx, runtime)
     }
 
     #[test]
@@ -11039,7 +10744,7 @@ mod tests {
         builder.add_function(func);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -11062,7 +10767,7 @@ mod tests {
         let hook_calls = Arc::new(AtomicUsize::new(0));
         let hook_calls_clone = Arc::clone(&hook_calls);
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         ctx.set_debugger_hook(Some(Arc::new(move |_| {
             hook_calls_clone.fetch_add(1, Ordering::SeqCst);
         })));
@@ -11087,7 +10792,7 @@ mod tests {
         builder.add_function(func);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         ctx.set_trace_config(crate::trace::TraceConfig {
             enabled: true,
             mode: crate::trace::TraceMode::RingBuffer,
@@ -11135,7 +10840,7 @@ mod tests {
         builder.add_function(func);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         ctx.set_trace_config(crate::trace::TraceConfig {
             enabled: true,
             mode: crate::trace::TraceMode::RingBuffer,
@@ -11184,7 +10889,7 @@ mod tests {
         builder.add_function(func);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -11216,7 +10921,7 @@ mod tests {
         builder.add_function(func);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -11260,7 +10965,7 @@ mod tests {
         builder.add_function(func);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -11310,7 +11015,7 @@ mod tests {
         builder.add_function(func);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -11359,7 +11064,7 @@ mod tests {
         builder.add_function(func);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -11399,7 +11104,7 @@ mod tests {
         builder.add_function(helper);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -11463,7 +11168,7 @@ mod tests {
         builder.add_function(double);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -11525,7 +11230,7 @@ mod tests {
         builder.add_function(add);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -11619,7 +11324,7 @@ mod tests {
         builder.add_function(inner);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -11685,7 +11390,7 @@ mod tests {
         builder.add_function(getter);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -11780,7 +11485,7 @@ mod tests {
         builder.add_function(setter);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -11829,7 +11534,7 @@ mod tests {
         builder.add_function(func);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -11874,7 +11579,7 @@ mod tests {
         builder.add_function(func);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -11919,7 +11624,7 @@ mod tests {
         builder.add_function(func);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -11971,7 +11676,7 @@ mod tests {
         builder.add_function(constructor);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -12019,7 +11724,7 @@ mod tests {
         builder.add_function(func);
         let module = builder.build();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute(&module, &mut ctx).unwrap();
 
@@ -12066,7 +11771,7 @@ mod tests {
         let module = builder.build();
         let module = std::sync::Arc::new(module);
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
 
@@ -12160,7 +11865,7 @@ mod tests {
         let module = builder.build();
         let module = std::sync::Arc::new(module);
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
 
@@ -12360,7 +12065,7 @@ mod tests {
         let module = builder.build();
         let module = std::sync::Arc::new(module);
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
 
@@ -12384,7 +12089,8 @@ mod tests {
         // Test that proto_epoch is bumped when set_prototype is called
         use crate::object::get_proto_epoch;
 
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
 
         // Record initial epoch
         let initial_epoch = get_proto_epoch();
@@ -12455,7 +12161,7 @@ mod tests {
         // Record epoch before execution
         let epoch_before = get_proto_epoch();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
 
@@ -12519,7 +12225,7 @@ mod tests {
         let module = builder.build();
         let module = std::sync::Arc::new(module);
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
         assert_eq!(result.as_int32(), Some(42));
@@ -12625,7 +12331,7 @@ mod tests {
 
         let epoch_before = get_proto_epoch();
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
 
@@ -12654,7 +12360,8 @@ mod tests {
         // Test that adding more than DICTIONARY_THRESHOLD properties triggers dictionary mode
         use crate::object::{DICTIONARY_THRESHOLD, JsObject, PropertyKey};
 
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let obj = GcRef::new(JsObject::new(Value::null(), memory_manager));
 
         // Initially not in dictionary mode
@@ -12698,7 +12405,8 @@ mod tests {
         // Test that deleting a property triggers dictionary mode
         use crate::object::{JsObject, PropertyKey};
 
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let obj = GcRef::new(JsObject::new(Value::null(), memory_manager));
 
         // Add a few properties
@@ -12729,7 +12437,8 @@ mod tests {
         // Test that dictionary mode storage works correctly
         use crate::object::{JsObject, PropertyKey};
 
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let obj = GcRef::new(JsObject::new(Value::null(), memory_manager));
 
         // Add a property
@@ -12764,7 +12473,8 @@ mod tests {
         use crate::object::{JsObject, PropertyKey};
         use otter_vm_bytecode::function::InlineCacheState;
 
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let obj = GcRef::new(JsObject::new(Value::null(), memory_manager));
 
         // Add and delete a property to trigger dictionary mode
@@ -12821,7 +12531,7 @@ mod tests {
 
         // Execute the function multiple times
         for _ in 0..100 {
-            let mut ctx = create_test_context();
+            let (mut ctx, _rt) = create_test_context_with_runtime();
             let interpreter = Interpreter::new();
             let _ = interpreter.execute_arc(module.clone(), &mut ctx);
         }
@@ -12832,7 +12542,7 @@ mod tests {
 
         // Execute until we cross the threshold
         for _ in 0..(HOT_FUNCTION_THRESHOLD - 100) {
-            let mut ctx = create_test_context();
+            let (mut ctx, _rt) = create_test_context_with_runtime();
             let interpreter = Interpreter::new();
             let _ = interpreter.execute_arc(module.clone(), &mut ctx);
         }
@@ -12953,7 +12663,7 @@ mod tests {
         let module = builder.build();
         let module = Arc::new(module);
 
-        let mut ctx = create_test_context();
+        let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
 

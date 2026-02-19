@@ -2659,6 +2659,7 @@ mod tests {
 
     #[test]
     fn test_parse_encoding_string() {
+        let _rt = otter_vm_core::runtime::VmRuntime::new();
         let val = Value::string(JsString::intern("utf8"));
         let result = parse_encoding(Some(&val)).unwrap();
         assert_eq!(result, Some("utf8".to_string()));
@@ -2684,6 +2685,7 @@ mod tests {
 
     #[test]
     fn test_data_to_bytes_string() {
+        let _rt = otter_vm_core::runtime::VmRuntime::new();
         let val = Value::string(JsString::new_gc("hello"));
         let bytes = data_to_bytes(&val).unwrap();
         assert_eq!(bytes, b"hello");

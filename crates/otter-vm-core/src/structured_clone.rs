@@ -294,7 +294,8 @@ mod tests {
 
     #[test]
     fn test_clone_primitives() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let mut cloner = StructuredCloner::new(memory_manager.clone());
 
         assert!(cloner.clone(&Value::undefined()).unwrap().is_undefined());
@@ -311,7 +312,8 @@ mod tests {
 
     #[test]
     fn test_clone_string() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let mut cloner = StructuredCloner::new(memory_manager.clone());
         let s = Value::string(JsString::intern("hello"));
         let cloned = cloner.clone(&s).unwrap();
@@ -321,7 +323,8 @@ mod tests {
 
     #[test]
     fn test_clone_object() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let mut cloner = StructuredCloner::new(memory_manager.clone());
         let obj = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         let _ = obj.set(PropertyKey::string("x"), Value::int32(1));
@@ -344,7 +347,8 @@ mod tests {
 
     #[test]
     fn test_shared_array_buffer_shares_memory() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let mut cloner = StructuredCloner::new(memory_manager.clone());
         let sab = GcRef::new(SharedArrayBuffer::new(4));
         let _ = sab.set(0, 42);
@@ -367,7 +371,8 @@ mod tests {
         use crate::value::Closure;
         use otter_vm_bytecode::Module;
 
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let mut cloner = StructuredCloner::new(memory_manager.clone());
         let dummy_module = Arc::new(Module::builder("test.js").build());
         let func = Value::function(GcRef::new(Closure {
@@ -389,7 +394,8 @@ mod tests {
 
     #[test]
     fn test_clone_typed_array_copies_underlying_buffer() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let mut cloner = StructuredCloner::new(memory_manager.clone());
 
         let buffer = GcRef::new(JsArrayBuffer::new(8, None, memory_manager.clone()));
@@ -415,7 +421,8 @@ mod tests {
 
     #[test]
     fn test_clone_data_view_copies_underlying_buffer() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let mut cloner = StructuredCloner::new(memory_manager.clone());
 
         let buffer = GcRef::new(JsArrayBuffer::new(8, None, memory_manager.clone()));

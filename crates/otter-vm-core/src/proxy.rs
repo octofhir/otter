@@ -159,7 +159,8 @@ mod tests {
 
     #[test]
     fn test_proxy_creation() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let target = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         let handler = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         let proxy = JsProxy::new(Value::object(target), Value::object(handler));
@@ -171,7 +172,8 @@ mod tests {
 
     #[test]
     fn test_proxy_revoke() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let target = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         let handler = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         let proxy = JsProxy::new(Value::object(target), Value::object(handler));
@@ -185,7 +187,8 @@ mod tests {
 
     #[test]
     fn test_revocable_proxy() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let target = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         let handler = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         let RevocableProxy { proxy, revoke } =
@@ -198,7 +201,8 @@ mod tests {
 
     #[test]
     fn test_get_trap_missing() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let target = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         let handler = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
         let proxy = JsProxy::new(Value::object(target), Value::object(handler));

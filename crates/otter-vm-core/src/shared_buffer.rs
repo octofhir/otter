@@ -220,6 +220,7 @@ mod tests {
 
     #[test]
     fn test_shared_between_threads() {
+        let _rt = crate::runtime::VmRuntime::new();
         let sab = GcRef::new(SharedArrayBuffer::new(1));
         let sab_clone = sab; // GcRef is Copy
 
@@ -233,6 +234,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_atomics() {
+        let _rt = crate::runtime::VmRuntime::new();
         let sab = GcRef::new(SharedArrayBuffer::new(1));
         let mut handles = vec![];
 

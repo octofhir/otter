@@ -71,6 +71,8 @@ pub use otter_vm_runtime::{
     ExtensionRegistry,
     HttpEvent,
     IsolatedEnvStore,
+    // Isolate configuration
+    IsolateConfig,
     // Module loader
     LoadedModule,
     ModuleError,
@@ -250,6 +252,14 @@ impl EngineBuilder {
     /// Set explicit Node.js API profile.
     pub fn with_nodejs_profile(mut self, profile: NodeApiProfile) -> Self {
         self.nodejs_profile = profile;
+        self
+    }
+
+    /// Set isolate configuration (stack depth, heap size, strict mode).
+    ///
+    /// If not set, uses `IsolateConfig::default()`.
+    pub fn isolate_config(mut self, config: IsolateConfig) -> Self {
+        self.inner = self.inner.isolate_config(config);
         self
     }
 

@@ -156,48 +156,18 @@ impl Test262Runner {
         }
     }
 
-    /// Rebuild engine after a panic to restore consistent state.
+    /// Rebuild engine to restore consistent state.
     ///
-    /// Only called after a panic — normal test runs reuse the same engine.
+    /// Drops the old `Otter` (which drops its `Isolate`, cleaning up
+    /// thread-local GC registry and memory manager via RAII) and creates
+    /// a fresh one. The catch_unwind around drop handles the case where
+    /// the old engine's internal state is corrupted (e.g. after a panic).
     fn rebuild_engine(&mut self) {
-        // Phase 1: Drop old engine in a panic-safe way.
-        //
-        // After a VM panic the engine's internal data structures (property maps,
-        // string table, etc.) may be left in a corrupted state.  Calling
-        // VmContext::teardown() on corrupt state can trigger a second panic which,
-        // being outside any catch_unwind boundary, would abort the process.
-        //
-        // Wrapping the drop in catch_unwind ensures any secondary panics are
-        // silenced.  The GC objects on the thread-local heap are still alive
-        // (dealloc_all is NOT called — see Phase 2 comment below).
         let old_engine = self.engine.take();
-        if let Err(_) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(old_engine);
-        })) {
-            // teardown panicked on corrupted state — silently ignored.
-        }
+        }));
 
-        // Phase 2: Create a fresh engine WITHOUT clearing the string intern table.
-        //
-        // We must NOT call clear_global_string_table() nor dealloc_all() here:
-        //
-        // * dealloc_all() would free GC memory while `well_known` thread-local
-        //   statics (LENGTH, PROTOTYPE, …) still hold GcRef<JsString> pointers
-        //   to those objects → dangling pointers → SIGSEGV.
-        //
-        // * clear_global_string_table() removes the old strings from the intern
-        //   table.  The new engine would then intern fresh copies.  The
-        //   well_known statics still point at the OLD copies.  On the next GC
-        //   cycle the old copies are unreachable from any root → freed →
-        //   well_known statics dangle → SIGSEGV.
-        //
-        // The correct approach: keep the STRING_TABLE intact.  The new engine
-        // calls JsString::intern("length") etc. during intrinsics setup, finds
-        // the existing entries in the table, and reuses those same GcRefs that
-        // the well_known statics hold.  The GC keeps those strings alive because
-        // they are reachable through the new engine's property maps.  The
-        // prune_dead_string_table_entries hook then evicts only truly unreachable
-        // entries on subsequent GC cycles.
         let (harness_ext, harness_state) = crate::harness::create_harness_extension_with_state();
         let mut engine = EngineBuilder::new().extension(harness_ext).build();
 
@@ -316,8 +286,15 @@ impl Test262Runner {
         path: &Path,
         timeout: Option<Duration>,
     ) -> Vec<TestResult> {
+        self.engine_mut().reset_realm();
+
         let relative_path = path.strip_prefix(&self.test_dir).unwrap_or(path);
         let relative_path_str = relative_path.to_string_lossy().to_string();
+
+        if relative_path_str.ends_with("intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-timezone.js")
+        {
+            self.rebuild_engine();
+        }
 
         // Read test file
         let content = match fs::read_to_string(path) {
@@ -374,6 +351,7 @@ impl Test262Runner {
             if *mode == ExecutionMode::NonStrict && result.0 == TestOutcome::Fail {
                 break;
             }
+
         }
 
         results
@@ -454,11 +432,12 @@ impl Test262Runner {
             .map(|i| &content[i + 5..])
             .unwrap_or(content);
         if mode == ExecutionMode::Strict {
-            // Run strict-mode test body via indirect eval so strictness applies
-            // to test code only (not to prepended harness files).
+            // Run strict-mode test body via direct eval so strictness applies
+            // to test code only (not to prepended harness files) while keeping
+            // script-level `this` semantics aligned with test262 expectations.
             let strict_body = format!("\"use strict\";\n{}", test_content);
             if let Ok(encoded) = serde_json::to_string(&strict_body) {
-                test_source.push_str("(0, eval)(");
+                test_source.push_str("eval(");
                 test_source.push_str(&encoded);
                 test_source.push_str(");\n");
             } else {

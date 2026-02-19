@@ -81,7 +81,7 @@ pub use proxy::{JsProxy, RevocableProxy};
 pub use runtime::VmRuntime;
 pub use shape::Shape;
 pub use shared_buffer::SharedArrayBuffer;
-pub use string::{JsString, clear_global_string_table, global_string_table_size};
+pub use string::{JsString, StringTable, clear_global_string_table, global_string_table_size};
 pub use structured_clone::{StructuredCloneError, StructuredCloner, structured_clone};
 pub use trace::{TraceConfig, TraceEntry, TraceMode, TraceRingBuffer, TraceState};
 pub use typed_array::{JsTypedArray, TypedArrayKind};

@@ -789,6 +789,7 @@ mod tests {
 
     #[test]
     fn test_promise_resolve() {
+        let _rt = crate::runtime::VmRuntime::new();
         let promise = JsPromise::new();
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
@@ -805,6 +806,7 @@ mod tests {
 
     #[test]
     fn test_promise_reject() {
+        let _rt = crate::runtime::VmRuntime::new();
         let promise = JsPromise::new();
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
@@ -821,6 +823,7 @@ mod tests {
 
     #[test]
     fn test_promise_already_resolved() {
+        let _rt = crate::runtime::VmRuntime::new();
         let promise = JsPromise::resolved(Value::number(100.0));
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
@@ -836,6 +839,7 @@ mod tests {
 
     #[test]
     fn test_promise_state() {
+        let _rt = crate::runtime::VmRuntime::new();
         let promise = JsPromise::new();
         assert!(promise.is_pending());
         assert!(!promise.is_fulfilled());
@@ -850,8 +854,9 @@ mod tests {
 
     #[test]
     fn test_with_resolvers() {
+        let _rt = crate::runtime::VmRuntime::new();
         let resolvers =
-            JsPromise::with_resolvers(Arc::new(crate::memory::MemoryManager::test()), |_, _| {});
+            JsPromise::with_resolvers(_rt.memory_manager().clone(), |_, _| {});
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
 
@@ -867,8 +872,9 @@ mod tests {
 
     #[test]
     fn test_with_resolvers_reject() {
+        let _rt = crate::runtime::VmRuntime::new();
         let resolvers =
-            JsPromise::with_resolvers(Arc::new(crate::memory::MemoryManager::test()), |_, _| {});
+            JsPromise::with_resolvers(_rt.memory_manager().clone(), |_, _| {});
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
 
@@ -883,6 +889,7 @@ mod tests {
 
     #[test]
     fn test_finally() {
+        let _rt = crate::runtime::VmRuntime::new();
         let promise = JsPromise::new();
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
@@ -897,6 +904,7 @@ mod tests {
 
     #[test]
     fn test_finally_on_reject() {
+        let _rt = crate::runtime::VmRuntime::new();
         let promise = JsPromise::new();
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
@@ -911,6 +919,7 @@ mod tests {
 
     #[test]
     fn test_resolve_with_enqueue() {
+        let _rt = crate::runtime::VmRuntime::new();
         let promise = JsPromise::new();
         let order = Arc::new(AtomicU32::new(0));
         let order_clone = order.clone();

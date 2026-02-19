@@ -8472,45 +8472,12 @@ impl Compiler {
                 ObjectPropertyKind::ObjectProperty(prop) => {
                     match prop.kind {
                         PropertyKind::Init => {
-                            // Fast path: non-computed static keys
-                            if !prop.computed {
-                                let key = match &prop.key {
-                                    PropertyKey::StaticIdentifier(ident) => {
-                                        Some(self.codegen.add_string(&ident.name))
-                                    }
-                                    PropertyKey::StringLiteral(lit) => {
-                                        let units = Self::decode_lone_surrogates(
-                                            lit.value.as_str(),
-                                            lit.lone_surrogates,
-                                        );
-                                        Some(self.codegen.add_string_units(units))
-                                    }
-                                    _ => None,
-                                };
-
-                                if let Some(key) = key {
-                                    let value = self.compile_expression(&prop.value)?;
-                                    let ic_index = self.codegen.alloc_ic();
-                                    self.codegen.emit(Instruction::SetPropConst {
-                                        obj: dst,
-                                        name: key,
-                                        val: value,
-                                        ic_index,
-                                    });
-                                    self.codegen.free_reg(value);
-                                    continue;
-                                }
-                            }
-
-                            // Computed key: obj[key] = value
                             let key_reg = self.compile_property_key(&prop.key)?;
                             let value = self.compile_expression(&prop.value)?;
-                            let ic_index = self.codegen.alloc_ic();
-                            self.codegen.emit(Instruction::SetProp {
+                            self.codegen.emit(Instruction::DefineProperty {
                                 obj: dst,
                                 key: key_reg,
                                 val: value,
-                                ic_index,
                             });
                             self.codegen.free_reg(value);
                             self.codegen.free_reg(key_reg);

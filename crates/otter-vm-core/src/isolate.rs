@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::context::VmContext;
 use crate::memory::MemoryManager;
 use crate::runtime::{RuntimeConfig, VmRuntime};
-use crate::string;
+use crate::string::StringTable;
 
 /// Configuration for creating a new Isolate.
 #[derive(Debug, Clone)]
@@ -73,21 +73,30 @@ impl Default for IsolateConfig {
 
 /// A complete JavaScript isolate.
 ///
-/// Encapsulates all per-VM state: runtime, context, memory manager, and
-/// associated thread-locals. Only one thread may access an Isolate at a time
-/// (enforced by `&mut self` on `enter()`).
+/// Encapsulates all per-VM state: runtime (which owns the string table, GC
+/// registry, and memory manager), context, and associated thread-locals. Only
+/// one thread may access an Isolate at a time (enforced by `&mut self` on
+/// `enter()`).
 ///
 /// # Send but not Sync
 ///
 /// `Isolate` is `Send` (can be moved between threads) but NOT `Sync`
 /// (cannot be shared between threads simultaneously). This matches the
 /// V8 Locker/Unlocker pattern via Rust ownership.
+///
+/// # Field Drop Order
+///
+/// Fields are dropped in declaration order:
+/// 1. `context` — execution state (no Drop impl, just freed)
+/// 2. `runtime` — `VmRuntime::drop()` calls `dealloc_all()`, clears string
+///    table, clears thread-local pointers
+/// 3. `memory_manager`, `handle`, `entered`
 pub struct Isolate {
     /// The VM execution context (registers, call stack, locals).
     /// MUST be declared before `runtime` — Rust drops fields in declaration
     /// order, and context teardown uses the GC registry owned by runtime.
     context: VmContext,
-    /// The VM runtime (module cache, intrinsics, GC registry).
+    /// The VM runtime (module cache, intrinsics, GC registry, string table).
     /// Dropped AFTER context, so the registry is still alive during teardown.
     runtime: VmRuntime,
     /// Memory manager for this isolate
@@ -118,8 +127,9 @@ impl Isolate {
             strict_mode: config.strict_mode,
         };
 
-        // VmRuntime::with_config creates its own GC registry + MemoryManager
-        // and sets thread-locals during construction.
+        // VmRuntime::with_config creates GC registry, MemoryManager, StringTable
+        // and sets all thread-locals during construction. JsString::intern()
+        // calls during intrinsics creation use the runtime's string table.
         let runtime = VmRuntime::with_config(runtime_config);
         let memory_manager = runtime.memory_manager().clone();
 
@@ -134,6 +144,7 @@ impl Isolate {
         };
 
         // Clear thread-locals — will be re-set on enter()
+        StringTable::clear_thread_default();
         MemoryManager::clear_thread_default();
         otter_vm_gc::clear_thread_registry();
 
@@ -155,13 +166,10 @@ impl Isolate {
     ///
     /// | Thread-Local | Set on Enter | Cleared on Exit |
     /// |---|---|---|
+    /// | `THREAD_STRING_TABLE` | Yes | Yes |
     /// | `THREAD_MEMORY_MANAGER` | Yes | Yes |
-    /// | `STRING_TABLE` | Auto-init per thread | No (cached) |
-    /// | `THREAD_REGISTRY` | Auto-init per thread | No (leaked static) |
+    /// | `THREAD_REGISTRY` | Yes | Yes |
     /// | `CAPABILITIES` | Managed by Otter runtime | Managed by Otter runtime |
-    /// | `WRITE_BARRIER_BUF` | Auto-init per thread | Transient |
-    /// | `GC_DEALLOC_IN_PROGRESS` | Auto-init per thread | Transient |
-    /// | Well-known strings | Lazy-init per thread | No (cached) |
     ///
     /// # Panics
     ///
@@ -174,6 +182,9 @@ impl Isolate {
         );
         self.entered = true;
 
+        // Set thread-local string table so JsString::intern() uses this runtime's table
+        StringTable::set_thread_default(self.runtime.string_table());
+
         // Set thread-local memory manager for GcRef::new() allocation tracking
         MemoryManager::set_thread_default(self.memory_manager.clone());
 
@@ -181,12 +192,34 @@ impl Isolate {
         // SAFETY: pointer remains valid — VmRuntime owns the Box and outlives the guard
         unsafe { otter_vm_gc::set_thread_registry(self.runtime.gc_registry()) };
 
-        // Note: STRING_TABLE is per-thread and auto-initialized (lazy cache).
-        // Well-known strings are also lazy per-thread.
-        // These work for "one isolate per thread". For future thread migration
-        // (Step B), they would need to be moved into per-Isolate state.
-
         IsolateGuard { isolate: self }
+    }
+
+    /// Enter the isolate without an RAII guard.
+    ///
+    /// Thread-locals are set up immediately and will be cleared when the
+    /// `Isolate` is dropped. Use this when the isolate's lifetime is managed
+    /// by an owning struct (e.g. `Otter`) rather than a lexical scope.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the isolate is already entered.
+    pub fn enter_owned(&mut self) {
+        assert!(
+            !self.entered,
+            "Isolate::enter_owned() called while already entered"
+        );
+        self.entered = true;
+
+        // Set thread-local string table so JsString::intern() uses this runtime's table
+        StringTable::set_thread_default(self.runtime.string_table());
+
+        // Set thread-local memory manager for GcRef::new() allocation tracking
+        MemoryManager::set_thread_default(self.memory_manager.clone());
+
+        // Set thread-local GC registry so gc_alloc() uses this runtime's registry
+        // SAFETY: pointer remains valid — VmRuntime owns the Box and outlives the Isolate
+        unsafe { otter_vm_gc::set_thread_registry(self.runtime.gc_registry()) };
     }
 
     /// Get a thread-safe handle for cross-thread operations.
@@ -220,17 +253,27 @@ impl Isolate {
     pub fn context_mut(&mut self) -> &mut VmContext {
         &mut self.context
     }
+
+    /// Access the per-runtime string table.
+    pub fn string_table(&self) -> &StringTable {
+        self.runtime.string_table()
+    }
 }
 
 impl Drop for Isolate {
     fn drop(&mut self) {
         if self.entered {
-            string::clear_global_string_table();
+            // Clear thread-local pointers. VmRuntime::drop() handles clearing
+            // the string table contents and its own thread-local pointers.
+            StringTable::clear_thread_default();
+            MemoryManager::clear_thread_default();
+            otter_vm_gc::clear_thread_registry();
             self.entered = false;
         }
         // Fields drop in declaration order:
         //   1. context (no Drop impl, just freed)
-        //   2. runtime (VmRuntime::drop: dealloc_all, clear thread-locals)
+        //   2. runtime (VmRuntime::drop: dealloc_all, clear string table,
+        //      clear remaining thread-local pointers)
         //   3. memory_manager, handle, entered
     }
 }
@@ -274,11 +317,17 @@ impl<'a> IsolateGuard<'a> {
     pub fn gc_registry(&self) -> &otter_vm_gc::AllocationRegistry {
         self.isolate.runtime.gc_registry()
     }
+
+    /// Access the per-runtime string table.
+    pub fn string_table(&self) -> &StringTable {
+        self.isolate.runtime.string_table()
+    }
 }
 
 impl Drop for IsolateGuard<'_> {
     fn drop(&mut self) {
-        // Clear thread-local state
+        // Clear thread-local state (reverse of enter() order)
+        StringTable::clear_thread_default();
         MemoryManager::clear_thread_default();
         otter_vm_gc::clear_thread_registry();
 
@@ -523,5 +572,52 @@ mod tests {
 
         // Isolate should NOT be Sync — this is enforced by not implementing Sync.
         // We can't have a compile-time negative test, but we document the intent.
+    }
+
+    #[test]
+    fn test_isolate_per_isolate_string_table() {
+        use crate::string::JsString;
+
+        let mut isolate = Isolate::new(IsolateConfig::default());
+
+        // During construction, intrinsics should have interned strings
+        // into the per-isolate table (e.g., "length", "prototype").
+        assert!(isolate.string_table().is_interned("length"));
+        assert!(isolate.string_table().is_interned("prototype"));
+        assert!(isolate.string_table().is_interned("constructor"));
+
+        // Enter isolate — new interns go to the per-isolate table
+        {
+            let guard = isolate.enter();
+            let s = JsString::intern("isolate_specific_string");
+            assert!(guard.string_table().is_interned("isolate_specific_string"));
+            assert_eq!(s.as_str(), "isolate_specific_string");
+        }
+
+        // After exit, the table still holds the string (it's owned by Isolate)
+        assert!(isolate.string_table().is_interned("isolate_specific_string"));
+    }
+
+    #[test]
+    fn test_two_isolates_separate_string_tables() {
+        use crate::string::JsString;
+
+        // Create two isolates — each should have its own string table
+        let mut iso1 = Isolate::new(IsolateConfig::default());
+        let mut iso2 = Isolate::new(IsolateConfig::default());
+
+        {
+            let _guard = iso1.enter();
+            JsString::intern("only_in_iso1");
+        }
+        {
+            let _guard = iso2.enter();
+            JsString::intern("only_in_iso2");
+        }
+
+        assert!(iso1.string_table().is_interned("only_in_iso1"));
+        assert!(!iso1.string_table().is_interned("only_in_iso2"));
+        assert!(iso2.string_table().is_interned("only_in_iso2"));
+        assert!(!iso2.string_table().is_interned("only_in_iso1"));
     }
 }

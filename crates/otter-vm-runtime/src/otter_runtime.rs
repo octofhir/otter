@@ -30,6 +30,8 @@ use otter_vm_core::runtime::VmRuntime;
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
 
+use otter_vm_core::isolate::{Isolate, IsolateConfig};
+
 use crate::event_loop::{ActiveServerCount, EventLoop, HttpEvent, WsEvent};
 use crate::extension::{AsyncOpFn, ExtensionRegistry, OpHandler};
 use crate::microtask::{JsJobQueueWrapper, NextTickQueueWrapper};
@@ -71,8 +73,8 @@ impl ResumeSignal {
 
 /// High-level runtime that integrates VM, event loop, and extensions
 pub struct Otter {
-    /// Bytecode VM
-    vm: VmRuntime,
+    /// Isolate wrapping the bytecode VM with RAII thread-local management
+    isolate: Isolate,
     /// Event loop (shared)
     event_loop: Arc<EventLoop>,
     /// Module loader for resolving and loading ES modules
@@ -116,13 +118,21 @@ struct RealmSlot {
 impl Otter {
     /// Create new runtime with default configuration
     pub fn new() -> Self {
+        Self::with_isolate_config(IsolateConfig::default())
+    }
+
+    /// Create new runtime with explicit isolate configuration
+    pub fn with_isolate_config(config: IsolateConfig) -> Self {
         let (http_tx, http_rx) = mpsc::unbounded_channel();
         let (ws_tx, ws_rx) = mpsc::unbounded_channel();
         let event_loop = EventLoop::new(); // Already returns Arc<EventLoop>
         let active_servers = event_loop.get_active_server_count();
 
+        let mut isolate = Isolate::new(config);
+        isolate.enter_owned();
+
         Self {
-            vm: VmRuntime::new(),
+            isolate,
             event_loop,
             loader: Arc::new(crate::module_loader::ModuleLoader::new(
                 std::env::current_dir().unwrap_or_default(),
@@ -195,7 +205,7 @@ impl Otter {
         self.realms.lock().clear();
 
         // Create fresh realm, swap default, drop old
-        self.vm.reset_default_realm();
+        self.isolate.runtime_mut().reset_default_realm();
 
         // Clear module cache to prevent cross-test pollution
         self.loader.clear();
@@ -357,7 +367,7 @@ impl Otter {
         }
 
         // 3. Create execution context with globals and interrupt flag
-        let mut ctx = self.vm.create_context();
+        let mut ctx = self.isolate.runtime().create_context();
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
         ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
 
@@ -383,7 +393,7 @@ impl Otter {
         let compiled_modules = self.extensions.all_compiled_js();
         if !compiled_modules.is_empty() {
             for module in compiled_modules {
-                if let Err(e) = self.vm.execute_module_with_context(&module, &mut ctx) {
+                if let Err(e) = self.isolate.runtime().execute_module_with_context(&module, &mut ctx) {
                     eprintln!("Extension setup failed: {}", e);
                     return Err(OtterError::Runtime(e.to_string()));
                 }
@@ -597,7 +607,7 @@ impl Otter {
             return;
         };
 
-        let mm = self.vm.memory_manager().clone();
+        let mm = self.isolate.runtime().memory_manager().clone();
         for event in events {
             let payload = ws_event_to_json(&event);
             let args = vec![json_to_value(&payload, mm.clone())];
@@ -783,7 +793,7 @@ impl Otter {
             crate::capabilities_context::CapabilitiesGuard::new(self.capabilities.clone());
 
         // Create execution context with interrupt flag
-        let mut ctx = self.vm.create_context();
+        let mut ctx = self.isolate.runtime().create_context();
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
         ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
 
@@ -853,7 +863,7 @@ impl Otter {
             // Resolve imports for this dependency
             let dep_locals = self.resolve_module_imports(&module_bytecode, url)?;
 
-            self.vm
+            self.isolate.runtime()
                 .execute_module_with_context_and_locals(
                     &module_bytecode,
                     &mut ctx,
@@ -871,7 +881,7 @@ impl Otter {
         // Resolve imports for main module
         let initial_locals = self.resolve_module_imports(&bytecode, main_url)?;
         let result = self
-            .vm
+            .isolate.runtime()
             .execute_module_with_context_and_locals(
                 &bytecode,
                 &mut ctx,
@@ -904,7 +914,7 @@ impl Otter {
             None => return Ok(initial_locals),
         };
 
-        let mm = self.vm.memory_manager().clone();
+        let mm = self.isolate.runtime().memory_manager().clone();
 
         for import in &bytecode.imports {
             let resolved = self
@@ -958,9 +968,9 @@ impl Otter {
             return Ok(());
         }
 
-        let intrinsics = self.vm.intrinsics();
+        let intrinsics = self.isolate.runtime().intrinsics();
         let global = ctx.global().clone();
-        let mm = self.vm.memory_manager().clone();
+        let mm = self.isolate.runtime().memory_manager().clone();
 
         // Determine profile — for now default to Full, will be configurable later
         let profile = crate::extension_v2::Profile::Full;
@@ -1012,7 +1022,7 @@ impl Otter {
         let pending_ops = self.event_loop.get_pending_async_ops_count();
         let fn_proto = ctx
             .function_prototype()
-            .unwrap_or_else(|| self.vm.function_prototype());
+            .unwrap_or_else(|| self.isolate.runtime().function_prototype());
 
         for op_name in self.extensions.op_names() {
             if let Some(handler) = self.extensions.get_op(op_name) {
@@ -1020,7 +1030,7 @@ impl Otter {
                     op_name,
                     handler.clone(),
                     Arc::clone(&pending_ops),
-                    self.vm.memory_manager().clone(),
+                    self.isolate.runtime().memory_manager().clone(),
                     fn_proto,
                 );
                 let _ = global.set(PropertyKey::string(op_name), native_fn);
@@ -1034,10 +1044,10 @@ impl Otter {
         self.register_module_require(global.clone(), fn_proto);
 
         let ctx_ptr = ctx as *mut VmContext as usize;
-        let vm_ptr = &self.vm as *const VmRuntime as usize;
+        let vm_ptr = self.isolate.runtime() as *const VmRuntime as usize;
         let otter_ptr = self as *const Otter as usize;
         let realms_store = Arc::clone(&self.realms);
-        let mm_eval = self.vm.memory_manager().clone();
+        let mm_eval = self.isolate.runtime().memory_manager().clone();
         let mm_eval_closure = mm_eval.clone();
         let _ = global.set(
             PropertyKey::string("__otter_eval"),
@@ -1123,7 +1133,7 @@ impl Otter {
         );
 
         // Create a new realm and return { global, evalScript }
-        let mm_realm = self.vm.memory_manager().clone();
+        let mm_realm = self.isolate.runtime().memory_manager().clone();
         let fn_proto_realm = fn_proto;
         let realms_for_create = Arc::clone(&realms_store);
         let mm_realm_for_create = mm_realm.clone();
@@ -1133,8 +1143,8 @@ impl Otter {
                 move |_this: &Value, _args: &[Value], _mm| {
                     unsafe {
                         let otter = &*(otter_ptr as *const Otter);
-                        let realm_id = otter.vm.create_realm();
-                        let mut realm_ctx = otter.vm.create_context_in_realm(realm_id);
+                        let realm_id = otter.isolate.runtime().create_realm();
+                        let mut realm_ctx = otter.isolate.runtime().create_context_in_realm(realm_id);
                         otter
                             .setup_context(&mut realm_ctx)
                             .map_err(|e| VmError::internal(e.to_string()))?;
@@ -1198,7 +1208,7 @@ impl Otter {
         // Create console object from __console_* ops
         let console_obj = GcRef::new(JsObject::new(
             Value::null(),
-            self.vm.memory_manager().clone(),
+            self.isolate.runtime().memory_manager().clone(),
         ));
 
         // Helper to wire console methods from global __console_* functions
@@ -1333,7 +1343,7 @@ impl Otter {
         // __env_get(key) -> string | undefined
         let env_store_get = Arc::clone(&env_store);
         let caps_get = caps.clone();
-        let mm_env = self.vm.memory_manager().clone();
+        let mm_env = self.isolate.runtime().memory_manager().clone();
         let _ = global.set(
             PropertyKey::string("__env_get"),
             Value::native_function_with_proto(
@@ -1393,7 +1403,7 @@ impl Otter {
         // __env_has(key) -> boolean
         let env_store_has = Arc::clone(&env_store);
         let caps_has = caps.clone();
-        let mm_has = self.vm.memory_manager().clone();
+        let mm_has = self.isolate.runtime().memory_manager().clone();
         let _ = global.set(
             PropertyKey::string("__env_has"),
             Value::native_function_with_proto(
@@ -1423,7 +1433,7 @@ impl Otter {
     /// CJS module bytecode — enabling `require()` for local files.
     fn register_module_require(&self, global: GcRef<JsObject>, fn_proto: GcRef<JsObject>) {
         let loader = Arc::clone(&self.loader);
-        let mm = self.vm.memory_manager().clone();
+        let mm = self.isolate.runtime().memory_manager().clone();
 
         let _ = global.set(
             PropertyKey::string("__module_require"),
@@ -1563,7 +1573,7 @@ impl Otter {
             .compile(code, source_url, false) // Non-strict context for top-level code
             .map_err(|e| OtterError::Compile(e.to_string()))?;
 
-        self.vm
+        self.isolate.runtime()
             .execute_module_with_context(&module, ctx)
             .map_err(|e| OtterError::Runtime(e.to_string()))
     }
@@ -1571,7 +1581,7 @@ impl Otter {
     /// Create a persistent execution context with all extensions registered.
     /// The caller owns the context and can reuse it across multiple `eval_in_context` calls.
     pub fn create_test_context(&self) -> Result<VmContext, OtterError> {
-        let mut ctx = self.vm.create_context();
+        let mut ctx = self.isolate.runtime().create_context();
         self.setup_context(&mut ctx)?;
         Ok(ctx)
     }
@@ -1608,7 +1618,7 @@ impl Otter {
 
         // Execute in provided context
         let result = self
-            .vm
+            .isolate.runtime()
             .execute_module_with_context(&module, ctx)
             .map_err(|e| OtterError::Runtime(e.to_string()))?;
 
@@ -2410,7 +2420,7 @@ impl Otter {
             .compile_eval(code, source_url, false)
             .map_err(|e| OtterError::Compile(e.to_string()))?;
 
-        self.vm
+        self.isolate.runtime()
             .execute_module_with_context(&module, ctx)
             .map_err(|e| OtterError::Runtime(e.to_string()))
     }
@@ -2756,6 +2766,7 @@ mod tests {
 
     #[test]
     fn test_value_json_conversion() {
+        let _rt = Otter::new(); // sets up thread-local GC registry via Isolate
         let mm = Arc::new(otter_vm_core::MemoryManager::test());
         // Test primitives
         assert_eq!(value_to_json(&Value::null()), serde_json::Value::Null);
@@ -2773,6 +2784,7 @@ mod tests {
 
     #[test]
     fn test_json_value_conversion() {
+        let _rt = Otter::new(); // sets up thread-local GC registry via Isolate
         let mm = Arc::new(otter_vm_core::MemoryManager::test());
         // Test primitives
         assert!(json_to_value(&serde_json::Value::Null, mm.clone()).is_null());

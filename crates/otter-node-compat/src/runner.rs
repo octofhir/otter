@@ -70,13 +70,13 @@ impl NodeCompatRunner {
     }
 
     /// Rebuild engine after a panic.
+    ///
+    /// Drops the old `Otter` (which drops its `Isolate`, cleaning up
+    /// thread-local GC registry and memory manager via RAII) and creates
+    /// a fresh one. The catch_unwind handles corrupted teardown.
     fn rebuild_engine(&mut self) {
-        // Drop in a panic-safe wrapper to avoid aborting on corrupted teardown.
         let old = self.engine.take();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(old)));
-        // Do NOT clear STRING_TABLE or call dealloc_all().  The new engine
-        // reuses the existing interned strings; clearing them makes well_known
-        // thread-local GcRef statics dangle → SIGSEGV after the next GC cycle.
         self.engine = Some(build_engine());
     }
 

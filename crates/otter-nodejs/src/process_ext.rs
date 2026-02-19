@@ -775,12 +775,14 @@ mod tests {
 
     #[test]
     fn test_platform_value() {
+        let _rt = otter_vm_core::runtime::VmRuntime::new();
         let v = platform_value();
         assert!(v.as_string().is_some());
     }
 
     #[test]
     fn test_arch_value() {
+        let _rt = otter_vm_core::runtime::VmRuntime::new();
         let v = arch_value();
         assert!(v.as_string().is_some());
     }

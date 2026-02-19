@@ -2005,6 +2005,8 @@ pub fn install_map_statics(
                 // Create a new Map
                 let mm = ncx.ctx.memory_manager().clone();
                 let map_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                // Root map_obj across call_function GC points
+                ncx.ctx.push_root_slot(Value::object(map_obj));
                 // Set Map prototype
                 if let Some(map_proto) = ncx
                     .ctx
@@ -2020,7 +2022,7 @@ pub fn install_map_statics(
 
                 // Iterate items
                 let mut k: u32 = 0;
-                iterate_with_protocol(&items, ncx, |value, ncx| {
+                let loop_result = iterate_with_protocol(&items, ncx, |value, ncx| {
                     let key = ncx.call_function(
                         &callback,
                         Value::undefined(),
@@ -2058,8 +2060,10 @@ pub fn install_map_statics(
                         let _ = map_data.set(map_key, Value::array(GcRef::new(arr)));
                     }
                     Ok(())
-                })?;
+                });
 
+                ncx.ctx.pop_root_slots(1);
+                loop_result?;
                 Ok(Value::object(map_obj))
             },
             mm.clone(),

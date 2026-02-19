@@ -1002,15 +1002,22 @@ fn init_typed_array_iterators(
                     .unwrap_or(Value::null());
                 let new_ta =
                     create_typed_array(kind, len, src_proto, ncx.memory_manager().clone())?;
-                for i in 0..len {
-                    let val = ta_element_value(&ta, i);
-                    let mapped = ncx.call_function(
-                        &callback,
-                        this_arg.clone(),
-                        &[val, Value::number(i as f64), this_val.clone()],
-                    )?;
-                    ta_set_from_value(&new_ta, i, &mapped);
-                }
+                // Root the new TypedArray's object across call_function GC points
+                ncx.ctx.push_root_slot(Value::object(new_ta.object));
+                let loop_result: Result<(), VmError> = (|| {
+                    for i in 0..len {
+                        let val = ta_element_value(&ta, i);
+                        let mapped = ncx.call_function(
+                            &callback,
+                            this_arg.clone(),
+                            &[val, Value::number(i as f64), this_val.clone()],
+                        )?;
+                        ta_set_from_value(&new_ta, i, &mapped);
+                    }
+                    Ok(())
+                })();
+                ncx.ctx.pop_root_slots(1);
+                loop_result?;
                 let obj = new_ta.object;
                 obj.define_property(
                     PropertyKey::string("__TypedArrayData__"),

@@ -388,7 +388,7 @@ impl PropertyDescriptor {
         Self::Accessor {
             get: Some(get),
             set: None,
-            attributes: PropertyAttributes::accessor(),
+            attributes: PropertyAttributes::builtin_accessor(),
         }
     }
 }
@@ -417,6 +417,8 @@ pub enum SetPropertyError {
     Sealed,
     /// Property is an accessor without a setter.
     AccessorWithoutSetter,
+    /// Array length assignment was invalid and must throw `RangeError`.
+    InvalidArrayLength,
 }
 
 impl std::fmt::Display for SetPropertyError {
@@ -427,6 +429,7 @@ impl std::fmt::Display for SetPropertyError {
             Self::NonExtensible => write!(f, "Cannot add property, object is not extensible"),
             Self::Sealed => write!(f, "Cannot add property to a sealed object"),
             Self::AccessorWithoutSetter => write!(f, "Cannot set property which has only a getter"),
+            Self::InvalidArrayLength => write!(f, "Invalid array length"),
         }
     }
 }
@@ -1459,14 +1462,14 @@ impl JsObject {
             if let PropertyKey::String(s) = &key {
                 if s.as_str() == "length" {
                     drop(flags);
-                    let new_len = value.as_number().unwrap_or(0.0);
+                    let new_len = crate::globals::to_number(&value);
                     if new_len < 0.0 || new_len != (new_len as u32 as f64) || new_len.is_nan() {
-                        return Err(SetPropertyError::NonExtensible); // RangeError in spec
+                        return Err(SetPropertyError::InvalidArrayLength);
                     }
                     if self.set_array_length(new_len as u32) {
                         return Ok(());
                     }
-                    return Err(SetPropertyError::NonExtensible);
+                    return Err(SetPropertyError::InvalidArrayLength);
                 }
             }
         }
@@ -3239,7 +3242,8 @@ mod tests {
 
     #[test]
     fn test_object_get_set() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let obj = JsObject::new(Value::null(), memory_manager);
 
         obj.set(PropertyKey::string("foo"), Value::int32(42));
@@ -3248,7 +3252,8 @@ mod tests {
 
     #[test]
     fn test_object_has() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let obj = JsObject::new(Value::null(), memory_manager);
         obj.set(PropertyKey::string("foo"), Value::int32(42));
 
@@ -3258,7 +3263,8 @@ mod tests {
 
     #[test]
     fn test_array() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let arr = JsObject::array(3, memory_manager);
         assert!(arr.is_array());
         assert_eq!(arr.array_length(), 3);
@@ -3274,7 +3280,8 @@ mod tests {
 
     #[test]
     fn test_array_holes() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let arr = JsObject::array(3, memory_manager);
         arr.set(PropertyKey::Index(0), Value::int32(10));
         arr.set(PropertyKey::Index(1), Value::int32(20));
@@ -3302,7 +3309,8 @@ mod tests {
 
     #[test]
     fn test_array_prefill_holes() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let arr = JsObject::array(5, memory_manager);
         // new Array(5) should create holes, not present elements
         assert!(!arr.has_own(&PropertyKey::Index(0)));
@@ -3312,7 +3320,8 @@ mod tests {
 
     #[test]
     fn test_array_length_truncate() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let arr = JsObject::array(0, memory_manager);
         arr.set(PropertyKey::Index(0), Value::int32(1));
         arr.set(PropertyKey::Index(1), Value::int32(2));
@@ -3336,7 +3345,8 @@ mod tests {
 
     #[test]
     fn test_array_length_set_via_property() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let arr = JsObject::array(0, memory_manager);
         arr.set(PropertyKey::Index(0), Value::int32(10));
         arr.set(PropertyKey::Index(1), Value::int32(20));
@@ -3357,7 +3367,8 @@ mod tests {
 
     #[test]
     fn test_object_freeze() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let obj = JsObject::new(Value::null(), memory_manager);
         obj.set(PropertyKey::string("foo"), Value::int32(42));
 
@@ -3391,7 +3402,8 @@ mod tests {
 
     #[test]
     fn test_object_seal() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let obj = JsObject::new(Value::null(), memory_manager);
         let _ = obj.set(PropertyKey::string("foo"), Value::int32(42));
 
@@ -3426,7 +3438,8 @@ mod tests {
 
     #[test]
     fn test_object_prevent_extensions() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let obj = JsObject::new(Value::null(), memory_manager);
         let _ = obj.set(PropertyKey::string("foo"), Value::int32(42));
 
@@ -3457,7 +3470,8 @@ mod tests {
 
     #[test]
     fn test_deep_prototype_chain() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         // Build a prototype chain of depth 100
         let mut proto_val = Value::null();
         for i in 0..100 {
@@ -3485,7 +3499,8 @@ mod tests {
 
     #[test]
     fn test_prototype_chain_depth_limit() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         // Build a prototype chain that exceeds the limit (100)
         let mut proto_val = Value::null();
         for i in 0..110 {
@@ -3505,7 +3520,8 @@ mod tests {
 
     #[test]
     fn test_prototype_cycle_prevention() {
-        let memory_manager = Arc::new(crate::memory::MemoryManager::test());
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
         let obj1 = GcRef::new(JsObject::new(Value::null(), Arc::clone(&memory_manager)));
         let obj2 = GcRef::new(JsObject::new(
             Value::object(obj1),

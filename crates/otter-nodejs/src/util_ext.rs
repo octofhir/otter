@@ -641,6 +641,7 @@ mod tests {
 
     #[test]
     fn test_format_value_primitives() {
+        let _rt = otter_vm_core::runtime::VmRuntime::new();
         assert_eq!(format_value(&Value::undefined()), "undefined");
         assert_eq!(format_value(&Value::null()), "null");
         assert_eq!(format_value(&Value::boolean(true)), "true");
@@ -659,6 +660,7 @@ mod tests {
 
     #[test]
     fn test_deep_strict_equal_primitives() {
+        let _rt = otter_vm_core::runtime::VmRuntime::new();
         assert!(deep_strict_equal(
             &Value::number(1.0),
             &Value::number(1.0),

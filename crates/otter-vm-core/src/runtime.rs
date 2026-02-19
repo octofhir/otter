@@ -15,6 +15,7 @@ use crate::interpreter::Interpreter;
 use crate::intrinsics::Intrinsics;
 use crate::object::JsObject;
 use crate::realm::{RealmId, RealmRecord, RealmRegistry};
+use crate::string::StringTable;
 use crate::value::Value;
 
 /// Maximum number of compiled modules to cache before evicting the oldest (FIFO).
@@ -40,6 +41,11 @@ pub struct VmRuntime {
     /// Box-owned — dropped when VmRuntime drops.
     /// Thread-local pointer is cleared in Drop before the Box is freed.
     gc_registry: Box<otter_vm_gc::AllocationRegistry>,
+    /// Per-runtime string interning table.
+    /// Box-owned for heap-stable address — the thread-local `THREAD_STRING_TABLE`
+    /// pointer must survive struct moves (same reason as `gc_registry`).
+    /// Cleared in `Drop` after `dealloc_all()` frees the underlying GC objects.
+    string_table: Box<StringTable>,
     /// Intrinsic `%Function.prototype%` object (ES2023 §10.3.1).
     /// Created once at runtime init, shared across contexts.
     function_prototype: GcRef<JsObject>,
@@ -92,6 +98,13 @@ impl VmRuntime {
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(config.max_heap_size));
         // Set thread-local MM so allocations during construction are tracked.
         crate::memory::MemoryManager::set_thread_default(memory_manager.clone());
+
+        // Create per-runtime string table (Box-owned for heap-stable pointer).
+        // Set as thread-local so all JsString::intern() calls during intrinsics
+        // creation use this table. The heap address survives struct moves.
+        let string_table = Box::new(StringTable::new());
+        StringTable::set_thread_default(&*string_table);
+
         let realm_registry = RealmRegistry::new();
         let default_realm_id = realm_registry.allocate_id();
 
@@ -138,6 +151,7 @@ impl VmRuntime {
             intrinsics,
             memory_manager,
             gc_registry,
+            string_table,
             config,
             realm_registry,
             default_realm_id,
@@ -296,6 +310,11 @@ impl VmRuntime {
         &self.gc_registry
     }
 
+    /// Get the per-runtime string interning table.
+    pub fn string_table(&self) -> &StringTable {
+        &*self.string_table
+    }
+
     /// Replace the default realm with a freshly created one.
     ///
     /// Creates a new realm (fresh intrinsics, global, Function.prototype),
@@ -344,10 +363,15 @@ impl Drop for VmRuntime {
         let our_ptr = &*self.gc_registry as *const otter_vm_gc::AllocationRegistry;
         unsafe { otter_vm_gc::set_thread_registry(&*self.gc_registry) };
 
-        // Free all GC-allocated objects. This sets GC_DEALLOC_IN_PROGRESS
-        // which prevents VmContext::teardown from running (if it hasn't
-        // already been dropped).
+        // Free all GC-allocated objects.
         self.gc_registry.dealloc_all();
+
+        // Clear the string intern table — it holds GcRef<JsString> from
+        // our registry, which are now dangling after dealloc_all.
+        self.string_table.clear();
+
+        // Clear thread-local string table pointer only if it's ours
+        StringTable::clear_thread_default_if(&*self.string_table);
 
         // Clear thread-local GC registry. MUST happen before Box drops.
         otter_vm_gc::clear_thread_registry_if(our_ptr);

@@ -87,10 +87,29 @@ fn default_proto_for_construct(
     target: &Value,
     new_target: &Value,
 ) -> Option<GcRef<JsObject>> {
-    let tag = builtin_tag_for_value(target)?;
     let realm_id = ncx.realm_id_for_function(new_target);
-    let intrinsics = ncx.ctx.realm_intrinsics(realm_id)?;
-    intrinsics.prototype_for_builtin_tag(tag.as_str())
+    if let Some(tag) = builtin_tag_for_value(target)
+        && let Some(intrinsics) = ncx.ctx.realm_intrinsics(realm_id)
+        && let Some(proto) = intrinsics.prototype_for_builtin_tag(tag.as_str())
+    {
+        return Some(proto);
+    }
+
+    // Intl constructors are not in Intrinsics yet; derive default prototype
+    // from the newTarget realm's Intl namespace when available.
+    let ctor_name = target
+        .as_object()
+        .and_then(|o| o.get(&PropertyKey::string("name")))
+        .and_then(|v| v.as_string())
+        .map(|s| s.as_str().to_string())?;
+    let realm_global = ncx.ctx.realm_global(realm_id)?;
+    realm_global
+        .get(&PropertyKey::string("Intl"))
+        .and_then(|v| v.as_object())
+        .and_then(|intl| intl.get(&PropertyKey::string(&ctor_name)))
+        .and_then(|v| v.as_object())
+        .and_then(|ctor| ctor.get(&PropertyKey::string("prototype")))
+        .and_then(|v| v.as_object())
 }
 
 fn is_constructor_value(value: &Value) -> bool {

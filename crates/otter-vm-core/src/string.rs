@@ -7,26 +7,46 @@
 //!
 //! Strings are managed via `GcRef<JsString>` which wraps a `GcBox<JsString>`.
 //! The `GcBox` provides the GC header for marking. Interned strings are kept
-//! alive by the thread-local intern table (acting as a GC root).
+//! alive by the intern table (acting as a GC root).
+//!
+//! ## Per-Isolate String Tables
+//!
+//! Each `VmRuntime` owns a `StringTable` instance. When a runtime or isolate
+//! is active, a thread-local pointer (`THREAD_STRING_TABLE`) is set to the
+//! runtime's table. `JsString::intern()` and `intern_utf16()` use this pointer.
+//!
+//! This follows the same pattern as `THREAD_MEMORY_MANAGER` and `THREAD_REGISTRY`.
 
 use crate::gc::GcRef;
 use rustc_hash::{FxHashMap, FxHasher};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
-// Thread-local string intern table (one isolate = one thread).
-// Uses RefCell<FxHashMap> instead of DashMap for zero-lock overhead.
-// Each thread gets its own table, providing proper isolate isolation.
+// ============================================================================
+// Thread-local state
+// ============================================================================
+
+// Per-runtime string table pointer. Set by `VmRuntime::with_config()` during
+// construction, `Isolate::enter()` during entry, and cleared by
+// `IsolateGuard::drop()` / `VmRuntime::drop()`.
+//
+// SAFETY: The pointer is valid for the duration of the VmRuntime or Isolate
+// guard. It points to the `StringTable` owned by `VmRuntime`, which outlives
+// any guard.
 thread_local! {
-    static STRING_TABLE: RefCell<FxHashMap<u64, Vec<GcRef<JsString>>>> =
-        RefCell::new(FxHashMap::default());
+    static THREAD_STRING_TABLE: Cell<*const StringTable> = const { Cell::new(std::ptr::null()) };
 }
 
-/// String interning table for explicit management
+// ============================================================================
+// StringTable — per-runtime string interning
+// ============================================================================
+
+/// String interning table for per-runtime/per-isolate management.
 ///
-/// This provides an instance-based alternative to the thread-local STRING_TABLE.
-/// Useful for VM instances that want isolated string tables.
+/// Each `VmRuntime` owns one `StringTable`. When the runtime is active on a
+/// thread, `THREAD_STRING_TABLE` points to it so `JsString::intern()` can
+/// find the correct table without explicit parameters.
 pub struct StringTable {
     strings: RefCell<FxHashMap<u64, Vec<GcRef<JsString>>>>,
 }
@@ -38,21 +58,51 @@ unsafe impl Send for StringTable {}
 unsafe impl Sync for StringTable {}
 
 impl StringTable {
-    /// Create a new string table
+    /// Create a new empty string table.
     pub fn new() -> Self {
         Self {
             strings: RefCell::new(FxHashMap::default()),
         }
     }
 
-    /// Intern a string in this table
+    // ---- Thread-local management (same pattern as MemoryManager) ----------
+
+    /// Set the thread-local string table pointer to this table.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `self` outlives the thread-local reference.
+    /// In practice this is guaranteed by `VmRuntime` ownership or `IsolateGuard` RAII.
+    pub fn set_thread_default(table: &StringTable) {
+        THREAD_STRING_TABLE.with(|cell| cell.set(table as *const StringTable));
+    }
+
+    /// Clear the thread-local string table pointer.
+    pub fn clear_thread_default() {
+        THREAD_STRING_TABLE.with(|cell| cell.set(std::ptr::null()));
+    }
+
+    /// Clear the thread-local string table pointer only if it points to `table`.
+    ///
+    /// Used during teardown to avoid clearing another runtime's table.
+    pub fn clear_thread_default_if(table: &StringTable) {
+        THREAD_STRING_TABLE.with(|cell| {
+            let current = cell.get();
+            if current == table as *const StringTable {
+                cell.set(std::ptr::null());
+            }
+        });
+    }
+
+    // ---- Interning --------------------------------------------------------
+
+    /// Intern a string in this table.
     pub fn intern(&self, s: &str) -> GcRef<JsString> {
         let units: Vec<u16> = s.encode_utf16().collect();
         let hash = JsString::compute_hash_units(&units);
 
         // Check if already interned
-        {
-            let borrowed = self.strings.borrow();
+        if let Ok(borrowed) = self.strings.try_borrow() {
             if let Some(bucket) = borrowed.get(&hash) {
                 for existing in bucket.iter() {
                     if existing.data.as_ref() == units.as_slice() {
@@ -70,36 +120,18 @@ impl StringTable {
         });
 
         // Add to the hash bucket
-        self.strings
-            .borrow_mut()
-            .entry(hash)
-            .or_insert_with(Vec::new)
-            .push(js_str);
+        if let Ok(mut borrowed) = self.strings.try_borrow_mut() {
+            borrowed.entry(hash).or_insert_with(Vec::new).push(js_str);
+        }
         js_str
     }
 
-    /// Check if a string is interned in this table
-    pub fn is_interned(&self, s: &str) -> bool {
-        let units: Vec<u16> = s.encode_utf16().collect();
-        let hash = JsString::compute_hash_units(&units);
-        let borrowed = self.strings.borrow();
-        if let Some(bucket) = borrowed.get(&hash) {
-            for existing in bucket.iter() {
-                if existing.data.as_ref() == units.as_slice() {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Intern a UTF-16 string in this table
+    /// Intern a UTF-16 string in this table.
     pub fn intern_utf16(&self, units: &[u16]) -> GcRef<JsString> {
         let hash = JsString::compute_hash_units(units);
 
         // Check if already interned
-        {
-            let borrowed = self.strings.borrow();
+        if let Ok(borrowed) = self.strings.try_borrow() {
             if let Some(bucket) = borrowed.get(&hash) {
                 for existing in bucket.iter() {
                     if existing.data.as_ref() == units {
@@ -116,22 +148,87 @@ impl StringTable {
         });
 
         // Add to the hash bucket
-        self.strings
-            .borrow_mut()
-            .entry(hash)
-            .or_insert_with(Vec::new)
-            .push(js_str);
+        if let Ok(mut borrowed) = self.strings.try_borrow_mut() {
+            borrowed.entry(hash).or_insert_with(Vec::new).push(js_str);
+        }
         js_str
     }
 
-    /// Get the number of interned strings
+    /// Check if a string is interned in this table.
+    pub fn is_interned(&self, s: &str) -> bool {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        let hash = JsString::compute_hash_units(&units);
+        let borrowed = self.strings.borrow();
+        if let Some(bucket) = borrowed.get(&hash) {
+            for existing in bucket.iter() {
+                if existing.data.as_ref() == units.as_slice() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Get the number of hash buckets in the table.
     pub fn len(&self) -> usize {
         self.strings.borrow().len()
     }
 
-    /// Check if the table is empty
+    /// Check if the table is empty.
     pub fn is_empty(&self) -> bool {
         self.strings.borrow().is_empty()
+    }
+
+    // ---- GC integration ---------------------------------------------------
+
+    /// Remove all entries from the table.
+    ///
+    /// Called during runtime teardown to prevent dangling `GcRef<JsString>`
+    /// after `dealloc_all()` frees the underlying GC objects.
+    pub fn clear(&self) {
+        self.strings.borrow_mut().clear();
+    }
+
+    /// Prune dead (unmarked) entries from this table.
+    ///
+    /// **Must be called after the mark phase and before the sweep phase** of a
+    /// full GC cycle. Entries whose mark color is `White` were not reached from
+    /// any GC root and will be freed by the upcoming sweep. Removing them here
+    /// prevents dangling `GcRef`s.
+    pub fn prune_dead_entries(&self) {
+        use otter_vm_gc::object::MarkColor;
+        let mut borrowed = self.strings.borrow_mut();
+        for bucket in borrowed.values_mut() {
+            // SAFETY: called after mark, before sweep — all GcBox memory is still
+            // valid. Objects with mark() == White will be freed by sweep.
+            bucket.retain(|js_str| js_str.header().mark() != MarkColor::White);
+        }
+        // Remove hash buckets that became empty after pruning.
+        borrowed.retain(|_, bucket| !bucket.is_empty());
+    }
+
+    /// Trace all interned strings in this table.
+    ///
+    /// Called during GC root collection to keep ALL interned strings alive.
+    /// **Only use this when the weak-ref eviction path (`prune_dead_entries`)
+    /// is not in effect.** The two approaches are mutually exclusive.
+    pub fn trace_all(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // Collect headers first so we don't hold a RefCell borrow while invoking
+        // the tracer callback (which may re-enter string interning).
+        let headers: Vec<*const otter_vm_gc::GcHeader> = {
+            let borrowed = self.strings.borrow();
+            let mut out = Vec::new();
+            for bucket in borrowed.values() {
+                for js_str in bucket.iter() {
+                    out.push(js_str.header() as *const _);
+                }
+            }
+            out
+        };
+
+        for header in headers {
+            tracer(header);
+        }
     }
 }
 
@@ -141,19 +238,43 @@ impl Default for StringTable {
     }
 }
 
-/// Clear the thread-local string intern table.
+// ============================================================================
+// Free functions — operate on the current thread's string table
+// ============================================================================
+
+/// Clear the current thread's string intern table.
 ///
-/// Call this when tearing down a VM isolate to allow the GC to reclaim
-/// interned string memory. After calling this, all existing `GcRef<JsString>`
-/// from the table are dangling — only use this when no VM is active on this thread.
+/// Clears the per-runtime table pointed to by `THREAD_STRING_TABLE`.
+///
+/// Call this when tearing down a VM to allow the GC to reclaim interned string
+/// memory. After calling this, all existing `GcRef<JsString>` from the table
+/// are dangling — only use this when no VM is active on this thread.
 pub fn clear_global_string_table() {
-    STRING_TABLE.with(|table| table.borrow_mut().clear());
+    THREAD_STRING_TABLE.with(|cell| {
+        let ptr = cell.get();
+        if !ptr.is_null() {
+            // SAFETY: pointer is valid — set by VmRuntime/Isolate, cleared on exit.
+            let table = unsafe { &*ptr };
+            table.clear();
+        }
+    });
 }
 
-/// Get the number of entries in the thread-local string intern table.
+/// Get the number of entries in the current thread's string intern table.
 pub fn global_string_table_size() -> usize {
-    STRING_TABLE.with(|table| table.borrow().len())
+    THREAD_STRING_TABLE.with(|cell| {
+        let ptr = cell.get();
+        if !ptr.is_null() {
+            let table = unsafe { &*ptr };
+            return table.len();
+        }
+        0
+    })
 }
+
+// ============================================================================
+// JsString
+// ============================================================================
 
 /// An interned JavaScript string with GC support
 ///
@@ -171,39 +292,23 @@ pub struct JsString {
 }
 
 impl JsString {
-    /// Create or retrieve an interned string (using thread-local table)
+    /// Create or retrieve an interned string.
+    ///
+    /// Uses the per-runtime `StringTable` via `THREAD_STRING_TABLE`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no `StringTable` is set on the current thread (i.e. no
+    /// `VmRuntime` or `Isolate` is active).
     pub fn intern(s: &str) -> GcRef<Self> {
-        let units: Vec<u16> = s.encode_utf16().collect();
-        let hash = Self::compute_hash_units(&units);
-
-        STRING_TABLE.with(|table| {
-            // Check if already interned
-            {
-                let borrowed = table.borrow();
-                if let Some(bucket) = borrowed.get(&hash) {
-                    for existing in bucket.iter() {
-                        if existing.data.as_ref() == units.as_slice() {
-                            return *existing;
-                        }
-                    }
-                }
-            }
-
-            // Create new interned string via GcRef
-            let js_str = GcRef::new(Self {
-                data: units.into(),
-                utf8: OnceLock::new(),
-                hash,
-            });
-
-            // Add to the hash bucket
-            table
-                .borrow_mut()
-                .entry(hash)
-                .or_insert_with(Vec::new)
-                .push(js_str);
-            js_str
-        })
+        let table_ptr = THREAD_STRING_TABLE.with(|cell| cell.get());
+        assert!(
+            !table_ptr.is_null(),
+            "JsString::intern() called without an active VmRuntime or Isolate on this thread"
+        );
+        // SAFETY: pointer is valid for the duration of the VmRuntime/Isolate.
+        let table = unsafe { &*table_ptr };
+        table.intern(s)
     }
 
     /// Create a string without interning (for temporary strings)
@@ -229,37 +334,22 @@ impl JsString {
         GcRef::new(Self::from_utf16_units(units))
     }
 
-    /// Create or retrieve an interned string from UTF-16 code units
+    /// Create or retrieve an interned string from UTF-16 code units.
+    ///
+    /// Uses the per-runtime `StringTable` via `THREAD_STRING_TABLE`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no `StringTable` is set on the current thread.
     pub fn intern_utf16(units: &[u16]) -> GcRef<Self> {
-        let hash = Self::compute_hash_units(units);
-
-        STRING_TABLE.with(|table| {
-            // Check if already interned
-            {
-                let borrowed = table.borrow();
-                if let Some(bucket) = borrowed.get(&hash) {
-                    for existing in bucket.iter() {
-                        if existing.data.as_ref() == units {
-                            return *existing;
-                        }
-                    }
-                }
-            }
-
-            let js_str = GcRef::new(Self {
-                data: Arc::from(units),
-                utf8: OnceLock::new(),
-                hash,
-            });
-
-            // Add to the hash bucket
-            table
-                .borrow_mut()
-                .entry(hash)
-                .or_insert_with(Vec::new)
-                .push(js_str);
-            js_str
-        })
+        let table_ptr = THREAD_STRING_TABLE.with(|cell| cell.get());
+        assert!(
+            !table_ptr.is_null(),
+            "JsString::intern_utf16() called without an active VmRuntime or Isolate on this thread"
+        );
+        // SAFETY: pointer is valid for the duration of the VmRuntime/Isolate.
+        let table = unsafe { &*table_ptr };
+        table.intern_utf16(units)
     }
 
     /// Get the string as a str slice
@@ -336,7 +426,7 @@ impl JsString {
         Self::intern_utf16(slice)
     }
 
-    /// Concatenate using a string table instead of thread-local intern
+    /// Concatenate using a specific string table instead of thread-local intern
     pub fn concat_with_table(&self, other: &JsString, table: &StringTable) -> GcRef<Self> {
         let mut units = Vec::with_capacity(self.data.len() + other.data.len());
         units.extend_from_slice(&self.data);
@@ -398,42 +488,61 @@ impl AsRef<[u16]> for JsString {
 // The GcBox<JsString> wrapper (via GcRef) provides the GC header.
 // JsString::trace is a no-op since strings don't contain GC references.
 
-/// Well-known interned strings (for property names)
-///
-/// These are lazily initialized per-thread via the thread-local STRING_TABLE.
-/// Since `GcRef` is `Copy`, we store them in thread_local and copy out.
-pub mod well_known {
-    use super::*;
+// ============================================================================
+// GC Tracing Implementation
+// ============================================================================
 
-    macro_rules! well_known_string {
-        ($name:ident, $value:literal) => {
-            thread_local! {
-                /// Well-known string constant
-                static $name: GcRef<JsString> = JsString::intern($value);
-            }
-        };
+impl otter_vm_gc::GcTraceable for JsString {
+    // Strings don't contain GC references
+    const NEEDS_TRACE: bool = false;
+
+    fn trace(&self, _tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // No references to trace
     }
-
-    well_known_string!(LENGTH, "length");
-    well_known_string!(PROTOTYPE, "prototype");
-    well_known_string!(CONSTRUCTOR, "constructor");
-    well_known_string!(NAME, "name");
-    well_known_string!(VALUE, "value");
-    well_known_string!(WRITABLE, "writable");
-    well_known_string!(ENUMERABLE, "enumerable");
-    well_known_string!(CONFIGURABLE, "configurable");
-    well_known_string!(GET, "get");
-    well_known_string!(SET, "set");
-    well_known_string!(UNDEFINED, "undefined");
-    well_known_string!(NULL, "null");
-    well_known_string!(TRUE, "true");
-    well_known_string!(FALSE, "false");
-    well_known_string!(TO_STRING, "toString");
-    well_known_string!(VALUE_OF, "valueOf");
-    well_known_string!(CALL, "call");
-    well_known_string!(APPLY, "apply");
-    well_known_string!(BIND, "bind");
 }
+
+/// Trace all interned strings in the current thread's string table.
+///
+/// **Only use this when the weak-ref eviction path (`prune_dead_string_table_entries`)
+/// is not in effect.**  The two approaches are mutually exclusive: calling this
+/// re-roots all strings and defeats the weak-ref eviction.
+pub fn trace_global_string_table(tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+    THREAD_STRING_TABLE.with(|cell| {
+        let ptr = cell.get();
+        if !ptr.is_null() {
+            // SAFETY: pointer is valid — set by VmRuntime/Isolate, cleared on exit.
+            let table = unsafe { &*ptr };
+            table.trace_all(tracer);
+        }
+    });
+}
+
+/// Prune dead entries from the current thread's string table.
+///
+/// **Must be called after the mark phase and before the sweep phase** of a
+/// full GC cycle.  At that point every `GcBox<JsString>` is still in memory
+/// (sweep has not run yet), so reading the GC header is safe.  Entries whose
+/// mark color is `White` were not reached from any GC root — they will be
+/// freed by the upcoming sweep, so they must be removed from the table now to
+/// prevent dangling `GcRef`s.
+///
+/// Callers that use this pruning approach MUST NOT also call
+/// `trace_global_string_table()` for the same GC cycle — doing so would
+/// re-root all strings and defeat eviction.
+pub fn prune_dead_string_table_entries() {
+    THREAD_STRING_TABLE.with(|cell| {
+        let ptr = cell.get();
+        if !ptr.is_null() {
+            // SAFETY: pointer is valid — set by VmRuntime/Isolate, cleared on exit.
+            let table = unsafe { &*ptr };
+            table.prune_dead_entries();
+        }
+    });
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -441,6 +550,7 @@ mod tests {
 
     #[test]
     fn test_interning() {
+        let _rt = crate::runtime::VmRuntime::new();
         let s1 = JsString::intern("hello");
         let s2 = JsString::intern("hello");
 
@@ -450,6 +560,7 @@ mod tests {
 
     #[test]
     fn test_different_strings() {
+        let _rt = crate::runtime::VmRuntime::new();
         let s1 = JsString::intern("hello");
         let s2 = JsString::intern("world");
 
@@ -459,6 +570,7 @@ mod tests {
 
     #[test]
     fn test_concat() {
+        let _rt = crate::runtime::VmRuntime::new();
         let s1 = JsString::intern("hello");
         let s2 = JsString::intern(" world");
         let result = s1.concat(&s2);
@@ -468,6 +580,7 @@ mod tests {
 
     #[test]
     fn test_substring() {
+        let _rt = crate::runtime::VmRuntime::new();
         let s = JsString::intern("hello world");
         let sub = s.substring(0, 5);
 
@@ -476,6 +589,7 @@ mod tests {
 
     #[test]
     fn test_string_table() {
+        let _rt = crate::runtime::VmRuntime::new();
         let table = StringTable::new();
 
         let s1 = table.intern("hello");
@@ -495,6 +609,7 @@ mod tests {
 
     #[test]
     fn test_substring_utf16() {
+        let _rt = crate::runtime::VmRuntime::new();
         let s = JsString::intern("hello world");
         let sub = s.substring_utf16(0, 5);
         assert_eq!(sub.as_str(), "hello");
@@ -506,6 +621,7 @@ mod tests {
 
     #[test]
     fn test_substring_utf16_emoji() {
+        let _rt = crate::runtime::VmRuntime::new();
         // Emoji (like 😀) is represented as a surrogate pair in UTF-16
         let s = JsString::intern("a😀b");
 
@@ -523,6 +639,7 @@ mod tests {
 
     #[test]
     fn test_gcref_header() {
+        let _rt = crate::runtime::VmRuntime::new();
         use otter_vm_gc::object::MarkColor;
 
         let s = JsString::intern("test");
@@ -536,6 +653,7 @@ mod tests {
 
     #[test]
     fn test_concat_with_table() {
+        let _rt = crate::runtime::VmRuntime::new();
         let table = StringTable::new();
         let s1 = table.intern("hello");
         let s2 = table.intern(" world");
@@ -546,61 +664,34 @@ mod tests {
         // Should be interned in the table
         assert!(table.is_interned("hello world"));
     }
-}
 
-// ============================================================================
-// GC Tracing Implementation
-// ============================================================================
+    #[test]
+    fn test_string_table_clear() {
+        let _rt = crate::runtime::VmRuntime::new();
+        let table = StringTable::new();
+        table.intern("foo");
+        table.intern("bar");
+        assert_eq!(table.len(), 2);
 
-impl otter_vm_gc::GcTraceable for JsString {
-    // Strings don't contain GC references
-    const NEEDS_TRACE: bool = false;
-
-    fn trace(&self, _tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
-        // No references to trace
+        table.clear();
+        assert_eq!(table.len(), 0);
+        assert!(table.is_empty());
     }
-}
 
-/// Trace all interned strings in the thread-local STRING_TABLE
-///
-/// Called during GC root collection to keep ALL interned strings alive.
-/// **Only use this when the weak-ref eviction path (`prune_dead_string_table_entries`)
-/// is not in effect.**  The two approaches are mutually exclusive: calling this
-/// re-roots all strings and defeats the weak-ref eviction.
-pub fn trace_global_string_table(tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
-    STRING_TABLE.with(|table| {
-        let borrowed = table.borrow();
-        for bucket in borrowed.values() {
-            for js_str in bucket.iter() {
-                tracer(js_str.header() as *const _);
-            }
-        }
-    });
-}
+    #[test]
+    fn test_runtime_sets_thread_string_table() {
+        // VmRuntime::new() should set THREAD_STRING_TABLE, so JsString::intern works
+        let _rt = crate::runtime::VmRuntime::new();
+        let s = JsString::intern("runtime_test");
+        assert_eq!(s.as_str(), "runtime_test");
+    }
 
-/// Prune dead entries from the thread-local STRING_TABLE.
-///
-/// **Must be called after the mark phase and before the sweep phase** of a
-/// full GC cycle.  At that point every `GcBox<JsString>` is still in memory
-/// (sweep has not run yet), so reading the GC header is safe.  Entries whose
-/// mark color is `White` were not reached from any GC root — they will be
-/// freed by the upcoming sweep, so they must be removed from the table now to
-/// prevent dangling `GcRef`s.
-///
-/// Callers that use this pruning approach MUST NOT also call
-/// `trace_global_string_table()` for the same GC cycle — doing so would
-/// re-root all strings and defeat eviction.
-pub fn prune_dead_string_table_entries() {
-    use otter_vm_gc::object::MarkColor;
-    STRING_TABLE.with(|table| {
-        let mut borrowed = table.borrow_mut();
-        for bucket in borrowed.values_mut() {
-            // SAFETY: called after mark, before sweep — all GcBox memory is still
-            // valid.  Objects with mark() == White will be freed by sweep; we
-            // remove them here to prevent dangling GcRefs in the table.
-            bucket.retain(|js_str| js_str.header().mark() != MarkColor::White);
-        }
-        // Remove hash buckets that became empty after pruning.
-        borrowed.retain(|_, bucket| !bucket.is_empty());
-    });
+    #[test]
+    #[should_panic(expected = "without an active VmRuntime")]
+    fn test_intern_without_runtime_panics() {
+        // Clear any existing thread-local (might be set by other tests)
+        StringTable::clear_thread_default();
+        // This should panic — no VmRuntime/Isolate active
+        let _s = JsString::intern("should_panic");
+    }
 }

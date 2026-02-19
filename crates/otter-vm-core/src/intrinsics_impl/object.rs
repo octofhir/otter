@@ -1345,7 +1345,13 @@ pub fn init_object_constructor(
                 let mut names = Vec::new();
                 for key in keys {
                     match key {
-                        PropertyKey::String(s) => names.push(Value::string(s)),
+                        PropertyKey::String(s) => {
+                            let name = s.as_str();
+                            if name == "__non_constructor" || name == "__realm_id__" {
+                                continue;
+                            }
+                            names.push(Value::string(s));
+                        }
                         PropertyKey::Index(i) => {
                             names.push(Value::string(JsString::intern(&i.to_string())));
                         }
@@ -1679,6 +1685,8 @@ pub fn init_object_constructor(
 
                 let mm = ncx.ctx.memory_manager().clone();
                 let result = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                // Root result across call_function GC points
+                ncx.ctx.push_root_slot(Value::object(result));
 
                 // Iterate items using the iterable protocol
                 let iter_sym = crate::intrinsics::well_known::iterator_symbol();
@@ -1699,88 +1707,98 @@ pub fn init_object_constructor(
                 };
 
                 if !iter_fn.is_callable() {
+                    ncx.ctx.pop_root_slots(1);
                     return Err(VmError::type_error("object is not iterable"));
                 }
 
-                let iterator = ncx.call_function(&iter_fn, items.clone(), &[])?;
-                let iterator_obj = iterator
-                    .as_object()
-                    .ok_or_else(|| VmError::type_error("Iterator result is not an object"))?;
-                let next_fn = iterator_obj
-                    .get(&PropertyKey::string("next"))
-                    .unwrap_or(Value::undefined());
-
-                let mut k: u32 = 0;
-                loop {
-                    let iter_result = ncx.call_function(&next_fn, iterator.clone(), &[])?;
-                    let iter_obj = iter_result
+                let loop_result: Result<(), VmError> = (|| {
+                    let iterator = ncx.call_function(&iter_fn, items.clone(), &[])?;
+                    let iterator_obj = iterator
                         .as_object()
                         .ok_or_else(|| VmError::type_error("Iterator result is not an object"))?;
-                    let done = iter_obj
-                        .get(&PropertyKey::string("done"))
-                        .unwrap_or(Value::undefined());
-                    if done.to_boolean() {
-                        break;
-                    }
-                    let value = iter_obj
-                        .get(&PropertyKey::string("value"))
+                    let next_fn = iterator_obj
+                        .get(&PropertyKey::string("next"))
                         .unwrap_or(Value::undefined());
 
-                    let group_key = ncx.call_function(
-                        &callback,
-                        Value::undefined(),
-                        &[value.clone(), Value::number(k as f64)],
-                    )?;
-                    k += 1;
-
-                    // Convert key to property key (string)
-                    let prop_key = if let Some(s) = group_key.as_string() {
-                        PropertyKey::String(s)
-                    } else if let Some(n) = group_key.as_number() {
-                        PropertyKey::String(JsString::intern(&crate::globals::js_number_to_string(
-                            n,
-                        )))
-                    } else if group_key.is_undefined() {
-                        PropertyKey::string("undefined")
-                    } else if group_key.is_null() {
-                        PropertyKey::string("null")
-                    } else if let Some(b) = group_key.as_boolean() {
-                        PropertyKey::string(if b { "true" } else { "false" })
-                    } else if let Some(sym) = group_key.as_symbol() {
-                        PropertyKey::Symbol(sym)
-                    } else {
-                        PropertyKey::string("[object Object]")
-                    };
-
-                    if let Some(existing) = result.get(&prop_key) {
-                        if let Some(arr) = existing.as_array().or_else(|| existing.as_object()) {
-                            let len = arr
-                                .get(&PropertyKey::string("length"))
-                                .and_then(|v| v.as_number())
-                                .unwrap_or(0.0) as u32;
-                            let _ = arr.set(PropertyKey::Index(len), value);
-                            let _ = arr.set(
-                                PropertyKey::string("length"),
-                                Value::number((len + 1) as f64),
-                            );
+                    let mut k: u32 = 0;
+                    loop {
+                        let iter_result = ncx.call_function(&next_fn, iterator.clone(), &[])?;
+                        let iter_obj = iter_result
+                            .as_object()
+                            .ok_or_else(|| {
+                                VmError::type_error("Iterator result is not an object")
+                            })?;
+                        let done = iter_obj
+                            .get(&PropertyKey::string("done"))
+                            .unwrap_or(Value::undefined());
+                        if done.to_boolean() {
+                            break;
                         }
-                    } else {
-                        let arr = JsObject::array(4, mm.clone());
-                        if let Some(array_proto) = ncx
-                            .ctx
-                            .get_global("Array")
-                            .and_then(|v| v.as_object())
-                            .and_then(|c| c.get(&PropertyKey::string("prototype")))
-                            .and_then(|v| v.as_object())
-                        {
-                            arr.set_prototype(Value::object(array_proto));
+                        let value = iter_obj
+                            .get(&PropertyKey::string("value"))
+                            .unwrap_or(Value::undefined());
+
+                        let group_key = ncx.call_function(
+                            &callback,
+                            Value::undefined(),
+                            &[value.clone(), Value::number(k as f64)],
+                        )?;
+                        k += 1;
+
+                        // Convert key to property key (string)
+                        let prop_key = if let Some(s) = group_key.as_string() {
+                            PropertyKey::String(s)
+                        } else if let Some(n) = group_key.as_number() {
+                            PropertyKey::String(JsString::intern(
+                                &crate::globals::js_number_to_string(n),
+                            ))
+                        } else if group_key.is_undefined() {
+                            PropertyKey::string("undefined")
+                        } else if group_key.is_null() {
+                            PropertyKey::string("null")
+                        } else if let Some(b) = group_key.as_boolean() {
+                            PropertyKey::string(if b { "true" } else { "false" })
+                        } else if let Some(sym) = group_key.as_symbol() {
+                            PropertyKey::Symbol(sym)
+                        } else {
+                            PropertyKey::string("[object Object]")
+                        };
+
+                        if let Some(existing) = result.get(&prop_key) {
+                            if let Some(arr) =
+                                existing.as_array().or_else(|| existing.as_object())
+                            {
+                                let len = arr
+                                    .get(&PropertyKey::string("length"))
+                                    .and_then(|v| v.as_number())
+                                    .unwrap_or(0.0) as u32;
+                                let _ = arr.set(PropertyKey::Index(len), value);
+                                let _ = arr.set(
+                                    PropertyKey::string("length"),
+                                    Value::number((len + 1) as f64),
+                                );
+                            }
+                        } else {
+                            let arr = JsObject::array(4, mm.clone());
+                            if let Some(array_proto) = ncx
+                                .ctx
+                                .get_global("Array")
+                                .and_then(|v| v.as_object())
+                                .and_then(|c| c.get(&PropertyKey::string("prototype")))
+                                .and_then(|v| v.as_object())
+                            {
+                                arr.set_prototype(Value::object(array_proto));
+                            }
+                            let _ = arr.set(PropertyKey::Index(0), value);
+                            let _ = arr.set(PropertyKey::string("length"), Value::number(1.0));
+                            let _ = result.set(prop_key, Value::array(GcRef::new(arr)));
                         }
-                        let _ = arr.set(PropertyKey::Index(0), value);
-                        let _ = arr.set(PropertyKey::string("length"), Value::number(1.0));
-                        let _ = result.set(prop_key, Value::array(GcRef::new(arr)));
                     }
-                }
+                    Ok(())
+                })();
 
+                ncx.ctx.pop_root_slots(1);
+                loop_result?;
                 Ok(Value::object(result))
             },
             mm.clone(),

@@ -66,6 +66,11 @@ impl TimerCallbackRoots {
     pub fn remove(&self, id: u64) {
         self.entries.lock().remove(&id);
     }
+
+    /// Clear all timer roots.
+    pub fn clear(&self) {
+        self.entries.lock().clear();
+    }
 }
 
 impl otter_vm_core::context::ExternalRootSet for TimerCallbackRoots {

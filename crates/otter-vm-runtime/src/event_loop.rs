@@ -643,6 +643,22 @@ impl EventLoop {
         self.running.store(false, Ordering::Release);
     }
 
+    /// Clear all pending timers, immediates, microtasks, NextTick, and JS jobs.
+    /// This is used to perfectly isolate tests and prevent memory leaks from
+    /// tests that time out but leave pending promises or timers.
+    pub fn clear_all_queues(&self) {
+        self.timers.lock().clear();
+        self.timer_heap.lock().clear();
+        self.immediates.lock().clear();
+        self.immediate_queue_len.store(0, Ordering::Relaxed);
+        self.microtasks.clear();
+        self.js_jobs.clear();
+        self.next_tick.clear();
+        self.executing_timer_ids.lock().clear();
+        self.executing_immediate_ids.lock().clear();
+        self.timer_callback_roots.clear();
+    }
+
     // === HTTP support methods ===
 
     /// Set the HTTP events receiver channel

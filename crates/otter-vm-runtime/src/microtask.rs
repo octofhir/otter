@@ -136,6 +136,14 @@ impl MicrotaskQueue {
     pub fn is_empty(&self) -> bool {
         self.len.load(Ordering::Relaxed) == 0
     }
+
+    /// Clear all pending microtasks
+    pub fn clear(&self) {
+        let mut queue = self.queue.lock();
+        let len = queue.len();
+        queue.clear();
+        self.len.fetch_sub(len, Ordering::Relaxed);
+    }
 }
 
 impl Default for MicrotaskQueue {
@@ -206,6 +214,14 @@ impl JsJobQueue {
     /// Check if queue is empty
     pub fn is_empty(&self) -> bool {
         self.len.load(Ordering::Relaxed) == 0
+    }
+
+    /// Clear all pending JS jobs
+    pub fn clear(&self) {
+        let mut queue = self.queue.lock();
+        let len = queue.len();
+        queue.clear();
+        self.len.fetch_sub(len, Ordering::Relaxed);
     }
 
     /// Trace GC roots held by queued JS callback jobs
@@ -299,6 +315,14 @@ impl NextTickQueue {
     /// Check if queue is empty.
     pub fn is_empty(&self) -> bool {
         self.len.load(Ordering::Relaxed) == 0
+    }
+
+    /// Clear all pending nextTick jobs.
+    pub fn clear(&self) {
+        let mut queue = self.queue.lock();
+        let len = queue.len();
+        queue.clear();
+        self.len.fetch_sub(len, Ordering::Relaxed);
     }
 
     /// Trace GC roots held by queued nextTick jobs.

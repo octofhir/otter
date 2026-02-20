@@ -80,14 +80,6 @@ fn trace_modified_register_indices(instruction: &Instruction) -> Vec<u16> {
         | Instruction::Sub { dst, .. }
         | Instruction::Mul { dst, .. }
         | Instruction::Div { dst, .. }
-        | Instruction::AddI32 { dst, .. }
-        | Instruction::SubI32 { dst, .. }
-        | Instruction::MulI32 { dst, .. }
-        | Instruction::DivI32 { dst, .. }
-        | Instruction::AddF64 { dst, .. }
-        | Instruction::SubF64 { dst, .. }
-        | Instruction::MulF64 { dst, .. }
-        | Instruction::DivF64 { dst, .. }
         | Instruction::Mod { dst, .. }
         | Instruction::Pow { dst, .. }
         | Instruction::Neg { dst, .. }
@@ -168,6 +160,59 @@ impl Interpreter {
     pub fn new() -> Self {
         Self {
             current_module: None,
+        }
+    }
+
+    #[inline]
+    fn get_arithmetic_fast_path(
+        ctx: &VmContext,
+        feedback_index: u16,
+    ) -> Option<otter_vm_bytecode::function::ArithmeticType> {
+        if let Some(frame) = ctx.current_frame() {
+            if let Some(func) = frame.module.function(frame.function_index) {
+                let feedback = func.feedback_vector.read();
+                if let Some(ic) = feedback.get(feedback_index as usize) {
+                    if let otter_vm_bytecode::function::InlineCacheState::ArithmeticFastPath(ty) =
+                        ic.ic_state
+                    {
+                        return Some(ty);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn update_arithmetic_ic(ctx: &VmContext, feedback_index: u16, left: &Value, right: &Value) {
+        if let Some(frame) = ctx.current_frame() {
+            if let Some(func) = frame.module.function(frame.function_index) {
+                let feedback = func.feedback_vector.write();
+                if let Some(ic) = feedback.get_mut(feedback_index as usize) {
+                    Self::observe_value_type(&mut ic.type_observations, left);
+                    Self::observe_value_type(&mut ic.type_observations, right);
+
+                    let new_ty = if ic.type_observations.is_int32_only() {
+                        Some(otter_vm_bytecode::function::ArithmeticType::Int32)
+                    } else if ic.type_observations.is_numeric_only() {
+                        Some(otter_vm_bytecode::function::ArithmeticType::Number)
+                    } else if !ic.type_observations.seen_object
+                        && !ic.type_observations.seen_function
+                        && ic.type_observations.seen_string
+                    {
+                        Some(otter_vm_bytecode::function::ArithmeticType::String)
+                    } else {
+                        None
+                    };
+
+                    if let Some(ty) = new_ty {
+                        ic.ic_state =
+                            otter_vm_bytecode::function::InlineCacheState::ArithmeticFastPath(ty);
+                    } else {
+                        ic.ic_state = otter_vm_bytecode::function::InlineCacheState::Megamorphic;
+                    }
+                }
+            }
         }
     }
 
@@ -591,31 +636,32 @@ impl Interpreter {
 
             let instruction = &func.instructions[frame.pc];
 
-            let instruction_result = match self.execute_instruction(instruction, &current_module, ctx) {
-                Ok(result) => result,
-                Err(err) => match err {
-                    VmError::Exception(thrown) => InstructionResult::Throw(thrown.value),
-                    VmError::TypeError(message) => {
-                        InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
-                    }
-                    VmError::RangeError(message) => {
-                        InstructionResult::Throw(self.make_error(ctx, "RangeError", &message))
-                    }
-                    VmError::ReferenceError(message) => {
-                        InstructionResult::Throw(self.make_error(ctx, "ReferenceError", &message))
-                    }
-                    VmError::SyntaxError(message) => {
-                        InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
-                    }
-                    other => {
-                        while ctx.stack_depth() > prev_stack_depth {
-                            ctx.pop_frame();
+            let instruction_result =
+                match self.execute_instruction(instruction, &current_module, ctx) {
+                    Ok(result) => result,
+                    Err(err) => match err {
+                        VmError::Exception(thrown) => InstructionResult::Throw(thrown.value),
+                        VmError::TypeError(message) => {
+                            InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
                         }
-                        ctx.set_running(was_running);
-                        return Err(other);
-                    }
-                },
-            };
+                        VmError::RangeError(message) => {
+                            InstructionResult::Throw(self.make_error(ctx, "RangeError", &message))
+                        }
+                        VmError::ReferenceError(message) => InstructionResult::Throw(
+                            self.make_error(ctx, "ReferenceError", &message),
+                        ),
+                        VmError::SyntaxError(message) => {
+                            InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
+                        }
+                        other => {
+                            while ctx.stack_depth() > prev_stack_depth {
+                                ctx.pop_frame();
+                            }
+                            ctx.set_running(was_running);
+                            return Err(other);
+                        }
+                    },
+                };
 
             match instruction_result {
                 InstructionResult::Continue => {
@@ -2092,31 +2138,29 @@ impl Interpreter {
                 let left = ctx.get_register(lhs.0).clone();
                 let right = ctx.get_register(rhs.0).clone();
 
-                // Collect type feedback and check for quickening opportunity
-                let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = frame.module.function(frame.function_index) {
-                        let feedback = func.feedback_vector.write();
-                        if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
-                            Self::observe_value_type(&mut meta.type_observations, &left);
-                            Self::observe_value_type(&mut meta.type_observations, &right);
-                            // Use fast path if only int32 types have been seen
-                            meta.type_observations.is_int32_only()
-                        } else {
-                            false
+                if let Some(ty) = Self::get_arithmetic_fast_path(ctx, *feedback_index) {
+                    use otter_vm_bytecode::function::ArithmeticType;
+                    match ty {
+                        ArithmeticType::Int32 => {
+                            if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
+                                if let Some(result) = l.checked_add(r) {
+                                    ctx.set_register(dst.0, Value::int32(result));
+                                    return Ok(InstructionResult::Continue);
+                                }
+                            }
                         }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                // Fast path for int32 addition (inline quickening)
-                if use_int32_fast_path {
-                    if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
-                        if let Some(result) = l.checked_add(r) {
-                            ctx.set_register(dst.0, Value::int32(result));
-                            return Ok(InstructionResult::Continue);
+                        ArithmeticType::Number => {
+                            if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
+                                ctx.set_register(dst.0, Value::number(l + r));
+                                return Ok(InstructionResult::Continue);
+                            }
+                        }
+                        ArithmeticType::String => {
+                            if left.is_string() || right.is_string() {
+                                let result = self.op_add(ctx, &left, &right)?;
+                                ctx.set_register(dst.0, result);
+                                return Ok(InstructionResult::Continue);
+                            }
                         }
                     }
                 }
@@ -2124,6 +2168,7 @@ impl Interpreter {
                 // Generic path
                 let result = self.op_add(ctx, &left, &right)?;
                 ctx.set_register(dst.0, result);
+                Self::update_arithmetic_ic(ctx, *feedback_index, &left, &right);
                 Ok(InstructionResult::Continue)
             }
 
@@ -2136,31 +2181,28 @@ impl Interpreter {
                 let left_value = ctx.get_register(lhs.0).clone();
                 let right_value = ctx.get_register(rhs.0).clone();
 
-                // Collect type feedback and check for quickening opportunity
-                let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = frame.module.function(frame.function_index) {
-                        let feedback = func.feedback_vector.write();
-                        if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
-                            Self::observe_value_type(&mut meta.type_observations, &left_value);
-                            Self::observe_value_type(&mut meta.type_observations, &right_value);
-                            meta.type_observations.is_int32_only()
-                        } else {
-                            false
+                if let Some(ty) = Self::get_arithmetic_fast_path(ctx, *feedback_index) {
+                    use otter_vm_bytecode::function::ArithmeticType;
+                    match ty {
+                        ArithmeticType::Int32 => {
+                            if let (Some(l), Some(r)) =
+                                (left_value.as_int32(), right_value.as_int32())
+                            {
+                                if let Some(result) = l.checked_sub(r) {
+                                    ctx.set_register(dst.0, Value::int32(result));
+                                    return Ok(InstructionResult::Continue);
+                                }
+                            }
                         }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                // Fast path for int32 subtraction (inline quickening)
-                if use_int32_fast_path {
-                    if let (Some(l), Some(r)) = (left_value.as_int32(), right_value.as_int32()) {
-                        if let Some(result) = l.checked_sub(r) {
-                            ctx.set_register(dst.0, Value::int32(result));
-                            return Ok(InstructionResult::Continue);
+                        ArithmeticType::Number => {
+                            if let (Some(l), Some(r)) =
+                                (left_value.as_number(), right_value.as_number())
+                            {
+                                ctx.set_register(dst.0, Value::number(l - r));
+                                return Ok(InstructionResult::Continue);
+                            }
                         }
+                        _ => {}
                     }
                 }
 
@@ -2178,6 +2220,7 @@ impl Interpreter {
                     }
                     _ => return Err(VmError::type_error("Cannot mix BigInt and other types")),
                 }
+                Self::update_arithmetic_ic(ctx, *feedback_index, &left_value, &right_value);
                 Ok(InstructionResult::Continue)
             }
 
@@ -2320,192 +2363,6 @@ impl Interpreter {
                     }
                     _ => return Err(VmError::type_error("Cannot mix BigInt and other types")),
                 }
-                Ok(InstructionResult::Continue)
-            }
-
-            // ==================== Quickened Arithmetic (type-specialized) ====================
-            Instruction::AddI32 {
-                dst,
-                lhs,
-                rhs,
-                feedback_index: _,
-            } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-
-                // Fast path: both operands are int32
-                if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
-                    // Check for overflow, fall back to f64 if it occurs
-                    if let Some(result) = l.checked_add(r) {
-                        ctx.set_register(dst.0, Value::int32(result));
-                        return Ok(InstructionResult::Continue);
-                    }
-                }
-
-                // Fallback to generic add
-                let result = self.op_add(ctx, &left, &right)?;
-                ctx.set_register(dst.0, result);
-                Ok(InstructionResult::Continue)
-            }
-
-            Instruction::SubI32 {
-                dst,
-                lhs,
-                rhs,
-                feedback_index: _,
-            } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-
-                // Fast path: both operands are int32
-                if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
-                    if let Some(result) = l.checked_sub(r) {
-                        ctx.set_register(dst.0, Value::int32(result));
-                        return Ok(InstructionResult::Continue);
-                    }
-                }
-
-                // Fallback to generic sub
-                let left_num = self.coerce_number(ctx, left)?;
-                let right_num = self.coerce_number(ctx, right)?;
-                ctx.set_register(dst.0, Value::number(left_num - right_num));
-                Ok(InstructionResult::Continue)
-            }
-
-            Instruction::MulI32 {
-                dst,
-                lhs,
-                rhs,
-                feedback_index: _,
-            } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-
-                // Fast path: both operands are int32
-                if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
-                    if let Some(result) = l.checked_mul(r) {
-                        ctx.set_register(dst.0, Value::int32(result));
-                        return Ok(InstructionResult::Continue);
-                    }
-                }
-
-                // Fallback to generic mul
-                let left_num = self.coerce_number(ctx, left)?;
-                let right_num = self.coerce_number(ctx, right)?;
-                ctx.set_register(dst.0, Value::number(left_num * right_num));
-                Ok(InstructionResult::Continue)
-            }
-
-            Instruction::DivI32 {
-                dst,
-                lhs,
-                rhs,
-                feedback_index: _,
-            } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-
-                // Fast path: both operands are int32 and divide evenly
-                if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
-                    if r != 0 && l % r == 0 {
-                        if let Some(result) = l.checked_div(r) {
-                            ctx.set_register(dst.0, Value::int32(result));
-                            return Ok(InstructionResult::Continue);
-                        }
-                    }
-                }
-
-                // Fallback to generic div (produces f64)
-                let left_num = self.coerce_number(ctx, left)?;
-                let right_num = self.coerce_number(ctx, right)?;
-                ctx.set_register(dst.0, Value::number(left_num / right_num));
-                Ok(InstructionResult::Continue)
-            }
-
-            Instruction::AddF64 {
-                dst,
-                lhs,
-                rhs,
-                feedback_index: _,
-            } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-
-                // Fast path: both operands are numbers
-                if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
-                    ctx.set_register(dst.0, Value::number(l + r));
-                    return Ok(InstructionResult::Continue);
-                }
-
-                // Fallback to generic add
-                let result = self.op_add(ctx, &left, &right)?;
-                ctx.set_register(dst.0, result);
-                Ok(InstructionResult::Continue)
-            }
-
-            Instruction::SubF64 {
-                dst,
-                lhs,
-                rhs,
-                feedback_index: _,
-            } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-
-                // Fast path: both operands are numbers
-                if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
-                    ctx.set_register(dst.0, Value::number(l - r));
-                    return Ok(InstructionResult::Continue);
-                }
-
-                // Fallback to generic sub
-                let left_num = self.coerce_number(ctx, left)?;
-                let right_num = self.coerce_number(ctx, right)?;
-                ctx.set_register(dst.0, Value::number(left_num - right_num));
-                Ok(InstructionResult::Continue)
-            }
-
-            Instruction::MulF64 {
-                dst,
-                lhs,
-                rhs,
-                feedback_index: _,
-            } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-
-                // Fast path: both operands are numbers
-                if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
-                    ctx.set_register(dst.0, Value::number(l * r));
-                    return Ok(InstructionResult::Continue);
-                }
-
-                // Fallback to generic mul
-                let left_num = self.coerce_number(ctx, left)?;
-                let right_num = self.coerce_number(ctx, right)?;
-                ctx.set_register(dst.0, Value::number(left_num * right_num));
-                Ok(InstructionResult::Continue)
-            }
-
-            Instruction::DivF64 {
-                dst,
-                lhs,
-                rhs,
-                feedback_index: _,
-            } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-
-                // Fast path: both operands are numbers
-                if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
-                    ctx.set_register(dst.0, Value::number(l / r));
-                    return Ok(InstructionResult::Continue);
-                }
-
-                // Fallback to generic div
-                let left_num = self.coerce_number(ctx, left)?;
-                let right_num = self.coerce_number(ctx, right)?;
-                ctx.set_register(dst.0, Value::number(left_num / right_num));
                 Ok(InstructionResult::Continue)
             }
 
@@ -3941,9 +3798,70 @@ impl Interpreter {
                             .unwrap_or_else(Value::undefined)
                     }
                 } else if let Some(obj_ref) = receiver.as_object() {
-                    obj_ref
-                        .get(&Self::utf16_key(method_name))
-                        .unwrap_or_else(Value::undefined)
+                    let key = Self::utf16_key(method_name);
+
+                    if !obj_ref.is_dictionary_mode() {
+                        if let Some(offset) = obj_ref.shape().get_offset(&key) {
+                            let frame = ctx
+                                .current_frame()
+                                .ok_or_else(|| VmError::internal("no frame"))?;
+                            let func = frame
+                                .module
+                                .function(frame.function_index)
+                                .ok_or_else(|| VmError::internal("no function"))?;
+                            let feedback = func.feedback_vector.write();
+                            if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                use otter_vm_bytecode::function::InlineCacheState;
+                                let shape_ptr = std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
+                                let current_epoch = crate::object::get_proto_epoch();
+
+                                match &mut ic.ic_state {
+                                    InlineCacheState::Uninitialized => {
+                                        ic.ic_state = InlineCacheState::Monomorphic {
+                                            shape_id: shape_ptr,
+                                            offset: offset as u32,
+                                        };
+                                        ic.proto_epoch = current_epoch;
+                                    }
+                                    InlineCacheState::Monomorphic {
+                                        shape_id: old_shape,
+                                        offset: old_offset,
+                                    } => {
+                                        if *old_shape != shape_ptr {
+                                            let mut entries = [(0u64, 0u32); 4];
+                                            entries[0] = (*old_shape, *old_offset);
+                                            entries[1] = (shape_ptr, offset as u32);
+                                            ic.ic_state =
+                                                InlineCacheState::Polymorphic { count: 2, entries };
+                                            ic.proto_epoch = current_epoch;
+                                        }
+                                    }
+                                    InlineCacheState::Polymorphic { count, entries } => {
+                                        let mut found = false;
+                                        for i in 0..(*count as usize) {
+                                            if entries[i].0 == shape_ptr {
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                        if !found {
+                                            if (*count as usize) < 4 {
+                                                entries[*count as usize] =
+                                                    (shape_ptr, offset as u32);
+                                                *count += 1;
+                                                ic.proto_epoch = current_epoch;
+                                            } else {
+                                                ic.ic_state = InlineCacheState::Megamorphic;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
+                    obj_ref.get(&key).unwrap_or_else(Value::undefined)
                 } else if receiver.is_string() {
                     let string_obj = ctx
                         .get_global("String")
@@ -6550,24 +6468,63 @@ impl Interpreter {
 
                 // Update IC if method was found on the object itself
                 if let Some(obj) = receiver.as_object() {
-                    if let Some(offset) = obj.shape().get_offset(&key) {
-                        let frame = ctx
-                            .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let func = frame
-                            .module
-                            .function(frame.function_index)
-                            .ok_or_else(|| VmError::internal("no function"))?;
-                        let feedback = func.feedback_vector.write();
-                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized =
-                                ic.ic_state
-                            {
-                                ic.ic_state =
-                                    otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                                        shape_id: std::sync::Arc::as_ptr(&obj.shape()) as u64,
-                                        offset: offset as u32,
-                                    };
+                    if !obj.is_dictionary_mode() {
+                        if let Some(offset) = obj.shape().get_offset(&key) {
+                            let frame = ctx
+                                .current_frame()
+                                .ok_or_else(|| VmError::internal("no frame"))?;
+                            let func = frame
+                                .module
+                                .function(frame.function_index)
+                                .ok_or_else(|| VmError::internal("no function"))?;
+                            let feedback = func.feedback_vector.write();
+                            if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                use otter_vm_bytecode::function::InlineCacheState;
+                                let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                let current_epoch = crate::object::get_proto_epoch();
+
+                                match &mut ic.ic_state {
+                                    InlineCacheState::Uninitialized => {
+                                        ic.ic_state = InlineCacheState::Monomorphic {
+                                            shape_id: shape_ptr,
+                                            offset: offset as u32,
+                                        };
+                                        ic.proto_epoch = current_epoch;
+                                    }
+                                    InlineCacheState::Monomorphic {
+                                        shape_id: old_shape,
+                                        offset: old_offset,
+                                    } => {
+                                        if *old_shape != shape_ptr {
+                                            let mut entries = [(0u64, 0u32); 4];
+                                            entries[0] = (*old_shape, *old_offset);
+                                            entries[1] = (shape_ptr, offset as u32);
+                                            ic.ic_state =
+                                                InlineCacheState::Polymorphic { count: 2, entries };
+                                            ic.proto_epoch = current_epoch;
+                                        }
+                                    }
+                                    InlineCacheState::Polymorphic { count, entries } => {
+                                        let mut found = false;
+                                        for i in 0..(*count as usize) {
+                                            if entries[i].0 == shape_ptr {
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                        if !found {
+                                            if (*count as usize) < 4 {
+                                                entries[*count as usize] =
+                                                    (shape_ptr, offset as u32);
+                                                *count += 1;
+                                                ic.proto_epoch = current_epoch;
+                                            } else {
+                                                ic.ic_state = InlineCacheState::Megamorphic;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -6729,24 +6686,63 @@ impl Interpreter {
 
                 // Update IC if method was found on the object itself
                 if let Some(obj) = receiver.as_object() {
-                    if let Some(offset) = obj.shape().get_offset(&key) {
-                        let frame = ctx
-                            .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let func = frame
-                            .module
-                            .function(frame.function_index)
-                            .ok_or_else(|| VmError::internal("no function"))?;
-                        let feedback = func.feedback_vector.write();
-                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCacheState::Uninitialized =
-                                ic.ic_state
-                            {
-                                ic.ic_state =
-                                    otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                                        shape_id: std::sync::Arc::as_ptr(&obj.shape()) as u64,
-                                        offset: offset as u32,
-                                    };
+                    if !obj.is_dictionary_mode() {
+                        if let Some(offset) = obj.shape().get_offset(&key) {
+                            let frame = ctx
+                                .current_frame()
+                                .ok_or_else(|| VmError::internal("no frame"))?;
+                            let func = frame
+                                .module
+                                .function(frame.function_index)
+                                .ok_or_else(|| VmError::internal("no function"))?;
+                            let feedback = func.feedback_vector.write();
+                            if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                use otter_vm_bytecode::function::InlineCacheState;
+                                let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                let current_epoch = crate::object::get_proto_epoch();
+
+                                match &mut ic.ic_state {
+                                    InlineCacheState::Uninitialized => {
+                                        ic.ic_state = InlineCacheState::Monomorphic {
+                                            shape_id: shape_ptr,
+                                            offset: offset as u32,
+                                        };
+                                        ic.proto_epoch = current_epoch;
+                                    }
+                                    InlineCacheState::Monomorphic {
+                                        shape_id: old_shape,
+                                        offset: old_offset,
+                                    } => {
+                                        if *old_shape != shape_ptr {
+                                            let mut entries = [(0u64, 0u32); 4];
+                                            entries[0] = (*old_shape, *old_offset);
+                                            entries[1] = (shape_ptr, offset as u32);
+                                            ic.ic_state =
+                                                InlineCacheState::Polymorphic { count: 2, entries };
+                                            ic.proto_epoch = current_epoch;
+                                        }
+                                    }
+                                    InlineCacheState::Polymorphic { count, entries } => {
+                                        let mut found = false;
+                                        for i in 0..(*count as usize) {
+                                            if entries[i].0 == shape_ptr {
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                        if !found {
+                                            if (*count as usize) < 4 {
+                                                entries[*count as usize] =
+                                                    (shape_ptr, offset as u32);
+                                                *count += 1;
+                                                ic.proto_epoch = current_epoch;
+                                            } else {
+                                                ic.ic_state = InlineCacheState::Megamorphic;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -6786,7 +6782,8 @@ impl Interpreter {
                         PropertyKey::string("length"),
                         Value::int32((dst_len + src_len) as i32),
                     );
-                } else if let (Some(dst_obj), Some(src_str)) = (dst_arr.as_object(), src_arr.as_string())
+                } else if let (Some(dst_obj), Some(src_str)) =
+                    (dst_arr.as_object(), src_arr.as_string())
                 {
                     // Spread string primitives by Unicode code point.
                     let mut out_index = dst_obj
@@ -6803,7 +6800,10 @@ impl Interpreter {
                                 && idx + 1 < units.len()
                                 && crate::intrinsics_impl::string::is_low_surrogate(units[idx + 1])
                             {
-                                (crate::string::JsString::intern_utf16(&[first, units[idx + 1]]), idx + 2)
+                                (
+                                    crate::string::JsString::intern_utf16(&[first, units[idx + 1]]),
+                                    idx + 2,
+                                )
                             } else {
                                 (crate::string::JsString::intern_utf16(&[first]), idx + 1)
                             };
@@ -8145,18 +8145,26 @@ impl Interpreter {
         ctx.exit_native_call();
 
         let result = match result {
-            Err(VmError::TypeError(message)) => {
-                Err(VmError::exception(self.make_error(ctx, "TypeError", &message)))
-            }
-            Err(VmError::RangeError(message)) => {
-                Err(VmError::exception(self.make_error(ctx, "RangeError", &message)))
-            }
-            Err(VmError::ReferenceError(message)) => Err(VmError::exception(
-                self.make_error(ctx, "ReferenceError", &message),
-            )),
-            Err(VmError::SyntaxError(message)) => {
-                Err(VmError::exception(self.make_error(ctx, "SyntaxError", &message)))
-            }
+            Err(VmError::TypeError(message)) => Err(VmError::exception(self.make_error(
+                ctx,
+                "TypeError",
+                &message,
+            ))),
+            Err(VmError::RangeError(message)) => Err(VmError::exception(self.make_error(
+                ctx,
+                "RangeError",
+                &message,
+            ))),
+            Err(VmError::ReferenceError(message)) => Err(VmError::exception(self.make_error(
+                ctx,
+                "ReferenceError",
+                &message,
+            ))),
+            Err(VmError::SyntaxError(message)) => Err(VmError::exception(self.make_error(
+                ctx,
+                "SyntaxError",
+                &message,
+            ))),
             other => other,
         };
 
@@ -9826,14 +9834,11 @@ impl Interpreter {
     /// Run the field initializer function for derived constructors after super() returns.
     /// The field_init_func is compiled as an inner function of the constructor.
     /// It is called with `this` bound to the newly created instance.
-    fn run_field_initializers(
-        &self,
-        ctx: &mut VmContext,
-        this_value: &Value,
-    ) -> VmResult<()> {
+    fn run_field_initializers(&self, ctx: &mut VmContext, this_value: &Value) -> VmResult<()> {
         // Get the current frame's module and function index
         let (module, function_index) = {
-            let frame = ctx.current_frame()
+            let frame = ctx
+                .current_frame()
                 .ok_or_else(|| VmError::internal("no frame for field init"))?;
             (frame.module.clone(), frame.function_index)
         };
@@ -9846,7 +9851,8 @@ impl Interpreter {
 
         if let Some(init_idx) = field_init_idx {
             // Get the field init function definition
-            let init_func = module.function(init_idx)
+            let init_func = module
+                .function(init_idx)
                 .ok_or_else(|| VmError::internal("field init function not found"))?;
 
             // Capture upvalues from the current frame (the constructor)

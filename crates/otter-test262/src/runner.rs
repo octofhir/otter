@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use otter_engine::{EngineBuilder, Otter, OtterError, Value};
+use otter_vm_core::IsolateConfig;
 
 use crate::harness::TestHarnessState;
 use crate::metadata::{ErrorPhase, ExecutionMode, TestMetadata};
@@ -78,8 +79,11 @@ impl TimeoutWatchdog {
         thread::Builder::new()
             .name("test262-timeout-watchdog".to_string())
             .spawn(move || {
-                let mut armed: Option<(u64, std::time::Instant, Arc<std::sync::atomic::AtomicBool>)> =
-                    None;
+                let mut armed: Option<(
+                    u64,
+                    std::time::Instant,
+                    Arc<std::sync::atomic::AtomicBool>,
+                )> = None;
                 loop {
                     if let Some((token, deadline, flag)) = armed.take() {
                         let now = std::time::Instant::now();
@@ -93,14 +97,21 @@ impl TimeoutWatchdog {
                                 duration,
                                 interrupt_flag,
                             }) => {
-                                armed = Some((token, std::time::Instant::now() + duration, interrupt_flag));
+                                armed = Some((
+                                    token,
+                                    std::time::Instant::now() + duration,
+                                    interrupt_flag,
+                                ));
                             }
-                            Ok(WatchdogCommand::Disarm { token: disarm_token }) => {
+                            Ok(WatchdogCommand::Disarm {
+                                token: disarm_token,
+                            }) => {
                                 if disarm_token != token {
                                     armed = Some((token, deadline, flag));
                                 }
                             }
-                            Ok(WatchdogCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            Ok(WatchdogCommand::Stop)
+                            | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                             Err(mpsc::RecvTimeoutError::Timeout) => {
                                 flag.store(true, Ordering::Relaxed);
                             }
@@ -112,8 +123,11 @@ impl TimeoutWatchdog {
                                 duration,
                                 interrupt_flag,
                             }) => {
-                                armed =
-                                    Some((token, std::time::Instant::now() + duration, interrupt_flag));
+                                armed = Some((
+                                    token,
+                                    std::time::Instant::now() + duration,
+                                    interrupt_flag,
+                                ));
                             }
                             Ok(WatchdogCommand::Disarm { .. }) => {}
                             Ok(WatchdogCommand::Stop) | Err(_) => break,
@@ -207,7 +221,13 @@ impl Test262Runner {
         trace_timeouts_only: bool,
     ) -> Self {
         let (harness_ext, harness_state) = crate::harness::create_harness_extension_with_state();
-        let mut engine = EngineBuilder::new().extension(harness_ext).build();
+        let mut engine = EngineBuilder::new()
+            .isolate_config(IsolateConfig {
+                max_heap_size: 64 * 1024 * 1024, // 64MB
+                ..Default::default()
+            })
+            .extension(harness_ext)
+            .build();
 
         // Configure trace if dump_on_timeout is enabled
         if dump_on_timeout {
@@ -269,7 +289,13 @@ impl Test262Runner {
         }));
 
         let (harness_ext, harness_state) = crate::harness::create_harness_extension_with_state();
-        let mut engine = EngineBuilder::new().extension(harness_ext).build();
+        let mut engine = EngineBuilder::new()
+            .isolate_config(IsolateConfig {
+                max_heap_size: 64 * 1024 * 1024, // 64MB
+                ..Default::default()
+            })
+            .extension(harness_ext)
+            .build();
 
         // Re-apply trace configuration if enabled
         if self.dump_on_timeout {
@@ -446,7 +472,6 @@ impl Test262Runner {
             if *mode == ExecutionMode::NonStrict && result.0 == TestOutcome::Fail {
                 break;
             }
-
         }
 
         results

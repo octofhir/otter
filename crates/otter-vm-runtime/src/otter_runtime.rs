@@ -208,6 +208,15 @@ impl Otter {
         // Clear module cache to prevent cross-test pollution
         self.loader.clear();
 
+        // Clear event loop queues (microtasks, timers, promise reactions)
+        // This is critical for test isolation and preventing leaks from timed-out tests.
+        self.event_loop.clear_all_queues();
+
+        // Eagerly collect garbage now that original realm roots are dropped.
+        // This prevents memory accumulation across thousands of Test262 runs
+        // and keeps the live set minimal.
+        self.isolate.runtime().create_context().collect_garbage();
+
         // Reset execution state
         self.clear_interrupt();
         *self.debug_snapshot.lock() = VmContextSnapshot::default();
@@ -391,7 +400,11 @@ impl Otter {
         let compiled_modules = self.extensions.all_compiled_js();
         if !compiled_modules.is_empty() {
             for module in compiled_modules {
-                if let Err(e) = self.isolate.runtime().execute_module_with_context(&module, &mut ctx) {
+                if let Err(e) = self
+                    .isolate
+                    .runtime()
+                    .execute_module_with_context(&module, &mut ctx)
+                {
                     eprintln!("Extension setup failed: {}", e);
                     return Err(OtterError::Runtime(e.to_string()));
                 }
@@ -861,7 +874,8 @@ impl Otter {
             // Resolve imports for this dependency
             let dep_locals = self.resolve_module_imports(&module_bytecode, url)?;
 
-            self.isolate.runtime()
+            self.isolate
+                .runtime()
                 .execute_module_with_context_and_locals(
                     &module_bytecode,
                     &mut ctx,
@@ -879,7 +893,8 @@ impl Otter {
         // Resolve imports for main module
         let initial_locals = self.resolve_module_imports(&bytecode, main_url)?;
         let result = self
-            .isolate.runtime()
+            .isolate
+            .runtime()
             .execute_module_with_context_and_locals(
                 &bytecode,
                 &mut ctx,
@@ -1142,7 +1157,8 @@ impl Otter {
                     unsafe {
                         let otter = &*(otter_ptr as *const Otter);
                         let realm_id = otter.isolate.runtime().create_realm();
-                        let mut realm_ctx = otter.isolate.runtime().create_context_in_realm(realm_id);
+                        let mut realm_ctx =
+                            otter.isolate.runtime().create_context_in_realm(realm_id);
                         otter
                             .setup_context(&mut realm_ctx)
                             .map_err(|e| VmError::internal(e.to_string()))?;
@@ -1571,7 +1587,8 @@ impl Otter {
             .compile(code, source_url, false) // Non-strict context for top-level code
             .map_err(|e| OtterError::Compile(e.to_string()))?;
 
-        self.isolate.runtime()
+        self.isolate
+            .runtime()
             .execute_module_with_context(&module, ctx)
             .map_err(|e| OtterError::Runtime(e.to_string()))
     }
@@ -1616,7 +1633,8 @@ impl Otter {
 
         // Execute in provided context
         let result = self
-            .isolate.runtime()
+            .isolate
+            .runtime()
             .execute_module_with_context(&module, ctx)
             .map_err(|e| OtterError::Runtime(e.to_string()))?;
 
@@ -2418,7 +2436,8 @@ impl Otter {
             .compile_eval(code, source_url, false)
             .map_err(|e| OtterError::Compile(e.to_string()))?;
 
-        self.isolate.runtime()
+        self.isolate
+            .runtime()
             .execute_module_with_context(&module, ctx)
             .map_err(|e| OtterError::Runtime(e.to_string()))
     }

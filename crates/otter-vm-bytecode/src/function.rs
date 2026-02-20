@@ -72,6 +72,19 @@ pub enum InlineCacheState {
     },
     /// Megamorphic state: too many shapes seen, fallback to slow path
     Megamorphic,
+    /// Quickened arithmetic specialization type
+    ArithmeticFastPath(ArithmeticType),
+}
+
+/// Type of arithmetic fast path
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArithmeticType {
+    /// Both operands are Int32
+    Int32,
+    /// Both operands are Numbers (f64) or mixed numeric
+    Number,
+    /// Both operands are Strings (for Add only)
+    String,
 }
 
 /// Type flags for value type observations (used for type feedback)

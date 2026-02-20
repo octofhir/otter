@@ -621,55 +621,6 @@ pub enum Instruction {
         feedback_index: u16,
     },
 
-    // Quickened arithmetic (type-specialized, no type checks needed)
-    AddI32 {
-        dst: Register,
-        lhs: Register,
-        rhs: Register,
-        feedback_index: u16,
-    },
-    SubI32 {
-        dst: Register,
-        lhs: Register,
-        rhs: Register,
-        feedback_index: u16,
-    },
-    MulI32 {
-        dst: Register,
-        lhs: Register,
-        rhs: Register,
-        feedback_index: u16,
-    },
-    DivI32 {
-        dst: Register,
-        lhs: Register,
-        rhs: Register,
-        feedback_index: u16,
-    },
-    AddF64 {
-        dst: Register,
-        lhs: Register,
-        rhs: Register,
-        feedback_index: u16,
-    },
-    SubF64 {
-        dst: Register,
-        lhs: Register,
-        rhs: Register,
-        feedback_index: u16,
-    },
-    MulF64 {
-        dst: Register,
-        lhs: Register,
-        rhs: Register,
-        feedback_index: u16,
-    },
-    DivF64 {
-        dst: Register,
-        lhs: Register,
-        rhs: Register,
-        feedback_index: u16,
-    },
     Mod {
         dst: Register,
         lhs: Register,

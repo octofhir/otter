@@ -63,4 +63,13 @@ impl RealmRegistry {
             None
         }
     }
+
+    /// Trace all GC roots held by all realm records.
+    pub fn trace_roots(&self, tracer: &mut dyn FnMut(*const crate::gc::GcHeader)) {
+        for realm in self.realms.read().iter() {
+            tracer(realm.function_prototype.header() as *const _);
+            tracer(realm.global.header() as *const _);
+            realm.intrinsics.trace_roots(tracer);
+        }
+    }
 }

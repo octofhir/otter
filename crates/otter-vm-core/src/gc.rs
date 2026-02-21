@@ -762,6 +762,20 @@ impl Trace for crate::context::VmContext {
         for value in self.root_slots_to_trace() {
             tracer.mark_value(value);
         }
+
+        if let Some(fp) = self.function_prototype_intrinsic() {
+            tracer.mark(fp.as_ref());
+        }
+        if let Some(gp) = self.generator_prototype_intrinsic() {
+            tracer.mark(gp.as_ref());
+        }
+        if let Some(agp) = self.async_generator_prototype_intrinsic() {
+            tracer.mark(agp.as_ref());
+        }
+
+        if let Some(registry) = self.realm_registry() {
+            registry.trace_roots(&mut |header| tracer.mark_header(header));
+        }
     }
 }
 

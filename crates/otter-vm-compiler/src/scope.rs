@@ -11,6 +11,10 @@ pub enum VariableKind {
     Let,
     /// const declaration (block-scoped, non-re-declarable, immutable)
     Const,
+    /// Annex B block-level function declaration lexical binding (sloppy mode).
+    AnnexBFunction,
+    /// Function parameter binding.
+    Parameter,
 }
 
 impl VariableKind {
@@ -113,7 +117,10 @@ impl ScopeChain {
             let mut scope_idx = current_idx;
             loop {
                 if let Some(existing) = self.scopes[scope_idx].bindings.get(name) {
-                    if existing.kind != VariableKind::Var {
+                    if existing.kind != VariableKind::Var
+                        && existing.kind != VariableKind::AnnexBFunction
+                        && existing.kind != VariableKind::Parameter
+                    {
                         return None;
                     }
                 }
@@ -139,7 +146,10 @@ impl ScopeChain {
 
             // Hoist the binding to the function scope.
             if let Some(existing) = self.scopes[function_scope_idx].bindings.get(name) {
-                debug_assert_eq!(existing.kind, VariableKind::Var);
+                debug_assert!(
+                    existing.kind == VariableKind::Var
+                        || existing.kind == VariableKind::Parameter
+                );
                 return Some(existing.index);
             }
 
@@ -166,7 +176,11 @@ impl ScopeChain {
         }
 
         // Check for redeclaration in current lexical scope.
-        if self.scopes[current_idx].bindings.contains_key(name) {
+        if let Some(existing) = self.scopes[current_idx].bindings.get(name) {
+            if kind == VariableKind::AnnexBFunction && existing.kind == VariableKind::AnnexBFunction
+            {
+                return Some(existing.index);
+            }
             return None;
         }
 
@@ -183,6 +197,51 @@ impl ScopeChain {
             },
         );
 
+        Some(index)
+    }
+
+    /// Declare an Annex B synthetic var-extension binding in function scope.
+    ///
+    /// Unlike normal `var` declarations this does not mark `var_declared_names`
+    /// on lexical scopes, because it is paired with a block-level function
+    /// lexical binding in the same statement list.
+    pub fn declare_annex_b_var_extension(&mut self, name: &str) -> Option<u16> {
+        let current_idx = self.current?;
+        let function_scope_idx = self.current_function_scope_index()?;
+
+        let mut scope_idx = current_idx;
+        loop {
+            if let Some(existing) = self.scopes[scope_idx].bindings.get(name) {
+                if existing.kind != VariableKind::Var
+                    && existing.kind != VariableKind::AnnexBFunction
+                    && existing.kind != VariableKind::Parameter
+                {
+                    return None;
+                }
+            }
+            if scope_idx == function_scope_idx {
+                break;
+            }
+            scope_idx = self.scopes[scope_idx].parent?;
+        }
+
+        if let Some(existing) = self.scopes[function_scope_idx].bindings.get(name) {
+            if existing.kind == VariableKind::Var || existing.kind == VariableKind::Parameter {
+                return Some(existing.index);
+            }
+        }
+
+        let index = self.scopes[function_scope_idx].next_local;
+        self.scopes[function_scope_idx].next_local += 1;
+        self.scopes[function_scope_idx].bindings.insert(
+            name.to_string(),
+            Binding {
+                index,
+                kind: VariableKind::Var,
+                is_captured: false,
+                name: name.to_string(),
+            },
+        );
         Some(index)
     }
 
@@ -268,6 +327,22 @@ impl ScopeChain {
     /// Get current scope mutably
     pub fn current_scope_mut(&mut self) -> Option<&mut Scope> {
         self.current.map(|i| &mut self.scopes[i])
+    }
+
+    /// Whether the current lexical scope is a function scope.
+    pub fn current_scope_is_function(&self) -> bool {
+        self.current
+            .map(|idx| self.scopes[idx].is_function)
+            .unwrap_or(false)
+    }
+
+    /// Resolve a binding in the current function scope only.
+    pub fn function_scope_binding(&self, name: &str) -> Option<(u16, VariableKind)> {
+        let idx = self.current_function_scope_index()?;
+        self.scopes[idx]
+            .bindings
+            .get(name)
+            .map(|b| (b.index, b.kind))
     }
 
     /// Get number of locals in current function scope

@@ -440,6 +440,11 @@ impl CodeGen {
         })
     }
 
+    /// Declare an Annex B synthetic var-extension binding.
+    pub fn declare_annex_b_var_extension(&mut self, name: &str) -> Option<u16> {
+        self.current.scopes.declare_annex_b_var_extension(name)
+    }
+
     /// Declare a variable (is_const: true = Const, false = Let)
     /// For var declarations, use declare_variable_with_kind with VariableKind::Var
     pub fn declare_variable(&mut self, name: &str, is_const: bool) -> CompileResult<u16> {

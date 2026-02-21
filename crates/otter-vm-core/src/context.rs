@@ -1283,6 +1283,11 @@ impl VmContext {
         self.function_prototype_intrinsic = Some(proto);
     }
 
+    /// Get the intrinsic `%Function.prototype%` object if explicitly set.
+    pub fn function_prototype_intrinsic(&self) -> Option<GcRef<JsObject>> {
+        self.function_prototype_intrinsic
+    }
+
     /// Set the intrinsic `%GeneratorPrototype%` object.
     pub fn set_generator_prototype_intrinsic(&mut self, proto: GcRef<JsObject>) {
         self.generator_prototype_intrinsic = Some(proto);
@@ -1301,6 +1306,11 @@ impl VmContext {
     /// Get the intrinsic `%AsyncGeneratorPrototype%` object.
     pub fn async_generator_prototype_intrinsic(&self) -> Option<GcRef<JsObject>> {
         self.async_generator_prototype_intrinsic
+    }
+
+    /// Get the attached realm registry.
+    pub fn realm_registry(&self) -> Option<&Arc<RealmRegistry>> {
+        self.realm_registry.as_ref()
     }
 
     /// Set the eval compiler callback used by the interpreter to compile
@@ -2274,6 +2284,22 @@ impl VmContext {
         // Add external root sets (runtime-managed queues, etc.)
         for root_set in &self.external_root_sets {
             root_set.trace_roots(&mut |header| roots.push(header));
+        }
+
+        // Add context-level intrinsic roots.
+        if let Some(fp) = self.function_prototype_intrinsic {
+            roots.push(fp.header() as *const _);
+        }
+        if let Some(gp) = self.generator_prototype_intrinsic {
+            roots.push(gp.header() as *const _);
+        }
+        if let Some(agp) = self.async_generator_prototype_intrinsic {
+            roots.push(agp.header() as *const _);
+        }
+
+        // Add all realm roots (globals, function prototypes, intrinsics, symbols).
+        if let Some(registry) = &self.realm_registry {
+            registry.trace_roots(&mut |header| roots.push(header));
         }
 
         // Add global symbol registry

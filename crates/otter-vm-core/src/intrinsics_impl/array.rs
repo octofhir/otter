@@ -230,9 +230,7 @@ fn array_species_create(
 pub(crate) fn make_array_iterator(
     this_val: &Value,
     kind: &str,
-    mm: &Arc<MemoryManager>,
-    _fn_proto: GcRef<JsObject>,
-    array_iter_proto: GcRef<JsObject>,
+    ncx: &mut NativeContext<'_>,
 ) -> Result<Value, crate::error::VmError> {
     if this_val.as_object().is_none()
         && this_val.as_proxy().is_none()
@@ -240,8 +238,17 @@ pub(crate) fn make_array_iterator(
     {
         return Err("Array iterator: this is not an object".to_string().into());
     }
+    let realm_id = ncx.ctx.realm_id();
+    let intrinsics = ncx
+        .ctx
+        .realm_intrinsics(realm_id)
+        .ok_or_else(|| VmError::type_error("Array iterator prototype is not defined"))?;
+    let array_iter_proto = intrinsics.array_iterator_prototype;
     // Create iterator with %ArrayIteratorPrototype% as prototype (has next() on it)
-    let iter = GcRef::new(JsObject::new(Value::object(array_iter_proto), mm.clone()));
+    let iter = GcRef::new(JsObject::new(
+        Value::object(array_iter_proto),
+        ncx.memory_manager().clone(),
+    ));
     // Store the array reference, current index, and kind
     let _ = iter.set(PropertyKey::string("__array_ref__"), this_val.clone());
     let _ = iter.set(PropertyKey::string("__array_index__"), Value::number(0.0));
@@ -260,6 +267,7 @@ pub fn init_array_prototype(
     array_iterator_proto: GcRef<JsObject>,
     symbol_iterator: crate::gc::GcRef<crate::value::Symbol>,
 ) {
+    let _ = array_iterator_proto;
     // Array.prototype.push
     arr_proto.define_property(
         PropertyKey::string("push"),
@@ -1786,17 +1794,14 @@ pub fn init_array_prototype(
     // Array.prototype.values / keys / entries / [Symbol.iterator]
     // ================================================================
     {
-        let iter_proto = array_iterator_proto;
         let sym_ref = symbol_iterator;
 
         // Array.prototype.values()
-        let fn_p = fn_proto;
-        let ip = iter_proto;
         arr_proto.define_property(
             PropertyKey::string("values"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
                 move |this_val, _args, ncx| {
-                    make_array_iterator(this_val, "value", ncx.memory_manager(), fn_p, ip)
+                    make_array_iterator(this_val, "value", ncx)
                 },
                 mm.clone(),
                 fn_proto,
@@ -1806,13 +1811,11 @@ pub fn init_array_prototype(
         );
 
         // Array.prototype.keys()
-        let fn_p = fn_proto;
-        let ip = iter_proto;
         arr_proto.define_property(
             PropertyKey::string("keys"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
                 move |this_val, _args, ncx| {
-                    make_array_iterator(this_val, "key", ncx.memory_manager(), fn_p, ip)
+                    make_array_iterator(this_val, "key", ncx)
                 },
                 mm.clone(),
                 fn_proto,
@@ -1822,13 +1825,11 @@ pub fn init_array_prototype(
         );
 
         // Array.prototype.entries()
-        let fn_p = fn_proto;
-        let ip = iter_proto;
         arr_proto.define_property(
             PropertyKey::string("entries"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
                 move |this_val, _args, ncx| {
-                    make_array_iterator(this_val, "entry", ncx.memory_manager(), fn_p, ip)
+                    make_array_iterator(this_val, "entry", ncx)
                 },
                 mm.clone(),
                 fn_proto,
@@ -1838,13 +1839,11 @@ pub fn init_array_prototype(
         );
 
         // Array.prototype[Symbol.iterator] = Array.prototype.values
-        let fn_p = fn_proto;
-        let ip = iter_proto;
         arr_proto.define_property(
             PropertyKey::Symbol(sym_ref),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
                 move |this_val, _args, ncx| {
-                    make_array_iterator(this_val, "value", ncx.memory_manager(), fn_p, ip)
+                    make_array_iterator(this_val, "value", ncx)
                 },
                 mm.clone(),
                 fn_proto,

@@ -304,6 +304,84 @@ pub struct Intrinsics {
 }
 
 impl Intrinsics {
+    /// Trace all GC roots referenced by this intrinsics table.
+    pub fn trace_roots(&self, tracer: &mut dyn FnMut(*const crate::gc::GcHeader)) {
+        for obj in [
+            self.object_prototype,
+            self.function_prototype,
+            self.generator_function_prototype,
+            self.async_function_prototype,
+            self.async_generator_function_prototype,
+            self.object_constructor,
+            self.function_constructor,
+            self.abort_controller_constructor,
+            self.abort_signal_constructor,
+            self.string_prototype,
+            self.number_prototype,
+            self.boolean_prototype,
+            self.symbol_prototype,
+            self.bigint_prototype,
+            self.array_prototype,
+            self.map_prototype,
+            self.set_prototype,
+            self.weak_map_prototype,
+            self.weak_set_prototype,
+            self.error_prototype,
+            self.type_error_prototype,
+            self.range_error_prototype,
+            self.reference_error_prototype,
+            self.syntax_error_prototype,
+            self.uri_error_prototype,
+            self.eval_error_prototype,
+            self.aggregate_error_prototype,
+            self.promise_prototype,
+            self.regexp_prototype,
+            self.date_prototype,
+            self.array_buffer_prototype,
+            self.data_view_prototype,
+            self.abort_controller_prototype,
+            self.abort_signal_prototype,
+            self.iterator_prototype,
+            self.string_iterator_prototype,
+            self.array_iterator_prototype,
+            self.async_iterator_prototype,
+            self.generator_prototype,
+            self.async_generator_prototype,
+            self.typed_array_prototype,
+            self.int8_array_prototype,
+            self.uint8_array_prototype,
+            self.uint8_clamped_array_prototype,
+            self.int16_array_prototype,
+            self.uint16_array_prototype,
+            self.int32_array_prototype,
+            self.uint32_array_prototype,
+            self.float32_array_prototype,
+            self.float64_array_prototype,
+            self.bigint64_array_prototype,
+            self.biguint64_array_prototype,
+        ] {
+            tracer(obj.header() as *const _);
+        }
+
+        for symbol in [
+            &self.symbol_iterator,
+            &self.symbol_async_iterator,
+            &self.symbol_to_string_tag,
+            &self.symbol_has_instance,
+            &self.symbol_to_primitive,
+            &self.symbol_is_concat_spreadable,
+            &self.symbol_match,
+            &self.symbol_match_all,
+            &self.symbol_replace,
+            &self.symbol_search,
+            &self.symbol_split,
+            &self.symbol_species,
+            &self.symbol_unscopables,
+        ] {
+            symbol.trace(tracer);
+        }
+    }
+
     /// Resolve the intrinsic prototype for a builtin tag.
     pub fn prototype_for_builtin_tag(&self, tag: &str) -> Option<GcRef<JsObject>> {
         match tag {

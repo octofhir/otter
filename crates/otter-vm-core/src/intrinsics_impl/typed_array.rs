@@ -520,12 +520,11 @@ fn init_typed_array_iterators(
     array_iter_proto: GcRef<JsObject>,
 ) {
     // %TypedArray%.prototype.values() — uses shared %ArrayIteratorPrototype%
-    let aip = array_iter_proto;
     let values_method = Value::native_function_with_proto(
         move |this_val, _args, ncx| {
             let ta = get_typed_array(this_val)?;
             let ta_val = Value::typed_array(ta);
-            super::array::make_array_iterator(&ta_val, "value", ncx.memory_manager(), fn_proto, aip)
+            super::array::make_array_iterator(&ta_val, "value", ncx)
         },
         mm.clone(),
         fn_proto,
@@ -543,14 +542,14 @@ fn init_typed_array_iterators(
     );
 
     // %TypedArray%.prototype.keys()
-    let aip = array_iter_proto;
+    let _ = array_iter_proto;
     proto.define_property(
         PropertyKey::string("keys"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             move |this_val, _args, ncx| {
                 let ta = get_typed_array(this_val)?;
                 let ta_val = Value::typed_array(ta);
-                super::array::make_array_iterator(&ta_val, "key", ncx.memory_manager(), fn_proto, aip)
+                super::array::make_array_iterator(&ta_val, "key", ncx)
             },
             mm.clone(),
             fn_proto,
@@ -558,14 +557,13 @@ fn init_typed_array_iterators(
     );
 
     // %TypedArray%.prototype.entries()
-    let aip = array_iter_proto;
     proto.define_property(
         PropertyKey::string("entries"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             move |this_val, _args, ncx| {
                 let ta = get_typed_array(this_val)?;
                 let ta_val = Value::typed_array(ta);
-                super::array::make_array_iterator(&ta_val, "entry", ncx.memory_manager(), fn_proto, aip)
+                super::array::make_array_iterator(&ta_val, "entry", ncx)
             },
             mm.clone(),
             fn_proto,

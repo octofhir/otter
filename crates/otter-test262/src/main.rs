@@ -1,6 +1,7 @@
 use clap::{ArgAction, Parser, Subcommand};
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
+use serde::{Deserialize, Serialize};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use otter_test262::{
 // CLI
 // ---------------------------------------------------------------------------
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "test262")]
 #[command(about = "Run Test262 conformance tests against Otter VM")]
 struct Cli {
@@ -122,7 +123,7 @@ struct Cli {
     trace_timeouts_only: bool,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum Commands {
     /// Run test262 tests (default)
     Run,
@@ -134,6 +135,12 @@ enum Commands {
         /// New (current) result file
         #[arg(long, alias = "new")]
         current: PathBuf,
+    },
+    /// Run tests in batches, advancing only if all pass
+    Advance {
+        /// Number of tests per batch
+        #[arg(short = 'b', long, default_value = "300")]
+        batch_size: usize,
     },
 }
 
@@ -267,6 +274,9 @@ async fn async_main() {
         Some(Commands::Compare { base, current }) => {
             run_compare(&base, &current);
         }
+        Some(Commands::Advance { batch_size }) => {
+            run_advance(cli, batch_size).await;
+        }
         Some(Commands::Run) | None => {
             run_tests(cli).await;
         }
@@ -291,7 +301,7 @@ fn run_compare(base: &std::path::Path, current: &std::path::Path) {
 // Run command
 // ---------------------------------------------------------------------------
 
-async fn run_tests(cli: Cli) {
+async fn run_tests_core(cli: Cli) -> TestReport {
     let config = Test262Config::load_or_default(cli.config.as_deref());
     let save_results = cli.save.is_some();
     let save_path = cli.save.as_ref().and_then(|opt| opt.clone()).or_else(|| {
@@ -353,7 +363,7 @@ async fn run_tests(cli: Cli) {
             println!("{}", test.display());
         }
         println!("\nTotal: {} tests", tests.len());
-        return;
+        return TestReport::from_results(&[]);
     }
 
     // Collect tests
@@ -502,10 +512,7 @@ async fn run_tests(cli: Cli) {
             }
         }
 
-        if report.failed > 0 {
-            std::process::exit(1);
-        }
-        return;
+        return report;
     }
 
     // -------------------------------------------------------------------------
@@ -529,7 +536,8 @@ async fn run_tests(cli: Cli) {
 
     let mut summary = RunSummary::new(max_failures);
 
-    for path in tests { eprintln!("RUNNING: {}", path.display());
+    for path in tests {
+        eprintln!("RUNNING: {}", path.display());
         // Check ignored/known-panic via config
         let path_str = path.to_string_lossy();
         if config.is_ignored(&path_str) || config.is_known_panic(&path_str) {
@@ -760,8 +768,82 @@ async fn run_tests(cli: Cli) {
         }
     }
 
-    // Exit with error code if there were failures
+    report
+}
+
+// ---------------------------------------------------------------------------
+// Run command wrapper
+// ---------------------------------------------------------------------------
+
+async fn run_tests(cli: Cli) {
+    let report = run_tests_core(cli).await;
     if report.failed > 0 {
+        std::process::exit(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Advance command
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Default)]
+struct Progress {
+    skip: usize,
+}
+
+async fn run_advance(mut cli: Cli, batch_size: usize) {
+    let results_dir = PathBuf::from("test262_results");
+    let _ = std::fs::create_dir_all(&results_dir);
+    let progress_path = results_dir.join("progress.json");
+
+    let mut progress = if progress_path.exists() {
+        let content = std::fs::read_to_string(&progress_path).unwrap_or_default();
+        serde_json::from_str::<Progress>(&content).unwrap_or_default()
+    } else {
+        Progress::default()
+    };
+
+    if !cli.json {
+        eprintln!(
+            "{} current skip: {}, batch size: {}",
+            "Advance mode:".bold().cyan(),
+            progress.skip,
+            batch_size
+        );
+    }
+
+    // Set skip and max_tests for this run
+    cli.skip = Some(progress.skip);
+    cli.max_tests = Some(batch_size);
+
+    let report = run_tests_core(cli.clone()).await;
+
+    if report.failed == 0 && report.total > 0 && report.crashed == 0 && report.timeout == 0 {
+        progress.skip += batch_size;
+        let content = serde_json::to_string_pretty(&progress).unwrap();
+        if let Ok(()) = std::fs::write(&progress_path, content) {
+            if !cli.json {
+                eprintln!(
+                    "{} All tests passed! Next skip: {}",
+                    "SUCCESS:".bold().green(),
+                    progress.skip
+                );
+            }
+        }
+    } else {
+        if !cli.json {
+            if report.total == 0 {
+                eprintln!("{}", "No tests found to run.".yellow());
+            } else {
+                eprintln!(
+                    "{} {} failures, {} crashes, {} timeouts. Progress NOT advanced.",
+                    "FAILED:".bold().red(),
+                    report.failed,
+                    report.crashed,
+                    report.timeout
+                );
+            }
+        }
         std::process::exit(1);
     }
 }

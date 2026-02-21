@@ -1,5 +1,6 @@
 //! Main compiler implementation
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use oxc::CompilerInterface as OxcCompilerInterface;
@@ -61,6 +62,10 @@ pub struct Compiler {
     chain_end_jumps: Vec<usize>,
     /// Source URL of the module currently being compiled.
     current_source_url: String,
+    /// Names for which Annex B var-extension must be blocked in current context.
+    annex_b_blocked_names: HashSet<String>,
+    /// Top-level names that have Annex B global var-extension bindings.
+    annex_b_global_var_names: HashSet<String>,
 }
 
 /// Context in which an identifier is used, for strict mode error messages
@@ -152,6 +157,8 @@ impl Compiler {
             in_chain: false,
             chain_end_jumps: Vec::new(),
             current_source_url: String::new(),
+            annex_b_blocked_names: HashSet::new(),
+            annex_b_global_var_names: HashSet::new(),
         }
     }
 
@@ -465,15 +472,24 @@ impl Compiler {
         // are hoisted to the enclosing function scope before any code executes.
         self.hoist_var_declarations(statements)?;
 
-        // Phase 1: Declare all function names first
-        // This ensures that all functions can reference each other.
-        // Use Var kind so duplicate function declarations are allowed (sloppy mode).
+        // Phase 1: Declare all function names first so bodies can cross-reference.
         for (idx, stmt) in statements.iter().enumerate() {
             if let Statement::FunctionDeclaration(func) = stmt {
                 if let Some(id) = &func.id {
                     let name = id.name.to_string();
-                    self.codegen
-                        .declare_variable_with_kind(&name, crate::scope::VariableKind::Var)?;
+                    if self.codegen.current.scopes.current_scope_is_function() {
+                        // Function-body/program-level declaration: var-scoped binding.
+                        self.codegen
+                            .declare_variable_with_kind(&name, crate::scope::VariableKind::Var)?;
+                    } else {
+                        // Block-level declaration: lexical binding (Annex B form in sloppy mode).
+                        let kind = if self.is_strict_mode() {
+                            crate::scope::VariableKind::Let
+                        } else {
+                            crate::scope::VariableKind::AnnexBFunction
+                        };
+                        self.codegen.declare_variable_with_kind(&name, kind)?;
+                    }
                 }
                 hoisted_indices.push(idx);
             }
@@ -556,14 +572,19 @@ impl Compiler {
     /// This recursively scans blocks, if/else, for, while, switch, try/catch, etc.
     /// but does NOT descend into nested function bodies (they have their own scope).
     fn hoist_var_declarations(&mut self, statements: &[Statement]) -> CompileResult<()> {
+        let blocked = self.annex_b_blocked_names.clone();
         for stmt in statements {
-            self.hoist_var_declarations_from_stmt(stmt)?;
+            self.hoist_var_declarations_from_stmt(stmt, &blocked)?;
         }
         Ok(())
     }
 
     /// Recursively collect var-declared names from a single statement.
-    fn hoist_var_declarations_from_stmt(&mut self, stmt: &Statement) -> CompileResult<()> {
+    fn hoist_var_declarations_from_stmt(
+        &mut self,
+        stmt: &Statement,
+        blocked_annex_b_names: &HashSet<String>,
+    ) -> CompileResult<()> {
         match stmt {
             Statement::VariableDeclaration(decl) => {
                 if decl.kind == VariableDeclarationKind::Var {
@@ -572,86 +593,177 @@ impl Compiler {
                     }
                 }
             }
+            Statement::FunctionDeclaration(func) => {
+                if !self.is_strict_mode() && let Some(id) = &func.id {
+                    let name = id.name.to_string();
+                    if !blocked_annex_b_names.contains(&name) {
+                        self.hoist_annex_b_function_var_binding(&name)?;
+                    }
+                }
+            }
             Statement::BlockStatement(block) => {
                 for s in &block.body {
-                    self.hoist_var_declarations_from_stmt(s)?;
+                    self.hoist_var_declarations_from_stmt(s, blocked_annex_b_names)?;
                 }
             }
             Statement::IfStatement(if_stmt) => {
-                self.hoist_var_declarations_from_stmt(&if_stmt.consequent)?;
+                self.hoist_var_declarations_from_stmt(
+                    &if_stmt.consequent,
+                    blocked_annex_b_names,
+                )?;
                 if let Some(alt) = &if_stmt.alternate {
-                    self.hoist_var_declarations_from_stmt(alt)?;
+                    self.hoist_var_declarations_from_stmt(alt, blocked_annex_b_names)?;
                 }
             }
             Statement::ForStatement(for_stmt) => {
+                let mut blocked = blocked_annex_b_names.clone();
                 if let Some(ForStatementInit::VariableDeclaration(decl)) = &for_stmt.init {
                     if decl.kind == VariableDeclarationKind::Var {
                         for declarator in &decl.declarations {
                             self.hoist_var_names_from_binding(&declarator.id)?;
                         }
+                    } else {
+                        for declarator in &decl.declarations {
+                            Self::collect_binding_names(&declarator.id, &mut blocked);
+                        }
                     }
                 }
-                self.hoist_var_declarations_from_stmt(&for_stmt.body)?;
+                self.hoist_var_declarations_from_stmt(&for_stmt.body, &blocked)?;
             }
             Statement::ForInStatement(for_in) => {
+                let mut blocked = blocked_annex_b_names.clone();
                 if let ForStatementLeft::VariableDeclaration(decl) = &for_in.left {
                     if decl.kind == VariableDeclarationKind::Var {
                         for declarator in &decl.declarations {
                             self.hoist_var_names_from_binding(&declarator.id)?;
                         }
+                    } else {
+                        for declarator in &decl.declarations {
+                            Self::collect_binding_names(&declarator.id, &mut blocked);
+                        }
                     }
                 }
-                self.hoist_var_declarations_from_stmt(&for_in.body)?;
+                self.hoist_var_declarations_from_stmt(&for_in.body, &blocked)?;
             }
             Statement::ForOfStatement(for_of) => {
+                let mut blocked = blocked_annex_b_names.clone();
                 if let ForStatementLeft::VariableDeclaration(decl) = &for_of.left {
                     if decl.kind == VariableDeclarationKind::Var {
                         for declarator in &decl.declarations {
                             self.hoist_var_names_from_binding(&declarator.id)?;
                         }
+                    } else {
+                        for declarator in &decl.declarations {
+                            Self::collect_binding_names(&declarator.id, &mut blocked);
+                        }
                     }
                 }
-                self.hoist_var_declarations_from_stmt(&for_of.body)?;
+                self.hoist_var_declarations_from_stmt(&for_of.body, &blocked)?;
             }
             Statement::WhileStatement(while_stmt) => {
-                self.hoist_var_declarations_from_stmt(&while_stmt.body)?;
+                self.hoist_var_declarations_from_stmt(&while_stmt.body, blocked_annex_b_names)?;
             }
             Statement::DoWhileStatement(do_while) => {
-                self.hoist_var_declarations_from_stmt(&do_while.body)?;
+                self.hoist_var_declarations_from_stmt(&do_while.body, blocked_annex_b_names)?;
             }
             Statement::SwitchStatement(switch) => {
                 for case in &switch.cases {
                     for s in &case.consequent {
-                        self.hoist_var_declarations_from_stmt(s)?;
+                        self.hoist_var_declarations_from_stmt(s, blocked_annex_b_names)?;
                     }
                 }
             }
             Statement::TryStatement(try_stmt) => {
                 for s in &try_stmt.block.body {
-                    self.hoist_var_declarations_from_stmt(s)?;
+                    self.hoist_var_declarations_from_stmt(s, blocked_annex_b_names)?;
                 }
                 if let Some(handler) = &try_stmt.handler {
                     for s in &handler.body.body {
-                        self.hoist_var_declarations_from_stmt(s)?;
+                        self.hoist_var_declarations_from_stmt(s, blocked_annex_b_names)?;
                     }
                 }
                 if let Some(finalizer) = &try_stmt.finalizer {
                     for s in &finalizer.body {
-                        self.hoist_var_declarations_from_stmt(s)?;
+                        self.hoist_var_declarations_from_stmt(s, blocked_annex_b_names)?;
                     }
                 }
             }
             Statement::LabeledStatement(labeled) => {
-                self.hoist_var_declarations_from_stmt(&labeled.body)?;
+                self.hoist_var_declarations_from_stmt(&labeled.body, blocked_annex_b_names)?;
             }
             Statement::WithStatement(with_stmt) => {
-                self.hoist_var_declarations_from_stmt(&with_stmt.body)?;
+                self.hoist_var_declarations_from_stmt(&with_stmt.body, blocked_annex_b_names)?;
             }
-            // Function declarations are NOT scanned for var (they have their own scope)
-            // Other statements (expression, return, throw, break, continue, etc.) cannot contain var
+            // Other statements (expression, return, throw, break, continue, etc.) cannot contain var.
             _ => {}
         }
         Ok(())
+    }
+
+    fn collect_binding_names(pattern: &BindingPattern, out: &mut HashSet<String>) {
+        match pattern {
+            BindingPattern::BindingIdentifier(ident) => {
+                out.insert(ident.name.to_string());
+            }
+            BindingPattern::ObjectPattern(obj) => {
+                for prop in &obj.properties {
+                    Self::collect_binding_names(&prop.value, out);
+                }
+                if let Some(rest) = &obj.rest {
+                    Self::collect_binding_names(&rest.argument, out);
+                }
+            }
+            BindingPattern::ArrayPattern(arr) => {
+                for elem in arr.elements.iter().flatten() {
+                    Self::collect_binding_names(elem, out);
+                }
+                if let Some(rest) = &arr.rest {
+                    Self::collect_binding_names(&rest.argument, out);
+                }
+            }
+            BindingPattern::AssignmentPattern(assign) => {
+                Self::collect_binding_names(&assign.left, out);
+            }
+        }
+    }
+
+    fn hoist_annex_b_function_var_binding(&mut self, name: &str) -> CompileResult<()> {
+        if self.codegen.current.name.as_deref() == Some("main") {
+            self.annex_b_global_var_names.insert(name.to_string());
+            let undef_reg = self.codegen.alloc_reg();
+            self.codegen
+                .emit(Instruction::LoadUndefined { dst: undef_reg });
+            let name_idx = self.codegen.add_string(name);
+            let ic_index = self.codegen.alloc_ic();
+            self.codegen.emit(Instruction::SetGlobal {
+                name: name_idx,
+                src: undef_reg,
+                ic_index,
+                is_declaration: true,
+            });
+            self.codegen.free_reg(undef_reg);
+            return Ok(());
+        }
+
+        if let Some(local_idx) = self.codegen.declare_annex_b_var_extension(name) {
+            let undef_reg = self.codegen.alloc_reg();
+            self.codegen
+                .emit(Instruction::LoadUndefined { dst: undef_reg });
+            self.codegen.emit(Instruction::SetLocal {
+                idx: LocalIndex(local_idx),
+                src: undef_reg,
+            });
+            self.codegen.free_reg(undef_reg);
+        }
+        Ok(())
+    }
+
+    fn with_annex_b_blocked_names<R>(&mut self, names: HashSet<String>, f: impl FnOnce(&mut Self) -> R) -> R {
+        let old = self.annex_b_blocked_names.clone();
+        self.annex_b_blocked_names.extend(names);
+        let out = f(self);
+        self.annex_b_blocked_names = old;
+        out
     }
 
     /// Extract var-declared names from a binding pattern and declare them.
@@ -2237,7 +2349,13 @@ impl Compiler {
         self.codegen.free_reg(cond);
 
         // Compile consequent
-        self.compile_statement(&if_stmt.consequent)?;
+        if matches!(&if_stmt.consequent, Statement::FunctionDeclaration(_)) {
+            self.codegen.enter_scope();
+            self.compile_statement(&if_stmt.consequent)?;
+            self.codegen.exit_scope();
+        } else {
+            self.compile_statement(&if_stmt.consequent)?;
+        }
 
         if let Some(alternate) = &if_stmt.alternate {
             // Jump over else branch
@@ -2248,7 +2366,13 @@ impl Compiler {
             self.codegen.patch_jump(jump_else, else_offset);
 
             // Compile alternate
-            self.compile_statement(alternate)?;
+            if matches!(&*alternate, Statement::FunctionDeclaration(_)) {
+                self.codegen.enter_scope();
+                self.compile_statement(alternate)?;
+                self.codegen.exit_scope();
+            } else {
+                self.compile_statement(alternate)?;
+            }
 
             // Patch jump to end
             let end_offset = self.codegen.current_index() as i32 - jump_end as i32;
@@ -2396,11 +2520,17 @@ impl Compiler {
     /// Compile a for statement
     fn compile_for_statement(&mut self, for_stmt: &ForStatement) -> CompileResult<()> {
         self.codegen.enter_scope();
+        let mut annex_b_blocked = HashSet::new();
 
         // Compile init
         if let Some(init) = &for_stmt.init {
             match init {
                 ForStatementInit::VariableDeclaration(decl) => {
+                    if decl.kind != VariableDeclarationKind::Var {
+                        for declarator in &decl.declarations {
+                            Self::collect_binding_names(&declarator.id, &mut annex_b_blocked);
+                        }
+                    }
                     self.compile_variable_declaration(decl)?;
                 }
                 _ => {
@@ -2434,7 +2564,9 @@ impl Compiler {
         };
 
         // Compile body
-        self.compile_statement(&for_stmt.body)?;
+        self.with_annex_b_blocked_names(annex_b_blocked, |this| {
+            this.compile_statement(&for_stmt.body)
+        })?;
 
         // Compile update
         let update_start = self.codegen.current_index();
@@ -2479,6 +2611,7 @@ impl Compiler {
     /// for (const x of iterable) { ... }
     fn compile_for_of_statement(&mut self, for_of_stmt: &ForOfStatement) -> CompileResult<()> {
         self.codegen.enter_scope();
+        let mut annex_b_blocked = HashSet::new();
 
         // Compile the iterable expression
         let iterable = self.compile_expression(&for_of_stmt.right)?;
@@ -2573,6 +2706,11 @@ impl Compiler {
         // Assign value to the left side
         match &for_of_stmt.left {
             ForStatementLeft::VariableDeclaration(decl) => {
+                if decl.kind != VariableDeclarationKind::Var {
+                    for declarator in &decl.declarations {
+                        Self::collect_binding_names(&declarator.id, &mut annex_b_blocked);
+                    }
+                }
                 // For variable declarations like `const x`, `let [a, b]`, `var { x, y }`
                 let is_const = decl.kind == VariableDeclarationKind::Const;
                 if let Some(declarator) = decl.declarations.first() {
@@ -2598,7 +2736,9 @@ impl Compiler {
         }
 
         // Compile the loop body
-        self.compile_statement(&for_of_stmt.body)?;
+        self.with_annex_b_blocked_names(annex_b_blocked, |this| {
+            this.compile_statement(&for_of_stmt.body)
+        })?;
 
         // Jump back to loop start
         let back_offset = loop_start as i32 - self.codegen.current_index() as i32;
@@ -3398,6 +3538,7 @@ impl Compiler {
 
     fn compile_for_in_statement(&mut self, for_in_stmt: &ForInStatement) -> CompileResult<()> {
         self.codegen.enter_scope();
+        let mut annex_b_blocked = HashSet::new();
 
         // Compile the target expression.
         let target = self.compile_expression(&for_in_stmt.right)?;
@@ -3498,6 +3639,11 @@ impl Compiler {
 
         match &for_in_stmt.left {
             ForStatementLeft::VariableDeclaration(decl) => {
+                if decl.kind != VariableDeclarationKind::Var {
+                    for declarator in &decl.declarations {
+                        Self::collect_binding_names(&declarator.id, &mut annex_b_blocked);
+                    }
+                }
                 let is_const = decl.kind == VariableDeclarationKind::Const;
                 if let Some(declarator) = decl.declarations.first() {
                     if declarator.init.is_some() {
@@ -3518,7 +3664,9 @@ impl Compiler {
             }
         }
 
-        self.compile_statement(&for_in_stmt.body)?;
+        self.with_annex_b_blocked_names(annex_b_blocked, |this| {
+            this.compile_statement(&for_in_stmt.body)
+        })?;
 
         let back_offset = loop_start as i32 - self.codegen.current_index() as i32;
         self.codegen.emit(Instruction::Jump {
@@ -3678,11 +3826,19 @@ impl Compiler {
 
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
 
-        // Declare function in current scope using Var kind so duplicate
-        // function declarations are allowed in sloppy mode (ES spec §B.3.2).
+        // Declare binding for the function declaration.
         if let Some(ref n) = name {
-            self.codegen
-                .declare_variable_with_kind(n, crate::scope::VariableKind::Var)?;
+            if self.codegen.current.scopes.current_scope_is_function() {
+                self.codegen
+                    .declare_variable_with_kind(n, crate::scope::VariableKind::Var)?;
+            } else {
+                let kind = if self.is_strict_mode() {
+                    crate::scope::VariableKind::Let
+                } else {
+                    crate::scope::VariableKind::AnnexBFunction
+                };
+                self.codegen.declare_variable_with_kind(n, kind)?;
+            }
         }
 
         // Enter function context
@@ -3697,7 +3853,10 @@ impl Compiler {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
                     self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
-                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                    let local_idx = self.codegen.declare_variable_with_kind(
+                        &ident.name,
+                        crate::scope::VariableKind::Parameter,
+                    )?;
                     self.codegen.current.param_count += 1;
                     if let Some(init) = &param.initializer {
                         param_defaults.push((local_idx, init));
@@ -3711,7 +3870,10 @@ impl Compiler {
                             &ident.name,
                             IdentifierContext::Parameter,
                         )?;
-                        let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                        let local_idx = self.codegen.declare_variable_with_kind(
+                            &ident.name,
+                            crate::scope::VariableKind::Parameter,
+                        )?;
                         self.codegen.current.param_count += 1;
                         param_defaults.push((local_idx, &assign.right));
                     } else {
@@ -3763,7 +3925,10 @@ impl Compiler {
             match &rest.rest.argument {
                 BindingPattern::BindingIdentifier(ident) => {
                     self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
-                    self.codegen.declare_variable(&ident.name, false)?;
+                    self.codegen.declare_variable_with_kind(
+                        &ident.name,
+                        crate::scope::VariableKind::Parameter,
+                    )?;
                 }
                 pattern => {
                     // Reserve the implicit rest slot and destructure from it in function prologue.
@@ -3874,7 +4039,7 @@ impl Compiler {
             }
         }
 
-        // Create closure and store in variable
+        // Create closure and store in declaration binding.
         if let Some(n) = name
             && let Some(ResolvedBinding::Local(idx)) = self.codegen.resolve_variable(&n)
         {
@@ -3904,7 +4069,22 @@ impl Compiler {
                 idx: LocalIndex(idx),
                 src: dst,
             });
-            if self.codegen.current.name.as_deref() == Some("main") {
+            if let Some((var_idx, crate::scope::VariableKind::Var)) =
+                self.codegen.current.scopes.function_scope_binding(&n)
+                && var_idx != idx
+            {
+                // Annex B: update var-scoped binding from block-scoped function binding.
+                self.codegen.emit(Instruction::SetLocal {
+                    idx: LocalIndex(var_idx),
+                    src: dst,
+                });
+            }
+            let has_var_binding = matches!(
+                self.codegen.current.scopes.function_scope_binding(&n),
+                Some((_, crate::scope::VariableKind::Var))
+            ) || (self.codegen.current.name.as_deref() == Some("main")
+                && self.annex_b_global_var_names.contains(&n));
+            if self.codegen.current.name.as_deref() == Some("main") && has_var_binding {
                 let name_idx = self.codegen.add_string(&n);
                 let ic_index = self.codegen.alloc_ic();
                 self.codegen.emit(Instruction::SetGlobal {
@@ -3948,7 +4128,10 @@ impl Compiler {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
                     self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
-                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                    let local_idx = self.codegen.declare_variable_with_kind(
+                        &ident.name,
+                        crate::scope::VariableKind::Parameter,
+                    )?;
                     self.codegen.current.param_count += 1;
                     if let Some(init) = &param.initializer {
                         param_defaults.push((local_idx, init));
@@ -3961,7 +4144,10 @@ impl Compiler {
                             &ident.name,
                             IdentifierContext::Parameter,
                         )?;
-                        let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                        let local_idx = self.codegen.declare_variable_with_kind(
+                            &ident.name,
+                            crate::scope::VariableKind::Parameter,
+                        )?;
                         self.codegen.current.param_count += 1;
                         param_defaults.push((local_idx, &assign.right));
                     } else {
@@ -4011,7 +4197,10 @@ impl Compiler {
             match &rest.rest.argument {
                 BindingPattern::BindingIdentifier(ident) => {
                     self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
-                    self.codegen.declare_variable(&ident.name, false)?;
+                    self.codegen.declare_variable_with_kind(
+                        &ident.name,
+                        crate::scope::VariableKind::Parameter,
+                    )?;
                 }
                 pattern => {
                     let rest_local = self
@@ -4111,7 +4300,7 @@ impl Compiler {
         // Exit function and get index
         let func_idx = self.codegen.exit_function();
 
-        // Create closure and store in variable
+        // Create closure and store in declaration binding.
         if let Some(n) = name
             && let Some(ResolvedBinding::Local(idx)) = self.codegen.resolve_variable(&n)
         {
@@ -4141,7 +4330,22 @@ impl Compiler {
                 idx: LocalIndex(idx),
                 src: dst,
             });
-            if self.codegen.current.name.as_deref() == Some("main") {
+            if let Some((var_idx, crate::scope::VariableKind::Var)) =
+                self.codegen.current.scopes.function_scope_binding(&n)
+                && var_idx != idx
+            {
+                // Annex B: update var-scoped binding from block-scoped function binding.
+                self.codegen.emit(Instruction::SetLocal {
+                    idx: LocalIndex(var_idx),
+                    src: dst,
+                });
+            }
+            let has_var_binding = matches!(
+                self.codegen.current.scopes.function_scope_binding(&n),
+                Some((_, crate::scope::VariableKind::Var))
+            ) || (self.codegen.current.name.as_deref() == Some("main")
+                && self.annex_b_global_var_names.contains(&n));
+            if self.codegen.current.name.as_deref() == Some("main") && has_var_binding {
                 let name_idx = self.codegen.add_string(&n);
                 let ic_index = self.codegen.alloc_ic();
                 self.codegen.emit(Instruction::SetGlobal {
@@ -4201,7 +4405,10 @@ impl Compiler {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
                     self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
-                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                    let local_idx = self.codegen.declare_variable_with_kind(
+                        &ident.name,
+                        crate::scope::VariableKind::Parameter,
+                    )?;
                     self.codegen.current.param_count += 1;
                     if let Some(init) = &param.initializer {
                         param_defaults.push((local_idx, init));
@@ -4215,7 +4422,10 @@ impl Compiler {
                             &ident.name,
                             IdentifierContext::Parameter,
                         )?;
-                        let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                        let local_idx = self.codegen.declare_variable_with_kind(
+                            &ident.name,
+                            crate::scope::VariableKind::Parameter,
+                        )?;
                         self.codegen.current.param_count += 1;
                         param_defaults.push((local_idx, &assign.right));
                     } else {
@@ -4267,7 +4477,10 @@ impl Compiler {
             match &rest.rest.argument {
                 BindingPattern::BindingIdentifier(ident) => {
                     self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
-                    self.codegen.declare_variable(&ident.name, false)?;
+                    self.codegen.declare_variable_with_kind(
+                        &ident.name,
+                        crate::scope::VariableKind::Parameter,
+                    )?;
                 }
                 pattern => {
                     let rest_local = self
@@ -4450,7 +4663,10 @@ impl Compiler {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(ident) => {
                     self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
-                    let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                    let local_idx = self.codegen.declare_variable_with_kind(
+                        &ident.name,
+                        crate::scope::VariableKind::Parameter,
+                    )?;
                     self.codegen.current.param_count += 1;
                     if let Some(init) = &param.initializer {
                         param_defaults.push((local_idx, init));
@@ -4464,7 +4680,10 @@ impl Compiler {
                             &ident.name,
                             IdentifierContext::Parameter,
                         )?;
-                        let local_idx = self.codegen.declare_variable(&ident.name, false)?;
+                        let local_idx = self.codegen.declare_variable_with_kind(
+                            &ident.name,
+                            crate::scope::VariableKind::Parameter,
+                        )?;
                         self.codegen.current.param_count += 1;
                         param_defaults.push((local_idx, &assign.right));
                     } else {
@@ -4516,7 +4735,10 @@ impl Compiler {
             match &rest.rest.argument {
                 BindingPattern::BindingIdentifier(ident) => {
                     self.check_identifier_early_error(&ident.name, IdentifierContext::Parameter)?;
-                    self.codegen.declare_variable(&ident.name, false)?;
+                    self.codegen.declare_variable_with_kind(
+                        &ident.name,
+                        crate::scope::VariableKind::Parameter,
+                    )?;
                 }
                 pattern => {
                     let rest_local = self

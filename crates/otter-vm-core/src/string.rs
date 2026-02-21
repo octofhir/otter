@@ -106,6 +106,7 @@ impl StringTable {
             if let Some(bucket) = borrowed.get(&hash) {
                 for existing in bucket.iter() {
                     if existing.data.as_ref() == units.as_slice() {
+                        Self::perform_read_barrier(*existing);
                         return *existing;
                     }
                 }
@@ -135,6 +136,7 @@ impl StringTable {
             if let Some(bucket) = borrowed.get(&hash) {
                 for existing in bucket.iter() {
                     if existing.data.as_ref() == units {
+                        Self::perform_read_barrier(*existing);
                         return *existing;
                     }
                 }
@@ -167,6 +169,27 @@ impl StringTable {
             }
         }
         false
+    }
+
+    /// Perform a read barrier when an interned string is retrieved from the table.
+    ///
+    /// If an incremental GC is currently marking, and the retrieved string is
+    /// White (unmarked), we must mark it Gray to prevent it from being swept.
+    /// Weak cache retrievals resurrect references that the GC might have already
+    /// missed if the string had no active roots earlier in the GC cycle.
+    #[inline]
+    fn perform_read_barrier(js_str: GcRef<JsString>) {
+        let registry = otter_vm_gc::global_registry();
+        if !registry.is_marking() {
+            return;
+        }
+        let header_ptr = js_str.header() as *const otter_vm_gc::GcHeader;
+        let header = unsafe { &*header_ptr };
+        use otter_vm_gc::object::MarkColor;
+        if header.mark() == MarkColor::White {
+            header.set_mark(MarkColor::Gray);
+            otter_vm_gc::barrier_push(header_ptr);
+        }
     }
 
     /// Get the number of hash buckets in the table.

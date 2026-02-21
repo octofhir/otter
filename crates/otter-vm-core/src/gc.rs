@@ -176,41 +176,7 @@ unsafe impl<T: Sync> Sync for RawHandle<T> {}
 ///
 /// This is the low-level allocation unit for GC objects. The header
 /// contains marking bits for tri-color marking.
-#[repr(C)]
-pub struct GcBox<T> {
-    /// GC metadata (mark bits, generation, etc.)
-    header: GcHeader,
-    /// The actual value
-    value: T,
-}
-
-impl<T> GcBox<T> {
-    /// Create a new GcBox with the given value.
-    ///
-    /// Note: This creates an unallocated GcBox. Use `Gc::alloc` to allocate
-    /// on the GC heap.
-    pub fn new(value: T) -> Self {
-        Self {
-            header: GcHeader::new(0), // Type tag 0 for now
-            value,
-        }
-    }
-
-    /// Get reference to the header
-    pub fn header(&self) -> &GcHeader {
-        &self.header
-    }
-
-    /// Get reference to the value
-    pub fn value(&self) -> &T {
-        &self.value
-    }
-
-    /// Get mutable reference to the value
-    pub fn value_mut(&mut self) -> &mut T {
-        &mut self.value
-    }
-}
+pub type GcBox<T> = otter_vm_gc::object::GcAllocation<T>;
 
 /// An unrooted GC pointer.
 ///

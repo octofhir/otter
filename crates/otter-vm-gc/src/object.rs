@@ -66,6 +66,47 @@ pub enum MarkColor {
     Black = 2,
 }
 
+/// A GC allocation combining the object header and its value.
+///
+/// This structure uses `#[repr(C)]` to guarantee that `header` is at offset 0
+/// and `value` is laid out according to the platform's C ABI (padding as needed).
+/// The GC safely casts between `*mut GcHeader` and `*mut GcAllocation<T>`.
+#[repr(C)]
+pub struct GcAllocation<T> {
+    /// GC metadata header
+    pub header: GcHeader,
+    /// The actual object value
+    pub value: T,
+}
+
+impl<T> GcAllocation<T> {
+    /// Create a new GcAllocation with the given value.
+    ///
+    /// Note: This creates an unallocated GcAllocation. Use `Gc::alloc` or `gc_alloc_in` to allocate
+    /// on the GC heap.
+    pub fn new(value: T) -> Self {
+        Self {
+            header: GcHeader::new(0), // Type tag 0 for now
+            value,
+        }
+    }
+
+    /// Get reference to the header
+    pub fn header(&self) -> &GcHeader {
+        &self.header
+    }
+
+    /// Get reference to the value
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    /// Get mutable reference to the value
+    pub fn value_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
+
 impl GcHeader {
     /// Create new header
     pub const fn new(tag: u8) -> Self {

@@ -25,7 +25,12 @@ impl GcTraceable for TestObject {
 /// Get header pointer from a value pointer
 unsafe fn header_from_ptr<T>(ptr: *const T) -> *const GcHeader {
     // SAFETY: ptr points to the value after the GcHeader
-    unsafe { (ptr as *const u8).sub(std::mem::size_of::<GcHeader>()) as *const GcHeader }
+    unsafe {
+        (ptr as *const u8).sub(std::mem::offset_of!(
+            otter_vm_gc::object::GcAllocation<T>,
+            value
+        )) as *const GcHeader
+    }
 }
 
 #[test]

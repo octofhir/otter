@@ -2702,6 +2702,7 @@ impl JsObject {
                     // Need to store in shape for custom attributes
                     return self.ordinary_define_own_property(key, desc);
                 }
+                gc_write_barrier(&value);
                 self.elements.borrow_mut()[idx] = value;
             } else {
                 // Hole - create new element
@@ -2711,6 +2712,7 @@ impl JsObject {
                 if desc.has_non_default_data_attributes() {
                     return self.ordinary_define_own_property(key, desc);
                 }
+                gc_write_barrier(&value);
                 self.elements.borrow_mut()[idx] = value;
             }
         } else {
@@ -2733,6 +2735,7 @@ impl JsObject {
             if idx > elements.len() {
                 elements.resize(idx, Value::hole());
             }
+            gc_write_barrier(&value);
             elements.push(value);
         }
 
@@ -3180,6 +3183,7 @@ impl JsObject {
 
     /// Push element to array
     pub fn array_push(&self, value: Value) {
+        gc_write_barrier(&value);
         self.elements.borrow_mut().push(value);
     }
 

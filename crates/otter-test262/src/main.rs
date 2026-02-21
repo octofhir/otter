@@ -529,7 +529,7 @@ async fn run_tests(cli: Cli) {
 
     let mut summary = RunSummary::new(max_failures);
 
-    for path in tests {
+    for path in tests { eprintln!("RUNNING: {}", path.display());
         // Check ignored/known-panic via config
         let path_str = path.to_string_lossy();
         if config.is_ignored(&path_str) || config.is_known_panic(&path_str) {

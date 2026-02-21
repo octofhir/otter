@@ -25,7 +25,7 @@ use crate::marked_block::{
     BlockDirectory, DropFn, LARGE_OBJECT_THRESHOLD, NUM_SIZE_CLASSES, TraceFn,
     size_class_cell_size, size_class_index,
 };
-use crate::object::{GcHeader, MarkColor, bump_mark_version};
+use crate::object::{GcAllocation, GcHeader, MarkColor, bump_mark_version};
 
 /// GC phase for incremental collection.
 #[repr(u8)]
@@ -292,6 +292,12 @@ impl AllocationRegistry {
     ) -> usize {
         let start = Instant::now();
 
+        // Cancel any in-progress incremental GC — a full STW collection
+        // supersedes it. Without this, stale worklist entries from the
+        // interrupted incremental cycle point to objects that the STW sweep
+        // will free, causing use-after-free on the next mark step.
+        self.cancel_incremental_gc();
+
         #[cfg(feature = "gc_logging")]
         let initial_bytes = self.total_bytes.load(Ordering::Relaxed);
         #[cfg(feature = "gc_logging")]
@@ -372,6 +378,9 @@ impl AllocationRegistry {
         pre_sweep: F,
     ) -> usize {
         let start = Instant::now();
+
+        // Cancel any in-progress incremental GC (same reason as above).
+        self.cancel_incremental_gc();
 
         #[cfg(feature = "gc_logging")]
         let initial_bytes = self.total_bytes.load(Ordering::Relaxed);
@@ -557,9 +566,8 @@ impl AllocationRegistry {
 
                 // Look up trace function for this header (O(1))
                 if let Some(Some(trace_fn)) = trace_lookup.get(&(ptr as usize)) {
-                    // Trace the object's references
-                    let data_ptr = (ptr as *const u8).add(std::mem::size_of::<GcHeader>());
-                    trace_fn(data_ptr, &mut |child_header| {
+                    // Trace the object's references, passing the start of the allocation
+                    trace_fn(ptr as *const u8, &mut |child_header| {
                         if !child_header.is_null() {
                             let child_addr = child_header as usize;
                             if visited.insert(child_addr) {
@@ -622,6 +630,19 @@ impl AllocationRegistry {
     // ---------------------------------------------------------------
     // Incremental marking API
     // ---------------------------------------------------------------
+
+    /// Cancel an in-progress incremental GC cycle.
+    ///
+    /// Clears the worklist, trace lookup, and resets the phase to Idle.
+    /// This is a no-op when no incremental cycle is active.
+    fn cancel_incremental_gc(&self) {
+        if self.gc_phase.get() != GcPhase::Idle {
+            self.mark_worklist.borrow_mut().clear();
+            *self.trace_lookup.borrow_mut() = None;
+            self.mark_start.set(None);
+            self.gc_phase.set(GcPhase::Idle);
+        }
+    }
 
     /// Get the current GC phase.
     pub fn gc_phase(&self) -> GcPhase {
@@ -722,8 +743,8 @@ impl AllocationRegistry {
 
                 // Look up trace function for this header (O(1))
                 if let Some(Some(trace_fn)) = lookup.get(&(ptr as usize)) {
-                    let data_ptr = (ptr as *const u8).add(std::mem::size_of::<GcHeader>());
-                    trace_fn(data_ptr, &mut |child_header| {
+                    // Pass the allocation pointer directly
+                    trace_fn(ptr as *const u8, &mut |child_header| {
                         if !child_header.is_null() {
                             // Use mark color as "in-worklist" sentinel instead of HashSet.
                             // Only add White objects (not yet seen this cycle).
@@ -924,7 +945,7 @@ pub unsafe fn gc_alloc_in<T>(registry: &AllocationRegistry, value: T) -> *mut T
 where
     T: GcTraceable + 'static,
 {
-    let layout = std::alloc::Layout::new::<(GcHeader, T)>();
+    let layout = std::alloc::Layout::new::<GcAllocation<T>>();
     let alloc_size = layout.size();
 
     let trace_fn: Option<TraceFn> = if T::NEEDS_TRACE {
@@ -933,7 +954,7 @@ where
         None
     };
 
-    let ptr: *mut (GcHeader, T);
+    let ptr: *mut GcAllocation<T>;
 
     if alloc_size <= LARGE_OBJECT_THRESHOLD {
         // Small object: allocate from block directory.
@@ -941,13 +962,13 @@ where
         // the block owns the memory).
         let drop_fn: DropFn = drop_gc_box_in_block::<T>;
         let cell_ptr = registry.allocate_in_block(alloc_size, drop_fn, trace_fn);
-        ptr = cell_ptr as *mut (GcHeader, T);
+        ptr = cell_ptr as *mut GcAllocation<T>;
     } else {
         // Large object: allocate individually via global allocator.
         // Use drop_gc_box which also calls dealloc.
         let drop_fn: DropFn = drop_gc_box::<T>;
         // SAFETY: Layout is valid and non-zero sized
-        let raw = unsafe { std::alloc::alloc(layout) as *mut (GcHeader, T) };
+        let raw = unsafe { std::alloc::alloc(layout) as *mut GcAllocation<T> };
         if raw.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
@@ -963,49 +984,49 @@ where
     // Initialize header and value
     // SAFETY: ptr is non-null and properly aligned (from block or alloc)
     unsafe {
-        std::ptr::write(&mut (*ptr).0, GcHeader::new(0));
-        std::ptr::write(&mut (*ptr).1, value);
+        std::ptr::write(&mut (*ptr).header, GcHeader::new(0));
+        std::ptr::write(&mut (*ptr).value, value);
 
         // Black allocation: objects allocated during marking are pre-marked Black.
         // This prevents newly allocated objects from being swept in the ongoing cycle.
         if registry.is_marking() {
-            (*ptr).0.set_mark(MarkColor::Black);
+            (*ptr).header.set_mark(MarkColor::Black);
         }
     }
 
     // Return pointer to the value (after the header)
-    unsafe { &mut (*ptr).1 as *mut T }
+    unsafe { &mut (*ptr).value as *mut T }
 }
 
 /// Drop function for block-allocated GC cells.
 ///
 /// Only drops the value in-place (no dealloc — the block owns the memory).
 unsafe fn drop_gc_box_in_block<T>(ptr: *mut u8) {
-    let box_ptr = ptr as *mut (GcHeader, T);
-    // SAFETY: ptr is valid and points to an initialized (GcHeader, T)
+    let box_ptr = ptr as *mut GcAllocation<T>;
+    // SAFETY: ptr is valid and points to an initialized GcAllocation<T>
     unsafe {
-        std::ptr::drop_in_place(&mut (*box_ptr).1);
+        std::ptr::drop_in_place(&mut (*box_ptr).value);
         // Do NOT call dealloc — the block owns this memory
     }
 }
 
 /// Drop function for large GC boxes (individually allocated).
 unsafe fn drop_gc_box<T>(ptr: *mut u8) {
-    let layout = std::alloc::Layout::new::<(GcHeader, T)>();
-    let box_ptr = ptr as *mut (GcHeader, T);
-    // SAFETY: ptr is valid and points to an initialized (GcHeader, T)
+    let layout = std::alloc::Layout::new::<GcAllocation<T>>();
+    let box_ptr = ptr as *mut GcAllocation<T>;
+    // SAFETY: ptr is valid and points to an initialized GcAllocation<T>
     unsafe {
-        std::ptr::drop_in_place(&mut (*box_ptr).1);
+        std::ptr::drop_in_place(&mut (*box_ptr).value);
         std::alloc::dealloc(ptr, layout);
     }
 }
 
 /// Trace function for GC boxes
 unsafe fn trace_gc_box<T: GcTraceable>(ptr: *const u8, tracer: &mut dyn FnMut(*const GcHeader)) {
-    let value_ptr = ptr as *const T;
-    // SAFETY: ptr is valid and points to an initialized T
+    let alloc_ptr = ptr as *const GcAllocation<T>;
+    // SAFETY: ptr is valid and points to an initialized GcAllocation<T>
     unsafe {
-        (*value_ptr).trace(tracer);
+        (*alloc_ptr).value.trace(tracer);
     }
 }
 
@@ -1111,8 +1132,9 @@ mod tests {
         let ptr = unsafe { gc_alloc_in(&registry, 42i32) };
 
         // Get the header pointer for rooting
-        let header_ptr =
-            unsafe { (ptr as *const u8).sub(std::mem::size_of::<GcHeader>()) as *const GcHeader };
+        let header_ptr = unsafe {
+            (ptr as *mut u8).sub(std::mem::offset_of!(GcAllocation<i32>, value)) as *const GcHeader
+        };
 
         assert_eq!(registry.allocation_count(), 1);
 
@@ -1174,8 +1196,10 @@ mod tests {
                 },
             )
         };
-        let node2_header =
-            unsafe { (node2 as *const u8).sub(std::mem::size_of::<GcHeader>()) as *const GcHeader };
+        let node2_header = unsafe {
+            (node2 as *mut u8).sub(std::mem::offset_of!(GcAllocation<Node>, value))
+                as *const GcHeader
+        };
 
         let node1 = unsafe {
             gc_alloc_in(
@@ -1186,8 +1210,10 @@ mod tests {
                 },
             )
         };
-        let node1_header =
-            unsafe { (node1 as *const u8).sub(std::mem::size_of::<GcHeader>()) as *const GcHeader };
+        let node1_header = unsafe {
+            (node1 as *mut u8).sub(std::mem::offset_of!(GcAllocation<Node>, value))
+                as *const GcHeader
+        };
 
         // Also create an unreachable node
         unsafe {
@@ -1229,8 +1255,10 @@ mod tests {
                 },
             )
         };
-        let node1_header =
-            unsafe { (node1 as *const u8).sub(std::mem::size_of::<GcHeader>()) as *const GcHeader };
+        let node1_header = unsafe {
+            (node1 as *mut u8).sub(std::mem::offset_of!(GcAllocation<Node>, value))
+                as *const GcHeader
+        };
 
         let node2 = unsafe {
             gc_alloc_in(
@@ -1241,8 +1269,10 @@ mod tests {
                 },
             )
         };
-        let node2_header =
-            unsafe { (node2 as *const u8).sub(std::mem::size_of::<GcHeader>()) as *const GcHeader };
+        let node2_header = unsafe {
+            (node2 as *mut u8).sub(std::mem::offset_of!(GcAllocation<Node>, value))
+                as *const GcHeader
+        };
 
         // Complete the cycle
         unsafe {
@@ -1324,8 +1354,9 @@ mod tests {
         let registry = AllocationRegistry::new();
 
         let ptr = unsafe { gc_alloc_in(&registry, 42i32) };
-        let header_ptr =
-            unsafe { (ptr as *const u8).sub(std::mem::size_of::<GcHeader>()) as *const GcHeader };
+        let header_ptr = unsafe {
+            (ptr as *mut u8).sub(std::mem::offset_of!(GcAllocation<i32>, value)) as *const GcHeader
+        };
 
         // Also allocate something unreachable
         unsafe {
@@ -1354,13 +1385,15 @@ mod tests {
         let registry = AllocationRegistry::new();
 
         let ptr = unsafe { gc_alloc_in(&registry, 42i32) };
-        let header_ptr =
-            unsafe { (ptr as *const u8).sub(std::mem::size_of::<GcHeader>()) as *const GcHeader };
+        let header_ptr = unsafe {
+            (ptr as *mut u8).sub(std::mem::offset_of!(GcAllocation<i32>, value)) as *const GcHeader
+        };
 
         // Allocate a second object (not in initial roots)
         let ptr2 = unsafe { gc_alloc_in(&registry, 99i32) };
-        let header_ptr2 =
-            unsafe { (ptr2 as *const u8).sub(std::mem::size_of::<GcHeader>()) as *const GcHeader };
+        let header_ptr2 = unsafe {
+            (ptr2 as *mut u8).sub(std::mem::offset_of!(GcAllocation<i32>, value)) as *const GcHeader
+        };
 
         // Start incremental GC with only first object as root
         registry.start_incremental_gc(&[header_ptr]);

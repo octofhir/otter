@@ -247,10 +247,9 @@ impl MarkedBlock {
 
                 // Only trace gray objects (in worklist)
                 if header.mark() == MarkColor::Gray {
-                    // The trace_fn expects a pointer to the VALUE (after the header)
-                    let value_ptr = unsafe { base.add(offset + std::mem::size_of::<GcHeader>()) };
+                    // The trace_fn expects a pointer to the allocation start
                     unsafe {
-                        trace_fn(value_ptr, tracer);
+                        trace_fn(header_ptr as *const u8, tracer);
                     }
                 }
             }

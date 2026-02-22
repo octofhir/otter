@@ -118,6 +118,7 @@ pub fn setup_global_object(
     // Global functions — all get fn_proto as [[Prototype]] with proper length/name
     // Per spec §19.2, these are { writable: true, enumerable: false, configurable: true }
     define_global_fn(&global, &mm, fn_proto, global_eval, "eval", 1);
+    define_global_fn(&global, &mm, fn_proto, global_eval_script, "__evalScript", 1);
     define_global_fn(&global, &mm, fn_proto, global_is_finite, "isFinite", 1);
     define_global_fn(&global, &mm, fn_proto, global_is_nan, "isNaN", 1);
     define_global_fn(&global, &mm, fn_proto, global_parse_int, "parseInt", 2);
@@ -1232,6 +1233,23 @@ fn get_arg(args: &[Value], index: usize) -> Value {
 ///
 /// Currently, indirect eval is not fully supported. When called with a string,
 /// it returns an error. This is a limitation to be addressed in a future update.
+/// `__evalScript(code)` - Compile and execute code as a global script.
+/// For $262.evalScript semantics: top-level `let`/`const` behave as global bindings.
+fn global_eval_script(
+    _this: &Value,
+    args: &[Value],
+    ncx: &mut crate::context::NativeContext<'_>,
+) -> Result<Value, VmError> {
+    let arg = get_arg(args, 0);
+    if !arg.is_string() {
+        return Ok(arg);
+    }
+    let source = arg
+        .as_string()
+        .ok_or_else(|| VmError::type_error("evalScript argument is not a string"))?;
+    ncx.eval_as_global_script(source.as_str())
+}
+
 fn global_eval(
     this: &Value,
     args: &[Value],
@@ -1444,10 +1462,10 @@ fn global_encode_uri(
 fn global_decode_uri(
     _this: &Value,
     args: &[Value],
-    _ncx: &mut crate::context::NativeContext<'_>,
+    ncx: &mut crate::context::NativeContext<'_>,
 ) -> Result<Value, VmError> {
     let input = get_arg(args, 0);
-    let encoded = to_string(&input);
+    let encoded = ncx.to_string_value(&input)?;
 
     decode_uri_impl(&encoded, true)
 }
@@ -1482,54 +1500,157 @@ fn global_encode_uri_component(
 fn global_decode_uri_component(
     _this: &Value,
     args: &[Value],
-    _ncx: &mut crate::context::NativeContext<'_>,
+    ncx: &mut crate::context::NativeContext<'_>,
 ) -> Result<Value, VmError> {
     let input = get_arg(args, 0);
-    let encoded = to_string(&input);
+    let encoded = ncx.to_string_value(&input)?;
 
     decode_uri_impl(&encoded, false)
 }
 
-/// Common implementation for decodeURI and decodeURIComponent
+/// Read a single %XX hex escape from bytes. Returns the byte value.
+fn read_percent_hex(bytes: &[u8], pos: usize) -> Result<u8, VmError> {
+    if pos + 2 >= bytes.len() {
+        return Err(VmError::uri_error("URI malformed"));
+    }
+    if bytes[pos] != b'%' {
+        return Err(VmError::uri_error("URI malformed"));
+    }
+    let h1 = bytes[pos + 1];
+    let h2 = bytes[pos + 2];
+    if !h1.is_ascii_hexdigit() || !h2.is_ascii_hexdigit() {
+        return Err(VmError::uri_error("URI malformed"));
+    }
+    let val = hex_val(h1) * 16 + hex_val(h2);
+    Ok(val)
+}
+
+fn hex_val(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    }
+}
+
+/// Common implementation for decodeURI and decodeURIComponent (ES2026 §19.2.6.4)
 fn decode_uri_impl(encoded: &str, preserve_reserved: bool) -> Result<Value, VmError> {
-    let mut result = Vec::with_capacity(encoded.len());
-    let mut chars = encoded.chars().peekable();
+    let bytes = encoded.as_bytes();
+    let len = bytes.len();
+    let mut result = Vec::with_capacity(len);
+    let mut k = 0;
 
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            // Collect hex digits
-            let mut hex_chars = String::with_capacity(2);
-            for _ in 0..2 {
-                match chars.next() {
-                    Some(h) if h.is_ascii_hexdigit() => hex_chars.push(h),
-                    _ => return Err(VmError::type_error("URIError: malformed URI sequence")),
-                }
-            }
+    while k < len {
+        if bytes[k] == b'%' {
+            // Read first byte
+            let b = read_percent_hex(bytes, k)?;
+            k += 3;
 
-            let byte = u8::from_str_radix(&hex_chars, 16)
-                .map_err(|_| "URIError: malformed URI sequence".to_string())?;
-
-            // For decodeURI, check if this is a reserved character
-            if preserve_reserved && URI_RESERVED.contains(byte as char) && byte < 128 {
-                // Keep the encoded form
-                result.push(b'%');
-                for b in hex_chars.bytes() {
+            if b & 0x80 == 0 {
+                // Single-byte ASCII character
+                let c = b as char;
+                if preserve_reserved && (URI_RESERVED.contains(c) || c == '#') {
+                    // Keep encoded form
+                    result.push(b'%');
+                    result.push(bytes[k - 2]);
+                    result.push(bytes[k - 1]);
+                } else {
                     result.push(b);
                 }
             } else {
-                result.push(byte);
+                // Multi-byte UTF-8 sequence
+                let n = if b & 0xE0 == 0xC0 {
+                    2
+                } else if b & 0xF0 == 0xE0 {
+                    3
+                } else if b & 0xF8 == 0xF0 {
+                    4
+                } else {
+                    return Err(VmError::uri_error("URI malformed"));
+                };
+
+                let mut utf8_bytes = Vec::with_capacity(n);
+                utf8_bytes.push(b);
+
+                for _j in 1..n {
+                    if k >= len || bytes[k] != b'%' {
+                        return Err(VmError::uri_error("URI malformed"));
+                    }
+                    let cont = read_percent_hex(bytes, k)?;
+                    k += 3;
+                    // Validate continuation byte: must be 10xxxxxx
+                    if cont & 0xC0 != 0x80 {
+                        return Err(VmError::uri_error("URI malformed"));
+                    }
+                    utf8_bytes.push(cont);
+                }
+
+                // Decode UTF-8 to a code point
+                let cp = match n {
+                    2 => {
+                        let cp = ((utf8_bytes[0] as u32 & 0x1F) << 6)
+                            | (utf8_bytes[1] as u32 & 0x3F);
+                        // Overlong check: must be >= 0x80
+                        if cp < 0x80 {
+                            return Err(VmError::uri_error("URI malformed"));
+                        }
+                        cp
+                    }
+                    3 => {
+                        let cp = ((utf8_bytes[0] as u32 & 0x0F) << 12)
+                            | ((utf8_bytes[1] as u32 & 0x3F) << 6)
+                            | (utf8_bytes[2] as u32 & 0x3F);
+                        // Overlong check: must be >= 0x800
+                        if cp < 0x800 {
+                            return Err(VmError::uri_error("URI malformed"));
+                        }
+                        // Reject surrogates U+D800-U+DFFF
+                        if (0xD800..=0xDFFF).contains(&cp) {
+                            return Err(VmError::uri_error("URI malformed"));
+                        }
+                        cp
+                    }
+                    4 => {
+                        let cp = ((utf8_bytes[0] as u32 & 0x07) << 18)
+                            | ((utf8_bytes[1] as u32 & 0x3F) << 12)
+                            | ((utf8_bytes[2] as u32 & 0x3F) << 6)
+                            | (utf8_bytes[3] as u32 & 0x3F);
+                        // Overlong check: must be >= 0x10000
+                        if cp < 0x10000 {
+                            return Err(VmError::uri_error("URI malformed"));
+                        }
+                        // Must be valid Unicode (max U+10FFFF)
+                        if cp > 0x10FFFF {
+                            return Err(VmError::uri_error("URI malformed"));
+                        }
+                        cp
+                    }
+                    _ => return Err(VmError::uri_error("URI malformed")),
+                };
+
+                // For decodeURI, check if the decoded character is reserved
+                if preserve_reserved && cp < 128 && (URI_RESERVED.contains(cp as u8 as char) || cp as u8 as char == '#') {
+                    // Keep encoded form of all bytes
+                    for byte in &utf8_bytes {
+                        result.push(b'%');
+                        result.push(b"0123456789ABCDEF"[(*byte >> 4) as usize]);
+                        result.push(b"0123456789ABCDEF"[(*byte & 0x0F) as usize]);
+                    }
+                } else {
+                    // Append UTF-8 bytes
+                    result.extend_from_slice(&utf8_bytes);
+                }
             }
         } else {
-            // Regular character: encode as UTF-8
-            let mut buf = [0u8; 4];
-            let encoded_char = c.encode_utf8(&mut buf);
-            result.extend_from_slice(encoded_char.as_bytes());
+            result.push(bytes[k]);
+            k += 1;
         }
     }
 
     // Convert bytes to string
-    let decoded =
-        String::from_utf8(result).map_err(|_| "URIError: malformed URI sequence".to_string())?;
+    let decoded = String::from_utf8(result)
+        .map_err(|_| VmError::uri_error("URI malformed"))?;
 
     Ok(Value::string(JsString::intern(&decoded)))
 }

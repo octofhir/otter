@@ -747,6 +747,11 @@ pub struct ObjectFlags {
     pub array_length_writable: Option<bool>,
     /// String exotic object (new String("...")) — character indices are non-writable/non-configurable
     pub is_string_exotic: bool,
+    /// [[IsHTMLDDA]] internal slot (Annex B). Objects with this flag:
+    /// - typeof returns "undefined"
+    /// - ToBoolean returns false
+    /// - Abstract equality with null/undefined returns true
+    pub is_htmldda: bool,
 }
 
 impl JsObject {
@@ -2929,6 +2934,11 @@ impl JsObject {
     /// Check if object is an array
     pub fn is_array(&self) -> bool {
         self.flags.borrow().is_array
+    }
+
+    /// Check if object has [[IsHTMLDDA]] internal slot (Annex B)
+    pub fn is_htmldda(&self) -> bool {
+        self.flags.borrow().is_htmldda
     }
 
     /// Mark this object as an array exotic object

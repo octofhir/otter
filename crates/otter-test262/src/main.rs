@@ -659,6 +659,7 @@ async fn run_tests_core(cli: Cli) -> TestReport {
                     },
                     by_feature: summary.by_feature.clone(),
                     failures: summary.failures.clone(),
+                    timeouts: summary.timeouts.clone(),
                 };
                 let persisted = PersistedReport {
                     timestamp: chrono::Utc::now().to_rfc3339(),

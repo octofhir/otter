@@ -26,18 +26,18 @@ var $DONE = function(err) {
 // $262 host object (test262 host-defined)
 var $262 = {
     global: this,
-    // Minimal host emulation for AnnexB IsHTMLDDA feature.
-    // It must be present and callable (used as a method in a number of tests).
-    IsHTMLDDA: function() { return null; },
+    // AnnexB IsHTMLDDA: creates an object with [[IsHTMLDDA]] internal slot.
+    // typeof returns "undefined", ToBoolean returns false, == null/undefined is true.
+    IsHTMLDDA: __test262_create_htmldda(),
     gc: function() {
         if (typeof __test262_gc === 'function') {
             __test262_gc();
         }
     },
     evalScript: function(code) {
-        // Use indirect eval to execute in global scope (Test262 requirement)
-        // The (1, eval) pattern makes eval execute in global scope, not local
-        return (1, eval)(code);
+        // Execute code as a global script (Test262 $262.evalScript semantics).
+        // Global let/const declarations persist across script evaluations.
+        return __evalScript(code);
     },
     detachArrayBuffer: function(buffer) {
         if (typeof __test262_detach_array_buffer === 'function') {
@@ -208,6 +208,26 @@ pub fn create_harness_extension_with_state() -> (Extension, TestHarnessState) {
                 handler: OpHandler::Native(Arc::new(|_args, memory_manager| {
                     memory_manager.request_gc();
                     Ok(Value::undefined())
+                })),
+            },
+            // $262.IsHTMLDDA - creates a callable object with [[IsHTMLDDA]] internal slot.
+            // Per spec, IsHTMLDDA has [[Call]] (returns null when called) and:
+            // - typeof returns "undefined"
+            // - ToBoolean returns false
+            // - Abstract equality with null/undefined returns true
+            Op {
+                name: "__test262_create_htmldda".into(),
+                handler: OpHandler::Native(Arc::new(|_args, memory_manager| {
+                    // Create as NativeFunction so it's callable
+                    let htmldda_fn = Value::native_function(
+                        |_this, _args, _ncx| Ok(Value::null()),
+                        memory_manager,
+                    );
+                    // Set is_htmldda on the underlying JsObject
+                    if let Some(obj) = htmldda_fn.native_function_object() {
+                        obj.flags.borrow_mut().is_htmldda = true;
+                    }
+                    Ok(htmldda_fn)
                 })),
             },
             // $262.detachArrayBuffer() - detaches an ArrayBuffer

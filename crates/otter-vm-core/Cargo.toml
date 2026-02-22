@@ -33,6 +33,7 @@ fixed_decimal = { version = "0.7.1", features = ["ryu"] }
 icu_decimal = "2.1.1"
 icu_locale = "2.1.1"
 writeable = "0.6.2"
+temporal_rs = "0.1.2"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

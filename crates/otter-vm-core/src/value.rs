@@ -817,6 +817,16 @@ impl Value {
         matches!(&self.heap_ref, Some(HeapRef::String(_)))
     }
 
+    /// Check if value has [[IsHTMLDDA]] internal slot (Annex B)
+    #[inline]
+    pub fn is_htmldda(&self) -> bool {
+        match &self.heap_ref {
+            Some(HeapRef::Object(obj)) => obj.is_htmldda(),
+            Some(HeapRef::NativeFunction(f)) => f.object.is_htmldda(),
+            _ => false,
+        }
+    }
+
     /// Check if value is an object (includes functions, arrays, regexps, etc.)
     #[inline]
     pub fn is_object(&self) -> bool {
@@ -1181,6 +1191,12 @@ impl Value {
                 // Strings: empty string is false
                 if let Some(s) = self.as_string() {
                     !s.is_empty()
+                } else if let Some(HeapRef::Object(obj)) = &self.heap_ref {
+                    // [[IsHTMLDDA]] objects: ToBoolean returns false (Annex B)
+                    !obj.is_htmldda()
+                } else if let Some(HeapRef::NativeFunction(f)) = &self.heap_ref {
+                    // [[IsHTMLDDA]] NativeFunction: ToBoolean returns false (Annex B)
+                    !f.object.is_htmldda()
                 } else {
                     // Objects, functions are always truthy
                     true
@@ -1201,13 +1217,24 @@ impl Value {
             _ if self.is_int32() || !self.is_nan_boxed() => "number",
             _ => match &self.heap_ref {
                 Some(HeapRef::String(_)) => "string",
-                Some(HeapRef::Function(_) | HeapRef::NativeFunction(_)) => "function",
+                Some(HeapRef::Function(_)) => "function",
+                Some(HeapRef::NativeFunction(f)) => {
+                    // [[IsHTMLDDA]] NativeFunction: typeof returns "undefined" (Annex B)
+                    if f.object.is_htmldda() {
+                        "undefined"
+                    } else {
+                        "function"
+                    }
+                }
                 Some(HeapRef::Symbol(_)) => "symbol",
                 Some(HeapRef::BigInt(_)) => "bigint",
                 Some(HeapRef::RegExp(_)) => "object",
                 Some(HeapRef::Object(obj)) => {
+                    // [[IsHTMLDDA]] objects: typeof returns "undefined" (Annex B)
+                    if obj.is_htmldda() {
+                        "undefined"
                     // Check if it's a bound function (has __boundFunction__ property)
-                    if obj.get(&PropertyKey::string("__boundFunction__")).is_some() {
+                    } else if obj.get(&PropertyKey::string("__boundFunction__")).is_some() {
                         "function"
                     } else {
                         "object"

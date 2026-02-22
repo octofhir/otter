@@ -47,6 +47,13 @@ pub struct Compiler {
     last_was_return: bool,
     /// When true, the last expression statement's value is returned (eval semantics)
     eval_mode: bool,
+    /// When true, top-level `let`/`const` declarations are treated as global bindings
+    /// (like `var`) instead of lexical locals. Used for `$262.evalScript` to implement
+    /// proper global script semantics where lexical bindings persist across script executions.
+    global_let_as_var: bool,
+    /// Collected top-level lex declaration names when global_let_as_var is true.
+    /// Populated during compilation, used to set Module::global_lex_names.
+    global_lex_names: Vec<String>,
     /// Inferred name for anonymous function expressions (ES2023 §15.1.3).
     /// Set before compiling an expression that might be an anonymous function.
     pending_inferred_name: Option<String>,
@@ -63,9 +70,12 @@ pub struct Compiler {
     /// Source URL of the module currently being compiled.
     current_source_url: String,
     /// Names for which Annex B var-extension must be blocked in current context.
-    annex_b_blocked_names: HashSet<String>,
+    lexical_blocked_var_names: HashSet<String>,
+    /// Stack of saved lexical_blocked_var_names for when entering nested function scopes.
+    /// Each function scope starts fresh (no inheritance from outer function's lexical names).
+    lexical_blocked_stack: Vec<HashSet<String>>,
     /// Top-level names that have Annex B global var-extension bindings.
-    annex_b_global_var_names: HashSet<String>,
+    eval_hoisted_global_vars: HashSet<String>,
 }
 
 /// Context in which an identifier is used, for strict mode error messages
@@ -93,6 +103,8 @@ struct ControlScope {
     continue_jumps: Vec<usize>,
     /// Target index for `continue` (start of loop iteration logic)
     continue_target: Option<usize>,
+    /// Iterator register for for-of loops (for IteratorClose on break)
+    iterator_reg: Option<Register>,
 }
 
 #[derive(Default)]
@@ -152,13 +164,16 @@ impl Compiler {
             in_derived_class: false,
             last_was_return: false,
             eval_mode: false,
+            global_let_as_var: false,
+            global_lex_names: Vec::new(),
             pending_inferred_name: None,
             next_template_site: 0,
             in_chain: false,
             chain_end_jumps: Vec::new(),
             current_source_url: String::new(),
-            annex_b_blocked_names: HashSet::new(),
-            annex_b_global_var_names: HashSet::new(),
+            lexical_blocked_var_names: HashSet::new(),
+            lexical_blocked_stack: Vec::new(),
+            eval_hoisted_global_vars: HashSet::new(),
         }
     }
 
@@ -262,6 +277,19 @@ impl Compiler {
         self.compile_inner(source, source_url, false, strict_context)
     }
 
+    /// Compile source code as a global script (for $262.evalScript semantics).
+    /// Global `let`/`const` declarations at the top level are treated as global
+    /// object property bindings (like `var`), so they persist across script executions.
+    pub fn compile_global_script(
+        mut self,
+        source: &str,
+        source_url: &str,
+    ) -> CompileResult<otter_vm_bytecode::Module> {
+        self.eval_mode = true; // Return last expression value
+        self.global_let_as_var = true;
+        self.compile_inner(source, source_url, false, false)
+    }
+
     /// Compile source code to a module.
     ///
     /// `strict_context`: If true, code is compiled in strict mode context (e.g., direct eval in strict mode).
@@ -342,7 +370,12 @@ impl Compiler {
             self.codegen.emit(Instruction::ReturnUndefined);
         }
 
-        Ok(self.codegen.finish(source_url))
+        let mut module = self.codegen.finish(source_url);
+        // Set global lex names for GlobalDeclarationInstantiation collision checks
+        if !self.global_lex_names.is_empty() {
+            module.global_lex_names = std::mem::take(&mut self.global_lex_names);
+        }
+        Ok(module)
     }
 
     fn build_line_starts(source: &str) -> Vec<u32> {
@@ -486,7 +519,7 @@ impl Compiler {
                         let kind = if self.is_strict_mode() {
                             crate::scope::VariableKind::Let
                         } else {
-                            crate::scope::VariableKind::AnnexBFunction
+                            crate::scope::VariableKind::BlockScopedFunction
                         };
                         self.codegen.declare_variable_with_kind(&name, kind)?;
                     }
@@ -519,6 +552,14 @@ impl Compiler {
     /// Only declares names, NOT values — initialization happens during normal compilation.
     fn hoist_lexical_declarations(&mut self, statements: &[Statement]) -> CompileResult<()> {
         use crate::scope::VariableKind;
+        // In global_let_as_var mode at main top level, skip pre-declaring let/const as locals.
+        // They will be compiled as SetGlobal instead, so no local binding is needed.
+        let skip_for_global = self.global_let_as_var
+            && self.codegen.current.name.as_deref() == Some("main")
+            && self.codegen.current.scopes.current_scope_is_function();
+        if skip_for_global {
+            return Ok(());
+        }
         for stmt in statements {
             if let Statement::VariableDeclaration(decl) = stmt {
                 let kind = match decl.kind {
@@ -572,7 +613,38 @@ impl Compiler {
     /// This recursively scans blocks, if/else, for, while, switch, try/catch, etc.
     /// but does NOT descend into nested function bodies (they have their own scope).
     fn hoist_var_declarations(&mut self, statements: &[Statement]) -> CompileResult<()> {
-        let blocked = self.annex_b_blocked_names.clone();
+        // Per B.3.3.1/B.3.3.3: collect all top-level lexical (let/const) names from this
+        // statement list. These block Annex B var extension for same-named function
+        // declarations in any nested block within this scope.
+        let mut top_level_lexical: HashSet<String> = HashSet::new();
+        for stmt in statements {
+            if let Statement::VariableDeclaration(decl) = stmt {
+                if decl.kind != VariableDeclarationKind::Var {
+                    for declarator in &decl.declarations {
+                        Self::collect_binding_names(&declarator.id, &mut top_level_lexical);
+                    }
+                }
+            }
+        }
+        // Per B.3.3.1 ii: "F is not an element of parameterNames" — parameter names
+        // (including the synthesized "arguments" name when argumentsObjectNeeded is true)
+        // block Annex B var hoisting for block-level function declarations.
+        let param_names = self.codegen.current.scopes.collect_parameter_names();
+        top_level_lexical.extend(param_names.iter().cloned());
+        // If this is a non-arrow, non-strict function, and "arguments" is not already
+        // a parameter, add "arguments" to the blocked set because argumentsObjectNeeded
+        // is true — per B.3.3.1 step 22.f, "arguments" is appended to parameterNames.
+        let is_arrow = self.codegen.current.flags.is_arrow;
+        let is_strict = self.codegen.current.flags.is_strict || self.is_strict_mode();
+        if !is_arrow && !is_strict && !param_names.contains("arguments") {
+            top_level_lexical.insert("arguments".to_string());
+        }
+        // Extend the current blocked set with top-level lexicals so the compile phase
+        // (which uses self.lexical_blocked_var_names) also sees them blocked.
+        // We don't need to save/restore here because hoist_var_declarations is called
+        // once per scope level and the lexical names are stable for that scope.
+        self.lexical_blocked_var_names.extend(top_level_lexical.iter().cloned());
+        let blocked = self.lexical_blocked_var_names.clone();
         for stmt in statements {
             self.hoist_var_declarations_from_stmt(stmt, &blocked)?;
         }
@@ -583,7 +655,7 @@ impl Compiler {
     fn hoist_var_declarations_from_stmt(
         &mut self,
         stmt: &Statement,
-        blocked_annex_b_names: &HashSet<String>,
+        blocked_var_names: &HashSet<String>,
     ) -> CompileResult<()> {
         match stmt {
             Statement::VariableDeclaration(decl) => {
@@ -596,27 +668,70 @@ impl Compiler {
             Statement::FunctionDeclaration(func) => {
                 if !self.is_strict_mode() && let Some(id) = &func.id {
                     let name = id.name.to_string();
-                    if !blocked_annex_b_names.contains(&name) {
-                        self.hoist_annex_b_function_var_binding(&name)?;
+                    if !blocked_var_names.contains(&name) {
+                        self.hoist_eval_block_function_var_binding(&name)?;
                     }
                 }
             }
             Statement::BlockStatement(block) => {
+                // Collect lexical names bound in this block — these block Annex B
+                // var hoisting for function declarations in NESTED (inner) blocks.
+                // Per B.3.3.1 ii: replacing an inner function f with `var f` would
+                // produce an early error if f is lexically declared in any enclosing
+                // block within the function (13.2.1.1: lex ∩ var = SyntaxError).
+                let mut blocked_nested = blocked_var_names.clone();
                 for s in &block.body {
-                    self.hoist_var_declarations_from_stmt(s, blocked_annex_b_names)?;
+                    match s {
+                        Statement::VariableDeclaration(decl)
+                            if decl.kind != VariableDeclarationKind::Var =>
+                        {
+                            // let/const declarations are block-lex
+                            for declarator in &decl.declarations {
+                                Self::collect_binding_names(
+                                    &declarator.id,
+                                    &mut blocked_nested,
+                                );
+                            }
+                        }
+                        Statement::FunctionDeclaration(func) if !self.is_strict_mode() => {
+                            // Block-scoped function declarations are lexical in this
+                            // block (even in sloppy mode). A nested `function f(){}` in
+                            // an inner block cannot get Annex B var-extension if this
+                            // outer block already has a lex `f` here.
+                            if let Some(id) = &func.id {
+                                blocked_nested.insert(id.name.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for s in &block.body {
+                    match s {
+                        // Direct FunctionDeclarations in this block are processed with
+                        // the caller's blocked set (they are candidates for Annex B).
+                        Statement::FunctionDeclaration(_) => {
+                            self.hoist_var_declarations_from_stmt(s, blocked_var_names)?;
+                        }
+                        // All other statements (including nested blocks, loops, etc.)
+                        // are processed with blocked_nested so they see this block's
+                        // function declarations as lexically bound.
+                        _ => {
+                            self.hoist_var_declarations_from_stmt(s, &blocked_nested)?;
+                        }
+                    }
                 }
             }
             Statement::IfStatement(if_stmt) => {
                 self.hoist_var_declarations_from_stmt(
                     &if_stmt.consequent,
-                    blocked_annex_b_names,
+                    blocked_var_names,
                 )?;
                 if let Some(alt) = &if_stmt.alternate {
-                    self.hoist_var_declarations_from_stmt(alt, blocked_annex_b_names)?;
+                    self.hoist_var_declarations_from_stmt(alt, blocked_var_names)?;
                 }
             }
             Statement::ForStatement(for_stmt) => {
-                let mut blocked = blocked_annex_b_names.clone();
+                let mut blocked = blocked_var_names.clone();
                 if let Some(ForStatementInit::VariableDeclaration(decl)) = &for_stmt.init {
                     if decl.kind == VariableDeclarationKind::Var {
                         for declarator in &decl.declarations {
@@ -631,7 +746,7 @@ impl Compiler {
                 self.hoist_var_declarations_from_stmt(&for_stmt.body, &blocked)?;
             }
             Statement::ForInStatement(for_in) => {
-                let mut blocked = blocked_annex_b_names.clone();
+                let mut blocked = blocked_var_names.clone();
                 if let ForStatementLeft::VariableDeclaration(decl) = &for_in.left {
                     if decl.kind == VariableDeclarationKind::Var {
                         for declarator in &decl.declarations {
@@ -646,7 +761,7 @@ impl Compiler {
                 self.hoist_var_declarations_from_stmt(&for_in.body, &blocked)?;
             }
             Statement::ForOfStatement(for_of) => {
-                let mut blocked = blocked_annex_b_names.clone();
+                let mut blocked = blocked_var_names.clone();
                 if let ForStatementLeft::VariableDeclaration(decl) = &for_of.left {
                     if decl.kind == VariableDeclarationKind::Var {
                         for declarator in &decl.declarations {
@@ -661,38 +776,66 @@ impl Compiler {
                 self.hoist_var_declarations_from_stmt(&for_of.body, &blocked)?;
             }
             Statement::WhileStatement(while_stmt) => {
-                self.hoist_var_declarations_from_stmt(&while_stmt.body, blocked_annex_b_names)?;
+                self.hoist_var_declarations_from_stmt(&while_stmt.body, blocked_var_names)?;
             }
             Statement::DoWhileStatement(do_while) => {
-                self.hoist_var_declarations_from_stmt(&do_while.body, blocked_annex_b_names)?;
+                self.hoist_var_declarations_from_stmt(&do_while.body, blocked_var_names)?;
             }
             Statement::SwitchStatement(switch) => {
+                // Collect lexical names from switch cases to block Annex B hoisting.
+                // Per B.3.3.3, `let f` in the switch block prevents `function f(){}` Annex B extension.
+                let mut blocked = blocked_var_names.clone();
                 for case in &switch.cases {
                     for s in &case.consequent {
-                        self.hoist_var_declarations_from_stmt(s, blocked_annex_b_names)?;
+                        if let Statement::VariableDeclaration(decl) = s {
+                            if decl.kind != VariableDeclarationKind::Var {
+                                for declarator in &decl.declarations {
+                                    Self::collect_binding_names(&declarator.id, &mut blocked);
+                                }
+                            }
+                        }
+                    }
+                }
+                for case in &switch.cases {
+                    for s in &case.consequent {
+                        self.hoist_var_declarations_from_stmt(s, &blocked)?;
                     }
                 }
             }
             Statement::TryStatement(try_stmt) => {
                 for s in &try_stmt.block.body {
-                    self.hoist_var_declarations_from_stmt(s, blocked_annex_b_names)?;
+                    self.hoist_var_declarations_from_stmt(s, blocked_var_names)?;
                 }
                 if let Some(handler) = &try_stmt.handler {
+                    // Per B.3.5: catch parameter names block var hoisting ONLY when
+                    // the CatchParameter is a destructuring pattern (ObjectPattern or
+                    // ArrayPattern). Simple `catch (f)` (BindingIdentifier) does NOT
+                    // block hoisting — the Annex B extension still applies.
+                    let mut blocked = blocked_var_names.clone();
+                    if let Some(param) = &handler.param {
+                        let is_simple_binding = matches!(
+                            &param.pattern,
+                            BindingPattern::BindingIdentifier(_)
+                        );
+                        if !is_simple_binding {
+                            Self::collect_binding_names(&param.pattern, &mut blocked);
+                        }
+                    }
                     for s in &handler.body.body {
-                        self.hoist_var_declarations_from_stmt(s, blocked_annex_b_names)?;
+                        self.hoist_var_declarations_from_stmt(s, &blocked)?;
                     }
                 }
                 if let Some(finalizer) = &try_stmt.finalizer {
                     for s in &finalizer.body {
-                        self.hoist_var_declarations_from_stmt(s, blocked_annex_b_names)?;
+                        self.hoist_var_declarations_from_stmt(s, blocked_var_names)?;
                     }
                 }
             }
             Statement::LabeledStatement(labeled) => {
-                self.hoist_var_declarations_from_stmt(&labeled.body, blocked_annex_b_names)?;
+                self.hoist_var_declarations_from_stmt(&labeled.body, blocked_var_names)?;
             }
             Statement::WithStatement(with_stmt) => {
-                self.hoist_var_declarations_from_stmt(&with_stmt.body, blocked_annex_b_names)?;
+                self.hoist_var_declarations_from_stmt(&with_stmt.body, blocked_var_names)?;
             }
             // Other statements (expression, return, throw, break, continue, etc.) cannot contain var.
             _ => {}
@@ -727,43 +870,61 @@ impl Compiler {
         }
     }
 
-    fn hoist_annex_b_function_var_binding(&mut self, name: &str) -> CompileResult<()> {
+    fn hoist_eval_block_function_var_binding(&mut self, name: &str) -> CompileResult<()> {
         if self.codegen.current.name.as_deref() == Some("main") {
-            self.annex_b_global_var_names.insert(name.to_string());
-            let undef_reg = self.codegen.alloc_reg();
-            self.codegen
-                .emit(Instruction::LoadUndefined { dst: undef_reg });
+            self.eval_hoisted_global_vars.insert(name.to_string());
             let name_idx = self.codegen.add_string(name);
-            let ic_index = self.codegen.alloc_ic();
-            self.codegen.emit(Instruction::SetGlobal {
-                name: name_idx,
-                src: undef_reg,
-                ic_index,
-                is_declaration: true,
-            });
-            self.codegen.free_reg(undef_reg);
+            // Use DeclareGlobalVar: only creates the binding if it doesn't already exist.
+            // This preserves existing values (e.g. outer function parameters injected
+            // onto the global for direct eval).
+            // Per spec: eval code (B.3.3.3) uses configurable=true,
+            // global script code (B.3.3.2) uses configurable=false (CreateGlobalFunctionBinding).
+            let configurable = self.eval_mode; // true for eval, false for script
+            self.codegen
+                .emit(Instruction::DeclareGlobalVar { name: name_idx, configurable });
             return Ok(());
         }
 
-        if let Some(local_idx) = self.codegen.declare_annex_b_var_extension(name) {
-            let undef_reg = self.codegen.alloc_reg();
-            self.codegen
-                .emit(Instruction::LoadUndefined { dst: undef_reg });
-            self.codegen.emit(Instruction::SetLocal {
-                idx: LocalIndex(local_idx),
-                src: undef_reg,
-            });
-            self.codegen.free_reg(undef_reg);
+        if let Some((local_idx, is_new)) = self.codegen.declare_block_function_var_extension(name) {
+            // Per B.3.3.3: only initialize to undefined if a NEW binding was created.
+            // If an existing Var/Parameter binding was reused, do NOT reinitialize it
+            // (the parameter value must be preserved).
+            if is_new {
+                let undef_reg = self.codegen.alloc_reg();
+                self.codegen
+                    .emit(Instruction::LoadUndefined { dst: undef_reg });
+                self.codegen.emit(Instruction::SetLocal {
+                    idx: LocalIndex(local_idx),
+                    src: undef_reg,
+                });
+                self.codegen.free_reg(undef_reg);
+            }
         }
         Ok(())
     }
 
-    fn with_annex_b_blocked_names<R>(&mut self, names: HashSet<String>, f: impl FnOnce(&mut Self) -> R) -> R {
-        let old = self.annex_b_blocked_names.clone();
-        self.annex_b_blocked_names.extend(names);
+    fn with_lexical_blocked_var_names<R>(&mut self, names: HashSet<String>, f: impl FnOnce(&mut Self) -> R) -> R {
+        let old = self.lexical_blocked_var_names.clone();
+        self.lexical_blocked_var_names.extend(names);
         let out = f(self);
-        self.annex_b_blocked_names = old;
+        self.lexical_blocked_var_names = old;
         out
+    }
+
+    /// Save lexical_blocked_var_names and clear it for a new function scope.
+    /// Each function scope starts with an empty set — outer function's lexical names
+    /// should NOT block inner function's Annex B extensions.
+    /// Must be paired with pop_function_scope_lexical_blocked.
+    fn push_function_scope_lexical_blocked(&mut self) {
+        let saved = std::mem::take(&mut self.lexical_blocked_var_names);
+        self.lexical_blocked_stack.push(saved);
+    }
+
+    /// Restore lexical_blocked_var_names after exiting a function scope.
+    fn pop_function_scope_lexical_blocked(&mut self) {
+        if let Some(saved) = self.lexical_blocked_stack.pop() {
+            self.lexical_blocked_var_names = saved;
+        }
     }
 
     /// Extract var-declared names from a binding pattern and declare them.
@@ -857,16 +1018,63 @@ impl Compiler {
 
             Statement::BlockStatement(block) => {
                 self.codegen.enter_scope();
-                // Hoist function declarations in block
-                let hoisted = self.hoist_function_declarations(&block.body)?;
-                // Compile statements, skipping hoisted function declarations
-                for (idx, stmt) in block.body.iter().enumerate() {
-                    if !hoisted.contains(&idx) {
-                        self.compile_statement(stmt)?;
+
+                // Collect lexical names declared directly in this block so they
+                // block var-extension hoisting for same-named function declarations.
+                // This covers the hoisting AND compilation phases.
+                let mut block_lexical_names = HashSet::new();
+                for s in &block.body {
+                    if let Statement::VariableDeclaration(decl) = s {
+                        if decl.kind != VariableDeclarationKind::Var {
+                            for declarator in &decl.declarations {
+                                Self::collect_binding_names(
+                                    &declarator.id,
+                                    &mut block_lexical_names,
+                                );
+                            }
+                        }
                     }
                 }
+
+                // Collect block-level function declaration names. Per B.3.3.1, these
+                // are lexically bound in this block, blocking Annex B hoisting for
+                // same-named function declarations in NESTED blocks. We add them
+                // AFTER hoist_function_declarations (for this block's own functions,
+                // which ARE Annex B applicable), but BEFORE compiling nested statements.
+                let block_func_names: HashSet<String> = if !self.is_strict_mode() {
+                    block
+                        .body
+                        .iter()
+                        .filter_map(|s| {
+                            if let Statement::FunctionDeclaration(func) = s {
+                                func.id.as_ref().map(|id| id.name.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                } else {
+                    HashSet::new()
+                };
+
+                // Hoist and compile:
+                // 1. Run hoist_function_declarations with only let/const blocked
+                //    (so this block's own function declarations get Annex B treatment).
+                // 2. Then add block function names to lexical_blocked before compiling
+                //    nested statements (so nested blocks see them as blocked).
+                let result = self.with_lexical_blocked_var_names(block_lexical_names, |this| {
+                    let hoisted = this.hoist_function_declarations(&block.body)?;
+                    // Now add block function names so nested block compilations see them.
+                    this.lexical_blocked_var_names.extend(block_func_names);
+                    for (idx, stmt) in block.body.iter().enumerate() {
+                        if !hoisted.contains(&idx) {
+                            this.compile_statement(stmt)?;
+                        }
+                    }
+                    Ok::<(), crate::CompileError>(())
+                });
                 self.codegen.exit_scope();
-                Ok(())
+                result
             }
 
             Statement::IfStatement(if_stmt) => self.compile_if_statement(if_stmt),
@@ -927,6 +1135,13 @@ impl Compiler {
                 }
 
                 if let Some(idx) = target_scope_idx {
+                    // Emit IteratorClose for any for-of loops we're breaking out of
+                    // (including the target scope and any intermediate scopes)
+                    for i in (idx..self.loop_stack.len()).rev() {
+                        if let Some(iter_reg) = self.loop_stack[i].iterator_reg {
+                            self.codegen.emit(Instruction::IteratorClose { iter: iter_reg });
+                        }
+                    }
                     let jump_idx = self.codegen.emit_jump();
                     self.loop_stack[idx].break_jumps.push(jump_idx);
                     Ok(())
@@ -1639,6 +1854,7 @@ impl Compiler {
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
         let inferred_name = self.pending_inferred_name.take();
 
+        self.push_function_scope_lexical_blocked();
         self.codegen.enter_function(inferred_name);
 
         if let Some(fields) = field_initializers {
@@ -1649,6 +1865,7 @@ impl Compiler {
 
         self.codegen.emit(Instruction::ReturnUndefined);
         let func_idx = self.codegen.exit_function();
+        self.pop_function_scope_lexical_blocked();
 
         let dst = self.codegen.alloc_reg();
         self.codegen.emit(Instruction::Closure {
@@ -1670,6 +1887,7 @@ impl Compiler {
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
         let inferred_name = self.pending_inferred_name.take();
 
+        self.push_function_scope_lexical_blocked();
         self.codegen.enter_function(inferred_name);
         // Mark as derived constructor so the runtime sets up home_object
         self.codegen.current.flags.is_derived = true;
@@ -1689,6 +1907,7 @@ impl Compiler {
 
         self.codegen.emit(Instruction::ReturnUndefined);
         let func_idx = self.codegen.exit_function();
+        self.pop_function_scope_lexical_blocked();
 
         let dst = self.codegen.alloc_reg();
         self.codegen.emit(Instruction::Closure {
@@ -2002,8 +2221,38 @@ impl Compiler {
                 // Per ES2023 §15.1.11: in script top-level ("main"), `var`
                 // declarations are global bindings — reads and writes go
                 // through GetGlobal/SetGlobal, not local registers.
-                if kind == crate::scope::VariableKind::Var
-                    && self.codegen.current.name.as_deref() == Some("main")
+                // In global_let_as_var mode (for $262.evalScript), top-level `let`/`const`
+                // also use SetGlobal so they persist across separate script evaluations.
+                // Note: `var` applies at any nesting depth in main; `let`/`const` in
+                // global_let_as_var mode only apply at the top function scope.
+                let in_main = self.codegen.current.name.as_deref() == Some("main");
+                let in_main_top_scope = in_main
+                    && self.codegen.current.scopes.current_scope_is_function();
+
+                // B.3.5: var inside catch block with same name as simple catch param
+                // should write to the catch parameter's local, not the global.
+                let catch_param_local = if kind == crate::scope::VariableKind::Var {
+                    self.codegen.find_catch_parameter(&ident.name)
+                } else {
+                    None
+                };
+
+                let is_global_var = kind == crate::scope::VariableKind::Var && in_main && catch_param_local.is_none();
+                let is_global_lexical = self.global_let_as_var
+                    && (kind == crate::scope::VariableKind::Let
+                        || kind == crate::scope::VariableKind::Const)
+                    && in_main_top_scope;
+                // Collect lex names for GlobalDeclarationInstantiation collision checks
+                if is_global_lexical {
+                    self.global_lex_names.push(ident.name.to_string());
+                }
+                if let Some(local_idx) = catch_param_local {
+                    // B.3.5: write to catch parameter's local
+                    self.codegen.emit(Instruction::SetLocal {
+                        idx: LocalIndex(local_idx),
+                        src: value_reg,
+                    });
+                } else if is_global_var || is_global_lexical
                 {
                     let name_idx = self.codegen.add_string(&ident.name);
                     let ic_index = self.codegen.alloc_ic();
@@ -2412,6 +2661,7 @@ impl Compiler {
                     break_jumps: Vec::new(),
                     continue_jumps: Vec::new(), // Not used
                     continue_target: None,
+                    iterator_reg: None,
                 });
 
                 self.compile_statement(&stmt.body)?;
@@ -2439,6 +2689,7 @@ impl Compiler {
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             continue_target: None, // Will patch later
+            iterator_reg: None,
         });
 
         self.compile_statement(&stmt.body)?;
@@ -2481,6 +2732,7 @@ impl Compiler {
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             continue_target: Some(loop_start),
+            iterator_reg: None,
         });
 
         // Compile condition
@@ -2520,7 +2772,7 @@ impl Compiler {
     /// Compile a for statement
     fn compile_for_statement(&mut self, for_stmt: &ForStatement) -> CompileResult<()> {
         self.codegen.enter_scope();
-        let mut annex_b_blocked = HashSet::new();
+        let mut lexical_blocked = HashSet::new();
 
         // Compile init
         if let Some(init) = &for_stmt.init {
@@ -2528,7 +2780,7 @@ impl Compiler {
                 ForStatementInit::VariableDeclaration(decl) => {
                     if decl.kind != VariableDeclarationKind::Var {
                         for declarator in &decl.declarations {
-                            Self::collect_binding_names(&declarator.id, &mut annex_b_blocked);
+                            Self::collect_binding_names(&declarator.id, &mut lexical_blocked);
                         }
                     }
                     self.compile_variable_declaration(decl)?;
@@ -2551,6 +2803,7 @@ impl Compiler {
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             continue_target: Some(loop_start),
+            iterator_reg: None,
         });
 
         // Compile test
@@ -2564,7 +2817,7 @@ impl Compiler {
         };
 
         // Compile body
-        self.with_annex_b_blocked_names(annex_b_blocked, |this| {
+        self.with_lexical_blocked_var_names(lexical_blocked, |this| {
             this.compile_statement(&for_stmt.body)
         })?;
 
@@ -2611,7 +2864,7 @@ impl Compiler {
     /// for (const x of iterable) { ... }
     fn compile_for_of_statement(&mut self, for_of_stmt: &ForOfStatement) -> CompileResult<()> {
         self.codegen.enter_scope();
-        let mut annex_b_blocked = HashSet::new();
+        let mut lexical_blocked = HashSet::new();
 
         // Compile the iterable expression
         let iterable = self.compile_expression(&for_of_stmt.right)?;
@@ -2649,6 +2902,7 @@ impl Compiler {
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             continue_target: Some(loop_start),
+            iterator_reg: Some(iterator),
         });
 
         // result = iterator.next()
@@ -2708,11 +2962,9 @@ impl Compiler {
             ForStatementLeft::VariableDeclaration(decl) => {
                 if decl.kind != VariableDeclarationKind::Var {
                     for declarator in &decl.declarations {
-                        Self::collect_binding_names(&declarator.id, &mut annex_b_blocked);
+                        Self::collect_binding_names(&declarator.id, &mut lexical_blocked);
                     }
                 }
-                // For variable declarations like `const x`, `let [a, b]`, `var { x, y }`
-                let is_const = decl.kind == VariableDeclarationKind::Const;
                 if let Some(declarator) = decl.declarations.first() {
                     // Early error: Initializer is not allowed in for-of/for-in loop heads
                     if declarator.init.is_some() {
@@ -2721,8 +2973,18 @@ impl Compiler {
                                 .to_string(),
                         ));
                     }
-                    // Use the recursive binding initialization helper
-                    self.compile_binding_init(&declarator.id, value_reg, is_const)?;
+                    if decl.kind == VariableDeclarationKind::Var {
+                        // Var declarations were already hoisted — just assign value
+                        // via binding pattern (which handles catch parameter shadowing).
+                        self.compile_binding_pattern(
+                            &declarator.id,
+                            value_reg,
+                            crate::scope::VariableKind::Var,
+                        )?;
+                    } else {
+                        let is_const = decl.kind == VariableDeclarationKind::Const;
+                        self.compile_binding_init(&declarator.id, value_reg, is_const)?;
+                    }
                 }
             }
             left => {
@@ -2736,7 +2998,7 @@ impl Compiler {
         }
 
         // Compile the loop body
-        self.with_annex_b_blocked_names(annex_b_blocked, |this| {
+        self.with_lexical_blocked_var_names(lexical_blocked, |this| {
             this.compile_statement(&for_of_stmt.body)
         })?;
 
@@ -3538,7 +3800,48 @@ impl Compiler {
 
     fn compile_for_in_statement(&mut self, for_in_stmt: &ForInStatement) -> CompileResult<()> {
         self.codegen.enter_scope();
-        let mut annex_b_blocked = HashSet::new();
+        let mut lexical_blocked = HashSet::new();
+
+        // Early errors for for-in initializers (B.3.6):
+        // - In strict mode, for (var x = expr in obj) is always a SyntaxError
+        // - for (var [a] = expr in obj) and for (var {a} = expr in obj) are always SyntaxError
+        // - Only for (var x = expr in obj) with a simple BindingIdentifier in sloppy mode is allowed
+        if let ForStatementLeft::VariableDeclaration(decl) = &for_in_stmt.left {
+            if let Some(declarator) = decl.declarations.first() {
+                if declarator.init.is_some() {
+                    let is_simple_binding =
+                        matches!(&declarator.id, BindingPattern::BindingIdentifier(_));
+                    if !is_simple_binding {
+                        // BindingPattern initializers in for-in are always prohibited
+                        return Err(CompileError::Parse("for-in loop head declarations with BindingPattern may not have an initializer".to_string()));
+                    }
+                    if self.is_strict_mode() {
+                        // Strict mode: for-in initializers are prohibited
+                        return Err(CompileError::Parse("for-in loop variable declaration may not have an initializer in strict mode".to_string()));
+                    }
+                }
+            }
+        }
+
+        // Annex B: for (var x = expr in obj) — evaluate initializer before the RHS.
+        // Only allowed for simple BindingIdentifier in sloppy mode var declarations.
+        if let ForStatementLeft::VariableDeclaration(decl) = &for_in_stmt.left {
+            if decl.kind == VariableDeclarationKind::Var && !self.is_strict_mode() {
+                if let Some(declarator) = decl.declarations.first() {
+                    if let Some(init) = &declarator.init {
+                        if matches!(&declarator.id, BindingPattern::BindingIdentifier(_)) {
+                            let init_reg = self.compile_expression(init)?;
+                            self.compile_binding_pattern(
+                                &declarator.id,
+                                init_reg,
+                                crate::scope::VariableKind::Var,
+                            )?;
+                            self.codegen.free_reg(init_reg);
+                        }
+                    }
+                }
+            }
+        }
 
         // Compile the target expression.
         let target = self.compile_expression(&for_in_stmt.right)?;
@@ -3603,6 +3906,7 @@ impl Compiler {
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             continue_target: Some(loop_start),
+            iterator_reg: None,
         });
 
         let iter_frame = self.codegen.alloc_fresh_block(1);
@@ -3641,18 +3945,28 @@ impl Compiler {
             ForStatementLeft::VariableDeclaration(decl) => {
                 if decl.kind != VariableDeclarationKind::Var {
                     for declarator in &decl.declarations {
-                        Self::collect_binding_names(&declarator.id, &mut annex_b_blocked);
+                        Self::collect_binding_names(&declarator.id, &mut lexical_blocked);
                     }
                 }
-                let is_const = decl.kind == VariableDeclarationKind::Const;
                 if let Some(declarator) = decl.declarations.first() {
-                    if declarator.init.is_some() {
-                        return Err(CompileError::Parse(
-                            "for-in loop variable declaration may not have an initializer"
-                                .to_string(),
-                        ));
+                    if decl.kind == VariableDeclarationKind::Var {
+                        // Var declarations were already hoisted — just assign value
+                        // (handles catch parameter shadowing via compile_binding_pattern).
+                        self.compile_binding_pattern(
+                            &declarator.id,
+                            value_reg,
+                            crate::scope::VariableKind::Var,
+                        )?;
+                    } else {
+                        if declarator.init.is_some() {
+                            return Err(CompileError::Parse(
+                                "for-in loop variable declaration may not have an initializer"
+                                    .to_string(),
+                            ));
+                        }
+                        let is_const = decl.kind == VariableDeclarationKind::Const;
+                        self.compile_binding_init(&declarator.id, value_reg, is_const)?;
                     }
-                    self.compile_binding_init(&declarator.id, value_reg, is_const)?;
                 }
             }
             left => {
@@ -3664,7 +3978,7 @@ impl Compiler {
             }
         }
 
-        self.with_annex_b_blocked_names(annex_b_blocked, |this| {
+        self.with_lexical_blocked_var_names(lexical_blocked, |this| {
             this.compile_statement(&for_in_stmt.body)
         })?;
 
@@ -3733,15 +4047,51 @@ impl Compiler {
             self.codegen.emit(Instruction::Catch { dst: exc_reg });
 
             if let Some(param) = &handler.param {
-                self.compile_binding_init(&param.pattern, exc_reg, false)?;
+                let is_simple = matches!(&param.pattern, BindingPattern::BindingIdentifier(_));
+                if is_simple {
+                    // Simple catch parameter: use CatchParameter kind so var
+                    // redeclaration is allowed per B.3.5.
+                    if let BindingPattern::BindingIdentifier(ident) = &param.pattern {
+                        let local_idx = self.codegen.declare_variable_with_kind(
+                            &ident.name,
+                            crate::scope::VariableKind::CatchParameter,
+                        )?;
+                        self.codegen.emit(Instruction::SetLocal {
+                            idx: LocalIndex(local_idx),
+                            src: exc_reg,
+                        });
+                    }
+                } else {
+                    self.compile_binding_init(&param.pattern, exc_reg, false)?;
+                }
             }
 
-            for stmt in &handler.body.body {
-                self.compile_statement(stmt)?;
-            }
+            // Per B.3.5: if catch param is a destructuring pattern, its names block
+            // Annex B var extension for same-named function declarations in the catch body.
+            // (Simple `catch (f)` does NOT block — only destructuring `catch ({f})` does.)
+            let catch_blocked: HashSet<String> = if let Some(param) = &handler.param {
+                let is_simple = matches!(&param.pattern, BindingPattern::BindingIdentifier(_));
+                if !is_simple {
+                    let mut names = HashSet::new();
+                    Self::collect_binding_names(&param.pattern, &mut names);
+                    names
+                } else {
+                    HashSet::new()
+                }
+            } else {
+                HashSet::new()
+            };
+
+            let body_result = self.with_lexical_blocked_var_names(catch_blocked, |this| {
+                for stmt in &handler.body.body {
+                    this.compile_statement(stmt)?;
+                }
+                Ok::<(), crate::CompileError>(())
+            });
 
             self.codegen.free_reg(exc_reg);
             self.codegen.exit_scope();
+            body_result?;
 
             // Patch jump over catch
             let end_offset = self.codegen.current_index() as i32 - jump_over_catch as i32;
@@ -3835,13 +4185,14 @@ impl Compiler {
                 let kind = if self.is_strict_mode() {
                     crate::scope::VariableKind::Let
                 } else {
-                    crate::scope::VariableKind::AnnexBFunction
+                    crate::scope::VariableKind::BlockScopedFunction
                 };
                 self.codegen.declare_variable_with_kind(n, kind)?;
             }
         }
 
-        // Enter function context
+        // Enter function context (save outer function's lexical blocked names)
+        self.push_function_scope_lexical_blocked();
         self.codegen.enter_function(name.clone());
         self.codegen.current.flags.is_async = is_async;
         self.codegen.current.flags.is_generator = is_generator;
@@ -4028,6 +4379,7 @@ impl Compiler {
 
         // Exit function and get index
         let func_idx = self.codegen.exit_function();
+        self.pop_function_scope_lexical_blocked();
 
         if std::env::var("OTTER_DUMP_ASSERT").is_ok() && name.as_deref() == Some("assert") {
             if let Some(func) = self.codegen.functions.get(func_idx as usize) {
@@ -4083,7 +4435,7 @@ impl Compiler {
                 self.codegen.current.scopes.function_scope_binding(&n),
                 Some((_, crate::scope::VariableKind::Var))
             ) || (self.codegen.current.name.as_deref() == Some("main")
-                && self.annex_b_global_var_names.contains(&n));
+                && self.eval_hoisted_global_vars.contains(&n));
             if self.codegen.current.name.as_deref() == Some("main") && has_var_binding {
                 let name_idx = self.codegen.add_string(&n);
                 let ic_index = self.codegen.alloc_ic();
@@ -4112,11 +4464,22 @@ impl Compiler {
         let is_async = func.r#async;
         let is_generator = func.generator;
 
+        // Per B.3.3.1: check if this block-level function is Annex B applicable.
+        // A function is NOT applicable if its name is currently blocked (meaning an
+        // enclosing block or the function scope has a lex binding with the same name
+        // that would cause an early error if this function were replaced with `var F`).
+        let annex_b_applicable = !self.is_strict_mode()
+            && name
+                .as_deref()
+                .map(|n| !self.lexical_blocked_var_names.contains(n))
+                .unwrap_or(false);
+
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
 
         // Name is already declared in hoisting phase 1, so skip declare_variable
 
-        // Enter function context
+        // Enter function context (save outer function's lexical blocked names)
+        self.push_function_scope_lexical_blocked();
         self.codegen.enter_function(name.clone());
         self.codegen.current.flags.is_async = is_async;
         self.codegen.current.flags.is_generator = is_generator;
@@ -4299,6 +4662,7 @@ impl Compiler {
 
         // Exit function and get index
         let func_idx = self.codegen.exit_function();
+        self.pop_function_scope_lexical_blocked();
 
         // Create closure and store in declaration binding.
         if let Some(n) = name
@@ -4330,30 +4694,32 @@ impl Compiler {
                 idx: LocalIndex(idx),
                 src: dst,
             });
-            if let Some((var_idx, crate::scope::VariableKind::Var)) =
-                self.codegen.current.scopes.function_scope_binding(&n)
-                && var_idx != idx
-            {
-                // Annex B: update var-scoped binding from block-scoped function binding.
-                self.codegen.emit(Instruction::SetLocal {
-                    idx: LocalIndex(var_idx),
-                    src: dst,
-                });
-            }
-            let has_var_binding = matches!(
-                self.codegen.current.scopes.function_scope_binding(&n),
-                Some((_, crate::scope::VariableKind::Var))
-            ) || (self.codegen.current.name.as_deref() == Some("main")
-                && self.annex_b_global_var_names.contains(&n));
-            if self.codegen.current.name.as_deref() == Some("main") && has_var_binding {
-                let name_idx = self.codegen.add_string(&n);
-                let ic_index = self.codegen.alloc_ic();
-                self.codegen.emit(Instruction::SetGlobal {
-                    name: name_idx,
-                    src: dst,
-                    ic_index,
-                    is_declaration: true,
-                });
+            if annex_b_applicable {
+                if let Some((var_idx, crate::scope::VariableKind::Var)) =
+                    self.codegen.current.scopes.function_scope_binding(&n)
+                    && var_idx != idx
+                {
+                    // Annex B: update var-scoped binding from block-scoped function binding.
+                    self.codegen.emit(Instruction::SetLocal {
+                        idx: LocalIndex(var_idx),
+                        src: dst,
+                    });
+                }
+                let has_var_binding = matches!(
+                    self.codegen.current.scopes.function_scope_binding(&n),
+                    Some((_, crate::scope::VariableKind::Var))
+                ) || (self.codegen.current.name.as_deref() == Some("main")
+                    && self.eval_hoisted_global_vars.contains(&n));
+                if self.codegen.current.name.as_deref() == Some("main") && has_var_binding {
+                    let name_idx = self.codegen.add_string(&n);
+                    let ic_index = self.codegen.alloc_ic();
+                    self.codegen.emit(Instruction::SetGlobal {
+                        name: name_idx,
+                        src: dst,
+                        ic_index,
+                        is_declaration: true,
+                    });
+                }
             }
             self.codegen.free_reg(dst);
         }
@@ -4387,7 +4753,8 @@ impl Compiler {
 
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
 
-        // Enter function context
+        // Enter function context (save outer function's lexical blocked names)
+        self.push_function_scope_lexical_blocked();
         self.codegen.enter_function(name);
         self.codegen.current.flags.is_async = is_async;
         self.codegen.current.flags.is_generator = is_generator;
@@ -4604,6 +4971,7 @@ impl Compiler {
 
         // Exit function and get index
         let func_idx = self.codegen.exit_function();
+        self.pop_function_scope_lexical_blocked();
 
         // If this is a derived constructor with field initializers,
         // store the field init function index on the constructor.
@@ -4650,7 +5018,8 @@ impl Compiler {
 
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
 
-        // Enter function context
+        // Enter function context (save outer function's lexical blocked names)
+        self.push_function_scope_lexical_blocked();
         self.codegen.enter_function(inferred_name);
         self.codegen.current.flags.is_arrow = true;
         self.codegen.current.flags.is_async = is_async;
@@ -4848,6 +5217,7 @@ impl Compiler {
 
         // Exit function and get index
         let func_idx = self.codegen.exit_function();
+        self.pop_function_scope_lexical_blocked();
 
         // Create closure
         let dst = self.codegen.alloc_reg();
@@ -6719,6 +7089,12 @@ impl Compiler {
                     rhs_val,
                     &ts.expression,
                 )?,
+            AssignmentTarget::ArrayAssignmentTarget(_)
+            | AssignmentTarget::ObjectAssignmentTarget(_) => {
+                // Destructuring assignment: ([x, y] = rhs) or ({a, b} = rhs)
+                self.compile_assignment_target_init(&assign.left, rhs_val)?;
+                rhs_val
+            }
             _ => return Err(CompileError::InvalidAssignmentTarget),
         };
 
@@ -8986,6 +9362,8 @@ impl Compiler {
         &mut self,
         block: &oxc_ast::ast::StaticBlock,
     ) -> CompileResult<Register> {
+        // Save outer function's lexical blocked names
+        self.push_function_scope_lexical_blocked();
         self.codegen
             .enter_function(Some("<static_block>".to_string()));
 
@@ -8999,6 +9377,7 @@ impl Compiler {
 
         // Exit function and get a closure
         let func_idx = self.codegen.exit_function();
+        self.pop_function_scope_lexical_blocked();
         let dst = self.codegen.alloc_reg();
         self.codegen.emit(Instruction::Closure {
             dst,
@@ -9211,6 +9590,7 @@ impl Compiler {
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             continue_target: None,
+            iterator_reg: None,
         });
 
         // 3. Jump to checks
@@ -9222,22 +9602,42 @@ impl Compiler {
 
         self.codegen.enter_scope(); // Switch scope
 
-        for (i, case) in stmt.cases.iter().enumerate() {
-            // Mark start of this case's body
-            let body_start = self.codegen.current_index();
-            case_body_labels.push(body_start);
-
-            if case.test.is_none() {
-                if default_case_idx.is_some() {
-                    return Err(CompileError::syntax("Multiple default clauses", 0, 0));
+        // Collect all lexical (let/const) names from ALL case bodies.
+        // Per B.3.3.3, a `let f` anywhere in the switch block blocks Annex B
+        // var extension for `function f(){}` in nested blocks.
+        let mut switch_lexical_names = HashSet::new();
+        for case in &stmt.cases {
+            for s in &case.consequent {
+                if let Statement::VariableDeclaration(decl) = s {
+                    if decl.kind != VariableDeclarationKind::Var {
+                        for declarator in &decl.declarations {
+                            Self::collect_binding_names(&declarator.id, &mut switch_lexical_names);
+                        }
+                    }
                 }
-                default_case_idx = Some(i);
-            }
-
-            for stmt in &case.consequent {
-                self.compile_statement(stmt)?;
             }
         }
+
+        let compile_result = self.with_lexical_blocked_var_names(switch_lexical_names, |this| {
+            for (i, case) in stmt.cases.iter().enumerate() {
+                // Mark start of this case's body
+                let body_start = this.codegen.current_index();
+                case_body_labels.push(body_start);
+
+                if case.test.is_none() {
+                    if default_case_idx.is_some() {
+                        return Err(CompileError::syntax("Multiple default clauses", 0, 0));
+                    }
+                    default_case_idx = Some(i);
+                }
+
+                for stmt in &case.consequent {
+                    this.compile_statement(stmt)?;
+                }
+            }
+            Ok(())
+        });
+        compile_result?;
 
         self.codegen.exit_scope();
 

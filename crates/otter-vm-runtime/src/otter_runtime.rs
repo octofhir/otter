@@ -2382,6 +2382,12 @@ impl Otter {
                 .compile_eval(code, "<eval>", strict_context)
                 .map_err(|e| VmError::SyntaxError(e.to_string()))
         }));
+        ctx.set_script_eval_fn(Arc::new(|code: &str| {
+            let compiler = Compiler::new();
+            compiler
+                .compile_global_script(code, "<evalScript>")
+                .map_err(|e| VmError::SyntaxError(e.to_string()))
+        }));
     }
 
     /// Configure the JS job queue on a VmContext to enable Promise callbacks

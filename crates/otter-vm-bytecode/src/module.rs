@@ -161,6 +161,12 @@ pub struct Module {
 
     /// Original source (optional, for debugging)
     pub source: Option<String>,
+
+    /// Top-level lexical declaration names (let/const) for GlobalDeclarationInstantiation.
+    /// Only populated for global scripts compiled with global_let_as_var=true.
+    /// Used to check for var/lex collisions between script evaluations.
+    #[serde(default)]
+    pub global_lex_names: Vec<String>,
 }
 
 impl Module {
@@ -259,6 +265,7 @@ pub struct ModuleBuilder {
     is_esm: bool,
     has_top_level_await: bool,
     source: Option<String>,
+    global_lex_names: Vec<String>,
 }
 
 impl ModuleBuilder {
@@ -276,6 +283,7 @@ impl ModuleBuilder {
             is_esm: true,
             has_top_level_await: false,
             source: None,
+            global_lex_names: Vec::new(),
         }
     }
 
@@ -345,6 +353,12 @@ impl ModuleBuilder {
         self
     }
 
+    /// Set global lexical declaration names
+    pub fn global_lex_names(mut self, names: Vec<String>) -> Self {
+        self.global_lex_names = names;
+        self
+    }
+
     /// Build the module
     pub fn build(self) -> Module {
         Module {
@@ -360,6 +374,7 @@ impl ModuleBuilder {
             is_esm: self.is_esm,
             has_top_level_await: self.has_top_level_await,
             source: self.source,
+            global_lex_names: self.global_lex_names,
         }
     }
 }

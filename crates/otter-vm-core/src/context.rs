@@ -3,7 +3,7 @@
 //! The context holds per-execution state: registers, call stack, locals.
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -242,6 +242,20 @@ impl<'a> NativeContext<'a> {
         self.interpreter
     }
 
+    /// Perform a full JS-level property Get on an object.
+    /// This handles prototype chain walking, accessor (getter) invocation, and proxies.
+    /// Use this instead of `obj.get()` when observable side effects matter.
+    pub fn get_property(
+        &mut self,
+        obj: &GcRef<crate::object::JsObject>,
+        key: &crate::object::PropertyKey,
+    ) -> crate::error::VmResult<Value> {
+        let key_value = crate::proxy_operations::property_key_to_value_pub(key);
+        let receiver = Value::object(obj.clone());
+        self.interpreter
+            .get_with_proxy_chain(self.ctx, obj, key, key_value, &receiver)
+    }
+
     /// Execute a generator operation (next/return/throw) via the interpreter.
     ///
     /// This bridges from NativeContext-based generator prototype methods to the
@@ -262,6 +276,24 @@ impl<'a> NativeContext<'a> {
     /// consuming outer call frames.
     pub fn execute_module(&mut self, module: &Module) -> VmResult<Value> {
         self.interpreter.execute_eval_module(self.ctx, module)
+    }
+
+    /// Compile and execute source as a global script (for $262.evalScript semantics).
+    /// Top-level `let`/`const` declarations become persistent global bindings.
+    pub fn eval_as_global_script(&mut self, code: &str) -> VmResult<Value> {
+        let module = self.ctx.compile_global_script(code)?;
+        // Per spec GlobalDeclarationInstantiation step 3:
+        // For each lexName in module's lex declarations, if env.HasVarDeclaration(lexName),
+        // throw a SyntaxError.
+        for lex_name in &module.global_lex_names {
+            if self.ctx.has_global_var_name(lex_name) {
+                return Err(VmError::SyntaxError(format!(
+                    "Identifier '{}' has already been declared",
+                    lex_name
+                )));
+            }
+        }
+        self.execute_eval_module(&module)
     }
 
     /// Execute an eval-compiled module within this context.
@@ -446,12 +478,20 @@ pub struct VmContext {
     generator_prototype_intrinsic: Option<GcRef<JsObject>>,
     /// Intrinsic `%AsyncGeneratorPrototype%` object (ES2026 §27.6.1).
     async_generator_prototype_intrinsic: Option<GcRef<JsObject>>,
+    /// Set of global var-declared names (from DeclareGlobalVar).
+    /// Used by GlobalDeclarationInstantiation to check for lex/var collisions
+    /// across script evaluations ($262.evalScript).
+    global_var_names: HashSet<String>,
     /// Eval compiler callback: compiles eval source code into a Module.
     /// Set by otter-vm-runtime to bridge the compiler (which otter-vm-core
     /// cannot depend on directly). The interpreter handles execution.
     /// The boolean parameter indicates whether the caller is in strict mode context.
     eval_fn:
         Option<Arc<dyn Fn(&str, bool) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync>>,
+    /// Script compiler callback: compiles source as a global script where `let`/`const`
+    /// at top level behave as global var bindings (for $262.evalScript semantics).
+    script_eval_fn:
+        Option<Arc<dyn Fn(&str) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync>>,
     /// Microtask enqueue function for Promise callbacks.
     /// Set by otter-vm-runtime to enable proper microtask queuing from intrinsics.
     microtask_enqueue: Option<Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>>,
@@ -614,7 +654,9 @@ impl VmContext {
             function_prototype_intrinsic: None,
             generator_prototype_intrinsic: None,
             async_generator_prototype_intrinsic: None,
+            global_var_names: HashSet::new(),
             eval_fn: None,
+            script_eval_fn: None,
             microtask_enqueue: None,
             next_tick_enqueue: None,
             js_job_queue: None,
@@ -1201,6 +1243,16 @@ impl VmContext {
         self.global
     }
 
+    /// Record a global var-declared name (from DeclareGlobalVar).
+    pub fn add_global_var_name(&mut self, name: String) {
+        self.global_var_names.insert(name);
+    }
+
+    /// Check if a name was declared as a global var.
+    pub fn has_global_var_name(&self, name: &str) -> bool {
+        self.global_var_names.contains(name)
+    }
+
     /// Push a try handler for the current frame.
     pub fn push_try(&mut self, catch_pc: usize) {
         self.try_stack.push(TryHandler {
@@ -1337,6 +1389,31 @@ impl VmContext {
             .as_ref()
             .ok_or_else(|| VmError::type_error("eval() is not available in this context"))?;
         eval_fn(code, strict_context)
+    }
+
+    /// Set the script compiler callback for $262.evalScript semantics.
+    /// The callback compiles source as a global script where top-level `let`/`const`
+    /// behave as global property bindings (persisting across script evaluations).
+    pub fn set_script_eval_fn(
+        &mut self,
+        f: Arc<dyn Fn(&str) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync>,
+    ) {
+        self.script_eval_fn = Some(f);
+    }
+
+    /// Compile source as a global script (for $262.evalScript semantics).
+    /// Top-level `let`/`const` are treated as global var bindings.
+    /// Falls back to `compile_eval` if no script compiler is configured.
+    pub fn compile_global_script(
+        &self,
+        code: &str,
+    ) -> Result<otter_vm_bytecode::Module, VmError> {
+        if let Some(script_fn) = self.script_eval_fn.as_ref() {
+            script_fn(code)
+        } else {
+            // Fallback: use regular eval compilation
+            self.compile_eval(code, false)
+        }
     }
 
     /// Set the microtask enqueue callback used by Promise intrinsics.

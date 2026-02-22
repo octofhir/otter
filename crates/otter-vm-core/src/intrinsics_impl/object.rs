@@ -1111,7 +1111,12 @@ pub fn init_object_constructor(
                 .ok_or_else(|| "Object.defineProperty requires an object".to_string())?;
 
             // Per spec §20.1.2.4 step 1: TypeError if first argument is not an object
-            if obj_val.as_object().is_none() && obj_val.as_proxy().is_none() {
+            // Check all HeapRef variants that represent objects
+            if obj_val.as_object().is_none()
+                && obj_val.as_proxy().is_none()
+                && obj_val.as_function().is_none()
+                && obj_val.native_function_object().is_none()
+            {
                 return Err(VmError::type_error(
                     "Object.defineProperty called on non-object",
                 ));
@@ -1180,9 +1185,13 @@ pub fn init_object_constructor(
                 return Ok(obj_val.clone());
             }
 
-            let obj = obj_val.as_object().ok_or_else(|| {
-                "Object.defineProperty first argument must be an object".to_string()
-            })?;
+            let obj = obj_val
+                .as_object()
+                .or_else(|| obj_val.as_function().map(|f| f.object.clone()))
+                .or_else(|| obj_val.native_function_object())
+                .ok_or_else(|| {
+                    "Object.defineProperty first argument must be an object".to_string()
+                })?;
 
             let success = obj.define_own_property(key, &desc);
 

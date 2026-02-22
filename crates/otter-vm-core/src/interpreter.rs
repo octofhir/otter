@@ -653,6 +653,9 @@ impl Interpreter {
                         VmError::SyntaxError(message) => {
                             InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
                         }
+                        VmError::URIError(message) => {
+                            InstructionResult::Throw(self.make_error(ctx, "URIError", &message))
+                        }
                         other => {
                             while ctx.stack_depth() > prev_stack_depth {
                                 ctx.pop_frame();
@@ -789,10 +792,28 @@ impl Interpreter {
                         continue;
                     }
 
+                    // Check if we're unwinding through an async function frame.
+                    // If so, convert the error to a rejected promise instead of propagating.
+                    let is_async_frame = ctx
+                        .current_frame()
+                        .map(|f| f.is_async)
+                        .unwrap_or(false);
+
                     // Pop the frame we pushed and unwind to original depth
                     while ctx.stack_depth() > prev_stack_depth {
                         ctx.pop_frame();
                     }
+
+                    if is_async_frame {
+                        // Async function: wrap error in rejected promise
+                        let rejected = self.create_js_promise(
+                            ctx,
+                            JsPromise::rejected(error),
+                        );
+                        ctx.set_running(was_running);
+                        return Ok(rejected);
+                    }
+
                     ctx.set_running(was_running);
                     return Err(VmError::exception(error));
                 }
@@ -949,6 +970,9 @@ impl Interpreter {
                     VmError::SyntaxError(message) => {
                         InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
                     }
+                    VmError::URIError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "URIError", &message))
+                    }
                     other => return VmExecutionResult::Error(other.to_string()),
                 },
             };
@@ -1041,6 +1065,27 @@ impl Interpreter {
                         frame.pc = catch_pc;
 
                         ctx.set_exception(value);
+                        continue;
+                    }
+
+                    // Check if the current frame is async — if so, convert the
+                    // error to a rejected promise and continue in the caller.
+                    let is_async = ctx
+                        .current_frame()
+                        .map(|f| f.is_async)
+                        .unwrap_or(false);
+
+                    if is_async && ctx.stack_depth() > 1 {
+                        let return_reg = ctx
+                            .current_frame()
+                            .and_then(|f| f.return_register);
+                        ctx.pop_frame();
+                        cached_frame_id = usize::MAX;
+                        let rejected =
+                            self.create_js_promise(ctx, JsPromise::rejected(value));
+                        if let Some(reg) = return_reg {
+                            ctx.set_register(reg, rejected);
+                        }
                         continue;
                     }
 
@@ -1373,6 +1418,9 @@ impl Interpreter {
                     VmError::SyntaxError(message) => {
                         InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
                     }
+                    VmError::URIError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "URIError", &message))
+                    }
                     other => return Err(other),
                 },
             };
@@ -1449,6 +1497,28 @@ impl Interpreter {
                         frame.pc = catch_pc;
 
                         ctx.set_exception(value);
+                        continue;
+                    }
+
+                    // Check if the current frame is async — if so, convert the
+                    // error to a rejected promise and return it to the caller
+                    // instead of propagating as an uncaught exception.
+                    let is_async = ctx
+                        .current_frame()
+                        .map(|f| f.is_async)
+                        .unwrap_or(false);
+                    let return_reg = ctx
+                        .current_frame()
+                        .and_then(|f| f.return_register);
+
+                    if is_async && ctx.stack_depth() > 1 {
+                        ctx.pop_frame();
+                        cached_frame_id = usize::MAX;
+                        let rejected =
+                            self.create_js_promise(ctx, JsPromise::rejected(value));
+                        if let Some(reg) = return_reg {
+                            ctx.set_register(reg, rejected);
+                        }
                         continue;
                     }
 
@@ -1959,6 +2029,37 @@ impl Interpreter {
                     );
                 }
                 ctx.set_register(dst.0, value);
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::DeclareGlobalVar { name, configurable } => {
+                let name_const = module
+                    .constants
+                    .get(name.0)
+                    .ok_or_else(|| VmError::internal("constant not found"))?;
+                let name_str = name_const
+                    .as_string()
+                    .ok_or_else(|| VmError::internal("expected string constant"))?;
+                let key = Self::utf16_key(name_str);
+                // Track var-declared names for GlobalDeclarationInstantiation collision checks
+                ctx.add_global_var_name(String::from_utf16_lossy(name_str));
+                let global = ctx.global();
+                if !global.has_own(&key) {
+                    // Per spec: B.3.3.2 (global script) uses CreateGlobalFunctionBinding(F, undefined, false)
+                    // → configurable=false. B.3.3.3 (eval) uses configurable=true.
+                    use crate::object::{PropertyAttributes, PropertyDescriptor};
+                    global.define_property(
+                        key,
+                        PropertyDescriptor::data_with_attrs(
+                            Value::undefined(),
+                            PropertyAttributes {
+                                writable: true,
+                                enumerable: true,
+                                configurable: *configurable,
+                            },
+                        ),
+                    );
+                }
                 Ok(InstructionResult::Continue)
             }
 
@@ -2846,6 +2947,14 @@ impl Interpreter {
                 }
             }
 
+            Instruction::JumpIfNotNullish { src, offset } => {
+                if !ctx.get_register(src.0).is_nullish() {
+                    Ok(InstructionResult::Jump(offset.0))
+                } else {
+                    Ok(InstructionResult::Continue)
+                }
+            }
+
             // ==================== Exception Handling ====================
             Instruction::TryStart { catch_offset } => {
                 let pc = ctx
@@ -3564,6 +3673,10 @@ impl Interpreter {
                         ctx.set_pending_args(args);
                         ctx.set_pending_this(Value::undefined());
                         ctx.set_pending_is_derived(true);
+
+                        // Set callee_value so CallSuper can find the super constructor
+                        // via Object.getPrototypeOf(callee) (static inheritance chain)
+                        ctx.set_pending_callee_value(func_value.clone());
 
                         // Set home_object = the constructor's .prototype
                         // (used by super() to find the parent constructor)
@@ -4642,11 +4755,21 @@ impl Interpreter {
                 ctx.set_pending_this(caller_this);
 
                 let injected_eval_bindings = self.inject_eval_bindings(ctx);
+
+                // Detect if eval is running inside a function (not at global/module level).
+                // Function-scope eval needs cleanup of any new global properties afterwards.
+                let is_function_scope_eval = ctx.stack_depth() > 1;
+                let global_keys_before = if is_function_scope_eval {
+                    Some(ctx.global().own_keys())
+                } else {
+                    None
+                };
+
                 let eval_result = (|| {
                     let eval_module = ctx.compile_eval(&source, is_strict_context)?;
                     self.execute_eval_module(ctx, &eval_module)
                 })();
-                self.cleanup_eval_bindings(ctx, &injected_eval_bindings);
+                self.cleanup_eval_bindings(ctx, &injected_eval_bindings, global_keys_before.as_deref());
 
                 let result = eval_result?;
                 ctx.set_register(dst.0, result);
@@ -7001,6 +7124,12 @@ impl Interpreter {
                 // Call the iterator method with obj as `this`
                 if let Some(native_fn) = iterator_fn.as_native_function() {
                     let iterator = self.call_native_fn(ctx, native_fn, &obj, &[])?;
+                    // Per spec: If Type(iterator) is not Object, throw a TypeError
+                    if !iterator.is_object() {
+                        return Err(VmError::type_error(
+                            "Result of the Symbol.asyncIterator method is not an object",
+                        ));
+                    }
                     ctx.set_register(dst.0, iterator);
                     Ok(InstructionResult::Continue)
                 } else if let Some(closure) = iterator_fn.as_function() {
@@ -7078,6 +7207,47 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
+            Instruction::IteratorClose { iter } => {
+                // Spec 7.4.6 IteratorClose
+                let iterator = ctx.get_register(iter.0).clone();
+
+                // 1. GetMethod(iterator, "return")
+                let return_method = if let Some(obj) = iterator.as_object() {
+                    obj.get(&PropertyKey::string("return"))
+                        .unwrap_or(Value::undefined())
+                } else {
+                    Value::undefined()
+                };
+
+                // 2. If return is undefined or null, return (normal completion)
+                if return_method.is_undefined() || return_method.is_null() {
+                    return Ok(InstructionResult::Continue);
+                }
+
+                // 3. If not callable, throw TypeError
+                if !return_method.is_callable() {
+                    return Err(VmError::type_error(
+                        "iterator.return is not a function",
+                    ));
+                }
+
+                // 4. Call return method with iterator as this
+                let inner_result = if let Some(native_fn) = return_method.as_native_function() {
+                    self.call_native_fn(ctx, native_fn, &iterator, &[])?
+                } else {
+                    return Err(VmError::type_error("iterator.return is not a function"));
+                };
+
+                // 5. If result is not an object, throw TypeError
+                if !inner_result.is_object() && inner_result.as_proxy().is_none() {
+                    return Err(VmError::type_error(
+                        "Iterator result is not an object",
+                    ));
+                }
+
+                Ok(InstructionResult::Continue)
+            }
+
             // Catch-all for unimplemented instructions
             // TODO: Task List
             // [x] Phase 3 Implementation: GC Integration [x]
@@ -7105,32 +7275,68 @@ impl Interpreter {
                     // Derived class: set up prototype chain
                     let super_value = ctx.get_register(super_reg.0).clone();
 
-                    // Validate superclass is callable (or null for extends null)
+                    // Validate superclass per spec 15.7.14 ClassDefinitionEvaluation:
+                    // Step 5.e: if superclass === null (strict equality, NOT abstract)
+                    // Step 5.f: if IsConstructor(superclass) is false, throw TypeError
                     if super_value.is_null() {
                         // extends null: create prototype with null __proto__
                         let derived_proto = GcRef::new(JsObject::new(Value::null(), mm.clone()));
 
-                        // Set ctor.prototype = derived_proto
                         let proto_key = PropertyKey::string("prototype");
                         if let Some(ctor_obj) = ctor_value.as_object() {
                             let _ = ctor_obj.set(proto_key, Value::object(derived_proto.clone()));
-                            // Set derived_proto.constructor = ctor
                             let ctor_key = PropertyKey::string("constructor");
                             let _ = derived_proto.set(ctor_key, ctor_value.clone());
                         }
-                    } else if let Some(super_obj) = super_value.as_object() {
+                    } else {
+                        // Step 5.f: IsConstructor check.
+                        // In our VM, only HeapRef::Function closures (non-arrow, non-generator,
+                        // non-async) are constructors. NativeFunction is NOT a constructor.
+                        let is_constructor = if let Some(c) = super_value.as_function() {
+                            let is_arrow = c
+                                .module
+                                .function(c.function_index)
+                                .map(|f| f.is_arrow())
+                                .unwrap_or(false);
+                            !is_arrow && !c.is_generator && !c.is_async
+                        } else if super_value.as_native_function().is_some() {
+                            // Native functions can be constructors unless marked non-constructor
+                            if let Some(obj) = super_value.as_object() {
+                                !obj.get(&PropertyKey::string("__non_constructor"))
+                                    .map_or(false, |v| v.is_boolean() && v == Value::boolean(true))
+                            } else {
+                                true
+                            }
+                        } else {
+                            false
+                        };
+
+                        if !is_constructor {
+                            return Err(VmError::TypeError(
+                                "Class extends value is not a constructor or null".to_string(),
+                            ));
+                        }
+
+                        // Get the underlying JsObject for property lookup
+                        // (as_object() works for all HeapRef variants that represent objects)
+                        let super_obj = super_value.as_object().ok_or_else(|| {
+                            VmError::TypeError(
+                                "Class extends value is not a constructor or null".to_string(),
+                            )
+                        })?;
+
                         // Get super.prototype
                         let proto_key = PropertyKey::string("prototype");
                         let super_proto_val =
                             super_obj.get(&proto_key).unwrap_or_else(Value::undefined);
 
-                        // super.prototype must be object or null
+                        // super.prototype must be object or null (spec step 5.g.ii)
                         let super_proto = if super_proto_val.is_null() {
                             None
-                        } else if let Some(proto_obj) = super_proto_val.as_object() {
-                            Some(proto_obj)
+                        } else if super_proto_val.is_object() {
+                            // as_object() covers Function, NativeFunction, Array, etc.
+                            super_proto_val.as_object()
                         } else if super_proto_val.is_undefined() {
-                            // No .prototype property — treat as undefined → create with no parent
                             None
                         } else {
                             return Err(VmError::TypeError(
@@ -7151,29 +7357,12 @@ impl Interpreter {
                                 PropertyKey::string("prototype"),
                                 Value::object(derived_proto.clone()),
                             );
-                            // Set derived_proto.constructor = ctor
                             let _ = derived_proto
                                 .set(PropertyKey::string("constructor"), ctor_value.clone());
                             // Static inheritance: ctor.__proto__ = super
-                            ctor_obj.set_prototype(Value::object(super_obj));
+                            // Preserve original HeapRef variant
+                            ctor_obj.set_prototype(super_value.clone());
                         }
-                    } else if super_value.is_function() || super_value.is_native_function() {
-                        // Superclass is a function (but not an object with .prototype on HeapRef::Object)
-                        // This handles NativeFunction or Function HeapRef variants
-                        // For now, create a basic prototype chain
-                        let derived_proto = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-                        if let Some(ctor_obj) = ctor_value.as_object() {
-                            let _ = ctor_obj.set(
-                                PropertyKey::string("prototype"),
-                                Value::object(derived_proto.clone()),
-                            );
-                            let _ = derived_proto
-                                .set(PropertyKey::string("constructor"), ctor_value.clone());
-                        }
-                    } else {
-                        return Err(VmError::TypeError(
-                            "Class extends value is not a constructor or null".to_string(),
-                        ));
                     }
                 } else {
                     // Base class: ctor already has a .prototype from Closure creation
@@ -7198,7 +7387,7 @@ impl Interpreter {
                 args: args_base,
                 argc,
             } => {
-                // Get the current frame's home_object to find the superclass
+                // Get the current frame's home_object and callee to find the superclass
                 let frame = ctx
                     .current_frame()
                     .ok_or_else(|| VmError::internal("no frame for CallSuper"))?;
@@ -7215,14 +7404,26 @@ impl Interpreter {
                     .clone()
                     .unwrap_or_else(|| home_object.clone());
 
-                // Get the superclass constructor: Object.getPrototypeOf(home_object)
-                let super_proto = home_object.prototype().as_object().ok_or_else(|| {
-                    VmError::TypeError("Super constructor is not a constructor".to_string())
-                })?;
-
-                // The super constructor is the .constructor of the prototype's prototype
-                let ctor_key = PropertyKey::string("constructor");
-                let super_ctor_val = super_proto.get(&ctor_key).unwrap_or_else(Value::undefined);
+                // Per spec: GetSuperConstructor() = Object.getPrototypeOf(activeFunction)
+                // The super constructor is found via the static inheritance chain of the
+                // constructor function itself, NOT via the prototype chain of instances.
+                // Use callee_value.__proto__ (set during Construct), falling back to the
+                // old approach of home_object.__proto__.constructor for compatibility.
+                let super_ctor_val = if let Some(callee) = frame.callee_value.clone() {
+                    // Correct per spec: Object.getPrototypeOf(callee)
+                    if let Some(callee_obj) = callee.as_object() {
+                        callee_obj.prototype()
+                    } else {
+                        Value::undefined()
+                    }
+                } else {
+                    // Fallback: walk through home_object.__proto__.constructor
+                    let super_proto = home_object.prototype().as_object().ok_or_else(|| {
+                        VmError::TypeError("Super constructor is not a constructor".to_string())
+                    })?;
+                    let ctor_key = PropertyKey::string("constructor");
+                    super_proto.get(&ctor_key).unwrap_or_else(Value::undefined)
+                };
 
                 // Collect arguments from registers
                 let mut args = Vec::with_capacity(*argc as usize);
@@ -7343,12 +7544,20 @@ impl Interpreter {
                     args.push(ctx.get_local(i as u16)?);
                 }
 
-                // Get the superclass constructor
-                let super_proto = home_object.prototype().as_object().ok_or_else(|| {
-                    VmError::TypeError("Super constructor is not a constructor".to_string())
-                })?;
-                let ctor_key = PropertyKey::string("constructor");
-                let super_ctor_val = super_proto.get(&ctor_key).unwrap_or_else(Value::undefined);
+                // Per spec: GetSuperConstructor() = Object.getPrototypeOf(activeFunction)
+                let super_ctor_val = if let Some(callee) = frame.callee_value.clone() {
+                    if let Some(callee_obj) = callee.as_object() {
+                        callee_obj.prototype()
+                    } else {
+                        Value::undefined()
+                    }
+                } else {
+                    let super_proto = home_object.prototype().as_object().ok_or_else(|| {
+                        VmError::TypeError("Super constructor is not a constructor".to_string())
+                    })?;
+                    let ctor_key = PropertyKey::string("constructor");
+                    super_proto.get(&ctor_key).unwrap_or_else(Value::undefined)
+                };
                 let mm = ctx.memory_manager().clone();
 
                 let super_is_derived = super_ctor_val
@@ -7458,11 +7667,20 @@ impl Interpreter {
                     .clone()
                     .unwrap_or_else(|| home_object.clone());
 
-                let super_proto = home_object.prototype().as_object().ok_or_else(|| {
-                    VmError::TypeError("Super constructor is not a constructor".to_string())
-                })?;
-                let ctor_key = PropertyKey::string("constructor");
-                let super_ctor_val = super_proto.get(&ctor_key).unwrap_or_else(Value::undefined);
+                // Per spec: GetSuperConstructor() = Object.getPrototypeOf(activeFunction)
+                let super_ctor_val = if let Some(callee) = frame.callee_value.clone() {
+                    if let Some(callee_obj) = callee.as_object() {
+                        callee_obj.prototype()
+                    } else {
+                        Value::undefined()
+                    }
+                } else {
+                    let super_proto = home_object.prototype().as_object().ok_or_else(|| {
+                        VmError::TypeError("Super constructor is not a constructor".to_string())
+                    })?;
+                    let ctor_key = PropertyKey::string("constructor");
+                    super_proto.get(&ctor_key).unwrap_or_else(Value::undefined)
+                };
                 let mm = ctx.memory_manager().clone();
 
                 let super_is_derived = super_ctor_val
@@ -8200,14 +8418,39 @@ impl Interpreter {
         // Check if it's a native function
         if let Some(native_fn) = func.as_native_function() {
             let realm_id = self.realm_id_for_function(ctx, func);
-            return self.call_native_fn_with_realm(
+
+            // Create a new `this` object with the constructor's prototype
+            let ctor_proto = func
+                .as_object()
+                .and_then(|o| o.get(&PropertyKey::string("prototype")))
+                .and_then(|v| v.as_object())
+                .or_else(|| self.default_object_prototype_for_constructor(ctx, func));
+            let new_obj = GcRef::new(JsObject::new(
+                ctor_proto
+                    .map(Value::object)
+                    .unwrap_or_else(Value::null),
+                ctx.memory_manager().clone(),
+            ));
+            let new_obj_value = Value::object(new_obj);
+
+            let result = self.call_native_fn_with_realm(
                 ctx,
                 native_fn,
-                &this_value,
+                &new_obj_value,
                 args,
                 Some(realm_id),
                 true,
-            );
+            )?;
+
+            // Per spec: if constructor returns an object, use it; otherwise use `this`
+            if result.is_object()
+                || result.is_data_view()
+                || result.is_array_buffer()
+                || result.is_typed_array()
+            {
+                return Ok(result);
+            }
+            return Ok(new_obj_value);
         }
 
         // Regular closure call
@@ -8775,7 +9018,10 @@ impl Interpreter {
         }
     }
 
-    fn inject_eval_bindings(&self, ctx: &mut VmContext) -> Vec<PropertyKey> {
+    /// Inject the calling function's local variables onto the global object so that
+    /// direct eval code can access and modify them. Returns a list of (key, local_index)
+    /// pairs for cleanup and writeback after eval completes.
+    fn inject_eval_bindings(&self, ctx: &mut VmContext) -> Vec<(PropertyKey, u16)> {
         let mut injected = Vec::new();
         let Some(frame) = ctx.current_frame() else {
             return injected;
@@ -8805,16 +9051,46 @@ impl Interpreter {
                 continue;
             };
             if global.set(key, value).is_ok() {
-                injected.push(key);
+                injected.push((key, index as u16));
             }
         }
 
         injected
     }
 
-    fn cleanup_eval_bindings(&self, ctx: &mut VmContext, injected: &[PropertyKey]) {
+    /// Clean up after direct eval execution:
+    /// 1. Remove temporary global properties created during eval (for function-scope eval)
+    /// 2. Sync modified values back to outer function locals
+    /// 3. Remove injected local→global mirrors
+    fn cleanup_eval_bindings(
+        &self,
+        ctx: &mut VmContext,
+        injected: &[(PropertyKey, u16)],
+        global_keys_before: Option<&[PropertyKey]>,
+    ) {
         let global = ctx.global();
-        for key in injected {
+
+        // For function-scope eval: remove any new global properties that were created
+        // during eval execution (e.g. block-level function var bindings). These should
+        // be scoped to the function's varEnv, not the global.
+        if let Some(before_keys) = global_keys_before {
+            let before_set: rustc_hash::FxHashSet<PropertyKey> =
+                before_keys.iter().copied().collect();
+            let current_keys = global.own_keys();
+            for key in &current_keys {
+                if !before_set.contains(key) {
+                    let _ = global.delete(key);
+                }
+            }
+        }
+
+        // Sync modified values back to outer function locals, then remove from global
+        for (key, local_idx) in injected {
+            if let Some(PropertyDescriptor::Data { value, .. }) =
+                global.get_own_property_descriptor(key)
+            {
+                let _ = ctx.set_local(*local_idx, value);
+            }
             let _ = global.delete(key);
         }
     }
@@ -8822,7 +9098,7 @@ impl Interpreter {
     /// Get a property from an object, walking the prototype chain with proxy trap support.
     /// Unlike `JsObject::get()` which transparently bypasses proxy traps in the prototype chain,
     /// this method properly dispatches to `proxy_get` when a Proxy is encountered.
-    fn get_with_proxy_chain(
+    pub(crate) fn get_with_proxy_chain(
         &self,
         ctx: &mut VmContext,
         obj: &GcRef<JsObject>,
@@ -9662,6 +9938,15 @@ impl Interpreter {
 
         // null == undefined
         if (left.is_null() && right.is_undefined()) || (left.is_undefined() && right.is_null()) {
+            return Ok(true);
+        }
+
+        // [[IsHTMLDDA]] == null/undefined (Annex B)
+        // IsHTMLDDA objects are treated as null/undefined for abstract equality.
+        if left.is_htmldda() && (right.is_null() || right.is_undefined()) {
+            return Ok(true);
+        }
+        if right.is_htmldda() && (left.is_null() || left.is_undefined()) {
             return Ok(true);
         }
 
@@ -10563,6 +10848,9 @@ impl Interpreter {
                     }
                     VmError::SyntaxError(message) => {
                         InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
+                    }
+                    VmError::URIError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "URIError", &message))
                     }
                     other => {
                         generator.complete();

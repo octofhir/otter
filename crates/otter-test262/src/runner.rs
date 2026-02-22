@@ -516,12 +516,18 @@ impl Test262Runner {
         // Build test source with harness
         let mut test_source = String::new();
 
+        // For strict mode, put "use strict" first so the entire script (including harness)
+        // runs in strict mode. This ensures parse-phase negative tests detect SyntaxErrors.
+        if mode == ExecutionMode::Strict {
+            test_source.push_str("\"use strict\";\n");
+        }
+
         // Add default harness files (sta.js and assert.js)
         let mut includes = vec!["sta.js".to_string(), "assert.js".to_string()];
 
-        // For async tests, add donePrintHandle.js
-        if metadata.is_async() && !includes.contains(&"donePrintHandle.js".to_string()) {
-            includes.push("donePrintHandle.js".to_string());
+        // For async tests, add doneprintHandle.js
+        if metadata.is_async() && !includes.contains(&"doneprintHandle.js".to_string()) {
+            includes.push("doneprintHandle.js".to_string());
         }
 
         // Add explicitly requested harness files
@@ -551,13 +557,7 @@ impl Test262Runner {
             .find("---*/")
             .map(|i| &content[i + 5..])
             .unwrap_or(content);
-        if mode == ExecutionMode::Strict {
-            // Keep strict semantics without an extra eval scope.
-            test_source.push_str("\"use strict\";\n");
-            test_source.push_str(test_content);
-        } else {
-            test_source.push_str(test_content);
-        }
+        test_source.push_str(test_content);
 
         // Clear harness state before running the test
         self.harness_state.clear();

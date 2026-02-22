@@ -12,9 +12,12 @@ pub enum VariableKind {
     /// const declaration (block-scoped, non-re-declarable, immutable)
     Const,
     /// Annex B block-level function declaration lexical binding (sloppy mode).
-    AnnexBFunction,
+    BlockScopedFunction,
     /// Function parameter binding.
     Parameter,
+    /// Simple catch parameter (BindingIdentifier). Per B.3.5, var declarations
+    /// with the same name are allowed and reuse the catch parameter's local.
+    CatchParameter,
 }
 
 impl VariableKind {
@@ -114,11 +117,17 @@ impl ScopeChain {
         if kind == VariableKind::Var {
             // Early error: a `var` declaration conflicts with any existing lexical binding
             // in this scope chain up to (and including) the function scope.
+            // Per B.3.5: simple catch parameters (CatchParameter kind) allow `var` redeclaration.
+            let mut catch_param_index = None;
             let mut scope_idx = current_idx;
             loop {
                 if let Some(existing) = self.scopes[scope_idx].bindings.get(name) {
-                    if existing.kind != VariableKind::Var
-                        && existing.kind != VariableKind::AnnexBFunction
+                    if existing.kind == VariableKind::CatchParameter {
+                        // B.3.5: var redeclaration of simple catch parameter is allowed.
+                        // The var writes to the catch parameter's local.
+                        catch_param_index = Some(existing.index);
+                    } else if existing.kind != VariableKind::Var
+                        && existing.kind != VariableKind::BlockScopedFunction
                         && existing.kind != VariableKind::Parameter
                     {
                         return None;
@@ -142,6 +151,12 @@ impl ScopeChain {
                     break;
                 }
                 scope_idx = self.scopes[scope_idx].parent?;
+            }
+
+            // B.3.5: If there's a catch parameter with the same name, reuse its local.
+            // The var binds to the catch parameter, NOT hoisted to function scope.
+            if let Some(idx) = catch_param_index {
+                return Some(idx);
             }
 
             // Hoist the binding to the function scope.
@@ -177,7 +192,7 @@ impl ScopeChain {
 
         // Check for redeclaration in current lexical scope.
         if let Some(existing) = self.scopes[current_idx].bindings.get(name) {
-            if kind == VariableKind::AnnexBFunction && existing.kind == VariableKind::AnnexBFunction
+            if kind == VariableKind::BlockScopedFunction && existing.kind == VariableKind::BlockScopedFunction
             {
                 return Some(existing.index);
             }
@@ -205,7 +220,10 @@ impl ScopeChain {
     /// Unlike normal `var` declarations this does not mark `var_declared_names`
     /// on lexical scopes, because it is paired with a block-level function
     /// lexical binding in the same statement list.
-    pub fn declare_annex_b_var_extension(&mut self, name: &str) -> Option<u16> {
+    ///
+    /// Returns `Some((index, is_new))` where `is_new` is true if a fresh binding was created,
+    /// false if an existing Var/Parameter binding was reused (should NOT be reinitialized).
+    pub fn declare_block_function_var_extension(&mut self, name: &str) -> Option<(u16, bool)> {
         let current_idx = self.current?;
         let function_scope_idx = self.current_function_scope_index()?;
 
@@ -213,7 +231,7 @@ impl ScopeChain {
         loop {
             if let Some(existing) = self.scopes[scope_idx].bindings.get(name) {
                 if existing.kind != VariableKind::Var
-                    && existing.kind != VariableKind::AnnexBFunction
+                    && existing.kind != VariableKind::BlockScopedFunction
                     && existing.kind != VariableKind::Parameter
                 {
                     return None;
@@ -227,7 +245,7 @@ impl ScopeChain {
 
         if let Some(existing) = self.scopes[function_scope_idx].bindings.get(name) {
             if existing.kind == VariableKind::Var || existing.kind == VariableKind::Parameter {
-                return Some(existing.index);
+                return Some((existing.index, false));
             }
         }
 
@@ -242,7 +260,7 @@ impl ScopeChain {
                 name: name.to_string(),
             },
         );
-        Some(index)
+        Some((index, true))
     }
 
     fn current_function_scope_index(&self) -> Option<usize> {
@@ -254,6 +272,25 @@ impl ScopeChain {
             }
             scope_idx = scope.parent?;
         }
+    }
+
+    /// Check if a name is bound as a CatchParameter in any enclosing scope
+    /// (up to but not including the function scope). Returns the local index if found.
+    pub fn find_catch_parameter(&self, name: &str) -> Option<u16> {
+        let mut scope_idx = self.current?;
+        loop {
+            let scope = &self.scopes[scope_idx];
+            if let Some(binding) = scope.bindings.get(name) {
+                if binding.kind == VariableKind::CatchParameter {
+                    return Some(binding.index);
+                }
+            }
+            if scope.is_function {
+                break;
+            }
+            scope_idx = scope.parent?;
+        }
+        None
     }
 
     /// Resolve a variable
@@ -359,6 +396,22 @@ impl ScopeChain {
         let idx = self.scopes[fs].next_local;
         self.scopes[fs].next_local += 1;
         Some(idx)
+    }
+
+    /// Collect parameter names from the current function scope.
+    ///
+    /// Returns names of all bindings with `VariableKind::Parameter`.
+    /// Used by Annex B hoisting to check "F is not an element of parameterNames".
+    pub fn collect_parameter_names(&self) -> HashSet<String> {
+        let Some(idx) = self.current_function_scope_index() else {
+            return HashSet::new();
+        };
+        self.scopes[idx]
+            .bindings
+            .values()
+            .filter(|b| b.kind == VariableKind::Parameter)
+            .map(|b| b.name.clone())
+            .collect()
     }
 
     /// Collect all local names in the current function scope chain.

@@ -22,6 +22,10 @@ pub enum VmError {
     #[error("SyntaxError: {0}")]
     SyntaxError(String),
 
+    /// URI error (malformed URI sequence)
+    #[error("URIError: {0}")]
+    URIError(String),
+
     /// Internal error
     #[error("InternalError: {0}")]
     InternalError(String),
@@ -96,6 +100,11 @@ impl VmError {
     /// Create a syntax error
     pub fn syntax_error(msg: impl Into<String>) -> Self {
         Self::SyntaxError(msg.into())
+    }
+
+    /// Create a URI error
+    pub fn uri_error(msg: impl Into<String>) -> Self {
+        Self::URIError(msg.into())
     }
 
     /// Create an internal error

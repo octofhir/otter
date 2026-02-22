@@ -706,11 +706,25 @@ fn reflect_construct(
 
     let args_array = value_to_array_args(args_list)?;
 
-    let default_proto = default_proto_for_construct(ncx, target, &new_target);
-    let proto = ncx
-        .get_prototype_from_constructor_with_default(&new_target, default_proto)
-        .map(Value::object)
-        .unwrap_or_else(Value::null);
+    // GetPrototypeFromConstructor(newTarget, intrinsicDefaultProto)
+    // Must use observable [[Get]] to trigger accessors on newTarget.prototype
+    let proto = if let Some(nt_obj) = new_target.as_object() {
+        let proto_val = ncx.get_property(&nt_obj, &crate::object::PropertyKey::string("prototype"))?;
+        if proto_val.is_object() {
+            proto_val
+        } else {
+            // Fall back to default prototype
+            let default_proto = default_proto_for_construct(ncx, target, &new_target);
+            default_proto
+                .map(Value::object)
+                .unwrap_or_else(Value::null)
+        }
+    } else {
+        let default_proto = default_proto_for_construct(ncx, target, &new_target);
+        default_proto
+            .map(Value::object)
+            .unwrap_or_else(Value::null)
+    };
     let new_obj = GcRef::new(JsObject::new(proto, ncx.memory_manager().clone()));
     let this_val = Value::object(new_obj);
 

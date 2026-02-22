@@ -28,6 +28,8 @@ pub struct TestReport {
     pub by_feature: HashMap<String, FeatureReport>,
     /// Failed test details
     pub failures: Vec<FailureInfo>,
+    /// Timed out test paths
+    pub timeouts: Vec<String>,
 }
 
 /// Per-feature report
@@ -67,6 +69,7 @@ impl TestReport {
             pass_rate: 0.0,
             by_feature: HashMap::new(),
             failures: Vec::new(),
+            timeouts: Vec::new(),
         };
 
         for result in results {
@@ -81,7 +84,10 @@ impl TestReport {
                     });
                 }
                 TestOutcome::Skip => report.skipped += 1,
-                TestOutcome::Timeout => report.timeout += 1,
+                TestOutcome::Timeout => {
+                    report.timeout += 1;
+                    report.timeouts.push(result.path.clone());
+                }
                 TestOutcome::Crash => report.crashed += 1,
             }
 
@@ -124,6 +130,14 @@ impl TestReport {
         println!("Skipped: {}", self.skipped.to_string().yellow());
         println!("Timeout: {}", self.timeout);
         println!("Crashed: {}", self.crashed);
+
+        if !self.timeouts.is_empty() {
+            println!();
+            println!("{}", "=== Timeouts ===".bold().magenta());
+            for t in &self.timeouts {
+                println!("  {}", t.magenta());
+            }
+        }
 
         if !self.failures.is_empty() {
             println!();
@@ -201,6 +215,7 @@ pub struct RunSummary {
     pub by_feature: HashMap<String, FeatureReport>,
     pub by_edition: HashMap<editions::EsEdition, editions::EditionReport>,
     pub failures: Vec<FailureInfo>,
+    pub timeouts: Vec<String>,
     pub all_results: Vec<TestResult>,
     pub max_failures: usize,
 }
@@ -217,6 +232,7 @@ impl RunSummary {
             by_feature: HashMap::new(),
             by_edition: HashMap::new(),
             failures: Vec::new(),
+            timeouts: Vec::new(),
             all_results: Vec::new(),
             max_failures,
         }
@@ -237,7 +253,10 @@ impl RunSummary {
                 }
             }
             TestOutcome::Skip => self.skipped += 1,
-            TestOutcome::Timeout => self.timeout += 1,
+            TestOutcome::Timeout => {
+                self.timeout += 1;
+                self.timeouts.push(result.path.clone());
+            }
             TestOutcome::Crash => self.crashed += 1,
         }
 
@@ -298,6 +317,7 @@ impl RunSummary {
             pass_rate,
             by_feature: self.by_feature,
             failures: self.failures,
+            timeouts: self.timeouts,
         }
     }
 }

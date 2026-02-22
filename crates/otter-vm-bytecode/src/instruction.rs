@@ -44,6 +44,10 @@ pub enum Opcode {
     LoadThis = 0x16,
     /// Close upvalue: move local to heap cell when leaving scope
     CloseUpvalue = 0x17,
+    /// Declare a global var binding, initializing to undefined only if the property doesn't
+    /// already exist. Used by eval Annex B hoisting to avoid overwriting existing bindings
+    /// (e.g. outer function parameters injected onto the global for direct eval).
+    DeclareGlobalVar = 0x18,
 
     // ==================== Arithmetic ====================
     /// Addition: dst = lhs + rhs
@@ -208,6 +212,8 @@ pub enum Opcode {
     ForInNext = 0xB2,
     /// Get async iterator: dst = obj[Symbol.asyncIterator]() or fallback to Symbol.iterator
     GetAsyncIterator = 0xB3,
+    /// Close iterator: call iterator.return() if it exists
+    IteratorClose = 0xB4,
 
     // ==================== Class ====================
     /// Define class
@@ -277,6 +283,7 @@ impl Opcode {
             0x15 => Some(Self::SetGlobal),
             0x16 => Some(Self::LoadThis),
             0x17 => Some(Self::CloseUpvalue),
+            0x18 => Some(Self::DeclareGlobalVar),
 
             0x20 => Some(Self::Add),
             0x21 => Some(Self::Sub),
@@ -359,6 +366,7 @@ impl Opcode {
             0xB1 => Some(Self::IteratorNext),
             0xB2 => Some(Self::ForInNext),
             0xB3 => Some(Self::GetAsyncIterator),
+            0xB4 => Some(Self::IteratorClose),
 
             0xC0 => Some(Self::DefineClass),
             0xC1 => Some(Self::GetSuper),
@@ -413,6 +421,7 @@ impl Opcode {
             Self::SetGlobal => "SetGlobal",
             Self::LoadThis => "LoadThis",
             Self::CloseUpvalue => "CloseUpvalue",
+            Self::DeclareGlobalVar => "DeclareGlobalVar",
             // Arithmetic
             Self::Add => "Add",
             Self::Sub => "Sub",
@@ -495,6 +504,7 @@ impl Opcode {
             Self::IteratorNext => "IteratorNext",
             Self::ForInNext => "ForInNext",
             Self::GetAsyncIterator => "GetAsyncIterator",
+            Self::IteratorClose => "IteratorClose",
             // Class
             Self::DefineClass => "DefineClass",
             Self::GetSuper => "GetSuper",
@@ -593,6 +603,13 @@ pub enum Instruction {
     CloseUpvalue {
         /// Index of the local variable to close
         local_idx: LocalIndex,
+    },
+    /// Declare a global var binding: sets the global to `undefined` only if the
+    /// property does not already exist. Used by Annex B hoisting to create bindings.
+    /// `configurable`: true for eval code (B.3.3.3), false for global script code (B.3.3.2).
+    DeclareGlobalVar {
+        name: ConstantIndex,
+        configurable: bool,
     },
 
     // Arithmetic (generic, with type feedback)
@@ -989,6 +1006,12 @@ pub enum Instruction {
         dst: Register,
         obj: Register,
         offset: JumpOffset,
+    },
+    /// Close an iterator by calling iterator.return() if it exists.
+    /// Per spec 7.4.6 IteratorClose: if return method exists, call it.
+    /// If return method is not a function but exists, throw TypeError.
+    IteratorClose {
+        iter: Register,
     },
 
     // Class

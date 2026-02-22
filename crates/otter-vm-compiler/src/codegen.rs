@@ -441,8 +441,14 @@ impl CodeGen {
     }
 
     /// Declare an Annex B synthetic var-extension binding.
-    pub fn declare_annex_b_var_extension(&mut self, name: &str) -> Option<u16> {
-        self.current.scopes.declare_annex_b_var_extension(name)
+    /// Returns `Some((index, is_new))` — `is_new` is true if newly created.
+    pub fn declare_block_function_var_extension(&mut self, name: &str) -> Option<(u16, bool)> {
+        self.current.scopes.declare_block_function_var_extension(name)
+    }
+
+    /// Check if name is a CatchParameter in the enclosing scope chain.
+    pub fn find_catch_parameter(&self, name: &str) -> Option<u16> {
+        self.current.scopes.find_catch_parameter(name)
     }
 
     /// Declare a variable (is_const: true = Const, false = Let)

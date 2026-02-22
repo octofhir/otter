@@ -1238,6 +1238,7 @@ fn vm_error_to_rejection_value(ncx: &mut NativeContext, err: VmError) -> Value {
         VmError::ReferenceError(msg) => construct_error_object(ncx, "ReferenceError", &msg),
         VmError::RangeError(msg) => construct_error_object(ncx, "RangeError", &msg),
         VmError::SyntaxError(msg) => construct_error_object(ncx, "SyntaxError", &msg),
+        VmError::URIError(msg) => construct_error_object(ncx, "URIError", &msg),
         VmError::InternalError(msg) => construct_error_object(ncx, "Error", &msg),
         VmError::StackOverflow => {
             construct_error_object(ncx, "RangeError", "Maximum call stack size exceeded")

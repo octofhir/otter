@@ -889,6 +889,14 @@ impl Interpreter {
                 }
                 // Check for GC trigger at safepoint
                 ctx.maybe_collect_garbage();
+                // Execute pending FinalizationRegistry cleanup callbacks
+                if crate::weak_gc::has_pending_cleanups() {
+                    let cleanups = crate::weak_gc::drain_pending_cleanups();
+                    for (callback, held_value) in cleanups {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        let _ = ncx.call_function(&callback, Value::undefined(), &[held_value]);
+                    }
+                }
                 // Update debug snapshot
                 ctx.update_debug_snapshot();
             }
@@ -1305,6 +1313,14 @@ impl Interpreter {
                 }
                 // Check for GC trigger at safepoint
                 ctx.maybe_collect_garbage();
+                // Execute pending FinalizationRegistry cleanup callbacks
+                if crate::weak_gc::has_pending_cleanups() {
+                    let cleanups = crate::weak_gc::drain_pending_cleanups();
+                    for (callback, held_value) in cleanups {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        let _ = ncx.call_function(&callback, Value::undefined(), &[held_value]);
+                    }
+                }
                 // Update debug snapshot
                 ctx.update_debug_snapshot();
             }
@@ -10762,6 +10778,14 @@ impl Interpreter {
                     return GeneratorResult::Error(VmError::interrupted());
                 }
                 ctx.maybe_collect_garbage();
+                // Execute pending FinalizationRegistry cleanup callbacks
+                if crate::weak_gc::has_pending_cleanups() {
+                    let cleanups = crate::weak_gc::drain_pending_cleanups();
+                    for (callback, held_value) in cleanups {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        let _ = ncx.call_function(&callback, Value::undefined(), &[held_value]);
+                    }
+                }
             }
 
             let frame = match ctx.current_frame() {

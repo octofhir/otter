@@ -235,6 +235,14 @@ pub struct Intrinsics {
     pub array_iterator_prototype: GcRef<JsObject>,
     /// `%AsyncIteratorPrototype%`
     pub async_iterator_prototype: GcRef<JsObject>,
+    /// `%IteratorHelperPrototype%` — prototype for iterator helper objects (ES2025)
+    pub iterator_helper_prototype: GcRef<JsObject>,
+    /// `%WrapForValidIteratorPrototype%` — prototype for wrapped iterators (ES2025)
+    pub wrap_for_valid_iterator_prototype: GcRef<JsObject>,
+    /// `WeakRef.prototype`
+    pub weak_ref_prototype: GcRef<JsObject>,
+    /// `FinalizationRegistry.prototype`
+    pub finalization_registry_prototype: GcRef<JsObject>,
 
     // ========================================================================
     // Generator prototypes
@@ -345,6 +353,10 @@ impl Intrinsics {
             self.string_iterator_prototype,
             self.array_iterator_prototype,
             self.async_iterator_prototype,
+            self.iterator_helper_prototype,
+            self.wrap_for_valid_iterator_prototype,
+            self.weak_ref_prototype,
+            self.finalization_registry_prototype,
             self.generator_prototype,
             self.async_generator_prototype,
             self.typed_array_prototype,
@@ -496,6 +508,10 @@ impl Intrinsics {
             string_iterator_prototype: alloc(),
             array_iterator_prototype: alloc(),
             async_iterator_prototype: alloc(),
+            iterator_helper_prototype: alloc(),
+            wrap_for_valid_iterator_prototype: alloc(),
+            weak_ref_prototype: alloc(),
+            finalization_registry_prototype: alloc(),
             // Generators
             generator_prototype: alloc(),
             async_generator_prototype: alloc(),
@@ -816,6 +832,19 @@ impl Intrinsics {
         }
 
         // ====================================================================
+        // Iterator Helpers (ES2025) — lazy + terminal methods on Iterator.prototype
+        // ====================================================================
+        crate::intrinsics_impl::iterator_helpers::init_iterator_prototype(
+            self.iterator_prototype,
+            self.iterator_helper_prototype,
+            self.wrap_for_valid_iterator_prototype,
+            fn_proto,
+            mm,
+            well_known::iterator_symbol(),
+            well_known::to_string_tag_symbol(),
+        );
+
+        // ====================================================================
         // %StringIteratorPrototype% — prototype = %IteratorPrototype%
         // ====================================================================
         self.string_iterator_prototype
@@ -1129,6 +1158,27 @@ impl Intrinsics {
             self.weak_set_prototype,
             fn_proto,
             mm,
+        );
+
+        // ===================================================================
+        // WeakRef.prototype and FinalizationRegistry.prototype methods
+        // ===================================================================
+        self.weak_ref_prototype
+            .set_prototype(Value::object(self.object_prototype));
+        self.finalization_registry_prototype
+            .set_prototype(Value::object(self.object_prototype));
+
+        crate::intrinsics_impl::weak_ref::init_weak_ref_prototype(
+            self.weak_ref_prototype,
+            fn_proto,
+            mm,
+            well_known::to_string_tag_symbol(),
+        );
+        crate::intrinsics_impl::weak_ref::init_finalization_registry_prototype(
+            self.finalization_registry_prototype,
+            fn_proto,
+            mm,
+            well_known::to_string_tag_symbol(),
         );
 
         // ===================================================================

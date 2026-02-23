@@ -177,6 +177,10 @@ pub enum HeapRef {
     SetData(GcRef<SetData>),
     /// Ephemeron table for WeakMap/WeakSet
     EphemeronTable(GcRef<otter_vm_gc::EphemeronTable>),
+    /// WeakRef cell (weak reference to a GC object)
+    WeakRef(GcRef<otter_vm_gc::WeakRefCell>),
+    /// FinalizationRegistry data
+    FinalizationRegistry(GcRef<otter_vm_gc::FinalizationRegistryData>),
 }
 
 impl std::fmt::Debug for HeapRef {
@@ -200,6 +204,10 @@ impl std::fmt::Debug for HeapRef {
             HeapRef::MapData(m) => f.debug_tuple("MapData").field(m).finish(),
             HeapRef::SetData(s) => f.debug_tuple("SetData").field(s).finish(),
             HeapRef::EphemeronTable(e) => f.debug_tuple("EphemeronTable").field(e).finish(),
+            HeapRef::WeakRef(w) => f.debug_tuple("WeakRef").field(w).finish(),
+            HeapRef::FinalizationRegistry(r) => {
+                f.debug_tuple("FinalizationRegistry").field(r).finish()
+            }
         }
     }
 }
@@ -528,6 +536,24 @@ impl Value {
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::EphemeronTable(table)),
+        }
+    }
+
+    /// Create a WeakRef value (GC-managed weak reference)
+    pub fn weak_ref(cell: GcRef<otter_vm_gc::WeakRefCell>) -> Self {
+        let ptr = cell.as_ptr() as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::WeakRef(cell)),
+        }
+    }
+
+    /// Create a FinalizationRegistry value (GC-managed)
+    pub fn finalization_registry(data: GcRef<otter_vm_gc::FinalizationRegistryData>) -> Self {
+        let ptr = data.as_ptr() as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::FinalizationRegistry(data)),
         }
     }
 
@@ -1140,6 +1166,22 @@ impl Value {
         }
     }
 
+    /// Get as WeakRef cell reference
+    pub fn as_weak_ref(&self) -> Option<GcRef<otter_vm_gc::WeakRefCell>> {
+        match &self.heap_ref {
+            Some(HeapRef::WeakRef(w)) => Some(*w),
+            _ => None,
+        }
+    }
+
+    /// Get as FinalizationRegistry data reference
+    pub fn as_finalization_registry(&self) -> Option<GcRef<otter_vm_gc::FinalizationRegistryData>> {
+        match &self.heap_ref {
+            Some(HeapRef::FinalizationRegistry(r)) => Some(*r),
+            _ => None,
+        }
+    }
+
     /// Get the heap reference (for structured clone)
     #[doc(hidden)]
     pub fn heap_ref(&self) -> &Option<HeapRef> {
@@ -1170,6 +1212,8 @@ impl Value {
             Some(HeapRef::MapData(m)) => Some(m.header() as *const _),
             Some(HeapRef::SetData(s)) => Some(s.header() as *const _),
             Some(HeapRef::EphemeronTable(e)) => Some(e.header() as *const _),
+            Some(HeapRef::WeakRef(w)) => Some(w.header() as *const _),
+            Some(HeapRef::FinalizationRegistry(r)) => Some(r.header() as *const _),
             None => None,
         }
     }
@@ -1250,7 +1294,9 @@ impl Value {
                     | HeapRef::SharedArrayBuffer(_)
                     | HeapRef::MapData(_)
                     | HeapRef::SetData(_)
-                    | HeapRef::EphemeronTable(_),
+                    | HeapRef::EphemeronTable(_)
+                    | HeapRef::WeakRef(_)
+                    | HeapRef::FinalizationRegistry(_),
                 ) => "object",
                 Some(HeapRef::Proxy(_)) => {
                     if self.is_callable() {
@@ -1314,6 +1360,10 @@ impl std::fmt::Debug for Value {
                 Some(HeapRef::MapData(m)) => write!(f, "[MapData {:?}]", m),
                 Some(HeapRef::SetData(s)) => write!(f, "[SetData {:?}]", s),
                 Some(HeapRef::EphemeronTable(e)) => write!(f, "[EphemeronTable {:?}]", e),
+                Some(HeapRef::WeakRef(w)) => write!(f, "[WeakRef {:?}]", w),
+                Some(HeapRef::FinalizationRegistry(r)) => {
+                    write!(f, "[FinalizationRegistry {:?}]", r)
+                }
                 None => write!(f, "<unknown>"),
             },
         }
@@ -1523,6 +1573,15 @@ impl Value {
                 }
                 HeapRef::EphemeronTable(e) => {
                     tracer(e.header() as *const _);
+                }
+                HeapRef::WeakRef(w) => {
+                    // WeakRef itself is traced (keeps the cell alive),
+                    // but WeakRefCell::trace() is a no-op (doesn't trace target)
+                    tracer(w.header() as *const _);
+                }
+                HeapRef::FinalizationRegistry(r) => {
+                    // Trace the FinalizationRegistryData (traces callback + held values)
+                    otter_vm_gc::GcTraceable::trace(&**r, tracer);
                 }
             }
         }

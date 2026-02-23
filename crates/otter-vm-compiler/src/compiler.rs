@@ -18,6 +18,7 @@ use otter_vm_bytecode::{
 };
 
 use crate::codegen::CodeGen;
+use crate::constant_fold::{self, CompileTimeValue};
 use crate::error::{CompileError, CompileResult};
 use crate::literal_validator::{EcmaVersion, LiteralValidator};
 use crate::scope::ResolvedBinding;
@@ -5250,6 +5251,15 @@ impl Compiler {
 
     /// Inner implementation of expression compilation
     fn compile_expression_inner(&mut self, expr: &Expression) -> CompileResult<Register> {
+        // Try constant folding for unary/binary expressions on literals
+        if matches!(
+            expr,
+            Expression::UnaryExpression(_) | Expression::BinaryExpression(_)
+        ) && let Some(folded) = constant_fold::try_fold_expression(expr)
+        {
+            return self.emit_compile_time_value(folded);
+        }
+
         match expr {
             Expression::NumericLiteral(lit) => {
                 // Validate numeric literal before compilation
@@ -6899,6 +6909,52 @@ impl Compiler {
         self.codegen.emit(instruction);
         self.codegen.free_reg(src);
 
+        Ok(dst)
+    }
+
+    /// Emit bytecode to load a compile-time constant value into a register.
+    fn emit_compile_time_value(&mut self, value: CompileTimeValue) -> CompileResult<Register> {
+        let dst = self.codegen.alloc_reg();
+        match value {
+            CompileTimeValue::Int32(n) => {
+                self.codegen.emit(Instruction::LoadInt32 { dst, value: n });
+            }
+            CompileTimeValue::Number(n) => {
+                // Check if it fits as Int32 (but not -0.0)
+                if n.fract() == 0.0
+                    && n >= i32::MIN as f64
+                    && n <= i32::MAX as f64
+                    && !(n == 0.0 && n.is_sign_negative())
+                {
+                    self.codegen
+                        .emit(Instruction::LoadInt32 { dst, value: n as i32 });
+                } else {
+                    let idx = self.codegen.add_number(n);
+                    self.codegen.emit(Instruction::LoadConst { dst, idx });
+                }
+            }
+            CompileTimeValue::Boolean(b) => {
+                if b {
+                    self.codegen.emit(Instruction::LoadTrue { dst });
+                } else {
+                    self.codegen.emit(Instruction::LoadFalse { dst });
+                }
+            }
+            CompileTimeValue::String(units) => {
+                let idx = self.codegen.add_string_units(units);
+                self.codegen.emit(Instruction::LoadConst { dst, idx });
+            }
+            CompileTimeValue::Null => {
+                self.codegen.emit(Instruction::LoadNull { dst });
+            }
+            CompileTimeValue::Undefined => {
+                self.codegen.emit(Instruction::LoadUndefined { dst });
+            }
+            CompileTimeValue::BigInt(s) => {
+                let idx = self.codegen.add_bigint(s);
+                self.codegen.emit(Instruction::LoadConst { dst, idx });
+            }
+        }
         Ok(dst)
     }
 

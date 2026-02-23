@@ -14,6 +14,7 @@
 
 pub mod codegen;
 pub mod compiler;
+pub mod constant_fold;
 pub mod error;
 pub mod literal_validator;
 pub mod peephole;

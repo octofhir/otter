@@ -2080,13 +2080,13 @@ impl VmContext {
 
         let reclaimed = if ephemeron_tables.is_empty() {
             otter_vm_gc::global_registry()
-                .collect_with_pre_sweep_hook(&roots, crate::string::prune_dead_string_table_entries)
+                .collect_with_pre_sweep_hook(&roots, crate::weak_gc::combined_pre_sweep_hook)
         } else {
             let table_refs: Vec<_> = ephemeron_tables.iter().map(|t| t.as_ref()).collect();
             otter_vm_gc::global_registry().collect_with_ephemerons_and_pre_sweep_hook(
                 &roots,
                 &table_refs,
-                crate::string::prune_dead_string_table_entries,
+                crate::weak_gc::combined_pre_sweep_hook,
             )
         };
 
@@ -2199,7 +2199,7 @@ impl VmContext {
             let done = registry.incremental_mark_step(MARKING_BUDGET);
             if done {
                 let _reclaimed = registry
-                    .finish_gc_with_pre_sweep_hook(crate::string::prune_dead_string_table_entries);
+                    .finish_gc_with_pre_sweep_hook(crate::weak_gc::combined_pre_sweep_hook);
                 let live_bytes = registry.total_bytes();
                 self.memory_manager.on_gc_complete(live_bytes);
             }
@@ -2218,7 +2218,7 @@ impl VmContext {
                 let done = registry.incremental_mark_step(MARKING_BUDGET);
                 if done {
                     let _reclaimed = registry.finish_gc_with_pre_sweep_hook(
-                        crate::string::prune_dead_string_table_entries,
+                        crate::weak_gc::combined_pre_sweep_hook,
                     );
                     let live_bytes = registry.total_bytes();
                     self.memory_manager.on_gc_complete(live_bytes);
@@ -2229,7 +2229,7 @@ impl VmContext {
                 registry.collect_with_ephemerons_and_pre_sweep_hook(
                     &roots,
                     &table_refs,
-                    crate::string::prune_dead_string_table_entries,
+                    crate::weak_gc::combined_pre_sweep_hook,
                 );
                 let live_bytes = registry.total_bytes();
                 self.memory_manager.on_gc_complete(live_bytes);
@@ -2384,11 +2384,11 @@ impl VmContext {
             .trace_roots(&mut |header| roots.push(header));
 
         // NOTE: The global string intern table is NOT added as a root here.
-        // Instead, `prune_dead_string_table_entries()` is called as a pre-sweep
-        // hook (see `collect_garbage` / `maybe_collect_garbage`).  This implements
-        // weak-ref interning: strings survive only while referenced by live GC
-        // objects; unreachable interned strings are pruned before sweep and then
-        // freed by the sweeper.  This prevents monotonic STRING_TABLE growth.
+        // Instead, `combined_pre_sweep_hook()` is called as a pre-sweep hook
+        // (see `collect_garbage` / `maybe_collect_garbage`).  This hook:
+        // 1. Prunes dead string table entries (weak interning)
+        // 2. Clears dead WeakRef targets from the side table
+        // 3. Sweeps FinalizationRegistry entries for dead targets
 
         roots
     }

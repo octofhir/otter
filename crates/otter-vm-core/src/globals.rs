@@ -150,6 +150,26 @@ pub fn setup_global_object(
 
     // Standard built-in objects
     setup_builtin_constructors(global, fn_proto, intrinsics_opt);
+
+    // Iterator constructor (ES2025) — needs intrinsics for prototype chain
+    if let Some(intrinsics) = intrinsics_opt {
+        crate::intrinsics_impl::iterator_helpers::install_iterator_constructor(
+            global,
+            intrinsics.iterator_prototype,
+            intrinsics.wrap_for_valid_iterator_prototype,
+            fn_proto,
+            &mm,
+        );
+
+        // WeakRef + FinalizationRegistry constructors
+        crate::intrinsics_impl::weak_ref::install_weakref_constructors(
+            global,
+            intrinsics.weak_ref_prototype,
+            intrinsics.finalization_registry_prototype,
+            fn_proto,
+            &mm,
+        );
+    }
 }
 
 /// Set up standard built-in constructors and their prototypes.

@@ -267,6 +267,7 @@ impl Drop for Isolate {
             // the string table contents and its own thread-local pointers.
             StringTable::clear_thread_default();
             MemoryManager::clear_thread_default();
+            crate::weak_gc::clear_weak_gc_state();
             otter_vm_gc::clear_thread_registry();
             self.entered = false;
         }
@@ -329,6 +330,7 @@ impl Drop for IsolateGuard<'_> {
         // Clear thread-local state (reverse of enter() order)
         StringTable::clear_thread_default();
         MemoryManager::clear_thread_default();
+        crate::weak_gc::clear_weak_gc_state();
         otter_vm_gc::clear_thread_registry();
 
         self.isolate.entered = false;

@@ -17,18 +17,22 @@
 
 pub mod barrier;
 pub mod ephemeron;
+pub mod finalization;
 pub mod mark_sweep;
 pub mod marked_block;
 pub mod object;
+pub mod weak_ref;
 
 pub use barrier::{
     CARD_SIZE, CardState, CardTable, RememberedSet, WriteBarrierBuffer, combined_barrier,
     deletion_barrier, generational_barrier, insertion_barrier, insertion_barrier_buffered,
 };
 pub use ephemeron::EphemeronTable;
+pub use finalization::FinalizationRegistryData;
 pub use mark_sweep::{
     AllocationRegistry, GcPhase, GcTraceable, RegistryStats, barrier_push, clear_thread_registry,
     clear_thread_registry_if, gc_alloc, gc_alloc_in, global_registry, is_dealloc_in_progress,
     set_thread_registry,
 };
 pub use object::{GcHeader, GcObject};
+pub use weak_ref::WeakRefCell;

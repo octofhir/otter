@@ -56,6 +56,7 @@ pub mod symbol_registry;
 pub mod trace;
 pub mod typed_array;
 pub mod value;
+pub mod weak_gc;
 pub mod web_api;
 
 pub use array_buffer::JsArrayBuffer;

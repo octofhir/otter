@@ -147,6 +147,12 @@ impl StructuredCloner {
             Some(HeapRef::EphemeronTable(_)) => {
                 Err(StructuredCloneError::NotCloneable("EphemeronTable"))
             }
+            Some(HeapRef::WeakRef(_)) => {
+                Err(StructuredCloneError::NotCloneable("WeakRef"))
+            }
+            Some(HeapRef::FinalizationRegistry(_)) => {
+                Err(StructuredCloneError::NotCloneable("FinalizationRegistry"))
+            }
 
             None => Ok(Value::undefined()),
         }

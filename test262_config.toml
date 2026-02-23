@@ -37,9 +37,8 @@ skip_features = [
     "export-star-as-namespace-from-module",
     "top-level-await",
 
-    # FinalizationRegistry / WeakRef (GC-dependent, not yet implemented)
-    "FinalizationRegistry",
-    "WeakRef",
+    # FinalizationRegistry / WeakRef: host-gc-required tests need $262.gc()
+    # to reliably trigger collection + cleanup callbacks
     "host-gc-required",
 
     # ShadowRealm (proposal)
@@ -57,8 +56,7 @@ skip_features = [
     "arraybuffer-transfer",
     "immutable-arraybuffer",
 
-    # Iterator helpers & sequencing (ES2025, not yet implemented)
-    "iterator-helpers",
+    # Iterator sequencing & joint iteration (ES2025, not yet implemented)
     "iterator-sequencing",
     "joint-iteration",
 

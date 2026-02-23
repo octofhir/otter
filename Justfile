@@ -100,7 +100,11 @@ test262-dir dir:
 
 # List Test262 tests (with optional filter)
 test262-list filter="":
-    cargo run --profile test262 -p otter-test262 -- run --list-only {{ if filter != "" { "--filter " + filter } else { "" } }}
+    cargo run --profile test262 -p otter-test262 --bin test262 -- run --list-only {{ if filter != "" { "--filter " + filter } else { "" } }}
+
+# Run Test262 in "advance" mode (batch gate: progress only if all pass)
+test262-advance *args:
+    cargo run --profile test262 -p otter-test262 --bin test262 -- advance {{args}}
 
 # Run Test262 tests and save results to JSON
 test262-save *args:

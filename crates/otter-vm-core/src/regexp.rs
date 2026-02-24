@@ -27,6 +27,7 @@ pub struct JsRegExp {
 
 impl otter_vm_gc::GcTraceable for JsRegExp {
     const NEEDS_TRACE: bool = true;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::REGEXP;
     fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // Trace the object field (GC-managed)
         tracer(self.object.header() as *const _);
@@ -104,9 +105,12 @@ fn is_plain_literal_pattern(pattern: &str) -> bool {
     // Keep this strict: fallback is only for true literal patterns.
     !pattern.is_empty()
         && !pattern.contains('\\')
-        && !pattern
-            .chars()
-            .any(|c| matches!(c, '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'))
+        && !pattern.chars().any(|c| {
+            matches!(
+                c,
+                '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+            )
+        })
 }
 
 pub(crate) fn compute_literal_utf16_fallback(pattern: &str, flags: &Flags) -> Option<Vec<u16>> {

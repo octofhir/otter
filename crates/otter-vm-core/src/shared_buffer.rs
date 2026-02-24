@@ -17,6 +17,7 @@ pub struct SharedArrayBuffer {
 
 impl otter_vm_gc::GcTraceable for SharedArrayBuffer {
     const NEEDS_TRACE: bool = false;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::ARRAY_BUFFER;
     fn trace(&self, _tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // SharedArrayBuffer contains only Box<[AtomicU8]>, no GC references
     }
@@ -176,7 +177,7 @@ unsafe impl Sync for SharedArrayBuffer {}
 mod tests {
     use super::*;
     use crate::gc::GcRef;
-    
+
     use std::thread;
 
     #[test]

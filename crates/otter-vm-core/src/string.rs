@@ -518,6 +518,7 @@ impl AsRef<[u16]> for JsString {
 impl otter_vm_gc::GcTraceable for JsString {
     // Strings don't contain GC references
     const NEEDS_TRACE: bool = false;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::STRING;
 
     fn trace(&self, _tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // No references to trace

@@ -331,6 +331,11 @@ impl CodeGen {
         ConstantIndex(self.constants.add(Constant::bigint(s)))
     }
 
+    /// Add a RegExp constant
+    pub fn add_regexp(&mut self, pattern: &str, flags: &str) -> ConstantIndex {
+        ConstantIndex(self.constants.add(Constant::regexp(pattern, flags)))
+    }
+
     /// Add a Symbol constant
     pub fn add_symbol(&mut self, id: u64) -> ConstantIndex {
         ConstantIndex(self.constants.add(Constant::Symbol(id)))
@@ -443,7 +448,9 @@ impl CodeGen {
     /// Declare an Annex B synthetic var-extension binding.
     /// Returns `Some((index, is_new))` — `is_new` is true if newly created.
     pub fn declare_block_function_var_extension(&mut self, name: &str) -> Option<(u16, bool)> {
-        self.current.scopes.declare_block_function_var_extension(name)
+        self.current
+            .scopes
+            .declare_block_function_var_extension(name)
     }
 
     /// Check if name is a CatchParameter in the enclosing scope chain.

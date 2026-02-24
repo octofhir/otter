@@ -644,7 +644,8 @@ impl Compiler {
         // (which uses self.lexical_blocked_var_names) also sees them blocked.
         // We don't need to save/restore here because hoist_var_declarations is called
         // once per scope level and the lexical names are stable for that scope.
-        self.lexical_blocked_var_names.extend(top_level_lexical.iter().cloned());
+        self.lexical_blocked_var_names
+            .extend(top_level_lexical.iter().cloned());
         let blocked = self.lexical_blocked_var_names.clone();
         for stmt in statements {
             self.hoist_var_declarations_from_stmt(stmt, &blocked)?;
@@ -667,7 +668,9 @@ impl Compiler {
                 }
             }
             Statement::FunctionDeclaration(func) => {
-                if !self.is_strict_mode() && let Some(id) = &func.id {
+                if !self.is_strict_mode()
+                    && let Some(id) = &func.id
+                {
                     let name = id.name.to_string();
                     if !blocked_var_names.contains(&name) {
                         self.hoist_eval_block_function_var_binding(&name)?;
@@ -688,10 +691,7 @@ impl Compiler {
                         {
                             // let/const declarations are block-lex
                             for declarator in &decl.declarations {
-                                Self::collect_binding_names(
-                                    &declarator.id,
-                                    &mut blocked_nested,
-                                );
+                                Self::collect_binding_names(&declarator.id, &mut blocked_nested);
                             }
                         }
                         Statement::FunctionDeclaration(func) if !self.is_strict_mode() => {
@@ -723,10 +723,7 @@ impl Compiler {
                 }
             }
             Statement::IfStatement(if_stmt) => {
-                self.hoist_var_declarations_from_stmt(
-                    &if_stmt.consequent,
-                    blocked_var_names,
-                )?;
+                self.hoist_var_declarations_from_stmt(&if_stmt.consequent, blocked_var_names)?;
                 if let Some(alt) = &if_stmt.alternate {
                     self.hoist_var_declarations_from_stmt(alt, blocked_var_names)?;
                 }
@@ -814,10 +811,8 @@ impl Compiler {
                     // block hoisting — the Annex B extension still applies.
                     let mut blocked = blocked_var_names.clone();
                     if let Some(param) = &handler.param {
-                        let is_simple_binding = matches!(
-                            &param.pattern,
-                            BindingPattern::BindingIdentifier(_)
-                        );
+                        let is_simple_binding =
+                            matches!(&param.pattern, BindingPattern::BindingIdentifier(_));
                         if !is_simple_binding {
                             Self::collect_binding_names(&param.pattern, &mut blocked);
                         }
@@ -881,8 +876,10 @@ impl Compiler {
             // Per spec: eval code (B.3.3.3) uses configurable=true,
             // global script code (B.3.3.2) uses configurable=false (CreateGlobalFunctionBinding).
             let configurable = self.eval_mode; // true for eval, false for script
-            self.codegen
-                .emit(Instruction::DeclareGlobalVar { name: name_idx, configurable });
+            self.codegen.emit(Instruction::DeclareGlobalVar {
+                name: name_idx,
+                configurable,
+            });
             return Ok(());
         }
 
@@ -904,7 +901,11 @@ impl Compiler {
         Ok(())
     }
 
-    fn with_lexical_blocked_var_names<R>(&mut self, names: HashSet<String>, f: impl FnOnce(&mut Self) -> R) -> R {
+    fn with_lexical_blocked_var_names<R>(
+        &mut self,
+        names: HashSet<String>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         let old = self.lexical_blocked_var_names.clone();
         self.lexical_blocked_var_names.extend(names);
         let out = f(self);
@@ -1140,7 +1141,8 @@ impl Compiler {
                     // (including the target scope and any intermediate scopes)
                     for i in (idx..self.loop_stack.len()).rev() {
                         if let Some(iter_reg) = self.loop_stack[i].iterator_reg {
-                            self.codegen.emit(Instruction::IteratorClose { iter: iter_reg });
+                            self.codegen
+                                .emit(Instruction::IteratorClose { iter: iter_reg });
                         }
                     }
                     let jump_idx = self.codegen.emit_jump();
@@ -2227,8 +2229,8 @@ impl Compiler {
                 // Note: `var` applies at any nesting depth in main; `let`/`const` in
                 // global_let_as_var mode only apply at the top function scope.
                 let in_main = self.codegen.current.name.as_deref() == Some("main");
-                let in_main_top_scope = in_main
-                    && self.codegen.current.scopes.current_scope_is_function();
+                let in_main_top_scope =
+                    in_main && self.codegen.current.scopes.current_scope_is_function();
 
                 // B.3.5: var inside catch block with same name as simple catch param
                 // should write to the catch parameter's local, not the global.
@@ -2238,7 +2240,9 @@ impl Compiler {
                     None
                 };
 
-                let is_global_var = kind == crate::scope::VariableKind::Var && in_main && catch_param_local.is_none();
+                let is_global_var = kind == crate::scope::VariableKind::Var
+                    && in_main
+                    && catch_param_local.is_none();
                 let is_global_lexical = self.global_let_as_var
                     && (kind == crate::scope::VariableKind::Let
                         || kind == crate::scope::VariableKind::Const)
@@ -2253,8 +2257,7 @@ impl Compiler {
                         idx: LocalIndex(local_idx),
                         src: value_reg,
                     });
-                } else if is_global_var || is_global_lexical
-                {
+                } else if is_global_var || is_global_lexical {
                     let name_idx = self.codegen.add_string(&ident.name);
                     let ic_index = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::SetGlobal {
@@ -6099,63 +6102,15 @@ impl Compiler {
         // Validate RegExp literal before compilation
         self.literal_validator.validate_regexp_literal(lit)?;
 
-        // Load global RegExp and call it with (pattern, flags). Call convention requires
-        // `func` and args to be in contiguous registers.
-        let func_tmp = self.codegen.alloc_reg();
-        let name_idx = self.codegen.add_string("RegExp");
-        let ic_index = self.codegen.alloc_ic();
-        self.codegen.emit(Instruction::GetGlobal {
-            dst: func_tmp,
-            name: name_idx,
-            ic_index,
-        });
-
         let pattern = lit.regex.pattern.text.as_str();
         let flags = lit.regex.flags.to_string();
 
-        let pattern_tmp = self.codegen.alloc_reg();
-        let pattern_idx = self.codegen.add_string(pattern);
-        self.codegen.emit(Instruction::LoadConst {
-            dst: pattern_tmp,
-            idx: pattern_idx,
-        });
-
-        let flags_tmp = self.codegen.alloc_reg();
-        let flags_idx = self.codegen.add_string(&flags);
-        self.codegen.emit(Instruction::LoadConst {
-            dst: flags_tmp,
-            idx: flags_idx,
-        });
-
-        let frame = self.codegen.alloc_fresh_block(3);
-        let arg1 = Register(frame.0 + 1);
-        let arg2 = Register(frame.0 + 2);
-        self.codegen.emit(Instruction::Move {
-            dst: frame,
-            src: func_tmp,
-        });
-        self.codegen.emit(Instruction::Move {
-            dst: arg1,
-            src: pattern_tmp,
-        });
-        self.codegen.emit(Instruction::Move {
-            dst: arg2,
-            src: flags_tmp,
-        });
-
+        let const_idx = self.codegen.add_regexp(pattern, &flags);
         let dst = self.codegen.alloc_reg();
-        self.codegen.emit(Instruction::Call {
+        self.codegen.emit(Instruction::LoadConst {
             dst,
-            func: frame,
-            argc: 2,
+            idx: const_idx,
         });
-
-        self.codegen.free_reg(func_tmp);
-        self.codegen.free_reg(pattern_tmp);
-        self.codegen.free_reg(flags_tmp);
-        self.codegen.free_reg(frame);
-        self.codegen.free_reg(arg1);
-        self.codegen.free_reg(arg2);
 
         Ok(dst)
     }
@@ -6926,8 +6881,10 @@ impl Compiler {
                     && n <= i32::MAX as f64
                     && !(n == 0.0 && n.is_sign_negative())
                 {
-                    self.codegen
-                        .emit(Instruction::LoadInt32 { dst, value: n as i32 });
+                    self.codegen.emit(Instruction::LoadInt32 {
+                        dst,
+                        value: n as i32,
+                    });
                 } else {
                     let idx = self.codegen.add_number(n);
                     self.codegen.emit(Instruction::LoadConst { dst, idx });

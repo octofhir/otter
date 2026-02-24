@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// state.put(PathConfig { separator: '/' });
 ///
 /// // In a native function:
-/// let config = state.borrow::<PathConfig>();
+/// let config = state.get::<PathConfig>();
 /// ```
 pub struct ExtensionState {
     data: BTreeMap<TypeId, Box<dyn Any>>,
@@ -43,12 +43,12 @@ impl ExtensionState {
         self.data.insert(TypeId::of::<T>(), Box::new(val));
     }
 
-    /// Borrow a reference to a stored value of type `T`.
+    /// Get a reference to a stored value of type `T`.
     ///
     /// # Panics
     ///
     /// Panics if no value of type `T` has been stored.
-    pub fn borrow<T: 'static>(&self) -> &T {
+    pub fn get<T: 'static>(&self) -> &T {
         self.data
             .get(&TypeId::of::<T>())
             .and_then(|v| v.downcast_ref::<T>())
@@ -60,12 +60,12 @@ impl ExtensionState {
             })
     }
 
-    /// Borrow a mutable reference to a stored value of type `T`.
+    /// Get a mutable reference to a stored value of type `T`.
     ///
     /// # Panics
     ///
     /// Panics if no value of type `T` has been stored.
-    pub fn borrow_mut<T: 'static>(&mut self) -> &mut T {
+    pub fn get_mut<T: 'static>(&mut self) -> &mut T {
         self.data
             .get_mut(&TypeId::of::<T>())
             .and_then(|v| v.downcast_mut::<T>())
@@ -120,22 +120,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_put_and_borrow() {
+    fn test_put_and_get() {
         let mut state = ExtensionState::new();
         state.put(42_i32);
         state.put("hello".to_string());
 
-        assert_eq!(*state.borrow::<i32>(), 42);
-        assert_eq!(state.borrow::<String>(), "hello");
+        assert_eq!(*state.get::<i32>(), 42);
+        assert_eq!(state.get::<String>(), "hello");
     }
 
     #[test]
-    fn test_borrow_mut() {
+    fn test_get_mut() {
         let mut state = ExtensionState::new();
         state.put(vec![1, 2, 3]);
 
-        state.borrow_mut::<Vec<i32>>().push(4);
-        assert_eq!(state.borrow::<Vec<i32>>(), &vec![1, 2, 3, 4]);
+        state.get_mut::<Vec<i32>>().push(4);
+        assert_eq!(state.get::<Vec<i32>>(), &vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -171,13 +171,13 @@ mod tests {
         let mut state = ExtensionState::new();
         state.put(1_i32);
         state.put(2_i32);
-        assert_eq!(*state.borrow::<i32>(), 2);
+        assert_eq!(*state.get::<i32>(), 2);
     }
 
     #[test]
     #[should_panic(expected = "no value of type")]
-    fn test_borrow_missing_panics() {
+    fn test_get_missing_panics() {
         let state = ExtensionState::new();
-        let _ = state.borrow::<i32>();
+        let _ = state.get::<i32>();
     }
 }

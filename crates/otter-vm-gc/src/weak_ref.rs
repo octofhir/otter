@@ -64,6 +64,7 @@ impl std::fmt::Debug for WeakRefCell {
 impl GcTraceable for WeakRefCell {
     /// WeakRefCell does NOT trace its target — this is the whole point of weak references.
     const NEEDS_TRACE: bool = false;
+    const TYPE_ID: u8 = crate::object::tags::WEAK_REF;
 
     fn trace(&self, _tracer: &mut dyn FnMut(*const GcHeader)) {
         // Intentionally empty — weak references don't keep targets alive

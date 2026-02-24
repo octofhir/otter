@@ -170,6 +170,7 @@ impl std::fmt::Debug for MapData {
 
 impl otter_vm_gc::GcTraceable for MapData {
     const NEEDS_TRACE: bool = true;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::MAP_DATA;
 
     fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         let inner = self.inner.borrow();
@@ -302,6 +303,7 @@ impl std::fmt::Debug for SetData {
 
 impl otter_vm_gc::GcTraceable for SetData {
     const NEEDS_TRACE: bool = true;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::SET_DATA;
 
     fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         let inner = self.inner.borrow();

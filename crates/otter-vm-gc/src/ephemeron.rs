@@ -290,6 +290,7 @@ impl Drop for EphemeronTable {
 
 impl crate::mark_sweep::GcTraceable for EphemeronTable {
     const NEEDS_TRACE: bool = true;
+    const TYPE_ID: u8 = crate::object::tags::EPHEMERON_TABLE;
 
     fn trace(&self, tracer: &mut dyn FnMut(*const GcHeader)) {
         // Ephemerons are traced specially during GC mark phase

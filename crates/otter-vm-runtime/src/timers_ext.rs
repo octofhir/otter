@@ -8,6 +8,7 @@ use otter_vm_core::value::Value;
 use crate::extension::{Extension, Op, OpHandler};
 use crate::otter_runtime::Otter;
 
+/// Build the timer [`Extension`] (setTimeout, setInterval, setImmediate, queueMicrotask, etc.).
 pub fn create_timers_extension(otter: &Otter) -> Extension {
     let event_loop = otter.event_loop().clone();
     // Shared GC root registry for all active timer callbacks.

@@ -110,6 +110,7 @@ unsafe impl Sync for JsPromise {}
 
 impl otter_vm_gc::GcTraceable for JsPromise {
     const NEEDS_TRACE: bool = true;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::PROMISE;
     fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // Use the existing trace_roots method
         self.trace_roots(tracer);
@@ -855,8 +856,7 @@ mod tests {
     #[test]
     fn test_with_resolvers() {
         let _rt = crate::runtime::VmRuntime::new();
-        let resolvers =
-            JsPromise::with_resolvers(_rt.memory_manager().clone(), |_, _| {});
+        let resolvers = JsPromise::with_resolvers(_rt.memory_manager().clone(), |_, _| {});
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
 
@@ -873,8 +873,7 @@ mod tests {
     #[test]
     fn test_with_resolvers_reject() {
         let _rt = crate::runtime::VmRuntime::new();
-        let resolvers =
-            JsPromise::with_resolvers(_rt.memory_manager().clone(), |_, _| {});
+        let resolvers = JsPromise::with_resolvers(_rt.memory_manager().clone(), |_, _| {});
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
 

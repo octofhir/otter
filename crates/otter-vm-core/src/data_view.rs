@@ -22,6 +22,7 @@ pub struct JsDataView {
 
 impl otter_vm_gc::GcTraceable for JsDataView {
     const NEEDS_TRACE: bool = true;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::DATA_VIEW;
     fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // Trace the buffer's object field
         tracer(self.buffer.object.header() as *const _);

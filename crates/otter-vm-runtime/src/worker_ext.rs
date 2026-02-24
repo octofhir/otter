@@ -72,10 +72,7 @@ impl OtterExtension for WorkerExtension {
 
         let ctor_val = ctx
             .builtin_fresh("Worker")
-            .constructor_fn(
-                move |this, args, ncx| ctor_fn(this, args, ncx),
-                ctor_len,
-            )
+            .constructor_fn(move |this, args, ncx| ctor_fn(this, args, ncx), ctor_len)
             .method_native(post_msg_name, post_msg_fn, post_msg_len)
             .method_native(terminate_name, terminate_fn, terminate_len)
             .build();
@@ -95,6 +92,7 @@ pub fn worker_extension() -> Box<dyn OtterExtension> {
 // JS class via #[js_class] macro
 // ---------------------------------------------------------------------------
 
+#[allow(missing_docs)]
 #[js_class(name = "Worker")]
 pub struct JsWorker;
 
@@ -108,9 +106,7 @@ impl JsWorker {
         ncx: &mut NativeContext,
     ) -> Result<Value, VmError> {
         if !ncx.is_construct() {
-            return Err(VmError::type_error(
-                "Constructor Worker requires 'new'",
-            ));
+            return Err(VmError::type_error("Constructor Worker requires 'new'"));
         }
 
         let script_src = match args.first() {
@@ -181,7 +177,7 @@ impl JsWorker {
 
             worker
                 .post_message(data)
-                .map_err(|e| VmError::type_error(&format!("postMessage failed: {}", e)))?;
+                .map_err(|e| VmError::type_error(format!("postMessage failed: {}", e)))?;
 
             Ok(Value::undefined())
         })
@@ -283,7 +279,7 @@ fn install_worker_globals(
     let fn_proto = runtime.function_prototype();
     let global = {
         let ctx = runtime.create_context();
-        ctx.global().clone()
+        ctx.global()
     };
 
     // self === globalThis (Web Worker convention)
@@ -320,9 +316,7 @@ fn install_worker_globals(
     );
 
     let getter = Value::native_function_with_proto(
-        move |_this, _args, _ncx| {
-            Ok(handler_for_get.lock().clone().unwrap_or(Value::null()))
-        },
+        move |_this, _args, _ncx| Ok(handler_for_get.lock().clone().unwrap_or(Value::null())),
         mm.clone(),
         fn_proto,
     );

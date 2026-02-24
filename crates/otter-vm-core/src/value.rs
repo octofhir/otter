@@ -234,6 +234,7 @@ pub struct Closure {
 
 impl otter_vm_gc::GcTraceable for Closure {
     const NEEDS_TRACE: bool = true;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::CLOSURE;
 
     fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // Trace function object
@@ -262,6 +263,7 @@ pub struct NativeFunctionObject {
 
 impl otter_vm_gc::GcTraceable for NativeFunctionObject {
     const NEEDS_TRACE: bool = true;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::FUNCTION;
 
     fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // Trace the attached object
@@ -302,6 +304,7 @@ impl std::hash::Hash for Symbol {
 
 impl otter_vm_gc::GcTraceable for Symbol {
     const NEEDS_TRACE: bool = false;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::SYMBOL;
     fn trace(&self, _tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // Symbol contains only primitives (String, u64), no GC references
     }
@@ -316,6 +319,7 @@ pub struct BigInt {
 
 impl otter_vm_gc::GcTraceable for BigInt {
     const NEEDS_TRACE: bool = false;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::NONE;
     fn trace(&self, _tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // BigInt contains only a String, no GC references
     }

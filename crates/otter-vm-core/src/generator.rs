@@ -321,6 +321,7 @@ impl std::fmt::Debug for JsGenerator {
 
 impl otter_vm_gc::GcTraceable for JsGenerator {
     const NEEDS_TRACE: bool = true;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::GENERATOR;
 
     fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // Trace the generator object

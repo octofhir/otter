@@ -174,6 +174,8 @@ pub trait GcObject {
 
 /// Object type tags
 pub mod tags {
+    /// No trace (primitive, string header, etc)
+    pub const NONE: u8 = 0;
     /// String object
     pub const STRING: u8 = 1;
     /// Array object
@@ -184,6 +186,40 @@ pub mod tags {
     pub const FUNCTION: u8 = 4;
     /// Closure object
     pub const CLOSURE: u8 = 5;
+    /// RegExp object
+    pub const REGEXP: u8 = 6;
+    /// Symbol object
+    pub const SYMBOL: u8 = 7;
+    /// Date object
+    pub const DATE: u8 = 8;
+    /// Error object
+    pub const ERROR: u8 = 9;
+    /// Map object
+    pub const MAP: u8 = 10;
+    /// Set object
+    pub const SET: u8 = 11;
+    /// Proxy object
+    pub const PROXY: u8 = 12;
+    /// Promise object
+    pub const PROMISE: u8 = 13;
+    /// ArrayBuffer object
+    pub const ARRAY_BUFFER: u8 = 14;
+    /// TypedArray object
+    pub const TYPED_ARRAY: u8 = 15;
+    /// DataView object
+    pub const DATA_VIEW: u8 = 16;
+    /// Generator object
+    pub const GENERATOR: u8 = 17;
+    /// WeakRef object
+    pub const WEAK_REF: u8 = 18;
+    /// FinalizationRegistry object
+    pub const FINALIZATION_REGISTRY: u8 = 19;
+    /// MapData object
+    pub const MAP_DATA: u8 = 20;
+    /// SetData object
+    pub const SET_DATA: u8 = 21;
+    /// EphemeronTable object
+    pub const EPHEMERON_TABLE: u8 = 22;
 }
 
 #[cfg(test)]

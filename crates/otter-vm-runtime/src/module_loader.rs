@@ -149,6 +149,7 @@ impl ModuleNamespace {
     }
 }
 
+/// Convert a [`ModuleNamespace`] into a plain JS object whose properties mirror the exports.
 pub fn namespace_to_object(namespace: &ModuleNamespace, mm: Arc<MemoryManager>) -> Value {
     let obj = GcRef::new(JsObject::new(Value::null(), mm));
     for (key, value) in namespace.entries() {
@@ -200,10 +201,10 @@ impl LoadedModule {
         let namespace = ModuleNamespace::new();
         // Copy all enumerable own properties from the namespace object into ModuleNamespace
         for key in namespace_obj.own_keys() {
-            if let PropertyKey::String(s) = &key {
-                if let Some(val) = namespace_obj.get(&key) {
-                    namespace.set(s.as_str(), val);
-                }
+            if let PropertyKey::String(s) = &key
+                && let Some(val) = namespace_obj.get(&key)
+            {
+                namespace.set(s.as_str(), val);
             }
         }
 
@@ -500,59 +501,59 @@ impl ModuleLoader {
 
     /// Update a module's namespace after execution.
     pub fn update_namespace(&self, url: &str, ctx: &otter_vm_core::context::VmContext) {
-        if let Some(module) = self.get(url) {
-            if let Ok(guard) = module.write() {
-                let exports = guard.exports().to_vec();
-                let global = ctx.global();
-                let captured = ctx.captured_exports();
+        if let Some(module) = self.get(url)
+            && let Ok(guard) = module.write()
+        {
+            let exports = guard.exports().to_vec();
+            let global = ctx.global();
+            let captured = ctx.captured_exports();
 
-                for export_record in exports {
-                    match export_record {
-                        otter_vm_bytecode::module::ExportRecord::Named { local: _, exported } => {
-                            // First check captured exports (for ESM)
-                            if let Some(val) = captured.and_then(|c| c.get(&exported)) {
+            for export_record in exports {
+                match export_record {
+                    otter_vm_bytecode::module::ExportRecord::Named { local: _, exported } => {
+                        // First check captured exports (for ESM)
+                        if let Some(val) = captured.and_then(|c| c.get(&exported)) {
+                            println!(
+                                "  Captured named export (from context): {} = {:?}",
+                                exported, val
+                            );
+                            guard.namespace.set(&exported, val.clone());
+                        } else if let Some(val) = global.get(&exported.as_str().into()) {
+                            println!(
+                                "  Captured named export (from global): {} = {:?}",
+                                exported, val
+                            );
+                            guard.namespace.set(&exported, val);
+                        } else {
+                            // Fallback: try to see if it's in the realm's global
+                            if let Some(val) = ctx
+                                .realm_global(ctx.realm_id())
+                                .and_then(|g| g.get(&exported.as_str().into()))
+                            {
                                 println!(
-                                    "  Captured named export (from context): {} = {:?}",
-                                    exported, val
-                                );
-                                guard.namespace.set(&exported, val.clone());
-                            } else if let Some(val) = global.get(&exported.as_str().into()) {
-                                println!(
-                                    "  Captured named export (from global): {} = {:?}",
+                                    "  Captured named export (from realm global): {} = {:?}",
                                     exported, val
                                 );
                                 guard.namespace.set(&exported, val);
                             } else {
-                                // Fallback: try to see if it's in the realm's global
-                                if let Some(val) = ctx
-                                    .realm_global(ctx.realm_id())
-                                    .and_then(|g| g.get(&exported.as_str().into()))
-                                {
-                                    println!(
-                                        "  Captured named export (from realm global): {} = {:?}",
-                                        exported, val
-                                    );
-                                    guard.namespace.set(&exported, val);
-                                } else {
-                                    println!("  FAILED to capture named export: {}", exported);
-                                }
+                                println!("  FAILED to capture named export: {}", exported);
                             }
                         }
-                        otter_vm_bytecode::module::ExportRecord::Default { local: _ } => {
-                            // First check captured exports (for ESM)
-                            if let Some(val) = captured.and_then(|c| c.get("default")) {
-                                guard.namespace.set("default", val.clone());
-                            } else if let Some(val) = global.get(&"default".into()) {
-                                guard.namespace.set("default", val);
-                            } else if let Some(val) = ctx
-                                .realm_global(ctx.realm_id())
-                                .and_then(|g| g.get(&"default".into()))
-                            {
-                                guard.namespace.set("default", val);
-                            }
-                        }
-                        _ => {}
                     }
+                    otter_vm_bytecode::module::ExportRecord::Default { local: _ } => {
+                        // First check captured exports (for ESM)
+                        if let Some(val) = captured.and_then(|c| c.get("default")) {
+                            guard.namespace.set("default", val.clone());
+                        } else if let Some(val) = global.get(&"default".into()) {
+                            guard.namespace.set("default", val);
+                        } else if let Some(val) = ctx
+                            .realm_global(ctx.realm_id())
+                            .and_then(|g| g.get(&"default".into()))
+                        {
+                            guard.namespace.set("default", val);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1239,12 +1240,11 @@ fn find_package_type(path: &Path) -> Option<String> {
     loop {
         let pkg_path = current.join("package.json");
         if pkg_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&pkg_path) {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(type_field) = json.get("type").and_then(|v| v.as_str()) {
-                        return Some(type_field.to_string());
-                    }
-                }
+            if let Ok(content) = std::fs::read_to_string(&pkg_path)
+                && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+                && let Some(type_field) = json.get("type").and_then(|v| v.as_str())
+            {
+                return Some(type_field.to_string());
             }
             // Found package.json but no "type" field — Node.js defaults to CommonJS
             return Some("commonjs".to_string());
@@ -1420,7 +1420,7 @@ pub fn module_extension(loader: Arc<ModuleLoader>) -> crate::Extension {
                 Ok(json!(wrapper.filename()))
             }),
         ])
-        .with_js(&format!(
+        .with_js(format!(
             r#"
 // Dynamic import helper
 globalThis.__dynamicImport = async function(specifier, referrer) {{

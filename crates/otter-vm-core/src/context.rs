@@ -524,6 +524,8 @@ pub struct VmContext {
     pending_throw: Option<Value>,
     /// Cached template objects for tagged template sites.
     template_cache: HashMap<TemplateCacheKey, GcRef<JsObject>>,
+    /// Cached RegExp objects per (module_ptr, constant_index) so each literal is only compiled once.
+    regexp_cache: HashMap<(usize, u32), Value>,
 }
 
 /// Trait for JS job queue access (allows runtime to inject the queue)
@@ -669,6 +671,7 @@ impl VmContext {
             captured_module_exports: None,
             pending_throw: None,
             template_cache: HashMap::new(),
+            regexp_cache: HashMap::new(),
         }
     }
 
@@ -681,6 +684,14 @@ impl VmContext {
 
     pub(crate) fn cache_template_object(&mut self, key: TemplateCacheKey, obj: GcRef<JsObject>) {
         self.template_cache.insert(key, obj);
+    }
+
+    pub(crate) fn get_cached_regexp(&self, module_ptr: usize, const_idx: u32) -> Option<Value> {
+        self.regexp_cache.get(&(module_ptr, const_idx)).cloned()
+    }
+
+    pub(crate) fn cache_regexp(&mut self, module_ptr: usize, const_idx: u32, val: Value) {
+        self.regexp_cache.insert((module_ptr, const_idx), val);
     }
 
     /// Set captured module exports.
@@ -1404,10 +1415,7 @@ impl VmContext {
     /// Compile source as a global script (for $262.evalScript semantics).
     /// Top-level `let`/`const` are treated as global var bindings.
     /// Falls back to `compile_eval` if no script compiler is configured.
-    pub fn compile_global_script(
-        &self,
-        code: &str,
-    ) -> Result<otter_vm_bytecode::Module, VmError> {
+    pub fn compile_global_script(&self, code: &str) -> Result<otter_vm_bytecode::Module, VmError> {
         if let Some(script_fn) = self.script_eval_fn.as_ref() {
             script_fn(code)
         } else {
@@ -2198,8 +2206,8 @@ impl VmContext {
         if registry.is_marking() {
             let done = registry.incremental_mark_step(MARKING_BUDGET);
             if done {
-                let _reclaimed = registry
-                    .finish_gc_with_pre_sweep_hook(crate::weak_gc::combined_pre_sweep_hook);
+                let _reclaimed =
+                    registry.finish_gc_with_pre_sweep_hook(crate::weak_gc::combined_pre_sweep_hook);
                 let live_bytes = registry.total_bytes();
                 self.memory_manager.on_gc_complete(live_bytes);
             }
@@ -2217,9 +2225,8 @@ impl VmContext {
                 // Do first step immediately
                 let done = registry.incremental_mark_step(MARKING_BUDGET);
                 if done {
-                    let _reclaimed = registry.finish_gc_with_pre_sweep_hook(
-                        crate::weak_gc::combined_pre_sweep_hook,
-                    );
+                    let _reclaimed = registry
+                        .finish_gc_with_pre_sweep_hook(crate::weak_gc::combined_pre_sweep_hook);
                     let live_bytes = registry.total_bytes();
                     self.memory_manager.on_gc_complete(live_bytes);
                 }
@@ -2392,7 +2399,6 @@ impl VmContext {
 
         roots
     }
-
 }
 
 impl std::fmt::Debug for VmContext {

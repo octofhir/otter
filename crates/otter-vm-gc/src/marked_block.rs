@@ -77,8 +77,6 @@ pub struct MarkedBlock {
     free_bits: RefCell<Vec<u64>>,
     /// Per-cell drop function (set when cell is allocated, cleared on free).
     cell_drop_fns: RefCell<Vec<Option<DropFn>>>,
-    /// Per-cell trace function (set when cell is allocated, cleared on free).
-    cell_trace_fns: RefCell<Vec<Option<TraceFn>>>,
     /// Per-cell allocation size (actual size, for stats tracking).
     cell_sizes: RefCell<Vec<usize>>,
     /// Number of live (allocated) cells.
@@ -116,7 +114,6 @@ impl MarkedBlock {
         }
 
         let cell_drop_fns = vec![None; num_cells];
-        let cell_trace_fns = vec![None; num_cells];
         let cell_sizes = vec![0usize; num_cells];
 
         Self {
@@ -125,7 +122,6 @@ impl MarkedBlock {
             num_cells,
             free_bits: RefCell::new(free_bits),
             cell_drop_fns: RefCell::new(cell_drop_fns),
-            cell_trace_fns: RefCell::new(cell_trace_fns),
             cell_sizes: RefCell::new(cell_sizes),
             live_count: Cell::new(0),
         }
@@ -139,12 +135,7 @@ impl MarkedBlock {
     /// # Safety
     /// The caller must initialize the cell memory (write GcHeader + value)
     /// before the next GC cycle.
-    pub fn allocate(
-        &self,
-        actual_size: usize,
-        drop_fn: DropFn,
-        trace_fn: Option<TraceFn>,
-    ) -> Option<*mut u8> {
+    pub fn allocate(&self, actual_size: usize, drop_fn: DropFn) -> Option<*mut u8> {
         let mut free_bits = self.free_bits.borrow_mut();
 
         // Scan free_bits for a free cell
@@ -168,10 +159,6 @@ impl MarkedBlock {
             {
                 let mut drop_fns = self.cell_drop_fns.borrow_mut();
                 drop_fns[cell_idx] = Some(drop_fn);
-            }
-            {
-                let mut trace_fns = self.cell_trace_fns.borrow_mut();
-                trace_fns[cell_idx] = trace_fn;
             }
             {
                 let mut sizes = self.cell_sizes.borrow_mut();
@@ -222,40 +209,6 @@ impl MarkedBlock {
         self.num_cells
     }
 
-    /// Trace all live objects in this block during the mark phase.
-    ///
-    /// For each allocated cell that has a trace function, calls the trace
-    /// function to discover references to other GC objects.
-    pub fn trace_allocated(&self, tracer: &mut dyn FnMut(*const GcHeader)) {
-        let base = self.storage.as_ptr() as *const u8;
-        let free_bits = self.free_bits.borrow();
-        let trace_fns = self.cell_trace_fns.borrow();
-
-        for cell_idx in 0..self.num_cells {
-            // Skip free cells
-            let word_idx = cell_idx / 64;
-            let bit_idx = cell_idx % 64;
-            if free_bits[word_idx] & (1u64 << bit_idx) != 0 {
-                continue;
-            }
-
-            // Cell is allocated — if it has a trace fn, look up and potentially call
-            if let Some(trace_fn) = trace_fns[cell_idx] {
-                let offset = cell_idx * self.cell_size;
-                let header_ptr = unsafe { base.add(offset) as *const GcHeader };
-                let header = unsafe { &*header_ptr };
-
-                // Only trace gray objects (in worklist)
-                if header.mark() == MarkColor::Gray {
-                    // The trace_fn expects a pointer to the allocation start
-                    unsafe {
-                        trace_fn(header_ptr as *const u8, tracer);
-                    }
-                }
-            }
-        }
-    }
-
     /// Sweep this block: free all white (unreachable) cells.
     ///
     /// Returns the number of bytes reclaimed.
@@ -263,7 +216,6 @@ impl MarkedBlock {
         let base = self.storage.as_ptr() as *mut u8;
         let mut free_bits = self.free_bits.borrow_mut();
         let mut drop_fns = self.cell_drop_fns.borrow_mut();
-        let mut trace_fns = self.cell_trace_fns.borrow_mut();
         let mut sizes = self.cell_sizes.borrow_mut();
         let mut reclaimed: usize = 0;
 
@@ -294,7 +246,6 @@ impl MarkedBlock {
                 // Mark cell as free
                 free_bits[word_idx] |= 1u64 << bit_idx;
                 drop_fns[cell_idx] = None;
-                trace_fns[cell_idx] = None;
                 let size = sizes[cell_idx];
                 sizes[cell_idx] = 0;
                 reclaimed += size;
@@ -306,7 +257,6 @@ impl MarkedBlock {
         // (drop_fn might trigger operations that need block access)
         drop(free_bits);
         drop(drop_fns);
-        drop(trace_fns);
         drop(sizes);
 
         // Now call drop functions
@@ -327,7 +277,6 @@ impl MarkedBlock {
         let base = self.storage.as_ptr() as *mut u8;
         let mut free_bits = self.free_bits.borrow_mut();
         let mut drop_fns = self.cell_drop_fns.borrow_mut();
-        let mut trace_fns = self.cell_trace_fns.borrow_mut();
         let mut sizes = self.cell_sizes.borrow_mut();
         let mut reclaimed: usize = 0;
 
@@ -349,7 +298,6 @@ impl MarkedBlock {
 
             free_bits[word_idx] |= 1u64 << bit_idx;
             drop_fns[cell_idx] = None;
-            trace_fns[cell_idx] = None;
             reclaimed += sizes[cell_idx];
             sizes[cell_idx] = 0;
         }
@@ -358,7 +306,6 @@ impl MarkedBlock {
 
         drop(free_bits);
         drop(drop_fns);
-        drop(trace_fns);
         drop(sizes);
 
         for (ptr, drop_fn) in to_drop {
@@ -393,11 +340,10 @@ impl MarkedBlock {
     /// Used by the mark phase to find traceable objects.
     pub fn for_each_allocated<F>(&self, mut f: F)
     where
-        F: FnMut(*const GcHeader, Option<TraceFn>),
+        F: FnMut(*const GcHeader),
     {
         let base = self.storage.as_ptr() as *const u8;
         let free_bits = self.free_bits.borrow();
-        let trace_fns = self.cell_trace_fns.borrow();
 
         for cell_idx in 0..self.num_cells {
             let word_idx = cell_idx / 64;
@@ -408,7 +354,7 @@ impl MarkedBlock {
 
             let offset = cell_idx * self.cell_size;
             let header_ptr = unsafe { base.add(offset) as *const GcHeader };
-            f(header_ptr, trace_fns[cell_idx]);
+            f(header_ptr);
         }
     }
 }
@@ -447,12 +393,7 @@ impl BlockDirectory {
     /// allocates a new block.
     ///
     /// Returns a pointer to the cell start (for GcHeader placement).
-    pub fn allocate(
-        &self,
-        actual_size: usize,
-        drop_fn: DropFn,
-        trace_fn: Option<TraceFn>,
-    ) -> *mut u8 {
+    pub fn allocate(&self, actual_size: usize, drop_fn: DropFn) -> *mut u8 {
         let mut blocks = self.blocks.borrow_mut();
         let num_blocks = blocks.len();
 
@@ -462,7 +403,7 @@ impl BlockDirectory {
             // Try from cursor forward, then wrap around
             for i in 0..num_blocks {
                 let idx = (start + i) % num_blocks;
-                if let Some(ptr) = blocks[idx].allocate(actual_size, drop_fn, trace_fn) {
+                if let Some(ptr) = blocks[idx].allocate(actual_size, drop_fn) {
                     // Update cursor to this block (likely has more free cells)
                     self.cursor.set(idx);
                     return ptr;
@@ -473,7 +414,7 @@ impl BlockDirectory {
         // All blocks full (or no blocks) — allocate a new block
         let new_block = MarkedBlock::new(self.cell_size);
         let ptr = new_block
-            .allocate(actual_size, drop_fn, trace_fn)
+            .allocate(actual_size, drop_fn)
             .expect("freshly created block should have space");
         let new_idx = blocks.len();
         blocks.push(new_block);
@@ -532,7 +473,7 @@ impl BlockDirectory {
     /// Iterate over all allocated cells across all blocks.
     pub fn for_each_allocated<F>(&self, mut f: F)
     where
-        F: FnMut(*const GcHeader, Option<TraceFn>),
+        F: FnMut(*const GcHeader),
     {
         let blocks = self.blocks.borrow();
         for block in blocks.iter() {
@@ -592,11 +533,11 @@ mod tests {
     #[test]
     fn test_marked_block_allocate() {
         let block = MarkedBlock::new(64);
-        let ptr1 = block.allocate(64, dummy_drop, Some(dummy_trace));
+        let ptr1 = block.allocate(64, dummy_drop);
         assert!(ptr1.is_some());
         assert_eq!(block.live_count(), 1);
 
-        let ptr2 = block.allocate(64, dummy_drop, None);
+        let ptr2 = block.allocate(64, dummy_drop);
         assert!(ptr2.is_some());
         assert_eq!(block.live_count(), 2);
 
@@ -611,11 +552,11 @@ mod tests {
         let block = MarkedBlock::new(BLOCK_SIZE); // 1 cell per block
         assert_eq!(block.num_cells(), 1);
 
-        let ptr = block.allocate(BLOCK_SIZE, dummy_drop, None);
+        let ptr = block.allocate(BLOCK_SIZE, dummy_drop);
         assert!(ptr.is_some());
         assert!(block.is_full());
 
-        let ptr2 = block.allocate(BLOCK_SIZE, dummy_drop, None);
+        let ptr2 = block.allocate(BLOCK_SIZE, dummy_drop);
         assert!(ptr2.is_none());
     }
 
@@ -624,8 +565,8 @@ mod tests {
         let block = MarkedBlock::new(64);
 
         // Allocate two cells
-        let ptr1 = block.allocate(48, dummy_drop, None).unwrap();
-        let ptr2 = block.allocate(48, dummy_drop, None).unwrap();
+        let ptr1 = block.allocate(48, dummy_drop).unwrap();
+        let ptr2 = block.allocate(48, dummy_drop).unwrap();
         assert_eq!(block.live_count(), 2);
 
         // Mark ptr1's header as Black (reachable), leave ptr2 as White
@@ -642,7 +583,7 @@ mod tests {
 
         // ptr1 should still be allocated, ptr2's slot should be free
         // Allocate again — should reuse ptr2's slot
-        let ptr3 = block.allocate(48, dummy_drop, None).unwrap();
+        let ptr3 = block.allocate(48, dummy_drop).unwrap();
         assert_eq!(ptr3, ptr2); // Same slot reused
     }
 
@@ -650,7 +591,7 @@ mod tests {
     fn test_marked_block_dealloc_all() {
         let block = MarkedBlock::new(64);
         for _ in 0..10 {
-            block.allocate(48, dummy_drop, None);
+            block.allocate(48, dummy_drop);
         }
         assert_eq!(block.live_count(), 10);
 
@@ -663,10 +604,10 @@ mod tests {
     fn test_block_directory_allocate() {
         let dir = BlockDirectory::new(64);
 
-        let ptr1 = dir.allocate(48, dummy_drop, None);
+        let ptr1 = dir.allocate(48, dummy_drop);
         assert!(!ptr1.is_null());
 
-        let ptr2 = dir.allocate(48, dummy_drop, Some(dummy_trace));
+        let ptr2 = dir.allocate(48, dummy_drop);
         assert!(!ptr2.is_null());
         assert_ne!(ptr1, ptr2);
 
@@ -678,10 +619,10 @@ mod tests {
         // Use a large cell size so block fills quickly
         let dir = BlockDirectory::new(BLOCK_SIZE); // 1 cell per block
 
-        let ptr1 = dir.allocate(BLOCK_SIZE, dummy_drop, None);
+        let ptr1 = dir.allocate(BLOCK_SIZE, dummy_drop);
         assert!(!ptr1.is_null());
         // This should trigger a new block
-        let ptr2 = dir.allocate(BLOCK_SIZE, dummy_drop, None);
+        let ptr2 = dir.allocate(BLOCK_SIZE, dummy_drop);
         assert!(!ptr2.is_null());
         assert_ne!(ptr1, ptr2);
 
@@ -693,7 +634,7 @@ mod tests {
         let dir = BlockDirectory::new(64);
 
         // Allocate a cell
-        let ptr = dir.allocate(48, dummy_drop, None);
+        let ptr = dir.allocate(48, dummy_drop);
 
         // Leave it White (unreachable)
         // Sweep
@@ -702,14 +643,14 @@ mod tests {
         assert_eq!(dir.live_count(), 0);
 
         // Allocate again — should reuse the freed slot
-        let ptr2 = dir.allocate(48, dummy_drop, None);
+        let ptr2 = dir.allocate(48, dummy_drop);
         assert_eq!(ptr, ptr2);
     }
 
     #[test]
     fn test_block_contains() {
         let block = MarkedBlock::new(64);
-        let ptr = block.allocate(48, dummy_drop, None).unwrap();
+        let ptr = block.allocate(48, dummy_drop).unwrap();
 
         assert!(block.contains(ptr));
 
@@ -721,20 +662,15 @@ mod tests {
     #[test]
     fn test_for_each_allocated() {
         let block = MarkedBlock::new(64);
-        block.allocate(48, dummy_drop, Some(dummy_trace));
-        block.allocate(48, dummy_drop, None);
-        block.allocate(48, dummy_drop, Some(dummy_trace));
+        block.allocate(48, dummy_drop);
+        block.allocate(48, dummy_drop);
+        block.allocate(48, dummy_drop);
 
         let mut count = 0;
-        let mut with_trace = 0;
-        block.for_each_allocated(|_header, trace_fn| {
+        block.for_each_allocated(|_header| {
             count += 1;
-            if trace_fn.is_some() {
-                with_trace += 1;
-            }
         });
 
         assert_eq!(count, 3);
-        assert_eq!(with_trace, 2);
     }
 }

@@ -794,10 +794,7 @@ impl Interpreter {
 
                     // Check if we're unwinding through an async function frame.
                     // If so, convert the error to a rejected promise instead of propagating.
-                    let is_async_frame = ctx
-                        .current_frame()
-                        .map(|f| f.is_async)
-                        .unwrap_or(false);
+                    let is_async_frame = ctx.current_frame().map(|f| f.is_async).unwrap_or(false);
 
                     // Pop the frame we pushed and unwind to original depth
                     while ctx.stack_depth() > prev_stack_depth {
@@ -806,10 +803,7 @@ impl Interpreter {
 
                     if is_async_frame {
                         // Async function: wrap error in rejected promise
-                        let rejected = self.create_js_promise(
-                            ctx,
-                            JsPromise::rejected(error),
-                        );
+                        let rejected = self.create_js_promise(ctx, JsPromise::rejected(error));
                         ctx.set_running(was_running);
                         return Ok(rejected);
                     }
@@ -1078,19 +1072,13 @@ impl Interpreter {
 
                     // Check if the current frame is async — if so, convert the
                     // error to a rejected promise and continue in the caller.
-                    let is_async = ctx
-                        .current_frame()
-                        .map(|f| f.is_async)
-                        .unwrap_or(false);
+                    let is_async = ctx.current_frame().map(|f| f.is_async).unwrap_or(false);
 
                     if is_async && ctx.stack_depth() > 1 {
-                        let return_reg = ctx
-                            .current_frame()
-                            .and_then(|f| f.return_register);
+                        let return_reg = ctx.current_frame().and_then(|f| f.return_register);
                         ctx.pop_frame();
                         cached_frame_id = usize::MAX;
-                        let rejected =
-                            self.create_js_promise(ctx, JsPromise::rejected(value));
+                        let rejected = self.create_js_promise(ctx, JsPromise::rejected(value));
                         if let Some(reg) = return_reg {
                             ctx.set_register(reg, rejected);
                         }
@@ -1519,19 +1507,13 @@ impl Interpreter {
                     // Check if the current frame is async — if so, convert the
                     // error to a rejected promise and return it to the caller
                     // instead of propagating as an uncaught exception.
-                    let is_async = ctx
-                        .current_frame()
-                        .map(|f| f.is_async)
-                        .unwrap_or(false);
-                    let return_reg = ctx
-                        .current_frame()
-                        .and_then(|f| f.return_register);
+                    let is_async = ctx.current_frame().map(|f| f.is_async).unwrap_or(false);
+                    let return_reg = ctx.current_frame().and_then(|f| f.return_register);
 
                     if is_async && ctx.stack_depth() > 1 {
                         ctx.pop_frame();
                         cached_frame_id = usize::MAX;
-                        let rejected =
-                            self.create_js_promise(ctx, JsPromise::rejected(value));
+                        let rejected = self.create_js_promise(ctx, JsPromise::rejected(value));
                         if let Some(reg) = return_reg {
                             ctx.set_register(reg, rejected);
                         }
@@ -1767,7 +1749,26 @@ impl Interpreter {
                     .get(idx.0)
                     .ok_or_else(|| VmError::internal("constant not found"))?;
 
-                let value = self.constant_to_value(ctx, constant)?;
+                // Fast path: non-global/non-sticky RegExp literals are cached by (module_ptr, const_idx).
+                // Global/sticky RegExps have mutable lastIndex so we must not share a single instance.
+                let value = if let otter_vm_bytecode::Constant::RegExp { flags, .. } = constant {
+                    let is_stateful = flags.contains('g') || flags.contains('y');
+                    if is_stateful {
+                        self.constant_to_value(ctx, constant)?
+                    } else {
+                        let module_ptr = std::sync::Arc::as_ptr(module) as usize;
+                        if let Some(cached) = ctx.get_cached_regexp(module_ptr, idx.0) {
+                            cached
+                        } else {
+                            let val = self.constant_to_value(ctx, constant)?;
+                            ctx.cache_regexp(module_ptr, idx.0, val.clone());
+                            val
+                        }
+                    }
+                } else {
+                    self.constant_to_value(ctx, constant)?
+                };
+
                 ctx.set_register(dst.0, value);
                 Ok(InstructionResult::Continue)
             }
@@ -4782,10 +4783,27 @@ impl Interpreter {
                 };
 
                 let eval_result = (|| {
+                    let timer1 = std::time::Instant::now();
                     let eval_module = ctx.compile_eval(&source, is_strict_context)?;
-                    self.execute_eval_module(ctx, &eval_module)
+                    if timer1.elapsed().as_millis() > 50 {
+                        println!(
+                            "SLOW compile_eval for {:?} took {:?}",
+                            source,
+                            timer1.elapsed()
+                        );
+                    }
+                    let timer2 = std::time::Instant::now();
+                    let result = self.execute_eval_module(ctx, &eval_module);
+                    if timer2.elapsed().as_millis() > 50 {
+                        println!("SLOW execute_eval_module took {:?}", timer2.elapsed());
+                    }
+                    result
                 })();
-                self.cleanup_eval_bindings(ctx, &injected_eval_bindings, global_keys_before.as_deref());
+                self.cleanup_eval_bindings(
+                    ctx,
+                    &injected_eval_bindings,
+                    global_keys_before.as_deref(),
+                );
 
                 let result = eval_result?;
                 ctx.set_register(dst.0, result);
@@ -7242,9 +7260,7 @@ impl Interpreter {
 
                 // 3. If not callable, throw TypeError
                 if !return_method.is_callable() {
-                    return Err(VmError::type_error(
-                        "iterator.return is not a function",
-                    ));
+                    return Err(VmError::type_error("iterator.return is not a function"));
                 }
 
                 // 4. Call return method with iterator as this
@@ -7256,9 +7272,7 @@ impl Interpreter {
 
                 // 5. If result is not an object, throw TypeError
                 if !inner_result.is_object() && inner_result.as_proxy().is_none() {
-                    return Err(VmError::type_error(
-                        "Iterator result is not an object",
-                    ));
+                    return Err(VmError::type_error("Iterator result is not an object"));
                 }
 
                 Ok(InstructionResult::Continue)
@@ -8442,9 +8456,7 @@ impl Interpreter {
                 .and_then(|v| v.as_object())
                 .or_else(|| self.default_object_prototype_for_constructor(ctx, func));
             let new_obj = GcRef::new(JsObject::new(
-                ctor_proto
-                    .map(Value::object)
-                    .unwrap_or_else(Value::null),
+                ctor_proto.map(Value::object).unwrap_or_else(Value::null),
                 ctx.memory_manager().clone(),
             ));
             let new_obj_value = Value::object(new_obj);

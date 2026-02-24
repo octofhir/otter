@@ -3565,6 +3565,7 @@ mod tests {
 
 impl otter_vm_gc::GcTraceable for JsObject {
     const NEEDS_TRACE: bool = true;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::OBJECT;
 
     fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // Trace prototype (now a Value)

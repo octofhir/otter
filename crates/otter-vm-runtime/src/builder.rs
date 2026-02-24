@@ -145,9 +145,7 @@ impl OtterBuilder {
 
     /// Build the runtime
     pub fn build(self) -> Otter {
-        let mut runtime = Otter::with_isolate_config(
-            self.isolate_config.unwrap_or_default(),
-        );
+        let mut runtime = Otter::with_isolate_config(self.isolate_config.unwrap_or_default());
 
         // Set env store (defaults to empty/secure)
         let env_store = self

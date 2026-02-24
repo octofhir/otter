@@ -10,6 +10,7 @@
 #![warn(clippy::all)]
 #![warn(missing_docs)]
 
+pub mod async_runtime;
 pub mod builder;
 pub mod capabilities;
 pub mod capabilities_context;
@@ -26,11 +27,13 @@ pub mod promise;
 pub mod registration;
 pub mod timer;
 pub mod timer_root_set;
+/// Timer-related extension (setTimeout, setInterval, etc.).
 pub mod timers_ext;
 pub mod worker;
 pub mod worker_ext;
 
 // Re-export main types
+pub use async_runtime::{AsyncRuntime, TokioRuntime};
 pub use builder::OtterBuilder;
 pub use event_loop::{ActiveServerCount, EventLoop, HttpEvent, WsEvent};
 pub use extension::{
@@ -53,6 +56,7 @@ pub use extension_v2::{NativeExtensionRegistry, OtterExtension, Profile};
 pub use registration::{ModuleNamespaceBuilder, RegistrationContext};
 
 // Legacy alias for backwards compatibility
+/// Legacy alias for backwards compatibility. Use [`Otter`] instead.
 #[deprecated(since = "0.2.0", note = "Renamed to Otter")]
 pub type OtterRuntime = Otter;
 pub use promise::Promise;

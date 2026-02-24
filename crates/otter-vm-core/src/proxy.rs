@@ -28,6 +28,7 @@ pub struct JsProxy {
 
 impl otter_vm_gc::GcTraceable for JsProxy {
     const NEEDS_TRACE: bool = true;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::PROXY;
     fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // Trace target and handler Values (they may contain GC refs)
         self.target.trace(tracer);

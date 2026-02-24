@@ -2,6 +2,7 @@
 //!
 //! Async-only event loop with tokio integration for HTTP server support.
 
+use crate::async_runtime::{AsyncRuntime, TokioRuntime};
 use crate::microtask::{JsJobQueue, MicrotaskQueue, MicrotaskSequencer, NextTickQueue};
 use crate::timer::{Immediate, ImmediateId, Timer, TimerCallback, TimerHeapEntry, TimerId};
 use crate::timer_root_set::TimerCallbackRoots;
@@ -26,41 +27,71 @@ pub struct HttpEvent {
 /// WebSocket event for server dispatch
 #[derive(Debug, Clone)]
 pub enum WsEvent {
+    /// WebSocket connection opened.
     Open {
+        /// ID of the server that accepted the connection.
         server_id: u64,
+        /// ID of the new socket.
         socket_id: u64,
+        /// Optional connection data from the handshake.
         data: Option<JsonValue>,
+        /// Remote address of the client.
         remote_addr: Option<String>,
     },
+    /// Message received from a WebSocket client.
     Message {
+        /// ID of the server.
         server_id: u64,
+        /// ID of the socket that received the message.
         socket_id: u64,
+        /// Message payload as bytes.
         data: Vec<u8>,
+        /// True if the message is text, false if binary.
         is_text: bool,
     },
+    /// WebSocket connection closed.
     Close {
+        /// ID of the server.
         server_id: u64,
+        /// ID of the socket that closed.
         socket_id: u64,
+        /// WebSocket close code.
         code: u16,
+        /// Close reason message.
         reason: String,
     },
+    /// Socket write buffer drained (ready for more data).
     Drain {
+        /// ID of the server.
         server_id: u64,
+        /// ID of the socket.
         socket_id: u64,
     },
+    /// Ping frame received from client.
     Ping {
+        /// ID of the server.
         server_id: u64,
+        /// ID of the socket.
         socket_id: u64,
+        /// Ping payload as bytes.
         data: Vec<u8>,
     },
+    /// Pong frame received from client.
     Pong {
+        /// ID of the server.
         server_id: u64,
+        /// ID of the socket.
         socket_id: u64,
+        /// Pong payload as bytes.
         data: Vec<u8>,
     },
+    /// Error occurred on the WebSocket connection.
     Error {
+        /// ID of the server.
         server_id: u64,
+        /// ID of the socket where the error occurred.
         socket_id: u64,
+        /// Error message describing what went wrong.
         message: String,
     },
 }
@@ -139,11 +170,20 @@ pub struct EventLoop {
     /// Timer closures capture `Value`s (containing `GcRef<Closure>`) which would
     /// otherwise be invisible to `collect_gc_roots`. This set keeps them alive.
     timer_callback_roots: Arc<TimerCallbackRoots>,
+
+    // === Async runtime ===
+    /// Pluggable async runtime for time and scheduling primitives.
+    async_rt: Box<dyn AsyncRuntime>,
 }
 
 impl EventLoop {
-    /// Create a new event loop
+    /// Create a new event loop with the default tokio-backed async runtime.
     pub fn new() -> Arc<Self> {
+        Self::with_async_runtime(Box::new(TokioRuntime))
+    }
+
+    /// Create a new event loop with a custom [`AsyncRuntime`].
+    pub fn with_async_runtime(async_rt: Box<dyn AsyncRuntime>) -> Arc<Self> {
         let sequencer = MicrotaskSequencer::new();
         Arc::new(Self {
             timers: Mutex::new(HashMap::new()),
@@ -169,6 +209,8 @@ impl EventLoop {
             async_task_handles: Mutex::new(Vec::new()),
             // GC root tracking
             timer_callback_roots: TimerCallbackRoots::new(),
+            // Async runtime
+            async_rt,
         })
     }
 
@@ -282,7 +324,7 @@ impl EventLoop {
         };
 
         let id = TimerId(self.next_timer_id.fetch_add(1, Ordering::Relaxed));
-        let deadline = Instant::now() + clamped_delay;
+        let deadline = self.async_rt.now() + clamped_delay;
 
         (id, deadline, nesting_level)
     }
@@ -465,18 +507,20 @@ impl EventLoop {
         false
     }
 
-    /// Drain all microtasks
-    fn drain_microtasks(&self) {
+    /// Drain all microtasks. Returns `true` if any work was done.
+    pub(crate) fn drain_microtasks(&self) -> bool {
         let mut batch = Vec::new();
         self.microtasks.drain_all(&mut batch);
+        let did_work = !batch.is_empty();
         for task in batch {
             task();
         }
+        did_work
     }
 
-    /// Run all ready timers
-    fn run_timers(&self) {
-        let now = Instant::now();
+    /// Run all ready timers. Returns `true` if any timer callback was executed.
+    pub(crate) fn run_timers(&self) -> bool {
+        let now = self.async_rt.now();
 
         // Collect due timer IDs from a heap
         let mut due_ids = Vec::new();
@@ -500,6 +544,8 @@ impl EventLoop {
                 }
             }
         }
+
+        let did_work = !due_ids.is_empty();
 
         for timer_id in due_ids {
             // Extract callback and timer info
@@ -565,7 +611,7 @@ impl EventLoop {
                     interval_duration
                 };
 
-                let new_deadline = Instant::now() + clamped_interval;
+                let new_deadline = self.async_rt.now() + clamped_interval;
 
                 // Update timer deadline and re-add to heap
                 let mut timers = self.timers.lock();
@@ -600,10 +646,13 @@ impl EventLoop {
         for id in cancelled_ids {
             self.timers.lock().remove(&id);
         }
+
+        did_work
     }
 
-    /// Run all pending immediates
-    fn run_immediates(&self) {
+    /// Run all pending immediates. Returns `true` if any immediate was executed.
+    pub(crate) fn run_immediates(&self) -> bool {
+        let mut did_work = false;
         loop {
             let next = self.immediates.lock().pop_front();
             let Some(mut immediate) = next else {
@@ -619,17 +668,19 @@ impl EventLoop {
             self.executing_immediate_ids.lock().insert(immediate_id);
 
             if let Some(cb) = immediate.callback.take() {
+                did_work = true;
                 cb();
             }
 
             self.drain_microtasks();
             self.executing_immediate_ids.lock().remove(&immediate_id);
         }
+        did_work
     }
 
     /// Get time until next timer
     fn time_until_next_timer(&self) -> Option<Duration> {
-        let now = Instant::now();
+        let now = self.async_rt.now();
         let timers = self.timers.lock();
         timers
             .values()
@@ -802,10 +853,24 @@ impl EventLoop {
         }
     }
 
-    /// Run the event loop asynchronously with tokio
+    /// Yield to the async runtime.
+    pub(crate) async fn async_yield(&self) {
+        self.async_rt.yield_now().await;
+    }
+
+    /// Sleep via the async runtime.
+    pub(crate) async fn async_sleep(&self, duration: Duration) {
+        self.async_rt.sleep(duration).await;
+    }
+
+    /// Maximum tight-spin iterations before yielding to the async executor.
+    const MAX_SPIN_COUNT: usize = 8;
+
+    /// Run the event loop asynchronously.
     ///
-    /// This version supports HTTP server events and integrates with tokio for I/O.
-    /// Use this when running HTTP servers or other async operations.
+    /// Integrates HTTP/WS server events, timers, immediates, and microtasks.
+    /// Uses I/O batching: spins up to [`MAX_SPIN_COUNT`] iterations without
+    /// yielding when there is continuous work, then yields to the async runtime.
     pub async fn run_until_complete_async(&self) {
         self.running.store(true, Ordering::Release);
 
@@ -814,19 +879,27 @@ impl EventLoop {
                 break;
             }
 
-            // 1. Poll HTTP events (non-blocking)
-            self.poll_http_events();
-            // 1b. Poll WebSocket events (non-blocking)
-            self.poll_ws_events();
+            // Tight spin: process up to MAX_SPIN_COUNT batches without yielding
+            for _ in 0..Self::MAX_SPIN_COUNT {
+                let mut did_work = false;
 
-            // 2. Run all microtasks first (highest priority)
-            self.drain_microtasks();
+                // 1. Poll HTTP/WS events (non-blocking)
+                self.poll_http_events();
+                self.poll_ws_events();
 
-            // 3. Run ready timers
-            self.run_timers();
+                // 2. Run all microtasks (highest priority)
+                did_work |= self.drain_microtasks();
 
-            // 4. Run immediates
-            self.run_immediates();
+                // 3. Run ready timers
+                did_work |= self.run_timers();
+
+                // 4. Run immediates
+                did_work |= self.run_immediates();
+
+                if !did_work {
+                    break;
+                }
+            }
 
             // 5. Clean up completed async task handles
             self.cleanup_completed_tasks();
@@ -840,19 +913,19 @@ impl EventLoop {
                 break;
             }
 
-            // 6. Yield to tokio for I/O operations
-            // This allows HTTP server tasks and other async ops to progress
-            tokio::task::yield_now().await;
+            // 7. Yield to async runtime for I/O operations
+            self.async_rt.yield_now().await;
 
-            // 7. Small sleep if nothing is immediately ready to prevent busy-loop
+            // 8. Small sleep if nothing is immediately ready to prevent busy-loop
             if self.microtasks.is_empty()
                 && self.js_jobs.is_empty()
                 && self.immediate_queue_len.load(Ordering::Relaxed) == 0
                 && !has_servers
                 && let Some(wait) = self.time_until_next_timer()
             {
-                // Use tokio sleep instead of std::thread::sleep for async compatibility
-                tokio::time::sleep(wait.min(Duration::from_millis(10))).await;
+                self.async_rt
+                    .sleep(wait.min(Duration::from_millis(10)))
+                    .await;
             }
         }
 
@@ -889,6 +962,8 @@ impl Default for EventLoop {
             async_task_handles: Mutex::new(Vec::new()),
             // GC root tracking
             timer_callback_roots: TimerCallbackRoots::new(),
+            // Async runtime
+            async_rt: Box::new(TokioRuntime),
         }
     }
 }

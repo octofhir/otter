@@ -91,6 +91,7 @@ pub struct JsTypedArray {
 
 impl otter_vm_gc::GcTraceable for JsTypedArray {
     const NEEDS_TRACE: bool = true;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::TYPED_ARRAY;
     fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // Trace the object field
         tracer(self.object.header() as *const _);
@@ -116,7 +117,9 @@ impl JsTypedArray {
         }
 
         // Validate bounds
-        let byte_length = length.checked_mul(elem_size).ok_or("TypedArray length overflow")?;
+        let byte_length = length
+            .checked_mul(elem_size)
+            .ok_or("TypedArray length overflow")?;
         if byte_offset + byte_length > buffer.byte_length() {
             return Err("TypedArray would extend past end of buffer");
         }

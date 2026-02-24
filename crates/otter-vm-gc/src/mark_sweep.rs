@@ -19,8 +19,6 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use rustc_hash::FxHashMap;
-
 use crate::marked_block::{
     BlockDirectory, DropFn, LARGE_OBJECT_THRESHOLD, NUM_SIZE_CLASSES, TraceFn,
     size_class_cell_size, size_class_index,
@@ -96,8 +94,8 @@ struct LargeAllocation {
     _layout: std::alloc::Layout,
     /// Drop function for this allocation
     drop_fn: DropFn,
-    /// Trace function for this allocation
-    trace_fn: Option<TraceFn>,
+    /// Trace function for this allocation (obsolete, handled by trace_table)
+    _trace_fn: Option<TraceFn>,
 }
 
 // SAFETY: LargeAllocation contains raw pointers but they are managed exclusively
@@ -137,8 +135,9 @@ pub struct AllocationRegistry {
     gc_phase: Cell<GcPhase>,
     /// Persistent worklist for incremental marking (gray objects to process)
     mark_worklist: RefCell<VecDeque<*const GcHeader>>,
-    /// Cached trace function lookup table (built once when marking starts)
-    trace_lookup: RefCell<Option<FxHashMap<usize, Option<TraceFn>>>>,
+    /// Trace table (indexed by tag u8).
+    /// Maps object tags to their type-erased trace functions.
+    trace_table: [Option<TraceFn>; 256],
     /// Timestamp when incremental marking started (for pause time tracking)
     mark_start: Cell<Option<Instant>>,
 
@@ -170,7 +169,7 @@ impl AllocationRegistry {
             last_pause_nanos: AtomicU64::new(0),
             gc_phase: Cell::new(GcPhase::Idle),
             mark_worklist: RefCell::new(VecDeque::new()),
-            trace_lookup: RefCell::new(None),
+            trace_table: [None; 256],
             mark_start: Cell::new(None),
             write_barrier_buf: RefCell::new(Vec::with_capacity(256)),
             dealloc_in_progress: Cell::new(false),
@@ -184,6 +183,12 @@ impl AllocationRegistry {
         registry
     }
 
+    pub fn register_type<T: GcTraceable>(&mut self) {
+        if T::NEEDS_TRACE {
+            self.trace_table[T::TYPE_ID as usize] = Some(trace_gc_box::<T>);
+        }
+    }
+
     /// Register a new allocation.
     ///
     /// For small objects (≤ 8KB), allocates from a block directory.
@@ -193,13 +198,7 @@ impl AllocationRegistry {
     /// - `header` must point to a valid GcHeader at the start of an allocation
     /// - `drop_fn` must correctly deallocate the memory when called
     /// - The allocation must remain valid until removed from the registry
-    pub unsafe fn register(
-        &self,
-        header: *mut GcHeader,
-        size: usize,
-        drop_fn: DropFn,
-        trace_fn: Option<TraceFn>,
-    ) {
+    pub unsafe fn register(&self, header: *mut GcHeader, size: usize, drop_fn: DropFn) {
         // This is the legacy path for objects allocated externally (via alloc::alloc).
         // New allocations should go through allocate_in_block() directly.
         // For backwards compatibility, we register large objects here.
@@ -208,7 +207,7 @@ impl AllocationRegistry {
             size,
             _layout: std::alloc::Layout::from_size_align(size, 8).unwrap(),
             drop_fn,
-            trace_fn,
+            _trace_fn: None,
         };
         self.large_objects.borrow_mut().push(large);
         self.total_bytes.fetch_add(size, Ordering::Relaxed);
@@ -221,15 +220,10 @@ impl AllocationRegistry {
     ///
     /// # Panics
     /// Panics if `actual_size` > LARGE_OBJECT_THRESHOLD.
-    pub fn allocate_in_block(
-        &self,
-        actual_size: usize,
-        drop_fn: DropFn,
-        trace_fn: Option<TraceFn>,
-    ) -> *mut u8 {
+    pub fn allocate_in_block(&self, actual_size: usize, drop_fn: DropFn) -> *mut u8 {
         let sc_idx =
             size_class_index(actual_size).expect("allocate_in_block called for large object");
-        let ptr = self.directories[sc_idx].allocate(actual_size, drop_fn, trace_fn);
+        let ptr = self.directories[sc_idx].allocate(actual_size, drop_fn);
         self.total_bytes.fetch_add(actual_size, Ordering::Relaxed);
         ptr
     }
@@ -514,24 +508,6 @@ impl AllocationRegistry {
     ///
     /// This is built once per GC cycle for O(1) lookup during mark phase,
     /// replacing the O(n) linear search from the old Vec<AllocationEntry>.
-    fn build_trace_lookup(&self) -> FxHashMap<usize, Option<TraceFn>> {
-        let mut map = FxHashMap::default();
-
-        // Add all block-allocated objects
-        for dir in &self.directories {
-            dir.for_each_allocated(|header_ptr, trace_fn| {
-                map.insert(header_ptr as usize, trace_fn);
-            });
-        }
-
-        // Add large objects
-        let large_objects = self.large_objects.borrow();
-        for entry in large_objects.iter() {
-            map.insert(entry.header as usize, entry.trace_fn);
-        }
-
-        map
-    }
 
     /// Mark phase: trace from roots and mark all reachable objects
     fn mark(&self, roots: &[*const GcHeader]) {
@@ -551,9 +527,6 @@ impl AllocationRegistry {
             }
         }
 
-        // Build trace function lookup table (O(n) build, O(1) per lookup)
-        let trace_lookup = self.build_trace_lookup();
-
         // Process the worklist until empty
         while let Some(ptr) = worklist.pop_front() {
             unsafe {
@@ -565,7 +538,8 @@ impl AllocationRegistry {
                 }
 
                 // Look up trace function for this header (O(1))
-                if let Some(Some(trace_fn)) = trace_lookup.get(&(ptr as usize)) {
+                let tag = header.tag();
+                if let Some(trace_fn) = self.trace_table[tag as usize] {
                     // Trace the object's references, passing the start of the allocation
                     trace_fn(ptr as *const u8, &mut |child_header| {
                         if !child_header.is_null() {
@@ -638,7 +612,6 @@ impl AllocationRegistry {
     fn cancel_incremental_gc(&self) {
         if self.gc_phase.get() != GcPhase::Idle {
             self.mark_worklist.borrow_mut().clear();
-            *self.trace_lookup.borrow_mut() = None;
             self.mark_start.set(None);
             self.gc_phase.set(GcPhase::Idle);
         }
@@ -683,7 +656,6 @@ impl AllocationRegistry {
         }
 
         // Build trace lookup (once per cycle)
-        *self.trace_lookup.borrow_mut() = Some(self.build_trace_lookup());
 
         // Record start time and enter marking phase
         self.mark_start.set(Some(Instant::now()));
@@ -716,12 +688,6 @@ impl AllocationRegistry {
             }
         }
 
-        let trace_lookup = self.trace_lookup.borrow();
-        let lookup = match trace_lookup.as_ref() {
-            Some(l) => l,
-            None => return true, // No lookup means marking wasn't started properly
-        };
-
         let mut worklist = self.mark_worklist.borrow_mut();
         let mut processed = 0;
 
@@ -742,7 +708,8 @@ impl AllocationRegistry {
                 }
 
                 // Look up trace function for this header (O(1))
-                if let Some(Some(trace_fn)) = lookup.get(&(ptr as usize)) {
+                let tag = header.tag();
+                if let Some(trace_fn) = self.trace_table[tag as usize] {
                     // Pass the allocation pointer directly
                     trace_fn(ptr as *const u8, &mut |child_header| {
                         if !child_header.is_null() {
@@ -797,7 +764,6 @@ impl AllocationRegistry {
 
         // Clean up incremental state
         self.mark_worklist.borrow_mut().clear();
-        *self.trace_lookup.borrow_mut() = None;
         self.mark_start.set(None);
         self.gc_phase.set(GcPhase::Idle);
 
@@ -948,12 +914,6 @@ where
     let layout = std::alloc::Layout::new::<GcAllocation<T>>();
     let alloc_size = layout.size();
 
-    let trace_fn: Option<TraceFn> = if T::NEEDS_TRACE {
-        Some(trace_gc_box::<T>)
-    } else {
-        None
-    };
-
     let ptr: *mut GcAllocation<T>;
 
     if alloc_size <= LARGE_OBJECT_THRESHOLD {
@@ -961,7 +921,7 @@ where
         // Use drop_gc_box_in_block which only drops in-place (no dealloc —
         // the block owns the memory).
         let drop_fn: DropFn = drop_gc_box_in_block::<T>;
-        let cell_ptr = registry.allocate_in_block(alloc_size, drop_fn, trace_fn);
+        let cell_ptr = registry.allocate_in_block(alloc_size, drop_fn);
         ptr = cell_ptr as *mut GcAllocation<T>;
     } else {
         // Large object: allocate individually via global allocator.
@@ -977,14 +937,14 @@ where
         // Register with the large object tracker
         let header_ptr = ptr as *mut GcHeader;
         unsafe {
-            registry.register(header_ptr, alloc_size, drop_fn, trace_fn);
+            registry.register(header_ptr, alloc_size, drop_fn);
         }
     }
 
     // Initialize header and value
     // SAFETY: ptr is non-null and properly aligned (from block or alloc)
     unsafe {
-        std::ptr::write(&mut (*ptr).header, GcHeader::new(0));
+        std::ptr::write(&mut (*ptr).header, GcHeader::new(T::TYPE_ID));
         std::ptr::write(&mut (*ptr).value, value);
 
         // Black allocation: objects allocated during marking are pre-marked Black.
@@ -1035,6 +995,10 @@ pub trait GcTraceable {
     /// Whether this type contains GC references that need tracing
     const NEEDS_TRACE: bool;
 
+    /// Type ID for tag-based trace function lookup (O(1)).
+    /// 0 = no trace, 1-255 = type-specific trace function.
+    const TYPE_ID: u8 = 0;
+
     /// Trace all GC references in this value
     fn trace(&self, tracer: &mut dyn FnMut(*const GcHeader));
 
@@ -1050,31 +1014,37 @@ pub trait GcTraceable {
 // Implement GcTraceable for primitive types
 impl GcTraceable for () {
     const NEEDS_TRACE: bool = false;
+    const TYPE_ID: u8 = 0;
     fn trace(&self, _tracer: &mut dyn FnMut(*const GcHeader)) {}
 }
 
 impl GcTraceable for bool {
     const NEEDS_TRACE: bool = false;
+    const TYPE_ID: u8 = 0;
     fn trace(&self, _tracer: &mut dyn FnMut(*const GcHeader)) {}
 }
 
 impl GcTraceable for i32 {
     const NEEDS_TRACE: bool = false;
+    const TYPE_ID: u8 = 0;
     fn trace(&self, _tracer: &mut dyn FnMut(*const GcHeader)) {}
 }
 
 impl GcTraceable for i64 {
     const NEEDS_TRACE: bool = false;
+    const TYPE_ID: u8 = 0;
     fn trace(&self, _tracer: &mut dyn FnMut(*const GcHeader)) {}
 }
 
 impl GcTraceable for f64 {
     const NEEDS_TRACE: bool = false;
+    const TYPE_ID: u8 = 0;
     fn trace(&self, _tracer: &mut dyn FnMut(*const GcHeader)) {}
 }
 
 impl GcTraceable for String {
     const NEEDS_TRACE: bool = false;
+    const TYPE_ID: u8 = 0;
     fn trace(&self, _tracer: &mut dyn FnMut(*const GcHeader)) {}
 }
 

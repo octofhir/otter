@@ -338,7 +338,7 @@ impl Otter {
         &self.event_loop
     }
 
-    /// Compile and execute JavaScript code.
+    /// Compile and execute JavaScript/TypeScript code.
     ///
     /// Code is compiled as an ES module (allowing top-level await) and executed
     /// directly in the global scope — no async IIFE wrapper. This preserves:
@@ -346,7 +346,6 @@ impl Otter {
     /// - `function` declarations creating global properties
     /// - Correct `this` binding (global object for scripts)
     /// - Top-level `await` via the interpreter's suspension machinery
-    /// Compile and execute JavaScript/TypeScript code.
     ///
     /// When `source_url` is `Some`, relative `require()` / `import` paths
     /// resolve from that file location. Pass an absolute file path
@@ -434,7 +433,7 @@ impl Otter {
         }
 
         // 6. Set top-level `this` to the global object per ES2023 §19.2.1.
-        ctx.set_pending_this(Value::object(ctx.global().clone()));
+        ctx.set_pending_this(Value::object(ctx.global()));
 
         // 7. Load, link and execute as module
         let main_url = source_url;
@@ -478,7 +477,7 @@ impl Otter {
             // Resolve imports for this dependency
             let dep_locals = self.resolve_module_imports(&dep_bytecode_arc, url)?;
 
-            // Execute dependency module with suspension support for TLA
+            // Execute dependency module with unified event loop (handles TLA)
             let dep_promise = JsPromise::new();
             let dep_exec_result = self.execute_with_suspension(
                 &mut ctx,
@@ -490,7 +489,7 @@ impl Otter {
                     Some(dep_locals)
                 },
             )?;
-            self.run_module_to_completion(&mut ctx, dep_exec_result, dep_promise)
+            self.run_event_loop(&mut ctx, Some(dep_exec_result), dep_promise)
                 .await?;
 
             // Populate namespace
@@ -513,82 +512,168 @@ impl Otter {
         // After main execution starts, update its namespace
         self.loader.update_namespace(main_url, &ctx);
 
-        // 8. Handle execution result with async resume loop
+        // 8. Unified event loop: TLA suspend/resume + HTTP/WS + timers + immediates
         let final_value = self
-            .run_module_to_completion(&mut ctx, exec_result, result_promise)
+            .run_event_loop(&mut ctx, Some(exec_result), result_promise)
             .await?;
 
-        if self.interrupt_flag.load(Ordering::Relaxed) {
-            return Err(OtterError::Runtime(
-                "Execution interrupted (timeout)".to_string(),
-            ));
+        Ok(final_value)
+    }
+
+    /// Unified event loop: handles TLA suspension/resume, HTTP/WS dispatch,
+    /// timers, immediates, microtasks, and I/O batching.
+    ///
+    /// If `exec_result` is `Some`, drives module execution to completion
+    /// (handling TLA suspend/resume), then continues for detached async work.
+    /// If `None`, only runs the event loop for pending async operations.
+    async fn run_event_loop(
+        &self,
+        ctx: &mut VmContext,
+        exec_result: Option<VmExecutionResult>,
+        result_promise: GcRef<JsPromise>,
+    ) -> Result<Value, OtterError> {
+        use std::time::Duration;
+
+        let mut final_value = Value::undefined();
+        let mut signal: Option<Arc<ResumeSignal>> = None;
+        let mut pending_async_ctx: Option<otter_vm_core::async_context::AsyncContext> = None;
+
+        // Process initial execution result
+        if let Some(result) = exec_result {
+            match result {
+                VmExecutionResult::Complete(value) => {
+                    Self::capture_exports_from_frame(ctx);
+                    ctx.pop_frame();
+                    result_promise.resolve(value.clone());
+                    self.drain_microtasks(ctx)?;
+                    final_value = value;
+                    // Module done immediately, fall through to event loop
+                }
+                VmExecutionResult::Suspended(async_ctx) => {
+                    let s = ResumeSignal::new();
+                    self.register_promise_signal(async_ctx.awaited_promise, Arc::clone(&s));
+                    signal = Some(s);
+                    pending_async_ctx = Some(async_ctx);
+                }
+                VmExecutionResult::Error(msg) => {
+                    return Err(OtterError::Runtime(msg));
+                }
+            }
         }
 
-        // Keep runtime alive for detached async work (e.g. fs callbacks/promises
-        // started without top-level await) until the event loop reaches quiescence.
-        self.run_event_loop_with_http(&mut ctx).await;
+        loop {
+            // === Tight spin: up to 8 iterations without yielding ===
+            for _ in 0..8 {
+                let mut did_work = false;
 
-        if self.interrupt_flag.load(Ordering::Relaxed) {
-            return Err(OtterError::Runtime(
-                "Execution interrupted (timeout)".to_string(),
-            ));
+                // Phase 1: HTTP/WS events
+                let http_events = self.event_loop.take_http_events();
+                if !http_events.is_empty() {
+                    did_work = true;
+                    self.dispatch_http_events_batch(ctx, http_events);
+                }
+                let ws_events = self.event_loop.take_ws_events();
+                if !ws_events.is_empty() {
+                    did_work = true;
+                    self.dispatch_ws_events_batch(ctx, ws_events);
+                }
+
+                // Phase 2: Microtasks (JS jobs + Rust microtasks + nextTick)
+                self.drain_microtasks(ctx)?;
+
+                // Phase 3: Timers
+                did_work |= self.event_loop.run_timers();
+
+                // Phase 4: Immediates
+                did_work |= self.event_loop.run_immediates();
+
+                // Phase 5: Drain microtasks again (timer/immediate callbacks
+                // may have enqueued JS jobs)
+                self.drain_microtasks(ctx)?;
+
+                // Phase 6: Check TLA module progress
+                if let Some(ref s) = signal
+                    && s.is_ready()
+                {
+                    did_work = true;
+                    let settlement = s.take_value().unwrap();
+                    let async_ctx = pending_async_ctx.take().unwrap();
+                    signal = None;
+
+                    let interpreter = Interpreter::new();
+                    let new_result = match settlement {
+                        Ok(v) => interpreter.resume_async(ctx, async_ctx, v),
+                        Err(e) => interpreter.resume_async_throw(ctx, async_ctx, e),
+                    };
+
+                    match new_result {
+                        VmExecutionResult::Complete(value) => {
+                            Self::capture_exports_from_frame(ctx);
+                            ctx.pop_frame();
+                            result_promise.resolve(value.clone());
+                            self.drain_microtasks(ctx)?;
+                            final_value = value;
+                            // Module done, continue loop for detached work
+                        }
+                        VmExecutionResult::Suspended(new_ctx) => {
+                            let new_signal = ResumeSignal::new();
+                            self.register_promise_signal(
+                                new_ctx.awaited_promise,
+                                Arc::clone(&new_signal),
+                            );
+                            signal = Some(new_signal);
+                            pending_async_ctx = Some(new_ctx);
+                        }
+                        VmExecutionResult::Error(msg) => {
+                            if self.interrupt_flag.load(Ordering::Relaxed) {
+                                return Err(OtterError::Runtime(
+                                    "Execution interrupted (timeout)".into(),
+                                ));
+                            }
+                            return Err(OtterError::Runtime(msg));
+                        }
+                    }
+                }
+
+                if !did_work {
+                    break;
+                }
+            }
+
+            // === Interrupt check ===
+            if self.interrupt_flag.load(Ordering::Relaxed) {
+                return Err(OtterError::Runtime(
+                    "Execution interrupted (timeout)".into(),
+                ));
+            }
+
+            // === Exit check ===
+            let module_pending = signal.is_some();
+            let has_tasks = self.event_loop.has_pending_tasks();
+            let has_servers = self.event_loop.has_active_http_servers();
+            let has_async_ops = self.event_loop.has_pending_async_ops();
+
+            if !module_pending && !has_tasks && !has_servers && !has_async_ops {
+                break;
+            }
+
+            // === Yield to async runtime ===
+            self.event_loop.async_yield().await;
+
+            // Sleep when idle waiting for servers
+            if !has_tasks && !module_pending && has_servers {
+                self.event_loop.async_sleep(Duration::from_millis(1)).await;
+            }
         }
 
         Ok(final_value)
     }
 
-    /// Run the event loop with HTTP dispatch support
-    ///
-    /// This integrates HTTP event handling with the event loop, calling the JS
-    /// dispatcher function `__otter_http_dispatch(serverId, requestId)` for each request.
-    async fn run_event_loop_with_http(&self, ctx: &mut VmContext) {
-        use std::time::Duration;
-
-        loop {
-            // 1. Poll and dispatch HTTP events
-            self.dispatch_http_events(ctx);
-            // 1b. Poll and dispatch WebSocket events
-            self.dispatch_ws_events(ctx);
-
-            // 2. Drain microtasks and JS callback jobs
-            if let Err(e) = self.drain_microtasks(ctx) {
-                eprintln!("Error draining microtasks in event loop: {}", e);
-            }
-
-            // 2b. Check for interrupt
-            if self.interrupt_flag.load(Ordering::Relaxed) {
-                break;
-            }
-
-            // 3. Check if we should exit
-            let has_tasks = self.event_loop.has_pending_tasks();
-            let has_servers = self.event_loop.has_active_http_servers();
-            let has_async_ops = self.event_loop.has_pending_async_ops();
-
-            if !has_tasks && !has_servers && !has_async_ops {
-                break;
-            }
-
-            // 4. Yield to tokio for async I/O
-            tokio::task::yield_now().await;
-
-            // 5. Small sleep to prevent busy-loop when waiting for HTTP
-            if !has_tasks && has_servers {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        }
-    }
-
-    /// Dispatch pending HTTP events by calling JS handler
-    fn dispatch_http_events(&self, ctx: &mut VmContext) {
-        // Get pending HTTP events
-        let events = self.event_loop.take_http_events();
-
+    /// Dispatch a batch of HTTP events by calling JS handler.
+    fn dispatch_http_events_batch(&self, ctx: &mut VmContext, events: Vec<HttpEvent>) {
         for event in events {
-            // Call __otter_http_dispatch(serverId, requestId) in JS
             let global = ctx.global();
             if let Some(dispatch_fn) = global.get(&PropertyKey::string("__otter_http_dispatch")) {
-                // Call the dispatch function using the interpreter
                 let args = vec![
                     Value::number(event.server_id as f64),
                     Value::number(event.request_id as f64),
@@ -596,7 +681,6 @@ impl Otter {
                 let interpreter = Interpreter::new();
                 let _ = interpreter.call_function(ctx, &dispatch_fn, Value::undefined(), &args);
 
-                // Drain microtasks (including JS jobs) after each dispatch
                 if let Err(e) = self.drain_microtasks(ctx) {
                     eprintln!("Error draining microtasks after HTTP dispatch: {}", e);
                 }
@@ -606,9 +690,8 @@ impl Otter {
         }
     }
 
-    /// Dispatch pending WebSocket events by calling JS handler
-    fn dispatch_ws_events(&self, ctx: &mut VmContext) {
-        let events = self.event_loop.take_ws_events();
+    /// Dispatch a batch of WebSocket events by calling JS handler.
+    fn dispatch_ws_events_batch(&self, ctx: &mut VmContext, events: Vec<WsEvent>) {
         if events.is_empty() {
             return;
         }
@@ -627,81 +710,6 @@ impl Otter {
 
             if let Err(e) = self.drain_microtasks(ctx) {
                 eprintln!("Error draining microtasks after WS dispatch: {}", e);
-            }
-        }
-    }
-
-    /// Run a module's execution result to completion, handling suspension/resume for TLA.
-    ///
-    /// This is the core async resume loop extracted from `eval()`. It handles:
-    /// - `Complete`: capture exports, resolve the result promise, drain microtasks, return value
-    /// - `Suspended`: register promise signal, wait for resolution, resume VM
-    /// - `Error`: propagate as `OtterError`
-    ///
-    /// Used by both dependency module execution and main module execution.
-    async fn run_module_to_completion(
-        &self,
-        ctx: &mut VmContext,
-        mut exec_result: VmExecutionResult,
-        result_promise: GcRef<JsPromise>,
-    ) -> Result<Value, OtterError> {
-        loop {
-            match exec_result {
-                VmExecutionResult::Complete(value) => {
-                    // Capture exports from current frame before popping it.
-                    // The suspension path doesn't call the synchronous execute() which
-                    // normally sets captured_exports, so we do it here.
-                    Self::capture_exports_from_frame(ctx);
-                    // Pop the entry frame (matches the push in execute_with_suspension_and_locals)
-                    ctx.pop_frame();
-
-                    result_promise.resolve(value.clone());
-                    self.drain_microtasks(ctx)?;
-                    return Ok(value);
-                }
-                VmExecutionResult::Suspended(async_ctx) => {
-                    let signal = ResumeSignal::new();
-                    self.register_promise_signal(async_ctx.awaited_promise, Arc::clone(&signal));
-
-                    // Wait for the promise to settle (resolve or reject)
-                    let settlement = loop {
-                        if self.interrupt_flag.load(Ordering::Relaxed) {
-                            return Err(OtterError::Runtime("Test timed out".to_string()));
-                        }
-
-                        self.drain_microtasks(ctx)?;
-
-                        if signal.is_ready() {
-                            match signal.take_value() {
-                                Some(result) => break result,
-                                None => {
-                                    return Err(OtterError::Runtime(
-                                        "Signal ready but no value".to_string(),
-                                    ));
-                                }
-                            }
-                        }
-
-                        tokio::task::yield_now().await;
-                    };
-
-                    let interpreter = Interpreter::new();
-                    exec_result = match settlement {
-                        Ok(value) => interpreter.resume_async(ctx, async_ctx, value),
-                        Err(rejection) => {
-                            // Promise rejected — propagate through VM try-catch
-                            interpreter.resume_async_throw(ctx, async_ctx, rejection)
-                        }
-                    };
-                }
-                VmExecutionResult::Error(msg) => {
-                    if self.interrupt_flag.load(Ordering::Relaxed) {
-                        return Err(OtterError::Runtime(
-                            "Execution interrupted (timeout)".to_string(),
-                        ));
-                    }
-                    return Err(OtterError::Runtime(msg));
-                }
             }
         }
     }
@@ -728,17 +736,17 @@ impl Otter {
         for export in &module.exports {
             match export {
                 otter_vm_bytecode::module::ExportRecord::Named { local, exported } => {
-                    if let Some(idx) = entry_func.local_names.iter().position(|n| n == local) {
-                        if let Ok(val) = ctx.get_local(idx as u16) {
-                            exports.insert(exported.clone(), val);
-                        }
+                    if let Some(idx) = entry_func.local_names.iter().position(|n| n == local)
+                        && let Ok(val) = ctx.get_local(idx as u16)
+                    {
+                        exports.insert(exported.clone(), val);
                     }
                 }
                 otter_vm_bytecode::module::ExportRecord::Default { local } => {
-                    if let Some(idx) = entry_func.local_names.iter().position(|n| n == local) {
-                        if let Ok(val) = ctx.get_local(idx as u16) {
-                            exports.insert("default".to_string(), val);
-                        }
+                    if let Some(idx) = entry_func.local_names.iter().position(|n| n == local)
+                        && let Ok(val) = ctx.get_local(idx as u16)
+                    {
+                        exports.insert("default".to_string(), val);
                     }
                 }
                 _ => {}
@@ -831,7 +839,7 @@ impl Otter {
         }
 
         // Set top-level `this` to global object
-        ctx.set_pending_this(Value::object(ctx.global().clone()));
+        ctx.set_pending_this(Value::object(ctx.global()));
 
         // Load, link and execute
         let is_module =
@@ -982,7 +990,7 @@ impl Otter {
         }
 
         let intrinsics = self.isolate.runtime().intrinsics();
-        let global = ctx.global().clone();
+        let global = ctx.global();
         let mm = self.isolate.runtime().memory_manager().clone();
 
         // Determine profile — for now default to Full, will be configurable later
@@ -1013,7 +1021,7 @@ impl Otter {
             let ext = &self.native_extensions.extensions()[*idx];
             let mut load_ctx = crate::registration::RegistrationContext::new(
                 intrinsics,
-                ctx.global().clone(),
+                ctx.global(),
                 mm.clone(),
                 &mut self.extension_state,
             );
@@ -1031,7 +1039,7 @@ impl Otter {
 
     /// Register extension ops as global native functions in context
     fn register_ops_in_context(&self, ctx: &mut VmContext) {
-        let global = ctx.global().clone();
+        let global = ctx.global();
         let pending_ops = self.event_loop.get_pending_async_ops_count();
         let fn_proto = ctx
             .function_prototype()
@@ -1051,10 +1059,10 @@ impl Otter {
         }
 
         // Also register environment access if capabilities allow
-        self.register_env_access(global.clone(), fn_proto);
+        self.register_env_access(global, fn_proto);
 
         // Register __module_require with bytecode execution via NativeContext (safe)
-        self.register_module_require(global.clone(), fn_proto);
+        self.register_module_require(global, fn_proto);
 
         let ctx_ptr = ctx as *mut VmContext as usize;
         let vm_ptr = self.isolate.runtime() as *const VmRuntime as usize;
@@ -1313,7 +1321,7 @@ impl Otter {
                                 js_queue.enqueue(job, job_args);
                             },
                         );
-                        let promise = resolvers.promise.clone();
+                        let promise = resolvers.promise;
                         let resolve = resolvers.resolve.clone();
                         let reject = resolvers.reject.clone();
 
@@ -1730,7 +1738,7 @@ impl Otter {
                     return;
                 }
 
-                let result_clone = result_promise.clone();
+                let result_clone = result_promise;
                 let enqueue_js = make_js_enqueuer();
                 let enqueue_microtask = make_microtask_enqueuer();
                 promise.then_with_enqueue(
@@ -1739,7 +1747,7 @@ impl Otter {
                             kind: JsPromiseJobKind::PassthroughFulfill,
                             callback: Value::undefined(),
                             this_arg: Value::undefined(),
-                            result_promise: Some(result_clone.clone()),
+                            result_promise: Some(result_clone),
                         };
                         enqueue_js(job, vec![v]);
                     },
@@ -1755,7 +1763,7 @@ impl Otter {
                             kind: JsPromiseJobKind::PassthroughReject,
                             callback: Value::undefined(),
                             this_arg: Value::undefined(),
-                            result_promise: Some(result_clone.clone()),
+                            result_promise: Some(result_clone),
                         };
                         enqueue_js(job, vec![e]);
                     },
@@ -1810,7 +1818,7 @@ impl Otter {
 
             let resolve_fn = {
                 let called = Arc::clone(&called);
-                let result_promise = promise.clone();
+                let result_promise = promise;
                 let js_queue = Arc::clone(&js_queue);
                 if let Some(proto) = fn_proto {
                     Value::native_function_with_proto(
@@ -1818,7 +1826,7 @@ impl Otter {
                             if called.swap(true, Ordering::AcqRel) {
                                 return Ok(Value::undefined());
                             }
-                            let value = args.get(0).cloned().unwrap_or(Value::undefined());
+                            let value = args.first().cloned().unwrap_or(Value::undefined());
                             let js_queue = Arc::clone(&js_queue);
                             JsPromise::resolve_from_thenable_with_js_jobs(
                                 result_promise,
@@ -1838,7 +1846,7 @@ impl Otter {
                             if called.swap(true, Ordering::AcqRel) {
                                 return Ok(Value::undefined());
                             }
-                            let value = args.get(0).cloned().unwrap_or(Value::undefined());
+                            let value = args.first().cloned().unwrap_or(Value::undefined());
                             let js_queue = Arc::clone(&js_queue);
                             JsPromise::resolve_from_thenable_with_js_jobs(
                                 result_promise,
@@ -1856,7 +1864,7 @@ impl Otter {
 
             let reject_fn = {
                 let called = Arc::clone(&called);
-                let result_promise = promise.clone();
+                let result_promise = promise;
                 let js_queue = Arc::clone(&js_queue);
                 if let Some(proto) = fn_proto {
                     Value::native_function_with_proto(
@@ -1864,7 +1872,7 @@ impl Otter {
                             if called.swap(true, Ordering::AcqRel) {
                                 return Ok(Value::undefined());
                             }
-                            let value = args.get(0).cloned().unwrap_or(Value::undefined());
+                            let value = args.first().cloned().unwrap_or(Value::undefined());
                             let js_queue = Arc::clone(&js_queue);
                             JsPromise::reject_from_thenable_with_js_jobs(
                                 result_promise,
@@ -1884,7 +1892,7 @@ impl Otter {
                             if called.swap(true, Ordering::AcqRel) {
                                 return Ok(Value::undefined());
                             }
-                            let value = args.get(0).cloned().unwrap_or(Value::undefined());
+                            let value = args.first().cloned().unwrap_or(Value::undefined());
                             let js_queue = Arc::clone(&js_queue);
                             JsPromise::reject_from_thenable_with_js_jobs(
                                 result_promise,
@@ -1940,10 +1948,10 @@ impl Otter {
                 }
             }
 
-            if let Some(err) = runtime_error {
-                if first_error.is_none() {
-                    *first_error = Some(err);
-                }
+            if let Some(err) = runtime_error
+                && first_error.is_none()
+            {
+                *first_error = Some(err);
             }
         };
 
@@ -2020,7 +2028,7 @@ impl Otter {
                     result_promise,
                 } = job;
 
-                let passthrough_value = args.get(0).cloned().unwrap_or(Value::undefined());
+                let passthrough_value = args.first().cloned().unwrap_or(Value::undefined());
 
                 match kind {
                     JsPromiseJobKind::PassthroughFulfill => {
@@ -2086,16 +2094,11 @@ impl Otter {
                         match result {
                             Ok(Ok(value)) => {
                                 let gate_promise = JsPromise::new();
-                                resolve_result_promise(
-                                    &mut interpreter,
-                                    ctx,
-                                    gate_promise.clone(),
-                                    value,
-                                );
+                                resolve_result_promise(&mut interpreter, ctx, gate_promise, value);
 
                                 let enqueue_microtask = make_microtask_enqueuer();
                                 let enqueue_js = make_js_enqueuer();
-                                let result_clone = promise.clone();
+                                let result_clone = promise;
                                 let original_clone = original_value.clone();
                                 gate_promise.then_with_enqueue(
                                     move |_| {
@@ -2103,7 +2106,7 @@ impl Otter {
                                             kind: JsPromiseJobKind::PassthroughFulfill,
                                             callback: Value::undefined(),
                                             this_arg: Value::undefined(),
-                                            result_promise: Some(result_clone.clone()),
+                                            result_promise: Some(result_clone),
                                         };
                                         enqueue_js(job, vec![original_clone.clone()]);
                                     },
@@ -2112,14 +2115,14 @@ impl Otter {
 
                                 let enqueue_microtask = make_microtask_enqueuer();
                                 let enqueue_js = make_js_enqueuer();
-                                let result_clone = promise.clone();
+                                let result_clone = promise;
                                 gate_promise.catch_with_enqueue(
                                     move |e| {
                                         let job = JsPromiseJob {
                                             kind: JsPromiseJobKind::PassthroughReject,
                                             callback: Value::undefined(),
                                             this_arg: Value::undefined(),
-                                            result_promise: Some(result_clone.clone()),
+                                            result_promise: Some(result_clone),
                                         };
                                         enqueue_js(job, vec![e]);
                                     },
@@ -2154,10 +2157,10 @@ impl Otter {
                             }
                         }
 
-                        if let Some(err) = runtime_error {
-                            if first_error.is_none() {
-                                first_error = Some(err);
-                            }
+                        if let Some(err) = runtime_error
+                            && first_error.is_none()
+                        {
+                            first_error = Some(err);
                         }
 
                         continue;
@@ -2177,16 +2180,11 @@ impl Otter {
                         match result {
                             Ok(Ok(value)) => {
                                 let gate_promise = JsPromise::new();
-                                resolve_result_promise(
-                                    &mut interpreter,
-                                    ctx,
-                                    gate_promise.clone(),
-                                    value,
-                                );
+                                resolve_result_promise(&mut interpreter, ctx, gate_promise, value);
 
                                 let enqueue_microtask = make_microtask_enqueuer();
                                 let enqueue_js = make_js_enqueuer();
-                                let result_clone = promise.clone();
+                                let result_clone = promise;
                                 let original_clone = original_reason.clone();
                                 gate_promise.then_with_enqueue(
                                     move |_| {
@@ -2194,7 +2192,7 @@ impl Otter {
                                             kind: JsPromiseJobKind::PassthroughReject,
                                             callback: Value::undefined(),
                                             this_arg: Value::undefined(),
-                                            result_promise: Some(result_clone.clone()),
+                                            result_promise: Some(result_clone),
                                         };
                                         enqueue_js(job, vec![original_clone.clone()]);
                                     },
@@ -2203,14 +2201,14 @@ impl Otter {
 
                                 let enqueue_microtask = make_microtask_enqueuer();
                                 let enqueue_js = make_js_enqueuer();
-                                let result_clone = promise.clone();
+                                let result_clone = promise;
                                 gate_promise.catch_with_enqueue(
                                     move |e| {
                                         let job = JsPromiseJob {
                                             kind: JsPromiseJobKind::PassthroughReject,
                                             callback: Value::undefined(),
                                             this_arg: Value::undefined(),
-                                            result_promise: Some(result_clone.clone()),
+                                            result_promise: Some(result_clone),
                                         };
                                         enqueue_js(job, vec![e]);
                                     },
@@ -2245,10 +2243,10 @@ impl Otter {
                             }
                         }
 
-                        if let Some(err) = runtime_error {
-                            if first_error.is_none() {
-                                first_error = Some(err);
-                            }
+                        if let Some(err) = runtime_error
+                            && first_error.is_none()
+                        {
+                            first_error = Some(err);
                         }
 
                         continue;
@@ -2335,10 +2333,10 @@ impl Otter {
                     runtime_error = Some(format!("Error in JS callback: {}", vm_err));
                 }
 
-                if let Some(err) = runtime_error {
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
+                if let Some(err) = runtime_error
+                    && first_error.is_none()
+                {
+                    first_error = Some(err);
                 }
             } else {
                 let Some(task) = self.event_loop.microtask_queue().dequeue() else {
@@ -2349,17 +2347,17 @@ impl Otter {
                     task();
                 }));
 
-                if let Err(panic_err) = result {
-                    if first_error.is_none() {
-                        let error_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
-                            format!("Panic in microtask: {}", s)
-                        } else if let Some(s) = panic_err.downcast_ref::<String>() {
-                            format!("Panic in microtask: {}", s)
-                        } else {
-                            "Unknown panic in microtask".to_string()
-                        };
-                        first_error = Some(error_msg);
-                    }
+                if let Err(panic_err) = result
+                    && first_error.is_none()
+                {
+                    let error_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                        format!("Panic in microtask: {}", s)
+                    } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                        format!("Panic in microtask: {}", s)
+                    } else {
+                        "Unknown panic in microtask".to_string()
+                    };
+                    first_error = Some(error_msg);
                 }
             }
         }
@@ -2428,24 +2426,6 @@ impl Otter {
         ctx.register_external_root_set(
             loader.clone() as Arc<dyn otter_vm_core::context::ExternalRootSet + Send + Sync>
         );
-    }
-
-    /// Execute JS code with eval semantics (returns last expression value)
-    fn execute_js_eval(
-        &self,
-        ctx: &mut VmContext,
-        code: &str,
-        source_url: &str,
-    ) -> Result<Value, OtterError> {
-        let compiler = Compiler::new();
-        let module = compiler
-            .compile_eval(code, source_url, false)
-            .map_err(|e| OtterError::Compile(e.to_string()))?;
-
-        self.isolate
-            .runtime()
-            .execute_module_with_context(&module, ctx)
-            .map_err(|e| OtterError::Runtime(e.to_string()))
     }
 
     // ==================== Profiling API ====================

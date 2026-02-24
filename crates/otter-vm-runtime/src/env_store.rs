@@ -198,10 +198,10 @@ impl IsolatedEnvStore {
 
         // Add passthrough vars first (lower priority)
         for key in &self.passthrough {
-            if !self.is_denied(key) {
-                if let Ok(val) = std::env::var(key) {
-                    map.insert(key.clone(), val);
-                }
+            if !self.is_denied(key)
+                && let Ok(val) = std::env::var(key)
+            {
+                map.insert(key.clone(), val);
             }
         }
 
@@ -462,11 +462,13 @@ fn parse_env_value(
     // Check for multiline quoted value
     if value.starts_with('"') && !value.ends_with('"') {
         let mut multiline = value[1..].to_string();
-        while let Some(next_line) = lines.next() {
+        for next_line in lines.by_ref() {
             *line_num += 1;
             if next_line.ends_with('"') {
                 multiline.push('\n');
-                multiline.push_str(&next_line[..next_line.len() - 1]);
+                if let Some(stripped) = next_line.strip_suffix('"') {
+                    multiline.push_str(stripped);
+                }
                 return Ok(multiline);
             }
             multiline.push('\n');
@@ -477,11 +479,13 @@ fn parse_env_value(
 
     if value.starts_with('\'') && !value.ends_with('\'') {
         let mut multiline = value[1..].to_string();
-        while let Some(next_line) = lines.next() {
+        for next_line in lines.by_ref() {
             *line_num += 1;
             if next_line.ends_with('\'') {
                 multiline.push('\n');
-                multiline.push_str(&next_line[..next_line.len() - 1]);
+                if let Some(stripped) = next_line.strip_suffix('\'') {
+                    multiline.push_str(stripped);
+                }
                 return Ok(multiline);
             }
             multiline.push('\n');
@@ -529,13 +533,23 @@ impl std::error::Error for EnvWriteError {}
 pub enum EnvFileError {
     /// IO error reading file.
     Io {
+        /// Path to the file that could not be read.
         path: std::path::PathBuf,
+        /// The underlying IO error.
         source: std::io::Error,
     },
     /// Invalid environment variable key.
-    InvalidKey { key: String, line: usize },
+    InvalidKey {
+        /// The invalid key that was encountered.
+        key: String,
+        /// Line number where the invalid key was found.
+        line: usize,
+    },
     /// Unterminated quoted string.
-    UnterminatedString { line: usize },
+    UnterminatedString {
+        /// Line number where the unterminated string started.
+        line: usize,
+    },
 }
 
 impl std::fmt::Display for EnvFileError {

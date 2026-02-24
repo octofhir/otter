@@ -502,10 +502,10 @@ impl Test262Runner {
         mode: ExecutionMode,
         timeout: Option<Duration>,
     ) -> (TestOutcome, Option<String>) {
-        // Reset realm per mode: creates fresh global + intrinsics on the same
-        // GC heap. Much faster than full engine rebuild for large suites (no
-        // GC reset, no extension recompilation). Extensions re-applied by eval().
+        println!("STARTING reset_realm: {}", path.display());
+        let reset_start = std::time::Instant::now();
         self.engine_mut().reset_realm();
+        println!("FINISHED reset_realm in {:?}", reset_start.elapsed());
 
         let relative_path = path.strip_prefix(&self.test_dir).unwrap_or(path);
         let test_name = format!("{} ({})", relative_path.to_string_lossy(), mode);
@@ -595,6 +595,8 @@ impl Test262Runner {
     ) -> (TestOutcome, Option<String>) {
         let is_async = metadata.is_async();
 
+        println!("STARTING execute_test_with_url: {}", test_name);
+        let start_time = std::time::Instant::now();
         let outcome = match self
             .run_with_timeout(source, timeout, test_name, source_url)
             .await
@@ -682,6 +684,11 @@ impl Test262Runner {
         // Save trace if configured for failures/timeouts
         self.save_conditional_trace(&test_name, outcome.0);
 
+        println!(
+            "FINISHED execute_test_with_url: {} in {:?}",
+            test_name,
+            start_time.elapsed()
+        );
         outcome
     }
 
@@ -883,9 +890,11 @@ impl Test262Runner {
             let flag = self.engine().interrupt_flag();
             let token = self.timeout_watchdog.arm(duration, flag);
 
+            println!("STARTING eval in run_with_timeout: {}", _test_name);
             let result = AssertUnwindSafe(self.engine_mut().eval(source, Some(source_url)))
                 .catch_unwind()
                 .await;
+            println!("FINISHED eval in run_with_timeout: {}", _test_name);
 
             // Disarm watchdog if test finished before timeout
             self.timeout_watchdog.disarm(token);

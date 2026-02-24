@@ -153,6 +153,8 @@ pub struct Intrinsics {
     pub abort_controller_constructor: GcRef<JsObject>,
     /// `AbortSignal` constructor
     pub abort_signal_constructor: GcRef<JsObject>,
+    /// `RegExp` constructor
+    pub regexp_constructor: GcRef<JsObject>,
 
     // ========================================================================
     // Primitive wrapper prototypes
@@ -344,6 +346,7 @@ impl Intrinsics {
             self.aggregate_error_prototype,
             self.promise_prototype,
             self.regexp_prototype,
+            self.regexp_constructor,
             self.date_prototype,
             self.array_buffer_prototype,
             self.data_view_prototype,
@@ -503,6 +506,7 @@ impl Intrinsics {
             data_view_prototype: alloc(),
             abort_controller_prototype: alloc(),
             abort_signal_prototype: alloc(),
+            regexp_constructor: alloc(),
             // Iterators
             iterator_prototype: alloc(),
             string_iterator_prototype: alloc(),
@@ -575,6 +579,7 @@ impl Intrinsics {
             result.aggregate_error_prototype,
             result.promise_prototype,
             result.regexp_prototype,
+            result.regexp_constructor,
             result.date_prototype,
             result.array_buffer_prototype,
             result.data_view_prototype,
@@ -1055,28 +1060,30 @@ impl Intrinsics {
                         );
 
                         // Helper: get element at index from array-like value
-                        let get_element =
-                            |arr: &Value, i: usize, ncx: &mut crate::context::NativeContext| -> Result<Value, VmError> {
-                                if let Some(ta) = arr.as_typed_array() {
-                                    Ok(ta.get(i).map(Value::number).unwrap_or(Value::undefined()))
-                                } else if let Some(proxy) = arr.as_proxy() {
-                                    let key = PropertyKey::Index(i as u32);
-                                    let key_value = Value::number(i as f64);
-                                    crate::proxy_operations::proxy_get(
-                                        ncx,
-                                        proxy,
-                                        &key,
-                                        key_value,
-                                        arr.clone(),
-                                    )
-                                } else if let Some(arr_obj) = arr.as_object() {
-                                    Ok(arr_obj
-                                        .get(&PropertyKey::Index(i as u32))
-                                        .unwrap_or(Value::undefined()))
-                                } else {
-                                    Ok(Value::undefined())
-                                }
-                            };
+                        let get_element = |arr: &Value,
+                                           i: usize,
+                                           ncx: &mut crate::context::NativeContext|
+                         -> Result<Value, VmError> {
+                            if let Some(ta) = arr.as_typed_array() {
+                                Ok(ta.get(i).map(Value::number).unwrap_or(Value::undefined()))
+                            } else if let Some(proxy) = arr.as_proxy() {
+                                let key = PropertyKey::Index(i as u32);
+                                let key_value = Value::number(i as f64);
+                                crate::proxy_operations::proxy_get(
+                                    ncx,
+                                    proxy,
+                                    &key,
+                                    key_value,
+                                    arr.clone(),
+                                )
+                            } else if let Some(arr_obj) = arr.as_object() {
+                                Ok(arr_obj
+                                    .get(&PropertyKey::Index(i as u32))
+                                    .unwrap_or(Value::undefined()))
+                            } else {
+                                Ok(Value::undefined())
+                            }
+                        };
 
                         let value = match kind.as_str() {
                             "key" => Value::number(idx as f64),
@@ -2387,7 +2394,7 @@ impl Intrinsics {
         );
         crate::intrinsics_impl::helpers::define_species_getter(promise_ctor, fn_proto, mm);
 
-        let regexp_ctor = alloc_ctor();
+        let regexp_ctor = self.regexp_constructor;
         let regexp_ctor_fn =
             crate::intrinsics_impl::regexp::create_regexp_constructor(self.regexp_prototype);
         install(
@@ -2396,6 +2403,7 @@ impl Intrinsics {
             self.regexp_prototype,
             Some(regexp_ctor_fn),
         );
+        crate::intrinsics_impl::regexp::init_regexp_constructor(regexp_ctor, fn_proto, mm.clone());
         crate::intrinsics_impl::helpers::define_species_getter(regexp_ctor, fn_proto, mm);
 
         // RegExp.escape (ES2026 §22.2.4.1)

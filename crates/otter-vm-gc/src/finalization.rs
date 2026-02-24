@@ -126,6 +126,7 @@ impl GcTraceable for FinalizationRegistryData {
     /// FinalizationRegistryData does NOT trace targets (they are weak references).
     /// The held values and callback are stored on the JS wrapper and traced there.
     const NEEDS_TRACE: bool = false;
+    const TYPE_ID: u8 = crate::object::tags::FINALIZATION_REGISTRY;
 
     fn trace(&self, _tracer: &mut dyn FnMut(*const GcHeader)) {
         // Nothing to trace — all strong references live on the JS wrapper object.

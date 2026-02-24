@@ -90,7 +90,8 @@ impl VmRuntime {
         // Create per-runtime GC registry. Box-owned by VmRuntime.
         // Thread-local pointer is set for the duration of construction,
         // and cleared in VmRuntime::drop() before the Box is freed.
-        let gc_registry = Box::new(otter_vm_gc::AllocationRegistry::new());
+        let mut gc_registry = Box::new(otter_vm_gc::AllocationRegistry::new());
+        register_all_types(&mut gc_registry);
         // SAFETY: pointer remains valid as long as this VmRuntime is alive.
         // VmRuntime::drop() clears the thread-local before freeing the Box.
         unsafe { otter_vm_gc::set_thread_registry(&*gc_registry) };
@@ -127,7 +128,10 @@ impl VmRuntime {
         // Stage 3: Initialize core intrinsic properties (toString, valueOf, etc.)
         intrinsics.init_core(&memory_manager);
 
-        let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(
+            Value::object(intrinsics.object_prototype),
+            memory_manager.clone(),
+        ));
         global.define_property(
             crate::object::PropertyKey::string("__realm_id__"),
             crate::object::PropertyDescriptor::builtin_data(Value::int32(default_realm_id as i32)),
@@ -202,7 +206,10 @@ impl VmRuntime {
         intrinsics.wire_prototype_chains();
         intrinsics.init_core(&mm);
 
-        let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let global = GcRef::new(JsObject::new(
+            Value::object(intrinsics.object_prototype),
+            mm.clone(),
+        ));
         global.define_property(
             crate::object::PropertyKey::string("__realm_id__"),
             crate::object::PropertyDescriptor::builtin_data(Value::int32(realm_id as i32)),
@@ -381,6 +388,43 @@ impl Drop for VmRuntime {
 
         // Now Box<AllocationRegistry> drops (struct freed, memory already deallocated).
     }
+}
+
+fn register_all_types(registry: &mut otter_vm_gc::AllocationRegistry) {
+    use crate::array_buffer::JsArrayBuffer;
+    use crate::data_view::JsDataView;
+    use crate::generator::JsGenerator;
+    use crate::map_data::{MapData, SetData};
+    use crate::object::JsObject;
+    use crate::promise::JsPromise;
+    use crate::proxy::JsProxy;
+    use crate::regexp::JsRegExp;
+    use crate::shared_buffer::SharedArrayBuffer;
+    use crate::string::JsString;
+    use crate::typed_array::JsTypedArray;
+    use crate::value::{BigInt, Closure, NativeFunctionObject, Symbol};
+
+    registry.register_type::<JsString>();
+    registry.register_type::<JsObject>();
+    registry.register_type::<JsRegExp>();
+    registry.register_type::<Symbol>();
+    registry.register_type::<BigInt>();
+    registry.register_type::<Closure>();
+    registry.register_type::<NativeFunctionObject>();
+    registry.register_type::<MapData>();
+    registry.register_type::<SetData>();
+    registry.register_type::<JsPromise>();
+    registry.register_type::<JsProxy>();
+    registry.register_type::<JsArrayBuffer>();
+    registry.register_type::<SharedArrayBuffer>();
+    registry.register_type::<JsTypedArray>();
+    registry.register_type::<JsDataView>();
+    registry.register_type::<JsGenerator>();
+
+    // GC-internal types
+    registry.register_type::<otter_vm_gc::WeakRefCell>();
+    registry.register_type::<otter_vm_gc::FinalizationRegistryData>();
+    registry.register_type::<otter_vm_gc::EphemeronTable>();
 }
 
 // SAFETY: VmRuntime uses Mutex<IndexMap> (thread-safe) for modules and

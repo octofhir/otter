@@ -41,10 +41,12 @@ pub struct MicrotaskSequencer {
 }
 
 impl MicrotaskSequencer {
+    /// Create a new sequencer starting at zero.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Return the next monotonically increasing sequence number.
     pub fn next(&self) -> u64 {
         self.counter.fetch_add(1, Ordering::Relaxed)
     }
@@ -349,6 +351,7 @@ pub struct JsJobQueueWrapper {
 }
 
 impl JsJobQueueWrapper {
+    /// Wrap a shared [`JsJobQueue`] for trait-object usage.
     pub fn new(queue: Arc<JsJobQueue>) -> Arc<Self> {
         Arc::new(Self { queue })
     }

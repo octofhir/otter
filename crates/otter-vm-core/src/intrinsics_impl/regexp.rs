@@ -8,6 +8,7 @@
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
+use crate::intrinsics_impl::helpers::same_value;
 use crate::memory::MemoryManager;
 use crate::object::{
     JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey, get_value_full, set_value_full,
@@ -119,40 +120,6 @@ fn obj_set_with_receiver(
     }
     let _ = obj.set(pk, value);
     Ok(())
-}
-
-/// SameValue comparison per spec (treats NaN === NaN, -0 !== +0)
-fn same_value(x: &Value, y: &Value) -> bool {
-    // Both numbers: use SameValue semantics
-    let xn = x.as_number().or_else(|| x.as_int32().map(|i| i as f64));
-    let yn = y.as_number().or_else(|| y.as_int32().map(|i| i as f64));
-    if let (Some(xn), Some(yn)) = (xn, yn) {
-        if xn.is_nan() && yn.is_nan() {
-            return true;
-        }
-        if xn == 0.0 && yn == 0.0 {
-            return xn.to_bits() == yn.to_bits(); // distinguishes -0 and +0
-        }
-        return xn == yn;
-    }
-    // For non-numbers, use strict equality
-    if x.is_undefined() && y.is_undefined() {
-        return true;
-    }
-    if x.is_null() && y.is_null() {
-        return true;
-    }
-    // String comparison
-    if let (Some(xs), Some(ys)) = (x.as_string(), y.as_string()) {
-        return xs.as_str() == ys.as_str();
-    }
-    // Boolean comparison
-    if let (Some(xb), Some(yb)) = (x.as_boolean(), y.as_boolean()) {
-        return xb == yb;
-    }
-    // Object identity (same GcRef pointer)
-    // For objects/arrays, reference equality
-    false
 }
 
 /// ToUint32(n) §7.1.7
@@ -276,7 +243,6 @@ impl ExecMatch {
         }
         self.captures.get(idx - 1).cloned().flatten()
     }
-
 }
 
 fn find_utf16_literal(input: &[u16], pattern: &[u16], start: usize) -> Option<usize> {
@@ -292,7 +258,11 @@ fn find_utf16_literal(input: &[u16], pattern: &[u16], start: usize) -> Option<us
     None
 }
 
-fn find_special_duplicate_named(regex: &JsRegExp, input: &JsString, start: usize) -> Option<ExecMatch> {
+fn find_special_duplicate_named(
+    regex: &JsRegExp,
+    input: &JsString,
+    start: usize,
+) -> Option<ExecMatch> {
     const P1: &str = "(?:(?<x>a)|(?<y>a)(?<x>b))(?:(?<z>c)|(?<z>d))";
     const P2: &str = "(?:(?:(?<x>a)|(?<x>b)|c)\\k<x>){2}";
     let u = input.as_utf16();
@@ -304,25 +274,13 @@ fn find_special_duplicate_named(regex: &JsRegExp, input: &JsString, start: usize
                 if u[i + 1] == ('c' as u16) {
                     return Some(ExecMatch {
                         range: i..(i + 2),
-                        captures: vec![
-                            Some(i..(i + 1)),
-                            None,
-                            None,
-                            Some((i + 1)..(i + 2)),
-                            None,
-                        ],
+                        captures: vec![Some(i..(i + 1)), None, None, Some((i + 1)..(i + 2)), None],
                     });
                 }
                 if u[i + 1] == ('d' as u16) {
                     return Some(ExecMatch {
                         range: i..(i + 2),
-                        captures: vec![
-                            Some(i..(i + 1)),
-                            None,
-                            None,
-                            None,
-                            Some((i + 1)..(i + 2)),
-                        ],
+                        captures: vec![Some(i..(i + 1)), None, None, None, Some((i + 1)..(i + 2))],
                     });
                 }
             }
@@ -357,7 +315,11 @@ fn find_special_duplicate_named(regex: &JsRegExp, input: &JsString, start: usize
     }
 
     if regex.pattern == P2 {
-        let iter = |pos: usize| -> Option<(usize, Option<std::ops::Range<usize>>, Option<std::ops::Range<usize>>)> {
+        let iter = |pos: usize| -> Option<(
+            usize,
+            Option<std::ops::Range<usize>>,
+            Option<std::ops::Range<usize>>,
+        )> {
             if pos >= u.len() {
                 return None;
             }
@@ -702,13 +664,213 @@ fn regexp_builtin_exec(
     match mat {
         Some(m) => {
             set_last_index(regex, m.end() as f64)?;
-            Ok(build_exec_result(regex, input, &m, has_indices, ncx))
+            let result = build_exec_result(regex, input, &m, has_indices, ncx);
+            update_last_match_state(ncx, input, &m)?;
+            Ok(result)
         }
         None => {
             set_last_index(regex, 0.0)?;
             Ok(Value::null())
         }
     }
+}
+
+/// Update legacy RegExp static properties (§B.2.4)
+fn update_last_match_state(
+    ncx: &mut NativeContext<'_>,
+    input: &JsString,
+    mat: &ExecMatch,
+) -> Result<(), VmError> {
+    let realm_id = ncx.ctx.realm_id();
+    let re_ctor = match ncx.ctx.realm_intrinsics(realm_id) {
+        Some(intrinsics) => intrinsics.regexp_constructor,
+        None => return Ok(()),
+    };
+
+    // Store the state in internal slots (hidden properties)
+    let set_internal = |name: &str, val: Value| {
+        let _ = re_ctor.set(PropertyKey::string(&format!("__legacy_{}__", name)), val);
+    };
+
+    set_internal("input", Value::string(JsString::intern(input.as_str())));
+    set_internal(
+        "lastMatch",
+        Value::string(slice_utf16(input, mat.start(), mat.end())),
+    );
+
+    let last_paren = if mat.captures.is_empty() {
+        Value::string(JsString::intern(""))
+    } else {
+        match mat.group(mat.captures.len()) {
+            Some(range) => Value::string(slice_utf16(input, range.start, range.end)),
+            None => Value::string(JsString::intern("")),
+        }
+    };
+    set_internal("lastParen", last_paren);
+
+    set_internal(
+        "leftContext",
+        Value::string(slice_utf16(input, 0, mat.start())),
+    );
+    set_internal(
+        "rightContext",
+        Value::string(slice_utf16(input, mat.end(), input.len_utf16())),
+    );
+
+    for i in 1..=9 {
+        let val = match mat.group(i) {
+            Some(range) => Value::string(slice_utf16(input, range.start, range.end)),
+            None => Value::string(JsString::intern("")),
+        };
+        set_internal(&format!("${}", i), val);
+    }
+
+    Ok(())
+}
+
+fn get_legacy_prop(
+    ncx: &mut NativeContext<'_>,
+    this_val: &Value,
+    name: &str,
+) -> Result<Value, VmError> {
+    let realm_id = ncx.ctx.realm_id();
+    let intrinsics = ncx
+        .ctx
+        .realm_intrinsics(realm_id)
+        .ok_or_else(|| VmError::type_error("Intrinsics not found for realm"))?;
+    let re_ctor = intrinsics.regexp_constructor;
+
+    // Annex B §B.2.4.1: If SameValue(receiver, constructor) is false, throw TypeError
+    if !same_value(this_val, &Value::object(re_ctor)) {
+        return Err(VmError::type_error(
+            "Legacy RegExp property accessed on illegal receiver",
+        ));
+    }
+
+    Ok(re_ctor
+        .get(&PropertyKey::string(&format!("__legacy_{}__", name)))
+        .unwrap_or_else(|| {
+            // Default values according to spec
+            if name.starts_with('$')
+                || name == "lastParen"
+                || name == "lastMatch"
+                || name == "leftContext"
+                || name == "rightContext"
+            {
+                Value::string(JsString::intern(""))
+            } else {
+                Value::undefined()
+            }
+        }))
+}
+
+/// Annex B §B.2.4.1: [[Set]] for legacy static properties
+fn set_legacy_prop(
+    ncx: &mut NativeContext<'_>,
+    this_val: &Value,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    let realm_id = ncx.ctx.realm_id();
+    let intrinsics = ncx
+        .ctx
+        .realm_intrinsics(realm_id)
+        .ok_or_else(|| VmError::type_error("Intrinsics not found for realm"))?;
+    let re_ctor = intrinsics.regexp_constructor;
+
+    // Annex B §B.2.4.1: If SameValue(receiver, constructor) is false, throw TypeError
+    if !same_value(this_val, &Value::object(re_ctor)) {
+        return Err(VmError::type_error(
+            "Legacy RegExp property set on illegal receiver",
+        ));
+    }
+
+    if name == "input" || name == "$_" {
+        let val = args.get(0).cloned().unwrap_or(Value::undefined());
+        let s = ncx.to_string_value(&val)?;
+        let _ = re_ctor.set(
+            PropertyKey::string("__legacy_input__"),
+            Value::string(JsString::intern(&s)),
+        );
+    }
+
+    Ok(Value::undefined())
+}
+
+/// Initialize the RegExp constructor with legacy properties (§B.2.4)
+pub fn init_regexp_constructor(
+    re_ctor: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    mm: Arc<MemoryManager>,
+) {
+    let define_legacy = |name: &str, has_setter: bool| {
+        let name_owned = name.to_owned();
+        let getter_mm = mm.clone();
+        let getter_fn_proto = fn_proto.clone();
+        let name_owned_for_get = name_owned.clone();
+        let getter = Value::native_function_with_proto(
+            move |this_val, _args, ncx| get_legacy_prop(ncx, this_val, &name_owned_for_get),
+            getter_mm,
+            getter_fn_proto,
+        );
+
+        let setter = if has_setter {
+            let setter_mm = mm.clone();
+            let setter_fn_proto = fn_proto.clone();
+            let name_owned_for_set = name_owned.clone();
+            Some(Value::native_function_with_proto(
+                move |this_val, args, ncx| {
+                    set_legacy_prop(ncx, this_val, &name_owned_for_set, args)
+                },
+                setter_mm,
+                setter_fn_proto,
+            ))
+        } else {
+            None
+        };
+
+        re_ctor.define_property(
+            PropertyKey::string(name),
+            PropertyDescriptor::Accessor {
+                get: Some(getter),
+                set: setter,
+                attributes: PropertyAttributes {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            },
+        );
+    };
+
+    define_legacy("input", true);
+    define_legacy("lastMatch", false);
+    define_legacy("lastParen", false);
+    define_legacy("leftContext", false);
+    define_legacy("rightContext", false);
+
+    // Static properties for $1-$9
+    for i in 1..=9 {
+        define_legacy(&format!("${}", i), false);
+    }
+
+    // Manual aliases:
+    // $_ = input
+    // $& = lastMatch
+    // $+ = lastParen
+    // $` = leftContext
+    // $' = rightContext
+    let install_alias = |alias: &str, name: &str| {
+        if let Some(desc) = re_ctor.lookup_property_descriptor(&PropertyKey::string(name)) {
+            re_ctor.define_property(PropertyKey::string(alias), desc);
+        }
+    };
+
+    install_alias("$_", "input");
+    install_alias("$&", "lastMatch");
+    install_alias("$+", "lastParen");
+    install_alias("$`", "leftContext");
+    install_alias("$'", "rightContext");
 }
 
 /// RegExpExec (§22.2.7.1) — calls this.exec() if it exists, falls back to RegExpBuiltinExec
@@ -718,6 +880,17 @@ fn regexp_exec(
     ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
     let obj = get_this_object(this_val)?;
+
+    // Fast path: if the object has no own "exec" property, the user has not
+    // overridden exec on this instance. We can skip the expensive property lookup
+    // + JS function call and directly invoke the builtin.
+    let exec_key = PropertyKey::string("exec");
+    if !obj.has_own(&exec_key) {
+        if let Some(regex) = this_val.as_regex() {
+            return regexp_builtin_exec(&*regex, input, ncx);
+        }
+    }
+
     // 1. Let exec be ? Get(R, "exec")
     let exec = obj_get(&obj, "exec", ncx)?;
 
@@ -735,7 +908,7 @@ fn regexp_exec(
 
     // 3. If R does not have [[RegExpMatcher]], throw TypeError
     let regex = get_regex(this_val)?;
-    regexp_builtin_exec(&regex, input, ncx)
+    regexp_builtin_exec(&*regex, input, ncx)
 }
 
 /// Apply replacement patterns ($&, $1..$99, $$, $`, $', $<name>) on a single match.
@@ -1230,7 +1403,8 @@ pub fn init_regexp_prototype(
             regex_mut.pattern = pattern;
             regex_mut.flags = flags;
             regex_mut.unicode = parsed_flags.unicode || parsed_flags.unicode_sets;
-            regex_mut.capture_group_names = crate::regexp::parse_capture_group_names(&regex_mut.pattern);
+            regex_mut.capture_group_names =
+                crate::regexp::parse_capture_group_names(&regex_mut.pattern);
             regex_mut.fallback_literal_utf16 =
                 compute_literal_utf16_fallback(&regex_mut.pattern, &parsed_flags);
             regex_mut.native_regex = native_regex.ok();

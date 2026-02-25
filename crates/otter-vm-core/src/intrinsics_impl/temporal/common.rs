@@ -6,9 +6,11 @@
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
-use crate::object::{JsObject, PropertyKey};
+use crate::memory::MemoryManager;
+use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
+use std::sync::Arc;
 use temporal_rs::options::Overflow;
 
 // ============================================================================
@@ -40,6 +42,87 @@ pub(super) fn temporal_err(e: temporal_rs::error::TemporalError) -> VmError {
         temporal_rs::error::ErrorKind::Syntax => VmError::range_error(msg),
         _ => VmError::type_error(msg),
     }
+}
+
+// ============================================================================
+// Duration helpers
+// ============================================================================
+
+/// Duration field names in constructor order (public JS names)
+pub(super) const DURATION_FIELDS: [&str; 10] = [
+    "years", "months", "weeks", "days", "hours", "minutes",
+    "seconds", "milliseconds", "microseconds", "nanoseconds",
+];
+
+/// Internal slot names for Duration fields (avoid shadowing prototype getters)
+pub(super) const DURATION_SLOTS: [&str; 10] = [
+    "__dur_years", "__dur_months", "__dur_weeks", "__dur_days",
+    "__dur_hours", "__dur_minutes", "__dur_seconds", "__dur_milliseconds",
+    "__dur_microseconds", "__dur_nanoseconds",
+];
+
+/// ToIntegerIfIntegral (spec 7.4.39) — converts a JS value to an integer,
+/// throwing RangeError for NaN, Infinity, or non-integer values.
+pub(super) fn to_integer_if_integral(ncx: &mut NativeContext<'_>, val: &Value) -> Result<f64, VmError> {
+    let n = ncx.to_number_value(val)?;
+    if n.is_nan() {
+        return Err(VmError::range_error("Cannot convert NaN to an integer"));
+    }
+    if n.is_infinite() {
+        return Err(VmError::range_error("Cannot convert Infinity to an integer"));
+    }
+    if n != n.trunc() {
+        return Err(VmError::range_error("Value must be an integer"));
+    }
+    Ok(n)
+}
+
+/// Extract a `temporal_rs::Duration` from a JsObject's internal duration slots.
+pub(super) fn extract_duration_from_slots(obj: &GcRef<JsObject>) -> Result<temporal_rs::Duration, VmError> {
+    let get_f64 = |slot: &str| -> f64 {
+        obj.get(&PropertyKey::string(slot))
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0)
+    };
+    temporal_rs::Duration::new(
+        get_f64(DURATION_SLOTS[0]) as i64,
+        get_f64(DURATION_SLOTS[1]) as i64,
+        get_f64(DURATION_SLOTS[2]) as i64,
+        get_f64(DURATION_SLOTS[3]) as i64,
+        get_f64(DURATION_SLOTS[4]) as i64,
+        get_f64(DURATION_SLOTS[5]) as i64,
+        get_f64(DURATION_SLOTS[6]) as i64,
+        get_f64(DURATION_SLOTS[7]) as i64,
+        get_f64(DURATION_SLOTS[8]) as i128,
+        get_f64(DURATION_SLOTS[9]) as i128,
+    )
+    .map_err(temporal_err)
+}
+
+/// Create a new Duration JS object from a `temporal_rs::Duration`, storing
+/// validated field values in internal slots.
+pub(super) fn construct_duration_object(
+    dur: &temporal_rs::Duration,
+    proto: &GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+) -> GcRef<JsObject> {
+    let obj = GcRef::new(JsObject::new(Value::object(proto.clone()), mm.clone()));
+    obj.define_property(
+        PropertyKey::string(SLOT_TEMPORAL_TYPE),
+        PropertyDescriptor::builtin_data(Value::string(JsString::intern("Duration"))),
+    );
+    let vals: [f64; 10] = [
+        dur.years() as f64, dur.months() as f64, dur.weeks() as f64, dur.days() as f64,
+        dur.hours() as f64, dur.minutes() as f64, dur.seconds() as f64, dur.milliseconds() as f64,
+        dur.microseconds() as f64, dur.nanoseconds() as f64,
+    ];
+    for (slot, val) in DURATION_SLOTS.iter().zip(vals.iter()) {
+        obj.define_property(
+            PropertyKey::string(slot),
+            PropertyDescriptor::builtin_data(Value::number(*val)),
+        );
+    }
+    obj
 }
 
 // ============================================================================

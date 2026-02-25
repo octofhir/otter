@@ -6,6 +6,9 @@ use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKe
 use crate::string::JsString;
 use crate::value::Value;
 use std::sync::Arc;
+use temporal_rs::options::{RoundingMode, ToStringRoundingOptions, Unit};
+use temporal_rs::parsers::Precision;
+use temporal_rs::provider::NeverProvider;
 
 use super::common::*;
 
@@ -37,31 +40,36 @@ pub(super) fn install_duration(
         PropertyDescriptor::function_length(Value::number(0.0)),
     );
 
-    // Constructor
+    // ========================================================================
+    // Constructor: new Temporal.Duration(y, mo, w, d, h, mi, s, ms, us, ns)
+    // ========================================================================
+    let ctor_proto = proto.clone();
+    let ctor_mm = mm.clone();
     let ctor_fn: Box<
         dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
-    > = Box::new(|this, args, _ncx| {
-        if let Some(obj) = this.as_object() {
-            obj.define_property(
-                PropertyKey::string(SLOT_TEMPORAL_TYPE),
-                PropertyDescriptor::builtin_data(Value::string(JsString::intern("Duration"))),
-            );
-            let dur_fields = [
-                "years", "months", "weeks", "days", "hours", "minutes",
-                "seconds", "milliseconds", "microseconds", "nanoseconds",
-            ];
-            for (i, field) in dur_fields.iter().enumerate() {
-                if let Some(val) = args.get(i) {
-                    if !val.is_undefined() {
-                        obj.define_property(
-                            PropertyKey::string(field),
-                            PropertyDescriptor::builtin_data(val.clone()),
-                        );
-                    }
+    > = Box::new(move |_this, args, ncx| {
+        // Parse each argument with ToIntegerIfIntegral (defaulting to 0)
+        let mut vals = [0f64; 10];
+        for (i, field) in DURATION_FIELDS.iter().enumerate() {
+            if let Some(val) = args.get(i) {
+                if !val.is_undefined() {
+                    let n = to_integer_if_integral(ncx, val).map_err(|e| {
+                        VmError::range_error(format!("Invalid value for {}: {}", field, e))
+                    })?;
+                    vals[i] = n;
                 }
             }
         }
-        Ok(Value::undefined())
+
+        // Validate with temporal_rs::Duration::new()
+        let dur = temporal_rs::Duration::new(
+            vals[0] as i64, vals[1] as i64, vals[2] as i64, vals[3] as i64,
+            vals[4] as i64, vals[5] as i64, vals[6] as i64, vals[7] as i64,
+            vals[8] as i128, vals[9] as i128,
+        ).map_err(temporal_err)?;
+
+        let obj = construct_duration_object(&dur, &ctor_proto, &ctor_mm);
+        Ok(Value::object(obj))
     });
 
     let ctor_value = Value::native_function_with_proto_and_object(
@@ -80,53 +88,50 @@ pub(super) fn install_duration(
     // ========================================================================
     // Duration.from()
     // ========================================================================
-    let from_ctor = ctor_value.clone();
+    let from_proto = proto.clone();
+    let from_mm = mm.clone();
     let from_fn = Value::native_function_with_proto_named(
         move |_this, args, ncx| {
             let item = args.first().cloned().unwrap_or(Value::undefined());
             if item.is_string() {
                 let s = ncx.to_string_value(&item)?;
                 let dur = temporal_rs::Duration::from_utf8(s.as_bytes()).map_err(temporal_err)?;
-                let dur_args = vec![
-                    Value::number(dur.years() as f64), Value::number(dur.months() as f64),
-                    Value::number(dur.weeks() as f64), Value::number(dur.days() as f64),
-                    Value::number(dur.hours() as f64), Value::number(dur.minutes() as f64),
-                    Value::number(dur.seconds() as f64), Value::number(dur.milliseconds() as f64),
-                    Value::number(dur.microseconds() as f64), Value::number(dur.nanoseconds() as f64),
-                ];
-                return ncx.call_function_construct(&from_ctor, Value::undefined(), &dur_args);
+                let obj = construct_duration_object(&dur, &from_proto, &from_mm);
+                return Ok(Value::object(obj));
             }
             if let Some(obj) = item.as_object() {
                 let tt = obj.get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
                     .and_then(|v| v.as_string().map(|s| s.as_str().to_string()));
                 if tt.as_deref() == Some("Duration") {
-                    let fields = ["years","months","weeks","days","hours","minutes","seconds","milliseconds","microseconds","nanoseconds"];
-                    let dur_args: Vec<Value> = fields.iter().map(|f| {
-                        obj.get(&PropertyKey::string(f)).unwrap_or(Value::int32(0))
-                    }).collect();
-                    return ncx.call_function_construct(&from_ctor, Value::undefined(), &dur_args);
+                    let dur = extract_duration_from_slots(&obj)?;
+                    let result = construct_duration_object(&dur, &from_proto, &from_mm);
+                    return Ok(Value::object(result));
                 }
                 // Generic property bag
                 let field_names_alpha = ["days","hours","microseconds","milliseconds","minutes","months","nanoseconds","seconds","weeks","years"];
-                let field_names_ctor  = ["years","months","weeks","days","hours","minutes","seconds","milliseconds","microseconds","nanoseconds"];
-                let mut field_map = std::collections::HashMap::new();
+                let mut has_any = false;
+                let mut vals = [0f64; 10];
                 for &f in &field_names_alpha {
                     let v = ncx.get_property(&obj, &PropertyKey::string(f))?;
                     if !v.is_undefined() {
-                        let n = ncx.to_number_value(&v)?;
-                        if n.is_infinite() { return Err(VmError::range_error(format!("{} cannot be Infinity", f))); }
-                        if n.is_nan() { return Err(VmError::range_error(format!("{} cannot be NaN", f))); }
-                        if n != n.trunc() { return Err(VmError::range_error(format!("{} must be an integer", f))); }
-                        field_map.insert(f, n);
+                        has_any = true;
+                        let n = to_integer_if_integral(ncx, &v).map_err(|_| {
+                            VmError::range_error(format!("{} must be a finite integer", f))
+                        })?;
+                        let idx = DURATION_FIELDS.iter().position(|&x| x == f).unwrap();
+                        vals[idx] = n;
                     }
                 }
-                if field_map.is_empty() {
+                if !has_any {
                     return Err(VmError::type_error("duration object must have at least one temporal property"));
                 }
-                let dur_args: Vec<Value> = field_names_ctor.iter().map(|f| {
-                    Value::number(*field_map.get(f).unwrap_or(&0.0))
-                }).collect();
-                return ncx.call_function_construct(&from_ctor, Value::undefined(), &dur_args);
+                let dur = temporal_rs::Duration::new(
+                    vals[0] as i64, vals[1] as i64, vals[2] as i64, vals[3] as i64,
+                    vals[4] as i64, vals[5] as i64, vals[6] as i64, vals[7] as i64,
+                    vals[8] as i128, vals[9] as i128,
+                ).map_err(temporal_err)?;
+                let result = construct_duration_object(&dur, &from_proto, &from_mm);
+                return Ok(Value::object(result));
             }
             Err(VmError::type_error("invalid argument for Duration.from"))
         },
@@ -142,23 +147,18 @@ pub(super) fn install_duration(
     // ========================================================================
     let compare_fn = Value::native_function_with_proto_named(
         |_this, args, _ncx| {
-            let fields = ["years","months","weeks","days","hours","minutes","seconds","milliseconds","microseconds","nanoseconds"];
-            let d1 = args.first().and_then(|v| v.as_object()).ok_or_else(|| VmError::type_error("compare: first argument must be a Duration"))?;
-            let d2 = args.get(1).and_then(|v| v.as_object()).ok_or_else(|| VmError::type_error("compare: second argument must be a Duration"))?;
-            let mut v1 = [0f64; 10];
-            let mut v2 = [0f64; 10];
-            for (i, f) in fields.iter().enumerate() {
-                v1[i] = d1.get(&PropertyKey::string(f)).and_then(|v| v.as_number()).unwrap_or(0.0);
-                v2[i] = d2.get(&PropertyKey::string(f)).and_then(|v| v.as_number()).unwrap_or(0.0);
-            }
-            let ns1 = v1[9] + v1[8]*1e3 + v1[7]*1e6 + v1[6]*1e9 + v1[5]*60e9 + v1[4]*3600e9 + v1[3]*86400e9;
-            let ns2 = v2[9] + v2[8]*1e3 + v2[7]*1e6 + v2[6]*1e9 + v2[5]*60e9 + v2[4]*3600e9 + v2[3]*86400e9;
-            if ns1 < ns2 {
-                Ok(Value::int32(-1))
-            } else if ns1 > ns2 {
-                Ok(Value::int32(1))
-            } else {
-                Ok(Value::int32(0))
+            let d1_obj = args.first().and_then(|v| v.as_object())
+                .ok_or_else(|| VmError::type_error("compare: first argument must be a Duration"))?;
+            let d2_obj = args.get(1).and_then(|v| v.as_object())
+                .ok_or_else(|| VmError::type_error("compare: second argument must be a Duration"))?;
+            let d1 = extract_duration_from_slots(&d1_obj)?;
+            let d2 = extract_duration_from_slots(&d2_obj)?;
+            let ord = d1.compare_with_provider(&d2, None, &NeverProvider::default())
+                .map_err(temporal_err)?;
+            match ord {
+                std::cmp::Ordering::Less => Ok(Value::int32(-1)),
+                std::cmp::Ordering::Equal => Ok(Value::int32(0)),
+                std::cmp::Ordering::Greater => Ok(Value::int32(1)),
             }
         },
         mm.clone(), fn_proto.clone(), "compare", 2,
@@ -169,90 +169,203 @@ pub(super) fn install_duration(
     );
 
     // ========================================================================
+    // Prototype property getters
+    // ========================================================================
+
+    // Individual field getters: years, months, weeks, days, hours, minutes,
+    // seconds, milliseconds, microseconds, nanoseconds
+    // Installed as accessor properties (like PlainDate year/month/day)
+    for (slot, field) in DURATION_SLOTS.iter().zip(DURATION_FIELDS.iter()) {
+        let slot_name: &'static str = slot;
+        let field_name: &'static str = field;
+        let getter_fn = Value::native_function_with_proto(
+            move |this, _args, _ncx| {
+                let obj = this.as_object()
+                    .ok_or_else(|| VmError::type_error(format!("{} called on non-Duration", field_name)))?;
+                obj.get(&PropertyKey::string(slot_name))
+                    .filter(|v| !v.is_undefined())
+                    .ok_or_else(|| VmError::type_error(format!("{} called on non-Duration", field_name)))
+            },
+            mm.clone(), fn_proto.clone(),
+        );
+        proto.define_property(
+            PropertyKey::string(field),
+            PropertyDescriptor::Accessor {
+                get: Some(getter_fn),
+                set: None,
+                attributes: PropertyAttributes {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            },
+        );
+    }
+
+    // .sign getter (accessor)
+    let sign_fn = Value::native_function_with_proto(
+        |this, _args, _ncx| {
+            let obj = this.as_object()
+                .ok_or_else(|| VmError::type_error("sign called on non-Duration"))?;
+            let dur = extract_duration_from_slots(&obj)?;
+            Ok(Value::int32(dur.sign() as i32))
+        },
+        mm.clone(), fn_proto.clone(),
+    );
+    proto.define_property(
+        PropertyKey::string("sign"),
+        PropertyDescriptor::Accessor {
+            get: Some(sign_fn),
+            set: None,
+            attributes: PropertyAttributes { writable: false, enumerable: false, configurable: true },
+        },
+    );
+
+    // .blank getter (accessor)
+    let blank_fn = Value::native_function_with_proto(
+        |this, _args, _ncx| {
+            let obj = this.as_object()
+                .ok_or_else(|| VmError::type_error("blank called on non-Duration"))?;
+            let dur = extract_duration_from_slots(&obj)?;
+            Ok(Value::boolean(dur.is_zero()))
+        },
+        mm.clone(), fn_proto.clone(),
+    );
+    proto.define_property(
+        PropertyKey::string("blank"),
+        PropertyDescriptor::Accessor {
+            get: Some(blank_fn),
+            set: None,
+            attributes: PropertyAttributes { writable: false, enumerable: false, configurable: true },
+        },
+    );
+
+    // ========================================================================
     // Prototype methods
     // ========================================================================
 
     // .negated()
-    let neg_ctor = ctor_value.clone();
+    let neg_proto = proto.clone();
+    let neg_mm = mm.clone();
     let negated_fn = Value::native_function_with_proto_named(
-        move |this, _args, ncx| {
-            let obj = this.as_object().ok_or_else(|| VmError::type_error("negated called on non-Duration"))?;
-            let dur_field_names = ["years","months","weeks","days","hours","minutes","seconds","milliseconds","microseconds","nanoseconds"];
-            let mut neg_args = Vec::with_capacity(10);
-            for field in &dur_field_names {
-                let v = obj.get(&PropertyKey::string(field)).and_then(|v| v.as_number()).unwrap_or(0.0);
-                neg_args.push(if v == 0.0 { Value::number(0.0) } else { Value::number(-v) });
-            }
-            ncx.call_function_construct(&neg_ctor, Value::undefined(), &neg_args)
+        move |this, _args, _ncx| {
+            let obj = this.as_object()
+                .ok_or_else(|| VmError::type_error("negated called on non-Duration"))?;
+            let dur = extract_duration_from_slots(&obj)?;
+            let result = dur.negated();
+            Ok(Value::object(construct_duration_object(&result, &neg_proto, &neg_mm)))
         },
         mm.clone(), fn_proto.clone(), "negated", 0,
     );
     proto.define_property(PropertyKey::string("negated"), PropertyDescriptor::builtin_method(negated_fn));
 
-    // .toString()
+    // .abs()
+    let abs_proto = proto.clone();
+    let abs_mm = mm.clone();
+    let abs_fn = Value::native_function_with_proto_named(
+        move |this, _args, _ncx| {
+            let obj = this.as_object()
+                .ok_or_else(|| VmError::type_error("abs called on non-Duration"))?;
+            let dur = extract_duration_from_slots(&obj)?;
+            let result = dur.abs();
+            Ok(Value::object(construct_duration_object(&result, &abs_proto, &abs_mm)))
+        },
+        mm.clone(), fn_proto.clone(), "abs", 0,
+    );
+    proto.define_property(PropertyKey::string("abs"), PropertyDescriptor::builtin_method(abs_fn));
+
+    // .add(other)
+    let add_proto = proto.clone();
+    let add_mm = mm.clone();
+    let add_fn = Value::native_function_with_proto_named(
+        move |this, args, _ncx| {
+            let obj = this.as_object()
+                .ok_or_else(|| VmError::type_error("add called on non-Duration"))?;
+            let dur = extract_duration_from_slots(&obj)?;
+            let other_obj = args.first().and_then(|v| v.as_object())
+                .ok_or_else(|| VmError::type_error("add requires a Duration argument"))?;
+            let other = extract_duration_from_slots(&other_obj)?;
+            let result = dur.add(&other).map_err(temporal_err)?;
+            Ok(Value::object(construct_duration_object(&result, &add_proto, &add_mm)))
+        },
+        mm.clone(), fn_proto.clone(), "add", 1,
+    );
+    proto.define_property(PropertyKey::string("add"), PropertyDescriptor::builtin_method(add_fn));
+
+    // .subtract(other)
+    let sub_proto = proto.clone();
+    let sub_mm = mm.clone();
+    let subtract_fn = Value::native_function_with_proto_named(
+        move |this, args, _ncx| {
+            let obj = this.as_object()
+                .ok_or_else(|| VmError::type_error("subtract called on non-Duration"))?;
+            let dur = extract_duration_from_slots(&obj)?;
+            let other_obj = args.first().and_then(|v| v.as_object())
+                .ok_or_else(|| VmError::type_error("subtract requires a Duration argument"))?;
+            let other = extract_duration_from_slots(&other_obj)?;
+            let result = dur.subtract(&other).map_err(temporal_err)?;
+            Ok(Value::object(construct_duration_object(&result, &sub_proto, &sub_mm)))
+        },
+        mm.clone(), fn_proto.clone(), "subtract", 1,
+    );
+    proto.define_property(PropertyKey::string("subtract"), PropertyDescriptor::builtin_method(subtract_fn));
+
+    // .toString(options?)
     let tostring_fn = Value::native_function_with_proto_named(
-        |this, _args, _ncx| {
-            let obj = this.as_object().ok_or_else(|| VmError::type_error("toString called on non-Duration"))?;
-            let dur_field_names = ["years","months","weeks","days","hours","minutes","seconds","milliseconds","microseconds","nanoseconds"];
-            let mut vals = [0i64; 10];
-            for (i, field) in dur_field_names.iter().enumerate() {
-                vals[i] = obj.get(&PropertyKey::string(field)).and_then(|v| v.as_number()).unwrap_or(0.0) as i64;
-            }
-            let [years, months, _weeks, days, hours, minutes, seconds, milliseconds, microseconds, nanoseconds] = vals;
-            let sign = if [years,months,_weeks,days,hours,minutes,seconds,milliseconds,microseconds,nanoseconds].iter().any(|&v| v < 0) {
-                -1i64
-            } else { 1 };
-            let mut s = String::new();
-            if sign < 0 { s.push('-'); }
-            s.push('P');
-            let ay = years.unsigned_abs();
-            let amo = months.unsigned_abs();
-            let aw = _weeks.unsigned_abs();
-            let ad = days.unsigned_abs();
-            if ay > 0 { s.push_str(&format!("{}Y", ay)); }
-            if amo > 0 { s.push_str(&format!("{}M", amo)); }
-            if aw > 0 { s.push_str(&format!("{}W", aw)); }
-            if ad > 0 { s.push_str(&format!("{}D", ad)); }
-            let ah = hours.unsigned_abs();
-            let ami = minutes.unsigned_abs();
-            let total_ns_i128 = (seconds as i128) * 1_000_000_000
-                + (milliseconds as i128) * 1_000_000
-                + (microseconds as i128) * 1_000
-                + nanoseconds as i128;
-            let total_ns_abs = total_ns_i128.unsigned_abs();
-            let balanced_secs = total_ns_abs / 1_000_000_000;
-            let frac_ns = total_ns_abs % 1_000_000_000;
-            if ah > 0 || ami > 0 || balanced_secs > 0 || frac_ns > 0 {
-                s.push('T');
-                if ah > 0 { s.push_str(&format!("{}H", ah)); }
-                if ami > 0 { s.push_str(&format!("{}M", ami)); }
-                if balanced_secs > 0 || frac_ns > 0 {
-                    if frac_ns > 0 {
-                        let frac = format!("{:09}", frac_ns);
-                        let frac = frac.trim_end_matches('0');
-                        s.push_str(&format!("{}.{}S", balanced_secs, frac));
-                    } else {
-                        s.push_str(&format!("{}S", balanced_secs));
-                    }
-                }
-            }
-            if s == "P" || s == "-P" { s = "PT0S".to_string(); }
+        |this, args, ncx| {
+            let obj = this.as_object()
+                .ok_or_else(|| VmError::type_error("toString called on non-Duration"))?;
+            let dur = extract_duration_from_slots(&obj)?;
+
+            let options = parse_duration_to_string_options(ncx, args.first())?;
+            let s = dur.as_temporal_string(options).map_err(temporal_err)?;
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(), fn_proto.clone(), "toString", 0,
     );
     proto.define_property(PropertyKey::string("toString"), PropertyDescriptor::builtin_method(tostring_fn));
 
+    // .toJSON()
+    let tojson_fn = Value::native_function_with_proto_named(
+        |this, _args, _ncx| {
+            let obj = this.as_object()
+                .ok_or_else(|| VmError::type_error("toJSON called on non-Duration"))?;
+            let dur = extract_duration_from_slots(&obj)?;
+            let s = dur.as_temporal_string(ToStringRoundingOptions::default()).map_err(temporal_err)?;
+            Ok(Value::string(JsString::intern(&s)))
+        },
+        mm.clone(), fn_proto.clone(), "toJSON", 0,
+    );
+    proto.define_property(PropertyKey::string("toJSON"), PropertyDescriptor::builtin_method(tojson_fn));
+
+    // .toLocaleString() — falls back to toString() per spec
+    let tolocale_fn = Value::native_function_with_proto_named(
+        |this, _args, _ncx| {
+            let obj = this.as_object()
+                .ok_or_else(|| VmError::type_error("toLocaleString called on non-Duration"))?;
+            let dur = extract_duration_from_slots(&obj)?;
+            let s = dur.as_temporal_string(ToStringRoundingOptions::default()).map_err(temporal_err)?;
+            Ok(Value::string(JsString::intern(&s)))
+        },
+        mm.clone(), fn_proto.clone(), "toLocaleString", 0,
+    );
+    proto.define_property(PropertyKey::string("toLocaleString"), PropertyDescriptor::builtin_method(tolocale_fn));
+
+    // .valueOf() — always throws TypeError
+    let valueof_fn = Value::native_function_with_proto_named(
+        |_this, _args, _ncx| {
+            Err(VmError::type_error("Temporal.Duration cannot be converted to a primitive value"))
+        },
+        mm.clone(), fn_proto.clone(), "valueOf", 0,
+    );
+    proto.define_property(PropertyKey::string("valueOf"), PropertyDescriptor::builtin_method(valueof_fn));
+
     // .total(options)
     let total_fn = Value::native_function_with_proto_named(
         |this, args, ncx| {
-            let obj = this.as_object().ok_or_else(|| VmError::type_error("total called on non-Duration"))?;
-            let dur_field_names = ["years","months","weeks","days","hours","minutes","seconds","milliseconds","microseconds","nanoseconds"];
-            let mut vals = [0f64; 10];
-            for (i, field) in dur_field_names.iter().enumerate() {
-                vals[i] = obj.get(&PropertyKey::string(field)).and_then(|v| v.as_number()).unwrap_or(0.0);
-            }
-            let [years, months, _weeks, days, hours, minutes, seconds, milliseconds, microseconds, nanoseconds] = vals;
+            let obj = this.as_object()
+                .ok_or_else(|| VmError::type_error("total called on non-Duration"))?;
+            let dur = extract_duration_from_slots(&obj)?;
 
             let unit_arg = args.first().cloned().unwrap_or(Value::undefined());
             let unit_str = if unit_arg.is_string() {
@@ -267,59 +380,34 @@ pub(super) fn install_duration(
                 return Err(VmError::type_error("total requires a unit string or options object"));
             };
 
-            let total_ns = nanoseconds
-                + microseconds * 1e3
-                + milliseconds * 1e6
-                + seconds * 1e9
-                + minutes * 60e9
-                + hours * 3600e9
-                + days * 86400e9;
+            let unit: Unit = unit_str.as_str().parse()
+                .map_err(|_| VmError::range_error(format!("{} is not a valid unit", unit_str)))?;
 
-            let result = match unit_str.as_str() {
-                "nanosecond" | "nanoseconds" => total_ns,
-                "microsecond" | "microseconds" => total_ns / 1e3,
-                "millisecond" | "milliseconds" => total_ns / 1e6,
-                "second" | "seconds" => total_ns / 1e9,
-                "minute" | "minutes" => total_ns / 60e9,
-                "hour" | "hours" => total_ns / 3600e9,
-                "day" | "days" => total_ns / 86400e9,
-                "week" | "weeks" => total_ns / (7.0 * 86400e9),
-                "month" | "months" => months + years * 12.0,
-                "year" | "years" => years + months / 12.0,
-                _ => return Err(VmError::range_error(format!("{} is not a valid unit", unit_str))),
-            };
-            Ok(Value::number(result))
+            let result = dur.total_with_provider(unit, None, &NeverProvider::default())
+                .map_err(temporal_err)?;
+            Ok(Value::number(result.as_inner()))
         },
         mm.clone(), fn_proto.clone(), "total", 1,
     );
     proto.define_property(PropertyKey::string("total"), PropertyDescriptor::builtin_method(total_fn));
 
-    // .add(other)
-    let add_dur_ctor = ctor_value.clone();
-    let add_fn = Value::native_function_with_proto_named(
+    // .round(options)
+    let round_proto = proto.clone();
+    let round_mm = mm.clone();
+    let round_fn = Value::native_function_with_proto_named(
         move |this, args, ncx| {
-            let obj = this.as_object().ok_or_else(|| VmError::type_error("add called on non-Duration"))?;
-            let dur_field_names = ["years","months","weeks","days","hours","minutes","seconds","milliseconds","microseconds","nanoseconds"];
-            let mut this_vals = [0f64; 10];
-            for (i, field) in dur_field_names.iter().enumerate() {
-                this_vals[i] = obj.get(&PropertyKey::string(field)).and_then(|v| v.as_number()).unwrap_or(0.0);
-            }
-            let other_arg = args.first().cloned().unwrap_or(Value::undefined());
-            let other_obj = if let Some(o) = other_arg.as_object() {
-                o
-            } else {
-                return Err(VmError::type_error("add requires a Duration argument"));
-            };
-            let mut other_vals = [0f64; 10];
-            for (i, field) in dur_field_names.iter().enumerate() {
-                other_vals[i] = other_obj.get(&PropertyKey::string(field)).and_then(|v| v.as_number()).unwrap_or(0.0);
-            }
-            let result_args: Vec<Value> = (0..10).map(|i| Value::number(this_vals[i] + other_vals[i])).collect();
-            ncx.call_function_construct(&add_dur_ctor, Value::undefined(), &result_args)
+            let obj = this.as_object()
+                .ok_or_else(|| VmError::type_error("round called on non-Duration"))?;
+            let dur = extract_duration_from_slots(&obj)?;
+
+            let options = parse_duration_rounding_options(ncx, args.first())?;
+            let result = dur.round_with_provider(options, None, &NeverProvider::default())
+                .map_err(temporal_err)?;
+            Ok(Value::object(construct_duration_object(&result, &round_proto, &round_mm)))
         },
-        mm.clone(), fn_proto.clone(), "add", 1,
+        mm.clone(), fn_proto.clone(), "round", 1,
     );
-    proto.define_property(PropertyKey::string("add"), PropertyDescriptor::builtin_method(add_fn));
+    proto.define_property(PropertyKey::string("round"), PropertyDescriptor::builtin_method(round_fn));
 
     // @@toStringTag
     proto.define_property(
@@ -335,4 +423,125 @@ pub(super) fn install_duration(
         PropertyKey::string("Duration"),
         PropertyDescriptor::data_with_attrs(ctor_value, PropertyAttributes::builtin_method()),
     );
+}
+
+// ============================================================================
+// Option parsing helpers
+// ============================================================================
+
+/// Parse toString options from a JS argument into `ToStringRoundingOptions`.
+fn parse_duration_to_string_options(
+    ncx: &mut NativeContext<'_>,
+    arg: Option<&Value>,
+) -> Result<ToStringRoundingOptions, VmError> {
+    let arg = match arg {
+        Some(v) if !v.is_undefined() => v.clone(),
+        _ => return Ok(ToStringRoundingOptions::default()),
+    };
+
+    let opts_obj = arg.as_object()
+        .ok_or_else(|| VmError::type_error("options must be an object"))?;
+
+    let mut options = ToStringRoundingOptions::default();
+
+    // fractionalSecondDigits
+    let fsd = ncx.get_property(&opts_obj, &PropertyKey::string("fractionalSecondDigits"))?;
+    if !fsd.is_undefined() {
+        if fsd.is_string() {
+            let s = ncx.to_string_value(&fsd)?;
+            if s.as_str() == "auto" {
+                options.precision = Precision::Auto;
+            } else {
+                return Err(VmError::range_error(format!("Invalid fractionalSecondDigits: {}", s)));
+            }
+        } else {
+            let n = ncx.to_number_value(&fsd)?;
+            let digits = n as u8;
+            if !(0..=9).contains(&digits) || n != digits as f64 {
+                return Err(VmError::range_error("fractionalSecondDigits must be 'auto' or 0-9"));
+            }
+            options.precision = Precision::Digit(digits);
+        }
+    }
+
+    // smallestUnit
+    let su = ncx.get_property(&opts_obj, &PropertyKey::string("smallestUnit"))?;
+    if !su.is_undefined() {
+        let s = ncx.to_string_value(&su)?;
+        let unit: Unit = s.as_str().parse()
+            .map_err(|_| VmError::range_error(format!("{} is not a valid unit", s)))?;
+        options.smallest_unit = Some(unit);
+    }
+
+    // roundingMode
+    let rm = ncx.get_property(&opts_obj, &PropertyKey::string("roundingMode"))?;
+    if !rm.is_undefined() {
+        let s = ncx.to_string_value(&rm)?;
+        let mode: RoundingMode = s.as_str().parse().map_err(temporal_err)?;
+        options.rounding_mode = Some(mode);
+    }
+
+    Ok(options)
+}
+
+/// Parse rounding options from a JS argument into `RoundingOptions`.
+fn parse_duration_rounding_options(
+    ncx: &mut NativeContext<'_>,
+    arg: Option<&Value>,
+) -> Result<temporal_rs::options::RoundingOptions, VmError> {
+    let arg = match arg {
+        Some(v) if !v.is_undefined() => v.clone(),
+        _ => return Err(VmError::type_error("round requires options")),
+    };
+
+    // If it's a string, treat as shorthand for smallestUnit
+    if arg.is_string() {
+        let s = ncx.to_string_value(&arg)?;
+        let unit: Unit = s.as_str().parse()
+            .map_err(|_| VmError::range_error(format!("{} is not a valid unit", s)))?;
+        let mut opts = temporal_rs::options::RoundingOptions::default();
+        opts.smallest_unit = Some(unit);
+        return Ok(opts);
+    }
+
+    let opts_obj = arg.as_object()
+        .ok_or_else(|| VmError::type_error("options must be an object or string"))?;
+
+    let mut options = temporal_rs::options::RoundingOptions::default();
+
+    // largestUnit
+    let lu = ncx.get_property(&opts_obj, &PropertyKey::string("largestUnit"))?;
+    if !lu.is_undefined() {
+        let s = ncx.to_string_value(&lu)?;
+        let unit: Unit = s.as_str().parse()
+            .map_err(|_| VmError::range_error(format!("{} is not a valid unit", s)))?;
+        options.largest_unit = Some(unit);
+    }
+
+    // smallestUnit
+    let su = ncx.get_property(&opts_obj, &PropertyKey::string("smallestUnit"))?;
+    if !su.is_undefined() {
+        let s = ncx.to_string_value(&su)?;
+        let unit: Unit = s.as_str().parse()
+            .map_err(|_| VmError::range_error(format!("{} is not a valid unit", s)))?;
+        options.smallest_unit = Some(unit);
+    }
+
+    // roundingMode
+    let rm = ncx.get_property(&opts_obj, &PropertyKey::string("roundingMode"))?;
+    if !rm.is_undefined() {
+        let s = ncx.to_string_value(&rm)?;
+        let mode: RoundingMode = s.as_str().parse().map_err(temporal_err)?;
+        options.rounding_mode = Some(mode);
+    }
+
+    // roundingIncrement
+    let ri = ncx.get_property(&opts_obj, &PropertyKey::string("roundingIncrement"))?;
+    if !ri.is_undefined() {
+        let n = ncx.to_number_value(&ri)?;
+        let inc = temporal_rs::options::RoundingIncrement::try_from(n).map_err(temporal_err)?;
+        options.increment = Some(inc);
+    }
+
+    Ok(options)
 }

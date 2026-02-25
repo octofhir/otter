@@ -17,8 +17,6 @@ use crate::string::JsString;
 use crate::value::Value;
 use chrono::{Datelike, Timelike};
 use std::sync::Arc;
-use temporal_rs::options::Overflow;
-
 mod common;
 use common::*;
 

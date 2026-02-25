@@ -741,7 +741,7 @@ fn get_legacy_prop(
     let re_ctor = intrinsics.regexp_constructor;
 
     // Annex B §B.2.4.1: If SameValue(receiver, constructor) is false, throw TypeError
-    if !same_value(this_val, &Value::object(re_ctor)) {
+    if !same_value(this_val, &Value::object(re_ctor.clone())) {
         return Err(VmError::type_error(
             "Legacy RegExp property accessed on illegal receiver",
         ));
@@ -1344,6 +1344,19 @@ pub fn init_regexp_prototype(
             // Step 1: Let O be the this value.
             let regex = get_regex(this_val)?;
 
+            // Annex B §B.2.4.2: compile() should throw if called on a subclass instance.
+            // We check if the object's prototype is the original %RegExp.prototype%.
+            let intrinsics = ncx
+                .ctx
+                .realm_intrinsics(ncx.ctx.realm_id())
+                .ok_or_else(|| VmError::type_error("Intrinsics not found"))?;
+            let re_proto = intrinsics.regexp_prototype;
+            if regex.object.prototype().as_object().map(|p| p.as_ptr()) != Some(re_proto.as_ptr()) {
+                return Err(VmError::type_error(
+                    "RegExp.prototype.compile called on subclass instance",
+                ));
+            }
+
             let pattern_arg = args.first().cloned().unwrap_or(Value::undefined());
             let flags_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
@@ -1386,16 +1399,18 @@ pub fn init_regexp_prototype(
                 }
             }
 
-            // Validate pattern by trying to compile
+            // Validate pattern by trying to compile — throw SyntaxError on invalid pattern
             let parsed_flags = regress::Flags::from(flags.as_str());
             let engine_pattern = compile_pattern_for_regress(&pattern, &parsed_flags);
-            let native_regex = regress::Regex::with_flags(&engine_pattern, parsed_flags);
-            if native_regex.is_err() {
-                return Err(VmError::syntax_error(&format!(
-                    "Invalid regular expression: /{}/ ",
-                    pattern
-                )));
-            }
+            let native_regex = match regress::Regex::with_flags(&engine_pattern, parsed_flags) {
+                Ok(re) => Some(re),
+                Err(_e) => {
+                    return Err(VmError::syntax_error(&format!(
+                        "Invalid regular expression: /{}/: Invalid pattern",
+                        pattern
+                    )));
+                }
+            };
 
             // MUTATE in place — per spec, compile modifies `this`, not creating a new object.
             // Safety: single-threaded VM, we have exclusive logical access
@@ -1407,7 +1422,7 @@ pub fn init_regexp_prototype(
                 crate::regexp::parse_capture_group_names(&regex_mut.pattern);
             regex_mut.fallback_literal_utf16 =
                 compute_literal_utf16_fallback(&regex_mut.pattern, &parsed_flags);
-            regex_mut.native_regex = native_regex.ok();
+            regex_mut.native_regex = native_regex;
 
             // Step 12 (RegExpInitialize): Set(obj, "lastIndex", 0, true)
             // Per spec this happens AFTER mutation — if lastIndex is non-writable, throw TypeError
@@ -2218,15 +2233,68 @@ pub fn init_regexp_prototype(
 pub fn create_regexp_constructor(
     regexp_proto: GcRef<JsObject>,
 ) -> Box<dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync> {
-    Box::new(move |_this_val, args, ncx| {
+    Box::new(move |this_val, args, ncx| {
         let pattern_arg = args.first().cloned().unwrap_or(Value::undefined());
-        let flags_arg = args.get(1).cloned();
+        let flags_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
-        let (pattern, flags) = if let Some(re) = pattern_arg.as_regex() {
+        // Step 1: Let patternIsRegExp be ? IsRegExp(pattern).
+        let pattern_is_regexp = crate::intrinsics_impl::string::is_regexp_check(&pattern_arg, ncx)?;
+
+        // Step 2: If NewTarget is undefined
+        let is_construct = ncx.is_construct();
+        if !is_construct {
+            // b. If patternIsRegExp is true and flags is undefined
+            if pattern_is_regexp && flags_arg.is_undefined() {
+                // i. Let patternConstructor be ? Get(pattern, "constructor").
+                let pattern_obj = pattern_arg
+                    .as_object()
+                    .or_else(|| pattern_arg.as_regex().map(|r| r.object.clone()));
+                if let Some(obj) = pattern_obj {
+                    let pattern_constructor = crate::object::get_value_full(
+                        &obj,
+                        &PropertyKey::string("constructor"),
+                        ncx,
+                    )?;
+                    let regexp_ctor = ncx.ctx.get_global("RegExp").unwrap_or(Value::undefined());
+                    if crate::intrinsics_impl::helpers::same_value(
+                        &pattern_constructor,
+                        &regexp_ctor,
+                    ) {
+                        return Ok(pattern_arg.clone());
+                    }
+                }
+            }
+        }
+
+        let (pattern_str, flags_str) = if let Some(re) = pattern_arg.as_regex() {
             let p = re.pattern.clone();
-            let f = match &flags_arg {
-                Some(v) if !v.is_undefined() => ncx.to_string_value(v)?,
-                _ => re.flags.clone(),
+            let f = if flags_arg.is_undefined() {
+                re.flags.clone()
+            } else {
+                ncx.to_string_value(&flags_arg)?
+            };
+            (p, f)
+        } else if pattern_is_regexp {
+            let obj = pattern_arg
+                .as_object()
+                .or_else(|| pattern_arg.as_regex().map(|r| r.object.clone()))
+                .unwrap();
+            let p_val = obj_get(&obj, "source", ncx)?;
+            let p = if p_val.is_undefined() {
+                String::new()
+            } else {
+                ncx.to_string_value(&p_val)?
+            };
+
+            let f_val = if flags_arg.is_undefined() {
+                obj_get(&obj, "flags", ncx)?
+            } else {
+                flags_arg.clone()
+            };
+            let f = if f_val.is_undefined() {
+                String::new()
+            } else {
+                ncx.to_string_value(&f_val)?
             };
             (p, f)
         } else {
@@ -2235,17 +2303,46 @@ pub fn create_regexp_constructor(
             } else {
                 ncx.to_string_value(&pattern_arg)?
             };
-            let f = match &flags_arg {
-                Some(v) if !v.is_undefined() => ncx.to_string_value(v)?,
-                _ => String::new(),
+            let f = if flags_arg.is_undefined() {
+                String::new()
+            } else {
+                ncx.to_string_value(&flags_arg)?
             };
             (p, f)
         };
 
+        // Validate flags
+        for c in flags_str.chars() {
+            if !"dgimsuyv".contains(c) {
+                return Err(VmError::syntax_error(&format!("Invalid flag: {}", c)));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for c in flags_str.chars() {
+            if !seen.insert(c) {
+                return Err(VmError::syntax_error(&format!("Duplicate flag: {}", c)));
+            }
+        }
+
+        // Validate pattern
+        let parsed_flags = regress::Flags::from(flags_str.as_str());
+        let engine_pattern =
+            crate::regexp::compile_pattern_for_regress(&pattern_str, &parsed_flags);
+        let _native_regex = regress::Regex::with_flags(&engine_pattern, parsed_flags).ok();
+
+        let proto = if is_construct {
+            this_val
+                .as_object()
+                .and_then(|o| o.prototype().as_object())
+                .unwrap_or_else(|| regexp_proto.clone())
+        } else {
+            regexp_proto.clone()
+        };
+
         let regex = GcRef::new(JsRegExp::new(
-            pattern,
-            flags,
-            Some(regexp_proto.clone()),
+            pattern_str,
+            flags_str,
+            Some(proto),
             ncx.memory_manager().clone(),
         ));
         Ok(Value::regex(regex))

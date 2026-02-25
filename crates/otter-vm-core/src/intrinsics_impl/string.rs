@@ -216,7 +216,7 @@ fn get_property_of(
 /// ES spec IsRegExp (§7.2.8)
 /// ALWAYS calls Get(argument, @@match) first, even for RegExp objects.
 /// This ensures that custom Symbol.match getters that throw are properly propagated.
-fn is_regexp_check(val: &Value, ncx: &mut NativeContext<'_>) -> Result<bool, VmError> {
+pub(crate) fn is_regexp_check(val: &Value, ncx: &mut NativeContext<'_>) -> Result<bool, VmError> {
     if val.is_null() || val.is_undefined() {
         return Ok(false);
     }
@@ -549,8 +549,7 @@ pub fn init_string_prototype(
         0,
         |this_val, args, ncx| {
             let s = require_object_coercible_to_string(this_val, ncx)?;
-            let lowered =
-                crate::web_api::intl::to_locale_lowercase(s.as_str(), args.first(), ncx)?;
+            let lowered = crate::web_api::intl::to_locale_lowercase(s.as_str(), args.first(), ncx)?;
             Ok(Value::string(JsString::intern(&lowered)))
         },
         &mm,
@@ -577,8 +576,7 @@ pub fn init_string_prototype(
         0,
         |this_val, args, ncx| {
             let s = require_object_coercible_to_string(this_val, ncx)?;
-            let uppered =
-                crate::web_api::intl::to_locale_uppercase(s.as_str(), args.first(), ncx)?;
+            let uppered = crate::web_api::intl::to_locale_uppercase(s.as_str(), args.first(), ncx)?;
             Ok(Value::string(JsString::intern(&uppered)))
         },
         &mm,

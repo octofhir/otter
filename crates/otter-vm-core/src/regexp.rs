@@ -97,8 +97,114 @@ impl JsRegExp {
 /// JS non-`u`/`v` regexes operate on UCS-2 code units. Regress parses Rust UTF-8
 /// source scalars; this rewrite preserves JS behavior for astral literals like `𠮷`.
 pub(crate) fn compile_pattern_for_regress(pattern: &str, flags: &Flags) -> String {
-    let _ = flags;
-    pattern.to_string()
+    if flags.unicode || flags.unicode_sets {
+        return pattern.to_string();
+    }
+
+    let mut result = String::with_capacity(pattern.len());
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' && i + 1 < chars.len() {
+            let next = chars[i + 1];
+            match next {
+                'd'
+                | 'w'
+                | 's'
+                | 'D'
+                | 'W'
+                | 'S'
+                | 'b'
+                | 'B'
+                | 'n'
+                | 'r'
+                | 't'
+                | 'v'
+                | 'f'
+                | '0'
+                | '1'..='9'
+                | '\\'
+                | '/'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '.'
+                | '^'
+                | '$'
+                | '*'
+                | '+'
+                | '?'
+                | '|' => {
+                    result.push('\\');
+                    result.push(next);
+                    i += 2;
+                }
+                'x' => {
+                    if i + 3 < chars.len()
+                        && chars[i + 2].is_ascii_hexdigit()
+                        && chars[i + 3].is_ascii_hexdigit()
+                    {
+                        result.push('\\');
+                        result.push('x');
+                        i += 2;
+                    } else {
+                        // Annex B: incomplete \x is identity escape for 'x'
+                        result.push('x');
+                        i += 2;
+                    }
+                }
+                'u' => {
+                    if i + 5 < chars.len()
+                        && chars[i + 2..i + 6].iter().all(|c| c.is_ascii_hexdigit())
+                    {
+                        result.push('\\');
+                        result.push('u');
+                        i += 2;
+                    } else {
+                        // Annex B: incomplete \u is identity escape for 'u'
+                        result.push('u');
+                        i += 2;
+                    }
+                }
+                'c' => {
+                    if i + 2 < chars.len() && chars[i + 2].is_ascii_alphabetic() {
+                        result.push('\\');
+                        result.push('c');
+                        i += 2;
+                    } else {
+                        // Annex B: \c followed by non-letter match literal "\c"
+                        result.push_str("\\\\c");
+                        i += 2;
+                    }
+                }
+                _ => {
+                    // Annex B: identity escape for any other character
+                    if next as u32 > 0xFFFF {
+                        let mut buf = [0u16; 2];
+                        next.encode_utf16(&mut buf);
+                        result.push_str(&format!("\\u{:04x}\\u{:04x}", buf[0], buf[1]));
+                    } else {
+                        result.push(next);
+                    }
+                    i += 2;
+                }
+            }
+        } else if ch as u32 > 0xFFFF {
+            // Surrogateify astral char in non-unicode mode
+            let mut buf = [0u16; 2];
+            ch.encode_utf16(&mut buf);
+            result.push_str(&format!("\\u{:04x}\\u{:04x}", buf[0], buf[1]));
+            i += 1;
+        } else {
+            result.push(ch);
+            i += 1;
+        }
+    }
+    result
 }
 
 fn is_plain_literal_pattern(pattern: &str) -> bool {

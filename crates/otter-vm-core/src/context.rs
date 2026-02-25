@@ -256,6 +256,24 @@ impl<'a> NativeContext<'a> {
             .get_with_proxy_chain(self.ctx, obj, key, key_value, &receiver)
     }
 
+    /// Perform a full JS-level property Get on any Value (object, proxy, or primitive wrapper).
+    /// This is the Value-level equivalent of `get_property` — handles both objects and proxies.
+    pub fn get_property_of_value(
+        &mut self,
+        val: &Value,
+        key: &crate::object::PropertyKey,
+    ) -> crate::error::VmResult<Value> {
+        if let Some(obj) = val.as_object() {
+            return self.get_property(&obj, key);
+        }
+        if let Some(proxy) = val.as_proxy() {
+            let key_value = crate::proxy_operations::property_key_to_value_pub(key);
+            let receiver = val.clone();
+            return crate::proxy_operations::proxy_get(self, proxy, key, key_value, receiver);
+        }
+        Ok(Value::undefined())
+    }
+
     /// Execute a generator operation (next/return/throw) via the interpreter.
     ///
     /// This bridges from NativeContext-based generator prototype methods to the
@@ -282,18 +300,38 @@ impl<'a> NativeContext<'a> {
     /// Top-level `let`/`const` declarations become persistent global bindings.
     pub fn eval_as_global_script(&mut self, code: &str) -> VmResult<Value> {
         let module = self.ctx.compile_global_script(code)?;
-        // Per spec GlobalDeclarationInstantiation step 3:
-        // For each lexName in module's lex declarations, if env.HasVarDeclaration(lexName),
-        // throw a SyntaxError.
+        // Per spec GlobalDeclarationInstantiation steps 3-5:
+        let global = self.ctx.global();
         for lex_name in &module.global_lex_names {
-            if self.ctx.has_global_var_name(lex_name) {
+            // Step 3a: If env.HasLexicalDeclaration(name), throw SyntaxError.
+            // (Check existing global lex bindings — tracked via global_lex_names set)
+            if self.ctx.has_global_lex_name(lex_name) {
                 return Err(VmError::SyntaxError(format!(
                     "Identifier '{}' has already been declared",
                     lex_name
                 )));
             }
+            // Step 3d: If env.HasRestrictedGlobalProperty(name), throw SyntaxError.
+            // A restricted global property is a non-configurable own property of the global object.
+            // Configurable properties (e.g. from eval-created var bindings) are NOT restricted.
+            if let Some(desc) = global.get_own_property_descriptor(
+                &crate::object::PropertyKey::string(lex_name),
+            ) {
+                if !desc.is_configurable() {
+                    return Err(VmError::SyntaxError(format!(
+                        "Identifier '{}' has already been declared",
+                        lex_name
+                    )));
+                }
+            }
         }
-        self.execute_eval_module(&module)
+        // Record lex names so subsequent scripts see them as declared
+        let lex_names: Vec<String> = module.global_lex_names.clone();
+        let result = self.execute_eval_module(&module)?;
+        for name in lex_names {
+            self.ctx.add_global_lex_name(name);
+        }
+        Ok(result)
     }
 
     /// Execute an eval-compiled module within this context.
@@ -482,6 +520,9 @@ pub struct VmContext {
     /// Used by GlobalDeclarationInstantiation to check for lex/var collisions
     /// across script evaluations ($262.evalScript).
     global_var_names: HashSet<String>,
+    /// Set of global lex-declared names (from top-level let/const in scripts).
+    /// Used by GlobalDeclarationInstantiation step 3a (HasLexicalDeclaration).
+    global_lex_names: HashSet<String>,
     /// Eval compiler callback: compiles eval source code into a Module.
     /// Set by otter-vm-runtime to bridge the compiler (which otter-vm-core
     /// cannot depend on directly). The interpreter handles execution.
@@ -525,7 +566,7 @@ pub struct VmContext {
     /// Cached template objects for tagged template sites.
     template_cache: HashMap<TemplateCacheKey, GcRef<JsObject>>,
     /// Cached RegExp objects per (module_ptr, constant_index) so each literal is only compiled once.
-    regexp_cache: HashMap<(usize, u32), Value>,
+    regexp_cache: HashMap<(u64, u32), Value>,
 }
 
 /// Trait for JS job queue access (allows runtime to inject the queue)
@@ -657,6 +698,7 @@ impl VmContext {
             generator_prototype_intrinsic: None,
             async_generator_prototype_intrinsic: None,
             global_var_names: HashSet::new(),
+            global_lex_names: HashSet::new(),
             eval_fn: None,
             script_eval_fn: None,
             microtask_enqueue: None,
@@ -686,12 +728,12 @@ impl VmContext {
         self.template_cache.insert(key, obj);
     }
 
-    pub(crate) fn get_cached_regexp(&self, module_ptr: usize, const_idx: u32) -> Option<Value> {
-        self.regexp_cache.get(&(module_ptr, const_idx)).cloned()
+    pub(crate) fn get_cached_regexp(&self, module_id: u64, const_idx: u32) -> Option<Value> {
+        self.regexp_cache.get(&(module_id, const_idx)).cloned()
     }
 
-    pub(crate) fn cache_regexp(&mut self, module_ptr: usize, const_idx: u32, val: Value) {
-        self.regexp_cache.insert((module_ptr, const_idx), val);
+    pub(crate) fn cache_regexp(&mut self, module_id: u64, const_idx: u32, val: Value) {
+        self.regexp_cache.insert((module_id, const_idx), val);
     }
 
     /// Set captured module exports.
@@ -1262,6 +1304,16 @@ impl VmContext {
     /// Check if a name was declared as a global var.
     pub fn has_global_var_name(&self, name: &str) -> bool {
         self.global_var_names.contains(name)
+    }
+
+    /// Record a global lex-declared name (from top-level let/const in scripts).
+    pub fn add_global_lex_name(&mut self, name: String) {
+        self.global_lex_names.insert(name);
+    }
+
+    /// Check if a name was declared as a global lex binding (let/const).
+    pub fn has_global_lex_name(&self, name: &str) -> bool {
+        self.global_lex_names.contains(name)
     }
 
     /// Push a try handler for the current frame.

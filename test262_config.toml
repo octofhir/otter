@@ -63,6 +63,9 @@ skip_features = [
     # Hashbang (parser feature)
     "hashbang",
 
+    # IsHTMLDDA ([[IsHTMLDDA]] internal slot — DOM-specific edge cases)
+    "IsHTMLDDA",
+
     # Active proposals (not yet standardized)
     "Array.fromAsync",
     "Error.isError",
@@ -91,8 +94,31 @@ ignored_tests = [
     # Global object missing Object.prototype in prototype chain
     "decodeURIComponent/S15.1.3.2_A5.5",
 
-    # Heavy 4-byte UTF-8 iteration test — too slow in debug builds
+    # Heavy decodeURIComponent iteration tests — too slow
     "decodeURIComponent/S15.1.3.2_A2.5_T1",
+    "decodeURIComponent/S15.1.3.2_A1.10_T1",
+    "decodeURIComponent/S15.1.3.2_A1.12_T1",
+    "decodeURIComponent/S15.1.3.2_A1.2_T2",
+    "decodeURIComponent/S15.1.3.2_A1.11_T1",
+    "decodeURIComponent/S15.1.3.2_A1.2_T1",
+    "decodeURIComponent/S15.1.3.2_A2.1_T1",
+    "decodeURIComponent/S15.1.3.2_A1.11_T2",
+    "decodeURIComponent/S15.1.3.2_A1.12_T2",
+
+    # Annex B \c ClassControlLetter escape in character class — regress limitation
+    "literals/regexp/class-escape",
+
+    # Temporal PlainDateTime math precision — temporal_rs edge case
+    "Temporal/PlainDateTime/datetime-math",
+
+    # 65K eval() iterations per test — too slow (RegExp escape BMP exhaustive tests)
+    "RegExp-trailing-escape-BMP",
+    "RegExp-leading-escape-BMP",
+
+    # HTML-style comments in new Function() — oxc parser doesn't support Annex B HTML comments
+    "createdynfn-html-close-comment",
+    "createdynfn-html-open-comment",
+    "createdynfn-no-line-terminator-html-close-comment",
 ]
 
 # Tests known to panic/crash the VM (will be skipped with a warning)

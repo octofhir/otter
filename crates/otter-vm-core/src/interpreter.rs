@@ -1756,12 +1756,12 @@ impl Interpreter {
                     if is_stateful {
                         self.constant_to_value(ctx, constant)?
                     } else {
-                        let module_ptr = std::sync::Arc::as_ptr(module) as usize;
-                        if let Some(cached) = ctx.get_cached_regexp(module_ptr, idx.0) {
+                        let module_id = module.module_id;
+                        if let Some(cached) = ctx.get_cached_regexp(module_id, idx.0) {
                             cached
                         } else {
                             let val = self.constant_to_value(ctx, constant)?;
-                            ctx.cache_regexp(module_ptr, idx.0, val.clone());
+                            ctx.cache_regexp(module_id, idx.0, val.clone());
                             val
                         }
                     }
@@ -4876,26 +4876,6 @@ impl Interpreter {
                     return Ok(InstructionResult::Continue);
                 }
 
-                // Generator property access
-                if let Some(generator) = object.as_generator() {
-                    let key = Self::utf16_key(name_str);
-
-                    // Check the generator's internal object first
-                    if let Some(val) = generator.object.get(&key) {
-                        ctx.set_register(dst.0, val);
-                        return Ok(InstructionResult::Continue);
-                    }
-                    // Check prototype chain (this gives us next, return, throw, Symbol.iterator, Symbol.toStringTag)
-                    if let Some(proto) = generator.object.prototype().as_object() {
-                        if let Some(val) = proto.get(&key) {
-                            ctx.set_register(dst.0, val);
-                            return Ok(InstructionResult::Continue);
-                        }
-                    }
-                    ctx.set_register(dst.0, Value::undefined());
-                    return Ok(InstructionResult::Continue);
-                }
-
                 if let Some(str_ref) = object.as_string() {
                     if Self::utf16_eq_ascii(name_str, "length") {
                         ctx.set_register(dst.0, Value::int32(str_ref.len_utf16() as i32));
@@ -4937,63 +4917,6 @@ impl Interpreter {
                             return Ok(InstructionResult::Continue);
                         }
                     }
-                }
-
-                // Function property access
-                if let Some(closure) = object.as_function() {
-                    let key = Self::utf16_key(name_str);
-                    // Check the function's internal object first (for properties like .prototype, .length, .name)
-                    if let Some(val) = closure.object.get(&key) {
-                        if trace_array
-                            && (Self::utf16_eq_ascii(name_str, "Array")
-                                || Self::utf16_eq_ascii(name_str, "prototype")
-                                || Self::utf16_eq_ascii(name_str, "map"))
-                        {
-                            eprintln!(
-                                "[OTTER_TRACE_ARRAY] GetPropConst(function-obj) name={} is_global={} is_array_proto={} result_type={}",
-                                String::from_utf16_lossy(name_str),
-                                is_global,
-                                is_array_proto,
-                                val.type_of()
-                            );
-                            if Self::utf16_eq_ascii(name_str, "prototype") && is_array_ctor {
-                                let proto_match = val
-                                    .as_object()
-                                    .map(|p| Some(p.as_ptr()) == array_proto_ptr)
-                                    .unwrap_or(false);
-                                eprintln!(
-                                    "[OTTER_TRACE_ARRAY] Array.prototype from ctor match={} proto_ptr={:?} val_ptr={:?}",
-                                    proto_match,
-                                    array_proto_ptr,
-                                    val.as_object().map(|p| p.as_ptr())
-                                );
-                            }
-                        }
-                        ctx.set_register(dst.0, val);
-                        return Ok(InstructionResult::Continue);
-                    }
-                    // Check prototype chain
-                    if let Some(proto) = closure.object.prototype().as_object() {
-                        if let Some(val) = proto.get(&key) {
-                            if trace_array
-                                && (Self::utf16_eq_ascii(name_str, "Array")
-                                    || Self::utf16_eq_ascii(name_str, "prototype")
-                                    || Self::utf16_eq_ascii(name_str, "map"))
-                            {
-                                eprintln!(
-                                    "[OTTER_TRACE_ARRAY] GetPropConst(function-proto) name={} is_global={} is_array_proto={} result_type={}",
-                                    String::from_utf16_lossy(name_str),
-                                    is_global,
-                                    is_array_proto,
-                                    val.type_of()
-                                );
-                            }
-                            ctx.set_register(dst.0, val);
-                            return Ok(InstructionResult::Continue);
-                        }
-                    }
-                    ctx.set_register(dst.0, Value::undefined());
-                    return Ok(InstructionResult::Continue);
                 }
 
                 // IC Fast Path
@@ -5059,75 +4982,11 @@ impl Interpreter {
                     }
                 }
 
-                // Special handling for functions - look up from Function.prototype
-                if object.is_function() || object.is_native_function() {
-                    let key = Self::utf16_key(name_str);
-                    // First check the function's own object properties
-                    if let Some(obj_ref) = object.as_object() {
-                        if let Some(value) = obj_ref.get(&key) {
-                            ctx.set_register(dst.0, value);
-                            return Ok(InstructionResult::Continue);
-                        }
-                    }
-                    // Then look up from Function.prototype
-                    if let Some(function_obj) =
-                        ctx.get_global("Function").and_then(|v| v.as_object())
-                    {
-                        if let Some(proto) = function_obj
-                            .get(&PropertyKey::string("prototype"))
-                            .and_then(|v| v.as_object())
-                        {
-                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
-                            ctx.set_register(dst.0, value);
-                            return Ok(InstructionResult::Continue);
-                        }
-                    }
-                    ctx.set_register(dst.0, Value::undefined());
-                    return Ok(InstructionResult::Continue);
-                }
-
-                // DataView property access — no internal object, lookup on DataView.prototype
-                if object.is_data_view() {
-                    let key = Self::utf16_key(name_str);
-                    let receiver = object.clone();
-                    if let Some(dv_ctor) = ctx.get_global("DataView").and_then(|v| v.as_object()) {
-                        if let Some(proto) = dv_ctor
-                            .get(&PropertyKey::string("prototype"))
-                            .and_then(|v| v.as_object())
-                        {
-                            // Check for accessor properties (byteLength, buffer, byteOffset)
-                            match proto.lookup_property_descriptor(&key) {
-                                Some(crate::object::PropertyDescriptor::Accessor {
-                                    get, ..
-                                }) => {
-                                    let Some(getter) = get else {
-                                        ctx.set_register(dst.0, Value::undefined());
-                                        return Ok(InstructionResult::Continue);
-                                    };
-                                    if let Some(native_fn) = getter.as_native_function() {
-                                        let result =
-                                            self.call_native_fn(ctx, native_fn, &receiver, &[])?;
-                                        ctx.set_register(dst.0, result);
-                                        return Ok(InstructionResult::Continue);
-                                    }
-                                }
-                                _ => {
-                                    let value = proto.get(&key).unwrap_or_else(Value::undefined);
-                                    ctx.set_register(dst.0, value);
-                                    return Ok(InstructionResult::Continue);
-                                }
-                            }
-                        }
-                    }
-                    ctx.set_register(dst.0, Value::undefined());
-                    return Ok(InstructionResult::Continue);
-                }
-
-                if let Some(obj) = object.as_object() {
+                if let Some(obj_ref) = object.as_object() {
                     let receiver = object.clone();
                     let key = Self::utf16_key(name_str);
 
-                    match obj.lookup_property_descriptor(&key) {
+                    match obj_ref.lookup_property_descriptor(&key) {
                         Some(crate::object::PropertyDescriptor::Accessor { get, .. }) => {
                             let Some(getter) = get else {
                                 ctx.set_register(dst.0, Value::undefined());
@@ -5157,8 +5016,8 @@ impl Interpreter {
                         _ => {
                             // Slow path: full lookup and IC update
                             // Skip IC for dictionary mode objects
-                            if !obj.is_dictionary_mode() {
-                                if let Some(offset) = obj.shape().get_offset(&key) {
+                            if !obj_ref.is_dictionary_mode() {
+                                if let Some(offset) = obj_ref.shape().get_offset(&key) {
                                     let frame = ctx
                                         .current_frame()
                                         .ok_or_else(|| VmError::internal("no frame"))?;
@@ -5169,7 +5028,8 @@ impl Interpreter {
                                     let feedback = func.feedback_vector.write();
                                     if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                         use otter_vm_bytecode::function::InlineCacheState;
-                                        let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                        let shape_ptr =
+                                            std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
                                         let current_epoch = get_proto_epoch();
 
                                         match &mut ic.ic_state {
@@ -5221,8 +5081,8 @@ impl Interpreter {
                             }
 
                             let key_value = Value::string(JsString::intern_utf16(name_str));
-                            let value =
-                                self.get_with_proxy_chain(ctx, &obj, &key, key_value, &object)?;
+                            let value = self
+                                .get_with_proxy_chain(ctx, &obj_ref, &key, key_value, &receiver)?;
                             if trace_array
                                 && (Self::utf16_eq_ascii(name_str, "Array")
                                     || Self::utf16_eq_ascii(name_str, "prototype")
@@ -5583,13 +5443,6 @@ impl Interpreter {
                     } else {
                         obj.delete(&prop_key)
                     }
-                } else if let Some(closure) = object.as_function() {
-                    // Handle delete on function objects (for .length, .name, etc.)
-                    if !closure.object.has_own(&prop_key) {
-                        true
-                    } else {
-                        closure.object.delete(&prop_key)
-                    }
                 } else {
                     true
                 };
@@ -5690,75 +5543,8 @@ impl Interpreter {
                     }
                 }
 
-                // Function property access
-                if let Some(closure) = object.as_function() {
-                    let key = self.value_to_property_key(ctx, &key_value)?;
-                    let receiver = object.clone();
-                    let value = self.get_property_value(ctx, &closure.object, &key, &receiver)?;
-                    ctx.set_register(dst.0, value);
-                    return Ok(InstructionResult::Continue);
-                }
-
-                // Generator property access
-                if let Some(generator) = object.as_generator() {
-                    // Convert key to property key
-                    let key = self.value_to_property_key(ctx, &key_value)?;
-
-                    // Check the generator's internal object first
-                    if let Some(val) = generator.object.get(&key) {
-                        ctx.set_register(dst.0, val);
-                        return Ok(InstructionResult::Continue);
-                    }
-                    // Check prototype chain (this gives us next, return, throw, Symbol.iterator, Symbol.toStringTag)
-                    if let Some(proto) = generator.object.prototype().as_object() {
-                        if let Some(val) = proto.get(&key) {
-                            ctx.set_register(dst.0, val);
-                            return Ok(InstructionResult::Continue);
-                        }
-                    }
-                    ctx.set_register(dst.0, Value::undefined());
-                    return Ok(InstructionResult::Continue);
-                }
-
-                // DataView property access — no internal object, lookup on DataView.prototype
-                if object.is_data_view() {
-                    let key = self.value_to_property_key(ctx, &key_value)?;
-                    let receiver = object.clone();
-                    if let Some(dv_ctor) = ctx.get_global("DataView").and_then(|v| v.as_object()) {
-                        if let Some(proto) = dv_ctor
-                            .get(&PropertyKey::string("prototype"))
-                            .and_then(|v| v.as_object())
-                        {
-                            match proto.lookup_property_descriptor(&key) {
-                                Some(crate::object::PropertyDescriptor::Accessor {
-                                    get, ..
-                                }) => {
-                                    let Some(getter) = get else {
-                                        ctx.set_register(dst.0, Value::undefined());
-                                        return Ok(InstructionResult::Continue);
-                                    };
-                                    if let Some(native_fn) = getter.as_native_function() {
-                                        let result =
-                                            self.call_native_fn(ctx, native_fn, &receiver, &[])?;
-                                        ctx.set_register(dst.0, result);
-                                        return Ok(InstructionResult::Continue);
-                                    }
-                                }
-                                _ => {
-                                    let value = proto.get(&key).unwrap_or_else(Value::undefined);
-                                    ctx.set_register(dst.0, value);
-                                    return Ok(InstructionResult::Continue);
-                                }
-                            }
-                        }
-                    }
-                    ctx.set_register(dst.0, Value::undefined());
-                    return Ok(InstructionResult::Continue);
-                }
-
                 if let Some(obj) = object.as_object() {
                     let receiver = object.clone();
-
                     // Convert key to property key
                     let key = self.value_to_property_key(ctx, &key_value)?;
 

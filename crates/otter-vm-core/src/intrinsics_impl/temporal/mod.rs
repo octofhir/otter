@@ -397,6 +397,8 @@ pub fn install_temporal_namespace(
             // Calendar validation (arg 9)
             let calendar_val = args.get(9).cloned().unwrap_or(Value::undefined());
             if !calendar_val.is_undefined() {
+                // Per spec: only strings are valid calendar identifiers.
+                // Objects (including Duration), null, boolean, number, bigint, symbol → TypeError
                 if calendar_val.is_null() || calendar_val.is_boolean() || calendar_val.is_number() || calendar_val.is_bigint() {
                     return Err(VmError::type_error(format!(
                         "{} is not a valid calendar",
@@ -405,6 +407,11 @@ pub fn install_temporal_namespace(
                 }
                 if calendar_val.as_symbol().is_some() {
                     return Err(VmError::type_error("Cannot convert a Symbol value to a string"));
+                }
+                // Objects (typeof === "object" or "function") throw TypeError
+                if calendar_val.as_object().is_some() || calendar_val.as_proxy().is_some()
+                    || calendar_val.is_function() || calendar_val.is_native_function() {
+                    return Err(VmError::type_error("object is not a valid calendar"));
                 }
                 let cal_str = ncx.to_string_value(&calendar_val)?;
                 let lower = cal_str.as_str().to_ascii_lowercase();

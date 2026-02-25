@@ -10,6 +10,7 @@ use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
+use chrono::{Datelike, Timelike};
 use std::sync::Arc;
 use temporal_rs::options::Overflow;
 
@@ -426,6 +427,21 @@ pub(super) fn extract_iso_date_from_slots(obj: &GcRef<JsObject>) -> Result<tempo
     temporal_rs::PlainDate::try_new(y, m, d, temporal_rs::Calendar::default()).map_err(temporal_err)
 }
 
+/// Extract ISO date fields from an object with PlainDate OR PlainDateTime branding.
+/// Used by PlainDateTime getters that need calendar-derived date properties.
+pub(super) fn extract_iso_date_from_date_like_slots(obj: &GcRef<JsObject>) -> Result<temporal_rs::PlainDate, VmError> {
+    let tt = obj.get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
+        .and_then(|v| v.as_string().map(|s| s.as_str().to_string()));
+    match tt.as_deref() {
+        Some("PlainDate") | Some("PlainDateTime") => {}
+        _ => return Err(VmError::type_error("this is not a Temporal.PlainDate or Temporal.PlainDateTime")),
+    }
+    let y = obj.get(&PropertyKey::string(SLOT_ISO_YEAR)).and_then(|v| v.as_int32()).unwrap_or(0);
+    let m = obj.get(&PropertyKey::string(SLOT_ISO_MONTH)).and_then(|v| v.as_int32()).unwrap_or(1) as u8;
+    let d = obj.get(&PropertyKey::string(SLOT_ISO_DAY)).and_then(|v| v.as_int32()).unwrap_or(1) as u8;
+    temporal_rs::PlainDate::try_new(y, m, d, temporal_rs::Calendar::default()).map_err(temporal_err)
+}
+
 // ============================================================================
 // Standalone conversion helpers
 // ============================================================================
@@ -458,14 +474,6 @@ pub(super) fn validate_calendar_arg_standalone(ncx: &mut NativeContext<'_>, cal:
     if s.is_empty() { return Err(VmError::range_error("empty string is not a valid calendar ID")); }
     let lower = s.to_ascii_lowercase();
     if lower == "iso8601" { return Ok("iso8601".to_string()); }
-    if s.chars().any(|c| c.is_ascii_digit()) {
-        if temporal_rs::PlainDateTime::from_utf8(s.as_bytes()).is_ok() { return Ok("iso8601".to_string()); }
-        if temporal_rs::PlainDate::from_utf8(s.as_bytes()).is_ok() { return Ok("iso8601".to_string()); }
-        if temporal_rs::PlainTime::from_utf8(s.as_bytes()).is_ok() { return Ok("iso8601".to_string()); }
-        if temporal_rs::PlainMonthDay::from_utf8(s.as_bytes()).is_ok() { return Ok("iso8601".to_string()); }
-        if temporal_rs::PlainYearMonth::from_utf8(s.as_bytes()).is_ok() { return Ok("iso8601".to_string()); }
-        return Err(VmError::range_error(format!("{} is not a valid calendar ID", s)));
-    }
     Err(VmError::range_error(format!("{} is not a valid calendar ID", s)))
 }
 
@@ -494,6 +502,14 @@ pub(super) fn to_temporal_datetime_standalone(ncx: &mut NativeContext<'_>, item:
             let d = obj.get(&PropertyKey::string(SLOT_ISO_DAY)).and_then(|v| v.as_int32()).unwrap_or(1);
             return temporal_rs::PlainDateTime::try_new(y, mo as u8, d as u8, 0,0,0,0,0,0, temporal_rs::Calendar::default()).map_err(temporal_err);
         }
+        // ZonedDateTime → convert epoch nanoseconds to PlainDateTime
+        if temporal_type.as_deref() == Some("ZonedDateTime") {
+            let (y, mo, d, h, mi, sec, ms, us, ns) = zoned_datetime_to_parts(&obj, ncx)?;
+            return temporal_rs::PlainDateTime::try_new(
+                y, mo as u8, d as u8, h as u8, mi as u8, sec as u8, ms as u16, us as u16, ns as u16,
+                temporal_rs::Calendar::default(),
+            ).map_err(temporal_err);
+        }
         // Property bag: calendar, day, hour, microsecond, millisecond, minute, month, monthCode, nanosecond, second, year
         let calendar_val = ncx.get_property(&obj, &PropertyKey::string("calendar"))?;
         if !calendar_val.is_undefined() { validate_calendar_arg_standalone(ncx, &calendar_val)?; }
@@ -521,7 +537,7 @@ pub(super) fn to_temporal_datetime_standalone(ncx: &mut NativeContext<'_>, item:
         let ns_val = ncx.get_property(&obj, &PropertyKey::string("nanosecond"))?;
         let ns = if !ns_val.is_undefined() { let n = ncx.to_number_value(&ns_val)?; if n.is_infinite() { return Err(VmError::range_error("nanosecond cannot be Infinity")); } n as i32 } else { 0 };
         let sec_val = ncx.get_property(&obj, &PropertyKey::string("second"))?;
-        let sec = if !sec_val.is_undefined() { let sv = ncx.to_number_value(&sec_val)? as i32; if sv == 60 { 59 } else { sv } } else { 0 };
+        let sec = if !sec_val.is_undefined() { let n = ncx.to_number_value(&sec_val)?; if n.is_infinite() { return Err(VmError::range_error("second property cannot be Infinity")); } let sv = n as i32; if sv == 60 { 59 } else { sv } } else { 0 };
         let year_val = ncx.get_property(&obj, &PropertyKey::string("year"))?;
         let y = if !year_val.is_undefined() { let n = ncx.to_number_value(&year_val)?; if n.is_infinite() { return Err(VmError::range_error("year cannot be Infinity")); } n as i32 } else { return Err(VmError::type_error("year is required")); };
         return temporal_rs::PlainDateTime::try_new(y, month as u8, d as u8, h as u8, mi as u8, sec as u8, ms as u16, us as u16, ns as u16, temporal_rs::Calendar::default()).map_err(temporal_err);
@@ -697,20 +713,21 @@ pub(super) fn validate_annotations(s: &str) -> Result<(), VmError> {
                             s
                         )));
                     }
+                    // Non-critical duplicate: ignore (per spec, first wins)
+                } else {
+                    seen_calendar = true;
+                    if is_critical {
+                        seen_critical = true;
+                    }
+                    // Validate calendar ID (only the first annotation)
+                    if value != "iso8601" {
+                        return Err(VmError::range_error(format!(
+                            "Unknown calendar: {}",
+                            value
+                        )));
+                    }
+                    _calendar_value = value.to_string();
                 }
-                seen_calendar = true;
-                if is_critical {
-                    seen_critical = true;
-                }
-
-                // Validate calendar ID
-                if value != "iso8601" {
-                    return Err(VmError::range_error(format!(
-                        "Unknown calendar: {}",
-                        value
-                    )));
-                }
-                _calendar_value = value.to_string();
             } else if is_critical {
                 // Unknown critical annotation
                 return Err(VmError::range_error(format!(
@@ -1175,10 +1192,9 @@ pub(super) fn to_temporal_duration(ncx: &mut NativeContext<'_>, item: &Value) ->
             let tt = obj.get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
                 .and_then(|v| v.as_string().map(|s| s.as_str().to_string()));
             if tt.as_deref() == Some("Duration") {
-                let fields = ["years","months","weeks","days","hours","minutes","seconds","milliseconds","microseconds","nanoseconds"];
                 let mut vals = [0f64; 10];
-                for (i, field) in fields.iter().enumerate() {
-                    vals[i] = obj.get(&PropertyKey::string(field)).and_then(|v| v.as_number()).unwrap_or(0.0);
+                for (i, slot) in DURATION_SLOTS.iter().enumerate() {
+                    vals[i] = obj.get(&PropertyKey::string(slot)).and_then(|v| v.as_number()).unwrap_or(0.0);
                 }
                 return temporal_rs::Duration::new(
                     vals[0] as i64, vals[1] as i64, vals[2] as i64, vals[3] as i64,
@@ -1258,10 +1274,11 @@ pub(super) fn parse_difference_settings_for_date(ncx: &mut NativeContext<'_>, op
         let ri = ncx.get_property(&opts_obj, &PropertyKey::string("roundingIncrement"))?;
         if !ri.is_undefined() {
             let n = ncx.to_number_value(&ri)?;
-            if n <= 0.0 || n.is_infinite() || n != n.trunc() {
+            if n.is_nan() || n.is_infinite() || n <= 0.0 {
                 return Err(VmError::range_error("roundingIncrement must be a positive integer"));
             }
-            settings.increment = Some(temporal_rs::options::RoundingIncrement::try_new(n as u32)
+            let truncated = n.trunc() as u32;
+            settings.increment = Some(temporal_rs::options::RoundingIncrement::try_new(truncated)
                 .map_err(|_| VmError::range_error("roundingIncrement out of range"))?);
         }
     } else if let Some(s) = options_val.as_string() {
@@ -1273,8 +1290,54 @@ pub(super) fn parse_difference_settings_for_date(ncx: &mut NativeContext<'_>, op
     Ok(settings)
 }
 
-fn parse_temporal_unit(s: &str) -> Result<temporal_rs::options::Unit, VmError> {
+/// Parse difference settings for PlainYearMonth.until / .since
+/// The `_is_since` parameter is reserved for future use; temporal_rs handles sign internally.
+pub(super) fn parse_difference_settings_for_year_month(ncx: &mut NativeContext<'_>, options_val: &Value, _is_since: bool) -> Result<temporal_rs::options::DifferenceSettings, VmError> {
+    let mut settings = temporal_rs::options::DifferenceSettings::default();
+    if options_val.is_undefined() {
+        return Ok(settings);
+    }
+    // Type validation: primitives are not valid options
+    if options_val.is_null() || options_val.is_boolean() || options_val.is_number()
+        || options_val.is_bigint() || options_val.is_string() || options_val.as_symbol().is_some() {
+        return Err(VmError::type_error(format!("{} is not a valid options argument", options_val.type_of())));
+    }
+    // Read and coerce each option one at a time in spec order (interleaved for observable side effects)
+    // largestUnit
+    let lu = ncx.get_property_of_value(options_val, &PropertyKey::string("largestUnit"))?;
+    if !lu.is_undefined() {
+        let lu_str = ncx.to_string_value(&lu)?;
+        settings.largest_unit = Some(parse_temporal_unit(lu_str.as_str())?);
+    }
+    // roundingIncrement
+    let ri = ncx.get_property_of_value(options_val, &PropertyKey::string("roundingIncrement"))?;
+    if !ri.is_undefined() {
+        let n = ncx.to_number_value(&ri)?;
+        if n.is_nan() || n.is_infinite() || n <= 0.0 {
+            return Err(VmError::range_error("roundingIncrement must be a positive integer"));
+        }
+        let truncated = n.trunc() as u32;
+        settings.increment = Some(temporal_rs::options::RoundingIncrement::try_new(truncated)
+            .map_err(|_| VmError::range_error("roundingIncrement out of range"))?);
+    }
+    // roundingMode
+    let rm = ncx.get_property_of_value(options_val, &PropertyKey::string("roundingMode"))?;
+    if !rm.is_undefined() {
+        let rm_str = ncx.to_string_value(&rm)?;
+        settings.rounding_mode = Some(parse_rounding_mode(rm_str.as_str())?);
+    }
+    // smallestUnit
+    let su = ncx.get_property_of_value(options_val, &PropertyKey::string("smallestUnit"))?;
+    if !su.is_undefined() {
+        let su_str = ncx.to_string_value(&su)?;
+        settings.smallest_unit = Some(parse_temporal_unit(su_str.as_str())?);
+    }
+    Ok(settings)
+}
+
+pub(super) fn parse_temporal_unit(s: &str) -> Result<temporal_rs::options::Unit, VmError> {
     match s {
+        "auto" => Ok(temporal_rs::options::Unit::Auto),
         "year" | "years" => Ok(temporal_rs::options::Unit::Year),
         "month" | "months" => Ok(temporal_rs::options::Unit::Month),
         "week" | "weeks" => Ok(temporal_rs::options::Unit::Week),
@@ -1314,4 +1377,85 @@ pub(super) fn format_iso_year(year: i32) -> String {
     } else {
         format!("+{:06}", year)
     }
+}
+
+/// Extract date/time components from a ZonedDateTime object.
+/// Returns (year, month, day, hour, minute, second, ms, us, ns).
+/// Implements GetISOPartsFromEpoch + timezone offset application.
+pub(super) fn zoned_datetime_to_parts(
+    obj: &GcRef<JsObject>,
+    ncx: &mut NativeContext<'_>,
+) -> Result<(i32, i32, i32, i32, i32, i32, i32, i32, i32), VmError> {
+    // Get epochNanoseconds (BigInt)
+    let epoch_ns_val = obj.get(&PropertyKey::string("epochNanoseconds"))
+        .ok_or_else(|| VmError::type_error("ZonedDateTime missing epochNanoseconds"))?;
+    if !epoch_ns_val.is_bigint() {
+        return Err(VmError::type_error("epochNanoseconds must be a BigInt"));
+    }
+    // Convert BigInt to string then parse as i128
+    let ns_str = ncx.to_string_value(&epoch_ns_val)?;
+    let epoch_ns: i128 = ns_str.parse()
+        .map_err(|_| VmError::type_error("invalid epochNanoseconds"))?;
+
+    // Get timeZoneId for offset
+    let tz_val = obj.get(&PropertyKey::string("timeZoneId"))
+        .unwrap_or(Value::string(JsString::intern("UTC")));
+    let tz_str = if let Some(s) = tz_val.as_string() {
+        s.as_str().to_string()
+    } else {
+        let s = ncx.to_string_value(&tz_val)?;
+        s.to_string()
+    };
+
+    // Apply timezone offset (for UTC it's 0; for named zones parse offset)
+    let offset_ns: i128 = if tz_str == "UTC" {
+        0
+    } else {
+        parse_tz_offset_ns(&tz_str).unwrap_or(0)
+    };
+
+    let local_ns = epoch_ns + offset_ns;
+    epoch_ns_to_parts(local_ns)
+}
+
+/// Convert epoch nanoseconds to ISO date/time parts.
+/// Implements GetISOPartsFromEpoch algorithm from Temporal spec.
+pub(super) fn epoch_ns_to_parts(epoch_ns: i128) -> Result<(i32, i32, i32, i32, i32, i32, i32, i32, i32), VmError> {
+    const NS_PER_MS: i128 = 1_000_000;
+    const NS_PER_US: i128 = 1_000;
+    const MS_PER_SEC: i128 = 1_000;
+    const MS_PER_MIN: i128 = 60_000;
+    const MS_PER_HOUR: i128 = 3_600_000;
+    const MS_PER_DAY: i128 = 86_400_000;
+
+    // Step 1: remainder_ns has same sign as epoch_ns, magnitude is abs(epoch_ns) mod 10^6
+    let remainder_ns = epoch_ns.rem_euclid(NS_PER_MS);
+
+    // Step 2: epoch_ms = (epoch_ns - remainder_ns) / 10^6
+    let epoch_ms = (epoch_ns - remainder_ns) / NS_PER_MS;
+
+    // Use chrono to convert epoch_ms to date/time
+    let secs = if epoch_ms >= 0 {
+        epoch_ms / 1000
+    } else {
+        (epoch_ms - 999) / 1000
+    };
+    let sub_ms = ((epoch_ms % 1000) + 1000) % 1000;
+
+    let dt = chrono::DateTime::from_timestamp(secs as i64, (sub_ms as u32) * 1_000_000)
+        .ok_or_else(|| VmError::range_error("epoch nanoseconds out of range"))?;
+
+    let year = dt.year() as i32;
+    let month = dt.month() as i32;
+    let day = dt.day() as i32;
+    let hour = dt.hour() as i32;
+    let minute = dt.minute() as i32;
+    let second = dt.second() as i32;
+    let ms = (sub_ms % MS_PER_SEC) as i32;
+
+    // Microsecond and nanosecond from the sub-millisecond remainder
+    let us = (remainder_ns / NS_PER_US) as i32;
+    let ns = (remainder_ns % NS_PER_US) as i32;
+
+    Ok((year, month, day, hour, minute, second, ms, us, ns))
 }

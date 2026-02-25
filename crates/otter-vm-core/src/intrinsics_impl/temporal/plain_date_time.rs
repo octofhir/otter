@@ -174,7 +174,7 @@ pub(super) fn install_plain_date_time_prototype(
                 get: Some(Value::native_function_with_proto(
                     move |this, _args, _ncx| {
                         let obj = this.as_object().ok_or_else(|| VmError::type_error("getter called on non-object"))?;
-                        let pd = extract_iso_date_from_slots(&obj)?;
+                        let pd = extract_iso_date_from_date_like_slots(&obj)?;
                         Ok(Value::int32(f(&pd)))
                     },
                     mm.clone(), fn_proto.clone(),
@@ -191,7 +191,7 @@ pub(super) fn install_plain_date_time_prototype(
             get: Some(Value::native_function_with_proto(
                 |this, _args, _ncx| {
                     let obj = this.as_object().ok_or_else(|| VmError::type_error("inLeapYear"))?;
-                    let pd = extract_iso_date_from_slots(&obj)?;
+                    let pd = extract_iso_date_from_date_like_slots(&obj)?;
                     Ok(Value::boolean(pd.in_leap_year()))
                 },
                 mm.clone(), fn_proto.clone(),
@@ -201,40 +201,254 @@ pub(super) fn install_plain_date_time_prototype(
         },
     );
 
+    // weekOfYear
+    proto.define_property(
+        PropertyKey::string("weekOfYear"),
+        PropertyDescriptor::Accessor {
+            get: Some(Value::native_function_with_proto(
+                |this, _args, _ncx| {
+                    let obj = this.as_object().ok_or_else(|| VmError::type_error("weekOfYear"))?;
+                    let _ = obj.get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
+                        .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
+                        .filter(|t| t == "PlainDateTime")
+                        .ok_or_else(|| VmError::type_error("weekOfYear called on non-PlainDateTime"))?;
+                    let pdt = extract_pdt(&obj)?;
+                    match pdt.week_of_year() {
+                        Some(w) => Ok(Value::int32(w as i32)),
+                        None => Ok(Value::undefined()),
+                    }
+                },
+                mm.clone(), fn_proto.clone(),
+            )),
+            set: None,
+            attributes: PropertyAttributes { writable: false, enumerable: false, configurable: true },
+        },
+    );
+
+    // yearOfWeek
+    proto.define_property(
+        PropertyKey::string("yearOfWeek"),
+        PropertyDescriptor::Accessor {
+            get: Some(Value::native_function_with_proto(
+                |this, _args, _ncx| {
+                    let obj = this.as_object().ok_or_else(|| VmError::type_error("yearOfWeek"))?;
+                    let _ = obj.get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
+                        .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
+                        .filter(|t| t == "PlainDateTime")
+                        .ok_or_else(|| VmError::type_error("yearOfWeek called on non-PlainDateTime"))?;
+                    let pdt = extract_pdt(&obj)?;
+                    match pdt.year_of_week() {
+                        Some(y) => Ok(Value::int32(y)),
+                        None => Ok(Value::undefined()),
+                    }
+                },
+                mm.clone(), fn_proto.clone(),
+            )),
+            set: None,
+            attributes: PropertyAttributes { writable: false, enumerable: false, configurable: true },
+        },
+    );
+
+    // Helper: format PlainDateTime to string with options
+    fn format_pdt_string(
+        obj: &GcRef<JsObject>,
+        fractional_digits: Option<i32>,  // None = auto, 0-9 = explicit
+        smallest_unit: Option<temporal_rs::options::Unit>,
+        rounding_mode: temporal_rs::options::RoundingMode,
+        calendar_name: &str,
+    ) -> Result<String, VmError> {
+        let pdt = extract_pdt(obj)?;
+
+        // Determine effective precision from smallestUnit (overrides fractionalSecondDigits)
+        let (effective_digits, round_unit) = if let Some(unit) = smallest_unit {
+            match unit {
+                temporal_rs::options::Unit::Minute => (Some(-1i32), Some(unit)), // special: truncate to minute
+                temporal_rs::options::Unit::Second => (Some(0), Some(unit)),
+                temporal_rs::options::Unit::Millisecond => (Some(3), Some(unit)),
+                temporal_rs::options::Unit::Microsecond => (Some(6), Some(unit)),
+                temporal_rs::options::Unit::Nanosecond => (Some(9), Some(unit)),
+                _ => return Err(VmError::range_error(format!("{:?} is not a valid value for smallest unit", unit))),
+            }
+        } else {
+            (fractional_digits, None)
+        };
+
+        // Round the PlainDateTime if needed
+        let rounded = if round_unit.is_some() || (effective_digits.is_some() && effective_digits != Some(-1)) {
+            let su = round_unit.unwrap_or_else(|| {
+                match effective_digits.unwrap_or(9) {
+                    0 => temporal_rs::options::Unit::Second,
+                    1..=3 => temporal_rs::options::Unit::Millisecond,
+                    4..=6 => temporal_rs::options::Unit::Microsecond,
+                    _ => temporal_rs::options::Unit::Nanosecond,
+                }
+            });
+            let inc_val = match su {
+                temporal_rs::options::Unit::Second => 1,
+                temporal_rs::options::Unit::Millisecond => {
+                    let d = effective_digits.unwrap_or(3);
+                    if d <= 0 { 1 } else {
+                        let pow = 10u64.pow((3 - d.min(3)) as u32);
+                        if pow == 0 { 1 } else { pow }
+                    }
+                },
+                temporal_rs::options::Unit::Microsecond => {
+                    let d = effective_digits.unwrap_or(6);
+                    if d <= 3 { 1 } else {
+                        let pow = 10u64.pow((6 - d.min(6)) as u32);
+                        if pow == 0 { 1 } else { pow }
+                    }
+                },
+                temporal_rs::options::Unit::Nanosecond => {
+                    let d = effective_digits.unwrap_or(9);
+                    if d <= 6 { 1 } else {
+                        let pow = 10u64.pow((9 - d.min(9)) as u32);
+                        if pow == 0 { 1 } else { pow }
+                    }
+                },
+                temporal_rs::options::Unit::Minute => 1,
+                _ => 1,
+            };
+            let ri = temporal_rs::options::RoundingIncrement::try_from(inc_val as f64).unwrap_or_default();
+            let mut opts = temporal_rs::options::RoundingOptions::default();
+            opts.largest_unit = None;
+            opts.smallest_unit = Some(su);
+            opts.rounding_mode = Some(rounding_mode);
+            opts.increment = Some(ri);
+            pdt.round(opts).map_err(temporal_err)?
+        } else {
+            pdt
+        };
+
+        let y = rounded.iso_year();
+        let mo = rounded.iso_month();
+        let d = rounded.iso_day();
+        let h = rounded.hour();
+        let mi = rounded.minute();
+        let sec = rounded.second();
+        let ms = rounded.millisecond();
+        let us = rounded.microsecond();
+        let ns = rounded.nanosecond();
+
+        let date_part = if y < 0 || y > 9999 {
+            format!("{:+07}-{:02}-{:02}", y, mo, d)
+        } else {
+            format!("{:04}-{:02}-{:02}", y, mo, d)
+        };
+
+        let time_part = if effective_digits == Some(-1) {
+            // minute precision
+            format!("T{:02}:{:02}", h, mi)
+        } else {
+            let sub = ns as i64 + us as i64 * 1000 + ms as i64 * 1_000_000;
+            match effective_digits {
+                Some(0) => format!("T{:02}:{:02}:{:02}", h, mi, sec),
+                Some(n) if n > 0 => {
+                    let frac = format!("{:09}", sub);
+                    let trimmed = &frac[..n as usize];
+                    format!("T{:02}:{:02}:{:02}.{}", h, mi, sec, trimmed)
+                },
+                None => {
+                    // auto: trim trailing zeros
+                    if sub != 0 {
+                        let frac = format!("{:09}", sub);
+                        let trimmed = frac.trim_end_matches('0');
+                        format!("T{:02}:{:02}:{:02}.{}", h, mi, sec, trimmed)
+                    } else if sec != 0 || mi != 0 || h != 0 {
+                        format!("T{:02}:{:02}:{:02}", h, mi, sec)
+                    } else {
+                        "T00:00:00".to_string()
+                    }
+                },
+                _ => format!("T{:02}:{:02}:{:02}", h, mi, sec),
+            }
+        };
+
+        let cal_suffix = match calendar_name {
+            "always" => "[u-ca=iso8601]",
+            "critical" => "[!u-ca=iso8601]",
+            "auto" | "never" | _ => "",
+        };
+
+        Ok(format!("{}{}{}", date_part, time_part, cal_suffix))
+    }
+
     // toString
     let to_string_fn = Value::native_function_with_proto_named(
-        |this, _args, _ncx| {
+        |this, args, ncx| {
             let obj = this.as_object().ok_or_else(|| VmError::type_error("toString"))?;
-            let y = obj.get(&PropertyKey::string(SLOT_ISO_YEAR)).and_then(|v| v.as_int32()).ok_or_else(|| VmError::type_error("toString"))?;
-            let mo = obj.get(&PropertyKey::string(SLOT_ISO_MONTH)).and_then(|v| v.as_int32()).unwrap_or(1);
-            let d = obj.get(&PropertyKey::string(SLOT_ISO_DAY)).and_then(|v| v.as_int32()).unwrap_or(1);
-            let h = obj.get(&PropertyKey::string(SLOT_ISO_HOUR)).and_then(|v| v.as_int32()).unwrap_or(0);
-            let mi = obj.get(&PropertyKey::string(SLOT_ISO_MINUTE)).and_then(|v| v.as_int32()).unwrap_or(0);
-            let s = obj.get(&PropertyKey::string(SLOT_ISO_SECOND)).and_then(|v| v.as_int32()).unwrap_or(0);
-            let ms = obj.get(&PropertyKey::string(SLOT_ISO_MILLISECOND)).and_then(|v| v.as_int32()).unwrap_or(0);
-            let us = obj.get(&PropertyKey::string(SLOT_ISO_MICROSECOND)).and_then(|v| v.as_int32()).unwrap_or(0);
-            let ns = obj.get(&PropertyKey::string(SLOT_ISO_NANOSECOND)).and_then(|v| v.as_int32()).unwrap_or(0);
+            let _ = obj.get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
+                .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
+                .filter(|t| t == "PlainDateTime")
+                .ok_or_else(|| VmError::type_error("toString called on non-PlainDateTime"))?;
 
-            let date_part = if y < 0 || y > 9999 {
-                format!("{:+07}-{:02}-{:02}", y, mo, d)
-            } else {
-                format!("{:04}-{:02}-{:02}", y, mo, d)
-            };
+            let options_val = args.first().cloned().unwrap_or(Value::undefined());
+            if options_val.is_undefined() {
+                return Ok(Value::string(JsString::intern(
+                    &format_pdt_string(&obj, None, None, temporal_rs::options::RoundingMode::Trunc, "auto")?
+                )));
+            }
+            if !options_val.is_object() && options_val.as_proxy().is_none() {
+                return Err(VmError::type_error("options must be an object"));
+            }
 
-            let sub = ns + us * 1000 + ms * 1_000_000;
-            let time_part = if sub != 0 {
-                let frac = format!("{:09}", sub);
-                let trimmed = frac.trim_end_matches('0');
-                format!("T{:02}:{:02}:{:02}.{}", h, mi, s, trimmed)
-            } else if s != 0 {
-                format!("T{:02}:{:02}:{:02}", h, mi, s)
-            } else if mi != 0 || h != 0 {
-                format!("T{:02}:{:02}:{:02}", h, mi, s)
-            } else {
-                "T00:00:00".to_string()
-            };
+            // Read options in alphabetical order per spec
+            let cal_val = get_val_property(ncx, &options_val, "calendarName")?;
+            let calendar_name = if !cal_val.is_undefined() {
+                let s = ncx.to_string_value(&cal_val)?;
+                match s.as_str() {
+                    "auto" | "always" | "never" | "critical" => s,
+                    _ => return Err(VmError::range_error(format!("{} is not a valid value for calendarName option", s))),
+                }
+            } else { "auto".to_string() };
 
-            Ok(Value::string(JsString::intern(&format!("{}{}", date_part, time_part))))
+            let fsd_val = get_val_property(ncx, &options_val, "fractionalSecondDigits")?;
+            let fractional_digits = if !fsd_val.is_undefined() {
+                // Per spec GetStringOrNumberOption: if typeof is "number", use as number; else ToString
+                if fsd_val.is_number() {
+                    let n = fsd_val.as_number().unwrap_or(f64::NAN);
+                    if n.is_nan() || n.is_infinite() {
+                        return Err(VmError::range_error("fractionalSecondDigits must be auto or 0-9"));
+                    }
+                    let n = n.floor() as i32;
+                    if !(0..=9).contains(&n) {
+                        return Err(VmError::range_error("fractionalSecondDigits must be auto or 0-9"));
+                    }
+                    Some(n)
+                } else {
+                    // Not a number — convert to string and check for "auto"
+                    let s = ncx.to_string_value(&fsd_val)?;
+                    if s == "auto" {
+                        None
+                    } else {
+                        return Err(VmError::range_error(format!(
+                            "{} is not a valid value for fractionalSecondDigits", s
+                        )));
+                    }
+                }
+            } else { None };
+
+            let rm_val = get_val_property(ncx, &options_val, "roundingMode")?;
+            let rounding_mode = if !rm_val.is_undefined() {
+                let s = ncx.to_string_value(&rm_val)?;
+                parse_rounding_mode(&s)?
+            } else { temporal_rs::options::RoundingMode::Trunc };
+
+            let su_val = get_val_property(ncx, &options_val, "smallestUnit")?;
+            let smallest_unit = if !su_val.is_undefined() {
+                let s = ncx.to_string_value(&su_val)?;
+                let u = parse_temporal_unit(&s)?;
+                match u {
+                    temporal_rs::options::Unit::Year | temporal_rs::options::Unit::Month |
+                    temporal_rs::options::Unit::Week | temporal_rs::options::Unit::Day |
+                    temporal_rs::options::Unit::Auto => return Err(VmError::range_error(format!("{} is not a valid value for smallest unit", s))),
+                    _ => Some(u),
+                }
+            } else { None };
+
+            Ok(Value::string(JsString::intern(
+                &format_pdt_string(&obj, fractional_digits, smallest_unit, rounding_mode, &calendar_name)?
+            )))
         },
         mm.clone(),
         fn_proto.clone(),
@@ -275,10 +489,14 @@ pub(super) fn install_plain_date_time_prototype(
     // toLocaleString
     let to_locale_string_fn = Value::native_function_with_proto_named(
         |this, _args, ncx| {
-            if let Some(obj) = this.as_object() {
-                if let Some(ts) = obj.get(&PropertyKey::string("toString")) {
-                    return ncx.call_function(&ts, this.clone(), &[]);
-                }
+            let obj = this.as_object().ok_or_else(|| VmError::type_error("toLocaleString called on non-object"))?;
+            let ty = obj.get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
+                .and_then(|v| v.as_string().map(|s| s.as_str().to_string()));
+            if ty.as_deref() != Some("PlainDateTime") {
+                return Err(VmError::type_error("toLocaleString called on non-PlainDateTime"));
+            }
+            if let Some(ts) = obj.get(&PropertyKey::string("toString")) {
+                return ncx.call_function(&ts, this.clone(), &[]);
             }
             Err(VmError::type_error("toLocaleString"))
         },
@@ -600,7 +818,6 @@ pub(super) fn install_plain_date_time_prototype(
             let ns_val = obj.get(&PropertyKey::string(SLOT_ISO_NANOSECOND)).and_then(|v| v.as_int32()).unwrap_or(0);
 
             // Compute epoch nanoseconds from ISO date/time components
-            // Epoch is 1970-01-01T00:00:00Z
             let days_from_epoch = iso_date_to_epoch_days(y, mo, d);
             let time_ns = (h as i128) * 3_600_000_000_000
                 + (mi as i128) * 60_000_000_000
@@ -616,7 +833,7 @@ pub(super) fn install_plain_date_time_prototype(
             // For fixed-offset/UTC timezones, epoch_ns = local_epoch_ns - offset_ns
             let epoch_ns = local_epoch_ns - offset_ns;
 
-            // Validate Instant range: ±10^8 days = ±8.64 × 10^21 nanoseconds
+            // Validate Instant range
             let max_instant_ns: i128 = 8_640_000_000_000_000_000_000;
             if epoch_ns < -max_instant_ns || epoch_ns > max_instant_ns {
                 return Err(VmError::range_error("resulting Instant is outside the allowed range"));
@@ -624,30 +841,19 @@ pub(super) fn install_plain_date_time_prototype(
 
             let epoch_ns_str = epoch_ns.to_string();
 
-            // Create a ZonedDateTime object with proper prototype
+            // Create ZonedDateTime via constructor so internal slots are correct
             let temporal_ns_val = ncx.ctx.get_global("Temporal")
                 .ok_or_else(|| VmError::type_error("Temporal namespace not found"))?;
             let temporal_obj = temporal_ns_val.as_object()
                 .ok_or_else(|| VmError::type_error("Temporal namespace not found"))?;
-
-            let zdt_proto = temporal_obj.get(&PropertyKey::string("ZonedDateTime"))
-                .and_then(|ctor| ctor.as_object())
-                .and_then(|ctor_obj| ctor_obj.get(&PropertyKey::string("prototype")))
-                .unwrap_or(Value::undefined());
-
-            let result = GcRef::new(JsObject::new(zdt_proto, ncx.ctx.memory_manager().clone()));
-            result.define_property(PropertyKey::string(SLOT_TEMPORAL_TYPE),
-                PropertyDescriptor::builtin_data(Value::string(JsString::intern("ZonedDateTime"))));
-            result.define_property(PropertyKey::string("epochNanoseconds"),
-                PropertyDescriptor::data(Value::bigint(epoch_ns_str.clone())));
-            result.define_property(PropertyKey::string("calendarId"),
-                PropertyDescriptor::data(Value::string(JsString::intern("iso8601"))));
-            result.define_property(PropertyKey::string("timeZoneId"),
-                PropertyDescriptor::data(Value::string(JsString::intern(&tz_identifier))));
-            // Store the offset for this timezone
-            result.define_property(PropertyKey::string("__tz_offset_ns__"),
-                PropertyDescriptor::builtin_data(Value::string(JsString::intern(&offset_ns.to_string()))));
-            Ok(Value::object(result))
+            let ctor = temporal_obj.get(&PropertyKey::string("ZonedDateTime"))
+                .ok_or_else(|| VmError::type_error("ZonedDateTime constructor not found"))?;
+            let epoch_bigint = Value::bigint(epoch_ns_str);
+            ncx.call_function_construct(&ctor, Value::undefined(), &[
+                epoch_bigint,
+                Value::string(JsString::intern(&tz_identifier)),
+                Value::string(JsString::intern("iso8601")),
+            ])
         },
         mm.clone(), fn_proto.clone(), "toZonedDateTime", 1,
     );
@@ -1001,27 +1207,12 @@ pub(super) fn install_plain_date_time_prototype(
             return Err(VmError::type_error("cannot convert function to a Duration"));
         }
 
-        // If it's a Duration Temporal object, extract fields with 0 defaults (blank duration is valid)
+        // If it's a Duration Temporal object, extract from internal slots
         if let Some(obj) = item.as_object() {
             let temporal_type = obj.get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
                 .and_then(|v| v.as_string().map(|s| s.as_str().to_string()));
             if temporal_type.as_deref() == Some("Duration") {
-                // Duration object — read fields with 0 defaults, allowing all-zero
-                let y = obj.get(&PropertyKey::string("years")).and_then(|v| v.as_number()).unwrap_or(0.0);
-                let mo = obj.get(&PropertyKey::string("months")).and_then(|v| v.as_number()).unwrap_or(0.0);
-                let w = obj.get(&PropertyKey::string("weeks")).and_then(|v| v.as_number()).unwrap_or(0.0);
-                let d = obj.get(&PropertyKey::string("days")).and_then(|v| v.as_number()).unwrap_or(0.0);
-                let h = obj.get(&PropertyKey::string("hours")).and_then(|v| v.as_number()).unwrap_or(0.0);
-                let mi = obj.get(&PropertyKey::string("minutes")).and_then(|v| v.as_number()).unwrap_or(0.0);
-                let s = obj.get(&PropertyKey::string("seconds")).and_then(|v| v.as_number()).unwrap_or(0.0);
-                let ms = obj.get(&PropertyKey::string("milliseconds")).and_then(|v| v.as_number()).unwrap_or(0.0);
-                let us = obj.get(&PropertyKey::string("microseconds")).and_then(|v| v.as_number()).unwrap_or(0.0);
-                let ns = obj.get(&PropertyKey::string("nanoseconds")).and_then(|v| v.as_number()).unwrap_or(0.0);
-                return temporal_rs::Duration::new(
-                    y as i64, mo as i64, w as i64, d as i64,
-                    h as i64, mi as i64, s as i64, ms as i64,
-                    us as i128, ns as i128,
-                ).map_err(temporal_err);
+                return extract_duration_from_slots(&obj);
             }
         }
 
@@ -1278,6 +1469,91 @@ pub(super) fn install_plain_date_time_prototype(
     );
     proto.define_property(PropertyKey::string("subtract"), PropertyDescriptor::builtin_method(subtract_fn));
 
+    // toPlainTime — extract time portion as Temporal.PlainTime
+    let to_plain_time_fn = Value::native_function_with_proto_named(
+        |this, _args, ncx| {
+            let obj = this.as_object().ok_or_else(|| VmError::type_error("toPlainTime"))?;
+            let ty = obj.get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
+                .and_then(|v| v.as_string().map(|s| s.as_str().to_string()));
+            if ty.as_deref() != Some("PlainDateTime") {
+                return Err(VmError::type_error("toPlainTime called on non-PlainDateTime"));
+            }
+            let h = obj.get(&PropertyKey::string(SLOT_ISO_HOUR)).and_then(|v| v.as_int32()).unwrap_or(0);
+            let mi = obj.get(&PropertyKey::string(SLOT_ISO_MINUTE)).and_then(|v| v.as_int32()).unwrap_or(0);
+            let sec = obj.get(&PropertyKey::string(SLOT_ISO_SECOND)).and_then(|v| v.as_int32()).unwrap_or(0);
+            let ms = obj.get(&PropertyKey::string(SLOT_ISO_MILLISECOND)).and_then(|v| v.as_int32()).unwrap_or(0);
+            let us = obj.get(&PropertyKey::string(SLOT_ISO_MICROSECOND)).and_then(|v| v.as_int32()).unwrap_or(0);
+            let ns = obj.get(&PropertyKey::string(SLOT_ISO_NANOSECOND)).and_then(|v| v.as_int32()).unwrap_or(0);
+            let global = ncx.global();
+            let pt_ctor = global.get(&PropertyKey::string("Temporal"))
+                .and_then(|v| v.as_object())
+                .and_then(|t| t.get(&PropertyKey::string("PlainTime")))
+                .ok_or_else(|| VmError::type_error("Temporal.PlainTime not found"))?;
+            ncx.call_function_construct(&pt_ctor, Value::undefined(), &[
+                Value::int32(h), Value::int32(mi), Value::int32(sec),
+                Value::int32(ms), Value::int32(us), Value::int32(ns),
+            ])
+        },
+        mm.clone(), fn_proto.clone(), "toPlainTime", 0,
+    );
+    proto.define_property(PropertyKey::string("toPlainTime"), PropertyDescriptor::builtin_method(to_plain_time_fn));
+
+    // withPlainTime — replace time portion, keep date
+    let with_plain_time_fn = Value::native_function_with_proto_named(
+        |this, args, ncx| {
+            let obj = this.as_object().ok_or_else(|| VmError::type_error("withPlainTime"))?;
+            let ty = obj.get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
+                .and_then(|v| v.as_string().map(|s| s.as_str().to_string()));
+            if ty.as_deref() != Some("PlainDateTime") {
+                return Err(VmError::type_error("withPlainTime called on non-PlainDateTime"));
+            }
+            // Get date portion from this
+            let y = obj.get(&PropertyKey::string(SLOT_ISO_YEAR)).and_then(|v| v.as_int32()).unwrap_or(0);
+            let mo = obj.get(&PropertyKey::string(SLOT_ISO_MONTH)).and_then(|v| v.as_int32()).unwrap_or(1);
+            let d = obj.get(&PropertyKey::string(SLOT_ISO_DAY)).and_then(|v| v.as_int32()).unwrap_or(1);
+
+            // Get time from argument (default to midnight if undefined/absent)
+            let time_arg = args.first().cloned().unwrap_or(Value::undefined());
+            let (h, mi, sec, ms, us, ns) = if time_arg.is_undefined() {
+                (0, 0, 0, 0, 0, 0)
+            } else {
+                // Convert to PlainTime first via Temporal.PlainTime.from(), then extract slots
+                let global = ncx.global();
+                let pt_ctor = global.get(&PropertyKey::string("Temporal"))
+                    .and_then(|v| v.as_object())
+                    .and_then(|t| t.get(&PropertyKey::string("PlainTime")))
+                    .ok_or_else(|| VmError::type_error("Temporal.PlainTime not found"))?;
+                let pt_from = pt_ctor.as_object()
+                    .ok_or_else(|| VmError::type_error("Temporal.PlainTime not found"))?
+                    .get(&PropertyKey::string("from"))
+                    .ok_or_else(|| VmError::type_error("Temporal.PlainTime.from not found"))?;
+                let pt = ncx.call_function(&pt_from, pt_ctor, &[time_arg])?;
+                let pt_obj = pt.as_object()
+                    .ok_or_else(|| VmError::type_error("PlainTime.from did not return an object"))?;
+                let h = pt_obj.get(&PropertyKey::string(SLOT_ISO_HOUR)).and_then(|v| v.as_int32()).unwrap_or(0);
+                let mi = pt_obj.get(&PropertyKey::string(SLOT_ISO_MINUTE)).and_then(|v| v.as_int32()).unwrap_or(0);
+                let sec = pt_obj.get(&PropertyKey::string(SLOT_ISO_SECOND)).and_then(|v| v.as_int32()).unwrap_or(0);
+                let ms = pt_obj.get(&PropertyKey::string(SLOT_ISO_MILLISECOND)).and_then(|v| v.as_int32()).unwrap_or(0);
+                let us = pt_obj.get(&PropertyKey::string(SLOT_ISO_MICROSECOND)).and_then(|v| v.as_int32()).unwrap_or(0);
+                let ns = pt_obj.get(&PropertyKey::string(SLOT_ISO_NANOSECOND)).and_then(|v| v.as_int32()).unwrap_or(0);
+                (h, mi, sec, ms, us, ns)
+            };
+
+            let global = ncx.global();
+            let pdt_ctor = global.get(&PropertyKey::string("Temporal"))
+                .and_then(|v| v.as_object())
+                .and_then(|t| t.get(&PropertyKey::string("PlainDateTime")))
+                .ok_or_else(|| VmError::type_error("Temporal.PlainDateTime not found"))?;
+            ncx.call_function_construct(&pdt_ctor, Value::undefined(), &[
+                Value::int32(y), Value::int32(mo), Value::int32(d),
+                Value::int32(h), Value::int32(mi), Value::int32(sec),
+                Value::int32(ms), Value::int32(us), Value::int32(ns),
+            ])
+        },
+        mm.clone(), fn_proto.clone(), "withPlainTime", 0,
+    );
+    proto.define_property(PropertyKey::string("withPlainTime"), PropertyDescriptor::builtin_method(with_plain_time_fn));
+
     // .withCalendar(calendar) method
     let withcal_fn = Value::native_function_with_proto_named(
         |this, args, ncx| {
@@ -1319,6 +1595,99 @@ pub(super) fn install_plain_date_time_prototype(
         mm.clone(), fn_proto.clone(), "withCalendar", 1,
     );
     proto.define_property(PropertyKey::string("withCalendar"), PropertyDescriptor::builtin_method(withcal_fn));
+
+    // round(roundTo)
+    let round_fn = Value::native_function_with_proto_named(
+        |this, args, ncx| {
+            let obj = this.as_object().ok_or_else(|| VmError::type_error("round called on non-object"))?;
+            let ty = obj.get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
+                .and_then(|v| v.as_string().map(|s| s.as_str().to_string()));
+            if ty.as_deref() != Some("PlainDateTime") {
+                return Err(VmError::type_error("round called on non-PlainDateTime"));
+            }
+
+            let round_to = args.first().cloned().unwrap_or(Value::undefined());
+            if round_to.is_undefined() {
+                return Err(VmError::type_error("options parameter is required"));
+            }
+
+            // String shorthand: round("minute") etc.
+            let (smallest_unit, rounding_mode, increment) = if round_to.is_string() {
+                let s = ncx.to_string_value(&round_to)?;
+                let u = parse_temporal_unit(&s)?;
+                match u {
+                    temporal_rs::options::Unit::Year | temporal_rs::options::Unit::Month |
+                    temporal_rs::options::Unit::Week | temporal_rs::options::Unit::Auto =>
+                        return Err(VmError::range_error(format!("{} is not a valid value for smallest unit", s))),
+                    _ => {}
+                }
+                (Some(u), None, None)
+            } else if !round_to.is_object() && round_to.as_proxy().is_none() {
+                return Err(VmError::type_error("options must be a string or object"));
+            } else {
+                // Read options in alphabetical order
+                let ri_val = get_val_property(ncx, &round_to, "roundingIncrement")?;
+                let ri = if !ri_val.is_undefined() {
+                    let n = ncx.to_number_value(&ri_val)?;
+                    Some(temporal_rs::options::RoundingIncrement::try_from(n).map_err(temporal_err)?)
+                } else { None };
+
+                let rm_val = get_val_property(ncx, &round_to, "roundingMode")?;
+                let rm = if !rm_val.is_undefined() {
+                    let s = ncx.to_string_value(&rm_val)?;
+                    Some(parse_rounding_mode(&s)?)
+                } else { None };
+
+                let su_val = get_val_property(ncx, &round_to, "smallestUnit")?;
+                let su = if !su_val.is_undefined() {
+                    let s = ncx.to_string_value(&su_val)?;
+                    let u = parse_temporal_unit(&s)?;
+                    match u {
+                        temporal_rs::options::Unit::Year | temporal_rs::options::Unit::Month |
+                        temporal_rs::options::Unit::Week | temporal_rs::options::Unit::Auto =>
+                            return Err(VmError::range_error(format!("{} is not a valid value for smallest unit", s))),
+                        _ => {}
+                    }
+                    Some(u)
+                } else { None };
+
+                if su.is_none() {
+                    return Err(VmError::range_error("smallestUnit is required"));
+                }
+
+                (su, rm, ri)
+            };
+
+            let pdt = extract_pdt(&obj)?;
+            let mut opts = temporal_rs::options::RoundingOptions::default();
+            opts.largest_unit = None;
+            opts.smallest_unit = smallest_unit;
+            opts.rounding_mode = rounding_mode;
+            opts.increment = increment;
+            let rounded = pdt.round(opts).map_err(temporal_err)?;
+
+            // Construct result via constructor
+            let global = ncx.global();
+            let pdt_ctor = global.get(&PropertyKey::string("Temporal"))
+                .and_then(|v| v.as_object())
+                .and_then(|t| t.get(&PropertyKey::string("PlainDateTime")))
+                .ok_or_else(|| VmError::type_error("Temporal.PlainDateTime not found"))?;
+
+            ncx.call_function_construct(&pdt_ctor, Value::undefined(), &[
+                Value::int32(rounded.iso_year()),
+                Value::int32(rounded.iso_month() as i32),
+                Value::int32(rounded.iso_day() as i32),
+                Value::int32(rounded.hour() as i32),
+                Value::int32(rounded.minute() as i32),
+                Value::int32(rounded.second() as i32),
+                Value::int32(rounded.millisecond() as i32),
+                Value::int32(rounded.microsecond() as i32),
+                Value::int32(rounded.nanosecond() as i32),
+            ])
+        },
+        mm.clone(), fn_proto.clone(), "round", 1,
+    );
+    proto.define_property(PropertyKey::string("round"), PropertyDescriptor::builtin_method(round_fn));
 
     // @@toStringTag
     proto.define_property(

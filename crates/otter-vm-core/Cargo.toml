@@ -20,7 +20,7 @@ thiserror.workspace = true
 parking_lot = "0.12"
 dashmap = "6"
 rustc-hash = "2"
-regress = { version = "0.10.5", features = ["utf16"] }
+regress = { git = "https://github.com/ridiculousfish/regress.git", features = ["utf16"] }
 regex = "1"
 num-bigint = "0.4"
 num-traits = "0.2"
@@ -33,7 +33,7 @@ fixed_decimal = { version = "0.7.1", features = ["ryu"] }
 icu_decimal = "2.1.1"
 icu_locale = "2.1.1"
 writeable = "0.6.2"
-temporal_rs = "0.2.0"
+temporal_rs = { version = "0.2.0", features = ["compiled_data"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

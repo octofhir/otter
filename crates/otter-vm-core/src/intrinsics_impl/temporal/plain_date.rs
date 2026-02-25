@@ -638,6 +638,119 @@ pub(super) fn install_plain_date_prototype(
         PropertyDescriptor::builtin_method(to_locale_string_fn),
     );
 
+    // toZonedDateTime(item)
+    let to_zoned_fn = Value::native_function_with_proto_named(
+        |this, args, ncx| {
+            let obj = this
+                .as_object()
+                .ok_or_else(|| VmError::type_error("not a PlainDate"))?;
+            let y = obj
+                .get(&PropertyKey::string(SLOT_ISO_YEAR))
+                .and_then(|v| v.as_int32())
+                .ok_or_else(|| VmError::type_error("not a PlainDate"))?;
+            let m = obj
+                .get(&PropertyKey::string(SLOT_ISO_MONTH))
+                .and_then(|v| v.as_int32())
+                .unwrap_or(1);
+            let d = obj
+                .get(&PropertyKey::string(SLOT_ISO_DAY))
+                .and_then(|v| v.as_int32())
+                .unwrap_or(1);
+
+            let item = args.first().cloned().unwrap_or(Value::undefined());
+
+            // If item is a string, treat as timezone ID
+            // If item is an object, read timeZone and plainTime properties
+            let (tz_str, time_str) = if item.is_string() {
+                (item.as_string().unwrap().as_str().to_string(), None)
+            } else if let Some(item_obj) = item.as_object() {
+                let tz_val = item_obj
+                    .get(&PropertyKey::string("timeZone"))
+                    .unwrap_or(Value::undefined());
+                let tz_s = if tz_val.is_string() {
+                    tz_val.as_string().unwrap().as_str().to_string()
+                } else {
+                    return Err(VmError::type_error("timeZone is required"));
+                };
+                let pt_val = item_obj
+                    .get(&PropertyKey::string("plainTime"))
+                    .unwrap_or(Value::undefined());
+                (tz_s, if pt_val.is_undefined() { None } else { Some(pt_val) })
+            } else {
+                return Err(VmError::type_error(
+                    "toZonedDateTime argument must be a string or object",
+                ));
+            };
+
+            // Build ISO string: YYYY-MM-DDThh:mm:ss[tz]
+            let time_part = if let Some(pt) = &time_str {
+                if let Some(pt_obj) = pt.as_object() {
+                    let h = pt_obj
+                        .get(&PropertyKey::string(SLOT_ISO_HOUR))
+                        .and_then(|v| v.as_int32())
+                        .unwrap_or(0);
+                    let mi = pt_obj
+                        .get(&PropertyKey::string(SLOT_ISO_MINUTE))
+                        .and_then(|v| v.as_int32())
+                        .unwrap_or(0);
+                    let s = pt_obj
+                        .get(&PropertyKey::string(SLOT_ISO_SECOND))
+                        .and_then(|v| v.as_int32())
+                        .unwrap_or(0);
+                    format!("T{:02}:{:02}:{:02}", h, mi, s)
+                } else if pt.is_string() {
+                    let s = pt.as_string().unwrap().as_str().to_string();
+                    format!("T{}", s)
+                } else {
+                    "T00:00:00".to_string()
+                }
+            } else {
+                "T00:00:00".to_string()
+            };
+
+            let iso_str = format!(
+                "{}-{:02}-{:02}{}[{}]",
+                format_iso_year(y),
+                m,
+                d,
+                time_part,
+                tz_str
+            );
+
+            // Use ZonedDateTime constructor via Temporal namespace
+            let temporal_ns = ncx
+                .ctx
+                .get_global("Temporal")
+                .ok_or_else(|| VmError::type_error("Temporal not found"))?;
+            let temporal_obj = temporal_ns
+                .as_object()
+                .ok_or_else(|| VmError::type_error("Temporal not found"))?;
+            let zdt_from = temporal_obj
+                .get(&PropertyKey::string("ZonedDateTime"))
+                .ok_or_else(|| VmError::type_error("ZonedDateTime not found"))?;
+            let zdt_ctor_obj = zdt_from
+                .as_object()
+                .ok_or_else(|| VmError::type_error("ZonedDateTime not found"))?;
+            let from_fn = zdt_ctor_obj
+                .get(&PropertyKey::string("from"))
+                .ok_or_else(|| VmError::type_error("ZonedDateTime.from not found"))?;
+
+            ncx.call_function(
+                &from_fn,
+                zdt_from,
+                &[Value::string(JsString::intern(&iso_str))],
+            )
+        },
+        mm.clone(),
+        fn_proto.clone(),
+        "toZonedDateTime",
+        1,
+    );
+    proto.define_property(
+        PropertyKey::string("toZonedDateTime"),
+        PropertyDescriptor::builtin_method(to_zoned_fn),
+    );
+
     // @@toStringTag
     proto.define_property(
         PropertyKey::Symbol(crate::intrinsics::well_known::to_string_tag_symbol()),

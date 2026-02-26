@@ -22,12 +22,25 @@ use otter_vm_core::value::Value;
 use otter_vm_runtime::extension_v2::{OtterExtension, Profile};
 use otter_vm_runtime::registration::RegistrationContext;
 use std::collections::BTreeSet;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::events_ext::EventEmitter;
 
 static START_INSTANT: OnceLock<Instant> = OnceLock::new();
+static PROCESS_ARGV_OVERRIDE: LazyLock<Mutex<Option<Vec<String>>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Override process argv values used by `node:process` extension.
+///
+/// `Some(vec![...])` replaces host CLI args for `process.argv`/`process.argv0`.
+/// `None` restores default host process args behavior.
+pub fn set_process_argv_override(args: Option<Vec<String>>) {
+    let mut guard = PROCESS_ARGV_OVERRIDE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = args;
+}
 
 // ---------------------------------------------------------------------------
 // OtterExtension implementation
@@ -100,18 +113,20 @@ impl OtterExtension for NodeProcessExtension {
         );
 
         // process.argv0
-        let argv0 = std::env::args().next().unwrap_or_default();
+        let argv_values = effective_process_argv();
+        let argv0 = argv_values.first().cloned().unwrap_or_default();
         let _ = process_obj.set(
             PropertyKey::string("argv0"),
             Value::string(JsString::new_gc(&argv0)),
         );
 
         // process.argv
-        let argv_arr = build_argv_array(&mm);
+        let argv_arr = build_argv_array(&mm, ctx.intrinsics().array_prototype, &argv_values);
         let _ = process_obj.set(PropertyKey::string("argv"), Value::object(argv_arr));
 
         // process.execArgv (empty array for now)
         let exec_argv = GcRef::new(JsObject::array(0, mm.clone()));
+        exec_argv.set_prototype(Value::object(ctx.intrinsics().array_prototype));
         let _ = process_obj.set(PropertyKey::string("execArgv"), Value::object(exec_argv));
 
         // process.env (proxy-backed bridge to runtime env store + capabilities)
@@ -215,10 +230,21 @@ fn arch_value() -> Value {
     Value::string(JsString::intern(a))
 }
 
-fn build_argv_array(mm: &std::sync::Arc<otter_vm_core::memory::MemoryManager>) -> GcRef<JsObject> {
-    let args: Vec<String> = std::env::args().collect();
+fn effective_process_argv() -> Vec<String> {
+    let guard = PROCESS_ARGV_OVERRIDE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.clone().unwrap_or_else(|| std::env::args().collect())
+}
+
+fn build_argv_array(
+    mm: &std::sync::Arc<otter_vm_core::memory::MemoryManager>,
+    array_prototype: GcRef<JsObject>,
+    args: &[String],
+) -> GcRef<JsObject> {
     let arr = GcRef::new(JsObject::array(0, mm.clone()));
-    for arg in &args {
+    arr.set_prototype(Value::object(array_prototype));
+    for arg in args {
         arr.array_push(Value::string(JsString::new_gc(arg)));
     }
     arr
@@ -785,5 +811,19 @@ mod tests {
         let _rt = otter_vm_core::runtime::VmRuntime::new();
         let v = arch_value();
         assert!(v.as_string().is_some());
+    }
+
+    #[test]
+    fn test_process_argv_override_is_applied() {
+        let expected = vec![
+            "otter".to_string(),
+            "/tmp/script.ts".to_string(),
+            "alpha".to_string(),
+            "--beta".to_string(),
+        ];
+        set_process_argv_override(Some(expected.clone()));
+        let actual = effective_process_argv();
+        assert_eq!(actual, expected);
+        set_process_argv_override(None);
     }
 }

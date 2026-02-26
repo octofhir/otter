@@ -173,10 +173,7 @@ fn make_iterator_helper(
     mm: Arc<MemoryManager>,
     iter_helper_proto: GcRef<JsObject>,
 ) -> Value {
-    let helper = GcRef::new(JsObject::new(
-        Value::object(iter_helper_proto),
-        mm,
-    ));
+    let helper = GcRef::new(JsObject::new(Value::object(iter_helper_proto), mm));
     let _ = helper.set(pk(UNDERLYING_ITER), underlying.clone());
     let _ = helper.set(pk(UNDERLYING_NEXT), next_method);
     let _ = helper.set(pk(HELPER_KIND), Value::string(JsString::intern(kind)));
@@ -243,7 +240,11 @@ fn helper_next_map(
     }
 
     let _ = obj.set(pk(COUNTER), Value::number(counter + 1.0));
-    let mapped = ncx.call_function(&callback, Value::undefined(), &[value, Value::number(counter)])?;
+    let mapped = ncx.call_function(
+        &callback,
+        Value::undefined(),
+        &[value, Value::number(counter)],
+    )?;
     Ok(create_iter_result(mapped, false, ncx))
 }
 
@@ -271,8 +272,11 @@ fn helper_next_filter(
         let idx = counter;
         counter += 1.0;
         let _ = obj.set(pk(COUNTER), Value::number(counter));
-        let selected =
-            ncx.call_function(&callback, Value::undefined(), &[value.clone(), Value::number(idx)])?;
+        let selected = ncx.call_function(
+            &callback,
+            Value::undefined(),
+            &[value.clone(), Value::number(idx)],
+        )?;
         if selected.to_boolean() {
             return Ok(create_iter_result(value, false, ncx));
         }
@@ -381,8 +385,11 @@ fn helper_next_flat_map(
         let _ = obj.set(pk(COUNTER), Value::number(counter + 1.0));
 
         // Call mapper — result should be iterable
-        let mapped =
-            ncx.call_function(&callback, Value::undefined(), &[value, Value::number(counter)])?;
+        let mapped = ncx.call_function(
+            &callback,
+            Value::undefined(),
+            &[value, Value::number(counter)],
+        )?;
 
         // Get iterator from mapped value
         let inner_iter_val = get_iterator(&mapped, ncx)?;
@@ -467,9 +474,7 @@ fn get_iterator_direct(
     let obj = this
         .as_object()
         .or_else(|| this.native_function_object())
-        .ok_or_else(|| {
-            VmError::type_error("Iterator.prototype method called on non-object")
-        })?;
+        .ok_or_else(|| VmError::type_error("Iterator.prototype method called on non-object"))?;
     let next = ncx.get_property(&obj, &pk("next"))?;
     Ok((this.clone(), next))
 }
@@ -503,10 +508,7 @@ fn iterator_for_each(
     args: &[Value],
     ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    let callback = args
-        .first()
-        .cloned()
-        .unwrap_or_else(Value::undefined);
+    let callback = args.first().cloned().unwrap_or_else(Value::undefined);
     if !callback.is_function() && !callback.is_native_function() {
         return Err(VmError::type_error(
             "Iterator.prototype.forEach callback is not a function",
@@ -519,7 +521,11 @@ fn iterator_for_each(
         if done {
             break;
         }
-        ncx.call_function(&callback, Value::undefined(), &[value, Value::number(counter)])?;
+        ncx.call_function(
+            &callback,
+            Value::undefined(),
+            &[value, Value::number(counter)],
+        )?;
         counter += 1.0;
     }
     Ok(Value::undefined())
@@ -530,10 +536,7 @@ fn iterator_reduce(
     args: &[Value],
     ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    let callback = args
-        .first()
-        .cloned()
-        .unwrap_or_else(Value::undefined);
+    let callback = args.first().cloned().unwrap_or_else(Value::undefined);
     if !callback.is_function() && !callback.is_native_function() {
         return Err(VmError::type_error(
             "Iterator.prototype.reduce callback is not a function",
@@ -576,10 +579,7 @@ fn iterator_some(
     args: &[Value],
     ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    let callback = args
-        .first()
-        .cloned()
-        .unwrap_or_else(Value::undefined);
+    let callback = args.first().cloned().unwrap_or_else(Value::undefined);
     if !callback.is_function() && !callback.is_native_function() {
         return Err(VmError::type_error(
             "Iterator.prototype.some callback is not a function",
@@ -592,8 +592,11 @@ fn iterator_some(
         if done {
             return Ok(Value::boolean(false));
         }
-        let result =
-            ncx.call_function(&callback, Value::undefined(), &[value, Value::number(counter)])?;
+        let result = ncx.call_function(
+            &callback,
+            Value::undefined(),
+            &[value, Value::number(counter)],
+        )?;
         counter += 1.0;
         if result.to_boolean() {
             let _ = iter_close(&iter, ncx);
@@ -607,10 +610,7 @@ fn iterator_every(
     args: &[Value],
     ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    let callback = args
-        .first()
-        .cloned()
-        .unwrap_or_else(Value::undefined);
+    let callback = args.first().cloned().unwrap_or_else(Value::undefined);
     if !callback.is_function() && !callback.is_native_function() {
         return Err(VmError::type_error(
             "Iterator.prototype.every callback is not a function",
@@ -623,8 +623,11 @@ fn iterator_every(
         if done {
             return Ok(Value::boolean(true));
         }
-        let result =
-            ncx.call_function(&callback, Value::undefined(), &[value, Value::number(counter)])?;
+        let result = ncx.call_function(
+            &callback,
+            Value::undefined(),
+            &[value, Value::number(counter)],
+        )?;
         counter += 1.0;
         if !result.to_boolean() {
             let _ = iter_close(&iter, ncx);
@@ -638,10 +641,7 @@ fn iterator_find(
     args: &[Value],
     ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    let callback = args
-        .first()
-        .cloned()
-        .unwrap_or_else(Value::undefined);
+    let callback = args.first().cloned().unwrap_or_else(Value::undefined);
     if !callback.is_function() && !callback.is_native_function() {
         return Err(VmError::type_error(
             "Iterator.prototype.find callback is not a function",
@@ -677,10 +677,7 @@ fn iterator_map(
     ncx: &mut NativeContext<'_>,
     iter_helper_proto: GcRef<JsObject>,
 ) -> Result<Value, VmError> {
-    let callback = args
-        .first()
-        .cloned()
-        .unwrap_or_else(Value::undefined);
+    let callback = args.first().cloned().unwrap_or_else(Value::undefined);
     if !callback.is_function() && !callback.is_native_function() {
         return Err(VmError::type_error(
             "Iterator.prototype.map callback is not a function",
@@ -704,10 +701,7 @@ fn iterator_filter(
     ncx: &mut NativeContext<'_>,
     iter_helper_proto: GcRef<JsObject>,
 ) -> Result<Value, VmError> {
-    let callback = args
-        .first()
-        .cloned()
-        .unwrap_or_else(Value::undefined);
+    let callback = args.first().cloned().unwrap_or_else(Value::undefined);
     if !callback.is_function() && !callback.is_native_function() {
         return Err(VmError::type_error(
             "Iterator.prototype.filter callback is not a function",
@@ -731,10 +725,7 @@ fn iterator_take(
     ncx: &mut NativeContext<'_>,
     iter_helper_proto: GcRef<JsObject>,
 ) -> Result<Value, VmError> {
-    let limit = args
-        .first()
-        .and_then(|v| v.as_number())
-        .unwrap_or(f64::NAN);
+    let limit = args.first().and_then(|v| v.as_number()).unwrap_or(f64::NAN);
     if limit.is_nan() || limit < 0.0 {
         return Err(VmError::range_error(
             "Iterator.prototype.take requires a non-negative number",
@@ -759,10 +750,7 @@ fn iterator_drop(
     ncx: &mut NativeContext<'_>,
     iter_helper_proto: GcRef<JsObject>,
 ) -> Result<Value, VmError> {
-    let limit = args
-        .first()
-        .and_then(|v| v.as_number())
-        .unwrap_or(f64::NAN);
+    let limit = args.first().and_then(|v| v.as_number()).unwrap_or(f64::NAN);
     if limit.is_nan() || limit < 0.0 {
         return Err(VmError::range_error(
             "Iterator.prototype.drop requires a non-negative number",
@@ -787,10 +775,7 @@ fn iterator_flat_map(
     ncx: &mut NativeContext<'_>,
     iter_helper_proto: GcRef<JsObject>,
 ) -> Result<Value, VmError> {
-    let callback = args
-        .first()
-        .cloned()
-        .unwrap_or_else(Value::undefined);
+    let callback = args.first().cloned().unwrap_or_else(Value::undefined);
     if !callback.is_function() && !callback.is_native_function() {
         return Err(VmError::type_error(
             "Iterator.prototype.flatMap callback is not a function",
@@ -838,11 +823,7 @@ fn iterator_from(
                 let iter_result = ncx.call_function(&method, value.clone(), &[])?;
                 // Check if the result already has Iterator.prototype in its chain
                 // For simplicity, if it has a `next` method, wrap it
-                return Ok(wrap_for_valid_iterator(
-                    &iter_result,
-                    ncx,
-                    wrap_proto,
-                )?);
+                return Ok(wrap_for_valid_iterator(&iter_result, ncx, wrap_proto)?);
             }
         }
     }
@@ -896,9 +877,7 @@ fn wrap_next(
     let result = ncx.call_function(&next, iter, &[])?;
     // Ensure the result is an object
     if result.as_object().is_none() && result.native_function_object().is_none() {
-        return Err(VmError::type_error(
-            "Iterator result must be an object",
-        ));
+        return Err(VmError::type_error("Iterator result must be an object"));
     }
     Ok(result)
 }
@@ -1161,11 +1140,7 @@ pub fn install_iterator_constructor(
     mm: &Arc<MemoryManager>,
 ) {
     // Create Iterator constructor function
-    let ctor = Value::native_function_with_proto(
-        iterator_constructor,
-        mm.clone(),
-        fn_proto,
-    );
+    let ctor = Value::native_function_with_proto(iterator_constructor, mm.clone(), fn_proto);
     if let Some(ctor_obj) = ctor.native_function_object() {
         ctor_obj.define_property(
             PropertyKey::string("length"),

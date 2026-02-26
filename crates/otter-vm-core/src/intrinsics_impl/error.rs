@@ -375,9 +375,7 @@ fn iterable_to_list(
             ));
         }
         None => {
-            return Err(VmError::type_error(
-                "object is not iterable",
-            ));
+            return Err(VmError::type_error("object is not iterable"));
         }
     };
 
@@ -402,9 +400,9 @@ fn iterable_to_list(
         loop {
             // IteratorStep: call next()
             let step = ncx.call_function(&next_fn, Value::object(iter_obj.clone()), &[])?;
-            let step_obj = step.as_object().ok_or_else(|| {
-                VmError::type_error("Iterator result is not an object")
-            })?;
+            let step_obj = step
+                .as_object()
+                .ok_or_else(|| VmError::type_error("Iterator result is not an object"))?;
             // IteratorComplete: Get(result, "done")
             let done = get_value_full(&step_obj, &PropertyKey::string("done"), ncx)?;
             if done.to_boolean() {

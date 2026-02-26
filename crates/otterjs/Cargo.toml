@@ -20,8 +20,9 @@ path = "src/main.rs"
 
 [dependencies]
 # Main engine (single entry point for all VM functionality)
-otter-engine = { path = "../otter-engine", version = "0.1.3" }
+otter-engine = { path = "../otter-engine", version = "0.1.3", features = ["profiling"] }
 otter-vm-core = { path = "../otter-vm-core", version = "0.1.0" }
+otter-profiler = { path = "../otter-profiler", version = "0.1.0" }
 
 # Supporting crates (for features not in engine)
 otter-kv = { path = "../otter-kv", version = "0.1.0" }

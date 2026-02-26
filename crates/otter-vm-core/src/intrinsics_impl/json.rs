@@ -17,8 +17,20 @@ use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKe
 use crate::string::JsString;
 use crate::value::Value;
 use otter_macros::dive;
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// Native JSON hot-loop interrupt check cadence (power-of-two for bitmask checks).
+const JSON_INTERRUPT_CHECK_INTERVAL: usize = 1024;
+
+#[inline]
+fn maybe_check_interrupt(ncx: &mut NativeContext<'_>, index: usize) -> Result<(), VmError> {
+    if (index & (JSON_INTERRUPT_CHECK_INTERVAL - 1)) == 0 {
+        ncx.check_for_interrupt()?;
+    }
+    Ok(())
+}
 
 /// Tracks visited objects during JSON serialization to detect circular references.
 /// Also maintains a path for generating helpful error messages.
@@ -105,33 +117,64 @@ fn json_to_value(
     mm: &Arc<MemoryManager>,
     object_proto: &Value,
     array_proto: &Value,
-) -> Value {
+    key_cache: &mut FxHashMap<String, PropertyKey>,
+    node_count: &mut usize,
+    ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    *node_count += 1;
+    maybe_check_interrupt(ncx, *node_count)?;
+
     match json {
-        serde_json::Value::Null => Value::null(),
-        serde_json::Value::Bool(b) => Value::boolean(*b),
-        serde_json::Value::Number(n) => Value::number(n.as_f64().unwrap_or(f64::NAN)),
-        serde_json::Value::String(s) => Value::string(JsString::intern(s)),
+        serde_json::Value::Null => Ok(Value::null()),
+        serde_json::Value::Bool(b) => Ok(Value::boolean(*b)),
+        serde_json::Value::Number(n) => Ok(Value::number(n.as_f64().unwrap_or(f64::NAN))),
+        serde_json::Value::String(s) => Ok(Value::string(JsString::intern(s))),
         serde_json::Value::Array(items) => {
             let arr = GcRef::new(JsObject::array(items.len(), mm.clone()));
             // Set Array.prototype
             arr.set_prototype(array_proto.clone());
             for (i, item) in items.iter().enumerate() {
+                maybe_check_interrupt(ncx, i)?;
                 let _ = arr.set(
                     PropertyKey::Index(i as u32),
-                    json_to_value(item, mm, object_proto, array_proto),
+                    json_to_value(
+                        item,
+                        mm,
+                        object_proto,
+                        array_proto,
+                        key_cache,
+                        node_count,
+                        ncx,
+                    )?,
                 );
             }
-            Value::array(arr)
+            Ok(Value::array(arr))
         }
         serde_json::Value::Object(map) => {
             let obj = GcRef::new(JsObject::new(object_proto.clone(), mm.clone()));
-            for (k, v) in map {
+            for (i, (k, v)) in map.iter().enumerate() {
+                maybe_check_interrupt(ncx, i)?;
+                let key = if let Some(cached) = key_cache.get(k.as_str()) {
+                    *cached
+                } else {
+                    let new_key = PropertyKey::string(k);
+                    key_cache.insert(k.clone(), new_key);
+                    new_key
+                };
                 let _ = obj.set(
-                    PropertyKey::string(k),
-                    json_to_value(v, mm, object_proto, array_proto),
+                    key,
+                    json_to_value(
+                        v,
+                        mm,
+                        object_proto,
+                        array_proto,
+                        key_cache,
+                        node_count,
+                        ncx,
+                    )?,
                 );
             }
-            Value::object(obj)
+            Ok(Value::object(obj))
         }
     }
 }
@@ -559,6 +602,7 @@ fn serialize_array_simple(
     let mut items = Vec::with_capacity(len);
 
     for i in 0..len {
+        maybe_check_interrupt(ncx, i)?;
         let elem = obj
             .get(&PropertyKey::Index(i as u32))
             .unwrap_or(Value::undefined());
@@ -637,7 +681,8 @@ fn serialize_object_simple(
 
     let mut items = Vec::new();
 
-    for key in keys {
+    for (i, key) in keys.into_iter().enumerate() {
+        maybe_check_interrupt(ncx, i)?;
         if let Some(val) = obj.get(&PropertyKey::string(&key)) {
             let val = unwrap_primitive(&val);
             if let Some(json_val) =
@@ -812,6 +857,7 @@ fn stringify_array_with_replacer(
     let mut items = Vec::with_capacity(len);
 
     for i in 0..len {
+        maybe_check_interrupt(ncx, i)?;
         let key = i.to_string();
         match stringify_with_replacer(
             value,
@@ -906,7 +952,8 @@ fn stringify_object_with_replacer(
 
     let mut items = Vec::new();
 
-    for key in keys {
+    for (i, key) in keys.into_iter().enumerate() {
+        maybe_check_interrupt(ncx, i)?;
         if let Some(json_val) = stringify_with_replacer(
             value,
             &key,
@@ -985,7 +1032,17 @@ fn json_parse(
         .unwrap_or_else(Value::null);
 
     let mm = ncx.memory_manager().clone();
-    let result = json_to_value(&parsed, &mm, &object_proto, &array_proto);
+    let mut key_cache = FxHashMap::default();
+    let mut node_count = 0usize;
+    let result = json_to_value(
+        &parsed,
+        &mm,
+        &object_proto,
+        &array_proto,
+        &mut key_cache,
+        &mut node_count,
+        ncx,
+    )?;
 
     // Apply reviver if provided
     if let Some(reviver) = args.get(1) {
@@ -1238,6 +1295,7 @@ fn parse_replacer(
         let mut seen = HashSet::new();
 
         for i in 0..len {
+            maybe_check_interrupt(ncx, i)?;
             let item = get_replacer_element(r, i as u32, ncx)?;
 
             let key = if let Some(s) = item.as_string() {
@@ -1394,6 +1452,7 @@ fn walk_reviver(
         let len = get_length_for_reviver(&value, ncx)?;
 
         for i in 0..len {
+            maybe_check_interrupt(ncx, i)?;
             let elem_key = i.to_string();
             let new_elem = walk_reviver(&value, &elem_key, reviver, ncx)?;
             let prop_key = PropertyKey::Index(i as u32);
@@ -1409,7 +1468,8 @@ fn walk_reviver(
     } else if is_object_for_reviver(&value) {
         // Get enumerable own property keys
         let keys = get_enumerable_keys(&value, ncx)?;
-        for key_str in keys {
+        for (i, key_str) in keys.into_iter().enumerate() {
+            maybe_check_interrupt(ncx, i)?;
             let new_val = walk_reviver(&value, &key_str, reviver, ncx)?;
             let prop_key = PropertyKey::string(&key_str);
             let key_val = Value::string(JsString::intern(&key_str));

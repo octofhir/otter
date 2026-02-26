@@ -45,6 +45,7 @@ pub mod worker_threads_ext;
 
 pub use module_registry::NodeModuleEntry;
 use otter_vm_runtime::extension_v2::OtterExtension;
+pub use process_ext::set_process_argv_override;
 pub use provider::{
     NodeModuleProvider, create_nodejs_provider, create_nodejs_provider_for_profile,
     create_nodejs_safe_provider,

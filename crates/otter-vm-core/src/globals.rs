@@ -118,7 +118,14 @@ pub fn setup_global_object(
     // Global functions — all get fn_proto as [[Prototype]] with proper length/name
     // Per spec §19.2, these are { writable: true, enumerable: false, configurable: true }
     define_global_fn(&global, &mm, fn_proto, global_eval, "eval", 1);
-    define_global_fn(&global, &mm, fn_proto, global_eval_script, "__evalScript", 1);
+    define_global_fn(
+        &global,
+        &mm,
+        fn_proto,
+        global_eval_script,
+        "__evalScript",
+        1,
+    );
     define_global_fn(&global, &mm, fn_proto, global_is_finite, "isFinite", 1);
     define_global_fn(&global, &mm, fn_proto, global_is_nan, "isNaN", 1);
     define_global_fn(&global, &mm, fn_proto, global_parse_int, "parseInt", 2);
@@ -1609,8 +1616,8 @@ fn decode_uri_impl(encoded: &str, preserve_reserved: bool) -> Result<Value, VmEr
                 // Decode UTF-8 to a code point
                 let cp = match n {
                     2 => {
-                        let cp = ((utf8_bytes[0] as u32 & 0x1F) << 6)
-                            | (utf8_bytes[1] as u32 & 0x3F);
+                        let cp =
+                            ((utf8_bytes[0] as u32 & 0x1F) << 6) | (utf8_bytes[1] as u32 & 0x3F);
                         // Overlong check: must be >= 0x80
                         if cp < 0x80 {
                             return Err(VmError::uri_error("URI malformed"));
@@ -1650,7 +1657,10 @@ fn decode_uri_impl(encoded: &str, preserve_reserved: bool) -> Result<Value, VmEr
                 };
 
                 // For decodeURI, check if the decoded character is reserved
-                if preserve_reserved && cp < 128 && (URI_RESERVED.contains(cp as u8 as char) || cp as u8 as char == '#') {
+                if preserve_reserved
+                    && cp < 128
+                    && (URI_RESERVED.contains(cp as u8 as char) || cp as u8 as char == '#')
+                {
                     // Keep encoded form of all bytes
                     for byte in &utf8_bytes {
                         result.push(b'%');
@@ -1669,8 +1679,7 @@ fn decode_uri_impl(encoded: &str, preserve_reserved: bool) -> Result<Value, VmEr
     }
 
     // Convert bytes to string
-    let decoded = String::from_utf8(result)
-        .map_err(|_| VmError::uri_error("URI malformed"))?;
+    let decoded = String::from_utf8(result).map_err(|_| VmError::uri_error("URI malformed"))?;
 
     Ok(Value::string(JsString::intern(&decoded)))
 }
@@ -2075,7 +2084,11 @@ mod tests {
     type GlobalFn =
         fn(&Value, &[Value], &mut crate::context::NativeContext<'_>) -> Result<Value, VmError>;
 
-    fn call_global(runtime: &crate::runtime::VmRuntime, fn_impl: GlobalFn, args: &[Value]) -> Result<Value, VmError> {
+    fn call_global(
+        runtime: &crate::runtime::VmRuntime,
+        fn_impl: GlobalFn,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
         let mut ctx = runtime.create_context();
         let interpreter = crate::interpreter::Interpreter::new();
         let mut ncx = crate::context::NativeContext::new(&mut ctx, &interpreter);
@@ -2165,27 +2178,40 @@ mod tests {
         let _rt = crate::runtime::VmRuntime::new();
         // Basic integers
         assert_eq!(
-            call_global(&_rt, global_parse_int, &[Value::string(JsString::intern("42"))])
-                .unwrap()
-                .as_number(),
+            call_global(
+                &_rt,
+                global_parse_int,
+                &[Value::string(JsString::intern("42"))]
+            )
+            .unwrap()
+            .as_number(),
             Some(42.0)
         );
         assert_eq!(
-            call_global(&_rt, global_parse_int, &[Value::string(JsString::intern("-123"))])
-                .unwrap()
-                .as_number(),
+            call_global(
+                &_rt,
+                global_parse_int,
+                &[Value::string(JsString::intern("-123"))]
+            )
+            .unwrap()
+            .as_number(),
             Some(-123.0)
         );
         assert_eq!(
-            call_global(&_rt, global_parse_int, &[Value::string(JsString::intern("+456"))])
-                .unwrap()
-                .as_number(),
+            call_global(
+                &_rt,
+                global_parse_int,
+                &[Value::string(JsString::intern("+456"))]
+            )
+            .unwrap()
+            .as_number(),
             Some(456.0)
         );
 
         // With radix
         assert_eq!(
-            call_global(&_rt,
+            call_global(
+                &_rt,
                 global_parse_int,
                 &[Value::string(JsString::intern("ff")), Value::number(16.0)],
             )
@@ -2194,7 +2220,8 @@ mod tests {
             Some(255.0)
         );
         assert_eq!(
-            call_global(&_rt,
+            call_global(
+                &_rt,
                 global_parse_int,
                 &[Value::string(JsString::intern("1010")), Value::number(2.0)],
             )
@@ -2205,15 +2232,20 @@ mod tests {
 
         // Hex prefix
         assert_eq!(
-            call_global(&_rt, global_parse_int, &[Value::string(JsString::intern("0xFF"))])
-                .unwrap()
-                .as_number(),
+            call_global(
+                &_rt,
+                global_parse_int,
+                &[Value::string(JsString::intern("0xFF"))]
+            )
+            .unwrap()
+            .as_number(),
             Some(255.0)
         );
 
         // Stops at invalid char
         assert_eq!(
-            call_global(&_rt,
+            call_global(
+                &_rt,
                 global_parse_int,
                 &[Value::string(JsString::intern("123abc"))]
             )
@@ -2223,7 +2255,8 @@ mod tests {
         );
 
         // Invalid - returns NaN
-        let result = call_global(&_rt,
+        let result = call_global(
+            &_rt,
             global_parse_int,
             &[Value::string(JsString::intern("hello"))],
         )
@@ -2236,7 +2269,8 @@ mod tests {
     fn test_parse_float() {
         let _rt = crate::runtime::VmRuntime::new();
         assert_eq!(
-            call_global(&_rt,
+            call_global(
+                &_rt,
                 global_parse_float,
                 &[Value::string(JsString::intern("3.5"))]
             )
@@ -2245,7 +2279,8 @@ mod tests {
             Some(3.5)
         );
         assert_eq!(
-            call_global(&_rt,
+            call_global(
+                &_rt,
                 global_parse_float,
                 &[Value::string(JsString::intern("-2.5"))]
             )
@@ -2254,7 +2289,8 @@ mod tests {
             Some(-2.5)
         );
         assert_eq!(
-            call_global(&_rt,
+            call_global(
+                &_rt,
                 global_parse_float,
                 &[Value::string(JsString::intern("  42  "))]
             )
@@ -2263,7 +2299,8 @@ mod tests {
             Some(42.0)
         );
         assert_eq!(
-            call_global(&_rt,
+            call_global(
+                &_rt,
                 global_parse_float,
                 &[Value::string(JsString::intern("Infinity"))]
             )
@@ -2276,14 +2313,16 @@ mod tests {
     #[test]
     fn test_encode_uri_component() {
         let _rt = crate::runtime::VmRuntime::new();
-        let result = call_global(&_rt,
+        let result = call_global(
+            &_rt,
             global_encode_uri_component,
             &[Value::string(JsString::intern("hello world"))],
         )
         .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "hello%20world");
 
-        let result = call_global(&_rt,
+        let result = call_global(
+            &_rt,
             global_encode_uri_component,
             &[Value::string(JsString::intern("a=1&b=2"))],
         )
@@ -2294,14 +2333,16 @@ mod tests {
     #[test]
     fn test_decode_uri_component() {
         let _rt = crate::runtime::VmRuntime::new();
-        let result = call_global(&_rt,
+        let result = call_global(
+            &_rt,
             global_decode_uri_component,
             &[Value::string(JsString::intern("hello%20world"))],
         )
         .unwrap();
         assert_eq!(result.as_string().unwrap().as_str(), "hello world");
 
-        let result = call_global(&_rt,
+        let result = call_global(
+            &_rt,
             global_decode_uri_component,
             &[Value::string(JsString::intern("a%3D1%26b%3D2"))],
         )
@@ -2313,7 +2354,8 @@ mod tests {
     fn test_encode_uri() {
         let _rt = crate::runtime::VmRuntime::new();
         // encodeURI does not encode reserved characters
-        let result = call_global(&_rt,
+        let result = call_global(
+            &_rt,
             global_encode_uri,
             &[Value::string(JsString::intern(
                 "http://example.com/path?q=1",
@@ -2326,7 +2368,8 @@ mod tests {
         );
 
         // But does encode other special chars
-        let result = call_global(&_rt,
+        let result = call_global(
+            &_rt,
             global_encode_uri,
             &[Value::string(JsString::intern("hello world"))],
         )
@@ -2337,7 +2380,8 @@ mod tests {
     #[test]
     fn test_decode_uri() {
         let _rt = crate::runtime::VmRuntime::new();
-        let result = call_global(&_rt,
+        let result = call_global(
+            &_rt,
             global_decode_uri,
             &[Value::string(JsString::intern("hello%20world"))],
         )
@@ -2366,7 +2410,11 @@ mod tests {
     fn test_eval_string() {
         let _rt = crate::runtime::VmRuntime::new();
         // eval with string is not supported
-        let result = call_global(&_rt, global_eval, &[Value::string(JsString::intern("1 + 1"))]);
+        let result = call_global(
+            &_rt,
+            global_eval,
+            &[Value::string(JsString::intern("1 + 1"))],
+        );
         assert!(result.is_err());
     }
 }

@@ -125,11 +125,7 @@ fn weakref_deref(
         .as_object()
         .ok_or_else(|| VmError::type_error("WeakRef.prototype.deref called on non-object"))?;
 
-    if obj
-        .get(&pk(WEAKREF_MARKER))
-        .and_then(|v| v.as_boolean())
-        != Some(true)
-    {
+    if obj.get(&pk(WEAKREF_MARKER)).and_then(|v| v.as_boolean()) != Some(true) {
         return Err(VmError::type_error(
             "WeakRef.prototype.deref called on non-WeakRef",
         ));
@@ -199,15 +195,11 @@ fn finreg_register(
     args: &[Value],
     _ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    let obj = this_val
-        .as_object()
-        .ok_or_else(|| VmError::type_error("FinalizationRegistry.prototype.register called on non-object"))?;
+    let obj = this_val.as_object().ok_or_else(|| {
+        VmError::type_error("FinalizationRegistry.prototype.register called on non-object")
+    })?;
 
-    if obj
-        .get(&pk(FINREG_MARKER))
-        .and_then(|v| v.as_boolean())
-        != Some(true)
-    {
+    if obj.get(&pk(FINREG_MARKER)).and_then(|v| v.as_boolean()) != Some(true) {
         return Err(VmError::type_error(
             "FinalizationRegistry.prototype.register called on non-FinalizationRegistry",
         ));
@@ -234,18 +226,12 @@ fn finreg_register(
     let idx = data.register(target_header);
 
     // Store held value at entry index
-    if let Some(held_arr) = obj
-        .get(&pk(FINREG_HELD_VALUES))
-        .and_then(|v| v.as_array())
-    {
+    if let Some(held_arr) = obj.get(&pk(FINREG_HELD_VALUES)).and_then(|v| v.as_array()) {
         let _ = held_arr.set(PropertyKey::Index(idx), held_value);
     }
 
     // Store unregister token at entry index
-    if let Some(token_arr) = obj
-        .get(&pk(FINREG_TOKENS))
-        .and_then(|v| v.as_array())
-    {
+    if let Some(token_arr) = obj.get(&pk(FINREG_TOKENS)).and_then(|v| v.as_array()) {
         let _ = token_arr.set(PropertyKey::Index(idx), unregister_token);
     }
 
@@ -257,15 +243,11 @@ fn finreg_unregister(
     args: &[Value],
     _ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    let obj = this_val
-        .as_object()
-        .ok_or_else(|| VmError::type_error("FinalizationRegistry.prototype.unregister called on non-object"))?;
+    let obj = this_val.as_object().ok_or_else(|| {
+        VmError::type_error("FinalizationRegistry.prototype.unregister called on non-object")
+    })?;
 
-    if obj
-        .get(&pk(FINREG_MARKER))
-        .and_then(|v| v.as_boolean())
-        != Some(true)
-    {
+    if obj.get(&pk(FINREG_MARKER)).and_then(|v| v.as_boolean()) != Some(true) {
         return Err(VmError::type_error(
             "FinalizationRegistry.prototype.unregister called on non-FinalizationRegistry",
         ));
@@ -280,9 +262,7 @@ fn finreg_unregister(
     }
 
     // Find all entry indices that match this token
-    let token_arr = obj
-        .get(&pk(FINREG_TOKENS))
-        .and_then(|v| v.as_array());
+    let token_arr = obj.get(&pk(FINREG_TOKENS)).and_then(|v| v.as_array());
 
     let data = obj
         .get(&pk(FINREG_DATA))
@@ -455,8 +435,7 @@ pub fn install_weakref_constructors(
     );
 
     // FinalizationRegistry constructor
-    let fr_ctor =
-        Value::native_function_with_proto(finreg_constructor, mm.clone(), fn_proto);
+    let fr_ctor = Value::native_function_with_proto(finreg_constructor, mm.clone(), fn_proto);
     if let Some(ctor_obj) = fr_ctor.native_function_object() {
         ctor_obj.define_property(
             PropertyKey::string("length"),

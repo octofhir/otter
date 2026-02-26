@@ -336,6 +336,38 @@ impl JsTypedArray {
         true
     }
 
+    /// Get an element as a JS Value (BigInt for BigInt arrays, Number for others).
+    /// Returns None if out of bounds or detached.
+    pub fn get_value(&self, index: usize) -> Option<Value> {
+        if self.kind.is_bigint() {
+            self.get_bigint(index).map(|v| Value::bigint(v.to_string()))
+        } else {
+            self.get(index).map(Value::number)
+        }
+    }
+
+    /// Set an element from a JS Value. For BigInt arrays, the value must be a BigInt.
+    /// Returns false if out of bounds or detached.
+    pub fn set_value(&self, index: usize, val: &Value) -> bool {
+        if self.buffer.is_detached() || index >= self.length {
+            return false;
+        }
+        if self.kind.is_bigint() {
+            if let Some(crate::value::HeapRef::BigInt(b)) = val.heap_ref() {
+                if let Ok(n) = b.value.parse::<i64>() {
+                    self.set_bigint(index, n);
+                }
+            } else {
+                let n = crate::globals::to_number(val) as i64;
+                self.set_bigint(index, n);
+            }
+        } else {
+            let n = crate::globals::to_number(val);
+            self.set(index, n);
+        }
+        true
+    }
+
     /// Create a subarray view (shares the same buffer)
     pub fn subarray(&self, begin: i64, end: Option<i64>) -> Result<JsTypedArray, &'static str> {
         if self.buffer.is_detached() {

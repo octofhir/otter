@@ -597,7 +597,11 @@ mod tests {
         }
 
         // After exit, the table still holds the string (it's owned by Isolate)
-        assert!(isolate.string_table().is_interned("isolate_specific_string"));
+        assert!(
+            isolate
+                .string_table()
+                .is_interned("isolate_specific_string")
+        );
     }
 
     #[test]

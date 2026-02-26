@@ -1312,10 +1312,7 @@ pub fn proxy_prevent_extensions(ncx: &mut NativeContext, proxy: GcRef<JsProxy>) 
     result
 }
 
-fn proxy_prevent_extensions_impl(
-    ncx: &mut NativeContext,
-    proxy: GcRef<JsProxy>,
-) -> VmResult<bool> {
+fn proxy_prevent_extensions_impl(ncx: &mut NativeContext, proxy: GcRef<JsProxy>) -> VmResult<bool> {
     // Get target
     let target = proxy_target_value(proxy)?;
 

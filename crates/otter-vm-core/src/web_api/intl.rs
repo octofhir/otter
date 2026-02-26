@@ -3,17 +3,16 @@
 //! This installs `Intl` globally with broad API surface so locale-aware
 //! builtins can run and Test262 can exercise shape/branding checks.
 
+use fixed_decimal::{
+    Decimal as FixedDecimal, FloatPrecision, RoundingIncrement, SignDisplay as FixedSignDisplay,
+    SignedRoundingMode, UnsignedRoundingMode,
+};
+use icu_decimal::DecimalFormatter;
+use icu_decimal::options::{DecimalFormatterOptions, GroupingStrategy};
+use icu_locale::Locale;
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
-use fixed_decimal::{
-    Decimal as FixedDecimal, FloatPrecision, RoundingIncrement,
-    SignDisplay as FixedSignDisplay, SignedRoundingMode,
-    UnsignedRoundingMode,
-};
-use icu_decimal::options::{DecimalFormatterOptions, GroupingStrategy};
-use icu_decimal::DecimalFormatter;
-use icu_locale::Locale;
 use unicode_normalization::char::canonical_combining_class;
 use writeable::{Part, PartsWrite};
 
@@ -136,84 +135,14 @@ const SANCTIONED_SIMPLE_UNITS: &[&str] = &[
     "year",
 ];
 const SUPPORTED_NUMBERING_SYSTEMS: &[&str] = &[
-    "adlm",
-    "ahom",
-    "arab",
-    "arabext",
-    "bali",
-    "beng",
-    "bhks",
-    "brah",
-    "cakm",
-    "cham",
-    "deva",
-    "diak",
-    "fullwide",
-    "gara",
-    "gong",
-    "gonm",
-    "gujr",
-    "gukh",
-    "guru",
-    "hanidec",
-    "hmng",
-    "hmnp",
-    "java",
-    "kali",
-    "kawi",
-    "khmr",
-    "knda",
-    "krai",
-    "lana",
-    "lanatham",
-    "laoo",
-    "latn",
-    "lepc",
-    "limb",
-    "mathbold",
-    "mathdbl",
-    "mathmono",
-    "mathsanb",
-    "mathsans",
-    "mlym",
-    "modi",
-    "mong",
-    "mroo",
-    "mtei",
-    "mymr",
-    "mymrepka",
-    "mymrpao",
-    "mymrshan",
-    "mymrtlng",
-    "nagm",
-    "newa",
-    "nkoo",
-    "olck",
-    "onao",
-    "orya",
-    "osma",
-    "outlined",
-    "rohg",
-    "saur",
-    "segment",
-    "shrd",
-    "sind",
-    "sinh",
-    "sora",
-    "sund",
-    "sunu",
-    "takr",
-    "talu",
-    "tamldec",
-    "telu",
-    "thai",
-    "tibt",
-    "tirh",
-    "tnsa",
-    "tols",
-    "vaii",
-    "wara",
-    "wcho",
+    "adlm", "ahom", "arab", "arabext", "bali", "beng", "bhks", "brah", "cakm", "cham", "deva",
+    "diak", "fullwide", "gara", "gong", "gonm", "gujr", "gukh", "guru", "hanidec", "hmng", "hmnp",
+    "java", "kali", "kawi", "khmr", "knda", "krai", "lana", "lanatham", "laoo", "latn", "lepc",
+    "limb", "mathbold", "mathdbl", "mathmono", "mathsanb", "mathsans", "mlym", "modi", "mong",
+    "mroo", "mtei", "mymr", "mymrepka", "mymrpao", "mymrshan", "mymrtlng", "nagm", "newa", "nkoo",
+    "olck", "onao", "orya", "osma", "outlined", "rohg", "saur", "segment", "shrd", "sind", "sinh",
+    "sora", "sund", "sunu", "takr", "talu", "tamldec", "telu", "thai", "tibt", "tirh", "tnsa",
+    "tols", "vaii", "wara", "wcho",
 ];
 const SUPPORTED_TIME_ZONES: &[&str] = &[
     "Etc/GMT+1",
@@ -263,13 +192,52 @@ fn is_lithuanian_locale(locale: &str) -> bool {
 fn is_soft_dotted(ch: char) -> bool {
     matches!(
         ch as u32,
-        0x0069 | 0x006A | 0x012F | 0x0249 | 0x0268 | 0x029D | 0x02B2 | 0x03F3
-            | 0x0456 | 0x0458 | 0x1D62 | 0x1D96 | 0x1DA4 | 0x1DA8 | 0x1E2D | 0x1ECB
-            | 0x2071 | 0x2148 | 0x2149 | 0x2C7C | 0x1D422 | 0x1D423 | 0x1D456
-            | 0x1D457 | 0x1D48A | 0x1D48B | 0x1D4BE | 0x1D4BF | 0x1D4F2 | 0x1D4F3
-            | 0x1D526 | 0x1D527 | 0x1D55A | 0x1D55B | 0x1D58E | 0x1D58F | 0x1D5C2
-            | 0x1D5C3 | 0x1D5F6 | 0x1D5F7 | 0x1D62A | 0x1D62B | 0x1D65E | 0x1D65F
-            | 0x1D692 | 0x1D693
+        0x0069
+            | 0x006A
+            | 0x012F
+            | 0x0249
+            | 0x0268
+            | 0x029D
+            | 0x02B2
+            | 0x03F3
+            | 0x0456
+            | 0x0458
+            | 0x1D62
+            | 0x1D96
+            | 0x1DA4
+            | 0x1DA8
+            | 0x1E2D
+            | 0x1ECB
+            | 0x2071
+            | 0x2148
+            | 0x2149
+            | 0x2C7C
+            | 0x1D422
+            | 0x1D423
+            | 0x1D456
+            | 0x1D457
+            | 0x1D48A
+            | 0x1D48B
+            | 0x1D4BE
+            | 0x1D4BF
+            | 0x1D4F2
+            | 0x1D4F3
+            | 0x1D526
+            | 0x1D527
+            | 0x1D55A
+            | 0x1D55B
+            | 0x1D58E
+            | 0x1D58F
+            | 0x1D5C2
+            | 0x1D5C3
+            | 0x1D5F6
+            | 0x1D5F7
+            | 0x1D62A
+            | 0x1D62B
+            | 0x1D65E
+            | 0x1D65F
+            | 0x1D692
+            | 0x1D693
     )
 }
 
@@ -441,18 +409,14 @@ fn is_region(s: &str) -> bool {
 
 fn is_variant(s: &str) -> bool {
     (s.len() >= 5 && s.len() <= 8 && is_alnum(s))
-        || (s.len() == 4
-            && s.as_bytes()
-                .first()
-                .is_some_and(|b| b.is_ascii_digit())
-            && is_alnum(s))
+        || (s.len() == 4 && s.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) && is_alnum(s))
 }
 
 fn is_singleton(s: &str) -> bool {
     s.len() == 1
-        && s.chars().next().is_some_and(|c| {
-            c.is_ascii_alphanumeric() && c != 'x' && c != 'X'
-        })
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() && c != 'x' && c != 'X')
 }
 
 fn subdivision_alias(value: &str) -> Option<&'static str> {
@@ -472,7 +436,11 @@ fn canonicalize_u_extension(subtags: Vec<String>) -> Result<String, VmError> {
     }
     let mut i = 0usize;
     let mut attributes = Vec::new();
-    while i < subtags.len() && subtags[i].len() >= 3 && subtags[i].len() <= 8 && is_alnum(&subtags[i]) {
+    while i < subtags.len()
+        && subtags[i].len() >= 3
+        && subtags[i].len() <= 8
+        && is_alnum(&subtags[i])
+    {
         attributes.push(subtags[i].clone());
         i += 1;
     }
@@ -488,7 +456,11 @@ fn canonicalize_u_extension(subtags: Vec<String>) -> Result<String, VmError> {
         }
         i += 1;
         let start = i;
-        while i < subtags.len() && subtags[i].len() >= 3 && subtags[i].len() <= 8 && is_alnum(&subtags[i]) {
+        while i < subtags.len()
+            && subtags[i].len() >= 3
+            && subtags[i].len() <= 8
+            && is_alnum(&subtags[i])
+        {
             i += 1;
         }
         let mut value = subtags[start..i].join("-");
@@ -552,9 +524,7 @@ fn canonicalize_t_extension(subtags: Vec<String>) -> Result<String, VmError> {
     let mut tlang_end = 0usize;
     while i < subtags.len() {
         let s = &subtags[i];
-        if s.len() == 2
-            && s.as_bytes()[0].is_ascii_alphabetic()
-            && s.as_bytes()[1].is_ascii_digit()
+        if s.len() == 2 && s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[1].is_ascii_digit()
         {
             break;
         }
@@ -581,7 +551,11 @@ fn canonicalize_t_extension(subtags: Vec<String>) -> Result<String, VmError> {
         }
         i += 1;
         let start = i;
-        while i < subtags.len() && subtags[i].len() >= 3 && subtags[i].len() <= 8 && is_alnum(&subtags[i]) {
+        while i < subtags.len()
+            && subtags[i].len() >= 3
+            && subtags[i].len() <= 8
+            && is_alnum(&subtags[i])
+        {
             i += 1;
         }
         if start == i {
@@ -631,7 +605,10 @@ fn canonicalize_locale_tag(raw: &str) -> Result<String, VmError> {
     }
 
     let subtags: Vec<String> = lower.split('-').map(|s| s.to_string()).collect();
-    if subtags.iter().any(|s| s.is_empty() || s.len() > 8 || !is_alnum(s)) {
+    if subtags
+        .iter()
+        .any(|s| s.is_empty() || s.len() > 8 || !is_alnum(s))
+    {
         return Err(VmError::range_error("Invalid language tag"));
     }
     if !is_language(&subtags[0]) {
@@ -656,7 +633,11 @@ fn canonicalize_locale_tag(raw: &str) -> Result<String, VmError> {
     }
     if i < subtags.len() && is_region(&subtags[i]) {
         let r = &subtags[i];
-        region = Some(if r.len() == 2 { r.to_ascii_uppercase() } else { r.clone() });
+        region = Some(if r.len() == 2 {
+            r.to_ascii_uppercase()
+        } else {
+            r.clone()
+        });
         i += 1;
     }
 
@@ -741,7 +722,11 @@ fn canonicalize_locale_tag(raw: &str) -> Result<String, VmError> {
         }
         i += 1;
         let start = i;
-        while i < subtags.len() && subtags[i].len() > 1 && !is_singleton(&subtags[i]) && subtags[i] != "x" {
+        while i < subtags.len()
+            && subtags[i].len() > 1
+            && !is_singleton(&subtags[i])
+            && subtags[i] != "x"
+        {
             i += 1;
         }
         if start == i {
@@ -852,21 +837,20 @@ fn canonicalize_locale_list(
             Ok(Value::undefined())
         };
 
-        let has_prop =
-            |ncx: &mut NativeContext<'_>, key: PropertyKey| -> Result<bool, VmError> {
-                if let Some(proxy) = locales_obj.as_proxy() {
-                    return crate::proxy_operations::proxy_has(
-                        ncx,
-                        proxy,
-                        &key,
-                        crate::proxy_operations::property_key_to_value_pub(&key),
-                    );
-                }
-                if let Some(obj) = locales_obj.as_object() {
-                    return Ok(obj.has(&key));
-                }
-                Ok(false)
-            };
+        let has_prop = |ncx: &mut NativeContext<'_>, key: PropertyKey| -> Result<bool, VmError> {
+            if let Some(proxy) = locales_obj.as_proxy() {
+                return crate::proxy_operations::proxy_has(
+                    ncx,
+                    proxy,
+                    &key,
+                    crate::proxy_operations::property_key_to_value_pub(&key),
+                );
+            }
+            if let Some(obj) = locales_obj.as_object() {
+                return Ok(obj.has(&key));
+            }
+            Ok(false)
+        };
 
         let length_val = get_prop(ncx, PropertyKey::string("length"))?;
         let n = if length_val.is_undefined() {
@@ -1349,18 +1333,23 @@ fn resolved_options(
         {
             obj.define_property(PropertyKey::string("unitDisplay"), data(v));
         }
-        if notation.as_string().map(|s| s.as_str().to_string()).as_deref() == Some("compact") {
-            if obj.get_own_property_descriptor(&PropertyKey::string("unit")).is_none() {
+        if notation
+            .as_string()
+            .map(|s| s.as_str().to_string())
+            .as_deref()
+            == Some("compact")
+        {
+            if obj
+                .get_own_property_descriptor(&PropertyKey::string("unit"))
+                .is_none()
+            {
                 obj.define_property(PropertyKey::string("unit"), data(Value::undefined()));
             }
             if obj
                 .get_own_property_descriptor(&PropertyKey::string("unitDisplay"))
                 .is_none()
             {
-                obj.define_property(
-                    PropertyKey::string("unitDisplay"),
-                    data(Value::undefined()),
-                );
+                obj.define_property(PropertyKey::string("unitDisplay"), data(Value::undefined()));
             }
         }
         obj.define_property(
@@ -1387,7 +1376,12 @@ fn resolved_options(
         {
             obj.define_property(PropertyKey::string("maximumSignificantDigits"), data(v));
         }
-        if notation.as_string().map(|s| s.as_str().to_string()).as_deref() == Some("compact") {
+        if notation
+            .as_string()
+            .map(|s| s.as_str().to_string())
+            .as_deref()
+            == Some("compact")
+        {
             if obj
                 .get_own_property_descriptor(&PropertyKey::string("minimumSignificantDigits"))
                 .is_none()
@@ -1409,17 +1403,18 @@ fn resolved_options(
         }
         obj.define_property(
             PropertyKey::string("useGrouping"),
-            data(
-                match get_slot(INTL_NF_USE_GROUPING_KEY) {
-                    v if v.as_string().map(|s| s.as_str() == "false").unwrap_or(false) => Value::boolean(false),
-                    v => v,
-                },
-            ),
+            data(match get_slot(INTL_NF_USE_GROUPING_KEY) {
+                v if v
+                    .as_string()
+                    .map(|s| s.as_str() == "false")
+                    .unwrap_or(false) =>
+                {
+                    Value::boolean(false)
+                }
+                v => v,
+            }),
         );
-        obj.define_property(
-            PropertyKey::string("notation"),
-            data(notation.clone()),
-        );
+        obj.define_property(PropertyKey::string("notation"), data(notation.clone()));
         if notation
             .as_string()
             .map(|s| s.as_str().to_string())
@@ -1677,11 +1672,7 @@ fn apply_simple_numbering_system_digits(formatted: &str, numbering_system: &str)
 
     formatted
         .chars()
-        .map(|c| {
-            c.to_digit(10)
-                .map(|d| mapped[d as usize])
-                .unwrap_or(c)
-        })
+        .map(|c| c.to_digit(10).map(|d| mapped[d as usize]).unwrap_or(c))
         .collect()
 }
 
@@ -1743,8 +1734,9 @@ fn nf_value_to_decimal(
 ) -> Result<NfDecimalInput, VmError> {
     let mut decimal = if value.is_bigint() {
         let s = ncx.to_string_value(value)?;
-        FixedDecimal::from_str(&s)
-            .map_err(|e| VmError::range_error(format!("Invalid BigInt for Intl.NumberFormat: {e}")))?
+        FixedDecimal::from_str(&s).map_err(|e| {
+            VmError::range_error(format!("Invalid BigInt for Intl.NumberFormat: {e}"))
+        })?
     } else {
         let number = ncx.to_number_value(value)?;
         if number.is_nan() {
@@ -1909,7 +1901,10 @@ fn nf_significant_round_position(decimal: &FixedDecimal, sig_digits: i16) -> Opt
         return None;
     }
     let s = decimal.to_string();
-    let s = s.strip_prefix('-').or_else(|| s.strip_prefix('+')).unwrap_or(&s);
+    let s = s
+        .strip_prefix('-')
+        .or_else(|| s.strip_prefix('+'))
+        .unwrap_or(&s);
     let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
     let digits = format!("{int_part}{frac_part}");
     let first_nonzero = digits.bytes().position(|b| b != b'0')?;
@@ -1922,7 +1917,10 @@ fn nf_significant_pad_position(decimal: &FixedDecimal, min_sig: i16) -> Option<i
         return None;
     }
     let s = decimal.to_string();
-    let s = s.strip_prefix('-').or_else(|| s.strip_prefix('+')).unwrap_or(&s);
+    let s = s
+        .strip_prefix('-')
+        .or_else(|| s.strip_prefix('+'))
+        .unwrap_or(&s);
     let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
     let digits = format!("{int_part}{frac_part}");
     let Some(first_nonzero) = digits.bytes().position(|b| b != b'0') else {
@@ -2014,13 +2012,7 @@ fn nf_format_to_string(
             .get(&PropertyKey::string(INTL_NF_CURRENCY_SIGN_KEY))
             .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
             .unwrap_or_else(|| "standard".to_string());
-        out = nf_apply_currency_style(
-            &out,
-            &locale,
-            &currency,
-            &currency_display,
-            &currency_sign,
-        );
+        out = nf_apply_currency_style(&out, &locale, &currency, &currency_display, &currency_sign);
     } else if style == "unit" {
         let unit = this_obj
             .get(&PropertyKey::string(INTL_UNIT_KEY))
@@ -2108,7 +2100,11 @@ fn nf_currency_symbol(locale: &str, currency: &str, currency_display: &str) -> S
     }
 }
 
-fn nf_format_notation(this_obj: &GcRef<JsObject>, decimal: &FixedDecimal, locale: &str) -> Option<String> {
+fn nf_format_notation(
+    this_obj: &GcRef<JsObject>,
+    decimal: &FixedDecimal,
+    locale: &str,
+) -> Option<String> {
     let notation = this_obj
         .get(&PropertyKey::string(INTL_NF_NOTATION_KEY))
         .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
@@ -2369,12 +2365,23 @@ fn nf_push_decimal_number_parts(parts: &mut Vec<(String, String)>, number: &str)
     for i in (0..chars.len()).rev() {
         let c = chars[i];
         if matches!(c, '.' | ',' | '\u{066B}') {
-            let digits_before = chars[..i].iter().filter(|ch| nf_is_numeric_char(**ch)).count();
-            let digits_after = chars[i + 1..].iter().filter(|ch| nf_is_numeric_char(**ch)).count();
-            let has_more_separators_before = chars[..i]
+            let digits_before = chars[..i]
                 .iter()
-                .any(|ch| matches!(*ch, '.' | ',' | '\u{066B}' | '\u{066C}' | '\u{00A0}' | '\u{202F}' | ' ' | '\''));
-            if digits_after > 0 && !(digits_after == 3 && digits_before > 1 && !has_more_separators_before) {
+                .filter(|ch| nf_is_numeric_char(**ch))
+                .count();
+            let digits_after = chars[i + 1..]
+                .iter()
+                .filter(|ch| nf_is_numeric_char(**ch))
+                .count();
+            let has_more_separators_before = chars[..i].iter().any(|ch| {
+                matches!(
+                    *ch,
+                    '.' | ',' | '\u{066B}' | '\u{066C}' | '\u{00A0}' | '\u{202F}' | ' ' | '\''
+                )
+            });
+            if digits_after > 0
+                && !(digits_after == 3 && digits_before > 1 && !has_more_separators_before)
+            {
                 decimal_idx = Some(i);
                 break;
             }
@@ -2417,7 +2424,10 @@ fn nf_push_decimal_number_parts(parts: &mut Vec<(String, String)>, number: &str)
     }
 }
 
-fn nf_push_scientific_or_engineering_parts(parts: &mut Vec<(String, String)>, formatted: &str) -> bool {
+fn nf_push_scientific_or_engineering_parts(
+    parts: &mut Vec<(String, String)>,
+    formatted: &str,
+) -> bool {
     let Some((mantissa, exponent)) = formatted.split_once('E') else {
         return false;
     };
@@ -2506,7 +2516,9 @@ fn nf_take_trailing_parenthesis(parts: &mut Vec<(String, String)>, has_trailing_
     }
 }
 
-fn nf_split_numeric_prefix_and_unit_suffix<'a>(formatted: &'a str) -> Option<(&'a str, &'a str, &'a str)> {
+fn nf_split_numeric_prefix_and_unit_suffix<'a>(
+    formatted: &'a str,
+) -> Option<(&'a str, &'a str, &'a str)> {
     let mut number_end = 0usize;
     for (idx, c) in formatted.char_indices() {
         if nf_is_numeric_or_separator_char(c) {
@@ -2571,7 +2583,10 @@ fn nf_format_to_parts(
     let mut parts: Vec<(String, String)> = Vec::new();
 
     let mut has_trailing_parenthesis = false;
-    if let Some(inner) = formatted.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+    if let Some(inner) = formatted
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+    {
         parts.push(("literal".to_string(), "(".to_string()));
         formatted = inner.to_string();
         has_trailing_parenthesis = true;
@@ -2776,7 +2791,10 @@ fn supported_locales_of_impl(
         .collect();
     let arr = create_array(ncx, supported.len());
     for (i, locale) in supported.iter().enumerate() {
-        let _ = arr.set(PropertyKey::Index(i as u32), Value::string(JsString::intern(locale)));
+        let _ = arr.set(
+            PropertyKey::Index(i as u32),
+            Value::string(JsString::intern(locale)),
+        );
     }
     Ok(Value::array(arr))
 }
@@ -2855,13 +2873,15 @@ fn install_basic_intl_constructor(
         Arc::new({
             let proto_obj = proto_obj;
             move |this, args, ncx| {
-                let mut locale = normalize_locale_for_ops(first_requested_locale(args.first(), ncx)?);
+                let mut locale =
+                    normalize_locale_for_ops(first_requested_locale(args.first(), ncx)?);
                 if brand_key == INTL_COLLATOR_BRAND_KEY {
                     validate_collator_options(args.get(1), ncx)?;
                 }
                 let target = if ncx.is_construct() {
-                    this.as_object()
-                        .ok_or_else(|| VmError::type_error("Intl constructor requires object receiver"))?
+                    this.as_object().ok_or_else(|| {
+                        VmError::type_error("Intl constructor requires object receiver")
+                    })?
                 } else {
                     GcRef::new(JsObject::new(
                         Value::object(proto_obj),
@@ -2905,10 +2925,8 @@ fn install_basic_intl_constructor(
                     }
                 } else if brand_key == INTL_COLLATOR_BRAND_KEY {
                     let mut ext = parse_unicode_extension(&locale);
-                    let has_unsupported_key = ext
-                        .keys
-                        .keys()
-                        .any(|k| k != "co" && k != "kn" && k != "kf");
+                    let has_unsupported_key =
+                        ext.keys.keys().any(|k| k != "co" && k != "kn" && k != "kf");
                     if has_unsupported_key {
                         ext.keys.clear();
                     }
@@ -2916,7 +2934,8 @@ fn install_basic_intl_constructor(
                     set_string_data_property(&target, INTL_USAGE_KEY, "sort");
                     set_string_data_property(&target, INTL_SENSITIVITY_KEY, "variant");
                     let locale_base = ext.base.to_ascii_lowercase();
-                    let default_ignore_punctuation = locale_base == "th" || locale_base.starts_with("th-");
+                    let default_ignore_punctuation =
+                        locale_base == "th" || locale_base.starts_with("th-");
                     set_bool_data_property(
                         &target,
                         INTL_IGNORE_PUNCTUATION_KEY,
@@ -3037,10 +3056,9 @@ fn install_basic_intl_constructor(
                         .get(&PropertyKey::string(INTL_COLLATION_KEY))
                         .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
                         .unwrap_or_else(|| "default".to_string());
-                    let fn_proto = ncx
-                        .ctx
-                        .function_prototype()
-                        .ok_or_else(|| VmError::type_error("Function.prototype is not available"))?;
+                    let fn_proto = ncx.ctx.function_prototype().ok_or_else(|| {
+                        VmError::type_error("Function.prototype is not available")
+                    })?;
                     let compare = Value::native_function_with_proto_named(
                         move |_this, args, ncx| {
                             let left = args.first().cloned().unwrap_or(Value::undefined());
@@ -3089,7 +3107,13 @@ fn install_basic_intl_constructor(
                                 }
                             }
                             let locale_value = Value::string(JsString::intern(&bound_locale));
-                            Ok(Value::number(locale_compare(&l, &r, Some(&locale_value), None, ncx)?))
+                            Ok(Value::number(locale_compare(
+                                &l,
+                                &r,
+                                Some(&locale_value),
+                                None,
+                                ncx,
+                            )?))
                         },
                         ncx.memory_manager().clone(),
                         fn_proto,
@@ -3098,7 +3122,10 @@ fn install_basic_intl_constructor(
                     );
                     target.define_property(
                         PropertyKey::string("compare"),
-                        PropertyDescriptor::data_with_attrs(compare, PropertyAttributes::builtin_method()),
+                        PropertyDescriptor::data_with_attrs(
+                            compare,
+                            PropertyAttributes::builtin_method(),
+                        ),
                     );
                 } else if brand_key == INTL_DATETIMEFORMAT_BRAND_KEY {
                     if let Some(value) = get_option_string(args.get(1), "calendar", ncx)?
@@ -3143,7 +3170,10 @@ fn install_basic_intl_constructor(
                             }
                         }
                     }
-                    if target.get(&PropertyKey::string(INTL_NUMBERING_SYSTEM_KEY)).is_none() {
+                    if target
+                        .get(&PropertyKey::string(INTL_NUMBERING_SYSTEM_KEY))
+                        .is_none()
+                    {
                         if let Some(nu) = ext.keys.get("nu") {
                             set_string_data_property(&target, INTL_NUMBERING_SYSTEM_KEY, nu);
                         } else {
@@ -3163,7 +3193,10 @@ fn install_basic_intl_constructor(
                     let currency = get_option_string(options, "currency", ncx)?;
                     let currency_display = get_option_string(options, "currencyDisplay", ncx)?
                         .unwrap_or_else(|| "symbol".to_string());
-                    if !matches!(currency_display.as_str(), "code" | "symbol" | "narrowSymbol" | "name") {
+                    if !matches!(
+                        currency_display.as_str(),
+                        "code" | "symbol" | "narrowSymbol" | "name"
+                    ) {
                         return Err(VmError::range_error("Invalid currencyDisplay option"));
                     }
                     let currency_sign = get_option_string(options, "currencySign", ncx)?
@@ -3180,9 +3213,21 @@ fn install_basic_intl_constructor(
                         let currency = currency.ok_or_else(|| {
                             VmError::type_error("currency option is required with currency style")
                         })?;
-                        set_string_data_property(&target, INTL_CURRENCY_KEY, &currency.to_ascii_uppercase());
-                        set_string_data_property(&target, INTL_NF_CURRENCY_DISPLAY_KEY, &currency_display);
-                        set_string_data_property(&target, INTL_NF_CURRENCY_SIGN_KEY, &currency_sign);
+                        set_string_data_property(
+                            &target,
+                            INTL_CURRENCY_KEY,
+                            &currency.to_ascii_uppercase(),
+                        );
+                        set_string_data_property(
+                            &target,
+                            INTL_NF_CURRENCY_DISPLAY_KEY,
+                            &currency_display,
+                        );
+                        set_string_data_property(
+                            &target,
+                            INTL_NF_CURRENCY_SIGN_KEY,
+                            &currency_sign,
+                        );
                     }
 
                     let unit = get_option_string(options, "unit", ncx)?;
@@ -3197,15 +3242,19 @@ fn install_basic_intl_constructor(
                         return Err(VmError::range_error("Invalid unit option"));
                     }
                     if style == "unit" {
-                        let unit = unit
-                            .ok_or_else(|| VmError::type_error("unit option is required with unit style"))?;
+                        let unit = unit.ok_or_else(|| {
+                            VmError::type_error("unit option is required with unit style")
+                        })?;
                         set_string_data_property(&target, INTL_UNIT_KEY, &unit);
                         set_string_data_property(&target, INTL_NF_UNIT_DISPLAY_KEY, &unit_display);
                     }
 
                     let notation = get_option_string(options, "notation", ncx)?
                         .unwrap_or_else(|| "standard".to_string());
-                    if !matches!(notation.as_str(), "standard" | "scientific" | "engineering" | "compact") {
+                    if !matches!(
+                        notation.as_str(),
+                        "standard" | "scientific" | "engineering" | "compact"
+                    ) {
                         return Err(VmError::range_error("Invalid notation option"));
                     }
                     set_string_data_property(&target, INTL_NF_NOTATION_KEY, &notation);
@@ -3213,7 +3262,9 @@ fn install_basic_intl_constructor(
                     let min_int = get_option_number(options, "minimumIntegerDigits", ncx)?;
                     if let Some(v) = min_int {
                         if !v.is_finite() || v.fract() != 0.0 || !(1.0..=21.0).contains(&v) {
-                            return Err(VmError::range_error("Invalid minimumIntegerDigits option"));
+                            return Err(VmError::range_error(
+                                "Invalid minimumIntegerDigits option",
+                            ));
                         }
                         set_number_data_property(&target, INTL_NF_MIN_INT_DIGITS_KEY, v);
                     } else {
@@ -3224,13 +3275,17 @@ fn install_basic_intl_constructor(
                     let max_frac = get_option_number(options, "maximumFractionDigits", ncx)?;
                     if let Some(v) = min_frac {
                         if !v.is_finite() || v.fract() != 0.0 || !(0.0..=100.0).contains(&v) {
-                            return Err(VmError::range_error("Invalid minimumFractionDigits option"));
+                            return Err(VmError::range_error(
+                                "Invalid minimumFractionDigits option",
+                            ));
                         }
                         set_number_data_property(&target, INTL_NF_MIN_FRAC_DIGITS_KEY, v);
                     }
                     if let Some(v) = max_frac {
                         if !v.is_finite() || v.fract() != 0.0 || !(0.0..=100.0).contains(&v) {
-                            return Err(VmError::range_error("Invalid maximumFractionDigits option"));
+                            return Err(VmError::range_error(
+                                "Invalid maximumFractionDigits option",
+                            ));
                         }
                         set_number_data_property(&target, INTL_NF_MAX_FRAC_DIGITS_KEY, v);
                     }
@@ -3241,14 +3296,20 @@ fn install_basic_intl_constructor(
                             "minimumFractionDigits is greater than maximumFractionDigits",
                         ));
                     }
-                    if target.get(&PropertyKey::string(INTL_NF_MIN_FRAC_DIGITS_KEY)).is_none() {
+                    if target
+                        .get(&PropertyKey::string(INTL_NF_MIN_FRAC_DIGITS_KEY))
+                        .is_none()
+                    {
                         if style == "currency" {
                             set_number_data_property(&target, INTL_NF_MIN_FRAC_DIGITS_KEY, 2.0);
                         } else {
                             set_number_data_property(&target, INTL_NF_MIN_FRAC_DIGITS_KEY, 0.0);
                         }
                     }
-                    if target.get(&PropertyKey::string(INTL_NF_MAX_FRAC_DIGITS_KEY)).is_none() {
+                    if target
+                        .get(&PropertyKey::string(INTL_NF_MAX_FRAC_DIGITS_KEY))
+                        .is_none()
+                    {
                         if style == "currency" {
                             set_number_data_property(&target, INTL_NF_MAX_FRAC_DIGITS_KEY, 2.0);
                         } else {
@@ -3260,13 +3321,17 @@ fn install_basic_intl_constructor(
                     let max_sig = get_option_number(options, "maximumSignificantDigits", ncx)?;
                     if let Some(v) = min_sig {
                         if !v.is_finite() || v.fract() != 0.0 || !(1.0..=21.0).contains(&v) {
-                            return Err(VmError::range_error("Invalid minimumSignificantDigits option"));
+                            return Err(VmError::range_error(
+                                "Invalid minimumSignificantDigits option",
+                            ));
                         }
                         set_number_data_property(&target, INTL_NF_MIN_SIG_DIGITS_KEY, v);
                     }
                     if let Some(v) = max_sig {
                         if !v.is_finite() || v.fract() != 0.0 || !(1.0..=21.0).contains(&v) {
-                            return Err(VmError::range_error("Invalid maximumSignificantDigits option"));
+                            return Err(VmError::range_error(
+                                "Invalid maximumSignificantDigits option",
+                            ));
                         }
                         set_number_data_property(&target, INTL_NF_MAX_SIG_DIGITS_KEY, v);
                     }
@@ -3329,10 +3394,17 @@ fn install_basic_intl_constructor(
 
                     let rounding_priority = get_option_string(options, "roundingPriority", ncx)?
                         .unwrap_or_else(|| "auto".to_string());
-                    if !matches!(rounding_priority.as_str(), "auto" | "morePrecision" | "lessPrecision") {
+                    if !matches!(
+                        rounding_priority.as_str(),
+                        "auto" | "morePrecision" | "lessPrecision"
+                    ) {
                         return Err(VmError::range_error("Invalid roundingPriority option"));
                     }
-                    set_string_data_property(&target, INTL_NF_ROUNDING_PRIORITY_KEY, &rounding_priority);
+                    set_string_data_property(
+                        &target,
+                        INTL_NF_ROUNDING_PRIORITY_KEY,
+                        &rounding_priority,
+                    );
                     if rounding_increment.is_some()
                         && rounding_increment != Some(1.0)
                         && (min_sig.is_some()
@@ -3345,8 +3417,9 @@ fn install_basic_intl_constructor(
                         ));
                     }
 
-                    let trailing_zero_display = get_option_string(options, "trailingZeroDisplay", ncx)?
-                        .unwrap_or_else(|| "auto".to_string());
+                    let trailing_zero_display =
+                        get_option_string(options, "trailingZeroDisplay", ncx)?
+                            .unwrap_or_else(|| "auto".to_string());
                     if !matches!(trailing_zero_display.as_str(), "auto" | "stripIfInteger") {
                         return Err(VmError::range_error("Invalid trailingZeroDisplay option"));
                     }
@@ -3362,10 +3435,18 @@ fn install_basic_intl_constructor(
                         return Err(VmError::range_error("Invalid compactDisplay option"));
                     }
                     if notation == "compact" {
-                        set_string_data_property(&target, INTL_NF_COMPACT_DISPLAY_KEY, &compact_display);
+                        set_string_data_property(
+                            &target,
+                            INTL_NF_COMPACT_DISPLAY_KEY,
+                            &compact_display,
+                        );
                     }
 
-                    let default_use_grouping = if notation == "compact" { "min2" } else { "auto" };
+                    let default_use_grouping = if notation == "compact" {
+                        "min2"
+                    } else {
+                        "auto"
+                    };
                     match get_option_value(options, "useGrouping", ncx)? {
                         None => set_string_data_property(
                             &target,
@@ -3374,7 +3455,11 @@ fn install_basic_intl_constructor(
                         ),
                         Some(v) if v.is_boolean() => {
                             if v.as_boolean() == Some(true) {
-                                set_string_data_property(&target, INTL_NF_USE_GROUPING_KEY, "always");
+                                set_string_data_property(
+                                    &target,
+                                    INTL_NF_USE_GROUPING_KEY,
+                                    "always",
+                                );
                             } else {
                                 set_bool_data_property(&target, INTL_NF_USE_GROUPING_KEY, false);
                             }
@@ -3400,26 +3485,34 @@ fn install_basic_intl_constructor(
                                     );
                                 }
                                 "" => {
-                                    set_bool_data_property(&target, INTL_NF_USE_GROUPING_KEY, false);
+                                    set_bool_data_property(
+                                        &target,
+                                        INTL_NF_USE_GROUPING_KEY,
+                                        false,
+                                    );
                                 }
-                                _ => return Err(VmError::range_error("Invalid useGrouping option")),
+                                _ => {
+                                    return Err(VmError::range_error("Invalid useGrouping option"));
+                                }
                             }
                         }
                     }
 
                     let sign_display = get_option_string(options, "signDisplay", ncx)?
                         .unwrap_or_else(|| "auto".to_string());
-                    if !matches!(sign_display.as_str(), "auto" | "never" | "always" | "exceptZero" | "negative") {
+                    if !matches!(
+                        sign_display.as_str(),
+                        "auto" | "never" | "always" | "exceptZero" | "negative"
+                    ) {
                         return Err(VmError::range_error("Invalid signDisplay option"));
                     }
                     set_string_data_property(&target, INTL_NF_SIGN_DISPLAY_KEY, &sign_display);
 
                     // VM currently has call-path gaps for accessor-returned functions.
                     // Install an own format function on instances to preserve call behavior.
-                    let fn_proto = ncx
-                        .ctx
-                        .function_prototype()
-                        .ok_or_else(|| VmError::type_error("Function.prototype is not available"))?;
+                    let fn_proto = ncx.ctx.function_prototype().ok_or_else(|| {
+                        VmError::type_error("Function.prototype is not available")
+                    })?;
                     let target_for_format = target.clone();
                     let format = Value::native_function_with_proto_named(
                         move |_this, args, ncx| {
@@ -3434,7 +3527,10 @@ fn install_basic_intl_constructor(
                     );
                     target.define_property(
                         PropertyKey::string("format"),
-                        PropertyDescriptor::data_with_attrs(format, PropertyAttributes::builtin_method()),
+                        PropertyDescriptor::data_with_attrs(
+                            format,
+                            PropertyAttributes::builtin_method(),
+                        ),
                     );
                 } else if brand_key == INTL_RELATIVETIMEFORMAT_BRAND_KEY
                     && let Some(value) = get_option_string(args.get(1), "numberingSystem", ncx)?
@@ -3628,7 +3724,10 @@ pub fn install_intl(
             let locales = canonicalize_locale_list(args.first(), ncx)?;
             let arr = create_array(ncx, locales.len());
             for (i, locale) in locales.iter().enumerate() {
-                let _ = arr.set(PropertyKey::Index(i as u32), Value::string(JsString::intern(locale)));
+                let _ = arr.set(
+                    PropertyKey::Index(i as u32),
+                    Value::string(JsString::intern(locale)),
+                );
             }
             Ok(Value::array(arr))
         },
@@ -3652,7 +3751,11 @@ pub fn install_intl(
                 "numberingSystem" => SUPPORTED_NUMBERING_SYSTEMS.to_vec(),
                 "timeZone" => SUPPORTED_TIME_ZONES.to_vec(),
                 "unit" => SUPPORTED_UNITS.to_vec(),
-                _ => return Err(VmError::range_error("Invalid key for Intl.supportedValuesOf")),
+                _ => {
+                    return Err(VmError::range_error(
+                        "Invalid key for Intl.supportedValuesOf",
+                    ));
+                }
             };
             values.sort_unstable();
             values.dedup();
@@ -3837,7 +3940,10 @@ pub fn install_intl(
         "DateTimeFormat",
         INTL_DATETIMEFORMAT_BRAND_KEY,
         0,
-        &[("format", 1, datetime_format), ("resolvedOptions", 0, datetime_resolved_options)],
+        &[
+            ("format", 1, datetime_format),
+            ("resolvedOptions", 0, datetime_resolved_options),
+        ],
         mm,
         object_proto,
         fn_proto.clone(),
@@ -3869,7 +3975,9 @@ pub fn install_intl(
     let number_format_to_parts = Value::native_function_with_proto_named(
         |this_val, args, ncx| {
             let this_obj = this_val.as_object().ok_or_else(|| {
-                VmError::type_error("Intl.NumberFormat.prototype.formatToParts called on non-object")
+                VmError::type_error(
+                    "Intl.NumberFormat.prototype.formatToParts called on non-object",
+                )
             })?;
             if this_obj
                 .get(&PropertyKey::string(INTL_NUMBERFORMAT_BRAND_KEY))
@@ -4033,9 +4141,9 @@ pub fn install_intl(
     set_proto_to_string_tag(&number_ctor, "Intl.NumberFormat");
     let number_format_getter = Value::native_function_with_proto_named(
         |this_val, _args, ncx| {
-            let this_obj = this_val
-                .as_object()
-                .ok_or_else(|| VmError::type_error("Intl.NumberFormat.prototype.format called on non-object"))?;
+            let this_obj = this_val.as_object().ok_or_else(|| {
+                VmError::type_error("Intl.NumberFormat.prototype.format called on non-object")
+            })?;
             if this_obj
                 .get(&PropertyKey::string(INTL_NUMBERFORMAT_BRAND_KEY))
                 .is_none()
@@ -4137,7 +4245,10 @@ pub fn install_intl(
     let rtf_format = Value::native_function_with_proto_named(
         |_this, args, ncx| {
             let value = args.first().cloned().unwrap_or(Value::number(0.0));
-            let unit = args.get(1).cloned().unwrap_or(Value::string(JsString::intern("second")));
+            let unit = args
+                .get(1)
+                .cloned()
+                .unwrap_or(Value::string(JsString::intern("second")));
             let v = ncx.to_string_value(&value)?;
             let u = ncx.to_string_value(&unit)?;
             Ok(Value::string(JsString::intern(&format!("{v} {u}"))))
@@ -4151,7 +4262,10 @@ pub fn install_intl(
         |_this, args, ncx| {
             let formatted = {
                 let value = args.first().cloned().unwrap_or(Value::number(0.0));
-                let unit = args.get(1).cloned().unwrap_or(Value::string(JsString::intern("second")));
+                let unit = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Value::string(JsString::intern("second")));
                 let v = ncx.to_string_value(&value)?;
                 let u = ncx.to_string_value(&unit)?;
                 format!("{v} {u}")
@@ -4209,7 +4323,13 @@ pub fn install_intl(
                 if let Some(obj) = v.as_object() {
                     let length = obj
                         .get(&PropertyKey::string("length"))
-                        .map(|v| ncx.to_number_value(&v).unwrap_or(0.0).max(0.0).min(64.0).floor() as usize)
+                        .map(|v| {
+                            ncx.to_number_value(&v)
+                                .unwrap_or(0.0)
+                                .max(0.0)
+                                .min(64.0)
+                                .floor() as usize
+                        })
                         .unwrap_or(0);
                     let mut parts = Vec::new();
                     for i in 0..length {
@@ -4479,8 +4599,11 @@ pub fn install_intl(
     );
     let locale_calendar_getter = Value::native_function_with_proto_named(
         |this_val, _args, _ncx| {
-            let locale =
-                locale_from_receiver(this_val, INTL_LOCALE_BRAND_KEY, "Intl.Locale.prototype.calendar")?;
+            let locale = locale_from_receiver(
+                this_val,
+                INTL_LOCALE_BRAND_KEY,
+                "Intl.Locale.prototype.calendar",
+            )?;
             let calendar = this_val
                 .as_object()
                 .and_then(|obj| {
@@ -4499,8 +4622,11 @@ pub fn install_intl(
     );
     let locale_collation_getter = Value::native_function_with_proto_named(
         |this_val, _args, _ncx| {
-            let locale =
-                locale_from_receiver(this_val, INTL_LOCALE_BRAND_KEY, "Intl.Locale.prototype.collation")?;
+            let locale = locale_from_receiver(
+                this_val,
+                INTL_LOCALE_BRAND_KEY,
+                "Intl.Locale.prototype.collation",
+            )?;
             let collation = this_val
                 .as_object()
                 .and_then(|obj| {

@@ -4,76 +4,15 @@ use crate::gc::GcRef;
 use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
+use crate::temporal_value::TemporalValue;
 use crate::value::Value;
 use std::sync::Arc;
 
 use super::common::*;
 
-// Internal slots for ZonedDateTime
-const SLOT_ZDT_EPOCH_NS: &str = "__zdt_epoch_ns__";
-const SLOT_ZDT_TZ: &str = "__zdt_tz__";
-const SLOT_ZDT_CALENDAR: &str = "__zdt_calendar__";
-
 /// Get the compiled timezone provider from temporal_rs.
 fn tz_provider() -> &'static impl temporal_rs::provider::TimeZoneProvider {
     &*temporal_rs::provider::COMPILED_TZ_PROVIDER
-}
-
-/// Reconstruct a temporal_rs::ZonedDateTime from an object's internal slots.
-fn extract_zdt(obj: &GcRef<JsObject>) -> Result<temporal_rs::ZonedDateTime, VmError> {
-    let epoch_ns_str = obj
-        .get(&PropertyKey::string(SLOT_ZDT_EPOCH_NS))
-        .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
-        .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-    let epoch_ns: i128 = epoch_ns_str
-        .parse()
-        .map_err(|_| VmError::range_error("invalid epoch nanoseconds"))?;
-
-    let tz_str = obj
-        .get(&PropertyKey::string(SLOT_ZDT_TZ))
-        .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
-        .unwrap_or_else(|| "UTC".to_string());
-
-    let cal_str = obj
-        .get(&PropertyKey::string(SLOT_ZDT_CALENDAR))
-        .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
-        .unwrap_or_else(|| "iso8601".to_string());
-
-    let tz = temporal_rs::TimeZone::try_from_identifier_str_with_provider(&tz_str, tz_provider())
-        .map_err(temporal_err)?;
-    let cal =
-        temporal_rs::Calendar::try_from_utf8(cal_str.as_bytes()).map_err(temporal_err)?;
-
-    temporal_rs::ZonedDateTime::try_new_with_provider(epoch_ns, tz, cal, tz_provider())
-        .map_err(temporal_err)
-}
-
-/// Store a temporal_rs::ZonedDateTime into an object's internal slots.
-fn store_zdt(obj: &GcRef<JsObject>, zdt: &temporal_rs::ZonedDateTime) {
-    obj.define_property(
-        PropertyKey::string(SLOT_TEMPORAL_TYPE),
-        PropertyDescriptor::builtin_data(Value::string(JsString::intern("ZonedDateTime"))),
-    );
-    obj.define_property(
-        PropertyKey::string(SLOT_ZDT_EPOCH_NS),
-        PropertyDescriptor::builtin_data(Value::string(JsString::intern(
-            &zdt.epoch_nanoseconds().0.to_string(),
-        ))),
-    );
-    let tz_id = zdt
-        .time_zone()
-        .identifier_with_provider(tz_provider())
-        .unwrap_or_else(|_| "UTC".to_string());
-    obj.define_property(
-        PropertyKey::string(SLOT_ZDT_TZ),
-        PropertyDescriptor::builtin_data(Value::string(JsString::intern(&tz_id))),
-    );
-    obj.define_property(
-        PropertyKey::string(SLOT_ZDT_CALENDAR),
-        PropertyDescriptor::builtin_data(Value::string(JsString::intern(
-            zdt.calendar().identifier(),
-        ))),
-    );
 }
 
 /// Create a ZonedDateTime JS value from a temporal_rs::ZonedDateTime.
@@ -229,19 +168,8 @@ fn resolve_timezone(
     // All other objects throw TypeError per ToTemporalTimeZoneIdentifier.
     if tz_val.as_object().is_some() || tz_val.as_proxy().is_some() {
         if let Some(obj) = tz_val.as_object() {
-            let tt = obj
-                .get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
-                .and_then(|v| v.as_string().map(|s| s.as_str().to_string()));
-            if tt.as_deref() == Some("ZonedDateTime") {
-                let tz_str = obj
-                    .get(&PropertyKey::string(SLOT_ZDT_TZ))
-                    .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
-                    .unwrap_or_else(|| "UTC".to_string());
-                return temporal_rs::TimeZone::try_from_identifier_str_with_provider(
-                    &tz_str,
-                    tz_provider(),
-                )
-                .map_err(temporal_err);
+            if let Ok(zdt) = extract_zoned_date_time(&obj) {
+                return Ok(zdt.time_zone().clone());
             }
         }
         return Err(VmError::type_error(format!(
@@ -287,7 +215,9 @@ fn value_to_bigint_i128(ncx: &mut NativeContext<'_>, val: &Value) -> Result<i128
         return Err(VmError::type_error("Cannot convert a number to a BigInt"));
     }
     if val.as_symbol().is_some() {
-        return Err(VmError::type_error("Cannot convert a Symbol value to a BigInt"));
+        return Err(VmError::type_error(
+            "Cannot convert a Symbol value to a BigInt",
+        ));
     }
     if val.is_boolean() {
         let b = val.as_boolean().unwrap_or(false);
@@ -297,7 +227,9 @@ fn value_to_bigint_i128(ncx: &mut NativeContext<'_>, val: &Value) -> Result<i128
         let s = ncx.to_string_value(val)?;
         let s = s.as_str().trim();
         if s.is_empty() {
-            return Err(VmError::syntax_error("Cannot convert empty string to a BigInt"));
+            return Err(VmError::syntax_error(
+                "Cannot convert empty string to a BigInt",
+            ));
         }
         return s
             .parse::<i128>()
@@ -320,14 +252,8 @@ pub(super) fn install_zoned_date_time(
     fn_proto: &GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
-    let proto = GcRef::new(JsObject::new(
-        Value::object(obj_proto.clone()),
-        mm.clone(),
-    ));
-    let ctor_obj = GcRef::new(JsObject::new(
-        Value::object(fn_proto.clone()),
-        mm.clone(),
-    ));
+    let proto = GcRef::new(JsObject::new(Value::object(obj_proto.clone()), mm.clone()));
+    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone()), mm.clone()));
 
     ctor_obj.define_property(
         PropertyKey::string("prototype"),
@@ -397,9 +323,9 @@ pub(super) fn install_zoned_date_time(
             temporal_rs::ZonedDateTime::try_new_with_provider(epoch_ns, tz, cal, tz_provider())
                 .map_err(temporal_err)?;
 
-        // Store in internal slots
+        // Store in internal slots using the new TemporalValue approach
         if let Some(obj) = this.as_object() {
-            store_zdt(&obj, &zdt);
+            store_temporal_inner(&obj, TemporalValue::ZonedDateTime(zdt));
         }
         Ok(Value::undefined())
     });
@@ -450,8 +376,7 @@ pub(super) fn install_zoned_date_time(
                     parse_zdt_from_options(ncx, &options_val)?;
 
                 // Step 3: Re-parse with actual options if they differ from safe defaults
-                let zdt = if disambiguation
-                    != temporal_rs::options::Disambiguation::Compatible
+                let zdt = if disambiguation != temporal_rs::options::Disambiguation::Compatible
                     || offset_option != temporal_rs::options::OffsetDisambiguation::Use
                 {
                     temporal_rs::ZonedDateTime::from_utf8_with_provider(
@@ -472,19 +397,12 @@ pub(super) fn install_zoned_date_time(
             let is_proxy = item.as_proxy().is_some();
             if item.as_object().is_some() || is_proxy {
                 // Check if it's an existing ZonedDateTime
-                let temporal_type = if let Some(obj) = item.as_object() {
-                    obj.get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
-                        .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
-                } else {
-                    None
-                };
-
-                if temporal_type.as_deref() == Some("ZonedDateTime") {
-                    let obj = item.as_object().unwrap();
-                    let (_disambiguation, _offset_option, _overflow) =
-                        parse_zdt_from_options(ncx, &options_val)?;
-                    let zdt = extract_zdt(&obj)?;
-                    return construct_zdt_value(ncx, &zdt);
+                if let Some(obj) = item.as_object() {
+                    if let Ok(zdt) = extract_zoned_date_time(&obj) {
+                        let (_disambiguation, _offset_option, _overflow) =
+                            parse_zdt_from_options(ncx, &options_val)?;
+                        return construct_zdt_value(ncx, &zdt);
+                    }
                 }
 
                 // Property bag — spec order: calendar, then fields alphabetically,
@@ -494,12 +412,11 @@ pub(super) fn install_zoned_date_time(
                         ncx.get_property_of_value(&item, &PropertyKey::string(name))
                     };
 
-                // 1. Read calendar
+                // 1. Read calendar — lenient validation (accepts ISO strings)
                 let calendar_val = get_field(ncx, "calendar")?;
                 let cal = if !calendar_val.is_undefined() {
-                    let cal_str = validate_calendar_arg_standalone(ncx, &calendar_val)?;
-                    temporal_rs::Calendar::try_from_utf8(cal_str.as_bytes())
-                        .map_err(temporal_err)?
+                    resolve_calendar_from_property(ncx, &calendar_val)?;
+                    temporal_rs::Calendar::default() // We only support iso8601
                 } else {
                     temporal_rs::Calendar::default()
                 };
@@ -788,7 +705,7 @@ pub(super) fn install_zoned_date_time(
                     let obj = this
                         .as_object()
                         .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-                    let zdt = extract_zdt(&obj)?;
+                    let zdt = extract_zoned_date_time(&obj)?;
                     #[allow(clippy::redundant_closure_call)]
                     Ok($extract(&zdt))
                 },
@@ -804,59 +721,119 @@ pub(super) fn install_zoned_date_time(
         };
     }
 
-    define_getter!(proto, "calendarId", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::string(JsString::intern(zdt.calendar().identifier()))
-    });
+    define_getter!(
+        proto,
+        "calendarId",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| {
+            Value::string(JsString::intern(zdt.calendar().identifier()))
+        }
+    );
 
-    define_getter!(proto, "timeZoneId", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        let tz_id = zdt.time_zone().identifier_with_provider(tz_provider())
-            .unwrap_or_else(|_| "UTC".to_string());
-        Value::string(JsString::intern(&tz_id))
-    });
+    define_getter!(
+        proto,
+        "timeZoneId",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| {
+            let tz_id = zdt
+                .time_zone()
+                .identifier_with_provider(tz_provider())
+                .unwrap_or_else(|_| "UTC".to_string());
+            Value::string(JsString::intern(&tz_id))
+        }
+    );
 
-    define_getter!(proto, "year", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::int32(zdt.year())
-    });
+    define_getter!(
+        proto,
+        "year",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::int32(zdt.year()) }
+    );
 
-    define_getter!(proto, "month", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::int32(zdt.month() as i32)
-    });
+    define_getter!(
+        proto,
+        "month",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::int32(zdt.month() as i32) }
+    );
 
-    define_getter!(proto, "monthCode", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::string(JsString::intern(zdt.month_code().as_str()))
-    });
+    define_getter!(
+        proto,
+        "monthCode",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| {
+            Value::string(JsString::intern(zdt.month_code().as_str()))
+        }
+    );
 
-    define_getter!(proto, "day", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::int32(zdt.day() as i32)
-    });
+    define_getter!(
+        proto,
+        "day",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::int32(zdt.day() as i32) }
+    );
 
-    define_getter!(proto, "hour", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::int32(zdt.hour() as i32)
-    });
+    define_getter!(
+        proto,
+        "hour",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::int32(zdt.hour() as i32) }
+    );
 
-    define_getter!(proto, "minute", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::int32(zdt.minute() as i32)
-    });
+    define_getter!(
+        proto,
+        "minute",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::int32(zdt.minute() as i32) }
+    );
 
-    define_getter!(proto, "second", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::int32(zdt.second() as i32)
-    });
+    define_getter!(
+        proto,
+        "second",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::int32(zdt.second() as i32) }
+    );
 
-    define_getter!(proto, "millisecond", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::int32(zdt.millisecond() as i32)
-    });
+    define_getter!(
+        proto,
+        "millisecond",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::int32(zdt.millisecond() as i32) }
+    );
 
-    define_getter!(proto, "microsecond", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::int32(zdt.microsecond() as i32)
-    });
+    define_getter!(
+        proto,
+        "microsecond",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::int32(zdt.microsecond() as i32) }
+    );
 
-    define_getter!(proto, "nanosecond", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::int32(zdt.nanosecond() as i32)
-    });
+    define_getter!(
+        proto,
+        "nanosecond",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::int32(zdt.nanosecond() as i32) }
+    );
 
-    define_getter!(proto, "epochMilliseconds", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::number(zdt.epoch_milliseconds() as f64)
-    });
+    define_getter!(
+        proto,
+        "epochMilliseconds",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::number(zdt.epoch_milliseconds() as f64) }
+    );
 
     // epochNanoseconds - returns BigInt
     {
@@ -865,7 +842,7 @@ pub(super) fn install_zoned_date_time(
                 let obj = this
                     .as_object()
                     .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-                let zdt = extract_zdt(&obj)?;
+                let zdt = extract_zoned_date_time(&obj)?;
                 let ns_str = zdt.epoch_nanoseconds().0.to_string();
                 Ok(Value::bigint(ns_str))
             },
@@ -880,69 +857,129 @@ pub(super) fn install_zoned_date_time(
         );
     }
 
-    define_getter!(proto, "dayOfWeek", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::int32(zdt.day_of_week() as i32)
-    });
+    define_getter!(
+        proto,
+        "dayOfWeek",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::int32(zdt.day_of_week() as i32) }
+    );
 
-    define_getter!(proto, "dayOfYear", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::int32(zdt.day_of_year() as i32)
-    });
+    define_getter!(
+        proto,
+        "dayOfYear",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::int32(zdt.day_of_year() as i32) }
+    );
 
-    define_getter!(proto, "weekOfYear", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        match zdt.week_of_year() {
-            Some(w) => Value::int32(w as i32),
-            None => Value::undefined(),
+    define_getter!(
+        proto,
+        "weekOfYear",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| {
+            match zdt.week_of_year() {
+                Some(w) => Value::int32(w as i32),
+                None => Value::undefined(),
+            }
         }
-    });
+    );
 
-    define_getter!(proto, "yearOfWeek", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        match zdt.year_of_week() {
-            Some(y) => Value::int32(y),
-            None => Value::undefined(),
+    define_getter!(
+        proto,
+        "yearOfWeek",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| {
+            match zdt.year_of_week() {
+                Some(y) => Value::int32(y),
+                None => Value::undefined(),
+            }
         }
-    });
+    );
 
-    define_getter!(proto, "daysInWeek", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::int32(zdt.days_in_week() as i32)
-    });
+    define_getter!(
+        proto,
+        "daysInWeek",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::int32(zdt.days_in_week() as i32) }
+    );
 
-    define_getter!(proto, "daysInMonth", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::int32(zdt.days_in_month() as i32)
-    });
+    define_getter!(
+        proto,
+        "daysInMonth",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::int32(zdt.days_in_month() as i32) }
+    );
 
-    define_getter!(proto, "daysInYear", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::int32(zdt.days_in_year() as i32)
-    });
+    define_getter!(
+        proto,
+        "daysInYear",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::int32(zdt.days_in_year() as i32) }
+    );
 
-    define_getter!(proto, "monthsInYear", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::int32(zdt.months_in_year() as i32)
-    });
+    define_getter!(
+        proto,
+        "monthsInYear",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::int32(zdt.months_in_year() as i32) }
+    );
 
-    define_getter!(proto, "inLeapYear", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::boolean(zdt.in_leap_year())
-    });
+    define_getter!(
+        proto,
+        "inLeapYear",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::boolean(zdt.in_leap_year()) }
+    );
 
-    define_getter!(proto, "offset", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::string(JsString::intern(&zdt.offset()))
-    });
+    define_getter!(
+        proto,
+        "offset",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::string(JsString::intern(&zdt.offset())) }
+    );
 
-    define_getter!(proto, "offsetNanoseconds", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        Value::number(zdt.offset_nanoseconds() as f64)
-    });
+    define_getter!(
+        proto,
+        "offsetNanoseconds",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| { Value::number(zdt.offset_nanoseconds() as f64) }
+    );
 
-    define_getter!(proto, "era", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        match zdt.era() {
-            Some(e) => Value::string(JsString::intern(e.as_str())),
-            None => Value::undefined(),
+    define_getter!(
+        proto,
+        "era",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| {
+            match zdt.era() {
+                Some(e) => Value::string(JsString::intern(e.as_str())),
+                None => Value::undefined(),
+            }
         }
-    });
+    );
 
-    define_getter!(proto, "eraYear", fn_proto, mm, |zdt: &temporal_rs::ZonedDateTime| {
-        match zdt.era_year() {
-            Some(y) => Value::int32(y),
-            None => Value::undefined(),
+    define_getter!(
+        proto,
+        "eraYear",
+        fn_proto,
+        mm,
+        |zdt: &temporal_rs::ZonedDateTime| {
+            match zdt.era_year() {
+                Some(y) => Value::int32(y),
+                None => Value::undefined(),
+            }
         }
-    });
+    );
 
     // hoursInDay (needs provider)
     {
@@ -951,7 +988,7 @@ pub(super) fn install_zoned_date_time(
                 let obj = this
                     .as_object()
                     .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-                let zdt = extract_zdt(&obj)?;
+                let zdt = extract_zoned_date_time(&obj)?;
                 let hours = zdt
                     .hours_in_day_with_provider(tz_provider())
                     .map_err(temporal_err)?;
@@ -978,7 +1015,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
 
             let options_val = args.first().cloned().unwrap_or(Value::undefined());
             let (display_offset, display_tz, display_cal, rounding_opts) =
@@ -1011,7 +1048,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let s = zdt
                 .to_string_with_provider(tz_provider())
                 .map_err(temporal_err)?;
@@ -1033,7 +1070,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let s = zdt
                 .to_string_with_provider(tz_provider())
                 .map_err(temporal_err)?;
@@ -1075,7 +1112,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let sod = zdt
                 .start_of_day_with_provider(tz_provider())
                 .map_err(temporal_err)?;
@@ -1097,7 +1134,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let instant = zdt.to_instant();
             let ns_str = instant.epoch_nanoseconds().0.to_string();
             let temporal_ns = ncx
@@ -1129,7 +1166,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let pd = zdt.to_plain_date();
             construct_plain_date_value(ncx, pd.year(), pd.month() as i32, pd.day() as i32)
         },
@@ -1140,10 +1177,7 @@ pub(super) fn install_zoned_date_time(
     );
     proto.define_property(
         PropertyKey::string("toPlainDate"),
-        PropertyDescriptor::data_with_attrs(
-            to_plain_date_fn,
-            PropertyAttributes::builtin_method(),
-        ),
+        PropertyDescriptor::data_with_attrs(to_plain_date_fn, PropertyAttributes::builtin_method()),
     );
 
     // toPlainTime()
@@ -1152,7 +1186,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let pt = zdt.to_plain_time();
             let temporal_ns = ncx
                 .ctx
@@ -1184,10 +1218,7 @@ pub(super) fn install_zoned_date_time(
     );
     proto.define_property(
         PropertyKey::string("toPlainTime"),
-        PropertyDescriptor::data_with_attrs(
-            to_plain_time_fn,
-            PropertyAttributes::builtin_method(),
-        ),
+        PropertyDescriptor::data_with_attrs(to_plain_time_fn, PropertyAttributes::builtin_method()),
     );
 
     // toPlainDateTime()
@@ -1196,7 +1227,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let pdt = zdt.to_plain_date_time();
             let temporal_ns = ncx
                 .ctx
@@ -1243,7 +1274,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let other_val = args.first().cloned().unwrap_or(Value::undefined());
             let other = to_temporal_zdt(ncx, &other_val)?;
             let eq = zdt
@@ -1267,14 +1298,13 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let cal_arg = args.first().cloned().unwrap_or(Value::undefined());
             if cal_arg.is_undefined() {
                 return Err(VmError::type_error("calendar argument is required"));
             }
-            let cal_str = validate_calendar_arg_standalone(ncx, &cal_arg)?;
-            let cal =
-                temporal_rs::Calendar::try_from_utf8(cal_str.as_bytes()).map_err(temporal_err)?;
+            resolve_calendar_from_property(ncx, &cal_arg)?;
+            let cal = temporal_rs::Calendar::default(); // We only support iso8601
             let new_zdt = zdt.with_calendar(cal);
             construct_zdt_value(ncx, &new_zdt)
         },
@@ -1285,10 +1315,7 @@ pub(super) fn install_zoned_date_time(
     );
     proto.define_property(
         PropertyKey::string("withCalendar"),
-        PropertyDescriptor::data_with_attrs(
-            with_calendar_fn,
-            PropertyAttributes::builtin_method(),
-        ),
+        PropertyDescriptor::data_with_attrs(with_calendar_fn, PropertyAttributes::builtin_method()),
     );
 
     // withTimeZone(timeZone)
@@ -1297,7 +1324,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let tz_arg = args.first().cloned().unwrap_or(Value::undefined());
             let tz = resolve_timezone(ncx, &tz_arg, true)?;
             let new_zdt = zdt
@@ -1324,7 +1351,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let pt_arg = args.first().cloned().unwrap_or(Value::undefined());
             let pt = if pt_arg.is_undefined() {
                 None
@@ -1355,7 +1382,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let dur_val = args.first().cloned().unwrap_or(Value::undefined());
             let dur = to_temporal_duration(ncx, &dur_val)?;
             let options_val = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1385,7 +1412,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let dur_val = args.first().cloned().unwrap_or(Value::undefined());
             let dur = to_temporal_duration(ncx, &dur_val)?;
             let options_val = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1415,7 +1442,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let other_val = args.first().cloned().unwrap_or(Value::undefined());
             let other = to_temporal_zdt(ncx, &other_val)?;
             let options_val = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1441,7 +1468,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let other_val = args.first().cloned().unwrap_or(Value::undefined());
             let other = to_temporal_zdt(ncx, &other_val)?;
             let options_val = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1467,7 +1494,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let fields_val = args.first().cloned().unwrap_or(Value::undefined());
             if fields_val.as_object().is_none() && fields_val.as_proxy().is_none() {
                 return Err(VmError::type_error("fields must be an object"));
@@ -1475,10 +1502,7 @@ pub(super) fn install_zoned_date_time(
             // RejectTemporalLikeObject:
             // 1. Check for Temporal internal slots (any Temporal type)
             if let Some(fobj) = fields_val.as_object() {
-                let tt = fobj
-                    .get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
-                    .and_then(|v| v.as_string().map(|s| s.as_str().to_string()));
-                if tt.is_some() {
+                if extract_temporal_inner(&fobj).is_ok() {
                     return Err(VmError::type_error(
                         "with() does not accept a Temporal object",
                     ));
@@ -1532,7 +1556,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let options_val = args.first().cloned().unwrap_or(Value::undefined());
             let round_opts = parse_zdt_rounding_options(ncx, &options_val)?;
             let new_zdt = zdt
@@ -1556,7 +1580,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let dir_val = args.first().cloned().unwrap_or(Value::undefined());
             let direction = parse_transition_direction(ncx, &dir_val)?;
             let result = zdt
@@ -1586,7 +1610,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             construct_plain_year_month_value(ncx, zdt.year(), zdt.month() as i32)
         },
         mm.clone(),
@@ -1608,7 +1632,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             construct_plain_month_day_value(ncx, zdt.month() as i32, zdt.day() as i32)
         },
         mm.clone(),
@@ -1630,7 +1654,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let epoch_ns = zdt.epoch_nanoseconds().0;
 
             // Get Temporal.Instant constructor and create an instance
@@ -1655,10 +1679,7 @@ pub(super) fn install_zoned_date_time(
     );
     proto.define_property(
         PropertyKey::string("toInstant"),
-        PropertyDescriptor::data_with_attrs(
-            to_instant_fn,
-            PropertyAttributes::builtin_method(),
-        ),
+        PropertyDescriptor::data_with_attrs(to_instant_fn, PropertyAttributes::builtin_method()),
     );
 
     // getISOFields()
@@ -1667,7 +1688,7 @@ pub(super) fn install_zoned_date_time(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
-            let zdt = extract_zdt(&obj)?;
+            let zdt = extract_zoned_date_time(&obj)?;
             let result = GcRef::new(JsObject::new(
                 Value::undefined(),
                 ncx.ctx.memory_manager().clone(),
@@ -1772,26 +1793,22 @@ fn to_temporal_zdt(
 ) -> Result<temporal_rs::ZonedDateTime, VmError> {
     // 1. If object with ZonedDateTime internal slot, extract directly
     if let Some(obj) = val.as_object() {
-        let tt = obj
-            .get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
-            .and_then(|v| v.as_string().map(|s| s.as_str().to_string()));
-        if tt.as_deref() == Some("ZonedDateTime") {
-            return extract_zdt(&obj);
+        if let Ok(zdt) = extract_zoned_date_time(&obj) {
+            return Ok(zdt);
         }
     }
 
     // 2. If object (not ZDT), treat as property bag
     if val.as_object().is_some() || val.as_proxy().is_some() {
-        let get =
-            |ncx: &mut NativeContext<'_>, name: &str| -> Result<Value, VmError> {
-                ncx.get_property_of_value(val, &PropertyKey::string(name))
-            };
+        let get = |ncx: &mut NativeContext<'_>, name: &str| -> Result<Value, VmError> {
+            ncx.get_property_of_value(val, &PropertyKey::string(name))
+        };
 
-        // Read calendar
+        // Read calendar — lenient validation (accepts ISO strings)
         let calendar_val = get(ncx, "calendar")?;
         let cal = if !calendar_val.is_undefined() {
-            let cal_str = validate_calendar_arg_standalone(ncx, &calendar_val)?;
-            temporal_rs::Calendar::try_from_utf8(cal_str.as_bytes()).map_err(temporal_err)?
+            resolve_calendar_from_property(ncx, &calendar_val)?;
+            temporal_rs::Calendar::default() // We only support iso8601
         } else {
             temporal_rs::Calendar::default()
         };
@@ -1969,43 +1986,37 @@ fn to_temporal_plain_time(
     ncx: &mut NativeContext<'_>,
     val: &Value,
 ) -> Result<temporal_rs::PlainTime, VmError> {
-    // Check for known Temporal types first (via as_object which gets internal slots)
+    // Check for known Temporal types first via TemporalValue extraction
     if let Some(obj) = val.as_object() {
-        let tt = obj
-            .get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
-            .and_then(|v| v.as_string().map(|s| s.as_str().to_string()));
-
-        if tt.as_deref() == Some("PlainTime") {
-            let h = obj.get(&PropertyKey::string(SLOT_ISO_HOUR)).and_then(|v| v.as_int32()).unwrap_or(0) as u8;
-            let m = obj.get(&PropertyKey::string(SLOT_ISO_MINUTE)).and_then(|v| v.as_int32()).unwrap_or(0) as u8;
-            let s = obj.get(&PropertyKey::string(SLOT_ISO_SECOND)).and_then(|v| v.as_int32()).unwrap_or(0) as u8;
-            let ms = obj.get(&PropertyKey::string(SLOT_ISO_MILLISECOND)).and_then(|v| v.as_int32()).unwrap_or(0) as u16;
-            let us = obj.get(&PropertyKey::string(SLOT_ISO_MICROSECOND)).and_then(|v| v.as_int32()).unwrap_or(0) as u16;
-            let ns = obj.get(&PropertyKey::string(SLOT_ISO_NANOSECOND)).and_then(|v| v.as_int32()).unwrap_or(0) as u16;
-            return temporal_rs::PlainTime::new(h, m, s, ms, us, ns).map_err(temporal_err);
-        }
-
-        if tt.as_deref() == Some("PlainDateTime") {
-            let h = obj.get(&PropertyKey::string(SLOT_ISO_HOUR)).and_then(|v| v.as_int32()).unwrap_or(0) as u8;
-            let m = obj.get(&PropertyKey::string(SLOT_ISO_MINUTE)).and_then(|v| v.as_int32()).unwrap_or(0) as u8;
-            let s = obj.get(&PropertyKey::string(SLOT_ISO_SECOND)).and_then(|v| v.as_int32()).unwrap_or(0) as u8;
-            let ms = obj.get(&PropertyKey::string(SLOT_ISO_MILLISECOND)).and_then(|v| v.as_int32()).unwrap_or(0) as u16;
-            let us = obj.get(&PropertyKey::string(SLOT_ISO_MICROSECOND)).and_then(|v| v.as_int32()).unwrap_or(0) as u16;
-            let ns = obj.get(&PropertyKey::string(SLOT_ISO_NANOSECOND)).and_then(|v| v.as_int32()).unwrap_or(0) as u16;
-            return temporal_rs::PlainTime::new(h, m, s, ms, us, ns).map_err(temporal_err);
-        }
-
-        if tt.as_deref() == Some("ZonedDateTime") {
-            let zdt = extract_zdt(&obj)?;
-            return temporal_rs::PlainTime::new(
-                zdt.hour(),
-                zdt.minute(),
-                zdt.second(),
-                zdt.millisecond(),
-                zdt.microsecond(),
-                zdt.nanosecond(),
-            )
-            .map_err(temporal_err);
+        if let Ok(inner) = extract_temporal_inner(&obj) {
+            match &*inner {
+                TemporalValue::PlainTime(pt) => {
+                    return Ok(*pt);
+                }
+                TemporalValue::PlainDateTime(pdt) => {
+                    return temporal_rs::PlainTime::new(
+                        pdt.hour(),
+                        pdt.minute(),
+                        pdt.second(),
+                        pdt.millisecond(),
+                        pdt.microsecond(),
+                        pdt.nanosecond(),
+                    )
+                    .map_err(temporal_err);
+                }
+                TemporalValue::ZonedDateTime(zdt) => {
+                    return temporal_rs::PlainTime::new(
+                        zdt.hour(),
+                        zdt.minute(),
+                        zdt.second(),
+                        zdt.millisecond(),
+                        zdt.microsecond(),
+                        zdt.nanosecond(),
+                    )
+                    .map_err(temporal_err);
+                }
+                _ => {}
+            }
         }
 
         // Property bag: read time fields in alphabetical order (per spec)
@@ -2214,7 +2225,9 @@ fn parse_zdt_to_string_options(
         // GetStringOrNumberOption: Number path
         let n = fsd_val.as_number().unwrap();
         if n.is_nan() {
-            return Err(VmError::range_error("fractionalSecondDigits must not be NaN"));
+            return Err(VmError::range_error(
+                "fractionalSecondDigits must not be NaN",
+            ));
         }
         let d = n.floor();
         if d < 0.0 || d > 9.0 || !d.is_finite() {
@@ -2315,10 +2328,7 @@ fn parse_zdt_difference_options(
     let increment = if !ri_val.is_undefined() {
         let n = ncx.to_number_value(&ri_val)?;
         let n_u32 = n.trunc() as u32;
-        Some(
-            temporal_rs::options::RoundingIncrement::try_new(n_u32)
-                .map_err(temporal_err)?,
-        )
+        Some(temporal_rs::options::RoundingIncrement::try_new(n_u32).map_err(temporal_err)?)
     } else {
         None
     };
@@ -2504,10 +2514,7 @@ fn parse_zdt_rounding_options(
     let increment = if !ri_val.is_undefined() {
         let n = ncx.to_number_value(&ri_val)?;
         let n_u32 = n.trunc() as u32;
-        Some(
-            temporal_rs::options::RoundingIncrement::try_new(n_u32)
-                .map_err(temporal_err)?,
-        )
+        Some(temporal_rs::options::RoundingIncrement::try_new(n_u32).map_err(temporal_err)?)
     } else {
         None
     };

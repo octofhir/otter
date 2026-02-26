@@ -70,9 +70,9 @@ pub use otter_vm_runtime::{
     Extension,
     ExtensionRegistry,
     HttpEvent,
-    IsolatedEnvStore,
     // Isolate configuration
     IsolateConfig,
+    IsolatedEnvStore,
     // Module loader
     LoadedModule,
     ModuleError,
@@ -164,6 +164,7 @@ pub fn create_builtins_extension_with_console<A: ConsoleAdapter>(adapter: A) -> 
 // Re-export Node.js compatibility
 pub use otter_nodejs::{
     NodeApiProfile, builtin_modules as nodejs_builtin_modules, is_builtin as nodejs_is_builtin,
+    set_process_argv_override,
 };
 
 // ============================================================================

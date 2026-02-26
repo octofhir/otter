@@ -4,33 +4,15 @@ use crate::gc::GcRef;
 use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
+use crate::temporal_value::TemporalValue;
 use crate::value::{HeapRef, Value};
 use std::sync::Arc;
 
 use super::common::*;
 
-const SLOT_INSTANT_NS: &str = "__instant_epoch_ns__";
-
 /// Get the compiled timezone provider from temporal_rs.
 fn tz_provider() -> &'static impl temporal_rs::provider::TimeZoneProvider {
     &*temporal_rs::provider::COMPILED_TZ_PROVIDER
-}
-
-/// Extract epoch nanoseconds (i128) from an Instant object.
-fn extract_instant_ns(obj: &GcRef<JsObject>) -> Result<i128, VmError> {
-    let ns_str = obj
-        .get(&PropertyKey::string(SLOT_INSTANT_NS))
-        .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
-        .ok_or_else(|| VmError::type_error("not an Instant"))?;
-    ns_str
-        .parse::<i128>()
-        .map_err(|_| VmError::range_error("invalid epoch nanoseconds"))
-}
-
-/// Extract a temporal_rs::Instant from a JS object.
-fn extract_instant(obj: &GcRef<JsObject>) -> Result<temporal_rs::Instant, VmError> {
-    let ns = extract_instant_ns(obj)?;
-    temporal_rs::Instant::try_new(ns).map_err(temporal_err)
 }
 
 /// Convert an argument to a temporal_rs::Instant (string or Instant object).
@@ -39,34 +21,25 @@ fn to_temporal_instant(
     val: &Value,
 ) -> Result<temporal_rs::Instant, VmError> {
     if let Some(obj) = val.as_object() {
-        let tt = obj
-            .get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
-            .and_then(|v| v.as_string().map(|s| s.as_str().to_string()));
-        match tt.as_deref() {
-            Some("Instant") => return extract_instant(&obj),
-            Some("ZonedDateTime") => {
-                // Fast path: extract epochNanoseconds from ZDT
-                let ns_val = obj.get(&PropertyKey::string("epochNanoseconds"));
-                if let Some(ns_v) = ns_val {
-                    if let Some(HeapRef::BigInt(b)) = ns_v.heap_ref() {
-                        let ns: i128 = b
-                            .value
-                            .parse()
-                            .map_err(|_| VmError::range_error("invalid epoch nanoseconds"))?;
-                        return temporal_rs::Instant::try_new(ns).map_err(temporal_err);
-                    }
-                }
-                return Err(VmError::type_error("Cannot extract epoch nanoseconds from ZonedDateTime"));
-            }
-            _ => {}
+        // Try extracting as Instant first
+        if let Ok(instant) = extract_instant(&obj) {
+            return Ok(instant);
         }
+        // Try extracting as ZonedDateTime
+        if let Ok(zdt) = extract_zoned_date_time(&obj) {
+            let ns = zdt.epoch_nanoseconds().0;
+            return temporal_rs::Instant::try_new(ns).map_err(temporal_err);
+        }
+        // Generic object: call toString, then parse as ISO string
+        let s = ncx.to_string_value(val)?;
+        return temporal_rs::Instant::from_utf8(s.as_str().as_bytes()).map_err(temporal_err);
     }
     if val.is_string() {
         let s = ncx.to_string_value(val)?;
         return temporal_rs::Instant::from_utf8(s.as_str().as_bytes()).map_err(temporal_err);
     }
-    // Try toString for objects (including proxies)
-    if val.as_object().is_some() || val.as_proxy().is_some() {
+    // Try toString for proxies
+    if val.as_proxy().is_some() {
         let s = ncx.to_string_value(val)?;
         return temporal_rs::Instant::from_utf8(s.as_str().as_bytes()).map_err(temporal_err);
     }
@@ -143,45 +116,57 @@ pub(super) fn install_instant(
 
         let epoch_ns_val = args.first().cloned().unwrap_or(Value::undefined());
 
-        // Must be a BigInt
-        let ns_str = if epoch_ns_val.is_bigint() {
+        // Per spec: ToBigInt(epochNanoseconds)
+        // Accepts: BigInt, boolean (true→1n, false→0n), string (parse as BigInt)
+        // Rejects: undefined→TypeError, null→TypeError, number→TypeError, symbol→TypeError
+        let ns: i128 = if epoch_ns_val.is_bigint() {
             match epoch_ns_val.heap_ref() {
-                Some(HeapRef::BigInt(b)) => b.value.clone(),
+                Some(HeapRef::BigInt(b)) => b
+                    .value
+                    .parse::<i128>()
+                    .map_err(|_| VmError::range_error("epoch nanoseconds out of range"))?,
                 _ => {
                     return Err(VmError::type_error(
                         "Temporal.Instant requires a BigInt argument",
-                    ))
+                    ));
                 }
             }
+        } else if let Some(b) = epoch_ns_val.as_boolean() {
+            if b { 1i128 } else { 0i128 }
+        } else if epoch_ns_val.is_string() {
+            let s = epoch_ns_val.as_string().unwrap().as_str().to_string();
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Err(VmError::syntax_error(
+                    "Cannot convert empty string to BigInt",
+                ));
+            }
+            trimmed
+                .parse::<i128>()
+                .map_err(|_| VmError::syntax_error(format!("Cannot convert {} to a BigInt", s)))?
+        } else if epoch_ns_val.is_number() {
+            return Err(VmError::type_error(
+                "Cannot convert a Number value to a BigInt",
+            ));
+        } else if epoch_ns_val.is_undefined() {
+            return Err(VmError::type_error("Cannot convert undefined to a BigInt"));
+        } else if epoch_ns_val.is_null() {
+            return Err(VmError::type_error("Cannot convert null to a BigInt"));
+        } else if epoch_ns_val.as_symbol().is_some() {
+            return Err(VmError::type_error(
+                "Cannot convert a Symbol value to a BigInt",
+            ));
         } else {
             return Err(VmError::type_error(
                 "Temporal.Instant requires a BigInt argument",
             ));
         };
 
-        let ns: i128 = ns_str
-            .parse()
-            .map_err(|_| VmError::range_error("epoch nanoseconds out of range"))?;
-
-        // Validate range
-        const MAX_NS: i128 = 8_640_000_000_000_000_000_000;
-        if ns < -MAX_NS || ns > MAX_NS {
-            return Err(VmError::range_error("epoch nanoseconds out of range"));
-        }
+        // Validate via temporal_rs (handles range check)
+        let instant = temporal_rs::Instant::try_new(ns).map_err(temporal_err)?;
 
         if let Some(obj) = this.as_object() {
-            obj.define_property(
-                PropertyKey::string(SLOT_TEMPORAL_TYPE),
-                PropertyDescriptor::builtin_data(Value::string(JsString::intern("Instant"))),
-            );
-            obj.define_property(
-                PropertyKey::string(SLOT_INSTANT_NS),
-                PropertyDescriptor::builtin_data(Value::string(JsString::intern(&ns_str))),
-            );
-            obj.define_property(
-                PropertyKey::string("epochNanoseconds"),
-                PropertyDescriptor::builtin_data(Value::bigint(ns_str)),
-            );
+            store_temporal_inner(&obj, TemporalValue::Instant(instant));
         }
 
         Ok(Value::undefined())
@@ -228,16 +213,18 @@ pub(super) fn install_instant(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not an Instant"))?;
-            let ns = extract_instant_ns(&obj)?;
-            Ok(Value::bigint(ns.to_string()))
+            let instant = extract_instant(&obj)?;
+            Ok(Value::bigint(instant.epoch_nanoseconds().0.to_string()))
         },
         mm.clone(),
         fn_proto.clone(),
         "get epochNanoseconds",
         0,
     );
-    // Note: epochNanoseconds is also set as a data property by the constructor,
-    // but the getter ensures the prototype accessor works correctly
+    proto.define_property(
+        PropertyKey::string("epochNanoseconds"),
+        PropertyDescriptor::getter(epoch_ns_getter),
+    );
 
     // equals(other)
     let equals_fn = Value::native_function_with_proto_named(
@@ -245,10 +232,12 @@ pub(super) fn install_instant(
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not an Instant"))?;
-            let ns = extract_instant_ns(&obj)?;
+            let instant = extract_instant(&obj)?;
             let other_val = args.first().cloned().unwrap_or(Value::undefined());
             let other = to_temporal_instant(ncx, &other_val)?;
-            Ok(Value::boolean(ns == other.epoch_nanoseconds().0))
+            Ok(Value::boolean(
+                instant.epoch_nanoseconds().0 == other.epoch_nanoseconds().0,
+            ))
         },
         mm.clone(),
         fn_proto.clone(),
@@ -382,46 +371,19 @@ pub(super) fn install_instant(
                 .ok_or_else(|| VmError::type_error("not an Instant"))?;
             let instant = extract_instant(&obj)?;
             let tz_val = args.first().cloned().unwrap_or(Value::undefined());
-            let tz_str = ncx.to_string_value(&tz_val)?;
-            let tz = temporal_rs::TimeZone::try_from_str_with_provider(
-                tz_str.as_str(),
-                tz_provider(),
-            )
-            .or_else(|_| {
-                temporal_rs::TimeZone::try_from_identifier_str_with_provider(
-                    tz_str.as_str(),
-                    tz_provider(),
-                )
-            })
-            .map_err(temporal_err)?;
+            // Validate timezone via temporal_rs (TypeError for non-string, RangeError for invalid)
+            if tz_val.is_undefined() {
+                return Err(VmError::type_error(
+                    "toZonedDateTimeISO requires a timeZone argument",
+                ));
+            }
+            let tz = to_temporal_timezone_identifier(ncx, &tz_val)?;
             let zdt = instant
                 .to_zoned_date_time_iso_with_provider(tz, tz_provider())
                 .map_err(temporal_err)?;
 
-            // Build ZDT JS value
-            let temporal_ns = ncx
-                .ctx
-                .get_global("Temporal")
-                .ok_or_else(|| VmError::type_error("Temporal not found"))?;
-            let temporal_obj = temporal_ns
-                .as_object()
-                .ok_or_else(|| VmError::type_error("Temporal not found"))?;
-            let zdt_ctor = temporal_obj
-                .get(&PropertyKey::string("ZonedDateTime"))
-                .ok_or_else(|| VmError::type_error("ZonedDateTime not found"))?;
-            let epoch_ns_val = Value::bigint(zdt.epoch_nanoseconds().0.to_string());
-            let tz_id = zdt
-                .time_zone()
-                .identifier_with_provider(tz_provider())
-                .unwrap_or_else(|_| "UTC".to_string());
-            ncx.call_function_construct(
-                &zdt_ctor,
-                Value::undefined(),
-                &[
-                    epoch_ns_val,
-                    Value::string(JsString::intern(&tz_id)),
-                ],
-            )
+            // Build ZDT JS value via common helper
+            construct_zoned_date_time_value(ncx, &zdt)
         },
         mm.clone(),
         fn_proto.clone(),
@@ -548,46 +510,34 @@ pub(super) fn install_instant(
             let item = args.first().cloned().unwrap_or(Value::undefined());
 
             if let Some(obj) = item.as_object() {
-                let tt = obj
-                    .get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
-                    .and_then(|v| v.as_string().map(|s| s.as_str().to_string()));
-                match tt.as_deref() {
-                    Some("Instant") => {
-                        // Copy Instant
-                        let ns = extract_instant_ns(&obj)?;
-                        return ncx.call_function_construct(
-                            &from_ctor,
-                            Value::undefined(),
-                            &[Value::bigint(ns.to_string())],
-                        );
-                    }
-                    Some("ZonedDateTime") => {
-                        // Fast path: extract epochNanoseconds from ZDT
-                        let ns_val = obj.get(&PropertyKey::string("epochNanoseconds"));
-                        if let Some(ns_v) = ns_val {
-                            if let Some(HeapRef::BigInt(b)) = ns_v.heap_ref() {
-                                return ncx.call_function_construct(
-                                    &from_ctor,
-                                    Value::undefined(),
-                                    &[Value::bigint(b.value.clone())],
-                                );
-                            }
-                        }
-                        return Err(VmError::type_error("Cannot extract epoch nanoseconds from ZonedDateTime"));
-                    }
-                    _ => {
-                        // Generic object: call toString, then parse as ISO string
-                        let s = ncx.to_string_value(&item)?;
-                        let instant = temporal_rs::Instant::from_utf8(s.as_str().as_bytes())
-                            .map_err(temporal_err)?;
-                        let ns = instant.epoch_nanoseconds().0;
-                        return ncx.call_function_construct(
-                            &from_ctor,
-                            Value::undefined(),
-                            &[Value::bigint(ns.to_string())],
-                        );
-                    }
+                // Try extracting as Instant (creates a copy)
+                if let Ok(instant) = extract_instant(&obj) {
+                    let ns = instant.epoch_nanoseconds().0;
+                    return ncx.call_function_construct(
+                        &from_ctor,
+                        Value::undefined(),
+                        &[Value::bigint(ns.to_string())],
+                    );
                 }
+                // Try extracting as ZonedDateTime
+                if let Ok(zdt) = extract_zoned_date_time(&obj) {
+                    let ns = zdt.epoch_nanoseconds().0;
+                    return ncx.call_function_construct(
+                        &from_ctor,
+                        Value::undefined(),
+                        &[Value::bigint(ns.to_string())],
+                    );
+                }
+                // Generic object: call toString, then parse as ISO string
+                let s = ncx.to_string_value(&item)?;
+                let instant =
+                    temporal_rs::Instant::from_utf8(s.as_str().as_bytes()).map_err(temporal_err)?;
+                let ns = instant.epoch_nanoseconds().0;
+                return ncx.call_function_construct(
+                    &from_ctor,
+                    Value::undefined(),
+                    &[Value::bigint(ns.to_string())],
+                );
             }
 
             // String: parse ISO 8601
@@ -649,7 +599,9 @@ pub(super) fn install_instant(
             let ms_val = args.first().cloned().unwrap_or(Value::undefined());
             let ms = ncx.to_number_value(&ms_val)?;
             if ms.is_nan() || ms.is_infinite() || ms != ms.trunc() {
-                return Err(VmError::range_error("epochMilliseconds must be a finite integer"));
+                return Err(VmError::range_error(
+                    "epochMilliseconds must be a finite integer",
+                ));
             }
             let ns = (ms as i128) * 1_000_000;
             const MAX_NS: i128 = 8_640_000_000_000_000_000_000;
@@ -680,11 +632,7 @@ pub(super) fn install_instant(
             if !ns_val.is_bigint() {
                 return Err(VmError::type_error("epochNanoseconds must be a BigInt"));
             }
-            ncx.call_function_construct(
-                &from_ns_ctor,
-                Value::undefined(),
-                &[ns_val],
-            )
+            ncx.call_function_construct(&from_ns_ctor, Value::undefined(), &[ns_val])
         },
         mm.clone(),
         fn_proto.clone(),
@@ -703,7 +651,9 @@ pub(super) fn install_instant(
             let s_val = args.first().cloned().unwrap_or(Value::undefined());
             let s = ncx.to_number_value(&s_val)?;
             if s.is_nan() || s.is_infinite() || s != s.trunc() {
-                return Err(VmError::range_error("epochSeconds must be a finite integer"));
+                return Err(VmError::range_error(
+                    "epochSeconds must be a finite integer",
+                ));
             }
             let ns = (s as i128) * 1_000_000_000;
             const MAX_NS: i128 = 8_640_000_000_000_000_000_000;
@@ -760,10 +710,7 @@ fn parse_instant_difference_options(
     let increment = if !ri_val.is_undefined() {
         let n = ncx.to_number_value(&ri_val)?;
         let n_u32 = n.trunc() as u32;
-        Some(
-            temporal_rs::options::RoundingIncrement::try_new(n_u32)
-                .map_err(temporal_err)?,
-        )
+        Some(temporal_rs::options::RoundingIncrement::try_new(n_u32).map_err(temporal_err)?)
     } else {
         None
     };
@@ -806,7 +753,7 @@ fn parse_instant_rounding_options(
     options_val: &Value,
 ) -> Result<temporal_rs::options::RoundingOptions, VmError> {
     if options_val.is_undefined() {
-        return Err(VmError::range_error("smallestUnit is required for round()"));
+        return Err(VmError::type_error("round requires an options argument"));
     }
 
     // String shorthand: treated as smallestUnit
@@ -824,10 +771,7 @@ fn parse_instant_rounding_options(
     let increment = if !ri_val.is_undefined() {
         let n = ncx.to_number_value(&ri_val)?;
         let n_u32 = n.trunc() as u32;
-        Some(
-            temporal_rs::options::RoundingIncrement::try_new(n_u32)
-                .map_err(temporal_err)?,
-        )
+        Some(temporal_rs::options::RoundingIncrement::try_new(n_u32).map_err(temporal_err)?)
     } else {
         None
     };
@@ -871,28 +815,15 @@ fn parse_instant_to_string_options(
     VmError,
 > {
     if options_val.is_undefined() {
-        return Ok((None, temporal_rs::options::ToStringRoundingOptions::default()));
+        return Ok((
+            None,
+            temporal_rs::options::ToStringRoundingOptions::default(),
+        ));
     }
 
     let _obj = get_options_object(options_val)?;
 
-    // timeZone option
-    let tz_val = get_option_value(ncx, options_val, "timeZone")?;
-    let tz = if !tz_val.is_undefined() {
-        let s = ncx.to_string_value(&tz_val)?;
-        Some(
-            temporal_rs::TimeZone::try_from_str_with_provider(s.as_str(), tz_provider())
-                .or_else(|_| {
-                    temporal_rs::TimeZone::try_from_identifier_str_with_provider(
-                        s.as_str(),
-                        tz_provider(),
-                    )
-                })
-                .map_err(temporal_err)?,
-        )
-    } else {
-        None
-    };
+    // Per spec ordering: fractionalSecondDigits, roundingMode, smallestUnit, timeZone
 
     // fractionalSecondDigits
     let fsd_val = get_option_value(ncx, options_val, "fractionalSecondDigits")?;
@@ -901,7 +832,9 @@ fn parse_instant_to_string_options(
     } else if fsd_val.is_number() {
         let n = fsd_val.as_number().unwrap();
         if n.is_nan() {
-            return Err(VmError::range_error("fractionalSecondDigits must not be NaN"));
+            return Err(VmError::range_error(
+                "fractionalSecondDigits must not be NaN",
+            ));
         }
         let d = n.floor();
         if d < 0.0 || d > 9.0 || !d.is_finite() {
@@ -942,6 +875,15 @@ fn parse_instant_to_string_options(
     } else {
         let s = ncx.to_string_value(&su_val)?;
         Some(parse_temporal_unit(s.as_str())?)
+    };
+
+    // timeZone — read LAST per spec ordering
+    let tz_val = get_option_value(ncx, options_val, "timeZone")?;
+    let tz = if !tz_val.is_undefined() {
+        // Use to_temporal_timezone_identifier for type validation (TypeError for non-strings)
+        Some(to_temporal_timezone_identifier(ncx, &tz_val)?)
+    } else {
+        None
     };
 
     Ok((

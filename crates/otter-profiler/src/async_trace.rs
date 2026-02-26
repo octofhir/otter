@@ -6,6 +6,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+/// Top-level schema version for async trace JSON exports.
+pub const ASYNC_TRACE_SCHEMA_VERSION: u32 = 1;
+
 /// Async operation tracer
 pub struct AsyncTracer {
     /// Next span ID
@@ -87,24 +90,23 @@ impl AsyncTracer {
 
     /// Export to Chrome trace format
     pub fn to_chrome_trace(&self) -> serde_json::Value {
+        let now_us = self.start_time.elapsed().as_micros() as u64;
         let completed = self.completed.lock();
-        let events: Vec<_> = completed
+        let active = self.active.lock();
+        let mut events: Vec<_> = completed
             .iter()
-            .map(|span| {
-                serde_json::json!({
-                    "name": span.name,
-                    "cat": span.op_type,
-                    "ph": "X",
-                    "ts": span.start_us,
-                    "dur": span.end_us.unwrap_or(span.start_us) - span.start_us,
-                    "pid": 1,
-                    "tid": 1,
-                    "args": span.metadata,
-                })
-            })
+            .map(|span| span_to_trace_event(span, now_us, false))
             .collect();
+        events.extend(
+            active
+                .values()
+                .map(|span| span_to_trace_event(span, now_us, true)),
+        );
+        events.sort_by_key(|event| event["ts"].as_u64().unwrap_or(0));
 
         serde_json::json!({
+            "otterAsyncTraceSchemaVersion": ASYNC_TRACE_SCHEMA_VERSION,
+            "displayTimeUnit": "ms",
             "traceEvents": events
         })
     }
@@ -137,6 +139,32 @@ impl AsyncTracer {
             }]
         })
     }
+}
+
+fn span_to_trace_event(span: &AsyncSpan, now_us: u64, incomplete: bool) -> serde_json::Value {
+    let end_us = span.end_us.unwrap_or(now_us);
+    let mut args = serde_json::Map::new();
+    for (k, v) in &span.metadata {
+        args.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    args.insert("spanId".to_string(), serde_json::Value::from(span.id));
+    if let Some(parent_id) = span.parent_id {
+        args.insert("parentId".to_string(), serde_json::Value::from(parent_id));
+    }
+    if incomplete {
+        args.insert("incomplete".to_string(), serde_json::Value::Bool(true));
+    }
+
+    serde_json::json!({
+        "name": span.name,
+        "cat": span.op_type,
+        "ph": "X",
+        "ts": span.start_us,
+        "dur": end_us.saturating_sub(span.start_us),
+        "pid": 1,
+        "tid": 1,
+        "args": args,
+    })
 }
 
 impl Default for AsyncTracer {
@@ -186,9 +214,30 @@ mod tests {
         tracer.span_end(id);
 
         let trace = tracer.to_chrome_trace();
+        assert_eq!(
+            trace["otterAsyncTraceSchemaVersion"],
+            serde_json::json!(ASYNC_TRACE_SCHEMA_VERSION)
+        );
         let events = trace["traceEvents"].as_array().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["name"], "test_op");
+        assert!(events[0]["args"]["spanId"].is_number());
+    }
+
+    #[test]
+    fn test_chrome_trace_includes_active_spans_as_incomplete() {
+        let tracer = AsyncTracer::new();
+        let _id = tracer.span_start("pending_op", "jobs", None);
+
+        let trace = tracer.to_chrome_trace();
+        let events = trace["traceEvents"].as_array().expect("traceEvents array");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["name"], "pending_op");
+        assert_eq!(
+            events[0]["args"]["incomplete"],
+            serde_json::Value::Bool(true)
+        );
+        assert!(events[0]["dur"].as_u64().is_some());
     }
 
     #[test]

@@ -314,9 +314,9 @@ impl<'a> NativeContext<'a> {
             // Step 3d: If env.HasRestrictedGlobalProperty(name), throw SyntaxError.
             // A restricted global property is a non-configurable own property of the global object.
             // Configurable properties (e.g. from eval-created var bindings) are NOT restricted.
-            if let Some(desc) = global.get_own_property_descriptor(
-                &crate::object::PropertyKey::string(lex_name),
-            ) {
+            if let Some(desc) =
+                global.get_own_property_descriptor(&crate::object::PropertyKey::string(lex_name))
+            {
                 if !desc.is_configurable() {
                     return Err(VmError::SyntaxError(format!(
                         "Identifier '{}' has already been declared",
@@ -642,6 +642,9 @@ pub struct VmContextSnapshot {
     pub current_frame: Option<FrameSnapshot>,
     /// Full call stack for detailed debugging
     pub call_stack: Vec<FrameSnapshot>,
+    /// Captured JS stack frames prepared for CPU profiling.
+    #[cfg(feature = "profiling")]
+    pub profiler_stack: Vec<otter_profiler::StackFrame>,
 }
 
 impl VmContext {
@@ -1187,6 +1190,11 @@ impl VmContext {
         // Add trace buffer entries if available
         if let Some(trace_state) = &self.trace_state {
             snapshot.recent_instructions = trace_state.ring_buffer.iter().cloned().collect();
+        }
+
+        #[cfg(feature = "profiling")]
+        {
+            snapshot.profiler_stack = self.capture_profiler_stack();
         }
 
         *target.lock() = snapshot;

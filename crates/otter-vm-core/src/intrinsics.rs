@@ -2116,7 +2116,17 @@ impl Intrinsics {
                 + Sync,
         > = Box::new(|this, args, ncx| {
             let n = if let Some(arg) = args.first() {
-                ncx.to_number_value(arg)?
+                // Per spec: Number(value) uses ToNumeric first, then BigInt→Number if needed
+                if arg.is_bigint() {
+                    // BigInt::numberValue — convert BigInt to f64
+                    if let Some(crate::value::HeapRef::BigInt(b)) = arg.heap_ref() {
+                        b.value.parse::<f64>().unwrap_or(f64::NAN)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    ncx.to_number_value(arg)?
+                }
             } else {
                 0.0
             };

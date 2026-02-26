@@ -112,7 +112,9 @@ pub struct MemoryManager {
 impl MemoryManager {
     /// Create a new memory manager with the specified limit
     pub fn new(limit: usize) -> Self {
-        let gc_stress = std::env::var("GC_STRESS").map(|v| v == "1").unwrap_or(false);
+        let gc_stress = std::env::var("GC_STRESS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         Self {
             allocated: AtomicUsize::new(0),
             limit,

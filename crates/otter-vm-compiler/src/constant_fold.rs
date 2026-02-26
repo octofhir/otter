@@ -74,11 +74,7 @@ impl CompileTimeValue {
                 0i32
             } else {
                 let int = n.trunc() % 4294967296.0;
-                let int = if int < 0.0 {
-                    int + 4294967296.0
-                } else {
-                    int
-                };
+                let int = if int < 0.0 { int + 4294967296.0 } else { int };
                 if int >= 2147483648.0 {
                     (int - 4294967296.0) as i32
                 } else {
@@ -253,9 +249,7 @@ pub fn try_fold_unary(op: UnaryOperator, operand: &CompileTimeValue) -> Option<C
                 CompileTimeValue::Undefined => "undefined",
                 CompileTimeValue::BigInt(_) => "bigint",
             };
-            Some(CompileTimeValue::String(
-                type_str.encode_utf16().collect(),
-            ))
+            Some(CompileTimeValue::String(type_str.encode_utf16().collect()))
         }
         UnaryOperator::Void => Some(CompileTimeValue::Undefined),
         UnaryOperator::Delete => None, // Side effects
@@ -355,8 +349,12 @@ pub fn try_fold_binary(
         }
 
         // Comparisons
-        BinaryOperator::StrictEquality => fold_strict_equality(lhs, rhs).map(CompileTimeValue::Boolean),
-        BinaryOperator::StrictInequality => fold_strict_equality(lhs, rhs).map(|eq| CompileTimeValue::Boolean(!eq)),
+        BinaryOperator::StrictEquality => {
+            fold_strict_equality(lhs, rhs).map(CompileTimeValue::Boolean)
+        }
+        BinaryOperator::StrictInequality => {
+            fold_strict_equality(lhs, rhs).map(|eq| CompileTimeValue::Boolean(!eq))
+        }
         BinaryOperator::LessThan => fold_relational_number(lhs, rhs, |l, r| l < r),
         BinaryOperator::LessEqualThan => fold_relational_number(lhs, rhs, |l, r| l <= r),
         BinaryOperator::GreaterThan => fold_relational_number(lhs, rhs, |l, r| l > r),
@@ -517,10 +515,7 @@ mod tests {
     #[test]
     fn test_logical_not() {
         assert_eq!(
-            try_fold_unary(
-                UnaryOperator::LogicalNot,
-                &CompileTimeValue::Boolean(true)
-            ),
+            try_fold_unary(UnaryOperator::LogicalNot, &CompileTimeValue::Boolean(true)),
             Some(CompileTimeValue::Boolean(false))
         );
         assert_eq!(
@@ -528,10 +523,7 @@ mod tests {
             Some(CompileTimeValue::Boolean(true))
         );
         assert_eq!(
-            try_fold_unary(
-                UnaryOperator::LogicalNot,
-                &CompileTimeValue::String(vec![])
-            ),
+            try_fold_unary(UnaryOperator::LogicalNot, &CompileTimeValue::String(vec![])),
             Some(CompileTimeValue::Boolean(true))
         );
     }

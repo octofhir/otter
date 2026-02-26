@@ -1079,7 +1079,11 @@ pub fn init_array_prototype(
                 }
                 let result = array_species_create(&obj, len, ncx)?;
                 // Root result across call_function GC points
-                let result_val = if result.is_array() { Value::array(result) } else { Value::object(result) };
+                let result_val = if result.is_array() {
+                    Value::array(result)
+                } else {
+                    Value::object(result)
+                };
                 ncx.ctx.push_root_slot(result_val.clone());
                 let loop_result: Result<(), VmError> = (|| {
                     for i in 0..len {
@@ -1128,7 +1132,11 @@ pub fn init_array_prototype(
                 }
                 let result = array_species_create(&obj, 0, ncx)?;
                 // Root result across call_function GC points
-                let result_val = if result.is_array() { Value::array(result) } else { Value::object(result) };
+                let result_val = if result.is_array() {
+                    Value::array(result)
+                } else {
+                    Value::object(result)
+                };
                 ncx.ctx.push_root_slot(result_val.clone());
                 let mut out_idx = 0u32;
                 let loop_result: Result<(), VmError> = (|| {
@@ -1574,7 +1582,11 @@ pub fn init_array_prototype(
                 }
                 let result = array_species_create(&obj, 0, ncx)?;
                 // Root result across call_function GC points
-                let result_val = if result.is_array() { Value::array(result) } else { Value::object(result) };
+                let result_val = if result.is_array() {
+                    Value::array(result)
+                } else {
+                    Value::object(result)
+                };
                 ncx.ctx.push_root_slot(result_val.clone());
                 let mut out_idx = 0u32;
                 let loop_result: Result<(), VmError> = (|| {
@@ -1800,9 +1812,7 @@ pub fn init_array_prototype(
         arr_proto.define_property(
             PropertyKey::string("values"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
-                move |this_val, _args, ncx| {
-                    make_array_iterator(this_val, "value", ncx)
-                },
+                move |this_val, _args, ncx| make_array_iterator(this_val, "value", ncx),
                 mm.clone(),
                 fn_proto,
                 "values",
@@ -1814,9 +1824,7 @@ pub fn init_array_prototype(
         arr_proto.define_property(
             PropertyKey::string("keys"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
-                move |this_val, _args, ncx| {
-                    make_array_iterator(this_val, "key", ncx)
-                },
+                move |this_val, _args, ncx| make_array_iterator(this_val, "key", ncx),
                 mm.clone(),
                 fn_proto,
                 "keys",
@@ -1828,9 +1836,7 @@ pub fn init_array_prototype(
         arr_proto.define_property(
             PropertyKey::string("entries"),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
-                move |this_val, _args, ncx| {
-                    make_array_iterator(this_val, "entry", ncx)
-                },
+                move |this_val, _args, ncx| make_array_iterator(this_val, "entry", ncx),
                 mm.clone(),
                 fn_proto,
                 "entries",
@@ -1842,9 +1848,7 @@ pub fn init_array_prototype(
         arr_proto.define_property(
             PropertyKey::Symbol(sym_ref),
             PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
-                move |this_val, _args, ncx| {
-                    make_array_iterator(this_val, "value", ncx)
-                },
+                move |this_val, _args, ncx| make_array_iterator(this_val, "value", ncx),
                 mm.clone(),
                 fn_proto,
                 "values",
@@ -2201,8 +2205,9 @@ pub fn install_array_statics(
                                 let iter_obj = iterator.as_object().ok_or_else(|| {
                                     VmError::type_error("Array.from: iterator is not an object")
                                 })?;
-                                let next_fn =
-                                    iter_obj.get(&PropertyKey::string("next")).ok_or_else(|| {
+                                let next_fn = iter_obj
+                                    .get(&PropertyKey::string("next"))
+                                    .ok_or_else(|| {
                                         VmError::type_error(
                                             "Array.from: iterator.next is not defined",
                                         )

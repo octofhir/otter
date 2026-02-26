@@ -37,6 +37,7 @@ use crate::proxy::JsProxy;
 use crate::regexp::JsRegExp;
 use crate::shared_buffer::SharedArrayBuffer;
 use crate::string::JsString;
+use crate::temporal_value::TemporalValue;
 use crate::typed_array::JsTypedArray;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -181,6 +182,8 @@ pub enum HeapRef {
     WeakRef(GcRef<otter_vm_gc::WeakRefCell>),
     /// FinalizationRegistry data
     FinalizationRegistry(GcRef<otter_vm_gc::FinalizationRegistryData>),
+    /// Temporal value (PlainDate, PlainTime, Duration, etc.)
+    Temporal(GcRef<TemporalValue>),
 }
 
 impl std::fmt::Debug for HeapRef {
@@ -208,6 +211,7 @@ impl std::fmt::Debug for HeapRef {
             HeapRef::FinalizationRegistry(r) => {
                 f.debug_tuple("FinalizationRegistry").field(r).finish()
             }
+            HeapRef::Temporal(t) => f.debug_tuple("Temporal").field(t).finish(),
         }
     }
 }
@@ -558,6 +562,25 @@ impl Value {
         Self {
             bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
             heap_ref: Some(HeapRef::FinalizationRegistry(data)),
+        }
+    }
+
+    /// Create a Temporal value (PlainDate, PlainTime, Duration, etc.)
+    pub fn temporal(tv: TemporalValue) -> Self {
+        let gc = GcRef::new(tv);
+        let ptr = gc.as_ptr() as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::Temporal(gc)),
+        }
+    }
+
+    /// Create a Temporal value from a pre-allocated GcRef
+    pub fn temporal_ref(gc: GcRef<TemporalValue>) -> Self {
+        let ptr = gc.as_ptr() as u64;
+        Self {
+            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
+            heap_ref: Some(HeapRef::Temporal(gc)),
         }
     }
 
@@ -1186,6 +1209,14 @@ impl Value {
         }
     }
 
+    /// Get as Temporal value (PlainDate, PlainTime, Duration, etc.)
+    pub fn as_temporal(&self) -> Option<GcRef<TemporalValue>> {
+        match &self.heap_ref {
+            Some(HeapRef::Temporal(t)) => Some(*t),
+            _ => None,
+        }
+    }
+
     /// Get the heap reference (for structured clone)
     #[doc(hidden)]
     pub fn heap_ref(&self) -> &Option<HeapRef> {
@@ -1218,6 +1249,7 @@ impl Value {
             Some(HeapRef::EphemeronTable(e)) => Some(e.header() as *const _),
             Some(HeapRef::WeakRef(w)) => Some(w.header() as *const _),
             Some(HeapRef::FinalizationRegistry(r)) => Some(r.header() as *const _),
+            Some(HeapRef::Temporal(t)) => Some(t.header() as *const _),
             None => None,
         }
     }
@@ -1300,7 +1332,8 @@ impl Value {
                     | HeapRef::SetData(_)
                     | HeapRef::EphemeronTable(_)
                     | HeapRef::WeakRef(_)
-                    | HeapRef::FinalizationRegistry(_),
+                    | HeapRef::FinalizationRegistry(_)
+                    | HeapRef::Temporal(_),
                 ) => "object",
                 Some(HeapRef::Proxy(_)) => {
                     if self.is_callable() {
@@ -1368,6 +1401,7 @@ impl std::fmt::Debug for Value {
                 Some(HeapRef::FinalizationRegistry(r)) => {
                     write!(f, "[FinalizationRegistry {:?}]", r)
                 }
+                Some(HeapRef::Temporal(t)) => write!(f, "[Temporal {:?}]", t),
                 None => write!(f, "<unknown>"),
             },
         }
@@ -1586,6 +1620,10 @@ impl Value {
                 HeapRef::FinalizationRegistry(r) => {
                     // Trace the FinalizationRegistryData (traces callback + held values)
                     otter_vm_gc::GcTraceable::trace(&**r, tracer);
+                }
+                HeapRef::Temporal(t) => {
+                    // TemporalValue has no inner GC refs, but we still need to keep the allocation alive
+                    tracer(t.header() as *const _);
                 }
             }
         }

@@ -10,7 +10,7 @@ pub mod cpu;
 pub mod memory;
 pub mod stats;
 
-pub use async_trace::{AsyncSpan, AsyncTracer};
+pub use async_trace::{ASYNC_TRACE_SCHEMA_VERSION, AsyncSpan, AsyncTracer};
 pub use cpu::{CpuProfile, CpuProfiler, StackFrame};
 pub use memory::{
     HeapInfo, HeapInfoProvider, HeapSnapshot, HeapSnapshotDiff, MemoryProfiler, TypeStats,

@@ -1732,11 +1732,9 @@ pub fn init_object_constructor(
                     let mut k: u32 = 0;
                     loop {
                         let iter_result = ncx.call_function(&next_fn, iterator.clone(), &[])?;
-                        let iter_obj = iter_result
-                            .as_object()
-                            .ok_or_else(|| {
-                                VmError::type_error("Iterator result is not an object")
-                            })?;
+                        let iter_obj = iter_result.as_object().ok_or_else(|| {
+                            VmError::type_error("Iterator result is not an object")
+                        })?;
                         let done = iter_obj
                             .get(&PropertyKey::string("done"))
                             .unwrap_or(Value::undefined());
@@ -1774,13 +1772,12 @@ pub fn init_object_constructor(
                         };
 
                         if let Some(existing) = result.get(&prop_key) {
-                            if let Some(arr) =
-                                existing.as_array().or_else(|| existing.as_object())
+                            if let Some(arr) = existing.as_array().or_else(|| existing.as_object())
                             {
-                                let len = arr
-                                    .get(&PropertyKey::string("length"))
-                                    .and_then(|v| v.as_number())
-                                    .unwrap_or(0.0) as u32;
+                                let len =
+                                    arr.get(&PropertyKey::string("length"))
+                                        .and_then(|v| v.as_number())
+                                        .unwrap_or(0.0) as u32;
                                 let _ = arr.set(PropertyKey::Index(len), value);
                                 let _ = arr.set(
                                     PropertyKey::string("length"),

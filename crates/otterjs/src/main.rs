@@ -29,6 +29,14 @@ struct Cli {
     #[arg(value_name = "FILE")]
     file: Option<PathBuf>,
 
+    /// Arguments to pass to script (when using direct file shorthand)
+    #[arg(
+        value_name = "ARGS",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    file_args: Vec<String>,
+
     /// Evaluate argument as a script (silent, use -p to print result)
     #[arg(short = 'e', long = "eval")]
     eval: Option<String>,
@@ -108,6 +116,30 @@ struct Cli {
     /// Capture timing information in trace (adds overhead)
     #[arg(long, global = true)]
     trace_timing: bool,
+
+    /// Enable CPU sampling profiler (writes .cpuprofile and .folded outputs)
+    #[arg(long, global = true)]
+    cpu_prof: bool,
+
+    /// CPU profiler sampling interval in microseconds (default: 1000)
+    #[arg(long, global = true, default_value = "1000")]
+    cpu_prof_interval: u64,
+
+    /// CPU profile output base name (default: otter-<pid>-<ts>.cpuprofile)
+    #[arg(long, global = true)]
+    cpu_prof_name: Option<String>,
+
+    /// CPU profile output directory (default: current working directory)
+    #[arg(long, global = true)]
+    cpu_prof_dir: Option<PathBuf>,
+
+    /// Enable async/op trace export (Chrome Trace JSON)
+    #[arg(long, global = true)]
+    async_trace: bool,
+
+    /// Async trace output file (default: otter-<pid>-<ts>.trace.json)
+    #[arg(long, global = true)]
+    async_trace_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -133,6 +165,14 @@ enum Commands {
     Run {
         /// The script file to run
         file: PathBuf,
+
+        /// Arguments to pass to script
+        #[arg(
+            value_name = "ARGS",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        args: Vec<String>,
     },
     /// Interactive REPL
     Repl,
@@ -217,21 +257,21 @@ async fn main() -> Result<()> {
 
     // Handle --print flag (evaluate and print result)
     if let Some(ref code) = cli.print {
-        return run_code(code, "<eval>", &cli, true).await;
+        return run_code(code, "<eval>", &[], &cli, true).await;
     }
 
     // Handle --eval flag (evaluate silently, only console.log produces output)
     if let Some(ref code) = cli.eval {
-        return run_code(code, "<eval>", &cli, false).await;
+        return run_code(code, "<eval>", &[], &cli, false).await;
     }
 
     // Handle direct file argument (otter script.js)
     if let Some(ref file) = cli.file {
-        return run_file(file, &cli).await;
+        return run_file(file, &cli.file_args, &cli).await;
     }
 
     match &cli.command {
-        Some(Commands::Run { file }) => run_file(file, &cli).await,
+        Some(Commands::Run { file, args }) => run_file(file, args, &cli).await,
         Some(Commands::Repl) => run_repl(&cli).await,
         Some(Commands::Test {
             paths,
@@ -354,7 +394,7 @@ impl Drop for ResolveBaseDirGuard {
 }
 
 /// Run a JavaScript file
-async fn run_file(path: &PathBuf, cli: &Cli) -> Result<()> {
+async fn run_file(path: &PathBuf, script_args: &[String], cli: &Cli) -> Result<()> {
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read file: {}", path.display()))?;
 
@@ -363,11 +403,279 @@ async fn run_file(path: &PathBuf, cli: &Cli) -> Result<()> {
     let abs_path = std::fs::canonicalize(path)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(path));
     let source_url = abs_path.to_string_lossy();
-    run_code(&source, &source_url, cli, false).await
+    run_code(&source, &source_url, script_args, cli, false).await
+}
+
+struct ProcessArgvOverrideGuard;
+
+impl ProcessArgvOverrideGuard {
+    fn install(source_url: &str, script_args: &[String]) -> Self {
+        let argv_override = build_process_argv_override(source_url, script_args);
+        otter_engine::set_process_argv_override(argv_override);
+        Self
+    }
+}
+
+impl Drop for ProcessArgvOverrideGuard {
+    fn drop(&mut self) {
+        otter_engine::set_process_argv_override(None);
+    }
+}
+
+fn build_process_argv_override(source_url: &str, script_args: &[String]) -> Option<Vec<String>> {
+    if source_url == "<eval>" {
+        return None;
+    }
+
+    let exec_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "otter".to_string());
+    let script_path = source_url
+        .strip_prefix("file://")
+        .unwrap_or(source_url)
+        .to_string();
+
+    let mut argv = Vec::with_capacity(script_args.len() + 2);
+    argv.push(exec_path);
+    argv.push(script_path);
+    argv.extend(script_args.iter().cloned());
+    Some(argv)
+}
+
+struct CpuSamplingSession {
+    profiler: std::sync::Arc<otter_profiler::CpuProfiler>,
+    stop_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    sampler_handle: tokio::task::JoinHandle<()>,
+    cpuprofile_path: PathBuf,
+    folded_path: PathBuf,
+}
+
+struct CpuProfileArtifacts {
+    cpuprofile_path: PathBuf,
+    folded_path: PathBuf,
+    sample_count: usize,
+}
+
+struct AsyncTraceArtifacts {
+    trace_path: PathBuf,
+    span_count: usize,
+}
+
+fn default_cpu_profile_name() -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_secs();
+    format!("otter-{}-{}.cpuprofile", std::process::id(), ts)
+}
+
+fn default_async_trace_name() -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_secs();
+    format!("otter-{}-{}.trace.json", std::process::id(), ts)
+}
+
+fn resolve_cpu_profile_paths(cli: &Cli) -> Result<(PathBuf, PathBuf)> {
+    let dir = if let Some(dir) = &cli.cpu_prof_dir {
+        dir.clone()
+    } else {
+        std::env::current_dir().context("Failed to get current directory for --cpu-prof-dir")?
+    };
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create profile output dir {}", dir.display()))?;
+
+    let base_name = cli
+        .cpu_prof_name
+        .clone()
+        .unwrap_or_else(default_cpu_profile_name);
+    let cpuprofile_name = if base_name.ends_with(".cpuprofile") {
+        base_name
+    } else {
+        format!("{}.cpuprofile", base_name)
+    };
+
+    let cpuprofile_path = dir.join(cpuprofile_name);
+    let folded_path = cpuprofile_path.with_extension("folded");
+    Ok((cpuprofile_path, folded_path))
+}
+
+fn resolve_async_trace_path(cli: &Cli) -> Result<PathBuf> {
+    if let Some(path) = &cli.async_trace_file {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create async trace output dir {}",
+                    parent.display()
+                )
+            })?;
+        }
+        return Ok(path.clone());
+    }
+
+    let cwd =
+        std::env::current_dir().context("Failed to get current directory for --async-trace")?;
+    Ok(cwd.join(default_async_trace_name()))
+}
+
+fn finish_async_trace(
+    engine: &otter_engine::Otter,
+    cli: &Cli,
+) -> Result<Option<AsyncTraceArtifacts>> {
+    if !cli.async_trace {
+        return Ok(None);
+    }
+
+    let trace_path = resolve_async_trace_path(cli)?;
+    let trace_json = engine.async_trace_json().unwrap_or_else(|| {
+        serde_json::json!({
+            "otterAsyncTraceSchemaVersion": otter_profiler::ASYNC_TRACE_SCHEMA_VERSION,
+            "displayTimeUnit": "ms",
+            "traceEvents": []
+        })
+    });
+    let span_count = trace_json["traceEvents"]
+        .as_array()
+        .map(|events| events.len())
+        .unwrap_or(0);
+    let bytes =
+        serde_json::to_vec_pretty(&trace_json).context("Failed to serialize async trace JSON")?;
+    std::fs::write(&trace_path, bytes)
+        .with_context(|| format!("Failed to write async trace to {}", trace_path.display()))?;
+
+    Ok(Some(AsyncTraceArtifacts {
+        trace_path,
+        span_count,
+    }))
+}
+
+fn snapshot_to_profiler_frames(
+    snapshot: &otter_engine::VmContextSnapshot,
+) -> Vec<otter_profiler::StackFrame> {
+    if !snapshot.profiler_stack.is_empty() {
+        return snapshot.profiler_stack.clone();
+    }
+
+    fn normalized_function_name(name: Option<&String>) -> String {
+        if let Some(name) = name {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        "(anonymous)".to_string()
+    }
+
+    let mut frames = Vec::new();
+
+    if !snapshot.call_stack.is_empty() {
+        // Snapshot call_stack is top->bottom; convert to bottom->top.
+        for frame in snapshot.call_stack.iter().rev() {
+            frames.push(otter_profiler::StackFrame {
+                function: normalized_function_name(frame.function_name.as_ref()),
+                file: Some(frame.module_url.clone()),
+                line: None,
+                column: None,
+            });
+        }
+        return frames;
+    }
+
+    if let Some(frame) = &snapshot.current_frame {
+        frames.push(otter_profiler::StackFrame {
+            function: normalized_function_name(frame.function_name.as_ref()),
+            file: Some(frame.module_url.clone()),
+            line: None,
+            column: None,
+        });
+    }
+
+    frames
+}
+
+fn start_cpu_sampling(
+    engine: &otter_engine::Otter,
+    cli: &Cli,
+) -> Result<Option<CpuSamplingSession>> {
+    if !cli.cpu_prof {
+        return Ok(None);
+    }
+
+    let (cpuprofile_path, folded_path) = resolve_cpu_profile_paths(cli)?;
+    let interval = std::time::Duration::from_micros(cli.cpu_prof_interval.max(100));
+
+    let profiler = std::sync::Arc::new(otter_profiler::CpuProfiler::with_interval(interval));
+    profiler.start();
+
+    let stop_signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let snapshot_handle = engine.debug_snapshot_handle();
+    let sampler_profiler = std::sync::Arc::clone(&profiler);
+    let sampler_stop = std::sync::Arc::clone(&stop_signal);
+
+    let sampler_handle = tokio::spawn(async move {
+        while !sampler_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let snapshot = snapshot_handle.lock().clone();
+            let frames = snapshot_to_profiler_frames(&snapshot);
+            if !frames.is_empty() {
+                sampler_profiler.record_sample(frames);
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+
+    Ok(Some(CpuSamplingSession {
+        profiler,
+        stop_signal,
+        sampler_handle,
+        cpuprofile_path,
+        folded_path,
+    }))
+}
+
+fn finish_cpu_sampling(session: CpuSamplingSession) -> Result<CpuProfileArtifacts> {
+    session
+        .stop_signal
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    session.sampler_handle.abort();
+
+    let profile = session.profiler.stop();
+    let cpuprofile = profile.to_cpuprofile();
+    let folded = profile.to_folded();
+    let sample_count = profile.sample_count;
+
+    let cpuprofile_bytes =
+        serde_json::to_vec_pretty(&cpuprofile).context("Failed to serialize cpuprofile JSON")?;
+    std::fs::write(&session.cpuprofile_path, cpuprofile_bytes).with_context(|| {
+        format!(
+            "Failed to write cpuprofile to {}",
+            session.cpuprofile_path.display()
+        )
+    })?;
+    std::fs::write(&session.folded_path, folded).with_context(|| {
+        format!(
+            "Failed to write folded stacks to {}",
+            session.folded_path.display()
+        )
+    })?;
+
+    Ok(CpuProfileArtifacts {
+        cpuprofile_path: session.cpuprofile_path,
+        folded_path: session.folded_path,
+        sample_count,
+    })
 }
 
 /// Run JavaScript code using EngineBuilder
-async fn run_code(source: &str, source_url: &str, cli: &Cli, print_result: bool) -> Result<()> {
+async fn run_code(
+    source: &str,
+    source_url: &str,
+    script_args: &[String],
+    cli: &Cli,
+    print_result: bool,
+) -> Result<()> {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
@@ -393,6 +701,7 @@ async fn run_code(source: &str, source_url: &str, cli: &Cli, print_result: bool)
         None
     };
 
+    let _argv_override_guard = ProcessArgvOverrideGuard::install(source_url, script_args);
     let caps = build_capabilities(cli);
 
     // Create engine with builtins (EngineBuilder handles all setup)
@@ -400,6 +709,7 @@ async fn run_code(source: &str, source_url: &str, cli: &Cli, print_result: bool)
         let _resolve_guard = ResolveBaseDirGuard::from_source_url(source_url)?;
         build_engine(cli, caps)
     };
+    engine.set_async_trace_enabled(cli.async_trace);
 
     // Configure trace (either for full trace or timeout dumps)
     if cli.trace {
@@ -440,6 +750,8 @@ async fn run_code(source: &str, source_url: &str, cli: &Cli, print_result: bool)
         None
     };
 
+    let cpu_sampling = start_cpu_sampling(&engine, cli)?;
+
     // Execute code
     let result = engine.eval(source, Some(source_url)).await;
 
@@ -447,6 +759,13 @@ async fn run_code(source: &str, source_url: &str, cli: &Cli, print_result: bool)
     if let Some(handle) = timeout_handle {
         handle.abort();
     }
+
+    let cpu_profile_artifacts = if let Some(session) = cpu_sampling {
+        Some(finish_cpu_sampling(session)?)
+    } else {
+        None
+    };
+    let async_trace_artifacts = finish_async_trace(&engine, cli)?;
 
     match result {
         Ok(value) => {
@@ -503,6 +822,22 @@ async fn run_code(source: &str, source_url: &str, cli: &Cli, print_result: bool)
                 println!("╰─────────────────────────────────────╯");
             }
 
+            if let Some(artifacts) = cpu_profile_artifacts {
+                eprintln!(
+                    "CPU profile written: {} (samples={})",
+                    artifacts.cpuprofile_path.display(),
+                    artifacts.sample_count
+                );
+                eprintln!("Folded stacks written: {}", artifacts.folded_path.display());
+            }
+            if let Some(artifacts) = async_trace_artifacts {
+                eprintln!(
+                    "Async trace written: {} (spans={})",
+                    artifacts.trace_path.display(),
+                    artifacts.span_count
+                );
+            }
+
             Ok(())
         }
         Err(e) => {
@@ -512,11 +847,41 @@ async fn run_code(source: &str, source_url: &str, cli: &Cli, print_result: bool)
                 if cli.dump_on_timeout {
                     dump_timeout_info(&engine, &cli, Some(source_url));
                 }
+                if let Some(artifacts) = cpu_profile_artifacts {
+                    eprintln!(
+                        "CPU profile written: {} (samples={})",
+                        artifacts.cpuprofile_path.display(),
+                        artifacts.sample_count
+                    );
+                    eprintln!("Folded stacks written: {}", artifacts.folded_path.display());
+                }
+                if let Some(artifacts) = async_trace_artifacts {
+                    eprintln!(
+                        "Async trace written: {} (spans={})",
+                        artifacts.trace_path.display(),
+                        artifacts.span_count
+                    );
+                }
                 Err(anyhow::anyhow!(
                     "Execution timed out after {} seconds",
                     cli.timeout
                 ))
             } else {
+                if let Some(artifacts) = cpu_profile_artifacts {
+                    eprintln!(
+                        "CPU profile written: {} (samples={})",
+                        artifacts.cpuprofile_path.display(),
+                        artifacts.sample_count
+                    );
+                    eprintln!("Folded stacks written: {}", artifacts.folded_path.display());
+                }
+                if let Some(artifacts) = async_trace_artifacts {
+                    eprintln!(
+                        "Async trace written: {} (spans={})",
+                        artifacts.trace_path.display(),
+                        artifacts.span_count
+                    );
+                }
                 Err(anyhow::anyhow!("{}", e))
             }
         }
@@ -1104,5 +1469,575 @@ mod tests {
         let cli =
             Cli::try_parse_from(["otter", "--node-api", "safe-core", "repl"]).expect("cli parse");
         assert!(matches!(cli.node_api, NodeApiMode::SafeCore));
+    }
+
+    #[test]
+    fn cpu_prof_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "otter",
+            "--cpu-prof",
+            "--cpu-prof-interval",
+            "500",
+            "--cpu-prof-name",
+            "bench.cpuprofile",
+            "--cpu-prof-dir",
+            "/tmp/otter-prof",
+            "repl",
+        ])
+        .expect("cli parse");
+
+        assert!(cli.cpu_prof);
+        assert_eq!(cli.cpu_prof_interval, 500);
+        assert_eq!(cli.cpu_prof_name.as_deref(), Some("bench.cpuprofile"));
+        assert_eq!(
+            cli.cpu_prof_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            Some("/tmp/otter-prof".to_string())
+        );
+    }
+
+    #[test]
+    fn cpu_prof_is_off_by_default() {
+        let cli = Cli::try_parse_from(["otter", "repl"]).expect("cli parse");
+        assert!(!cli.cpu_prof, "cpu profiler must be opt-in");
+    }
+
+    #[test]
+    fn async_trace_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "otter",
+            "--async-trace",
+            "--async-trace-file",
+            "/tmp/otter-async-trace.json",
+            "repl",
+        ])
+        .expect("cli parse");
+
+        assert!(cli.async_trace);
+        assert_eq!(
+            cli.async_trace_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            Some("/tmp/otter-async-trace.json".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_cpu_profile_paths_adds_extensions() {
+        let temp_dir = std::env::temp_dir().join("otter-profiler-path-test");
+        let cli = Cli::try_parse_from([
+            "otter",
+            "--cpu-prof",
+            "--cpu-prof-name",
+            "run",
+            "--cpu-prof-dir",
+            temp_dir.to_string_lossy().as_ref(),
+            "repl",
+        ])
+        .expect("cli parse");
+
+        let (cpuprofile, folded) = resolve_cpu_profile_paths(&cli).expect("paths");
+        assert!(cpuprofile.ends_with("run.cpuprofile"));
+        assert!(folded.ends_with("run.folded"));
+    }
+
+    #[test]
+    fn run_subcommand_parses_script_args() {
+        let cli = Cli::try_parse_from([
+            "otter",
+            "run",
+            "benchmarks/cpu/flamegraph.ts",
+            "math",
+            "2",
+            "--flag-like",
+        ])
+        .expect("cli parse");
+
+        match cli.command {
+            Some(Commands::Run { file, args }) => {
+                assert_eq!(file, PathBuf::from("benchmarks/cpu/flamegraph.ts"));
+                assert_eq!(args, vec!["math", "2", "--flag-like"]);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn shorthand_file_parses_script_args() {
+        let cli = Cli::try_parse_from([
+            "otter",
+            "benchmarks/cpu/flamegraph.ts",
+            "json",
+            "3",
+            "--flag-like",
+        ])
+        .expect("cli parse");
+
+        assert_eq!(
+            cli.file,
+            Some(PathBuf::from("benchmarks/cpu/flamegraph.ts"))
+        );
+        assert_eq!(cli.file_args, vec!["json", "3", "--flag-like"]);
+    }
+
+    #[test]
+    fn build_process_argv_override_includes_exec_and_script() {
+        let args = vec!["phase".to_string(), "2".to_string()];
+        let argv = build_process_argv_override("/tmp/workload.ts", &args).expect("argv");
+        assert!(argv.len() >= 4);
+        assert_eq!(argv[1], "/tmp/workload.ts");
+        assert_eq!(argv[2], "phase");
+        assert_eq!(argv[3], "2");
+    }
+
+    #[test]
+    fn snapshot_to_profiler_frames_prefers_vm_profiler_stack() {
+        let mut snapshot = otter_engine::VmContextSnapshot::default();
+        snapshot.profiler_stack.push(otter_profiler::StackFrame {
+            function: "vm_fn".to_string(),
+            file: Some("vm.ts".to_string()),
+            line: Some(7),
+            column: Some(3),
+        });
+
+        let frames = snapshot_to_profiler_frames(&snapshot);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].function, "vm_fn");
+        assert_eq!(frames[0].file.as_deref(), Some("vm.ts"));
+        assert_eq!(frames[0].line, Some(7));
+        assert_eq!(frames[0].column, Some(3));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn cpu_prof_e2e_generates_devtools_compatible_artifacts() {
+        let unique = format!(
+            "otter-cpu-prof-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let script_path = temp_dir.join("cpu-prof-e2e.ts");
+        std::fs::write(
+            &script_path,
+            r#"
+            const start = Date.now();
+            let spin = 0;
+            while (Date.now() - start < 30) {
+                spin++;
+            }
+            console.log(spin);
+            "#,
+        )
+        .expect("write script");
+
+        let temp_dir_arg = temp_dir.to_string_lossy().to_string();
+        let script_arg = script_path.to_string_lossy().to_string();
+        let cli = Cli::try_parse_from([
+            "otter",
+            "--cpu-prof",
+            "--cpu-prof-interval",
+            "200",
+            "--cpu-prof-name",
+            "e2e.cpuprofile",
+            "--cpu-prof-dir",
+            temp_dir_arg.as_str(),
+            "run",
+            script_arg.as_str(),
+        ])
+        .expect("cli parse");
+
+        let script_args: Vec<String> = Vec::new();
+        run_file(&script_path, &script_args, &cli)
+            .await
+            .expect("run file with cpu profiler");
+
+        let cpuprofile_path = temp_dir.join("e2e.cpuprofile");
+        let folded_path = temp_dir.join("e2e.folded");
+        assert!(cpuprofile_path.exists(), "missing cpuprofile output");
+        assert!(folded_path.exists(), "missing folded output");
+
+        let cpuprofile_raw = std::fs::read(&cpuprofile_path).expect("read cpuprofile");
+        let cpuprofile: serde_json::Value =
+            serde_json::from_slice(&cpuprofile_raw).expect("parse cpuprofile JSON");
+
+        assert!(cpuprofile["nodes"].is_array());
+        assert!(cpuprofile["samples"].is_array());
+        assert!(cpuprofile["timeDeltas"].is_array());
+        assert!(cpuprofile["startTime"].is_number());
+        assert!(cpuprofile["endTime"].is_number());
+
+        let samples = cpuprofile["samples"].as_array().expect("samples array");
+        let deltas = cpuprofile["timeDeltas"]
+            .as_array()
+            .expect("timeDeltas array");
+        assert_eq!(samples.len(), deltas.len());
+        assert!(
+            !samples.is_empty(),
+            "expected profiler to capture at least one sample"
+        );
+
+        let first_node = cpuprofile["nodes"]
+            .as_array()
+            .and_then(|nodes| nodes.first())
+            .expect("cpuprofile node");
+        let call_frame = first_node["callFrame"].as_object().expect("callFrame");
+        for key in [
+            "functionName",
+            "scriptId",
+            "url",
+            "lineNumber",
+            "columnNumber",
+        ] {
+            assert!(call_frame.contains_key(key), "missing callFrame key: {key}");
+        }
+
+        let folded = std::fs::read_to_string(&folded_path).expect("read folded");
+        assert!(
+            !folded.trim().is_empty(),
+            "folded output should not be empty"
+        );
+        for line in folded.lines().filter(|line| !line.trim().is_empty()) {
+            let mut parts = line.rsplitn(2, ' ');
+            let count = parts.next().expect("count");
+            let stack = parts.next().expect("stack");
+            assert!(
+                count.parse::<u64>().is_ok(),
+                "invalid folded count in line: {line}"
+            );
+            assert!(
+                !stack.trim().is_empty(),
+                "empty folded stack in line: {line}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn cpu_prof_off_by_default_emits_no_profile_artifacts() {
+        let unique = format!(
+            "otter-cpu-prof-default-off-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let script_path = temp_dir.join("cpu-prof-default-off.ts");
+        std::fs::write(
+            &script_path,
+            r#"
+            let x = 0;
+            for (let i = 0; i < 1000; i++) x += i;
+            console.log(x);
+            "#,
+        )
+        .expect("write script");
+
+        let script_arg = script_path.to_string_lossy().to_string();
+        let cli = Cli::try_parse_from(["otter", "run", script_arg.as_str()]).expect("cli parse");
+        assert!(!cli.cpu_prof, "cpu profiler should be disabled by default");
+
+        let script_args: Vec<String> = Vec::new();
+        run_file(&script_path, &script_args, &cli)
+            .await
+            .expect("run file without cpu profiler");
+
+        let mut generated_profiles = Vec::new();
+        for entry in std::fs::read_dir(&temp_dir).expect("read temp dir entries") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("cpuprofile")
+                || path.extension().and_then(|ext| ext.to_str()) == Some("folded")
+            {
+                generated_profiles.push(path);
+            }
+        }
+
+        assert!(
+            generated_profiles.is_empty(),
+            "expected no profile artifacts when --cpu-prof is not set, found: {:?}",
+            generated_profiles
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn async_trace_e2e_generates_chrome_trace_json() {
+        let unique = format!(
+            "otter-async-trace-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let script_path = temp_dir.join("async-trace-e2e.ts");
+        std::fs::write(
+            &script_path,
+            r#"
+            queueMicrotask(() => {});
+            await new Promise((resolve) => setTimeout(resolve, 1));
+            "#,
+        )
+        .expect("write script");
+
+        let trace_path = temp_dir.join("async.trace.json");
+        let script_arg = script_path.to_string_lossy().to_string();
+        let trace_arg = trace_path.to_string_lossy().to_string();
+
+        let cli = Cli::try_parse_from([
+            "otter",
+            "--async-trace",
+            "--async-trace-file",
+            trace_arg.as_str(),
+            "run",
+            script_arg.as_str(),
+        ])
+        .expect("cli parse");
+
+        let script_args: Vec<String> = Vec::new();
+        run_file(&script_path, &script_args, &cli)
+            .await
+            .expect("run file with async trace");
+
+        assert!(trace_path.exists(), "missing async trace output");
+        let trace_raw = std::fs::read(&trace_path).expect("read trace");
+        let trace: serde_json::Value =
+            serde_json::from_slice(&trace_raw).expect("parse async trace JSON");
+        assert_eq!(
+            trace["otterAsyncTraceSchemaVersion"],
+            serde_json::json!(otter_profiler::ASYNC_TRACE_SCHEMA_VERSION)
+        );
+        let events = trace["traceEvents"].as_array().expect("traceEvents array");
+        assert!(
+            !events.is_empty(),
+            "expected async trace to contain at least one span"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["name"] == "setTimeout" || event["name"] == "queueMicrotask"),
+            "expected timers/jobs spans in async trace"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["cat"] == "timers" || event["cat"] == "jobs"),
+            "expected timers/jobs categories in async trace"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn trace_e2e_generates_chrome_perfetto_compatible_json() {
+        let unique = format!(
+            "otter-trace-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let script_path = temp_dir.join("trace-e2e.ts");
+        std::fs::write(
+            &script_path,
+            r#"
+            let acc = 0;
+            for (let i = 0; i < 64; i++) {
+                acc += i;
+            }
+            console.log(acc);
+            "#,
+        )
+        .expect("write script");
+
+        let trace_path = temp_dir.join("vm.trace.json");
+        let script_arg = script_path.to_string_lossy().to_string();
+        let trace_arg = trace_path.to_string_lossy().to_string();
+        let cli = Cli::try_parse_from([
+            "otter",
+            "--trace",
+            "--trace-file",
+            trace_arg.as_str(),
+            "run",
+            script_arg.as_str(),
+        ])
+        .expect("cli parse");
+
+        let script_args: Vec<String> = Vec::new();
+        run_file(&script_path, &script_args, &cli)
+            .await
+            .expect("run file with trace");
+
+        assert!(trace_path.exists(), "missing trace output");
+        let trace_raw = std::fs::read(&trace_path).expect("read trace");
+        let trace: serde_json::Value =
+            serde_json::from_slice(&trace_raw).expect("parse trace JSON");
+        assert_eq!(
+            trace["otterTraceSchemaVersion"],
+            serde_json::json!(otter_vm_core::trace::TRACE_EVENT_SCHEMA_VERSION)
+        );
+
+        let events = trace["traceEvents"].as_array().expect("traceEvents array");
+        assert!(!events.is_empty(), "expected trace events");
+        for event in events {
+            assert!(event["name"].is_string(), "event name must be string");
+            assert_eq!(event["cat"], "vm.instruction");
+            assert_eq!(event["ph"], "X");
+            assert!(event["ts"].is_number(), "event ts must be numeric");
+            assert!(event["dur"].is_number(), "event dur must be numeric");
+            assert!(event["pid"].is_number(), "event pid must be numeric");
+            assert!(event["tid"].is_number(), "event tid must be numeric");
+
+            let args = event["args"].as_object().expect("event args object");
+            for key in [
+                "module",
+                "function",
+                "pc",
+                "function_index",
+                "operands",
+                "modified_registers",
+            ] {
+                assert!(args.contains_key(key), "missing trace args key: {key}");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn timeout_dump_is_reproducible_for_immediate_interrupt() {
+        fn extract_instruction_opcodes(dump: &str) -> Vec<String> {
+            dump.lines()
+                .filter_map(|line| {
+                    let trimmed = line.trim_start();
+                    let (prefix, suffix) = trimmed.split_once(':')?;
+                    if !prefix
+                        .chars()
+                        .all(|ch| ch.is_ascii_digit() || ch.is_ascii_whitespace())
+                    {
+                        return None;
+                    }
+                    let opcode = suffix.split_whitespace().next()?;
+                    Some(opcode.to_string())
+                })
+                .collect()
+        }
+
+        async fn write_timeout_dump(
+            cli: &Cli,
+            source: &str,
+            source_url: &str,
+        ) -> (String, std::path::PathBuf) {
+            let caps = build_capabilities(cli);
+            let mut engine = build_engine(cli, caps);
+            engine.set_trace_config(otter_vm_core::TraceConfig {
+                enabled: true,
+                mode: otter_vm_core::TraceMode::RingBuffer,
+                ring_buffer_size: cli.dump_buffer_size,
+                output_path: cli.dump_file.clone(),
+                filter: None,
+                capture_timing: false,
+            });
+
+            let interrupt_flag = engine.interrupt_flag();
+            let interrupt_task = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                interrupt_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            let err = engine
+                .eval(source, Some(source_url))
+                .await
+                .expect_err("execution should be interrupted");
+            interrupt_task.abort();
+            assert!(
+                err.to_string().to_lowercase().contains("interrupt"),
+                "expected interrupted error, got: {err}"
+            );
+
+            dump_timeout_info(&engine, cli, Some(source_url));
+            let dump_path = cli.dump_file.clone().expect("dump file path");
+            let dump = std::fs::read_to_string(&dump_path).expect("read timeout dump");
+            (dump, dump_path)
+        }
+
+        let unique = format!(
+            "otter-timeout-repro-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let source = "let x = 0; while (true) { x++; }";
+        let source_url = "timeout-repro.js";
+        let dump_one_path = temp_dir.join("timeout-one.txt");
+        let dump_two_path = temp_dir.join("timeout-two.txt");
+        let dump_one_arg = dump_one_path.to_string_lossy().to_string();
+        let dump_two_arg = dump_two_path.to_string_lossy().to_string();
+
+        let cli_one = Cli::try_parse_from([
+            "otter",
+            "--timeout",
+            "1",
+            "--dump-on-timeout",
+            "--dump-file",
+            dump_one_arg.as_str(),
+            "repl",
+        ])
+        .expect("cli one parse");
+        let cli_two = Cli::try_parse_from([
+            "otter",
+            "--timeout",
+            "1",
+            "--dump-on-timeout",
+            "--dump-file",
+            dump_two_arg.as_str(),
+            "repl",
+        ])
+        .expect("cli two parse");
+
+        let (dump_one, dump_one_path) = write_timeout_dump(&cli_one, source, source_url).await;
+        let (dump_two, dump_two_path) = write_timeout_dump(&cli_two, source, source_url).await;
+
+        assert!(
+            dump_one.contains("Recent Instructions"),
+            "timeout dump should include trace section"
+        );
+        let opcodes_one = extract_instruction_opcodes(&dump_one);
+        let opcodes_two = extract_instruction_opcodes(&dump_two);
+        assert!(
+            !opcodes_one.is_empty(),
+            "expected timeout dump to include instruction opcode lines"
+        );
+        assert_eq!(
+            opcodes_one, opcodes_two,
+            "timeout dump opcode sequence should be reproducible across identical runs"
+        );
+
+        let _ = std::fs::remove_file(dump_one_path);
+        let _ = std::fs::remove_file(dump_two_path);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

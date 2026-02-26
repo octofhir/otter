@@ -33,6 +33,8 @@ use otter_vm_core::isolate::{Isolate, IsolateConfig};
 use crate::event_loop::{ActiveServerCount, EventLoop, HttpEvent, WsEvent};
 use crate::extension::{AsyncOpFn, ExtensionRegistry, OpHandler};
 use crate::microtask::{JsJobQueueWrapper, NextTickQueueWrapper};
+#[cfg(feature = "profiling")]
+use otter_profiler::AsyncTracer;
 
 /// Signal for async resume - stores resolved/rejected value
 struct ResumeSignal {
@@ -66,6 +68,30 @@ impl ResumeSignal {
 
     fn take_value(&self) -> Option<Result<Value, Value>> {
         self.value.lock().take()
+    }
+}
+
+#[cfg(feature = "profiling")]
+fn op_trace_category(op_name: &str) -> &'static str {
+    let op = op_name.to_ascii_lowercase();
+    if op.contains("timer") || op.contains("timeout") || op.contains("interval") {
+        "timers"
+    } else if op.contains("fetch") || op.contains("http") {
+        "fetch"
+    } else if op.contains("fs") {
+        "fs"
+    } else if op.contains("net") || op.contains("ws") || op.contains("socket") {
+        "net"
+    } else if op.contains("job")
+        || op.contains("microtask")
+        || op.contains("nexttick")
+        || op.contains("next_tick")
+    {
+        "jobs"
+    } else if op.contains("module") || op.contains("import") || op.contains("require") {
+        "modules"
+    } else {
+        "ops"
     }
 }
 
@@ -103,6 +129,9 @@ pub struct Otter {
     debug_snapshot: Arc<parking_lot::Mutex<VmContextSnapshot>>,
     /// Trace configuration (if tracing is enabled)
     trace_config: Option<otter_vm_core::TraceConfig>,
+    /// Async operation tracer for Chrome Trace-compatible output
+    #[cfg(feature = "profiling")]
+    async_tracer: Option<Arc<AsyncTracer>>,
     /// Stored realm contexts created via createRealm().
     realms: Arc<parking_lot::Mutex<Vec<RealmSlot>>>,
 }
@@ -148,6 +177,8 @@ impl Otter {
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             debug_snapshot: Arc::new(parking_lot::Mutex::new(VmContextSnapshot::default())),
             trace_config: None,
+            #[cfg(feature = "profiling")]
+            async_tracer: None,
             realms: Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
     }
@@ -225,6 +256,37 @@ impl Otter {
     /// Set trace configuration for instruction-level tracing
     pub fn set_trace_config(&mut self, config: otter_vm_core::TraceConfig) {
         self.trace_config = Some(config);
+    }
+
+    /// Enable or disable async operation tracing.
+    ///
+    /// When enabled, op dispatch/complete spans are captured and can be exported
+    /// via [`Otter::async_trace_json`].
+    #[cfg(feature = "profiling")]
+    pub fn set_async_trace_enabled(&mut self, enabled: bool) {
+        self.async_tracer = if enabled {
+            Some(Arc::new(AsyncTracer::new()))
+        } else {
+            None
+        };
+    }
+
+    /// No-op fallback when profiling feature is disabled.
+    #[cfg(not(feature = "profiling"))]
+    pub fn set_async_trace_enabled(&mut self, _enabled: bool) {}
+
+    /// Export async trace in Chrome Trace Event JSON format.
+    #[cfg(feature = "profiling")]
+    pub fn async_trace_json(&self) -> Option<serde_json::Value> {
+        self.async_tracer
+            .as_ref()
+            .map(|tracer| tracer.to_chrome_trace())
+    }
+
+    /// Return no trace when profiling feature is disabled.
+    #[cfg(not(feature = "profiling"))]
+    pub fn async_trace_json(&self) -> Option<serde_json::Value> {
+        None
     }
 
     /// Dump formatted snapshot to writer (useful for debugging timeouts)
@@ -1283,28 +1345,88 @@ impl Otter {
 
         match handler {
             OpHandler::Native(native_fn) => {
+                #[cfg(feature = "profiling")]
+                let tracer = self.async_tracer.clone();
+                #[cfg(feature = "profiling")]
+                let op_name_for_trace = _name.clone();
+                #[cfg(feature = "profiling")]
+                let op_category_for_trace = op_trace_category(&_name).to_string();
+
                 // Native ops work directly with Value
                 Value::native_function_with_proto(
-                    move |_this, args, ncx| native_fn(args, ncx.memory_manager().clone()),
+                    move |_this, args, ncx| {
+                        #[cfg(feature = "profiling")]
+                        let span_id = tracer.as_ref().map(|tracer| {
+                            let id =
+                                tracer.span_start(&op_name_for_trace, &op_category_for_trace, None);
+                            tracer.add_metadata(id, "kind", "native_op");
+                            tracer.add_metadata(id, "args_len", &args.len().to_string());
+                            id
+                        });
+
+                        let outcome = native_fn(args, ncx.memory_manager().clone());
+
+                        #[cfg(feature = "profiling")]
+                        if let (Some(tracer), Some(id)) = (tracer.as_ref(), span_id) {
+                            tracer.span_end(id);
+                        }
+
+                        outcome
+                    },
                     mm,
                     fn_proto,
                 )
             }
             OpHandler::Sync(sync_fn) => {
+                #[cfg(feature = "profiling")]
+                let tracer = self.async_tracer.clone();
+                #[cfg(feature = "profiling")]
+                let op_name_for_trace = _name.clone();
+                #[cfg(feature = "profiling")]
+                let op_category_for_trace = op_trace_category(&_name).to_string();
+
                 // Sync JSON ops need Value -> JSON -> Value conversion
                 let mm_inner = mm.clone();
                 Value::native_function_with_proto(
                     move |_this, args, _mm_ignored| {
-                        let json_args: Vec<serde_json::Value> =
-                            args.iter().map(value_to_json).collect();
-                        let result = sync_fn(&json_args)?;
-                        Ok(json_to_value(&result, mm_inner.clone()))
+                        #[cfg(feature = "profiling")]
+                        let span_id = tracer.as_ref().map(|tracer| {
+                            let id =
+                                tracer.span_start(&op_name_for_trace, &op_category_for_trace, None);
+                            tracer.add_metadata(id, "kind", "sync_op");
+                            tracer.add_metadata(id, "args_len", &args.len().to_string());
+                            id
+                        });
+
+                        let outcome = (|| {
+                            let json_args: Vec<serde_json::Value> =
+                                args.iter().map(value_to_json).collect();
+                            let result = sync_fn(&json_args)?;
+                            Ok(json_to_value(&result, mm_inner.clone()))
+                        })();
+
+                        #[cfg(feature = "profiling")]
+                        if let (Some(tracer), Some(id)) = (tracer.as_ref(), span_id) {
+                            tracer.span_end(id);
+                        }
+                        outcome
                     },
                     mm,
                     fn_proto,
                 )
             }
             OpHandler::Async(async_fn) => {
+                #[cfg(feature = "profiling")]
+                let tracer = self.async_tracer.clone();
+                #[cfg(feature = "profiling")]
+                let op_name_for_trace = _name.clone();
+                #[cfg(feature = "profiling")]
+                let op_category_for_trace = op_trace_category(&_name).to_string();
+                #[cfg(feature = "profiling")]
+                let worker_op_name_for_trace = format!("{op_name_for_trace}:await");
+                #[cfg(feature = "profiling")]
+                let worker_op_category_for_trace = op_category_for_trace.clone();
+
                 // Async ops return a Promise and spawn a tokio task
                 let async_fn: AsyncOpFn = async_fn.clone();
                 let pending_ops = Arc::clone(&pending_ops);
@@ -1313,6 +1435,15 @@ impl Otter {
                 let js_queue = Arc::clone(self.event_loop.js_job_queue());
                 Value::native_function_with_proto(
                     move |_this, args, _mm_ignored| {
+                        #[cfg(feature = "profiling")]
+                        let dispatch_span_id = tracer.as_ref().map(|tracer| {
+                            let id =
+                                tracer.span_start(&op_name_for_trace, &op_category_for_trace, None);
+                            tracer.add_metadata(id, "kind", "async_op_dispatch");
+                            tracer.add_metadata(id, "args_len", &args.len().to_string());
+                            id
+                        });
+
                         let mm_promise = mm_outer_closure.clone();
                         let js_queue = Arc::clone(&js_queue);
                         let resolvers = JsPromise::with_resolvers_with_js_jobs(
@@ -1327,6 +1458,7 @@ impl Otter {
 
                         let json_args: Vec<serde_json::Value> =
                             args.iter().map(value_to_json).collect();
+                        let args_len_for_trace = json_args.len();
 
                         let future = async_fn(&json_args);
 
@@ -1334,7 +1466,33 @@ impl Otter {
                         pending_ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                         let mm_spawn = mm_outer_closure.clone();
+                        #[cfg(feature = "profiling")]
+                        let tracer_for_spawn = tracer.clone();
+                        #[cfg(feature = "profiling")]
+                        let worker_name_for_spawn = worker_op_name_for_trace.clone();
+                        #[cfg(feature = "profiling")]
+                        let worker_category_for_spawn = worker_op_category_for_trace.clone();
+                        #[cfg(feature = "profiling")]
+                        let parent_span_id_for_spawn = dispatch_span_id;
                         tokio::spawn(async move {
+                            #[cfg(feature = "profiling")]
+                            let worker_span_id = tracer_for_spawn.as_ref().and_then(|tracer| {
+                                parent_span_id_for_spawn.map(|parent_id| {
+                                    let id = tracer.span_start(
+                                        &worker_name_for_spawn,
+                                        &worker_category_for_spawn,
+                                        Some(parent_id),
+                                    );
+                                    tracer.add_metadata(id, "kind", "async_op_worker");
+                                    tracer.add_metadata(
+                                        id,
+                                        "args_len",
+                                        &args_len_for_trace.to_string(),
+                                    );
+                                    id
+                                })
+                            });
+
                             match future.await {
                                 Ok(json_result) => {
                                     let value = json_to_value(&json_result, mm_spawn);
@@ -1345,8 +1503,19 @@ impl Otter {
                                     reject(error);
                                 }
                             }
+                            #[cfg(feature = "profiling")]
+                            if let (Some(tracer), Some(id)) =
+                                (tracer_for_spawn.as_ref(), worker_span_id)
+                            {
+                                tracer.span_end(id);
+                            }
                             pending_ops_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         });
+
+                        #[cfg(feature = "profiling")]
+                        if let (Some(tracer), Some(id)) = (tracer.as_ref(), dispatch_span_id) {
+                            tracer.span_end(id);
+                        }
 
                         Ok(Value::promise(promise))
                     },
@@ -2827,5 +2996,101 @@ mod tests {
         assert!(result.is_ok());
         // Note: Each eval_sync creates a new context, so globals don't persist
         // This tests that the runtime can execute code that modifies globals
+    }
+
+    #[cfg(feature = "profiling")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_async_trace_links_parent_child_across_async_hop() {
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        let mut runtime = Otter::new();
+        runtime.set_async_trace_enabled(true);
+        let expected_ops = 16usize;
+        runtime
+            .register_extension(
+                crate::extension::Extension::new("trace-test").with_ops(vec![
+                    crate::extension::op_async("__test_async_op", |_args| async move {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        Ok(serde_json::json!(1))
+                    }),
+                ]),
+            )
+            .expect("register extension");
+
+        runtime
+            .eval(
+                &format!(
+                    "for (let i = 0; i < {expected_ops}; i++) {{ globalThis.__test_async_op(); }}"
+                ),
+                Some("trace-test.js"),
+            )
+            .await
+            .expect("dispatch async ops");
+
+        let trace = runtime.async_trace_json().expect("trace should be enabled");
+        let events = trace["traceEvents"]
+            .as_array()
+            .expect("traceEvents should be an array");
+        assert!(!events.is_empty(), "traceEvents should not be empty");
+
+        let span_ids: HashSet<u64> = events
+            .iter()
+            .filter_map(|event| event["args"]["spanId"].as_u64())
+            .collect();
+        let parent_ids: Vec<u64> = events
+            .iter()
+            .filter_map(|event| event["args"]["parentId"].as_u64())
+            .collect();
+
+        assert!(
+            !parent_ids.is_empty(),
+            "expected worker spans to include parentId"
+        );
+        assert!(
+            parent_ids.iter().all(|id| span_ids.contains(id)),
+            "every parentId should point to an existing spanId"
+        );
+
+        let dispatch_count = events
+            .iter()
+            .filter(|event| event["args"]["kind"] == "async_op_dispatch")
+            .count();
+        let worker_count = events
+            .iter()
+            .filter(|event| event["args"]["kind"] == "async_op_worker")
+            .count();
+        assert_eq!(
+            dispatch_count, expected_ops,
+            "dispatch span count should match async op count"
+        );
+        assert_eq!(
+            worker_count, expected_ops,
+            "worker span count should match async op count"
+        );
+
+        let mut last_ts = 0u64;
+        for event in events {
+            let ts = event["ts"].as_u64().expect("trace event ts");
+            let _dur = event["dur"].as_u64().expect("trace event dur");
+            assert!(
+                ts >= last_ts,
+                "trace events must be sorted by timestamp for coherent timeline"
+            );
+            last_ts = ts;
+        }
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event["args"]["kind"] == "async_op_dispatch"),
+            "expected dispatch span metadata"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["args"]["kind"] == "async_op_worker"),
+            "expected worker span metadata"
+        );
     }
 }

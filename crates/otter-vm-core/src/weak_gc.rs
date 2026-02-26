@@ -157,8 +157,7 @@ unsafe fn pre_sweep_weak_refs() {
                         .and_then(|arr| arr.get(&PropertyKey::Index(idx)))
                         .unwrap_or_else(Value::undefined);
 
-                    PENDING_CLEANUPS
-                        .with(|c| c.borrow_mut().push((callback.clone(), held_value)));
+                    PENDING_CLEANUPS.with(|c| c.borrow_mut().push((callback.clone(), held_value)));
                 }
             }
 

@@ -162,8 +162,7 @@ impl ScopeChain {
             // Hoist the binding to the function scope.
             if let Some(existing) = self.scopes[function_scope_idx].bindings.get(name) {
                 debug_assert!(
-                    existing.kind == VariableKind::Var
-                        || existing.kind == VariableKind::Parameter
+                    existing.kind == VariableKind::Var || existing.kind == VariableKind::Parameter
                 );
                 return Some(existing.index);
             }
@@ -192,7 +191,8 @@ impl ScopeChain {
 
         // Check for redeclaration in current lexical scope.
         if let Some(existing) = self.scopes[current_idx].bindings.get(name) {
-            if kind == VariableKind::BlockScopedFunction && existing.kind == VariableKind::BlockScopedFunction
+            if kind == VariableKind::BlockScopedFunction
+                && existing.kind == VariableKind::BlockScopedFunction
             {
                 return Some(existing.index);
             }

@@ -149,9 +149,29 @@ fn trace_modified_register_indices(instruction: &Instruction) -> Vec<u16> {
 }
 
 fn trace_modified_registers(instruction: &Instruction, ctx: &VmContext) -> Vec<(u16, String)> {
+    const TRACE_VALUE_PREVIEW_LIMIT: usize = 160;
+
+    #[inline]
+    fn truncate_debug_value(mut raw: String) -> String {
+        if raw.len() <= TRACE_VALUE_PREVIEW_LIMIT {
+            return raw;
+        }
+
+        let mut end = TRACE_VALUE_PREVIEW_LIMIT;
+        while !raw.is_char_boundary(end) {
+            end -= 1;
+        }
+        raw.truncate(end);
+        raw.push_str("...");
+        raw
+    }
+
     trace_modified_register_indices(instruction)
         .into_iter()
-        .map(|reg| (reg, format!("{:?}", ctx.get_register(reg))))
+        .map(|reg| {
+            let raw = format!("{:?}", ctx.get_register(reg));
+            (reg, truncate_debug_value(raw))
+        })
         .collect()
 }
 
@@ -5544,6 +5564,28 @@ impl Interpreter {
                 }
 
                 if let Some(obj) = object.as_object() {
+                    // TypedArray indexed element access — route through buffer
+                    {
+                        let maybe_idx: Option<usize> = if let Some(n) = key_value.as_int32() {
+                            if n >= 0 { Some(n as usize) } else { None }
+                        } else if let Some(n) = key_value.as_number() {
+                            let idx = n as usize;
+                            if n >= 0.0 && n == idx as f64 { Some(idx) } else { None }
+                        } else {
+                            None
+                        };
+
+                        if let Some(idx) = maybe_idx {
+                            if let Some(ta_val) = obj.get(&PropertyKey::string("__TypedArrayData__")) {
+                                if let Some(ta) = ta_val.as_typed_array() {
+                                    let val = ta.get_value(idx).unwrap_or(Value::undefined());
+                                    ctx.set_register(dst.0, val);
+                                    return Ok(InstructionResult::Continue);
+                                }
+                            }
+                        }
+                    }
+
                     let receiver = object.clone();
                     // Convert key to property key
                     let key = self.value_to_property_key(ctx, &key_value)?;
@@ -5673,6 +5715,27 @@ impl Interpreter {
                 }
 
                 if let Some(obj) = object.as_object() {
+                    // TypedArray indexed element set — route through buffer
+                    {
+                        let maybe_idx: Option<usize> = if let Some(n) = key_value.as_int32() {
+                            if n >= 0 { Some(n as usize) } else { None }
+                        } else if let Some(n) = key_value.as_number() {
+                            let idx = n as usize;
+                            if n >= 0.0 && n == idx as f64 { Some(idx) } else { None }
+                        } else {
+                            None
+                        };
+
+                        if let Some(idx) = maybe_idx {
+                            if let Some(ta_val) = obj.get(&PropertyKey::string("__TypedArrayData__")) {
+                                if let Some(ta) = ta_val.as_typed_array() {
+                                    ta.set_value(idx, &val_val);
+                                    return Ok(InstructionResult::Continue);
+                                }
+                            }
+                        }
+                    }
+
                     let key = self.value_to_property_key(ctx, &key_value)?;
 
                     match obj.lookup_property_descriptor(&key) {
@@ -11101,6 +11164,56 @@ mod tests {
         assert!(!load_entry.modified_registers.is_empty());
         assert_eq!(load_entry.modified_registers[0].0, 0);
         assert!(load_entry.modified_registers[0].1.contains("42"));
+    }
+
+    #[test]
+    fn test_trace_truncates_large_modified_register_values() {
+        use otter_vm_bytecode::ConstantIndex;
+
+        let mut builder = Module::builder("test.js");
+        builder.constants_mut().add_string(&"x".repeat(4096));
+
+        let func = Function::builder()
+            .name("main")
+            .instruction(Instruction::LoadConst {
+                dst: Register(0),
+                idx: ConstantIndex(0),
+            })
+            .instruction(Instruction::ReturnUndefined)
+            .build();
+        builder.add_function(func);
+        let module = builder.build();
+
+        let (mut ctx, _rt) = create_test_context_with_runtime();
+        ctx.set_trace_config(crate::trace::TraceConfig {
+            enabled: true,
+            mode: crate::trace::TraceMode::RingBuffer,
+            ring_buffer_size: 16,
+            output_path: None,
+            filter: None,
+            capture_timing: false,
+        });
+
+        let interpreter = Interpreter::new();
+        let _ = interpreter.execute(&module, &mut ctx).unwrap();
+
+        let entries: Vec<_> = ctx.get_trace_buffer().unwrap().iter().cloned().collect();
+        let load_entry = entries
+            .iter()
+            .find(|entry| entry.opcode == "LoadConst")
+            .expect("expected LoadConst in trace");
+        let traced = &load_entry.modified_registers[0].1;
+
+        assert!(
+            traced.len() <= 163,
+            "expected truncated value preview, got len={}",
+            traced.len()
+        );
+        assert!(
+            traced.ends_with("..."),
+            "expected truncated suffix, got: {}",
+            traced
+        );
     }
 
     #[test]

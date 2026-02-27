@@ -304,7 +304,8 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
 
                 // For temporal types: read overflow for observable side effects, then extract
                 if let Some(obj) = item.as_object() {
-                    let tt = obj.get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
+                    let tt = obj
+                        .get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
                         .and_then(|v| v.as_string().map(|s| s.as_str().to_string()));
                     if tt.as_deref() == Some("PlainDate")
                         || tt.as_deref() == Some("PlainDateTime")
@@ -312,7 +313,12 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
                     {
                         let _ = parse_overflow_option(ncx, &options_val)?;
                         let pd = to_temporal_plain_date(ncx, &item, None)?;
-                        return construct_plain_date_value(ncx, pd.year(), pd.month() as i32, pd.day() as i32);
+                        return construct_plain_date_value(
+                            ncx,
+                            pd.year(),
+                            pd.month() as i32,
+                            pd.day() as i32,
+                        );
                     }
                 }
 

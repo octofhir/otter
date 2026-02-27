@@ -442,6 +442,48 @@ fn build_process_argv_override(source_url: &str, script_args: &[String]) -> Opti
     Some(argv)
 }
 
+#[cfg(feature = "jit")]
+fn parse_env_truthy(value: &str) -> bool {
+    !matches!(value.trim(), "" | "0")
+        && !value.trim().eq_ignore_ascii_case("false")
+        && !value.trim().eq_ignore_ascii_case("off")
+        && !value.trim().eq_ignore_ascii_case("no")
+}
+
+#[cfg(feature = "jit")]
+fn maybe_print_jit_stats() {
+    let enabled = std::env::var("OTTER_JIT_STATS")
+        .ok()
+        .is_some_and(|v| parse_env_truthy(&v));
+    if !enabled {
+        return;
+    }
+
+    let stats = otter_vm_core::jit_runtime_stats();
+    let hit_rate = if stats.execute_attempts > 0 {
+        (stats.execute_hits as f64 * 100.0) / stats.execute_attempts as f64
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "JIT stats: compile req={} ok={} err={} | exec attempts={} hits={} misses={} bailouts={} deopts={} hit_rate={:.2}% | compiled={}",
+        stats.compile_requests,
+        stats.compile_successes,
+        stats.compile_errors,
+        stats.execute_attempts,
+        stats.execute_hits,
+        stats.execute_not_compiled,
+        stats.execute_bailouts,
+        stats.deoptimizations,
+        hit_rate,
+        stats.compiled_functions
+    );
+}
+
+#[cfg(not(feature = "jit"))]
+fn maybe_print_jit_stats() {}
+
 struct CpuSamplingSession {
     profiler: std::sync::Arc<otter_profiler::CpuProfiler>,
     stop_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -766,6 +808,7 @@ async fn run_code(
         None
     };
     let async_trace_artifacts = finish_async_trace(&engine, cli)?;
+    maybe_print_jit_stats();
 
     match result {
         Ok(value) => {

@@ -412,6 +412,28 @@ impl Value {
         }
     }
 
+    /// Construct a value from raw JIT bits when they are known to be non-pointer.
+    ///
+    /// Returns `None` for pointer-tagged values, since those require a valid
+    /// `heap_ref` to be GC-safe.
+    #[inline]
+    pub(crate) fn from_jit_bits(bits: u64) -> Option<Self> {
+        if (bits & TAG_MASK) == TAG_POINTER {
+            return None;
+        }
+
+        Some(Self {
+            bits,
+            heap_ref: None,
+        })
+    }
+
+    /// Return raw NaN-box bits for JIT argument passing.
+    #[inline]
+    pub(crate) fn to_jit_bits(&self) -> i64 {
+        self.bits as i64
+    }
+
     /// Create NaN value explicitly
     #[inline]
     pub const fn nan() -> Self {
@@ -1548,6 +1570,15 @@ mod tests {
 
         assert_eq!(v1, v1.clone());
         assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn test_from_jit_bits_rejects_pointer_tag() {
+        assert!(Value::from_jit_bits(0x7FFC_0000_0000_0001).is_none());
+
+        let boxed_int = Value::int32(7).bits;
+        let restored = Value::from_jit_bits(boxed_int).expect("int32 bits should be accepted");
+        assert_eq!(restored.as_int32(), Some(7));
     }
 }
 

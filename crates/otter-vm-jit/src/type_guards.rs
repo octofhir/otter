@@ -21,7 +21,7 @@
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::instructions::BlockArg;
-use cranelift_codegen::ir::{types, Block, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{Block, InstBuilder, MemFlags, Value, types};
 use cranelift_frontend::FunctionBuilder;
 
 // ---------------------------------------------------------------------------
@@ -101,6 +101,17 @@ pub(crate) fn emit_both_float64(builder: &mut FunctionBuilder, lhs: Value, rhs: 
     builder.ins().band(l, r)
 }
 
+/// Emit: is this value any JS Number representation (int32, f64, NaN-tag)?
+///
+/// Returns a Cranelift `i8` value (0 or 1).
+pub(crate) fn emit_is_number(builder: &mut FunctionBuilder, val: Value) -> Value {
+    let is_i32 = emit_is_int32(builder, val);
+    let is_f64 = emit_is_float64(builder, val);
+    let is_nan_tag = builder.ins().icmp_imm(IntCC::Equal, val, TAG_NAN);
+    let i32_or_f64 = builder.ins().bor(is_i32, is_f64);
+    builder.ins().bor(i32_or_f64, is_nan_tag)
+}
+
 // ---------------------------------------------------------------------------
 // Boxing / unboxing
 // ---------------------------------------------------------------------------
@@ -157,6 +168,15 @@ pub(crate) fn emit_is_truthy(builder: &mut FunctionBuilder, val: Value) -> Value
     // truthy = !falsy
     let zero_i8 = builder.ins().iconst(types::I8, 0);
     builder.ins().icmp(IntCC::Equal, is_falsy, zero_i8)
+}
+
+/// Emit nullish check (`value === null || value === undefined`).
+///
+/// Returns a Cranelift `i8` (0 = not nullish, 1 = nullish).
+pub(crate) fn emit_is_nullish(builder: &mut FunctionBuilder, val: Value) -> Value {
+    let is_null = builder.ins().icmp_imm(IntCC::Equal, val, TAG_NULL);
+    let is_undef = builder.ins().icmp_imm(IntCC::Equal, val, TAG_UNDEFINED);
+    builder.ins().bor(is_null, is_undef)
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +263,9 @@ pub(crate) fn emit_guarded_i32_arith(
     let result_i32 = builder.ins().ireduce(types::I32, result_i64);
     let check = builder.ins().sextend(types::I64, result_i32);
     let no_overflow = builder.ins().icmp(IntCC::Equal, result_i64, check);
-    builder.ins().brif(no_overflow, box_block, &[], slow_block, &[]);
+    builder
+        .ins()
+        .brif(no_overflow, box_block, &[], slow_block, &[]);
 
     // Rebox the i32 result
     builder.switch_to_block(box_block);
@@ -251,7 +273,11 @@ pub(crate) fn emit_guarded_i32_arith(
     builder.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
 
     let result = builder.block_params(merge_block)[0];
-    GuardedResult { merge_block, slow_block, result }
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result,
+    }
 }
 
 /// Emit a guarded i32 comparison.
@@ -283,22 +309,431 @@ pub(crate) fn emit_guarded_i32_cmp(
     builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
 
     let result_val = builder.block_params(merge_block)[0];
-    GuardedResult { merge_block, slow_block, result: result_val }
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result: result_val,
+    }
+}
+
+/// Emit guarded numeric binary arithmetic (`+`, `-`, `*`).
+///
+/// Fast path 1: int32 + int32 with overflow check.
+/// Fast path 2: Number + Number (int32/f64/NaN-tag) via f64 arithmetic.
+/// Slow path: non-number operands.
+pub(crate) fn emit_guarded_numeric_arith(
+    builder: &mut FunctionBuilder,
+    op: ArithOp,
+    lhs: Value,
+    rhs: Value,
+) -> GuardedResult {
+    let i32_fast = builder.create_block();
+    let i32_box = builder.create_block();
+    let numeric_entry = builder.create_block();
+    let lhs_i32_block = builder.create_block();
+    let lhs_i32_convert = builder.create_block();
+    let lhs_f64_block = builder.create_block();
+    let rhs_i32_block = builder.create_block();
+    let rhs_f64_block = builder.create_block();
+    let compute_block = builder.create_block();
+    let nan_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let merge_block = builder.create_block();
+
+    builder.append_block_param(rhs_i32_block, types::F64);
+    builder.append_block_param(rhs_f64_block, types::F64);
+    builder.append_block_param(compute_block, types::F64);
+    builder.append_block_param(compute_block, types::F64);
+    builder.append_block_param(merge_block, types::I64);
+
+    let both_i32 = emit_both_int32(builder, lhs, rhs);
+    builder
+        .ins()
+        .brif(both_i32, i32_fast, &[], numeric_entry, &[]);
+
+    builder.switch_to_block(i32_fast);
+    let l32 = emit_unbox_int32(builder, lhs);
+    let r32 = emit_unbox_int32(builder, rhs);
+    let l64 = builder.ins().sextend(types::I64, l32);
+    let r64 = builder.ins().sextend(types::I64, r32);
+    let result_i64 = match op {
+        ArithOp::Add => builder.ins().iadd(l64, r64),
+        ArithOp::Sub => builder.ins().isub(l64, r64),
+        ArithOp::Mul => builder.ins().imul(l64, r64),
+    };
+    let result_i32 = builder.ins().ireduce(types::I32, result_i64);
+    let check = builder.ins().sextend(types::I64, result_i32);
+    let no_overflow = builder.ins().icmp(IntCC::Equal, result_i64, check);
+    builder
+        .ins()
+        .brif(no_overflow, i32_box, &[], numeric_entry, &[]);
+
+    builder.switch_to_block(i32_box);
+    let boxed = emit_box_int32(builder, result_i32);
+    builder.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
+
+    builder.switch_to_block(numeric_entry);
+    let lhs_is_i32 = emit_is_int32(builder, lhs);
+    let rhs_is_i32 = emit_is_int32(builder, rhs);
+    let lhs_is_number = emit_is_number(builder, lhs);
+    let rhs_is_number = emit_is_number(builder, rhs);
+    let both_numbers = builder.ins().band(lhs_is_number, rhs_is_number);
+    builder
+        .ins()
+        .brif(both_numbers, lhs_i32_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(lhs_i32_block);
+    builder
+        .ins()
+        .brif(lhs_is_i32, lhs_i32_convert, &[], lhs_f64_block, &[]);
+
+    builder.switch_to_block(lhs_i32_convert);
+    let lhs_i32 = emit_unbox_int32(builder, lhs);
+    let lhs_i64 = builder.ins().sextend(types::I64, lhs_i32);
+    let lhs_num_f64 = builder.ins().fcvt_from_sint(types::F64, lhs_i64);
+    builder.ins().brif(
+        rhs_is_i32,
+        rhs_i32_block,
+        &[BlockArg::Value(lhs_num_f64)],
+        rhs_f64_block,
+        &[BlockArg::Value(lhs_num_f64)],
+    );
+
+    builder.switch_to_block(lhs_f64_block);
+    let lhs_num_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), lhs);
+    builder.ins().brif(
+        rhs_is_i32,
+        rhs_i32_block,
+        &[BlockArg::Value(lhs_num_f64)],
+        rhs_f64_block,
+        &[BlockArg::Value(lhs_num_f64)],
+    );
+
+    builder.switch_to_block(rhs_i32_block);
+    let lhs_num_f64 = builder.block_params(rhs_i32_block)[0];
+    let rhs_i32 = emit_unbox_int32(builder, rhs);
+    let rhs_i64 = builder.ins().sextend(types::I64, rhs_i32);
+    let rhs_num_f64 = builder.ins().fcvt_from_sint(types::F64, rhs_i64);
+    builder.ins().jump(
+        compute_block,
+        &[BlockArg::Value(lhs_num_f64), BlockArg::Value(rhs_num_f64)],
+    );
+
+    builder.switch_to_block(rhs_f64_block);
+    let lhs_num_f64 = builder.block_params(rhs_f64_block)[0];
+    let rhs_num_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), rhs);
+    builder.ins().jump(
+        compute_block,
+        &[BlockArg::Value(lhs_num_f64), BlockArg::Value(rhs_num_f64)],
+    );
+
+    builder.switch_to_block(compute_block);
+    let lhs_num_f64 = builder.block_params(compute_block)[0];
+    let rhs_num_f64 = builder.block_params(compute_block)[1];
+    let result_f64 = match op {
+        ArithOp::Add => builder.ins().fadd(lhs_num_f64, rhs_num_f64),
+        ArithOp::Sub => builder.ins().fsub(lhs_num_f64, rhs_num_f64),
+        ArithOp::Mul => builder.ins().fmul(lhs_num_f64, rhs_num_f64),
+    };
+    let is_nan = builder
+        .ins()
+        .fcmp(FloatCC::Unordered, result_f64, result_f64);
+    let result_bits = builder
+        .ins()
+        .bitcast(types::I64, MemFlags::new(), result_f64);
+    builder.ins().brif(
+        is_nan,
+        nan_block,
+        &[],
+        merge_block,
+        &[BlockArg::Value(result_bits)],
+    );
+
+    builder.switch_to_block(nan_block);
+    let nan_val = builder.ins().iconst(types::I64, TAG_NAN);
+    builder.ins().jump(merge_block, &[BlockArg::Value(nan_val)]);
+
+    let result = builder.block_params(merge_block)[0];
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result,
+    }
+}
+
+/// Emit guarded numeric comparison.
+///
+/// Fast path 1: int32 + int32 using `int_cc`.
+/// Fast path 2: Number + Number using `float_cc`.
+/// Slow path: non-number operands.
+pub(crate) fn emit_guarded_numeric_cmp(
+    builder: &mut FunctionBuilder,
+    int_cc: IntCC,
+    float_cc: FloatCC,
+    lhs: Value,
+    rhs: Value,
+) -> GuardedResult {
+    let i32_fast = builder.create_block();
+    let numeric_entry = builder.create_block();
+    let lhs_i32_block = builder.create_block();
+    let lhs_i32_convert = builder.create_block();
+    let lhs_f64_block = builder.create_block();
+    let rhs_i32_block = builder.create_block();
+    let rhs_f64_block = builder.create_block();
+    let compare_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let merge_block = builder.create_block();
+
+    builder.append_block_param(rhs_i32_block, types::F64);
+    builder.append_block_param(rhs_f64_block, types::F64);
+    builder.append_block_param(compare_block, types::F64);
+    builder.append_block_param(compare_block, types::F64);
+    builder.append_block_param(merge_block, types::I64);
+
+    let both_i32 = emit_both_int32(builder, lhs, rhs);
+    builder
+        .ins()
+        .brif(both_i32, i32_fast, &[], numeric_entry, &[]);
+
+    builder.switch_to_block(i32_fast);
+    let l32 = emit_unbox_int32(builder, lhs);
+    let r32 = emit_unbox_int32(builder, rhs);
+    let cmp = builder.ins().icmp(int_cc, l32, r32);
+    let i32_result = emit_bool_to_nanbox(builder, cmp);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(i32_result)]);
+
+    builder.switch_to_block(numeric_entry);
+    let lhs_is_i32 = emit_is_int32(builder, lhs);
+    let rhs_is_i32 = emit_is_int32(builder, rhs);
+    let lhs_is_number = emit_is_number(builder, lhs);
+    let rhs_is_number = emit_is_number(builder, rhs);
+    let both_numbers = builder.ins().band(lhs_is_number, rhs_is_number);
+    builder
+        .ins()
+        .brif(both_numbers, lhs_i32_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(lhs_i32_block);
+    builder
+        .ins()
+        .brif(lhs_is_i32, lhs_i32_convert, &[], lhs_f64_block, &[]);
+
+    builder.switch_to_block(lhs_i32_convert);
+    let lhs_i32 = emit_unbox_int32(builder, lhs);
+    let lhs_i64 = builder.ins().sextend(types::I64, lhs_i32);
+    let lhs_num_f64 = builder.ins().fcvt_from_sint(types::F64, lhs_i64);
+    builder.ins().brif(
+        rhs_is_i32,
+        rhs_i32_block,
+        &[BlockArg::Value(lhs_num_f64)],
+        rhs_f64_block,
+        &[BlockArg::Value(lhs_num_f64)],
+    );
+
+    builder.switch_to_block(lhs_f64_block);
+    let lhs_num_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), lhs);
+    builder.ins().brif(
+        rhs_is_i32,
+        rhs_i32_block,
+        &[BlockArg::Value(lhs_num_f64)],
+        rhs_f64_block,
+        &[BlockArg::Value(lhs_num_f64)],
+    );
+
+    builder.switch_to_block(rhs_i32_block);
+    let lhs_num_f64 = builder.block_params(rhs_i32_block)[0];
+    let rhs_i32 = emit_unbox_int32(builder, rhs);
+    let rhs_i64 = builder.ins().sextend(types::I64, rhs_i32);
+    let rhs_num_f64 = builder.ins().fcvt_from_sint(types::F64, rhs_i64);
+    builder.ins().jump(
+        compare_block,
+        &[BlockArg::Value(lhs_num_f64), BlockArg::Value(rhs_num_f64)],
+    );
+
+    builder.switch_to_block(rhs_f64_block);
+    let lhs_num_f64 = builder.block_params(rhs_f64_block)[0];
+    let rhs_num_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), rhs);
+    builder.ins().jump(
+        compare_block,
+        &[BlockArg::Value(lhs_num_f64), BlockArg::Value(rhs_num_f64)],
+    );
+
+    builder.switch_to_block(compare_block);
+    let lhs_num_f64 = builder.block_params(compare_block)[0];
+    let rhs_num_f64 = builder.block_params(compare_block)[1];
+    let cmp = builder.ins().fcmp(float_cc, lhs_num_f64, rhs_num_f64);
+    let numeric_result = emit_bool_to_nanbox(builder, cmp);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(numeric_result)]);
+
+    let result = builder.block_params(merge_block)[0];
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result,
+    }
+}
+
+/// Emit guarded numeric division.
+///
+/// Fast path 1: exact int32 division.
+/// Fast path 2: Number + Number via f64 division.
+/// Slow path: non-number operands.
+pub(crate) fn emit_guarded_numeric_div(
+    builder: &mut FunctionBuilder,
+    lhs: Value,
+    rhs: Value,
+) -> GuardedResult {
+    let i32_fast = builder.create_block();
+    let i32_overflow_check = builder.create_block();
+    let i32_exact_check = builder.create_block();
+    let i32_box = builder.create_block();
+    let numeric_entry = builder.create_block();
+    let lhs_i32_block = builder.create_block();
+    let lhs_i32_convert = builder.create_block();
+    let lhs_f64_block = builder.create_block();
+    let rhs_i32_block = builder.create_block();
+    let rhs_f64_block = builder.create_block();
+    let compute_block = builder.create_block();
+    let nan_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let merge_block = builder.create_block();
+
+    builder.append_block_param(rhs_i32_block, types::F64);
+    builder.append_block_param(rhs_f64_block, types::F64);
+    builder.append_block_param(compute_block, types::F64);
+    builder.append_block_param(compute_block, types::F64);
+    builder.append_block_param(merge_block, types::I64);
+
+    let both_i32 = emit_both_int32(builder, lhs, rhs);
+    builder
+        .ins()
+        .brif(both_i32, i32_fast, &[], numeric_entry, &[]);
+
+    builder.switch_to_block(i32_fast);
+    let l32 = emit_unbox_int32(builder, lhs);
+    let r32 = emit_unbox_int32(builder, rhs);
+    let zero = builder.ins().iconst(types::I32, 0);
+    let rhs_nonzero = builder.ins().icmp(IntCC::NotEqual, r32, zero);
+    builder
+        .ins()
+        .brif(rhs_nonzero, i32_overflow_check, &[], numeric_entry, &[]);
+
+    builder.switch_to_block(i32_overflow_check);
+    let neg_one = builder.ins().iconst(types::I32, -1);
+    let int_min = builder.ins().iconst(types::I32, i32::MIN as i64);
+    let rhs_is_neg_one = builder.ins().icmp(IntCC::Equal, r32, neg_one);
+    let lhs_is_int_min = builder.ins().icmp(IntCC::Equal, l32, int_min);
+    let overflow_pair = builder.ins().band(rhs_is_neg_one, lhs_is_int_min);
+    builder
+        .ins()
+        .brif(overflow_pair, numeric_entry, &[], i32_exact_check, &[]);
+
+    builder.switch_to_block(i32_exact_check);
+    let remainder = builder.ins().srem(l32, r32);
+    let exact = builder.ins().icmp(IntCC::Equal, remainder, zero);
+    builder.ins().brif(exact, i32_box, &[], numeric_entry, &[]);
+
+    builder.switch_to_block(i32_box);
+    let quotient = builder.ins().sdiv(l32, r32);
+    let boxed = emit_box_int32(builder, quotient);
+    builder.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
+
+    builder.switch_to_block(numeric_entry);
+    let lhs_is_i32 = emit_is_int32(builder, lhs);
+    let rhs_is_i32 = emit_is_int32(builder, rhs);
+    let lhs_is_number = emit_is_number(builder, lhs);
+    let rhs_is_number = emit_is_number(builder, rhs);
+    let both_numbers = builder.ins().band(lhs_is_number, rhs_is_number);
+    builder
+        .ins()
+        .brif(both_numbers, lhs_i32_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(lhs_i32_block);
+    builder
+        .ins()
+        .brif(lhs_is_i32, lhs_i32_convert, &[], lhs_f64_block, &[]);
+
+    builder.switch_to_block(lhs_i32_convert);
+    let lhs_i32 = emit_unbox_int32(builder, lhs);
+    let lhs_i64 = builder.ins().sextend(types::I64, lhs_i32);
+    let lhs_num_f64 = builder.ins().fcvt_from_sint(types::F64, lhs_i64);
+    builder.ins().brif(
+        rhs_is_i32,
+        rhs_i32_block,
+        &[BlockArg::Value(lhs_num_f64)],
+        rhs_f64_block,
+        &[BlockArg::Value(lhs_num_f64)],
+    );
+
+    builder.switch_to_block(lhs_f64_block);
+    let lhs_num_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), lhs);
+    builder.ins().brif(
+        rhs_is_i32,
+        rhs_i32_block,
+        &[BlockArg::Value(lhs_num_f64)],
+        rhs_f64_block,
+        &[BlockArg::Value(lhs_num_f64)],
+    );
+
+    builder.switch_to_block(rhs_i32_block);
+    let lhs_num_f64 = builder.block_params(rhs_i32_block)[0];
+    let rhs_i32 = emit_unbox_int32(builder, rhs);
+    let rhs_i64 = builder.ins().sextend(types::I64, rhs_i32);
+    let rhs_num_f64 = builder.ins().fcvt_from_sint(types::F64, rhs_i64);
+    builder.ins().jump(
+        compute_block,
+        &[BlockArg::Value(lhs_num_f64), BlockArg::Value(rhs_num_f64)],
+    );
+
+    builder.switch_to_block(rhs_f64_block);
+    let lhs_num_f64 = builder.block_params(rhs_f64_block)[0];
+    let rhs_num_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), rhs);
+    builder.ins().jump(
+        compute_block,
+        &[BlockArg::Value(lhs_num_f64), BlockArg::Value(rhs_num_f64)],
+    );
+
+    builder.switch_to_block(compute_block);
+    let lhs_num_f64 = builder.block_params(compute_block)[0];
+    let rhs_num_f64 = builder.block_params(compute_block)[1];
+    let result_f64 = builder.ins().fdiv(lhs_num_f64, rhs_num_f64);
+    let is_nan = builder
+        .ins()
+        .fcmp(FloatCC::Unordered, result_f64, result_f64);
+    let result_bits = builder
+        .ins()
+        .bitcast(types::I64, MemFlags::new(), result_f64);
+    builder.ins().brif(
+        is_nan,
+        nan_block,
+        &[],
+        merge_block,
+        &[BlockArg::Value(result_bits)],
+    );
+
+    builder.switch_to_block(nan_block);
+    let nan_val = builder.ins().iconst(types::I64, TAG_NAN);
+    builder.ins().jump(merge_block, &[BlockArg::Value(nan_val)]);
+
+    let result = builder.block_params(merge_block)[0];
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result,
+    }
 }
 
 /// Emit a correct strict equality (`===` / `!==`) check.
 ///
-/// Handles the two edge cases where raw bit comparison is wrong:
-/// 1. `NaN === NaN` → false (same TAG_NAN bits, but JS says not equal)
-/// 2. `+0.0 === -0.0` → true (different f64 bits, but JS says equal)
+/// Handles all Number representation combinations:
+/// - int32 vs int32
+/// - f64 vs f64 (including `+0.0` / `-0.0`)
+/// - int32 vs f64 (e.g. `1 === 1.0`)
 ///
-/// ```text
-///   same bits? ──yes──→ [same_block: not TAG_NAN?] ──→ merge
-///       │no
-///   both f64? ──yes──→ [f64_block: fcmp eq]  ──→ merge
-///       │no
-///   [not_equal_block] ──→ merge
-/// ```
+/// Also preserves `NaN !== NaN`.
 pub(crate) fn emit_strict_eq(
     builder: &mut FunctionBuilder,
     lhs: Value,
@@ -307,9 +742,20 @@ pub(crate) fn emit_strict_eq(
 ) -> Value {
     let same_block = builder.create_block();
     let diff_block = builder.create_block();
-    let f64_block = builder.create_block();
+    let numeric_block = builder.create_block();
+    let lhs_i32_block = builder.create_block();
+    let lhs_f64_block = builder.create_block();
+    let rhs_i32_block = builder.create_block();
+    let rhs_f64_block = builder.create_block();
+    let rhs_compare_block = builder.create_block();
     let not_equal_block = builder.create_block();
     let merge_block = builder.create_block();
+
+    // Blocks carrying converted numeric values.
+    builder.append_block_param(rhs_i32_block, types::F64);
+    builder.append_block_param(rhs_f64_block, types::F64);
+    builder.append_block_param(rhs_compare_block, types::F64);
+    builder.append_block_param(rhs_compare_block, types::F64);
     builder.append_block_param(merge_block, types::I64);
 
     // Step 1: are the bits identical?
@@ -334,37 +780,87 @@ pub(crate) fn emit_strict_eq(
         .ins()
         .jump(merge_block, &[BlockArg::Value(same_result)]);
 
-    // Different bits: could be +0.0 === -0.0
+    // Different bits: if both are Numbers (int32/f64), compare numerically.
+    // Otherwise strict equality is false.
     builder.switch_to_block(diff_block);
-    let both_f64 = emit_both_float64(builder, lhs, rhs);
+    let lhs_is_i32 = emit_is_int32(builder, lhs);
+    let rhs_is_i32 = emit_is_int32(builder, rhs);
+    let lhs_is_f64 = emit_is_float64(builder, lhs);
+    let rhs_is_f64 = emit_is_float64(builder, rhs);
+    let lhs_is_number = builder.ins().bor(lhs_is_i32, lhs_is_f64);
+    let rhs_is_number = builder.ins().bor(rhs_is_i32, rhs_is_f64);
+    let both_numbers = builder.ins().band(lhs_is_number, rhs_is_number);
     builder
         .ins()
-        .brif(both_f64, f64_block, &[], not_equal_block, &[]);
+        .brif(both_numbers, numeric_block, &[], not_equal_block, &[]);
 
-    // Both are f64 with different bits: use float comparison (handles ±0)
-    builder.switch_to_block(f64_block);
-    let l_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), lhs);
-    let r_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), rhs);
+    // Convert lhs to f64.
+    builder.switch_to_block(numeric_block);
+    builder
+        .ins()
+        .brif(lhs_is_i32, lhs_i32_block, &[], lhs_f64_block, &[]);
+
+    builder.switch_to_block(lhs_i32_block);
+    let lhs_i32 = emit_unbox_int32(builder, lhs);
+    let lhs_i64 = builder.ins().sextend(types::I64, lhs_i32);
+    let lhs_num_f64 = builder.ins().fcvt_from_sint(types::F64, lhs_i64);
+    builder.ins().brif(
+        rhs_is_i32,
+        rhs_i32_block,
+        &[BlockArg::Value(lhs_num_f64)],
+        rhs_f64_block,
+        &[BlockArg::Value(lhs_num_f64)],
+    );
+
+    builder.switch_to_block(lhs_f64_block);
+    let lhs_num_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), lhs);
+    builder.ins().brif(
+        rhs_is_i32,
+        rhs_i32_block,
+        &[BlockArg::Value(lhs_num_f64)],
+        rhs_f64_block,
+        &[BlockArg::Value(lhs_num_f64)],
+    );
+
+    // Convert rhs to f64 with lhs carried through as a block parameter.
+    builder.switch_to_block(rhs_i32_block);
+    let lhs_num_f64 = builder.block_params(rhs_i32_block)[0];
+    let rhs_i32 = emit_unbox_int32(builder, rhs);
+    let rhs_i64 = builder.ins().sextend(types::I64, rhs_i32);
+    let rhs_num_f64 = builder.ins().fcvt_from_sint(types::F64, rhs_i64);
+    builder.ins().jump(
+        rhs_compare_block,
+        &[BlockArg::Value(lhs_num_f64), BlockArg::Value(rhs_num_f64)],
+    );
+
+    builder.switch_to_block(rhs_f64_block);
+    let lhs_num_f64 = builder.block_params(rhs_f64_block)[0];
+    let rhs_num_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), rhs);
+    builder.ins().jump(
+        rhs_compare_block,
+        &[BlockArg::Value(lhs_num_f64), BlockArg::Value(rhs_num_f64)],
+    );
+
+    builder.switch_to_block(rhs_compare_block);
+    let lhs_num_f64 = builder.block_params(rhs_compare_block)[0];
+    let rhs_num_f64 = builder.block_params(rhs_compare_block)[1];
     let float_cc = if negated {
         FloatCC::NotEqual
     } else {
         FloatCC::Equal
     };
-    let fcmp_result = builder.ins().fcmp(float_cc, l_f64, r_f64);
-    let f64_result = emit_bool_to_nanbox(builder, fcmp_result);
+    let fcmp_result = builder.ins().fcmp(float_cc, lhs_num_f64, rhs_num_f64);
+    let numeric_result = emit_bool_to_nanbox(builder, fcmp_result);
     builder
         .ins()
-        .jump(merge_block, &[BlockArg::Value(f64_result)]);
+        .jump(merge_block, &[BlockArg::Value(numeric_result)]);
 
     // Not both f64, different bits → not equal
     builder.switch_to_block(not_equal_block);
-    let ne_val = builder.ins().iconst(
-        types::I64,
-        if negated { TAG_TRUE } else { TAG_FALSE },
-    );
-    builder
+    let ne_val = builder
         .ins()
-        .jump(merge_block, &[BlockArg::Value(ne_val)]);
+        .iconst(types::I64, if negated { TAG_TRUE } else { TAG_FALSE });
+    builder.ins().jump(merge_block, &[BlockArg::Value(ne_val)]);
 
     builder.switch_to_block(merge_block);
     builder.block_params(merge_block)[0]
@@ -381,6 +877,7 @@ pub(crate) fn emit_guarded_i32_div(
     rhs: Value,
 ) -> GuardedResult {
     let i32_fast = builder.create_block();
+    let overflow_check = builder.create_block();
     let div_check = builder.create_block();
     let box_block = builder.create_block();
     let slow_block = builder.create_block();
@@ -399,15 +896,24 @@ pub(crate) fn emit_guarded_i32_div(
     let rhs_nonzero = builder.ins().icmp(IntCC::NotEqual, r32, zero);
     builder
         .ins()
-        .brif(rhs_nonzero, div_check, &[], slow_block, &[]);
+        .brif(rhs_nonzero, overflow_check, &[], slow_block, &[]);
+
+    // Prevent signed div/mod overflow trap on INT_MIN / -1.
+    builder.switch_to_block(overflow_check);
+    let neg_one = builder.ins().iconst(types::I32, -1);
+    let int_min = builder.ins().iconst(types::I32, i32::MIN as i64);
+    let rhs_is_neg_one = builder.ins().icmp(IntCC::Equal, r32, neg_one);
+    let lhs_is_int_min = builder.ins().icmp(IntCC::Equal, l32, int_min);
+    let overflow_pair = builder.ins().band(rhs_is_neg_one, lhs_is_int_min);
+    builder
+        .ins()
+        .brif(overflow_pair, slow_block, &[], div_check, &[]);
 
     builder.switch_to_block(div_check);
     // Check for exact division: lhs % rhs == 0
     let remainder = builder.ins().srem(l32, r32);
     let exact = builder.ins().icmp(IntCC::Equal, remainder, zero);
-    builder
-        .ins()
-        .brif(exact, box_block, &[], slow_block, &[]);
+    builder.ins().brif(exact, box_block, &[], slow_block, &[]);
 
     builder.switch_to_block(box_block);
     let quotient = builder.ins().sdiv(l32, r32);
@@ -432,6 +938,7 @@ pub(crate) fn emit_guarded_i32_mod(
     rhs: Value,
 ) -> GuardedResult {
     let i32_fast = builder.create_block();
+    let overflow_check = builder.create_block();
     let safe_block = builder.create_block();
     let slow_block = builder.create_block();
     let merge_block = builder.create_block();
@@ -448,7 +955,18 @@ pub(crate) fn emit_guarded_i32_mod(
     let rhs_nonzero = builder.ins().icmp(IntCC::NotEqual, r32, zero);
     builder
         .ins()
-        .brif(rhs_nonzero, safe_block, &[], slow_block, &[]);
+        .brif(rhs_nonzero, overflow_check, &[], slow_block, &[]);
+
+    // Prevent signed remainder overflow trap on INT_MIN % -1.
+    builder.switch_to_block(overflow_check);
+    let neg_one = builder.ins().iconst(types::I32, -1);
+    let int_min = builder.ins().iconst(types::I32, i32::MIN as i64);
+    let rhs_is_neg_one = builder.ins().icmp(IntCC::Equal, r32, neg_one);
+    let lhs_is_int_min = builder.ins().icmp(IntCC::Equal, l32, int_min);
+    let overflow_pair = builder.ins().band(rhs_is_neg_one, lhs_is_int_min);
+    builder
+        .ins()
+        .brif(overflow_pair, slow_block, &[], safe_block, &[]);
 
     builder.switch_to_block(safe_block);
     let remainder = builder.ins().srem(l32, r32);
@@ -501,8 +1019,12 @@ pub(crate) fn emit_guarded_f64_arith(
     };
 
     // NaN canonicalization: hardware NaN bits could collide with TAG_UNDEFINED
-    let is_nan = builder.ins().fcmp(FloatCC::Unordered, result_f64, result_f64);
-    let result_bits = builder.ins().bitcast(types::I64, MemFlags::new(), result_f64);
+    let is_nan = builder
+        .ins()
+        .fcmp(FloatCC::Unordered, result_f64, result_f64);
+    let result_bits = builder
+        .ins()
+        .bitcast(types::I64, MemFlags::new(), result_f64);
     builder.ins().brif(
         is_nan,
         nan_block,
@@ -513,9 +1035,7 @@ pub(crate) fn emit_guarded_f64_arith(
 
     builder.switch_to_block(nan_block);
     let nan_val = builder.ins().iconst(types::I64, TAG_NAN);
-    builder
-        .ins()
-        .jump(merge_block, &[BlockArg::Value(nan_val)]);
+    builder.ins().jump(merge_block, &[BlockArg::Value(nan_val)]);
 
     let result = builder.block_params(merge_block)[0];
     GuardedResult {
@@ -548,8 +1068,12 @@ pub(crate) fn emit_guarded_f64_div(
     let r_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), rhs);
     let result_f64 = builder.ins().fdiv(l_f64, r_f64);
 
-    let is_nan = builder.ins().fcmp(FloatCC::Unordered, result_f64, result_f64);
-    let result_bits = builder.ins().bitcast(types::I64, MemFlags::new(), result_f64);
+    let is_nan = builder
+        .ins()
+        .fcmp(FloatCC::Unordered, result_f64, result_f64);
+    let result_bits = builder
+        .ins()
+        .bitcast(types::I64, MemFlags::new(), result_f64);
     builder.ins().brif(
         is_nan,
         nan_block,
@@ -560,9 +1084,7 @@ pub(crate) fn emit_guarded_f64_div(
 
     builder.switch_to_block(nan_block);
     let nan_val = builder.ins().iconst(types::I64, TAG_NAN);
-    builder
-        .ins()
-        .jump(merge_block, &[BlockArg::Value(nan_val)]);
+    builder.ins().jump(merge_block, &[BlockArg::Value(nan_val)]);
 
     let result = builder.block_params(merge_block)[0];
     GuardedResult {
@@ -596,9 +1118,7 @@ pub(crate) fn emit_guarded_f64_cmp(
     let r_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), rhs);
     let cmp = builder.ins().fcmp(cc, l_f64, r_f64);
     let result = emit_bool_to_nanbox(builder, cmp);
-    builder
-        .ins()
-        .jump(merge_block, &[BlockArg::Value(result)]);
+    builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
 
     let result_val = builder.block_params(merge_block)[0];
     GuardedResult {
@@ -616,10 +1136,7 @@ pub(crate) fn emit_guarded_f64_cmp(
 ///
 /// Checks that the operand is NaN-boxed int32, unboxes, negates with overflow
 /// check (INT_MIN case), and reboxes.
-pub(crate) fn emit_guarded_i32_neg(
-    builder: &mut FunctionBuilder,
-    val: Value,
-) -> GuardedResult {
+pub(crate) fn emit_guarded_i32_neg(builder: &mut FunctionBuilder, val: Value) -> GuardedResult {
     let i32_fast = builder.create_block();
     let box_block = builder.create_block();
     let slow_block = builder.create_block();
@@ -642,16 +1159,17 @@ pub(crate) fn emit_guarded_i32_neg(
     builder.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
 
     let result = builder.block_params(merge_block)[0];
-    GuardedResult { merge_block, slow_block, result }
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result,
+    }
 }
 
 /// Emit a guarded i32 increment (value + 1).
 ///
 /// Checks that the operand is NaN-boxed int32 and not INT_MAX (overflow).
-pub(crate) fn emit_guarded_i32_inc(
-    builder: &mut FunctionBuilder,
-    val: Value,
-) -> GuardedResult {
+pub(crate) fn emit_guarded_i32_inc(builder: &mut FunctionBuilder, val: Value) -> GuardedResult {
     let i32_fast = builder.create_block();
     let box_block = builder.create_block();
     let slow_block = builder.create_block();
@@ -674,16 +1192,17 @@ pub(crate) fn emit_guarded_i32_inc(
     builder.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
 
     let result_val = builder.block_params(merge_block)[0];
-    GuardedResult { merge_block, slow_block, result: result_val }
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result: result_val,
+    }
 }
 
 /// Emit a guarded i32 decrement (value - 1).
 ///
 /// Checks that the operand is NaN-boxed int32 and not INT_MIN (overflow).
-pub(crate) fn emit_guarded_i32_dec(
-    builder: &mut FunctionBuilder,
-    val: Value,
-) -> GuardedResult {
+pub(crate) fn emit_guarded_i32_dec(builder: &mut FunctionBuilder, val: Value) -> GuardedResult {
     let i32_fast = builder.create_block();
     let box_block = builder.create_block();
     let slow_block = builder.create_block();
@@ -706,73 +1225,163 @@ pub(crate) fn emit_guarded_i32_dec(
     builder.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
 
     let result_val = builder.block_params(merge_block)[0];
-    GuardedResult { merge_block, slow_block, result: result_val }
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result: result_val,
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Bitwise operations
 // ---------------------------------------------------------------------------
 
-/// Emit guarded i32 bitwise operation.
+/// Convert a numeric JS value (int32/f64/NaN-tag) to int32.
 ///
-/// JS bitwise ops always convert to int32 first (ToInt32), so the fast path
-/// just checks both operands are int32, unboxes, operates, reboxes.
-/// No overflow concern since bitwise ops produce i32 by definition.
+/// This matches the runtime's current `ToInt32` behavior:
+/// - `NaN` / `±Infinity` => 0
+/// - finite number => trunc toward zero, then wrap via low 32 bits
+/// - int32 values pass through unchanged
+fn emit_number_to_int32(builder: &mut FunctionBuilder, val: Value) -> Value {
+    let i32_block = builder.create_block();
+    let number_block = builder.create_block();
+    let finite_block = builder.create_block();
+    let zero_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I32);
+
+    let is_i32 = emit_is_int32(builder, val);
+    builder
+        .ins()
+        .brif(is_i32, i32_block, &[], number_block, &[]);
+
+    builder.switch_to_block(i32_block);
+    let unboxed = emit_unbox_int32(builder, val);
+    builder.ins().jump(merge_block, &[BlockArg::Value(unboxed)]);
+
+    builder.switch_to_block(number_block);
+    let num = builder.ins().bitcast(types::F64, MemFlags::new(), val);
+    let is_nan = builder.ins().fcmp(FloatCC::Unordered, num, num);
+    let abs_num = builder.ins().fabs(num);
+    let inf_bits = builder
+        .ins()
+        .iconst(types::I64, f64::INFINITY.to_bits() as i64);
+    let inf = builder.ins().bitcast(types::F64, MemFlags::new(), inf_bits);
+    let is_inf = builder.ins().fcmp(FloatCC::Equal, abs_num, inf);
+    let non_finite = builder.ins().bor(is_nan, is_inf);
+    builder
+        .ins()
+        .brif(non_finite, zero_block, &[], finite_block, &[]);
+
+    builder.switch_to_block(zero_block);
+    let zero_i32 = builder.ins().iconst(types::I32, 0);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(zero_i32)]);
+
+    builder.switch_to_block(finite_block);
+    let int64 = builder.ins().fcvt_to_sint_sat(types::I64, num);
+    let int32 = builder.ins().ireduce(types::I32, int64);
+    builder.ins().jump(merge_block, &[BlockArg::Value(int32)]);
+
+    builder.switch_to_block(merge_block);
+    builder.block_params(merge_block)[0]
+}
+
+/// Emit guarded numeric bitwise operation.
+///
+/// JS bitwise ops convert operands with `ToInt32`/`ToUint32`; this fast path
+/// accepts numeric operands (int32/f64/NaN-tag), applies conversion, executes
+/// bitwise op, and returns either int32 boxed value or f64 for `>>>` high-bit
+/// results that exceed int32 range.
 pub(crate) fn emit_guarded_i32_bitwise(
     builder: &mut FunctionBuilder,
     op: BitwiseOp,
     lhs: Value,
     rhs: Value,
 ) -> GuardedResult {
-    let i32_fast = builder.create_block();
+    let numeric_fast = builder.create_block();
+    let ushr_number_block = builder.create_block();
+    let box_block = builder.create_block();
     let slow_block = builder.create_block();
     let merge_block = builder.create_block();
     builder.append_block_param(merge_block, types::I64);
 
-    let both = emit_both_int32(builder, lhs, rhs);
-    builder.ins().brif(both, i32_fast, &[], slow_block, &[]);
+    let lhs_is_number = emit_is_number(builder, lhs);
+    let rhs_is_number = emit_is_number(builder, rhs);
+    let both_numbers = builder.ins().band(lhs_is_number, rhs_is_number);
+    builder
+        .ins()
+        .brif(both_numbers, numeric_fast, &[], slow_block, &[]);
 
-    builder.switch_to_block(i32_fast);
-    let l32 = emit_unbox_int32(builder, lhs);
-    let r32 = emit_unbox_int32(builder, rhs);
+    builder.switch_to_block(numeric_fast);
+    let l32 = emit_number_to_int32(builder, lhs);
+    let r32 = emit_number_to_int32(builder, rhs);
+    let shift_mask = builder.ins().iconst(types::I32, 0x1f);
+    let shift_amt = builder.ins().band(r32, shift_mask);
 
     let result = match op {
         BitwiseOp::And => builder.ins().band(l32, r32),
         BitwiseOp::Or => builder.ins().bor(l32, r32),
         BitwiseOp::Xor => builder.ins().bxor(l32, r32),
-        BitwiseOp::Shl => builder.ins().ishl(l32, r32),
-        BitwiseOp::Shr => builder.ins().sshr(l32, r32),
-        BitwiseOp::Ushr => builder.ins().ushr(l32, r32),
+        BitwiseOp::Shl => builder.ins().ishl(l32, shift_amt),
+        BitwiseOp::Shr => builder.ins().sshr(l32, shift_amt),
+        BitwiseOp::Ushr => builder.ins().ushr(l32, shift_amt),
     };
 
+    // JS `>>>` can produce uint32 values > i32::MAX, which cannot be represented
+    // as a NaN-boxed int32 result. Return raw f64 bits for those values.
+    if matches!(op, BitwiseOp::Ushr) {
+        let is_negative_i32 = builder.ins().icmp_imm(IntCC::SignedLessThan, result, 0);
+        builder
+            .ins()
+            .brif(is_negative_i32, ushr_number_block, &[], box_block, &[]);
+    } else {
+        builder.ins().jump(box_block, &[]);
+    }
+
+    builder.switch_to_block(ushr_number_block);
+    let as_u64 = builder.ins().uextend(types::I64, result);
+    let as_f64 = builder.ins().fcvt_from_uint(types::F64, as_u64);
+    let bits = builder.ins().bitcast(types::I64, MemFlags::new(), as_f64);
+    builder.ins().jump(merge_block, &[BlockArg::Value(bits)]);
+
+    builder.switch_to_block(box_block);
     let boxed = emit_box_int32(builder, result);
     builder.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
 
     let result_val = builder.block_params(merge_block)[0];
-    GuardedResult { merge_block, slow_block, result: result_val }
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result: result_val,
+    }
 }
 
-/// Emit guarded i32 bitwise NOT (unary).
-pub(crate) fn emit_guarded_i32_bitnot(
-    builder: &mut FunctionBuilder,
-    val: Value,
-) -> GuardedResult {
-    let i32_fast = builder.create_block();
+/// Emit guarded numeric bitwise NOT (`~`).
+pub(crate) fn emit_guarded_i32_bitnot(builder: &mut FunctionBuilder, val: Value) -> GuardedResult {
+    let numeric_fast = builder.create_block();
     let slow_block = builder.create_block();
     let merge_block = builder.create_block();
     builder.append_block_param(merge_block, types::I64);
 
-    let is_i32 = emit_is_int32(builder, val);
-    builder.ins().brif(is_i32, i32_fast, &[], slow_block, &[]);
+    let is_number = emit_is_number(builder, val);
+    builder
+        .ins()
+        .brif(is_number, numeric_fast, &[], slow_block, &[]);
 
-    builder.switch_to_block(i32_fast);
-    let v32 = emit_unbox_int32(builder, val);
+    builder.switch_to_block(numeric_fast);
+    let v32 = emit_number_to_int32(builder, val);
     let result = builder.ins().bnot(v32);
     let boxed = emit_box_int32(builder, result);
     builder.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
 
     let result_val = builder.block_params(merge_block)[0];
-    GuardedResult { merge_block, slow_block, result: result_val }
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result: result_val,
+    }
 }
 
 /// Supported bitwise operations.

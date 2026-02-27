@@ -1819,6 +1819,11 @@ impl VmContext {
         self.pending_args = args;
     }
 
+    /// Borrow pending arguments for the next function call.
+    pub fn pending_args(&self) -> &[Value] {
+        &self.pending_args
+    }
+
     /// Take pending arguments (transfers ownership)
     pub fn take_pending_args(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.pending_args)

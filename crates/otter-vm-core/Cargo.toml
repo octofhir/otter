@@ -6,7 +6,7 @@ description = "Core VM execution engine for Otter"
 license = "MIT"
 
 [features]
-default = []
+default = ["jit"]
 profiling = ["dep:otter-profiler"]
 jit = ["dep:otter-vm-jit"]
 

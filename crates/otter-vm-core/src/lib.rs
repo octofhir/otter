@@ -76,6 +76,8 @@ pub use generator::{
 pub use interpreter::{GeneratorResult, Interpreter};
 pub use intrinsics::Intrinsics;
 pub use isolate::{Isolate, IsolateConfig, IsolateGuard, IsolateHandle};
+#[cfg(feature = "jit")]
+pub use jit_runtime::JitRuntimeStats;
 pub use memory::MemoryManager;
 pub use object::{JsObject, PropertyKey, SetPropertyError};
 pub use promise::{JsPromise, PromiseState, PromiseWithResolvers};
@@ -91,3 +93,9 @@ pub use typed_array::{JsTypedArray, TypedArrayKind};
 pub use value::{NativeFn, Symbol, Value};
 
 pub use convert::{FromValue, IntoValue};
+
+#[cfg(feature = "jit")]
+/// Return a snapshot of JIT runtime counters.
+pub fn jit_runtime_stats() -> JitRuntimeStats {
+    jit_runtime::stats_snapshot()
+}

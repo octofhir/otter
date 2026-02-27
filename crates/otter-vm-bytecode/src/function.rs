@@ -1,7 +1,7 @@
 //! Function bytecode representation
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::instruction::Instruction;
 use crate::operand::LocalIndex;
@@ -403,6 +403,10 @@ pub struct Function {
     #[serde(skip)]
     pub is_deoptimized: std::sync::atomic::AtomicBool,
 
+    /// Cached entry pointer for compiled JIT code (0 means not compiled).
+    #[serde(skip)]
+    pub jit_entry_ptr: AtomicUsize,
+
     /// For derived constructors: index of an inner function that initializes
     /// instance fields. Called on `this` after `super()` returns.
     pub field_init_func: Option<u32>,
@@ -453,6 +457,11 @@ impl Function {
     /// Returns `true` if this call caused the function to become hot (first time crossing threshold).
     #[inline]
     pub fn record_call(&self) -> bool {
+        // Once hot, avoid atomic RMW on every subsequent call in hot loops.
+        if self.is_hot.load(Ordering::Relaxed) {
+            return false;
+        }
+
         let prev_count = self.call_count.fetch_add(1, Ordering::Relaxed);
         let new_count = prev_count.saturating_add(1);
 
@@ -495,9 +504,14 @@ impl Function {
         let prev = self.bailout_count.fetch_add(1, Ordering::Relaxed);
         let new_count = prev.saturating_add(1);
         if new_count >= deopt_threshold {
-            self.is_deoptimized
+            let deoptimized = self
+                .is_deoptimized
                 .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
-                .is_ok()
+                .is_ok();
+            if deoptimized {
+                self.jit_entry_ptr.store(0, Ordering::Release);
+            }
+            deoptimized
         } else {
             false
         }
@@ -513,6 +527,24 @@ impl Function {
     #[inline]
     pub fn is_deoptimized(&self) -> bool {
         self.is_deoptimized.load(Ordering::Relaxed)
+    }
+
+    /// Get cached JIT entry pointer (0 means no compiled code cached).
+    #[inline]
+    pub fn jit_entry_ptr(&self) -> usize {
+        self.jit_entry_ptr.load(Ordering::Acquire)
+    }
+
+    /// Cache JIT entry pointer for lock-free execution fast path.
+    #[inline]
+    pub fn set_jit_entry_ptr(&self, ptr: usize) {
+        self.jit_entry_ptr.store(ptr, Ordering::Release);
+    }
+
+    /// Clear cached JIT entry pointer.
+    #[inline]
+    pub fn clear_jit_entry_ptr(&self) {
+        self.jit_entry_ptr.store(0, Ordering::Release);
     }
 }
 
@@ -538,6 +570,7 @@ impl Clone for Function {
             is_deoptimized: std::sync::atomic::AtomicBool::new(
                 self.is_deoptimized.load(Ordering::Relaxed),
             ),
+            jit_entry_ptr: AtomicUsize::new(0),
             field_init_func: self.field_init_func,
         }
     }
@@ -697,6 +730,7 @@ impl FunctionBuilder {
             is_hot: std::sync::atomic::AtomicBool::new(false),
             bailout_count: AtomicU32::new(0),
             is_deoptimized: std::sync::atomic::AtomicBool::new(false),
+            jit_entry_ptr: AtomicUsize::new(0),
             field_init_func: None,
         }
     }
@@ -792,5 +826,42 @@ mod tests {
         assert_eq!(map.find(5).unwrap().line, 2);
         assert_eq!(map.find(7).unwrap().line, 2); // Between entries
         assert_eq!(map.find(10).unwrap().line, 3);
+    }
+
+    #[test]
+    fn record_call_stops_counting_after_hot_transition() {
+        let func = Function::builder().name("hot").build();
+
+        for _ in 0..(HOT_FUNCTION_THRESHOLD - 1) {
+            assert!(!func.record_call());
+        }
+
+        assert_eq!(func.get_call_count(), HOT_FUNCTION_THRESHOLD - 1);
+        assert!(!func.is_hot_function());
+
+        assert!(func.record_call());
+        assert!(func.is_hot_function());
+        assert_eq!(func.get_call_count(), HOT_FUNCTION_THRESHOLD);
+
+        // After hot transition, `record_call` should avoid extra RMWs.
+        for _ in 0..16 {
+            assert!(!func.record_call());
+        }
+
+        assert_eq!(func.get_call_count(), HOT_FUNCTION_THRESHOLD);
+    }
+
+    #[test]
+    fn jit_entry_ptr_clears_on_deopt() {
+        let func = Function::builder().name("jit").build();
+        func.set_jit_entry_ptr(0xDEAD_BEEF);
+        assert_eq!(func.jit_entry_ptr(), 0xDEAD_BEEF);
+
+        assert!(!func.record_bailout(3));
+        assert!(!func.record_bailout(3));
+        assert_eq!(func.jit_entry_ptr(), 0xDEAD_BEEF);
+
+        assert!(func.record_bailout(3));
+        assert_eq!(func.jit_entry_ptr(), 0);
     }
 }

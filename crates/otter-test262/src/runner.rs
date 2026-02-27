@@ -680,11 +680,6 @@ impl Test262Runner {
         // Save trace if configured for failures/timeouts
         self.save_conditional_trace(&test_name, outcome.0);
 
-        println!(
-            "FINISHED execute_test_with_url: {} in {:?}",
-            test_name,
-            start_time.elapsed()
-        );
         outcome
     }
 

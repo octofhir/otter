@@ -3,7 +3,8 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use otter_vm_bytecode::{Function, Module};
+use otter_vm_bytecode::{Constant, Function, Module};
+use otter_vm_jit::translator::can_translate_function_with_constants;
 
 #[derive(Debug, Clone)]
 pub(crate) struct JitCompileRequest {
@@ -12,6 +13,7 @@ pub(crate) struct JitCompileRequest {
     pub(crate) function_index: u32,
     pub(crate) function_name: Option<String>,
     pub(crate) call_count: u32,
+    pub(crate) constants: Vec<Constant>,
     pub(crate) function: Function,
 }
 
@@ -39,6 +41,14 @@ pub(crate) fn enqueue_hot_function(
     function_index: u32,
     function: &Function,
 ) -> bool {
+    let constants: Vec<Constant> = module.constants.iter().cloned().collect();
+
+    // Keep queue overhead low in always-on mode: only enqueue functions that
+    // the current baseline translator can compile.
+    if !can_translate_function_with_constants(function, &constants) {
+        return false;
+    }
+
     let key = (module.module_id, function_index);
     let mut state = lock_queue();
 
@@ -52,6 +62,7 @@ pub(crate) fn enqueue_hot_function(
         function_index,
         function_name: function.name.clone(),
         call_count: function.get_call_count(),
+        constants,
         function: function.clone(),
     });
     true
@@ -81,8 +92,17 @@ pub(crate) fn clear_for_tests() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use super::*;
-    use otter_vm_bytecode::{Function, Instruction, Module, Register};
+    use otter_vm_bytecode::{ConstantIndex, Function, Instruction, Module, Register};
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("jit_queue test lock should not be poisoned")
+    }
 
     fn make_test_module() -> Arc<Module> {
         let mut builder = Module::builder("jit-queue-test.js");
@@ -101,6 +121,7 @@ mod tests {
 
     #[test]
     fn enqueue_deduplicates_until_popped() {
+        let _guard = test_lock();
         clear_for_tests();
         let module = make_test_module();
         let func = module.function(0).expect("function 0 must exist");
@@ -118,5 +139,56 @@ mod tests {
 
         assert_eq!(pending_count(), 0);
         assert!(enqueue_hot_function(&module, 0, func));
+    }
+
+    #[test]
+    fn enqueue_skips_unsupported_function() {
+        let _guard = test_lock();
+        clear_for_tests();
+        let module = {
+            let mut builder = Module::builder("jit-queue-unsupported.js");
+            builder.add_function(
+                Function::builder()
+                    .name("unsupported")
+                    .instruction(Instruction::LoadConst {
+                        dst: Register(0),
+                        idx: ConstantIndex(0),
+                    })
+                    .instruction(Instruction::Return { src: Register(0) })
+                    .build(),
+            );
+            Arc::new(builder.build())
+        };
+
+        let func = module.function(0).expect("function 0 must exist");
+        func.mark_hot();
+        assert!(!enqueue_hot_function(&module, 0, func));
+        assert_eq!(pending_count(), 0);
+    }
+
+    #[test]
+    fn enqueue_allows_numeric_load_const() {
+        let _guard = test_lock();
+        clear_for_tests();
+        let module = {
+            let mut builder = Module::builder("jit-queue-load-const-number.js");
+            builder.constants_mut().add_number(123.5);
+            builder.add_function(
+                Function::builder()
+                    .name("supported")
+                    .instruction(Instruction::LoadConst {
+                        dst: Register(0),
+                        idx: ConstantIndex(0),
+                    })
+                    .instruction(Instruction::Return { src: Register(0) })
+                    .build(),
+            );
+            Arc::new(builder.build())
+        };
+
+        let func = module.function(0).expect("function 0 must exist");
+        func.mark_hot();
+        assert!(enqueue_hot_function(&module, 0, func));
+        assert_eq!(pending_count(), 1);
     }
 }

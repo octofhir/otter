@@ -60,6 +60,8 @@ pub(crate) enum PreferredType {
 /// Maximum recursion depth for abstract equality comparison.
 /// Prevents stack overflow from malicious valueOf/toString chains.
 const MAX_ABSTRACT_EQUAL_DEPTH: usize = 128;
+#[cfg(feature = "jit")]
+const JIT_LOOP_EAGER_CANDIDATE_BUDGET: usize = 8;
 
 fn trace_modified_register_indices(instruction: &Instruction) -> Vec<u16> {
     match instruction {
@@ -236,6 +238,79 @@ impl Interpreter {
         }
     }
 
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn has_backward_jump(function: &otter_vm_bytecode::Function) -> bool {
+        function
+            .instructions
+            .iter()
+            .any(|instruction| match instruction {
+                Instruction::Jump { offset }
+                | Instruction::JumpIfTrue { offset, .. }
+                | Instruction::JumpIfFalse { offset, .. }
+                | Instruction::JumpIfNullish { offset, .. }
+                | Instruction::JumpIfNotNullish { offset, .. }
+                | Instruction::ForInNext { offset, .. } => offset.0 < 0,
+                _ => false,
+            })
+    }
+
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn is_static_jit_candidate(function: &otter_vm_bytecode::Function) -> bool {
+        !function.flags.is_async
+            && !function.flags.is_generator
+            && !function.flags.has_rest
+            && !function.flags.uses_arguments
+            && !function.flags.uses_eval
+            && function.upvalues.is_empty()
+    }
+
+    #[cfg(feature = "jit")]
+    fn precompile_module_jit_candidates(&self, module: &Arc<Module>) {
+        if !crate::jit_runtime::is_jit_enabled() {
+            return;
+        }
+
+        if crate::jit_runtime::is_jit_eager_enabled() {
+            for idx in 0..module.function_count() {
+                let function_index = idx as u32;
+                if let Some(function) = module.function(function_index) {
+                    function.mark_hot();
+                    crate::jit_queue::enqueue_hot_function(module, function_index, function);
+                }
+            }
+            for _ in 0..module.function_count() {
+                crate::jit_runtime::compile_one_pending_request();
+            }
+            return;
+        }
+
+        let mut enqueued = 0usize;
+        for idx in 0..module.function_count() {
+            if enqueued >= JIT_LOOP_EAGER_CANDIDATE_BUDGET {
+                break;
+            }
+            let function_index = idx as u32;
+            let Some(function) = module.function(function_index) else {
+                continue;
+            };
+            if function.is_hot_function() || function.is_deoptimized() {
+                continue;
+            }
+            if !Self::is_static_jit_candidate(function) || !Self::has_backward_jump(function) {
+                continue;
+            }
+            function.mark_hot();
+            crate::jit_queue::enqueue_hot_function(module, function_index, function);
+            enqueued += 1;
+        }
+
+        for _ in 0..enqueued {
+            crate::jit_runtime::compile_one_pending_request();
+        }
+    }
+
     /// Execute a module
     pub fn execute(&self, module: &Module, ctx: &mut VmContext) -> VmResult<Value> {
         // Wrap in Arc for closure capture
@@ -263,13 +338,18 @@ impl Interpreter {
             .entry_function()
             .ok_or_else(|| VmError::internal("no entry function"))?;
 
+        #[cfg(feature = "jit")]
+        self.precompile_module_jit_candidates(&module);
+
         // Record the function call for hot function detection
         let became_hot = entry_func.record_call();
         if became_hot {
             #[cfg(feature = "jit")]
             {
-                crate::jit_queue::enqueue_hot_function(&module, module.entry_point, entry_func);
-                crate::jit_runtime::compile_one_pending_request();
+                if crate::jit_runtime::is_jit_enabled() {
+                    crate::jit_queue::enqueue_hot_function(&module, module.entry_point, entry_func);
+                    crate::jit_runtime::compile_one_pending_request();
+                }
             }
             #[cfg(not(feature = "jit"))]
             let _ = became_hot;
@@ -376,13 +456,18 @@ impl Interpreter {
             None => return VmExecutionResult::Error("no entry function".to_string()),
         };
 
+        #[cfg(feature = "jit")]
+        self.precompile_module_jit_candidates(&module);
+
         // Record the function call for hot function detection
         let became_hot = entry_func.record_call();
         if became_hot {
             #[cfg(feature = "jit")]
             {
-                crate::jit_queue::enqueue_hot_function(&module, module.entry_point, entry_func);
-                crate::jit_runtime::compile_one_pending_request();
+                if crate::jit_runtime::is_jit_enabled() {
+                    crate::jit_queue::enqueue_hot_function(&module, module.entry_point, entry_func);
+                    crate::jit_runtime::compile_one_pending_request();
+                }
             }
             #[cfg(not(feature = "jit"))]
             let _ = became_hot;
@@ -744,11 +829,44 @@ impl Interpreter {
                     if became_hot {
                         #[cfg(feature = "jit")]
                         {
-                            crate::jit_queue::enqueue_hot_function(&module, func_index, func);
-                            crate::jit_runtime::compile_one_pending_request();
+                            if crate::jit_runtime::is_jit_enabled() {
+                                crate::jit_queue::enqueue_hot_function(&module, func_index, func);
+                                crate::jit_runtime::compile_one_pending_request();
+                            }
                         }
                         #[cfg(not(feature = "jit"))]
                         let _ = became_hot;
+                    }
+
+                    #[cfg(feature = "jit")]
+                    {
+                        let can_try_jit = crate::jit_runtime::is_jit_enabled()
+                            && func.is_hot_function()
+                            && !func.is_deoptimized()
+                            && !is_construct
+                            && !is_async
+                            && upvalues.is_empty()
+                            && !func.flags.has_rest
+                            && !func.flags.uses_arguments
+                            && !func.flags.uses_eval
+                            && argc <= func.param_count;
+                        if can_try_jit {
+                            match crate::jit_runtime::try_execute_jit(
+                                module.module_id,
+                                func_index,
+                                func,
+                                ctx.pending_args(),
+                            ) {
+                                crate::jit_runtime::JitExecResult::Ok(bits) => {
+                                    if let Some(value) = Value::from_jit_bits(bits as u64) {
+                                        ctx.set_register(return_reg, value);
+                                        continue;
+                                    }
+                                }
+                                crate::jit_runtime::JitExecResult::Bailout
+                                | crate::jit_runtime::JitExecResult::NotCompiled => {}
+                            }
+                        }
                     }
 
                     let local_count = func.local_count;
@@ -1135,7 +1253,53 @@ impl Interpreter {
                     };
 
                     // Record the function call for hot function detection
-                    let _ = callee.record_call();
+                    let became_hot = callee.record_call();
+                    if became_hot {
+                        #[cfg(feature = "jit")]
+                        {
+                            if crate::jit_runtime::is_jit_enabled() {
+                                crate::jit_queue::enqueue_hot_function(
+                                    &call_module,
+                                    func_index,
+                                    callee,
+                                );
+                                crate::jit_runtime::compile_one_pending_request();
+                            }
+                        }
+                        #[cfg(not(feature = "jit"))]
+                        let _ = became_hot;
+                    }
+
+                    #[cfg(feature = "jit")]
+                    {
+                        let can_try_jit = crate::jit_runtime::is_jit_enabled()
+                            && callee.is_hot_function()
+                            && !callee.is_deoptimized()
+                            && !is_construct
+                            && !is_async
+                            && upvalues.is_empty()
+                            && !callee.flags.has_rest
+                            && !callee.flags.uses_arguments
+                            && !callee.flags.uses_eval
+                            && argc <= callee.param_count;
+                        if can_try_jit {
+                            match crate::jit_runtime::try_execute_jit(
+                                call_module.module_id,
+                                func_index,
+                                callee,
+                                ctx.pending_args(),
+                            ) {
+                                crate::jit_runtime::JitExecResult::Ok(bits) => {
+                                    if let Some(value) = Value::from_jit_bits(bits as u64) {
+                                        ctx.set_register(return_reg, value);
+                                        continue;
+                                    }
+                                }
+                                crate::jit_runtime::JitExecResult::Bailout
+                                | crate::jit_runtime::JitExecResult::NotCompiled => {}
+                            }
+                        }
+                    }
 
                     // Extract values before moving call_module
                     let local_count = callee.local_count;
@@ -1567,7 +1731,53 @@ impl Interpreter {
                     })?;
 
                     // Record the function call for hot function detection
-                    let _ = callee.record_call();
+                    let became_hot = callee.record_call();
+                    if became_hot {
+                        #[cfg(feature = "jit")]
+                        {
+                            if crate::jit_runtime::is_jit_enabled() {
+                                crate::jit_queue::enqueue_hot_function(
+                                    &call_module,
+                                    func_index,
+                                    callee,
+                                );
+                                crate::jit_runtime::compile_one_pending_request();
+                            }
+                        }
+                        #[cfg(not(feature = "jit"))]
+                        let _ = became_hot;
+                    }
+
+                    #[cfg(feature = "jit")]
+                    {
+                        let can_try_jit = crate::jit_runtime::is_jit_enabled()
+                            && callee.is_hot_function()
+                            && !callee.is_deoptimized()
+                            && !is_construct
+                            && !is_async
+                            && upvalues.is_empty()
+                            && !callee.flags.has_rest
+                            && !callee.flags.uses_arguments
+                            && !callee.flags.uses_eval
+                            && argc <= callee.param_count;
+                        if can_try_jit {
+                            match crate::jit_runtime::try_execute_jit(
+                                call_module.module_id,
+                                func_index,
+                                callee,
+                                ctx.pending_args(),
+                            ) {
+                                crate::jit_runtime::JitExecResult::Ok(bits) => {
+                                    if let Some(value) = Value::from_jit_bits(bits as u64) {
+                                        ctx.set_register(return_reg, value);
+                                        continue;
+                                    }
+                                }
+                                crate::jit_runtime::JitExecResult::Bailout
+                                | crate::jit_runtime::JitExecResult::NotCompiled => {}
+                            }
+                        }
+                    }
 
                     // Extract values before moving call_module
                     let local_count = callee.local_count;
@@ -2476,9 +2686,12 @@ impl Interpreter {
                 // Fast path for int32 division (only if result is exact integer)
                 if use_int32_fast_path {
                     if let (Some(l), Some(r)) = (left_value.as_int32(), right_value.as_int32()) {
-                        if r != 0 && l % r == 0 {
-                            // Result is an exact integer
-                            ctx.set_register(dst.0, Value::int32(l / r));
+                        if let Some(rem) = l.checked_rem(r)
+                            && rem == 0
+                            && let Some(quotient) = l.checked_div(r)
+                        {
+                            // Result is an exact integer and doesn't overflow i32.
+                            ctx.set_register(dst.0, Value::int32(quotient));
                             return Ok(InstructionResult::Continue);
                         }
                     }
@@ -5570,13 +5783,19 @@ impl Interpreter {
                             if n >= 0 { Some(n as usize) } else { None }
                         } else if let Some(n) = key_value.as_number() {
                             let idx = n as usize;
-                            if n >= 0.0 && n == idx as f64 { Some(idx) } else { None }
+                            if n >= 0.0 && n == idx as f64 {
+                                Some(idx)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         };
 
                         if let Some(idx) = maybe_idx {
-                            if let Some(ta_val) = obj.get(&PropertyKey::string("__TypedArrayData__")) {
+                            if let Some(ta_val) =
+                                obj.get(&PropertyKey::string("__TypedArrayData__"))
+                            {
                                 if let Some(ta) = ta_val.as_typed_array() {
                                     let val = ta.get_value(idx).unwrap_or(Value::undefined());
                                     ctx.set_register(dst.0, val);
@@ -5721,13 +5940,19 @@ impl Interpreter {
                             if n >= 0 { Some(n as usize) } else { None }
                         } else if let Some(n) = key_value.as_number() {
                             let idx = n as usize;
-                            if n >= 0.0 && n == idx as f64 { Some(idx) } else { None }
+                            if n >= 0.0 && n == idx as f64 {
+                                Some(idx)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         };
 
                         if let Some(idx) = maybe_idx {
-                            if let Some(ta_val) = obj.get(&PropertyKey::string("__TypedArrayData__")) {
+                            if let Some(ta_val) =
+                                obj.get(&PropertyKey::string("__TypedArrayData__"))
+                            {
                                 if let Some(ta) = ta_val.as_typed_array() {
                                     ta.set_value(idx, &val_val);
                                     return Ok(InstructionResult::Continue);
@@ -8479,11 +8704,44 @@ impl Interpreter {
                     if became_hot {
                         #[cfg(feature = "jit")]
                         {
-                            crate::jit_queue::enqueue_hot_function(&module, func_index, func);
-                            crate::jit_runtime::compile_one_pending_request();
+                            if crate::jit_runtime::is_jit_enabled() {
+                                crate::jit_queue::enqueue_hot_function(&module, func_index, func);
+                                crate::jit_runtime::compile_one_pending_request();
+                            }
                         }
                         #[cfg(not(feature = "jit"))]
                         let _ = became_hot;
+                    }
+
+                    #[cfg(feature = "jit")]
+                    {
+                        let can_try_jit = crate::jit_runtime::is_jit_enabled()
+                            && func.is_hot_function()
+                            && !func.is_deoptimized()
+                            && !is_construct
+                            && !is_async
+                            && upvalues.is_empty()
+                            && !func.flags.has_rest
+                            && !func.flags.uses_arguments
+                            && !func.flags.uses_eval
+                            && argc <= func.param_count;
+                        if can_try_jit {
+                            match crate::jit_runtime::try_execute_jit(
+                                module.module_id,
+                                func_index,
+                                func,
+                                ctx.pending_args(),
+                            ) {
+                                crate::jit_runtime::JitExecResult::Ok(bits) => {
+                                    if let Some(value) = Value::from_jit_bits(bits as u64) {
+                                        ctx.set_register(return_reg, value);
+                                        continue;
+                                    }
+                                }
+                                crate::jit_runtime::JitExecResult::Bailout
+                                | crate::jit_runtime::JitExecResult::NotCompiled => {}
+                            }
+                        }
                     }
 
                     let local_count = func.local_count;
@@ -11297,6 +11555,41 @@ mod tests {
     }
 
     #[test]
+    fn test_div_int_min_by_minus_one_does_not_panic() {
+        let mut builder = Module::builder("test.js");
+
+        let func = Function::builder()
+            .name("main")
+            .register_count(3)
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(0),
+                value: i32::MIN,
+            })
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: -1,
+            })
+            .instruction(Instruction::Div {
+                dst: Register(2),
+                lhs: Register(0),
+                rhs: Register(1),
+                feedback_index: 0,
+            })
+            .instruction(Instruction::Return { src: Register(2) })
+            .feedback_vector_size(1)
+            .build();
+
+        builder.add_function(func);
+        let module = builder.build();
+
+        let (mut ctx, _rt) = create_test_context_with_runtime();
+        let interpreter = Interpreter::new();
+        let result = interpreter.execute(&module, &mut ctx).unwrap();
+
+        assert_eq!(result.as_number(), Some(2147483648.0));
+    }
+
+    #[test]
     fn test_comparison() {
         let mut builder = Module::builder("test.js");
 
@@ -12950,6 +13243,39 @@ mod tests {
         // Should now be hot
         assert!(func.get_call_count() >= HOT_FUNCTION_THRESHOLD);
         assert!(func.is_hot_function());
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn test_jit_loop_candidate_detection() {
+        let loop_func = Function::builder()
+            .name("loop_func")
+            .register_count(1)
+            .instruction(Instruction::LoadTrue { dst: Register(0) })
+            .instruction(Instruction::JumpIfTrue {
+                cond: Register(0),
+                offset: otter_vm_bytecode::JumpOffset(-1),
+            })
+            .build();
+
+        assert!(Interpreter::has_backward_jump(&loop_func));
+        assert!(Interpreter::is_static_jit_candidate(&loop_func));
+
+        let non_loop = Function::builder()
+            .name("non_loop")
+            .instruction(Instruction::ReturnUndefined)
+            .build();
+        assert!(!Interpreter::has_backward_jump(&non_loop));
+
+        let non_candidate = Function::builder()
+            .name("non_candidate")
+            .flags(otter_vm_bytecode::function::FunctionFlags {
+                uses_arguments: true,
+                ..Default::default()
+            })
+            .instruction(Instruction::ReturnUndefined)
+            .build();
+        assert!(!Interpreter::is_static_jit_candidate(&non_candidate));
     }
 
     #[test]

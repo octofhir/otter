@@ -1012,14 +1012,13 @@ pub(super) fn install_plain_date_time_prototype(
                 return Err(VmError::range_error("time zone string must not be empty"));
             }
 
-            // Use temporal_rs for spec-compliant timezone parsing
-            // This handles: "UTC", "+01:00", "2021-08-19T17:30Z", "2021-08-19T17:30-07:00[+01:46]", etc.
-            let tz = temporal_rs::TimeZone::try_from_str(tz_s).map_err(temporal_err)?;
-            let tz_identifier = tz.identifier().map_err(temporal_err)?;
+            // Use temporal_rs for spec-compliant timezone parsing (with provider for IANA support)
+            let tz = temporal_rs::TimeZone::try_from_str_with_provider(tz_s, tz_provider())
+                .map_err(temporal_err)?;
 
             // Read disambiguation option
             let options_val = args.get(1).cloned().unwrap_or(Value::undefined());
-            let disambiguation_str = if !options_val.is_undefined() {
+            let disambiguation = if !options_val.is_undefined() {
                 if options_val.is_null()
                     || options_val.is_boolean()
                     || options_val.is_number()
@@ -1031,116 +1030,35 @@ pub(super) fn install_plain_date_time_prototype(
                         "options must be an object or undefined",
                     ));
                 }
-                if let Some(opts_obj) = options_val.as_object() {
-                    let dis_val =
-                        ncx.get_property(&opts_obj, &PropertyKey::string("disambiguation"))?;
-                    if !dis_val.is_undefined() {
-                        let dis_str = ncx.to_string_value(&dis_val)?;
-                        match dis_str.as_str() {
-                            "compatible" | "earlier" | "later" | "reject" => {
-                                dis_str.as_str().to_string()
-                            }
-                            _ => {
-                                return Err(VmError::range_error(format!(
-                                    "{} is not a valid value for disambiguation",
-                                    dis_str
-                                )));
-                            }
+                let dis_val = ncx
+                    .get_property_of_value(&options_val, &PropertyKey::string("disambiguation"))?;
+                if !dis_val.is_undefined() {
+                    let dis_str = ncx.to_string_value(&dis_val)?;
+                    match dis_str.as_str() {
+                        "compatible" => temporal_rs::options::Disambiguation::Compatible,
+                        "earlier" => temporal_rs::options::Disambiguation::Earlier,
+                        "later" => temporal_rs::options::Disambiguation::Later,
+                        "reject" => temporal_rs::options::Disambiguation::Reject,
+                        _ => {
+                            return Err(VmError::range_error(format!(
+                                "{} is not a valid value for disambiguation",
+                                dis_str
+                            )));
                         }
-                    } else {
-                        "compatible".to_string()
-                    }
-                } else if let Some(proxy) = options_val.as_proxy() {
-                    let key = PropertyKey::string("disambiguation");
-                    let key_value = crate::proxy_operations::property_key_to_value_pub(&key);
-                    let dis_val = crate::proxy_operations::proxy_get(
-                        ncx,
-                        proxy,
-                        &key,
-                        key_value,
-                        options_val.clone(),
-                    )?;
-                    if !dis_val.is_undefined() {
-                        let dis_str = ncx.to_string_value(&dis_val)?;
-                        match dis_str.as_str() {
-                            "compatible" | "earlier" | "later" | "reject" => {
-                                dis_str.as_str().to_string()
-                            }
-                            _ => {
-                                return Err(VmError::range_error(format!(
-                                    "{} is not a valid value for disambiguation",
-                                    dis_str
-                                )));
-                            }
-                        }
-                    } else {
-                        "compatible".to_string()
                     }
                 } else {
-                    "compatible".to_string()
+                    temporal_rs::options::Disambiguation::Compatible
                 }
             } else {
-                "compatible".to_string()
+                temporal_rs::options::Disambiguation::Compatible
             };
 
-            // Get the PlainDateTime components from extracted value
-            let y = this_pdt.year();
-            let mo = this_pdt.month() as i32;
-            let d = this_pdt.day() as i32;
-            let h = this_pdt.hour() as i32;
-            let mi = this_pdt.minute() as i32;
-            let s = this_pdt.second() as i32;
-            let ms_val = this_pdt.millisecond() as i32;
-            let us_val = this_pdt.microsecond() as i32;
-            let ns_val = this_pdt.nanosecond() as i32;
+            // Use temporal_rs to properly handle DST disambiguation for named timezones
+            let zdt = this_pdt
+                .to_zoned_date_time_with_provider(tz, disambiguation, tz_provider())
+                .map_err(temporal_err)?;
 
-            // Compute epoch nanoseconds from ISO date/time components
-            let days_from_epoch = iso_date_to_epoch_days(y, mo, d);
-            let time_ns = (h as i128) * 3_600_000_000_000
-                + (mi as i128) * 60_000_000_000
-                + (s as i128) * 1_000_000_000
-                + (ms_val as i128) * 1_000_000
-                + (us_val as i128) * 1_000
-                + (ns_val as i128);
-            let local_epoch_ns = (days_from_epoch as i128) * 86_400_000_000_000 + time_ns;
-
-            // Parse offset from timezone identifier
-            let offset_ns = parse_tz_offset_ns(&tz_identifier)?;
-
-            // For fixed-offset/UTC timezones, epoch_ns = local_epoch_ns - offset_ns
-            let epoch_ns = local_epoch_ns - offset_ns;
-
-            // Validate Instant range
-            let max_instant_ns: i128 = 8_640_000_000_000_000_000_000;
-            if epoch_ns < -max_instant_ns || epoch_ns > max_instant_ns {
-                return Err(VmError::range_error(
-                    "resulting Instant is outside the allowed range",
-                ));
-            }
-
-            let epoch_ns_str = epoch_ns.to_string();
-
-            // Create ZonedDateTime via constructor so internal slots are correct
-            let temporal_ns_val = ncx
-                .ctx
-                .get_global("Temporal")
-                .ok_or_else(|| VmError::type_error("Temporal namespace not found"))?;
-            let temporal_obj = temporal_ns_val
-                .as_object()
-                .ok_or_else(|| VmError::type_error("Temporal namespace not found"))?;
-            let ctor = temporal_obj
-                .get(&PropertyKey::string("ZonedDateTime"))
-                .ok_or_else(|| VmError::type_error("ZonedDateTime constructor not found"))?;
-            let epoch_bigint = Value::bigint(epoch_ns_str);
-            ncx.call_function_construct(
-                &ctor,
-                Value::undefined(),
-                &[
-                    epoch_bigint,
-                    Value::string(JsString::intern(&tz_identifier)),
-                    Value::string(JsString::intern("iso8601")),
-                ],
-            )
+            construct_zoned_date_time_value(ncx, &zdt)
         },
         mm.clone(),
         fn_proto.clone(),

@@ -163,15 +163,7 @@ fn json_to_value(
                 };
                 let _ = obj.set(
                     key,
-                    json_to_value(
-                        v,
-                        mm,
-                        object_proto,
-                        array_proto,
-                        key_cache,
-                        node_count,
-                        ncx,
-                    )?,
+                    json_to_value(v, mm, object_proto, array_proto, key_cache, node_count, ncx)?,
                 );
             }
             Ok(Value::object(obj))

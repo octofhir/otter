@@ -1646,17 +1646,47 @@ pub(super) fn to_temporal_plain_time(
         // Alphabetical: hour, microsecond, millisecond, minute, nanosecond, second
         let mut has_any = false;
         let h_val = ncx.get_property_of_value(item, &PropertyKey::string("hour"))?;
-        let h = if !h_val.is_undefined() { has_any = true; to_integer_with_truncation(ncx, &h_val)? as i32 } else { 0 };
+        let h = if !h_val.is_undefined() {
+            has_any = true;
+            to_integer_with_truncation(ncx, &h_val)? as i32
+        } else {
+            0
+        };
         let us_val = ncx.get_property_of_value(item, &PropertyKey::string("microsecond"))?;
-        let us = if !us_val.is_undefined() { has_any = true; to_integer_with_truncation(ncx, &us_val)? as i32 } else { 0 };
+        let us = if !us_val.is_undefined() {
+            has_any = true;
+            to_integer_with_truncation(ncx, &us_val)? as i32
+        } else {
+            0
+        };
         let ms_val = ncx.get_property_of_value(item, &PropertyKey::string("millisecond"))?;
-        let ms = if !ms_val.is_undefined() { has_any = true; to_integer_with_truncation(ncx, &ms_val)? as i32 } else { 0 };
+        let ms = if !ms_val.is_undefined() {
+            has_any = true;
+            to_integer_with_truncation(ncx, &ms_val)? as i32
+        } else {
+            0
+        };
         let mi_val = ncx.get_property_of_value(item, &PropertyKey::string("minute"))?;
-        let mi = if !mi_val.is_undefined() { has_any = true; to_integer_with_truncation(ncx, &mi_val)? as i32 } else { 0 };
+        let mi = if !mi_val.is_undefined() {
+            has_any = true;
+            to_integer_with_truncation(ncx, &mi_val)? as i32
+        } else {
+            0
+        };
         let ns_val = ncx.get_property_of_value(item, &PropertyKey::string("nanosecond"))?;
-        let ns = if !ns_val.is_undefined() { has_any = true; to_integer_with_truncation(ncx, &ns_val)? as i32 } else { 0 };
+        let ns = if !ns_val.is_undefined() {
+            has_any = true;
+            to_integer_with_truncation(ncx, &ns_val)? as i32
+        } else {
+            0
+        };
         let s_val = ncx.get_property_of_value(item, &PropertyKey::string("second"))?;
-        let sec = if !s_val.is_undefined() { has_any = true; to_integer_with_truncation(ncx, &s_val)? as i32 } else { 0 };
+        let sec = if !s_val.is_undefined() {
+            has_any = true;
+            to_integer_with_truncation(ncx, &s_val)? as i32
+        } else {
+            0
+        };
         if !has_any {
             return Err(VmError::type_error(
                 "property bag must have at least one time property",
@@ -1808,17 +1838,47 @@ pub(super) fn read_time_fields_from_bag_value(
     // Alphabetical: hour, microsecond, millisecond, minute, nanosecond, second
     let mut has_any = false;
     let h_val = ncx.get_property_of_value(val, &PropertyKey::string("hour"))?;
-    let h = if !h_val.is_undefined() { has_any = true; to_integer_with_truncation(ncx, &h_val)? as i32 } else { 0 };
+    let h = if !h_val.is_undefined() {
+        has_any = true;
+        to_integer_with_truncation(ncx, &h_val)? as i32
+    } else {
+        0
+    };
     let us_val = ncx.get_property_of_value(val, &PropertyKey::string("microsecond"))?;
-    let us = if !us_val.is_undefined() { has_any = true; to_integer_with_truncation(ncx, &us_val)? as u16 } else { 0 };
+    let us = if !us_val.is_undefined() {
+        has_any = true;
+        to_integer_with_truncation(ncx, &us_val)? as u16
+    } else {
+        0
+    };
     let ms_val = ncx.get_property_of_value(val, &PropertyKey::string("millisecond"))?;
-    let ms = if !ms_val.is_undefined() { has_any = true; to_integer_with_truncation(ncx, &ms_val)? as u16 } else { 0 };
+    let ms = if !ms_val.is_undefined() {
+        has_any = true;
+        to_integer_with_truncation(ncx, &ms_val)? as u16
+    } else {
+        0
+    };
     let mi_val = ncx.get_property_of_value(val, &PropertyKey::string("minute"))?;
-    let mi = if !mi_val.is_undefined() { has_any = true; to_integer_with_truncation(ncx, &mi_val)? as i32 } else { 0 };
+    let mi = if !mi_val.is_undefined() {
+        has_any = true;
+        to_integer_with_truncation(ncx, &mi_val)? as i32
+    } else {
+        0
+    };
     let ns_val = ncx.get_property_of_value(val, &PropertyKey::string("nanosecond"))?;
-    let ns = if !ns_val.is_undefined() { has_any = true; to_integer_with_truncation(ncx, &ns_val)? as u16 } else { 0 };
+    let ns = if !ns_val.is_undefined() {
+        has_any = true;
+        to_integer_with_truncation(ncx, &ns_val)? as u16
+    } else {
+        0
+    };
     let s_val = ncx.get_property_of_value(val, &PropertyKey::string("second"))?;
-    let mut sec = if !s_val.is_undefined() { has_any = true; to_integer_with_truncation(ncx, &s_val)? as i32 } else { 0 };
+    let mut sec = if !s_val.is_undefined() {
+        has_any = true;
+        to_integer_with_truncation(ncx, &s_val)? as i32
+    } else {
+        0
+    };
 
     if !has_any {
         return Ok(None);
@@ -2616,7 +2676,9 @@ pub(super) fn parse_relative_to_value(
         let has_non_iso_calendar = if !calendar_val.is_undefined() {
             // Check if the calendar is non-ISO before the validation call
             let cal_is_non_iso = if calendar_val.is_string() {
-                let s = calendar_val.as_string().map(|s| s.as_str().to_ascii_lowercase());
+                let s = calendar_val
+                    .as_string()
+                    .map(|s| s.as_str().to_ascii_lowercase());
                 s.as_deref() != Some("iso8601")
             } else {
                 false
@@ -2648,7 +2710,8 @@ pub(super) fn parse_relative_to_value(
             }
 
             // eraYear — read + ToIntegerWithTruncation (Infinity → RangeError)
-            let era_year_val = ncx.get_property_of_value(rt_val, &PropertyKey::string("eraYear"))?;
+            let era_year_val =
+                ncx.get_property_of_value(rt_val, &PropertyKey::string("eraYear"))?;
             if !era_year_val.is_undefined() {
                 let _era_year = to_integer_with_truncation(ncx, &era_year_val)? as i32;
             }
@@ -2656,19 +2719,35 @@ pub(super) fn parse_relative_to_value(
 
         // hour — read + coerce
         let h_val = ncx.get_property_of_value(rt_val, &PropertyKey::string("hour"))?;
-        let h = if !h_val.is_undefined() { to_integer_with_truncation(ncx, &h_val)? as i32 } else { 0 };
+        let h = if !h_val.is_undefined() {
+            to_integer_with_truncation(ncx, &h_val)? as i32
+        } else {
+            0
+        };
 
         // microsecond — read + coerce
         let us_val = ncx.get_property_of_value(rt_val, &PropertyKey::string("microsecond"))?;
-        let us = if !us_val.is_undefined() { to_integer_with_truncation(ncx, &us_val)? as u16 } else { 0 };
+        let us = if !us_val.is_undefined() {
+            to_integer_with_truncation(ncx, &us_val)? as u16
+        } else {
+            0
+        };
 
         // millisecond — read + coerce
         let ms_val = ncx.get_property_of_value(rt_val, &PropertyKey::string("millisecond"))?;
-        let ms = if !ms_val.is_undefined() { to_integer_with_truncation(ncx, &ms_val)? as u16 } else { 0 };
+        let ms = if !ms_val.is_undefined() {
+            to_integer_with_truncation(ncx, &ms_val)? as u16
+        } else {
+            0
+        };
 
         // minute — read + coerce
         let mi_val = ncx.get_property_of_value(rt_val, &PropertyKey::string("minute"))?;
-        let mi = if !mi_val.is_undefined() { to_integer_with_truncation(ncx, &mi_val)? as i32 } else { 0 };
+        let mi = if !mi_val.is_undefined() {
+            to_integer_with_truncation(ncx, &mi_val)? as i32
+        } else {
+            0
+        };
 
         // month — read + coerce immediately (before monthCode)
         let month_val = ncx.get_property_of_value(rt_val, &PropertyKey::string("month"))?;
@@ -2679,7 +2758,8 @@ pub(super) fn parse_relative_to_value(
         };
 
         // monthCode — read + coerce
-        let month_code_val = ncx.get_property_of_value(rt_val, &PropertyKey::string("monthCode"))?;
+        let month_code_val =
+            ncx.get_property_of_value(rt_val, &PropertyKey::string("monthCode"))?;
         let mc_str = if !month_code_val.is_undefined() {
             let coerced = to_primitive_require_string(ncx, &month_code_val)?;
             validate_month_code_syntax(coerced.as_str())?;
@@ -2690,7 +2770,11 @@ pub(super) fn parse_relative_to_value(
 
         // nanosecond — read + coerce
         let ns_val = ncx.get_property_of_value(rt_val, &PropertyKey::string("nanosecond"))?;
-        let ns = if !ns_val.is_undefined() { to_integer_with_truncation(ncx, &ns_val)? as u16 } else { 0 };
+        let ns = if !ns_val.is_undefined() {
+            to_integer_with_truncation(ncx, &ns_val)? as u16
+        } else {
+            0
+        };
 
         // offset — read + RequireString (objects → ToPrimitive string, non-string primitives → TypeError)
         let offset_val = ncx.get_property_of_value(rt_val, &PropertyKey::string("offset"))?;
@@ -2702,7 +2786,11 @@ pub(super) fn parse_relative_to_value(
 
         // second — read + coerce
         let s_val = ncx.get_property_of_value(rt_val, &PropertyKey::string("second"))?;
-        let mut sec = if !s_val.is_undefined() { to_integer_with_truncation(ncx, &s_val)? as i32 } else { 0 };
+        let mut sec = if !s_val.is_undefined() {
+            to_integer_with_truncation(ncx, &s_val)? as i32
+        } else {
+            0
+        };
 
         // timeZone — read
         let tz_val = ncx.get_property_of_value(rt_val, &PropertyKey::string("timeZone"))?;
@@ -2716,14 +2804,22 @@ pub(super) fn parse_relative_to_value(
         };
 
         // Leap second handling
-        if sec == 60 { sec = 59; }
+        if sec == 60 {
+            sec = 59;
+        }
 
         // Build time (if any time fields present)
-        let has_time = !h_val.is_undefined() || !us_val.is_undefined() || !ms_val.is_undefined()
-            || !mi_val.is_undefined() || !ns_val.is_undefined() || !s_val.is_undefined();
+        let has_time = !h_val.is_undefined()
+            || !us_val.is_undefined()
+            || !ms_val.is_undefined()
+            || !mi_val.is_undefined()
+            || !ns_val.is_undefined()
+            || !s_val.is_undefined();
         let time = if has_time {
-            Some(temporal_rs::PlainTime::try_new(h as u8, mi as u8, sec as u8, ms, us, ns)
-                .map_err(temporal_err)?)
+            Some(
+                temporal_rs::PlainTime::try_new(h as u8, mi as u8, sec as u8, ms, us, ns)
+                    .map_err(temporal_err)?,
+            )
         } else {
             None
         };
@@ -2752,9 +2848,13 @@ pub(super) fn parse_relative_to_value(
             )));
         }
         let pd = temporal_rs::PlainDate::new_with_overflow(
-            y, month.min(255) as u8, d.min(255) as u8,
-            temporal_rs::Calendar::default(), Overflow::Constrain,
-        ).map_err(temporal_err)?;
+            y,
+            month.min(255) as u8,
+            d.min(255) as u8,
+            temporal_rs::Calendar::default(),
+            Overflow::Constrain,
+        )
+        .map_err(temporal_err)?;
 
         // Decide ZonedDateTime vs PlainDate
         if !tz_val.is_undefined() {

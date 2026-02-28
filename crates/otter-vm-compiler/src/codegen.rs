@@ -753,13 +753,14 @@ impl CodeGen {
         if self.optimize {
             let mut optimizer = PeepholeOptimizer::new();
             for func in &mut self.functions {
-                optimizer.optimize(&mut func.instructions);
+                optimizer.optimize(func.instructions.write());
             }
         }
 
         // Check if the entry function contains a top-level Await instruction
         let has_tla = self.functions[entry_point as usize]
             .instructions
+            .read()
             .iter()
             .any(|instr| matches!(instr, Instruction::Await { .. }));
 

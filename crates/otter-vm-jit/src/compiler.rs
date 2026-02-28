@@ -6,6 +6,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module, ModuleError, default_libcall_names};
 use otter_vm_bytecode::{Constant, Function};
 
+use crate::runtime_helpers::{HelperFuncIds, HelperRefs, RuntimeHelpers};
 use crate::translator;
 
 /// Result of compiling a bytecode function to native code.
@@ -51,10 +52,11 @@ pub struct JitCompiler {
     function_builder_ctx: FunctionBuilderContext,
     context: cranelift_codegen::Context,
     next_function_id: u64,
+    helper_func_ids: Option<HelperFuncIds>,
 }
 
 impl JitCompiler {
-    /// Create a new baseline JIT compiler instance.
+    /// Create a new baseline JIT compiler instance (no runtime helpers).
     pub fn new() -> Result<Self, JitError> {
         let builder = JITBuilder::new(default_libcall_names())
             .map_err(|e| JitError::Builder(e.to_string()))?;
@@ -64,7 +66,32 @@ impl JitCompiler {
             function_builder_ctx: FunctionBuilderContext::new(),
             context: cranelift_codegen::Context::new(),
             next_function_id: 0,
+            helper_func_ids: None,
         })
+    }
+
+    /// Create a JIT compiler with runtime helper support.
+    ///
+    /// Runtime helpers enable compilation of property access, function calls,
+    /// and other complex operations that require VM context.
+    pub fn new_with_helpers(helpers: RuntimeHelpers) -> Result<Self, JitError> {
+        let mut builder = JITBuilder::new(default_libcall_names())
+            .map_err(|e| JitError::Builder(e.to_string()))?;
+        helpers.register_symbols(&mut builder);
+        let mut module = JITModule::new(builder);
+        let helper_func_ids = HelperFuncIds::declare(&helpers, &mut module)?;
+        Ok(Self {
+            module,
+            function_builder_ctx: FunctionBuilderContext::new(),
+            context: cranelift_codegen::Context::new(),
+            next_function_id: 0,
+            helper_func_ids: Some(helper_func_ids),
+        })
+    }
+
+    /// Whether runtime helpers are available for compilation.
+    pub fn has_helpers(&self) -> bool {
+        self.helper_func_ids.is_some()
     }
 
     /// Compile a bytecode function into native code.
@@ -85,8 +112,10 @@ impl JitCompiler {
         constants: &[Constant],
     ) -> Result<JitCompileArtifact, JitError> {
         let mut signature = self.module.make_signature();
-        signature.params.push(AbiParam::new(types::I64));
-        signature.params.push(AbiParam::new(types::I32));
+        // Signature: (ctx: I64, args_ptr: I64, argc: I32) -> I64
+        signature.params.push(AbiParam::new(types::I64)); // ctx pointer
+        signature.params.push(AbiParam::new(types::I64)); // args_ptr
+        signature.params.push(AbiParam::new(types::I32)); // argc
         signature.returns.push(AbiParam::new(types::I64));
 
         let name = format!(
@@ -105,10 +134,20 @@ impl JitCompiler {
             signature,
         );
 
+        // Declare helper function refs for this compilation if available
+        let helper_refs = self.helper_func_ids.as_ref().map(|func_ids| {
+            HelperRefs::declare(func_ids, &mut self.module, &mut self.context.func)
+        });
+
         {
             let mut builder =
                 FunctionBuilder::new(&mut self.context.func, &mut self.function_builder_ctx);
-            translator::translate_function_with_constants(&mut builder, function, constants)?;
+            translator::translate_function_with_constants(
+                &mut builder,
+                function,
+                constants,
+                helper_refs.as_ref(),
+            )?;
             builder.finalize();
         }
 
@@ -120,25 +159,27 @@ impl JitCompiler {
         Ok(JitCompileArtifact { code_ptr })
     }
 
-    /// Execute a compiled artifact as `extern "C" fn(*const i64, u32) -> i64`.
+    /// Execute a compiled artifact as `extern "C" fn(*mut u8, *const i64, u32) -> i64`.
     ///
-    /// This is intended for translator unit tests.
+    /// This is intended for translator unit tests. Passes null ctx pointer.
     pub fn execute_compiled_i64(&self, artifact: JitCompileArtifact) -> i64 {
         self.execute_compiled_i64_with_args(artifact, &[])
     }
 
     /// Execute a compiled artifact with pre-boxed NaN-value arguments.
+    ///
+    /// Passes null ctx pointer (sufficient for arithmetic-only functions).
     pub fn execute_compiled_i64_with_args(
         &self,
         artifact: JitCompileArtifact,
         args: &[i64],
     ) -> i64 {
-        let func: extern "C" fn(*const i64, u32) -> i64 = unsafe {
+        let func: extern "C" fn(*mut u8, *const i64, u32) -> i64 = unsafe {
             // SAFETY: Artifacts are produced by this compiler with signature
-            // `(*const i64, u32) -> i64`.
+            // `(*mut u8, *const i64, u32) -> i64`.
             std::mem::transmute(artifact.code_ptr)
         };
-        func(args.as_ptr(), args.len() as u32)
+        func(std::ptr::null_mut(), args.as_ptr(), args.len() as u32)
     }
 }
 
@@ -387,6 +428,8 @@ mod tests {
             .instruction(Instruction::Return { src: Register(2) })
             .feedback_vector_size(1)
             .build();
+        // Set feedback: f64 operands observed
+        function.feedback_vector.write()[0].type_observations.observe_number();
 
         let constants = [Constant::number(1.5), Constant::number(2.25)];
         let mut jit = JitCompiler::new().expect("jit initialization should succeed");
@@ -422,6 +465,9 @@ mod tests {
             .instruction(Instruction::Return { src: Register(2) })
             .feedback_vector_size(1)
             .build();
+        // Set feedback: mixed int32 + number observed
+        function.feedback_vector.write()[0].type_observations.observe_int32();
+        function.feedback_vector.write()[0].type_observations.observe_number();
 
         let constants = [Constant::number(2.5)];
         let mut jit = JitCompiler::new().expect("jit initialization should succeed");
@@ -485,6 +531,9 @@ mod tests {
             .instruction(Instruction::Return { src: Register(2) })
             .feedback_vector_size(1)
             .build();
+        // Set feedback: both int32 and number observed (overflow produces f64)
+        function.feedback_vector.write()[0].type_observations.observe_int32();
+        function.feedback_vector.write()[0].type_observations.observe_number();
 
         let mut jit = JitCompiler::new().expect("jit initialization should succeed");
         let artifact = jit

@@ -4388,7 +4388,7 @@ impl Compiler {
         if std::env::var("OTTER_DUMP_ASSERT").is_ok() && name.as_deref() == Some("assert") {
             if let Some(func) = self.codegen.functions.get(func_idx as usize) {
                 eprintln!("== OTTER_DUMP_ASSERT function assert ==");
-                for (i, instr) in func.instructions.iter().enumerate() {
+                for (i, instr) in func.instructions.read().iter().enumerate() {
                     eprintln!("{:04}: {:?}", i, instr);
                 }
                 eprintln!("== OTTER_DUMP_ASSERT end ==");
@@ -10139,7 +10139,7 @@ mod tests {
         };
 
         for func in &module.functions {
-            for instr in &func.instructions {
+            for instr in func.instructions.read() {
                 if let otter_vm_bytecode::Instruction::GetGlobal { name, .. } = instr {
                     assert!(
                         !is_arguments_constant(name.0),
@@ -10157,6 +10157,7 @@ mod tests {
         assert!(
             outer
                 .instructions
+                .read()
                 .iter()
                 .any(|i| matches!(i, otter_vm_bytecode::Instruction::CreateArguments { .. })),
             "outer should lazily initialize arguments local when captured by arrow"
@@ -10183,7 +10184,7 @@ mod tests {
         };
 
         for func in &module.functions {
-            for instr in &func.instructions {
+            for instr in func.instructions.read() {
                 if let otter_vm_bytecode::Instruction::GetGlobal { name, .. } = instr {
                     assert!(
                         !is_arguments_constant(name.0),
@@ -10211,12 +10212,13 @@ mod tests {
         assert!(
             !main
                 .instructions
+                .read()
                 .iter()
                 .any(|i| matches!(i, otter_vm_bytecode::Instruction::CreateArguments { .. })),
             "top-level should not synthesize an arguments object"
         );
         assert!(
-            main.instructions.iter().any(|i| matches!(
+            main.instructions.read().iter().any(|i| matches!(
                 i,
                 otter_vm_bytecode::Instruction::GetGlobal { name, .. } if is_arguments_constant(name.0)
             )),
@@ -10243,6 +10245,7 @@ mod tests {
             assert!(
                 !func
                     .instructions
+                    .read()
                     .iter()
                     .any(|i| matches!(i, otter_vm_bytecode::Instruction::CreateArguments { .. })),
                 "top-level + arrow should not synthesize arguments in any function context"
@@ -10251,7 +10254,7 @@ mod tests {
 
         assert!(
             module.functions.iter().any(|func| {
-                func.instructions.iter().any(|i| matches!(
+                func.instructions.read().iter().any(|i| matches!(
                     i,
                     otter_vm_bytecode::Instruction::GetGlobal { name, .. } if is_arguments_constant(name.0)
                 ))
@@ -10526,7 +10529,7 @@ mod tests {
         };
 
         let main = &module.functions[module.entry_point as usize];
-        assert!(main.instructions.iter().any(|instr| {
+        assert!(main.instructions.read().iter().any(|instr| {
             matches!(
                 instr,
                 otter_vm_bytecode::Instruction::GetGlobal { name, .. }
@@ -10535,6 +10538,7 @@ mod tests {
         }));
         assert!(
             main.instructions
+                .read()
                 .iter()
                 .any(|instr| matches!(instr, otter_vm_bytecode::Instruction::Call { argc: 2, .. }))
         );

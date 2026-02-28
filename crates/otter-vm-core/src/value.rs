@@ -428,6 +428,69 @@ impl Value {
         })
     }
 
+    /// Reconstruct a full Value from raw NaN-boxed bits, including pointer types.
+    ///
+    /// For pointer-tagged values, reads the GC header tag to determine the type
+    /// and reconstructs the appropriate `HeapRef`. Returns `None` for unsupported
+    /// or unrecognized pointer types.
+    ///
+    /// # Safety
+    ///
+    /// - The raw pointer in `bits` must point to a live GC object
+    /// - No GC must occur while the returned Value is in use
+    /// - Intended for JIT runtime helpers during no-GC JIT execution scope
+    #[cfg(feature = "jit")]
+    #[allow(unsafe_code)]
+    pub(crate) unsafe fn from_raw_bits_unchecked(bits: u64) -> Option<Self> {
+        use otter_vm_gc::object::{GcHeader, tags as gc_tags};
+        use std::ptr::NonNull;
+
+        if (bits & TAG_MASK) != TAG_POINTER {
+            return Self::from_jit_bits(bits);
+        }
+
+        let raw_ptr = (bits & PAYLOAD_MASK) as *const u8;
+        if raw_ptr.is_null() {
+            return None;
+        }
+
+        // GcAllocation<T> layout: [GcHeader (8 bytes)] [T value]
+        // raw_ptr points to T, header is 8 bytes before.
+        let header_offset = std::mem::offset_of!(crate::gc::GcBox<JsObject>, value);
+        let header_ptr = raw_ptr.sub(header_offset) as *const GcHeader;
+        let tag = (*header_ptr).tag();
+
+        // Reconstruct GcRef<T> from a raw value pointer.
+        // SAFETY: raw_ptr must point to the `value` field of a live GcBox<T>.
+        macro_rules! gc_ref {
+            ($T:ty) => {{
+                let offset = std::mem::offset_of!(crate::gc::GcBox<$T>, value);
+                let box_ptr = raw_ptr.sub(offset) as *mut crate::gc::GcBox<$T>;
+                let gc = crate::gc::Gc::from_raw(NonNull::new_unchecked(box_ptr));
+                crate::gc::GcRef::from_gc(gc)
+            }};
+        }
+
+        let heap_ref = match tag {
+            gc_tags::CLOSURE => HeapRef::Function(gc_ref!(Closure)),
+            gc_tags::FUNCTION => HeapRef::NativeFunction(gc_ref!(NativeFunctionObject)),
+            gc_tags::OBJECT => HeapRef::Object(gc_ref!(JsObject)),
+            gc_tags::ARRAY => HeapRef::Array(gc_ref!(JsObject)),
+            gc_tags::STRING => HeapRef::String(gc_ref!(JsString)),
+            gc_tags::PROXY => HeapRef::Proxy(gc_ref!(JsProxy)),
+            gc_tags::PROMISE => HeapRef::Promise(gc_ref!(JsPromise)),
+            gc_tags::GENERATOR => HeapRef::Generator(gc_ref!(JsGenerator)),
+            gc_tags::SYMBOL => HeapRef::Symbol(gc_ref!(Symbol)),
+            gc_tags::REGEXP => HeapRef::RegExp(gc_ref!(JsRegExp)),
+            _ => return None,
+        };
+
+        Some(Self {
+            bits,
+            heap_ref: Some(heap_ref),
+        })
+    }
+
     /// Return raw NaN-box bits for JIT argument passing.
     #[inline]
     pub(crate) fn to_jit_bits(&self) -> i64 {

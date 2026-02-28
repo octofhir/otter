@@ -1097,6 +1097,86 @@ pub enum Instruction {
         name: ConstantIndex,
         src: Register,
     },
+
+    // ==================== Quickened Instructions ====================
+    // Runtime-specialized variants, never emitted by the compiler.
+    // Created by bytecode quickening when IC observations stabilize.
+
+    /// Quickened Add: both operands observed as Int32.
+    /// Fast path: unbox i32, checked_add, rebox. On fail → de-quicken to Add.
+    AddInt32 {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        feedback_index: u16,
+    },
+    /// Quickened Sub: both operands observed as Int32.
+    SubInt32 {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        feedback_index: u16,
+    },
+    /// Quickened Mul: both operands observed as Int32.
+    MulInt32 {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        feedback_index: u16,
+    },
+    /// Quickened Div: both operands observed as Int32.
+    DivInt32 {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        feedback_index: u16,
+    },
+    /// Quickened Add: both operands observed as Number (f64).
+    AddNumber {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        feedback_index: u16,
+    },
+    /// Quickened Sub: both operands observed as Number (f64).
+    SubNumber {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        feedback_index: u16,
+    },
+    /// Quickened GetPropConst: IC is monomorphic (single shape).
+    /// Skips proxy/string/array checks, goes directly to shape check + offset load.
+    /// On shape miss → de-quicken to GetPropConst.
+    GetPropQuickened {
+        dst: Register,
+        obj: Register,
+        name: ConstantIndex,
+        ic_index: u16,
+    },
+    /// Quickened SetPropConst: IC is monomorphic (single shape).
+    /// Skips proxy checks, goes directly to shape check + offset store.
+    /// On shape miss → de-quicken to SetPropConst.
+    SetPropQuickened {
+        obj: Register,
+        name: ConstantIndex,
+        val: Register,
+        ic_index: u16,
+    },
+
+    // ── Superinstructions (fused pairs) ─────────────────────────
+
+    /// Fused GetLocal + GetPropConst: loads a local variable and immediately
+    /// performs IC-guided property access on it. Reduces dispatch overhead
+    /// for the extremely common `localObj.prop` pattern.
+    ///
+    /// Emitted by the peephole optimizer when GetLocal feeds into GetPropConst.
+    GetLocalProp {
+        dst: Register,
+        local_idx: LocalIndex,
+        name: ConstantIndex,
+        ic_index: u16,
+    },
 }
 
 #[cfg(test)]

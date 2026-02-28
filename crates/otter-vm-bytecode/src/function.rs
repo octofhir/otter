@@ -9,6 +9,29 @@ use crate::operand::LocalIndex;
 /// Threshold for marking a function as "hot" (candidate for JIT compilation)
 pub const HOT_FUNCTION_THRESHOLD: u32 = 1000;
 
+/// Number of IC hits before quickening an instruction.
+/// After this many consistent type observations, the generic instruction
+/// is replaced with a specialized variant (e.g., Add → AddInt32).
+pub const QUICKENING_WARMUP: u32 = 4;
+
+/// Maximum number of times a function can be recompiled by the JIT.
+/// After this many recompilations (each triggered by accumulated bailouts),
+/// the function is permanently deoptimized (blacklisted from JIT).
+/// Follows V8's approach: each recompilation uses wider feedback, preventing deopt loops.
+pub const MAX_RECOMPILATIONS: u32 = 3;
+
+/// Result of recording a JIT bailout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BailoutAction {
+    /// Below bailout threshold — continue using current JIT code.
+    Continue,
+    /// Bailout threshold crossed, JIT code invalidated.
+    /// Function should be re-enqueued for compilation with updated feedback.
+    Recompile,
+    /// Recompilation budget exhausted — permanently deoptimized.
+    PermanentDeopt,
+}
+
 /// Function flags
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionFlags {
@@ -318,6 +341,7 @@ impl FeedbackVector {
 
     /// Get a mutable reference to the inner vector.
     #[inline]
+    #[allow(clippy::mut_from_ref)]
     pub fn write(&self) -> &mut Vec<InstructionMetadata> {
         // SAFETY: VM is single-threaded, no concurrent access
         unsafe { &mut *self.inner.get() }
@@ -349,6 +373,73 @@ impl<'de> Deserialize<'de> for FeedbackVector {
     }
 }
 
+/// Thread-confined mutable vector for bytecode instructions.
+///
+/// Wraps `UnsafeCell<Vec<Instruction>>` to provide zero-overhead
+/// interior mutability, enabling runtime bytecode quickening
+/// (replacing generic instructions with specialized variants).
+#[allow(unsafe_code)]
+pub struct BytecodeVector {
+    inner: std::cell::UnsafeCell<Vec<Instruction>>,
+}
+
+// SAFETY: BytecodeVector is only accessed from a single VM thread.
+// Thread confinement is enforced by the Isolate abstraction.
+#[allow(unsafe_code)]
+unsafe impl Send for BytecodeVector {}
+#[allow(unsafe_code)]
+unsafe impl Sync for BytecodeVector {}
+
+#[allow(unsafe_code)]
+impl BytecodeVector {
+    /// Create a new bytecode vector from a vec.
+    pub fn new(vec: Vec<Instruction>) -> Self {
+        Self {
+            inner: std::cell::UnsafeCell::new(vec),
+        }
+    }
+
+    /// Get a shared reference to the inner vector.
+    #[inline]
+    pub fn read(&self) -> &Vec<Instruction> {
+        // SAFETY: VM is single-threaded, no concurrent mutable access
+        unsafe { &*self.inner.get() }
+    }
+
+    /// Get a mutable reference to the inner vector.
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    pub fn write(&self) -> &mut Vec<Instruction> {
+        // SAFETY: VM is single-threaded, no concurrent access
+        unsafe { &mut *self.inner.get() }
+    }
+}
+
+impl Clone for BytecodeVector {
+    fn clone(&self) -> Self {
+        Self::new(self.read().clone())
+    }
+}
+
+impl std::fmt::Debug for BytecodeVector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.read().fmt(f)
+    }
+}
+
+impl Serialize for BytecodeVector {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.read().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BytecodeVector {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let vec = Vec::<Instruction>::deserialize(deserializer)?;
+        Ok(Self::new(vec))
+    }
+}
+
 /// A bytecode function
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Function {
@@ -370,8 +461,8 @@ pub struct Function {
     /// Upvalue captures
     pub upvalues: Vec<UpvalueCapture>,
 
-    /// Bytecode instructions
-    pub instructions: Vec<Instruction>,
+    /// Bytecode instructions (mutable at runtime for quickening)
+    pub instructions: BytecodeVector,
 
     /// Feedback vector for Inline Caches (mutable at runtime)
     /// Contains IC state and statistics for each IC site
@@ -395,9 +486,14 @@ pub struct Function {
     #[serde(skip)]
     pub is_hot: std::sync::atomic::AtomicBool,
 
-    /// Number of times JIT code bailed out to the interpreter
+    /// Number of times JIT code bailed out to the interpreter (resets on recompilation)
     #[serde(skip)]
     pub bailout_count: AtomicU32,
+
+    /// Number of times JIT has recompiled this function (monotonically increasing).
+    /// After MAX_RECOMPILATIONS, permanently deoptimize.
+    #[serde(skip)]
+    pub recompilation_count: AtomicU32,
 
     /// Whether this function has been deoptimized (JIT code invalidated permanently)
     #[serde(skip)]
@@ -497,23 +593,32 @@ impl Function {
         self.is_hot.store(true, Ordering::Release);
     }
 
-    /// Record a JIT bailout. Returns `true` if this bailout caused deoptimization
-    /// (bailout count crossed the threshold).
+    /// Record a JIT bailout. Returns the action taken:
+    /// - `BailoutAction::Continue` — below threshold, keep running JIT code
+    /// - `BailoutAction::Recompile` — threshold crossed, JIT code invalidated, ready for recompilation
+    /// - `BailoutAction::PermanentDeopt` — exhausted recompilations, permanently deoptimized
     #[inline]
-    pub fn record_bailout(&self, deopt_threshold: u32) -> bool {
+    pub fn record_bailout(&self, deopt_threshold: u32) -> BailoutAction {
         let prev = self.bailout_count.fetch_add(1, Ordering::Relaxed);
         let new_count = prev.saturating_add(1);
         if new_count >= deopt_threshold {
-            let deoptimized = self
-                .is_deoptimized
-                .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
-                .is_ok();
-            if deoptimized {
-                self.jit_entry_ptr.store(0, Ordering::Release);
+            // Threshold crossed — invalidate JIT code
+            self.jit_entry_ptr.store(0, Ordering::Release);
+
+            let recomp = self.recompilation_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if recomp >= MAX_RECOMPILATIONS {
+                // Exhausted recompilation budget — permanent deoptimization
+                self.is_deoptimized
+                    .store(true, Ordering::Release);
+                BailoutAction::PermanentDeopt
+            } else {
+                // Reset bailout count for the next compilation cycle.
+                // Feedback vector retains the wider type observations.
+                self.bailout_count.store(0, Ordering::Relaxed);
+                BailoutAction::Recompile
             }
-            deoptimized
         } else {
-            false
+            BailoutAction::Continue
         }
     }
 
@@ -527,6 +632,23 @@ impl Function {
     #[inline]
     pub fn is_deoptimized(&self) -> bool {
         self.is_deoptimized.load(Ordering::Relaxed)
+    }
+
+    /// Check if this function needs recompilation.
+    /// True when the function is hot, was deopt'd for recompilation (not permanently),
+    /// and has no current JIT code.
+    #[inline]
+    pub fn needs_recompilation(&self) -> bool {
+        self.is_hot_function()
+            && !self.is_deoptimized()
+            && self.recompilation_count.load(Ordering::Relaxed) > 0
+            && self.jit_entry_ptr() == 0
+    }
+
+    /// Get the current recompilation count
+    #[inline]
+    pub fn get_recompilation_count(&self) -> u32 {
+        self.recompilation_count.load(Ordering::Relaxed)
     }
 
     /// Get cached JIT entry pointer (0 means no compiled code cached).
@@ -546,6 +668,17 @@ impl Function {
     pub fn clear_jit_entry_ptr(&self) {
         self.jit_entry_ptr.store(0, Ordering::Release);
     }
+
+    /// Replace the instruction at `pc` with a quickened variant.
+    /// Used by the interpreter to specialize hot instructions based on
+    /// observed types (e.g., Add → AddInt32 when only int32s seen).
+    #[inline]
+    pub fn quicken_instruction(&self, pc: usize, new_instr: Instruction) {
+        let bytecode = self.instructions.write();
+        if pc < bytecode.len() {
+            bytecode[pc] = new_instr;
+        }
+    }
 }
 
 impl Clone for Function {
@@ -557,7 +690,7 @@ impl Clone for Function {
             register_count: self.register_count,
             flags: self.flags,
             upvalues: self.upvalues.clone(),
-            instructions: self.instructions.clone(),
+            instructions: BytecodeVector::new(self.instructions.read().clone()),
             feedback_vector: self.feedback_vector.clone(),
             source_map: self.source_map.clone(),
             param_names: self.param_names.clone(),
@@ -565,8 +698,9 @@ impl Clone for Function {
             // Clone resets call statistics (new clone starts fresh)
             call_count: AtomicU32::new(0),
             is_hot: std::sync::atomic::AtomicBool::new(false),
-            // Preserve bailout state — deoptimized functions must stay deoptimized
+            // Preserve bailout/recompilation state — deoptimized functions must stay deoptimized
             bailout_count: AtomicU32::new(self.bailout_count.load(Ordering::Relaxed)),
+            recompilation_count: AtomicU32::new(self.recompilation_count.load(Ordering::Relaxed)),
             is_deoptimized: std::sync::atomic::AtomicBool::new(
                 self.is_deoptimized.load(Ordering::Relaxed),
             ),
@@ -721,7 +855,7 @@ impl FunctionBuilder {
             register_count: self.register_count,
             flags: self.flags,
             upvalues: self.upvalues,
-            instructions: self.instructions,
+            instructions: BytecodeVector::new(self.instructions),
             feedback_vector: FeedbackVector::new(self.feedback_vector),
             source_map: self.source_map,
             param_names: self.param_names,
@@ -729,6 +863,7 @@ impl FunctionBuilder {
             call_count: AtomicU32::new(0),
             is_hot: std::sync::atomic::AtomicBool::new(false),
             bailout_count: AtomicU32::new(0),
+            recompilation_count: AtomicU32::new(0),
             is_deoptimized: std::sync::atomic::AtomicBool::new(false),
             jit_entry_ptr: AtomicUsize::new(0),
             field_init_func: None,
@@ -811,7 +946,7 @@ mod tests {
 
         assert_eq!(func.display_name(), "add");
         assert_eq!(func.param_count, 2);
-        assert_eq!(func.instructions.len(), 2);
+        assert_eq!(func.instructions.read().len(), 2);
         assert!(func.is_strict());
     }
 
@@ -857,11 +992,35 @@ mod tests {
         func.set_jit_entry_ptr(0xDEAD_BEEF);
         assert_eq!(func.jit_entry_ptr(), 0xDEAD_BEEF);
 
-        assert!(!func.record_bailout(3));
-        assert!(!func.record_bailout(3));
+        // First 2 bailouts are below threshold (threshold=3)
+        assert_eq!(func.record_bailout(3), BailoutAction::Continue);
+        assert_eq!(func.record_bailout(3), BailoutAction::Continue);
         assert_eq!(func.jit_entry_ptr(), 0xDEAD_BEEF);
 
-        assert!(func.record_bailout(3));
+        // Third bailout triggers recompilation (first recompilation cycle)
+        assert_eq!(func.record_bailout(3), BailoutAction::Recompile);
         assert_eq!(func.jit_entry_ptr(), 0);
+        assert!(!func.is_deoptimized()); // Not permanently deoptimized yet
+
+        // Reset entry pointer for next cycle
+        func.set_jit_entry_ptr(0xDEAD_BEEF);
+
+        // Second recompilation cycle
+        for _ in 0..2 {
+            assert_eq!(func.record_bailout(3), BailoutAction::Continue);
+        }
+        assert_eq!(func.record_bailout(3), BailoutAction::Recompile);
+        assert_eq!(func.jit_entry_ptr(), 0);
+        assert!(!func.is_deoptimized());
+
+        func.set_jit_entry_ptr(0xDEAD_BEEF);
+
+        // Third (final) recompilation cycle => permanent deopt
+        for _ in 0..2 {
+            assert_eq!(func.record_bailout(3), BailoutAction::Continue);
+        }
+        assert_eq!(func.record_bailout(3), BailoutAction::PermanentDeopt);
+        assert_eq!(func.jit_entry_ptr(), 0);
+        assert!(func.is_deoptimized());
     }
 }

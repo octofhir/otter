@@ -83,7 +83,7 @@ fn main() {
         println!("function[{}].is_async = {}", idx, func.flags.is_async);
         println!("function[{}].is_arrow = {}", idx, func.flags.is_arrow);
         println!("instructions:");
-        for (pc, insn) in func.instructions.iter().enumerate() {
+        for (pc, insn) in func.instructions.read().iter().enumerate() {
             println!("{:04}: {:?}", pc, insn);
         }
     } else {

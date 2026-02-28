@@ -34,6 +34,8 @@ pub mod intrinsics;
 pub mod intrinsics_impl;
 pub mod isolate;
 #[cfg(feature = "jit")]
+mod jit_helpers;
+#[cfg(feature = "jit")]
 mod jit_queue;
 #[cfg(feature = "jit")]
 mod jit_runtime;

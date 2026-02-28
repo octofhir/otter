@@ -17,7 +17,8 @@ use otter_vm_bytecode::{Constant, Function};
 
 use crate::JitError;
 use crate::bailout::BAILOUT_SENTINEL;
-use crate::type_guards::{self, ArithOp, BitwiseOp};
+use crate::runtime_helpers::{HelperKind, HelperRefs};
+use crate::type_guards::{self, ArithOp, BitwiseOp, SpecializationHint};
 
 fn jump_target(pc: usize, offset: i32, instruction_count: usize) -> Result<usize, JitError> {
     let target = pc as i64 + offset as i64;
@@ -116,7 +117,33 @@ fn is_supported_baseline_opcode(instruction: &Instruction) -> bool {
             | Instruction::Return { .. }
             | Instruction::ReturnUndefined
             | Instruction::Nop
+            | Instruction::AddInt32 { .. }
+            | Instruction::SubInt32 { .. }
+            | Instruction::MulInt32 { .. }
+            | Instruction::DivInt32 { .. }
+            | Instruction::AddNumber { .. }
+            | Instruction::SubNumber { .. }
     )
+}
+
+/// Check if an instruction is supported when runtime helpers are available.
+///
+/// This extends the baseline set with property access and other operations
+/// that delegate to extern "C" helper functions.
+#[inline]
+fn is_supported_with_helpers(instruction: &Instruction) -> bool {
+    is_supported_baseline_opcode(instruction)
+        || matches!(
+            instruction,
+            Instruction::GetPropConst { .. }
+                | Instruction::SetPropConst { .. }
+                | Instruction::Call { .. }
+                | Instruction::GetLocalProp { .. }
+                | Instruction::NewObject { .. }
+                | Instruction::NewArray { .. }
+                | Instruction::GetGlobal { .. }
+                | Instruction::SetGlobal { .. }
+        )
 }
 
 /// Fast eligibility check for the current baseline translator subset.
@@ -132,6 +159,18 @@ pub fn can_translate_function(function: &Function) -> bool {
 /// Supports `LoadConst` only for number constants that can be represented
 /// as non-pointer NaN-boxed values.
 pub fn can_translate_function_with_constants(function: &Function, constants: &[Constant]) -> bool {
+    can_translate_impl(function, constants, false)
+}
+
+/// Fast eligibility check when runtime helpers are available.
+///
+/// Extends the baseline set with property access instructions that delegate
+/// to extern "C" runtime helper functions.
+pub fn can_translate_function_with_helpers(function: &Function, constants: &[Constant]) -> bool {
+    can_translate_impl(function, constants, true)
+}
+
+fn can_translate_impl(function: &Function, constants: &[Constant], has_helpers: bool) -> bool {
     if function.flags.has_rest
         || function.flags.uses_arguments
         || function.flags.uses_eval
@@ -143,13 +182,19 @@ pub fn can_translate_function_with_constants(function: &Function, constants: &[C
         return false;
     }
 
-    let instruction_count = function.instructions.len();
+    let instruction_count = function.instructions.read().len();
     if instruction_count == 0 {
         return true;
     }
 
-    for (pc, instruction) in function.instructions.iter().enumerate() {
-        if !is_supported_baseline_opcode(instruction) {
+    let opcode_check = if has_helpers {
+        is_supported_with_helpers
+    } else {
+        is_supported_baseline_opcode
+    };
+
+    for (pc, instruction) in function.instructions.read().iter().enumerate() {
+        if !opcode_check(instruction) {
             return false;
         }
 
@@ -159,7 +204,9 @@ pub fn can_translate_function_with_constants(function: &Function, constants: &[C
                     return false;
                 }
             }
-            Instruction::GetLocal { idx, .. } | Instruction::SetLocal { idx, .. } => {
+            Instruction::GetLocal { idx, .. }
+            | Instruction::SetLocal { idx, .. }
+            | Instruction::GetLocalProp { local_idx: idx, .. } => {
                 if idx.index() >= function.local_count {
                     return false;
                 }
@@ -287,7 +334,7 @@ pub fn translate_function(
     builder: &mut FunctionBuilder<'_>,
     function: &Function,
 ) -> Result<(), JitError> {
-    translate_function_with_constants(builder, function, &[])
+    translate_function_with_constants(builder, function, &[], None)
 }
 
 /// Translate a bytecode function into Cranelift IR with constant pool access.
@@ -295,13 +342,24 @@ pub fn translate_function_with_constants(
     builder: &mut FunctionBuilder<'_>,
     function: &Function,
     constants: &[Constant],
+    helpers: Option<&HelperRefs>,
 ) -> Result<(), JitError> {
-    let instruction_count = function.instructions.len();
+    let instruction_count = function.instructions.read().len();
     if instruction_count == 0 {
         let undef = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
         builder.ins().return_(&[undef]);
         return Ok(());
     }
+
+    // Snapshot type feedback for speculative optimization.
+    // Read the feedback vector once at compile time (not during IR emission).
+    let feedback_snapshot: Vec<_> = {
+        let fv = function.feedback_vector.read();
+        fv.iter().map(|m| m.type_observations).collect()
+    };
+    let get_hint = |feedback_index: u16| -> SpecializationHint {
+        SpecializationHint::from_type_flags(feedback_snapshot.get(feedback_index as usize))
+    };
 
     let reg_count = function.register_count as usize;
     let mut reg_slots = Vec::with_capacity(reg_count);
@@ -333,8 +391,10 @@ pub fn translate_function_with_constants(
 
     builder.switch_to_block(entry);
     let entry_params = builder.block_params(entry);
-    let args_ptr = entry_params[0];
-    let argc = entry_params[1];
+    // Signature: (ctx: I64, args_ptr: I64, argc: I32) -> I64
+    let ctx_ptr = entry_params[0];
+    let args_ptr = entry_params[1];
+    let argc = entry_params[2];
     let undef = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
     for idx in 0..reg_count {
         builder.ins().stack_store(undef, reg_slots[idx], 0);
@@ -350,7 +410,7 @@ pub fn translate_function_with_constants(
     }
     builder.ins().jump(blocks[0], &[]);
 
-    for (pc, instruction) in function.instructions.iter().enumerate() {
+    for (pc, instruction) in function.instructions.read().iter().enumerate() {
         builder.switch_to_block(blocks[pc]);
 
         match instruction {
@@ -397,34 +457,86 @@ pub fn translate_function_with_constants(
                 let v = read_reg(builder, &reg_slots, *src);
                 write_reg(builder, &reg_slots, *dst, v);
             }
-            Instruction::Add { dst, lhs, rhs, .. } => {
+            Instruction::Add { dst, lhs, rhs, feedback_index } => {
                 let left = read_reg(builder, &reg_slots, *lhs);
                 let right = read_reg(builder, &reg_slots, *rhs);
+                let hint = get_hint(*feedback_index);
                 let guarded =
-                    type_guards::emit_guarded_numeric_arith(builder, ArithOp::Add, left, right);
+                    type_guards::emit_specialized_arith(builder, ArithOp::Add, left, right, hint);
                 let out = lower_guarded_or_bail(builder, guarded);
                 write_reg(builder, &reg_slots, *dst, out);
             }
-            Instruction::Sub { dst, lhs, rhs, .. } => {
+            Instruction::Sub { dst, lhs, rhs, feedback_index } => {
                 let left = read_reg(builder, &reg_slots, *lhs);
                 let right = read_reg(builder, &reg_slots, *rhs);
+                let hint = get_hint(*feedback_index);
                 let guarded =
-                    type_guards::emit_guarded_numeric_arith(builder, ArithOp::Sub, left, right);
+                    type_guards::emit_specialized_arith(builder, ArithOp::Sub, left, right, hint);
                 let out = lower_guarded_or_bail(builder, guarded);
                 write_reg(builder, &reg_slots, *dst, out);
             }
-            Instruction::Mul { dst, lhs, rhs, .. } => {
+            Instruction::Mul { dst, lhs, rhs, feedback_index } => {
                 let left = read_reg(builder, &reg_slots, *lhs);
                 let right = read_reg(builder, &reg_slots, *rhs);
+                let hint = get_hint(*feedback_index);
                 let guarded =
-                    type_guards::emit_guarded_numeric_arith(builder, ArithOp::Mul, left, right);
+                    type_guards::emit_specialized_arith(builder, ArithOp::Mul, left, right, hint);
                 let out = lower_guarded_or_bail(builder, guarded);
                 write_reg(builder, &reg_slots, *dst, out);
             }
-            Instruction::Div { dst, lhs, rhs, .. } => {
+            Instruction::Div { dst, lhs, rhs, feedback_index } => {
                 let left = read_reg(builder, &reg_slots, *lhs);
                 let right = read_reg(builder, &reg_slots, *rhs);
-                let guarded = type_guards::emit_guarded_numeric_div(builder, left, right);
+                let hint = get_hint(*feedback_index);
+                // JS division always returns f64 (even 4/2 → 2.0), so Int32 hint
+                // still needs the numeric path for div-by-zero → Infinity handling.
+                let guarded = match hint {
+                    SpecializationHint::Float64 => type_guards::emit_guarded_f64_div(builder, left, right),
+                    _ => type_guards::emit_guarded_numeric_div(builder, left, right),
+                };
+                let out = lower_guarded_or_bail(builder, guarded);
+                write_reg(builder, &reg_slots, *dst, out);
+            }
+            // Quickened arithmetic: type already known from interpreter feedback
+            Instruction::AddInt32 { dst, lhs, rhs, .. } => {
+                let left = read_reg(builder, &reg_slots, *lhs);
+                let right = read_reg(builder, &reg_slots, *rhs);
+                let guarded = type_guards::emit_guarded_i32_arith(builder, ArithOp::Add, left, right);
+                let out = lower_guarded_or_bail(builder, guarded);
+                write_reg(builder, &reg_slots, *dst, out);
+            }
+            Instruction::SubInt32 { dst, lhs, rhs, .. } => {
+                let left = read_reg(builder, &reg_slots, *lhs);
+                let right = read_reg(builder, &reg_slots, *rhs);
+                let guarded = type_guards::emit_guarded_i32_arith(builder, ArithOp::Sub, left, right);
+                let out = lower_guarded_or_bail(builder, guarded);
+                write_reg(builder, &reg_slots, *dst, out);
+            }
+            Instruction::MulInt32 { dst, lhs, rhs, .. } => {
+                let left = read_reg(builder, &reg_slots, *lhs);
+                let right = read_reg(builder, &reg_slots, *rhs);
+                let guarded = type_guards::emit_guarded_i32_arith(builder, ArithOp::Mul, left, right);
+                let out = lower_guarded_or_bail(builder, guarded);
+                write_reg(builder, &reg_slots, *dst, out);
+            }
+            Instruction::DivInt32 { dst, lhs, rhs, .. } => {
+                let left = read_reg(builder, &reg_slots, *lhs);
+                let right = read_reg(builder, &reg_slots, *rhs);
+                let guarded = type_guards::emit_guarded_i32_div(builder, left, right);
+                let out = lower_guarded_or_bail(builder, guarded);
+                write_reg(builder, &reg_slots, *dst, out);
+            }
+            Instruction::AddNumber { dst, lhs, rhs, .. } => {
+                let left = read_reg(builder, &reg_slots, *lhs);
+                let right = read_reg(builder, &reg_slots, *rhs);
+                let guarded = type_guards::emit_guarded_f64_arith(builder, ArithOp::Add, left, right);
+                let out = lower_guarded_or_bail(builder, guarded);
+                write_reg(builder, &reg_slots, *dst, out);
+            }
+            Instruction::SubNumber { dst, lhs, rhs, .. } => {
+                let left = read_reg(builder, &reg_slots, *lhs);
+                let right = read_reg(builder, &reg_slots, *rhs);
+                let guarded = type_guards::emit_guarded_f64_arith(builder, ArithOp::Sub, left, right);
                 let out = lower_guarded_or_bail(builder, guarded);
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -686,6 +798,238 @@ pub fn translate_function_with_constants(
                 continue;
             }
             Instruction::Nop => {}
+            Instruction::GetPropConst {
+                dst,
+                obj,
+                name,
+                ic_index,
+            } => {
+                let helper_ref = helpers
+                    .and_then(|h| h.get(HelperKind::GetPropConst))
+                    .ok_or_else(|| unsupported(pc, instruction))?;
+                let obj_val = read_reg(builder, &reg_slots, *obj);
+                let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
+                let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                let call = builder.ins().call(helper_ref, &[ctx_ptr, obj_val, name_idx, ic_idx]);
+                let result = builder.inst_results(call)[0];
+
+                // If helper returns BAILOUT_SENTINEL, bail out the whole function
+                let bail_block = builder.create_block();
+                let continue_block = builder.create_block();
+                let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                let is_bailout = builder.ins().icmp(IntCC::Equal, result, sentinel);
+                builder
+                    .ins()
+                    .brif(is_bailout, bail_block, &[], continue_block, &[]);
+
+                builder.switch_to_block(bail_block);
+                emit_bailout_return(builder);
+
+                builder.switch_to_block(continue_block);
+                write_reg(builder, &reg_slots, *dst, result);
+            }
+            // Superinstruction: fused GetLocal + GetPropConst
+            Instruction::GetLocalProp {
+                dst,
+                local_idx,
+                name,
+                ic_index,
+            } => {
+                let helper_ref = helpers
+                    .and_then(|h| h.get(HelperKind::GetPropConst))
+                    .ok_or_else(|| unsupported(pc, instruction))?;
+                // Read the local variable directly (GetLocal part)
+                let obj_val = read_local(builder, &local_slots, *local_idx);
+                // Call GetPropConst helper (GetPropConst part)
+                let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
+                let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                let call = builder.ins().call(helper_ref, &[ctx_ptr, obj_val, name_idx, ic_idx]);
+                let result = builder.inst_results(call)[0];
+
+                let bail_block = builder.create_block();
+                let continue_block = builder.create_block();
+                let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                let is_bailout = builder.ins().icmp(IntCC::Equal, result, sentinel);
+                builder
+                    .ins()
+                    .brif(is_bailout, bail_block, &[], continue_block, &[]);
+
+                builder.switch_to_block(bail_block);
+                emit_bailout_return(builder);
+
+                builder.switch_to_block(continue_block);
+                write_reg(builder, &reg_slots, *dst, result);
+            }
+            Instruction::SetPropConst {
+                obj,
+                name,
+                val,
+                ic_index,
+            } => {
+                let helper_ref = helpers
+                    .and_then(|h| h.get(HelperKind::SetPropConst))
+                    .ok_or_else(|| unsupported(pc, instruction))?;
+                let obj_val = read_reg(builder, &reg_slots, *obj);
+                let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
+                let value = read_reg(builder, &reg_slots, *val);
+                let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                let call = builder.ins().call(
+                    helper_ref,
+                    &[ctx_ptr, obj_val, name_idx, value, ic_idx],
+                );
+                let result = builder.inst_results(call)[0];
+
+                // If helper returns BAILOUT_SENTINEL, bail out the whole function
+                let bail_block = builder.create_block();
+                let continue_block = builder.create_block();
+                let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                let is_bailout = builder.ins().icmp(IntCC::Equal, result, sentinel);
+                builder
+                    .ins()
+                    .brif(is_bailout, bail_block, &[], continue_block, &[]);
+
+                builder.switch_to_block(bail_block);
+                emit_bailout_return(builder);
+
+                builder.switch_to_block(continue_block);
+                // SetPropConst doesn't write to a dst register
+            }
+            Instruction::Call { dst, func, argc } => {
+                let helper_ref = helpers
+                    .and_then(|h| h.get(HelperKind::CallFunction))
+                    .ok_or_else(|| unsupported(pc, instruction))?;
+                let callee_val = read_reg(builder, &reg_slots, *func);
+                let argc_val = builder.ins().iconst(types::I64, *argc as i64);
+
+                // Build argument array on the stack
+                let argv_ptr = if *argc > 0 {
+                    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        (*argc as u32) * 8,
+                        8,
+                    ));
+                    for i in 0..(*argc as u16) {
+                        let arg_val =
+                            read_reg(builder, &reg_slots, Register(func.0 + 1 + i));
+                        builder
+                            .ins()
+                            .stack_store(arg_val, slot, (i as i32) * 8);
+                    }
+                    builder.ins().stack_addr(types::I64, slot, 0)
+                } else {
+                    builder.ins().iconst(types::I64, 0) // null pointer
+                };
+
+                let call = builder
+                    .ins()
+                    .call(helper_ref, &[ctx_ptr, callee_val, argc_val, argv_ptr]);
+                let result = builder.inst_results(call)[0];
+
+                // If helper returns BAILOUT_SENTINEL, bail out the whole function
+                let bail_block = builder.create_block();
+                let continue_block = builder.create_block();
+                let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                let is_bailout = builder.ins().icmp(IntCC::Equal, result, sentinel);
+                builder
+                    .ins()
+                    .brif(is_bailout, bail_block, &[], continue_block, &[]);
+
+                builder.switch_to_block(bail_block);
+                emit_bailout_return(builder);
+
+                builder.switch_to_block(continue_block);
+                write_reg(builder, &reg_slots, *dst, result);
+            }
+            Instruction::NewObject { dst } => {
+                let helper_ref = helpers
+                    .and_then(|h| h.get(HelperKind::NewObject))
+                    .ok_or_else(|| unsupported(pc, instruction))?;
+                let call = builder.ins().call(helper_ref, &[ctx_ptr]);
+                let result = builder.inst_results(call)[0];
+
+                let bail_block = builder.create_block();
+                let continue_block = builder.create_block();
+                let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                let is_bailout = builder.ins().icmp(IntCC::Equal, result, sentinel);
+                builder
+                    .ins()
+                    .brif(is_bailout, bail_block, &[], continue_block, &[]);
+
+                builder.switch_to_block(bail_block);
+                emit_bailout_return(builder);
+
+                builder.switch_to_block(continue_block);
+                write_reg(builder, &reg_slots, *dst, result);
+            }
+            Instruction::NewArray { dst, len } => {
+                let helper_ref = helpers
+                    .and_then(|h| h.get(HelperKind::NewArray))
+                    .ok_or_else(|| unsupported(pc, instruction))?;
+                let len_val = builder.ins().iconst(types::I64, *len as i64);
+                let call = builder.ins().call(helper_ref, &[ctx_ptr, len_val]);
+                let result = builder.inst_results(call)[0];
+
+                let bail_block = builder.create_block();
+                let continue_block = builder.create_block();
+                let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                let is_bailout = builder.ins().icmp(IntCC::Equal, result, sentinel);
+                builder
+                    .ins()
+                    .brif(is_bailout, bail_block, &[], continue_block, &[]);
+
+                builder.switch_to_block(bail_block);
+                emit_bailout_return(builder);
+
+                builder.switch_to_block(continue_block);
+                write_reg(builder, &reg_slots, *dst, result);
+            }
+            Instruction::GetGlobal { dst, name, ic_index } => {
+                let helper_ref = helpers
+                    .and_then(|h| h.get(HelperKind::GetGlobal))
+                    .ok_or_else(|| unsupported(pc, instruction))?;
+                let name_idx = builder.ins().iconst(types::I64, name.0 as i64);
+                let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                let call = builder.ins().call(helper_ref, &[ctx_ptr, name_idx, ic_idx]);
+                let result = builder.inst_results(call)[0];
+
+                let bail_block = builder.create_block();
+                let continue_block = builder.create_block();
+                let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                let is_bailout = builder.ins().icmp(IntCC::Equal, result, sentinel);
+                builder
+                    .ins()
+                    .brif(is_bailout, bail_block, &[], continue_block, &[]);
+
+                builder.switch_to_block(bail_block);
+                emit_bailout_return(builder);
+
+                builder.switch_to_block(continue_block);
+                write_reg(builder, &reg_slots, *dst, result);
+            }
+            Instruction::SetGlobal { name, src, ic_index, is_declaration } => {
+                let helper_ref = helpers
+                    .and_then(|h| h.get(HelperKind::SetGlobal))
+                    .ok_or_else(|| unsupported(pc, instruction))?;
+                let val = read_reg(builder, &reg_slots, *src);
+                let name_idx = builder.ins().iconst(types::I64, name.0 as i64);
+                let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                let is_decl = builder.ins().iconst(types::I64, *is_declaration as i64);
+                let call = builder.ins().call(helper_ref, &[ctx_ptr, name_idx, val, ic_idx, is_decl]);
+                let result = builder.inst_results(call)[0];
+
+                let bail_block = builder.create_block();
+                let continue_block = builder.create_block();
+                let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                let is_bailout = builder.ins().icmp(IntCC::Equal, result, sentinel);
+                builder
+                    .ins()
+                    .brif(is_bailout, bail_block, &[], continue_block, &[]);
+
+                builder.switch_to_block(bail_block);
+                emit_bailout_return(builder);
+
+                builder.switch_to_block(continue_block);
+            }
             _ => return Err(unsupported(pc, instruction)),
         }
 

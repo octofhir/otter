@@ -6,6 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use otter_vm_bytecode::Function;
 use otter_vm_jit::{BAILOUT_SENTINEL, DEOPT_THRESHOLD, JitCompiler};
 
+use crate::jit_helpers::{self, JitContext};
 use crate::jit_queue;
 use crate::value::Value;
 
@@ -97,6 +98,7 @@ pub(crate) fn is_jit_eager_enabled() -> bool {
 }
 
 /// Result of attempting to execute JIT-compiled code.
+#[derive(Debug)]
 pub(crate) enum JitExecResult {
     /// JIT code ran successfully, returning this value.
     Ok(i64),
@@ -104,17 +106,29 @@ pub(crate) enum JitExecResult {
     Bailout,
     /// No JIT code available for this function.
     NotCompiled,
+    /// JIT code bailed out and the function needs recompilation.
+    /// The caller should re-enqueue the function for compilation and re-execute in interpreter.
+    NeedsRecompilation,
 }
 
 /// Try to execute JIT-compiled code for a function.
 ///
 /// Returns `Ok(value)` on success, `Bailout` if a runtime condition caused
 /// the JIT code to bail out, or `NotCompiled` if no code exists.
+///
+/// `interpreter` and `vm_ctx` are raw pointers to the calling interpreter
+/// and context, enabling JIT runtime helpers to re-enter the interpreter
+/// for function calls. Pass null pointers when call helpers are not needed
+/// (e.g. in unit tests).
 pub(crate) fn try_execute_jit(
     module_id: u64,
     function_index: u32,
     function: &Function,
     args: &[Value],
+    proto_epoch: u64,
+    interpreter: *const crate::interpreter::Interpreter,
+    vm_ctx: *mut crate::context::VmContext,
+    constants: *const otter_vm_bytecode::ConstantPool,
 ) -> JitExecResult {
     if !is_jit_enabled() {
         return JitExecResult::NotCompiled;
@@ -158,39 +172,70 @@ pub(crate) fn try_execute_jit(
         return JitExecResult::NotCompiled;
     }
 
+    // Construct JitContext for runtime helpers
+    let jit_ctx = JitContext {
+        function_ptr: function as *const Function,
+        proto_epoch,
+        interpreter,
+        vm_ctx,
+        constants,
+    };
+
     // SAFETY: ptr was produced by JitCompiler with signature
-    // `(*const i64, u32) -> i64`.
-    let func: extern "C" fn(*const i64, u32) -> i64 = unsafe { std::mem::transmute(ptr) };
+    // `(*mut u8, *const i64, u32) -> i64`.
+    let func: extern "C" fn(*mut u8, *const i64, u32) -> i64 =
+        unsafe { std::mem::transmute(ptr) };
+    let ctx_ptr = &jit_ctx as *const JitContext as *mut u8;
     let argc = args.len() as u32;
     let result = if args.len() <= 8 {
         let mut inline = [0_i64; 8];
         for (idx, arg) in args.iter().enumerate() {
             inline[idx] = arg.to_jit_bits();
         }
-        func(inline.as_ptr(), argc)
+        func(ctx_ptr, inline.as_ptr(), argc)
     } else {
         let mut arg_bits = Vec::with_capacity(args.len());
         for arg in args {
             arg_bits.push(arg.to_jit_bits());
         }
-        func(arg_bits.as_ptr(), argc)
+        func(ctx_ptr, arg_bits.as_ptr(), argc)
     };
 
     if result == BAILOUT_SENTINEL {
-        let deoptimized = function.record_bailout(DEOPT_THRESHOLD);
+        use otter_vm_bytecode::function::BailoutAction;
+        let action = function.record_bailout(DEOPT_THRESHOLD);
 
         let mut state = lock_state();
         state.total_bailouts = state.total_bailouts.saturating_add(1);
 
-        if deoptimized {
-            function.clear_jit_entry_ptr();
-            state
-                .compiled_code_ptrs
-                .remove(&(module_id, function_index));
-            state.total_deoptimizations = state.total_deoptimizations.saturating_add(1);
-        }
+        let needs_recompile = match action {
+            BailoutAction::PermanentDeopt => {
+                // Exhausted recompilation budget — remove JIT code permanently
+                state
+                    .compiled_code_ptrs
+                    .remove(&(module_id, function_index));
+                state.total_deoptimizations = state.total_deoptimizations.saturating_add(1);
+                false
+            }
+            BailoutAction::Recompile => {
+                // JIT code invalidated, but function can be recompiled with wider feedback.
+                // Remove old compiled code; caller should re-enqueue.
+                state
+                    .compiled_code_ptrs
+                    .remove(&(module_id, function_index));
+                true
+            }
+            BailoutAction::Continue => {
+                // Below threshold — JIT code is still valid
+                false
+            }
+        };
 
-        JitExecResult::Bailout
+        if needs_recompile {
+            JitExecResult::NeedsRecompilation
+        } else {
+            JitExecResult::Bailout
+        }
     } else {
         if stats_enabled {
             let mut state = lock_state();
@@ -233,7 +278,8 @@ pub(crate) fn compile_one_pending_request() {
     }
 
     if state.compiler.is_none() {
-        match JitCompiler::new() {
+        let helpers = jit_helpers::build_runtime_helpers();
+        match JitCompiler::new_with_helpers(helpers) {
             Ok(compiler) => state.compiler = Some(compiler),
             Err(_) => {
                 state.compile_errors = state.compile_errors.saturating_add(1);
@@ -372,7 +418,7 @@ mod tests {
             .build();
 
         // Use a unique key that can't collide
-        match try_execute_jit(0xCAFE_0001_u64, 99, &f, &[]) {
+        match try_execute_jit(0xCAFE_0001_u64, 99, &f, &[], 0, std::ptr::null(), std::ptr::null_mut(), std::ptr::null()) {
             JitExecResult::NotCompiled => {}
             _ => panic!("expected NotCompiled"),
         }
@@ -405,7 +451,7 @@ mod tests {
         let key = 0xBEEF_0001_u64;
         assert!(compile_and_register(key, 0, &f));
 
-        match try_execute_jit(key, 0, &f, &[]) {
+        match try_execute_jit(key, 0, &f, &[], 0, std::ptr::null(), std::ptr::null_mut(), std::ptr::null()) {
             JitExecResult::Ok(val) => assert_eq!(val, boxed_i32(30)),
             _ => panic!("expected boxed int32(30)"),
         }
@@ -441,14 +487,14 @@ mod tests {
         assert!(compile_and_register(key, 0, &f));
 
         let args = [Value::int32(41)];
-        match try_execute_jit(key, 0, &f, &args) {
+        match try_execute_jit(key, 0, &f, &args, 0, std::ptr::null(), std::ptr::null_mut(), std::ptr::null()) {
             JitExecResult::Ok(val) => assert_eq!(val, boxed_i32(42)),
             _ => panic!("expected boxed int32(42)"),
         }
     }
 
     #[test]
-    fn bailout_on_div_by_zero() {
+    fn div_by_zero_returns_infinity() {
         let _guard = test_lock();
         let f = Function::builder()
             .name("div0")
@@ -474,13 +520,24 @@ mod tests {
         let key = 0xBEEF_0002_u64;
         assert!(compile_and_register(key, 0, &f));
 
-        match try_execute_jit(key, 0, &f, &[]) {
-            JitExecResult::Bailout => {}
-            _ => panic!("expected Bailout on div-by-zero"),
+        // JS division by zero returns Infinity (not an error).
+        // The JIT correctly handles int32 div-by-zero by falling back to f64 division.
+        match try_execute_jit(key, 0, &f, &[], 0, std::ptr::null(), std::ptr::null_mut(), std::ptr::null()) {
+            JitExecResult::Ok(bits) => {
+                let val = Value::from_jit_bits(bits as u64)
+                    .expect("should be a valid NaN-boxed value");
+                let f64_val = val.as_number().expect("should be f64 (Infinity)");
+                assert!(
+                    f64_val.is_infinite() && f64_val > 0.0,
+                    "42 / 0 should return +Infinity, got {}",
+                    f64_val
+                );
+            }
+            other => panic!("expected Ok(Infinity), got {:?}", other),
         }
 
-        assert_eq!(f.get_bailout_count(), 1);
-        assert!(!f.is_deoptimized());
+        // No bailout should have occurred
+        assert_eq!(f.get_bailout_count(), 0);
     }
 
     #[test]
@@ -488,48 +545,53 @@ mod tests {
         let _guard = test_lock();
         let f = Function::builder()
             .name("deopt_me")
-            .register_count(3)
+            .register_count(1)
             .instruction(Instruction::LoadInt32 {
                 dst: Register(0),
                 value: 1,
             })
-            .instruction(Instruction::LoadInt32 {
-                dst: Register(1),
-                value: 0,
-            })
-            .instruction(Instruction::Div {
-                dst: Register(2),
-                lhs: Register(0),
-                rhs: Register(1),
-                feedback_index: 0,
-            })
-            .instruction(Instruction::Return { src: Register(2) })
-            .feedback_vector_size(1)
+            .instruction(Instruction::Return { src: Register(0) })
             .build();
 
         let key = 0xBEEF_0003_u64;
         assert!(compile_and_register(key, 0, &f));
 
-        // Bail out until deoptimized
-        for _ in 0..DEOPT_THRESHOLD {
-            match try_execute_jit(key, 0, &f, &[]) {
-                JitExecResult::Bailout => {}
-                JitExecResult::NotCompiled => break,
-                _ => panic!("expected Bailout or NotCompiled"),
+        // Function is compiled and should execute successfully
+        match try_execute_jit(key, 0, &f, &[], 0, std::ptr::null(), std::ptr::null_mut(), std::ptr::null()) {
+            JitExecResult::Ok(bits) => {
+                assert_eq!(bits, boxed_i32(1));
+            }
+            other => panic!("expected Ok(1), got {:?}", other),
+        }
+
+        // Simulate bailouts via record_bailout API until permanently deoptimized.
+        // With monotonic feedback lattice: need MAX_RECOMPILATIONS * DEOPT_THRESHOLD bailouts.
+        // Each DEOPT_THRESHOLD bailouts triggers one recompilation (resetting count).
+        // After MAX_RECOMPILATIONS recompilations, permanent deopt.
+        use otter_vm_bytecode::function::{BailoutAction, MAX_RECOMPILATIONS};
+        for round in 0..MAX_RECOMPILATIONS {
+            for i in 0..DEOPT_THRESHOLD {
+                let action = f.record_bailout(DEOPT_THRESHOLD);
+                if round < MAX_RECOMPILATIONS - 1 || i < DEOPT_THRESHOLD - 1 {
+                    // Not yet permanently deoptimized
+                    assert!(!f.is_deoptimized(), "deoptimized too early at round={round} i={i}");
+                }
+                if i == DEOPT_THRESHOLD - 1 {
+                    if round < MAX_RECOMPILATIONS - 1 {
+                        assert_eq!(action, BailoutAction::Recompile, "expected Recompile at round={round}");
+                    } else {
+                        assert_eq!(action, BailoutAction::PermanentDeopt, "expected PermanentDeopt at final round");
+                    }
+                }
             }
         }
 
         assert!(f.is_deoptimized());
 
-        // Code should be removed from compiled map
-        let state = runtime_state().lock().unwrap();
-        assert!(!state.compiled_code_ptrs.contains_key(&(key, 0)));
-        drop(state);
-
-        // Future calls return NotCompiled
-        match try_execute_jit(key, 0, &f, &[]) {
+        // After permanent deoptimization, try_execute_jit returns NotCompiled
+        match try_execute_jit(key, 0, &f, &[], 0, std::ptr::null(), std::ptr::null_mut(), std::ptr::null()) {
             JitExecResult::NotCompiled => {}
-            _ => panic!("expected NotCompiled after deoptimization"),
+            other => panic!("expected NotCompiled after deoptimization, got {:?}", other),
         }
     }
 
@@ -546,8 +608,9 @@ mod tests {
             .instruction(Instruction::Return { src: Register(0) })
             .build();
 
-        // Manually deoptimize
-        for _ in 0..DEOPT_THRESHOLD {
+        // Manually deoptimize permanently
+        use otter_vm_bytecode::function::MAX_RECOMPILATIONS;
+        for _ in 0..(MAX_RECOMPILATIONS * DEOPT_THRESHOLD) {
             f.record_bailout(DEOPT_THRESHOLD);
         }
         assert!(f.is_deoptimized());
@@ -560,8 +623,8 @@ mod tests {
             Arc::new(b.build())
         };
         let function = module.function(0).expect("function 0");
-        // Deoptimize via the module's copy
-        for _ in 0..DEOPT_THRESHOLD {
+        // Deoptimize permanently via the module's copy
+        for _ in 0..(MAX_RECOMPILATIONS * DEOPT_THRESHOLD) {
             function.record_bailout(DEOPT_THRESHOLD);
         }
         assert!(function.is_deoptimized());

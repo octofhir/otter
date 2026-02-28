@@ -4,7 +4,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use otter_vm_bytecode::{Constant, Function, Module};
-use otter_vm_jit::translator::can_translate_function_with_constants;
+use otter_vm_jit::translator::can_translate_function_with_helpers;
 
 #[derive(Debug, Clone)]
 pub(crate) struct JitCompileRequest {
@@ -45,7 +45,7 @@ pub(crate) fn enqueue_hot_function(
 
     // Keep queue overhead low in always-on mode: only enqueue functions that
     // the current baseline translator can compile.
-    if !can_translate_function_with_constants(function, &constants) {
+    if !can_translate_function_with_helpers(function, &constants) {
         return false;
     }
 
@@ -135,7 +135,7 @@ mod tests {
         assert_eq!(req.module_source_url, "jit-queue-test.js");
         assert_eq!(req.function_index, 0);
         assert_eq!(req.function_name.as_deref(), Some("hot_candidate"));
-        assert_eq!(req.function.instructions.len(), 2);
+        assert_eq!(req.function.instructions.read().len(), 2);
 
         assert_eq!(pending_count(), 0);
         assert!(enqueue_hot_function(&module, 0, func));

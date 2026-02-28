@@ -1445,6 +1445,60 @@ impl SpecializationHint {
     }
 }
 
+/// Emit type-specialized arithmetic based on feedback-vector observations.
+///
+/// Selects the most efficient guard pattern for the observed type profile:
+/// - `Int32`: i32 guard only (1 branch, no f64 path)
+/// - `Float64`: f64 guard only (1 branch, no i32 path)
+/// - `Numeric`: full i32 + f64 cascade
+/// - `Generic`: immediate bailout (can't specialize)
+pub(crate) fn emit_specialized_arith(
+    builder: &mut FunctionBuilder,
+    op: ArithOp,
+    lhs: Value,
+    rhs: Value,
+    hint: SpecializationHint,
+) -> GuardedResult {
+    match hint {
+        SpecializationHint::Int32 => emit_guarded_i32_arith(builder, op, lhs, rhs),
+        SpecializationHint::Float64 => emit_guarded_f64_arith(builder, op, lhs, rhs),
+        SpecializationHint::Numeric => emit_guarded_numeric_arith(builder, op, lhs, rhs),
+        SpecializationHint::Generic => {
+            // Can't specialize — emit immediate bailout
+            let slow_block = builder.create_block();
+            let merge_block = builder.create_block();
+            builder.append_block_param(merge_block, types::I64);
+            builder.ins().jump(slow_block, &[]);
+            let result = builder.block_params(merge_block)[0];
+            GuardedResult {
+                merge_block,
+                slow_block,
+                result,
+            }
+        }
+    }
+}
+
+/// Emit type-specialized comparison based on feedback-vector observations.
+///
+/// Like `emit_specialized_arith`, selects the guard pattern matching the type profile.
+pub(crate) fn emit_specialized_cmp(
+    builder: &mut FunctionBuilder,
+    int_cc: IntCC,
+    float_cc: FloatCC,
+    lhs: Value,
+    rhs: Value,
+    hint: SpecializationHint,
+) -> GuardedResult {
+    match hint {
+        SpecializationHint::Int32 => emit_guarded_i32_cmp(builder, int_cc, lhs, rhs),
+        SpecializationHint::Float64 => emit_guarded_f64_cmp(builder, float_cc, lhs, rhs),
+        SpecializationHint::Numeric | SpecializationHint::Generic => {
+            emit_guarded_numeric_cmp(builder, int_cc, float_cc, lhs, rhs)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

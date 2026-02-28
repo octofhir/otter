@@ -603,7 +603,8 @@ impl PeepholeOptimizer {
             | Instruction::GetPropConst { dst, .. }
             | Instruction::NewObject { dst, .. }
             | Instruction::NewArray { dst, .. }
-            | Instruction::Closure { dst, .. } => Some(dst.0),
+            | Instruction::Closure { dst, .. }
+            | Instruction::GetLocalProp { dst, .. } => Some(dst.0),
             _ => None,
         }
     }
@@ -950,6 +951,33 @@ impl PeepholeOptimizer {
             if offset.0 == 1 {
                 // Jump offset 1 means jump to next instruction
                 return Some(WindowResult::Remove1);
+            }
+        }
+
+        // Superinstruction: GetLocal + GetPropConst → GetLocalProp
+        // Fuses local variable load with property access into a single dispatch.
+        // Safe because the compiler always frees the obj register right after
+        // GetPropConst (the local variable slot remains accessible via GetLocal).
+        if let (
+            Instruction::GetLocal {
+                dst: local_dst,
+                idx: local_idx,
+            },
+            Instruction::GetPropConst {
+                dst: prop_dst,
+                obj,
+                name,
+                ic_index,
+            },
+        ) = (first, second)
+        {
+            if local_dst == obj {
+                return Some(WindowResult::Replace1(Instruction::GetLocalProp {
+                    dst: *prop_dst,
+                    local_idx: *local_idx,
+                    name: *name,
+                    ic_index: *ic_index,
+                }));
             }
         }
 

@@ -567,6 +567,9 @@ pub struct VmContext {
     template_cache: HashMap<TemplateCacheKey, GcRef<JsObject>>,
     /// Cached RegExp objects per (module_ptr, constant_index) so each literal is only compiled once.
     regexp_cache: HashMap<(u64, u32), Value>,
+    /// Cached proto epoch value, refreshed once per run_loop iteration.
+    /// Avoids repeated atomic loads in IC hot paths.
+    pub(crate) cached_proto_epoch: u64,
 }
 
 /// Trait for JS job queue access (allows runtime to inject the queue)
@@ -717,6 +720,7 @@ impl VmContext {
             pending_throw: None,
             template_cache: HashMap::new(),
             regexp_cache: HashMap::new(),
+            cached_proto_epoch: crate::object::get_proto_epoch(),
         }
     }
 
@@ -1120,15 +1124,15 @@ impl VmContext {
             if let Some(func) = frame.module.function(frame.function_index) {
                 snapshot.function_name = func.name.clone();
                 snapshot.is_generator = Some(func.flags.is_generator);
-                if frame.pc < func.instructions.len() {
-                    snapshot.instruction = Some(format!("{:?}", func.instructions[frame.pc]));
+                if frame.pc < func.instructions.read().len() {
+                    snapshot.instruction = Some(format!("{:?}", func.instructions.read()[frame.pc]));
                 }
             }
 
             // Add current frame snapshot
             if let Some(func) = frame.module.function(frame.function_index) {
-                let instruction = if frame.pc < func.instructions.len() {
-                    Some(format!("{:?}", func.instructions[frame.pc]))
+                let instruction = if frame.pc < func.instructions.read().len() {
+                    Some(format!("{:?}", func.instructions.read()[frame.pc]))
                 } else {
                     None
                 };
@@ -1148,8 +1152,8 @@ impl VmContext {
         // Capture a few top frames for better watchdog debugging.
         for frame in self.call_stack.iter().rev().take(5) {
             if let Some(func) = frame.module.function(frame.function_index) {
-                let instruction = if frame.pc < func.instructions.len() {
-                    Some(format!("{:?}", func.instructions[frame.pc]))
+                let instruction = if frame.pc < func.instructions.read().len() {
+                    Some(format!("{:?}", func.instructions.read()[frame.pc]))
                 } else {
                     None
                 };
@@ -1169,8 +1173,8 @@ impl VmContext {
         // Capture ALL frames for full call stack
         for frame in self.call_stack.iter().rev() {
             if let Some(func) = frame.module.function(frame.function_index) {
-                let instruction = if frame.pc < func.instructions.len() {
-                    Some(format!("{:?}", func.instructions[frame.pc]))
+                let instruction = if frame.pc < func.instructions.read().len() {
+                    Some(format!("{:?}", func.instructions.read()[frame.pc]))
                 } else {
                     None
                 };

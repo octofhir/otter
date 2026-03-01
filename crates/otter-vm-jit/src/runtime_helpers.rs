@@ -207,10 +207,12 @@ pub enum HelperKind {
     GetAsyncIterator = 81,
     /// `(ctx, target) -> value_or_undefined` — ForInNext via host hooks
     ForInNext = 82,
+    /// `(obj, expected_shape, offset) -> value` — monomorphic property read (no ctx)
+    GetPropMono = 83,
 }
 
 /// Total number of helper kinds.
-pub const HELPER_COUNT: usize = 83;
+pub const HELPER_COUNT: usize = 84;
 
 /// Byte offset of `secondary_result` field in JitContext (`#[repr(C)]`).
 /// Used by IteratorNext to return both value and done flag.
@@ -218,7 +220,28 @@ pub const HELPER_COUNT: usize = 83;
 /// Layout: function_ptr(0) proto_epoch(8) interpreter(16) vm_ctx(24)
 ///         constants(32) upvalues_ptr(40) upvalue_count:u32(48) pad(52)
 ///         this_raw(56) callee_raw(64) home_object_raw(72) secondary_result(80)
+///         bailout_reason(88) bailout_pc(96)
+///         deopt_locals_ptr(104) deopt_locals_count:u32(112) pad(116)
+///         deopt_regs_ptr(120) deopt_regs_count:u32(128)
 pub const JIT_CTX_SECONDARY_RESULT_OFFSET: i32 = 80;
+
+/// Byte offset of `bailout_reason` in JitContext (`#[repr(C)]`).
+pub const JIT_CTX_BAILOUT_REASON_OFFSET: i32 = 88;
+
+/// Byte offset of `bailout_pc` in JitContext (`#[repr(C)]`).
+pub const JIT_CTX_BAILOUT_PC_OFFSET: i32 = 96;
+
+/// Byte offset of `deopt_locals_ptr` in JitContext (`#[repr(C)]`).
+pub const JIT_CTX_DEOPT_LOCALS_PTR_OFFSET: i32 = 104;
+
+/// Byte offset of `deopt_locals_count` in JitContext (`#[repr(C)]`).
+pub const JIT_CTX_DEOPT_LOCALS_COUNT_OFFSET: i32 = 112;
+
+/// Byte offset of `deopt_regs_ptr` in JitContext (`#[repr(C)]`).
+pub const JIT_CTX_DEOPT_REGS_PTR_OFFSET: i32 = 120;
+
+/// Byte offset of `deopt_regs_count` in JitContext (`#[repr(C)]`).
+pub const JIT_CTX_DEOPT_REGS_COUNT_OFFSET: i32 = 128;
 
 impl HelperKind {
     /// Symbol name used for Cranelift import resolution.
@@ -307,6 +330,7 @@ impl HelperKind {
             Self::ExportOp => "otter_rt_export",
             Self::GetAsyncIterator => "otter_rt_get_async_iterator",
             Self::ForInNext => "otter_rt_for_in_next",
+            Self::GetPropMono => "otter_rt_get_prop_mono",
         }
     }
 
@@ -370,7 +394,8 @@ impl HelperKind {
             | Self::DeclareGlobalVar
             | Self::SpreadArray
             | Self::SetHomeObject
-            | Self::CallSuper => 3,
+            | Self::CallSuper
+            | Self::GetPropMono => 3,
             Self::GetPropConst
             | Self::GetProp
             | Self::CallFunction

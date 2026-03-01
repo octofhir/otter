@@ -39,14 +39,42 @@ pub const BAILOUT_SENTINEL: i64 = 0x7FFC_0000_0000_0000_u64 as i64;
 pub const DEOPT_THRESHOLD: u32 = 10;
 
 /// Reason for a bailout from JIT code.
+///
+/// Values are persisted in JIT runtime telemetry and therefore must remain
+/// stable once released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
 pub enum BailoutReason {
-    /// Type guard failed (e.g., expected int32 but got string).
-    TypeGuardFailure,
-    /// Arithmetic overflow that couldn't be handled inline.
-    Overflow,
-    /// Unsupported operation encountered at runtime.
-    UnsupportedOperation,
+    /// Bailout happened but no specific reason was recorded.
+    Unknown = 0,
+    /// A runtime helper returned `BAILOUT_SENTINEL`.
+    HelperReturnedSentinel = 1,
+    /// A speculative/type fast path failed and entered the slow bailout branch.
+    TypeGuardFailure = 2,
+}
+
+impl BailoutReason {
+    /// Integer code persisted in JIT runtime telemetry.
+    #[inline]
+    pub const fn code(self) -> i64 {
+        self as i64
+    }
+
+    /// Decode a telemetry code into a reason category.
+    #[inline]
+    pub const fn from_code(code: i64) -> Self {
+        match code {
+            1 => Self::HelperReturnedSentinel,
+            2 => Self::TypeGuardFailure,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl Default for BailoutReason {
+    fn default() -> Self {
+        Self::Unknown
+    }
 }
 
 /// Check whether a JIT return value is the bailout sentinel.

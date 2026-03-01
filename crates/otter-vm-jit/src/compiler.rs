@@ -4,6 +4,7 @@ use cranelift_codegen::ir::{AbiParam, UserFuncName, types};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module, ModuleError, default_libcall_names};
+use otter_vm_bytecode::instruction::Instruction;
 use otter_vm_bytecode::{Constant, Function};
 
 use crate::runtime_helpers::{HelperFuncIds, HelperRefs, RuntimeHelpers};
@@ -14,6 +15,93 @@ use crate::translator;
 pub struct JitCompileArtifact {
     /// Entry pointer for compiled native code.
     pub code_ptr: *const u8,
+}
+
+/// Metadata for a single deopt-capable bytecode site.
+///
+/// # GC Safety (C1 invariant)
+///
+/// This struct must contain only plain scalar types and index containers.
+/// No `GcRef`, `Value`, `JsObject`, `JsString`, or other GC-managed types
+/// are permitted. This ensures deopt metadata can be stored, cloned, and
+/// transmitted across threads without interacting with GC rooting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeoptResumeSite {
+    /// Bytecode program counter.
+    pub bytecode_pc: u32,
+    /// Native code offset for the deopt point. Not wired yet.
+    pub native_offset: Option<u32>,
+    /// Live virtual register indices required for precise resume.
+    pub live_registers: Vec<u16>,
+    /// Live local indices required for precise resume.
+    pub live_locals: Vec<u16>,
+}
+
+/// Compile-time deopt metadata scaffold for a function.
+///
+/// # GC Safety (C1 invariant)
+///
+/// Contains only scalar metadata. See [`DeoptResumeSite`] for invariant details.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeoptMetadata {
+    /// Sorted list of deopt-capable sites.
+    pub sites: Vec<DeoptResumeSite>,
+}
+
+// Compile-time GC safety assertions: ensure deopt types are Send + Sync
+// (impossible if they contained GcRef which is !Send + !Sync).
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn check() {
+        assert_send_sync::<DeoptResumeSite>();
+        assert_send_sync::<DeoptMetadata>();
+    }
+};
+
+impl DeoptMetadata {
+    /// Check whether metadata has a site for the provided bytecode pc.
+    pub fn has_site(&self, pc: u32) -> bool {
+        self.sites.iter().any(|site| site.bytecode_pc == pc)
+    }
+}
+
+fn instruction_can_deopt(instruction: &Instruction) -> bool {
+    !matches!(
+        instruction,
+        Instruction::LoadUndefined { .. }
+            | Instruction::LoadNull { .. }
+            | Instruction::LoadTrue { .. }
+            | Instruction::LoadFalse { .. }
+            | Instruction::LoadInt8 { .. }
+            | Instruction::LoadInt32 { .. }
+            | Instruction::LoadConst { .. }
+            | Instruction::GetLocal { .. }
+            | Instruction::SetLocal { .. }
+            | Instruction::Move { .. }
+            | Instruction::Jump { .. }
+            | Instruction::JumpIfTrue { .. }
+            | Instruction::JumpIfFalse { .. }
+            | Instruction::JumpIfNullish { .. }
+            | Instruction::JumpIfNotNullish { .. }
+            | Instruction::Return { .. }
+            | Instruction::ReturnUndefined
+            | Instruction::Nop
+    )
+}
+
+fn build_deopt_metadata(function: &Function) -> DeoptMetadata {
+    let mut sites = Vec::new();
+    for (pc, instruction) in function.instructions.read().iter().enumerate() {
+        if instruction_can_deopt(instruction) {
+            sites.push(DeoptResumeSite {
+                bytecode_pc: pc as u32,
+                native_offset: None,
+                live_registers: Vec::new(),
+                live_locals: Vec::new(),
+            });
+        }
+    }
+    DeoptMetadata { sites }
 }
 
 /// Errors produced by the baseline JIT compiler.
@@ -111,6 +199,17 @@ impl JitCompiler {
         function: &Function,
         constants: &[Constant],
     ) -> Result<JitCompileArtifact, JitError> {
+        let (artifact, _) =
+            self.compile_function_with_constants_and_metadata(function, constants)?;
+        Ok(artifact)
+    }
+
+    /// Compile a bytecode function and return JIT artifact plus deopt metadata scaffold.
+    pub fn compile_function_with_constants_and_metadata(
+        &mut self,
+        function: &Function,
+        constants: &[Constant],
+    ) -> Result<(JitCompileArtifact, DeoptMetadata), JitError> {
         let mut signature = self.module.make_signature();
         // Signature: (ctx: I64, args_ptr: I64, argc: I32) -> I64
         signature.params.push(AbiParam::new(types::I64)); // ctx pointer
@@ -156,7 +255,8 @@ impl JitCompiler {
         self.module.finalize_definitions()?;
 
         let code_ptr = self.module.get_finalized_function(func_id);
-        Ok(JitCompileArtifact { code_ptr })
+        let metadata = build_deopt_metadata(function);
+        Ok((JitCompileArtifact { code_ptr }, metadata))
     }
 
     /// Execute a compiled artifact as `extern "C" fn(*mut u8, *const i64, u32) -> i64`.
@@ -220,6 +320,57 @@ mod tests {
             .expect("function compilation should succeed");
 
         assert!(!artifact.code_ptr.is_null());
+    }
+
+    #[test]
+    fn deopt_metadata_marks_only_deopt_capable_sites() {
+        let function = Function::builder()
+            .name("deopt_metadata_sites")
+            .register_count(3)
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(0),
+                value: 1,
+            }) // pc 0 (no deopt)
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: 2,
+            }) // pc 1 (no deopt)
+            .instruction(Instruction::Add {
+                dst: Register(2),
+                lhs: Register(0),
+                rhs: Register(1),
+                feedback_index: 0,
+            }) // pc 2 (can deopt)
+            .instruction(Instruction::Return { src: Register(2) }) // pc 3 (no deopt)
+            .feedback_vector_size(1)
+            .build();
+
+        let metadata = build_deopt_metadata(&function);
+        assert_eq!(metadata.sites.len(), 1);
+        assert_eq!(metadata.sites[0].bytecode_pc, 2);
+        assert!(metadata.has_site(2));
+        assert!(!metadata.has_site(0));
+    }
+
+    #[test]
+    fn compile_with_metadata_returns_scaffold_sites() {
+        let function = Function::builder()
+            .name("compile_with_metadata")
+            .register_count(1)
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(0),
+                value: 7,
+            })
+            .instruction(Instruction::Return { src: Register(0) })
+            .build();
+
+        let mut jit = JitCompiler::new().expect("jit initialization should succeed");
+        let (artifact, metadata) = jit
+            .compile_function_with_constants_and_metadata(&function, &[])
+            .expect("function compilation with metadata should succeed");
+
+        assert!(!artifact.code_ptr.is_null());
+        assert!(metadata.sites.is_empty());
     }
 
     #[test]
@@ -792,5 +943,101 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn deopt_state_dump_captures_locals_and_registers_on_bailout() {
+        // This function adds two non-int32 values (f64), causing a bailout on the Add
+        // if we set the feedback vector to expect only int32. This tests that
+        // the deopt path dumps local/register state to the context buffer.
+        //
+        // Layout: local[0] = param a, reg[0] = loaded int, reg[1] = Add result
+        // Bailout happens at pc 2 (Add) when type guard fails.
+
+        let function = Function::builder()
+            .name("deopt_state_dump_test")
+            .param_count(1)
+            .local_count(1)
+            .register_count(3)
+            .instruction(Instruction::GetLocal {
+                dst: Register(0),
+                idx: LocalIndex(0),
+            }) // pc 0
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: 10,
+            }) // pc 1
+            .instruction(Instruction::Add {
+                dst: Register(2),
+                lhs: Register(0),
+                rhs: Register(1),
+                feedback_index: 0,
+            }) // pc 2 - may bailout
+            .instruction(Instruction::Return { src: Register(2) }) // pc 3
+            .feedback_vector_size(1)
+            .build();
+        // Only int32 observed → JIT generates int32-only fast path
+        function.feedback_vector.write()[0]
+            .type_observations
+            .observe_int32();
+
+        let mut jit = JitCompiler::new().expect("jit init");
+        let artifact = jit
+            .compile_function(&function)
+            .expect("compilation should succeed");
+
+        // Set up a fake JitContext with deopt buffers
+        let mut deopt_locals = vec![0_i64; 1]; // 1 local
+        let mut deopt_regs = vec![0_i64; 3]; // 3 registers
+
+        // Build a minimal context-like buffer matching JitContext layout.
+        // The context is 136 bytes (through deopt_regs_count).
+        let mut ctx_buf = vec![0_u8; 136];
+        // Write deopt_locals_ptr at offset 104
+        let locals_ptr = deopt_locals.as_mut_ptr() as u64;
+        ctx_buf[104..112].copy_from_slice(&locals_ptr.to_ne_bytes());
+        // Write deopt_locals_count at offset 112
+        ctx_buf[112..116].copy_from_slice(&1_u32.to_ne_bytes());
+        // Write deopt_regs_ptr at offset 120
+        let regs_ptr = deopt_regs.as_mut_ptr() as u64;
+        ctx_buf[120..128].copy_from_slice(&regs_ptr.to_ne_bytes());
+        // Write deopt_regs_count at offset 128
+        ctx_buf[128..132].copy_from_slice(&3_u32.to_ne_bytes());
+        // Write bailout_pc = -1 at offset 96 (so we can detect if it was written)
+        ctx_buf[96..104].copy_from_slice(&(-1_i64).to_ne_bytes());
+
+        // Call with a f64 value (1.5) which will fail the int32 type guard → bailout
+        let argv = [1.5_f64.to_bits() as i64];
+
+        let func: extern "C" fn(*mut u8, *const i64, u32) -> i64 = unsafe {
+            std::mem::transmute(artifact.code_ptr)
+        };
+        let result = func(ctx_buf.as_mut_ptr(), argv.as_ptr(), 1);
+
+        // Should have bailed out
+        assert_eq!(result, crate::bailout::BAILOUT_SENTINEL);
+
+        // Check bailout_pc was written (offset 96)
+        let bailout_pc = i64::from_ne_bytes(ctx_buf[96..104].try_into().unwrap());
+        assert_eq!(bailout_pc, 2, "bailout should happen at pc 2 (Add)");
+
+        // Check deopt locals: local[0] should contain the f64 value 1.5
+        assert_eq!(
+            deopt_locals[0] as u64,
+            1.5_f64.to_bits(),
+            "local[0] should contain the f64 param value"
+        );
+
+        // Check deopt registers: reg[0] should contain the f64 param, reg[1] should be int32(10)
+        assert_eq!(
+            deopt_regs[0] as u64,
+            1.5_f64.to_bits(),
+            "reg[0] should contain GetLocal result (f64 1.5)"
+        );
+        assert_eq!(
+            deopt_regs[1],
+            boxed_i32(10),
+            "reg[1] should contain LoadInt32 value 10"
+        );
     }
 }

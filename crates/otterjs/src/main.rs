@@ -463,18 +463,62 @@ fn maybe_print_jit_stats() {
     };
 
     eprintln!(
-        "JIT stats: compile req={} ok={} err={} | exec attempts={} hits={} misses={} bailouts={} deopts={} hit_rate={:.2}% | compiled={}",
+        "JIT stats: compile req={} ok={} err={} (back_edge={}) | exec attempts={} hits={} misses={} bailouts={} (helper={}, guard={}, unknown={}) deopts={} hit_rate={:.2}% | compiled={} | osr {}/{}",
         stats.compile_requests,
         stats.compile_successes,
         stats.compile_errors,
+        stats.back_edge_compilations,
         stats.execute_attempts,
         stats.execute_hits,
         stats.execute_not_compiled,
         stats.execute_bailouts,
+        stats.execute_bailouts_helper,
+        stats.execute_bailouts_type_guard,
+        stats.execute_bailouts_unknown,
         stats.deoptimizations,
         hit_rate,
-        stats.compiled_functions
+        stats.compiled_functions,
+        stats.osr_successes,
+        stats.osr_attempts,
     );
+
+    if let (Some(module_id), Some(function_index), Some(pc)) = (
+        stats.last_bailout_module_id,
+        stats.last_bailout_function_index,
+        stats.last_bailout_pc,
+    ) {
+        let opcode = stats.last_bailout_opcode.unwrap_or("unknown");
+        eprintln!(
+            "JIT last bailout: module={} function={} pc={} opcode={} reason={:?}",
+            module_id, function_index, pc, opcode, stats.last_bailout_reason
+        );
+    }
+
+    if stats.bailout_sites_observed > 0 {
+        eprintln!(
+            "JIT bailout sites observed: {}",
+            stats.bailout_sites_observed
+        );
+        for (rank, site) in [
+            stats.top_bailout_site_1,
+            stats.top_bailout_site_2,
+            stats.top_bailout_site_3,
+        ]
+        .into_iter()
+        .flatten()
+        .enumerate()
+        {
+            eprintln!(
+                "JIT bailout top{}: module={} function={} pc={} opcode={} count={}",
+                rank + 1,
+                site.module_id,
+                site.function_index,
+                site.pc,
+                site.opcode,
+                site.count
+            );
+        }
+    }
 }
 
 struct CpuSamplingSession {

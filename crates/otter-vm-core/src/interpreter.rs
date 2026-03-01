@@ -373,6 +373,106 @@ impl Interpreter {
             && !function.flags.uses_arguments
             && !function.flags.uses_eval
     }
+    /// Handle a backward jump (back-edge) for loop-hot function detection and OSR.
+    ///
+    /// **Stage 1 — Back-edge counting:** Increments the function's back-edge
+    /// counter. When the counter crosses the hot threshold, the function is
+    /// marked hot and synchronously compiled by the JIT.
+    ///
+    /// **Stage 2 — OSR restart:** If JIT code is already available for the
+    /// function, restarts the entire function in JIT. This "full restart"
+    /// approach re-executes setup code but lets the hot loop run in native code.
+    ///
+    /// Returns `Some(value)` if OSR succeeded (the function completed in JIT),
+    /// or `None` to continue interpreting.
+    #[inline]
+    fn try_back_edge_osr(
+        &self,
+        ctx: &mut VmContext,
+        module: &Arc<Module>,
+        func: &otter_vm_bytecode::Function,
+    ) -> Option<Value> {
+        // ---- Stage 1: back-edge counting + JIT enqueue ----
+        let newly_hot =
+            func.record_back_edge_with_threshold(otter_vm_exec::jit_hot_threshold());
+        if newly_hot {
+            func.mark_hot();
+            if otter_vm_exec::is_jit_enabled() {
+                let func_index = ctx.current_frame()?.function_index;
+                otter_vm_exec::enqueue_hot_function(module, func_index, func);
+                otter_vm_exec::compile_one_pending_request(
+                    crate::jit_runtime::runtime_helpers(),
+                );
+                otter_vm_exec::record_back_edge_compilation();
+            }
+        }
+
+        // ---- Stage 2: OSR attempt ----
+        if !otter_vm_exec::is_jit_enabled()
+            || !func.is_hot_function()
+            || func.is_deoptimized()
+            || func.jit_entry_ptr() == 0
+            || func.flags.has_rest
+            || func.flags.uses_arguments
+            || func.flags.uses_eval
+        {
+            return None;
+        }
+
+        // Extract all needed state from the frame in one borrow.
+        let frame = ctx.current_frame()?;
+        if frame.is_construct || frame.is_async {
+            return None;
+        }
+        let func_index = frame.function_index;
+        let this_value = frame.this_value.clone();
+        let home_object = frame.home_object.clone();
+        let upvalues = frame.upvalues.clone();
+        // frame borrow ends here
+
+        // Extract current param values from locals.
+        let param_count = func.param_count as usize;
+        let argc = param_count.min(ctx.current_frame()?.argc);
+        let args: Vec<Value> = (0..argc)
+            .map(|i| ctx.get_local(i as u16).unwrap_or_else(|_| Value::undefined()))
+            .collect();
+
+        // Set up pending state for the JIT context.
+        ctx.set_pending_this(this_value);
+        if let Some(home_obj) = home_object {
+            ctx.set_pending_home_object(home_obj);
+        }
+
+        otter_vm_exec::record_osr_attempt();
+
+        let jit_interp: *const Self = self;
+        let jit_ctx_ptr: *mut VmContext = ctx;
+        match crate::jit_runtime::try_execute_jit(
+            module.module_id,
+            func_index,
+            func,
+            &args,
+            ctx.cached_proto_epoch,
+            jit_interp,
+            jit_ctx_ptr,
+            &module.constants as *const _,
+            &upvalues,
+        ) {
+            crate::jit_runtime::JitCallResult::Ok(value) => {
+                otter_vm_exec::record_osr_success();
+                Some(value)
+            }
+            crate::jit_runtime::JitCallResult::NeedsRecompilation => {
+                otter_vm_exec::enqueue_hot_function(module, func_index, func);
+                otter_vm_exec::compile_one_pending_request(
+                    crate::jit_runtime::runtime_helpers(),
+                );
+                None
+            }
+            _ => None,
+        }
+    }
+
     fn precompile_module_jit_candidates(&self, module: &Arc<Module>) {
         if !otter_vm_exec::is_jit_enabled() {
             return;
@@ -876,6 +976,27 @@ impl Interpreter {
                     ctx.advance_pc();
                 }
                 InstructionResult::Jump(offset) => {
+                    if offset < 0 {
+                        if let Some(osr_value) =
+                            self.try_back_edge_osr(ctx, &current_module, func)
+                        {
+                            let return_reg = ctx
+                                .current_frame()
+                                .ok_or_else(|| VmError::internal("no frame"))?
+                                .return_register;
+                            if ctx.stack_depth() <= prev_stack_depth + 1 {
+                                ctx.pop_frame();
+                                break osr_value;
+                            }
+                            ctx.pop_frame();
+                            if let Some(reg) = return_reg {
+                                ctx.set_register(reg, osr_value);
+                            } else {
+                                ctx.set_register(0, osr_value);
+                            }
+                            continue;
+                        }
+                    }
                     ctx.jump(offset);
                 }
                 InstructionResult::Return(value) => {
@@ -961,20 +1082,37 @@ impl Interpreter {
                                 &module.constants as *const _,
                                 &upvalues,
                             ) {
-                                otter_vm_exec::JitExecResult::Ok(bits) => {
-                                    if let Some(value) = Value::from_jit_bits(bits as u64) {
-                                        ctx.set_register(return_reg, value);
-                                        continue;
-                                    }
+                                crate::jit_runtime::JitCallResult::Ok(value) => {
+                                    ctx.set_register(return_reg, value);
+                                    continue;
                                 }
-                                otter_vm_exec::JitExecResult::NeedsRecompilation => {
+                                crate::jit_runtime::JitCallResult::BailoutResume {
+                                    bailout_pc,
+                                    locals,
+                                    registers,
+                                } => {
+                                    let local_count = func.local_count;
+                                    ctx.set_pending_upvalues(upvalues);
+                                    ctx.push_frame(
+                                        func_index,
+                                        module,
+                                        local_count,
+                                        Some(return_reg),
+                                        is_construct,
+                                        is_async,
+                                        argc as usize,
+                                    )?;
+                                    ctx.restore_deopt_state(bailout_pc, &locals, &registers);
+                                    continue;
+                                }
+                                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
                                     otter_vm_exec::enqueue_hot_function(&module, func_index, func);
                                     otter_vm_exec::compile_one_pending_request(
                                         crate::jit_runtime::runtime_helpers(),
                                     );
                                 }
-                                otter_vm_exec::JitExecResult::Bailout
-                                | otter_vm_exec::JitExecResult::NotCompiled => {}
+                                crate::jit_runtime::JitCallResult::BailoutRestart
+                                | crate::jit_runtime::JitCallResult::NotCompiled => {}
                             }
                         }
                     }
@@ -1248,6 +1386,26 @@ impl Interpreter {
                     ctx.advance_pc();
                 }
                 InstructionResult::Jump(offset) => {
+                    if offset < 0 {
+                        if let Some(osr_value) =
+                            self.try_back_edge_osr(ctx, module_ref, func)
+                        {
+                            if ctx.stack_depth() == 1 {
+                                ctx.set_running(false);
+                                return VmExecutionResult::Complete(osr_value);
+                            }
+                            let return_reg = ctx
+                                .current_frame()
+                                .map(|f| f.return_register)
+                                .unwrap_or(None);
+                            ctx.pop_frame();
+                            cached_frame_id = usize::MAX;
+                            if let Some(reg) = return_reg {
+                                ctx.set_register(reg, osr_value);
+                            }
+                            continue;
+                        }
+                    }
                     ctx.jump(offset);
                 }
                 InstructionResult::Return(value) => {
@@ -1390,13 +1548,32 @@ impl Interpreter {
                                 &call_module.constants as *const _,
                                 &upvalues,
                             ) {
-                                otter_vm_exec::JitExecResult::Ok(bits) => {
-                                    if let Some(value) = Value::from_jit_bits(bits as u64) {
-                                        ctx.set_register(return_reg, value);
-                                        continue;
-                                    }
+                                crate::jit_runtime::JitCallResult::Ok(value) => {
+                                    ctx.set_register(return_reg, value);
+                                    continue;
                                 }
-                                otter_vm_exec::JitExecResult::NeedsRecompilation => {
+                                crate::jit_runtime::JitCallResult::BailoutResume {
+                                    bailout_pc,
+                                    locals,
+                                    registers,
+                                } => {
+                                    let local_count = callee.local_count;
+                                    ctx.set_pending_upvalues(upvalues);
+                                    if let Err(e) = ctx.push_frame(
+                                        func_index,
+                                        call_module,
+                                        local_count,
+                                        Some(return_reg),
+                                        is_construct,
+                                        is_async,
+                                        argc as usize,
+                                    ) {
+                                        return VmExecutionResult::Error(e.to_string());
+                                    }
+                                    ctx.restore_deopt_state(bailout_pc, &locals, &registers);
+                                    continue;
+                                }
+                                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
                                     otter_vm_exec::enqueue_hot_function(
                                         &call_module,
                                         func_index,
@@ -1406,8 +1583,8 @@ impl Interpreter {
                                         crate::jit_runtime::runtime_helpers(),
                                     );
                                 }
-                                otter_vm_exec::JitExecResult::Bailout
-                                | otter_vm_exec::JitExecResult::NotCompiled => {}
+                                crate::jit_runtime::JitCallResult::BailoutRestart
+                                | crate::jit_runtime::JitCallResult::NotCompiled => {}
                             }
                         }
                     }
@@ -1708,6 +1885,25 @@ impl Interpreter {
                     ctx.advance_pc();
                 }
                 InstructionResult::Jump(offset) => {
+                    if offset < 0 {
+                        if let Some(osr_value) =
+                            self.try_back_edge_osr(ctx, module_ref, func)
+                        {
+                            if ctx.stack_depth() == 1 {
+                                return Ok(osr_value);
+                            }
+                            let return_reg = ctx
+                                .current_frame()
+                                .ok_or_else(|| VmError::internal("no frame"))?
+                                .return_register;
+                            ctx.pop_frame();
+                            cached_frame_id = usize::MAX;
+                            if let Some(reg) = return_reg {
+                                ctx.set_register(reg, osr_value);
+                            }
+                            continue;
+                        }
+                    }
                     ctx.jump(offset);
                 }
                 InstructionResult::Return(value) => {
@@ -1846,13 +2042,30 @@ impl Interpreter {
                                 &call_module.constants as *const _,
                                 &upvalues,
                             ) {
-                                otter_vm_exec::JitExecResult::Ok(bits) => {
-                                    if let Some(value) = Value::from_jit_bits(bits as u64) {
-                                        ctx.set_register(return_reg, value);
-                                        continue;
-                                    }
+                                crate::jit_runtime::JitCallResult::Ok(value) => {
+                                    ctx.set_register(return_reg, value);
+                                    continue;
                                 }
-                                otter_vm_exec::JitExecResult::NeedsRecompilation => {
+                                crate::jit_runtime::JitCallResult::BailoutResume {
+                                    bailout_pc,
+                                    locals,
+                                    registers,
+                                } => {
+                                    let local_count = callee.local_count;
+                                    ctx.set_pending_upvalues(upvalues);
+                                    ctx.push_frame(
+                                        func_index,
+                                        call_module,
+                                        local_count,
+                                        Some(return_reg),
+                                        is_construct,
+                                        is_async,
+                                        argc as usize,
+                                    )?;
+                                    ctx.restore_deopt_state(bailout_pc, &locals, &registers);
+                                    continue;
+                                }
+                                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
                                     otter_vm_exec::enqueue_hot_function(
                                         &call_module,
                                         func_index,
@@ -1862,8 +2075,8 @@ impl Interpreter {
                                         crate::jit_runtime::runtime_helpers(),
                                     );
                                 }
-                                otter_vm_exec::JitExecResult::Bailout
-                                | otter_vm_exec::JitExecResult::NotCompiled => {}
+                                crate::jit_runtime::JitCallResult::BailoutRestart
+                                | crate::jit_runtime::JitCallResult::NotCompiled => {}
                             }
                         }
                     }
@@ -8475,8 +8688,9 @@ impl Interpreter {
                 .current_frame()
                 .ok_or_else(|| VmError::internal("eval: no frame"))?;
             let current_module = Arc::clone(&frame.module);
+            let eval_func_index = frame.function_index;
             let func = current_module
-                .function(frame.function_index)
+                .function(eval_func_index)
                 .ok_or_else(|| VmError::internal("eval: function not found"))?;
 
             // End of function → implicit return undefined
@@ -8496,6 +8710,25 @@ impl Interpreter {
                     ctx.advance_pc();
                 }
                 Ok(InstructionResult::Jump(offset)) => {
+                    if offset < 0 {
+                        let newly_hot = func.record_back_edge_with_threshold(
+                            otter_vm_exec::jit_hot_threshold(),
+                        );
+                        if newly_hot {
+                            func.mark_hot();
+                            if otter_vm_exec::is_jit_enabled() {
+                                otter_vm_exec::enqueue_hot_function(
+                                    &current_module,
+                                    eval_func_index,
+                                    func,
+                                );
+                                otter_vm_exec::compile_one_pending_request(
+                                    crate::jit_runtime::runtime_helpers(),
+                                );
+                                otter_vm_exec::record_back_edge_compilation();
+                            }
+                        }
+                    }
                     ctx.jump(offset);
                 }
                 Ok(InstructionResult::Return(value)) => {
@@ -8923,7 +9156,8 @@ impl Interpreter {
             };
 
             let current_module = Arc::clone(&frame.module);
-            let func = match current_module.function(frame.function_index) {
+            let construct_func_index = frame.function_index;
+            let func = match current_module.function(construct_func_index) {
                 Some(f) => f,
                 None => return Err(VmError::internal("function not found")),
             };
@@ -8945,6 +9179,25 @@ impl Interpreter {
                     ctx.advance_pc();
                 }
                 Ok(InstructionResult::Jump(offset)) => {
+                    if offset < 0 {
+                        let newly_hot = func.record_back_edge_with_threshold(
+                            otter_vm_exec::jit_hot_threshold(),
+                        );
+                        if newly_hot {
+                            func.mark_hot();
+                            if otter_vm_exec::is_jit_enabled() {
+                                otter_vm_exec::enqueue_hot_function(
+                                    &current_module,
+                                    construct_func_index,
+                                    func,
+                                );
+                                otter_vm_exec::compile_one_pending_request(
+                                    crate::jit_runtime::runtime_helpers(),
+                                );
+                                otter_vm_exec::record_back_edge_compilation();
+                            }
+                        }
+                    }
                     ctx.jump(offset);
                 }
                 Ok(InstructionResult::Return(value)) => {
@@ -9030,20 +9283,37 @@ impl Interpreter {
                                 &module.constants as *const _,
                                 &upvalues,
                             ) {
-                                otter_vm_exec::JitExecResult::Ok(bits) => {
-                                    if let Some(value) = Value::from_jit_bits(bits as u64) {
-                                        ctx.set_register(return_reg, value);
-                                        continue;
-                                    }
+                                crate::jit_runtime::JitCallResult::Ok(value) => {
+                                    ctx.set_register(return_reg, value);
+                                    continue;
                                 }
-                                otter_vm_exec::JitExecResult::NeedsRecompilation => {
+                                crate::jit_runtime::JitCallResult::BailoutResume {
+                                    bailout_pc,
+                                    locals,
+                                    registers,
+                                } => {
+                                    let local_count = func.local_count;
+                                    ctx.set_pending_upvalues(upvalues);
+                                    ctx.push_frame(
+                                        func_index,
+                                        module,
+                                        local_count,
+                                        Some(return_reg),
+                                        is_construct,
+                                        is_async,
+                                        argc as usize,
+                                    )?;
+                                    ctx.restore_deopt_state(bailout_pc, &locals, &registers);
+                                    continue;
+                                }
+                                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
                                     otter_vm_exec::enqueue_hot_function(&module, func_index, func);
                                     otter_vm_exec::compile_one_pending_request(
                                         crate::jit_runtime::runtime_helpers(),
                                     );
                                 }
-                                otter_vm_exec::JitExecResult::Bailout
-                                | otter_vm_exec::JitExecResult::NotCompiled => {}
+                                crate::jit_runtime::JitCallResult::BailoutRestart
+                                | crate::jit_runtime::JitCallResult::NotCompiled => {}
                             }
                         }
                     }

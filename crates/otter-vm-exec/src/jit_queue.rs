@@ -105,6 +105,52 @@ mod tests {
         Arc::new(builder.entry_point(index).build())
     }
 
+    fn build_yield_module() -> Arc<Module> {
+        let function = Function::builder()
+            .name("jit_queue_yield_test")
+            .register_count(2)
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: 1,
+            })
+            .instruction(Instruction::Yield {
+                dst: Register(0),
+                src: Register(1),
+            })
+            .instruction(Instruction::Return { src: Register(0) })
+            .build();
+
+        let mut builder = Module::builder("jit-queue-yield-test.js");
+        let index = builder.add_function(function);
+        Arc::new(builder.entry_point(index).build())
+    }
+
+    fn build_async_flagged_module() -> Arc<Module> {
+        let function = Function::builder()
+            .name("jit_queue_async_flag_test")
+            .register_count(1)
+            .is_async(true)
+            .instruction(Instruction::ReturnUndefined)
+            .build();
+
+        let mut builder = Module::builder("jit-queue-async-flag-test.js");
+        let index = builder.add_function(function);
+        Arc::new(builder.entry_point(index).build())
+    }
+
+    fn build_generator_flagged_module() -> Arc<Module> {
+        let function = Function::builder()
+            .name("jit_queue_generator_flag_test")
+            .register_count(1)
+            .is_generator(true)
+            .instruction(Instruction::ReturnUndefined)
+            .build();
+
+        let mut builder = Module::builder("jit-queue-generator-flag-test.js");
+        let index = builder.add_function(function);
+        Arc::new(builder.entry_point(index).build())
+    }
+
     #[test]
     fn keeps_key_reserved_until_request_is_marked_finished() {
         let _guard = crate::test_lock();
@@ -122,6 +168,52 @@ mod tests {
         mark_request_finished(module.module_id, 0);
         assert!(enqueue_hot_function(&module, 0, function));
 
+        clear_for_tests();
+    }
+
+    #[test]
+    fn does_not_enqueue_functions_with_yield_bailout_stub_opcode() {
+        let _guard = crate::test_lock();
+        clear_for_tests();
+
+        let module = build_yield_module();
+        let function = module
+            .function(0)
+            .expect("test module should expose entry function");
+
+        assert!(
+            !enqueue_hot_function(&module, 0, function),
+            "yield/await bailout stubs should not pass JIT eligibility"
+        );
+        assert_eq!(pending_count(), 0);
+
+        clear_for_tests();
+    }
+
+    #[test]
+    fn does_not_enqueue_async_or_generator_functions() {
+        let _guard = crate::test_lock();
+        clear_for_tests();
+
+        let async_module = build_async_flagged_module();
+        let async_function = async_module
+            .function(0)
+            .expect("test module should expose entry function");
+        assert!(
+            !enqueue_hot_function(&async_module, 0, async_function),
+            "async functions must remain non-eligible for baseline JIT"
+        );
+
+        let generator_module = build_generator_flagged_module();
+        let generator_function = generator_module
+            .function(0)
+            .expect("test module should expose entry function");
+        assert!(
+            !enqueue_hot_function(&generator_module, 0, generator_function),
+            "generator functions must remain non-eligible for baseline JIT"
+        );
+
+        assert_eq!(pending_count(), 0);
         clear_for_tests();
     }
 }

@@ -13,7 +13,10 @@ use otter_vm_bytecode::Function;
 use otter_vm_bytecode::function::InlineCacheState;
 use otter_vm_gc::object::{GcAllocation, GcHeader, tags as gc_tags};
 use otter_vm_jit::BAILOUT_SENTINEL;
-use otter_vm_jit::runtime_helpers::{HelperKind, RuntimeHelpers};
+use otter_vm_jit::runtime_helpers::{
+    HelperKind, JIT_CTX_BAILOUT_PC_OFFSET, JIT_CTX_BAILOUT_REASON_OFFSET,
+    JIT_CTX_SECONDARY_RESULT_OFFSET, RuntimeHelpers,
+};
 
 use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
@@ -24,6 +27,7 @@ use crate::value::UpvalueCell;
 const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 const TAG_POINTER: u64 = 0x7FFC_0000_0000_0000;
+const TAG_INT32: u64 = 0x7FF8_0001_0000_0000;
 
 /// Opaque context passed as the first argument to every JIT-compiled function.
 ///
@@ -63,16 +67,80 @@ pub struct JitContext {
     /// Secondary return value for multi-result opcodes (e.g. IteratorNext done flag).
     /// Written by the helper, read by JIT code after the call returns.
     pub secondary_result: i64,
+    /// Deopt reason code written by JIT-side bailout paths.
+    pub bailout_reason: i64,
+    /// Bytecode pc at which JIT-side bailout happened.
+    pub bailout_pc: i64,
+    /// Pointer to caller-allocated buffer for dumping local values on deopt.
+    /// Null when precise resume is not requested.
+    pub deopt_locals_ptr: *mut i64,
+    /// Number of local slots in the deopt buffer.
+    pub deopt_locals_count: u32,
+    /// Pointer to caller-allocated buffer for dumping register values on deopt.
+    /// Null when precise resume is not requested.
+    pub deopt_regs_ptr: *mut i64,
+    /// Number of register slots in the deopt buffer.
+    pub deopt_regs_count: u32,
 }
 
-// Compile-time check: JIT_CTX_SECONDARY_RESULT_OFFSET in runtime_helpers.rs must match
-// the actual byte offset of `secondary_result` in JitContext.
+// Compile-time checks: offsets in runtime_helpers.rs must match JitContext layout.
+use otter_vm_jit::runtime_helpers::{
+    JIT_CTX_DEOPT_LOCALS_COUNT_OFFSET, JIT_CTX_DEOPT_LOCALS_PTR_OFFSET,
+    JIT_CTX_DEOPT_REGS_COUNT_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET,
+};
 const _: () = {
     assert!(
-        std::mem::offset_of!(JitContext, secondary_result) == 80,
+        std::mem::offset_of!(JitContext, secondary_result) as i32
+            == JIT_CTX_SECONDARY_RESULT_OFFSET,
         "JitContext::secondary_result offset changed — update JIT_CTX_SECONDARY_RESULT_OFFSET in runtime_helpers.rs"
     );
+    assert!(
+        std::mem::offset_of!(JitContext, bailout_reason) as i32 == JIT_CTX_BAILOUT_REASON_OFFSET,
+        "JitContext::bailout_reason offset changed — update JIT_CTX_BAILOUT_REASON_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::offset_of!(JitContext, bailout_pc) as i32 == JIT_CTX_BAILOUT_PC_OFFSET,
+        "JitContext::bailout_pc offset changed — update JIT_CTX_BAILOUT_PC_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::offset_of!(JitContext, deopt_locals_ptr) as i32
+            == JIT_CTX_DEOPT_LOCALS_PTR_OFFSET,
+        "JitContext::deopt_locals_ptr offset changed — update JIT_CTX_DEOPT_LOCALS_PTR_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::offset_of!(JitContext, deopt_locals_count) as i32
+            == JIT_CTX_DEOPT_LOCALS_COUNT_OFFSET,
+        "JitContext::deopt_locals_count offset changed — update JIT_CTX_DEOPT_LOCALS_COUNT_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::offset_of!(JitContext, deopt_regs_ptr) as i32
+            == JIT_CTX_DEOPT_REGS_PTR_OFFSET,
+        "JitContext::deopt_regs_ptr offset changed — update JIT_CTX_DEOPT_REGS_PTR_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::offset_of!(JitContext, deopt_regs_count) as i32
+            == JIT_CTX_DEOPT_REGS_COUNT_OFFSET,
+        "JitContext::deopt_regs_count offset changed — update JIT_CTX_DEOPT_REGS_COUNT_OFFSET in runtime_helpers.rs"
+    );
 };
+
+/// UTF-16 encoding of "length" for fast constant pool comparison.
+const LENGTH_UTF16: [u16; 6] = [108, 101, 110, 103, 116, 104];
+
+/// Check if the constant at `name_idx` in the module constant pool is "length".
+#[allow(unsafe_code)]
+fn is_length_constant(ctx: &JitContext, name_idx: i64) -> bool {
+    if ctx.constants.is_null() {
+        return false;
+    }
+    let pool = unsafe { &*ctx.constants };
+    if let Some(constant) = pool.get(name_idx as u32) {
+        if let otter_vm_bytecode::Constant::String(units) = constant {
+            return units.as_slice() == LENGTH_UTF16;
+        }
+    }
+    false
+}
 
 /// Runtime helper: GetPropConst — IC fast-path property read.
 ///
@@ -87,11 +155,59 @@ const _: () = {
 /// - `ctx_raw` must point to a valid `JitContext`
 /// - `obj_raw` must be a valid NaN-boxed value
 /// - No GC must occur during this call (guaranteed by caller)
+/// Extract a JsObject reference from NaN-boxed bits (TAG_POINTER with OBJECT/ARRAY tag).
+/// Returns None if not a valid heap object.
+#[inline]
+#[allow(unsafe_code)]
+fn extract_js_object_ref(bits: u64) -> Option<&'static JsObject> {
+    if (bits & TAG_MASK) != TAG_POINTER {
+        return None;
+    }
+    let raw_ptr = (bits & PAYLOAD_MASK) as *const u8;
+    if raw_ptr.is_null() {
+        return None;
+    }
+    let header_offset = std::mem::offset_of!(GcAllocation<JsObject>, value);
+    let header_ptr = unsafe { raw_ptr.sub(header_offset) as *const GcHeader };
+    let tag = unsafe { (*header_ptr).tag() };
+    if tag != gc_tags::OBJECT && tag != gc_tags::ARRAY {
+        return None;
+    }
+    Some(unsafe { &*(raw_ptr as *const JsObject) })
+}
+
+/// Monomorphic property read — compile-time shape and offset baked in.
+///
+/// Skips JitContext, feedback vector, IC lookup, and proto epoch check.
+/// Returns property value or BAILOUT_SENTINEL on shape mismatch / accessor.
+///
+/// Signature: `(obj: i64, expected_shape: i64, offset: i64) -> i64`
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_get_prop_mono(
+    obj_raw: i64,
+    expected_shape: i64,
+    offset: i64,
+) -> i64 {
+    let obj_ref = match extract_js_object_ref(obj_raw as u64) {
+        Some(o) => o,
+        None => return BAILOUT_SENTINEL,
+    };
+
+    if obj_ref.shape_ptr_raw() != expected_shape as u64 {
+        return BAILOUT_SENTINEL;
+    }
+
+    match obj_ref.get_by_offset(offset as usize) {
+        Some(val) => val.to_jit_bits(),
+        None => BAILOUT_SENTINEL,
+    }
+}
+
 #[allow(unsafe_code)]
 extern "C" fn otter_rt_get_prop_const(
     ctx_raw: i64,
     obj_raw: i64,
-    _name_idx: i64,
+    name_idx: i64,
     ic_idx: i64,
 ) -> i64 {
     let ctx = unsafe { &*(ctx_raw as *const JitContext) };
@@ -114,21 +230,27 @@ extern "C" fn otter_rt_get_prop_const(
     let header_ptr = unsafe { raw_ptr.sub(header_offset) as *const GcHeader };
     let tag = unsafe { (*header_ptr).tag() };
 
-    if tag != gc_tags::OBJECT {
+    // Accept both OBJECT and ARRAY tags (arrays are JsObjects with array flag).
+    if tag != gc_tags::OBJECT && tag != gc_tags::ARRAY {
         return BAILOUT_SENTINEL;
     }
 
-    // SAFETY: We verified the tag is OBJECT, so raw_ptr is *const JsObject.
+    // SAFETY: We verified the tag is OBJECT or ARRAY, so raw_ptr is *const JsObject.
     // The object is alive (reachable from interpreter stack). No GC during JIT.
     let obj_ref = unsafe { &*(raw_ptr as *const JsObject) };
 
-    // Check dictionary mode — IC doesn't apply
-    if obj_ref.is_dictionary_mode() {
-        return BAILOUT_SENTINEL;
+    // Fast path: array .length access (virtual property, not in shape/IC).
+    if tag == gc_tags::ARRAY && is_length_constant(ctx, name_idx) {
+        let flags = obj_ref.flags.borrow();
+        if let Some(sparse_len) = flags.sparse_array_length {
+            return crate::value::Value::int32(sparse_len as i32).to_jit_bits();
+        }
+        drop(flags);
+        return crate::value::Value::int32(obj_ref.elements.borrow().len() as i32).to_jit_bits();
     }
 
-    // Get shape pointer for comparison
-    let obj_shape_ptr = std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
+    // Get shape pointer for comparison — avoids Arc clone (no atomic refcount).
+    let obj_shape_ptr = obj_ref.shape_ptr_raw();
 
     // Read IC from feedback vector
     let function = unsafe { &*ctx.function_ptr };
@@ -142,7 +264,9 @@ extern "C" fn otter_rt_get_prop_const(
         return BAILOUT_SENTINEL;
     }
 
-    // IC fast path — extract offset from IC state, then read property
+    // IC fast path — extract offset from IC state, then read property.
+    // If the shape matches the IC entry, the object is guaranteed not in
+    // dictionary mode (dictionary transitions invalidate shape-based IC).
     let cached_offset: Option<u32> = match &ic.ic_state {
         InlineCacheState::Monomorphic { shape_id, offset } => {
             if obj_shape_ptr == *shape_id {
@@ -220,17 +344,14 @@ extern "C" fn otter_rt_set_prop_const(
     let header_ptr = unsafe { raw_ptr.sub(header_offset) as *const GcHeader };
     let tag = unsafe { (*header_ptr).tag() };
 
-    if tag != gc_tags::OBJECT {
+    if tag != gc_tags::OBJECT && tag != gc_tags::ARRAY {
         return BAILOUT_SENTINEL;
     }
 
     let obj_ref = unsafe { &*(raw_ptr as *const JsObject) };
 
-    if obj_ref.is_dictionary_mode() {
-        return BAILOUT_SENTINEL;
-    }
-
-    let obj_shape_ptr = std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
+    // Get shape pointer — avoids Arc clone (no atomic refcount).
+    let obj_shape_ptr = obj_ref.shape_ptr_raw();
 
     let function = unsafe { &*ctx.function_ptr };
     let feedback = function.feedback_vector.write();
@@ -243,13 +364,14 @@ extern "C" fn otter_rt_set_prop_const(
     }
 
     // Reconstruct the Value to write.
-    // For non-pointer values, we can reconstruct from bits directly.
-    // For pointer values, we bail (the object is reachable but we can't
-    // reconstruct the HeapRef safely without knowing the type).
+    // SAFETY: We are in the JIT execution scope — no GC has occurred.
+    // Pointer-tagged values (objects, strings, arrays) are still live.
     let value_bits = value_raw as u64;
     let write_value = if (value_bits & TAG_MASK) == TAG_POINTER {
-        // Heap value — bail out to interpreter for proper GC-safe handling
-        return BAILOUT_SENTINEL;
+        match unsafe { crate::value::Value::from_raw_bits_unchecked(value_bits) } {
+            Some(v) => v,
+            None => return BAILOUT_SENTINEL,
+        }
     } else {
         match crate::value::Value::from_jit_bits(value_bits) {
             Some(v) => v,
@@ -257,7 +379,8 @@ extern "C" fn otter_rt_set_prop_const(
         }
     };
 
-    // IC fast path — extract offset, then write
+    // IC fast path — extract offset, then write.
+    // Shape match implies object is not in dictionary mode.
     let cached_offset: Option<u32> = match &ic.ic_state {
         InlineCacheState::Monomorphic { shape_id, offset } => {
             if obj_shape_ptr == *shape_id {
@@ -363,7 +486,36 @@ extern "C" fn otter_rt_call_function(
     let interpreter = unsafe { &*ctx.interpreter };
     let vm_ctx = unsafe { &mut *ctx.vm_ctx };
 
-    // Perform the call via the interpreter
+    // Fast path: direct JIT-to-JIT call for JS closures with compiled code.
+    // Avoids the full interpreter.call_function() re-entry overhead when the
+    // callee already has JIT code available.
+    if let Some(closure) = callee.as_function() {
+        if !closure.is_generator && !closure.is_async {
+            if let Some(func_info) = closure.module.function(closure.function_index) {
+                if !func_info.flags.has_rest {
+                    match crate::jit_runtime::try_execute_jit(
+                        closure.module.module_id,
+                        closure.function_index,
+                        func_info,
+                        &args,
+                        vm_ctx.cached_proto_epoch,
+                        ctx.interpreter,
+                        ctx.vm_ctx,
+                        &closure.module.constants as *const _,
+                        &closure.upvalues,
+                    ) {
+                        crate::jit_runtime::JitCallResult::Ok(value) => {
+                            return value.to_jit_bits();
+                        }
+                        // Bailout or not compiled: fall through to interpreter
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Slow path: full interpreter re-entry
     match interpreter.call_function(vm_ctx, &callee, crate::value::Value::undefined(), &args) {
         Ok(result) => result.to_jit_bits(),
         Err(_) => BAILOUT_SENTINEL,
@@ -480,7 +632,7 @@ extern "C" fn otter_rt_get_global(ctx_raw: i64, name_idx: i64, ic_idx: i64) -> i
                 offset,
             } = &ic.ic_state
             {
-                if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr {
+                if global_obj.shape_ptr_raw() == *shape_addr {
                     if let Some(val) = global_obj.get_by_offset(*offset as usize) {
                         return val.to_jit_bits();
                     }
@@ -615,7 +767,9 @@ unsafe fn extract_js_object(bits: u64) -> Option<&'static JsObject> {
     }
     let header_offset = std::mem::offset_of!(GcAllocation<JsObject>, value);
     let header_ptr = raw_ptr.sub(header_offset) as *const GcHeader;
-    if (*header_ptr).tag() != gc_tags::OBJECT {
+    let tag = (*header_ptr).tag();
+    // Accept both OBJECT and ARRAY tags — arrays are JsObjects.
+    if tag != gc_tags::OBJECT && tag != gc_tags::ARRAY {
         return None;
     }
     Some(&*(raw_ptr as *const JsObject))
@@ -829,7 +983,7 @@ extern "C" fn otter_rt_get_elem(ctx_raw: i64, obj_raw: i64, idx_raw: i64, ic_idx
     }
 
     if matches!(&key, PropertyKey::String(_)) {
-        let obj_shape_ptr = std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
+        let obj_shape_ptr = obj_ref.shape_ptr_raw();
         let function = unsafe { &*ctx.function_ptr };
         let feedback = function.feedback_vector.write();
         if let Some(ic) = feedback.get_mut(ic_idx as usize) {
@@ -939,7 +1093,7 @@ extern "C" fn otter_rt_set_elem(
     }
 
     if matches!(&key, PropertyKey::String(_)) {
-        let obj_shape_ptr = std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
+        let obj_shape_ptr = obj_ref.shape_ptr_raw();
         let function = unsafe { &*ctx.function_ptr };
         let feedback = function.feedback_vector.write();
         if let Some(ic) = feedback.get_mut(ic_idx as usize) {
@@ -1210,7 +1364,7 @@ extern "C" fn otter_rt_call_method(
         return BAILOUT_SENTINEL;
     }
 
-    let obj_shape_ptr = std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
+    let obj_shape_ptr = obj_ref.shape_ptr_raw();
     let function = unsafe { &*ctx.function_ptr };
     let feedback = function.feedback_vector.write();
     let Some(ic) = feedback.get_mut(ic_idx as usize) else {
@@ -3367,6 +3521,267 @@ extern "C" fn otter_rt_bailout_stub(_ctx_raw: i64) -> i64 {
     BAILOUT_SENTINEL
 }
 
+// ---------------------------------------------------------------------------
+// Generic arithmetic / comparison helpers
+// ---------------------------------------------------------------------------
+//
+// These handle the slow path when JIT type guards fail (e.g., Int32 overflow,
+// mixed Int32/Float64 operands). They cover numeric cases only; non-numeric
+// operands (strings, objects, BigInt) return BAILOUT_SENTINEL.
+
+/// Extract an f64 from a JIT NaN-boxed value (int32 or float64).
+#[inline]
+#[allow(unsafe_code)]
+fn jit_to_f64(raw: i64) -> Option<f64> {
+    let bits = raw as u64;
+    // Fast check: is it an int32?
+    if (bits & 0xFFFF_FFFF_0000_0000) == TAG_INT32 {
+        let i = (bits & 0xFFFF_FFFF) as u32 as i32;
+        Some(i as f64)
+    } else {
+        // Try to reconstruct as Value and check for number
+        match unsafe { crate::value::Value::from_raw_bits_unchecked(bits) } {
+            Some(v) => v.as_number().or_else(|| v.as_int32().map(|i| i as f64)),
+            None => None,
+        }
+    }
+}
+
+/// Generic JS `+` for numeric operands.
+/// Signature: `(ctx: i64, lhs: i64, rhs: i64) -> i64`
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_add(_ctx_raw: i64, lhs_raw: i64, rhs_raw: i64) -> i64 {
+    match (jit_to_f64(lhs_raw), jit_to_f64(rhs_raw)) {
+        (Some(l), Some(r)) => crate::value::Value::number(l + r).to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
+    }
+}
+
+/// Generic JS `-` for numeric operands.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_sub(_ctx_raw: i64, lhs_raw: i64, rhs_raw: i64) -> i64 {
+    match (jit_to_f64(lhs_raw), jit_to_f64(rhs_raw)) {
+        (Some(l), Some(r)) => crate::value::Value::number(l - r).to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
+    }
+}
+
+/// Generic JS `*` for numeric operands.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_mul(_ctx_raw: i64, lhs_raw: i64, rhs_raw: i64) -> i64 {
+    match (jit_to_f64(lhs_raw), jit_to_f64(rhs_raw)) {
+        (Some(l), Some(r)) => crate::value::Value::number(l * r).to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
+    }
+}
+
+/// Generic JS `/` for numeric operands.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_div(_ctx_raw: i64, lhs_raw: i64, rhs_raw: i64) -> i64 {
+    match (jit_to_f64(lhs_raw), jit_to_f64(rhs_raw)) {
+        (Some(l), Some(r)) => crate::value::Value::number(l / r).to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
+    }
+}
+
+/// Generic JS `%` for numeric operands.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_mod(_ctx_raw: i64, lhs_raw: i64, rhs_raw: i64) -> i64 {
+    match (jit_to_f64(lhs_raw), jit_to_f64(rhs_raw)) {
+        (Some(l), Some(r)) => crate::value::Value::number(l % r).to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
+    }
+}
+
+/// Generic unary `-` for numeric operands.
+/// Signature: `(ctx: i64, val: i64) -> i64`
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_neg(_ctx_raw: i64, val_raw: i64) -> i64 {
+    match jit_to_f64(val_raw) {
+        Some(n) => crate::value::Value::number(-n).to_jit_bits(),
+        None => BAILOUT_SENTINEL,
+    }
+}
+
+/// Generic `++` (increment) for numeric operands.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_inc(_ctx_raw: i64, val_raw: i64) -> i64 {
+    match jit_to_f64(val_raw) {
+        Some(n) => crate::value::Value::number(n + 1.0).to_jit_bits(),
+        None => BAILOUT_SENTINEL,
+    }
+}
+
+/// Generic `--` (decrement) for numeric operands.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_dec(_ctx_raw: i64, val_raw: i64) -> i64 {
+    match jit_to_f64(val_raw) {
+        Some(n) => crate::value::Value::number(n - 1.0).to_jit_bits(),
+        None => BAILOUT_SENTINEL,
+    }
+}
+
+/// Generic `<` comparison for numeric operands.
+/// Returns JS true/false as NaN-boxed values.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_lt(_ctx_raw: i64, lhs_raw: i64, rhs_raw: i64) -> i64 {
+    match (jit_to_f64(lhs_raw), jit_to_f64(rhs_raw)) {
+        (Some(l), Some(r)) => crate::value::Value::boolean(l < r).to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
+    }
+}
+
+/// Generic `<=` comparison for numeric operands.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_le(_ctx_raw: i64, lhs_raw: i64, rhs_raw: i64) -> i64 {
+    match (jit_to_f64(lhs_raw), jit_to_f64(rhs_raw)) {
+        (Some(l), Some(r)) => crate::value::Value::boolean(l <= r).to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
+    }
+}
+
+/// Generic `>` comparison for numeric operands.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_gt(_ctx_raw: i64, lhs_raw: i64, rhs_raw: i64) -> i64 {
+    match (jit_to_f64(lhs_raw), jit_to_f64(rhs_raw)) {
+        (Some(l), Some(r)) => crate::value::Value::boolean(l > r).to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
+    }
+}
+
+/// Generic `>=` comparison for numeric operands.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_ge(_ctx_raw: i64, lhs_raw: i64, rhs_raw: i64) -> i64 {
+    match (jit_to_f64(lhs_raw), jit_to_f64(rhs_raw)) {
+        (Some(l), Some(r)) => crate::value::Value::boolean(l >= r).to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
+    }
+}
+
+/// Generic `==` (abstract equality) for numeric operands.
+/// Only handles numeric equality; non-numeric operands bail.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_eq(_ctx_raw: i64, lhs_raw: i64, rhs_raw: i64) -> i64 {
+    match (jit_to_f64(lhs_raw), jit_to_f64(rhs_raw)) {
+        (Some(l), Some(r)) => crate::value::Value::boolean(l == r).to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
+    }
+}
+
+/// Generic `!=` (abstract inequality) for numeric operands.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_neq(_ctx_raw: i64, lhs_raw: i64, rhs_raw: i64) -> i64 {
+    match (jit_to_f64(lhs_raw), jit_to_f64(rhs_raw)) {
+        (Some(l), Some(r)) => crate::value::Value::boolean(l != r).to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
+    }
+}
+
+/// Convert f64 to Int32 per ECMAScript ToInt32 spec.
+#[inline]
+fn f64_to_int32(n: f64) -> i32 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    // Truncate, mod 2^32, interpret as signed
+    (n as i64 as i32)
+}
+
+/// Convert f64 to Uint32 per ECMAScript ToUint32 spec.
+#[inline]
+fn f64_to_uint32(n: f64) -> u32 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    (n as i64 as u32)
+}
+
+/// Generic bitwise operation for non-int32 operands.
+/// Signature: `(ctx: i64, lhs: i64, rhs: i64, op_id: i64) -> i64`
+/// op_id: 0=And, 1=Or, 2=Xor, 3=Shl, 4=Shr, 5=Ushr
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_bitop(
+    _ctx_raw: i64,
+    lhs_raw: i64,
+    rhs_raw: i64,
+    op_id: i64,
+) -> i64 {
+    let lhs_f = match jit_to_f64(lhs_raw) {
+        Some(n) => n,
+        None => return BAILOUT_SENTINEL,
+    };
+    let rhs_f = match jit_to_f64(rhs_raw) {
+        Some(n) => n,
+        None => return BAILOUT_SENTINEL,
+    };
+
+    match op_id {
+        0 => {
+            // And
+            let result = f64_to_int32(lhs_f) & f64_to_int32(rhs_f);
+            crate::value::Value::int32(result).to_jit_bits()
+        }
+        1 => {
+            // Or
+            let result = f64_to_int32(lhs_f) | f64_to_int32(rhs_f);
+            crate::value::Value::int32(result).to_jit_bits()
+        }
+        2 => {
+            // Xor
+            let result = f64_to_int32(lhs_f) ^ f64_to_int32(rhs_f);
+            crate::value::Value::int32(result).to_jit_bits()
+        }
+        3 => {
+            // Shl
+            let left = f64_to_int32(lhs_f);
+            let shift = f64_to_uint32(rhs_f) & 0x1F;
+            crate::value::Value::int32(left << shift).to_jit_bits()
+        }
+        4 => {
+            // Shr (signed)
+            let left = f64_to_int32(lhs_f);
+            let shift = f64_to_uint32(rhs_f) & 0x1F;
+            crate::value::Value::int32(left >> shift).to_jit_bits()
+        }
+        5 => {
+            // Ushr (unsigned) — result is uint32, may not fit in int32
+            let left = f64_to_uint32(lhs_f);
+            let shift = f64_to_uint32(rhs_f) & 0x1F;
+            let result = left >> shift;
+            if result <= i32::MAX as u32 {
+                crate::value::Value::int32(result as i32).to_jit_bits()
+            } else {
+                crate::value::Value::number(result as f64).to_jit_bits()
+            }
+        }
+        _ => BAILOUT_SENTINEL,
+    }
+}
+
+/// Generic bitwise NOT for non-int32 operands.
+/// Signature: `(ctx: i64, val: i64) -> i64`
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_bitnot(_ctx_raw: i64, val_raw: i64) -> i64 {
+    match jit_to_f64(val_raw) {
+        Some(n) => {
+            let result = !f64_to_int32(n);
+            crate::value::Value::int32(result).to_jit_bits()
+        }
+        None => BAILOUT_SENTINEL,
+    }
+}
+
+/// Generic logical NOT.
+/// Signature: `(ctx: i64, val: i64) -> i64`
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_generic_not(_ctx_raw: i64, val_raw: i64) -> i64 {
+    let val = match unsafe { crate::value::Value::from_raw_bits_unchecked(val_raw as u64) } {
+        Some(v) => v,
+        None => return BAILOUT_SENTINEL,
+    };
+    crate::value::Value::boolean(!val.to_boolean()).to_jit_bits()
+}
+
 /// Build a `RuntimeHelpers` table with all available helper functions.
 pub fn build_runtime_helpers() -> RuntimeHelpers {
     let mut helpers = RuntimeHelpers::new();
@@ -3514,6 +3929,26 @@ pub fn build_runtime_helpers() -> RuntimeHelpers {
         helpers.set(HelperKind::ImportOp, otter_rt_import as *const u8);
         helpers.set(HelperKind::ExportOp, otter_rt_export as *const u8);
         helpers.set(HelperKind::ForInNext, otter_rt_for_in_next as *const u8);
+
+        // Generic arithmetic / comparison helpers (slow path for type guard failure)
+        helpers.set(HelperKind::GenericAdd, otter_rt_generic_add as *const u8);
+        helpers.set(HelperKind::GenericSub, otter_rt_generic_sub as *const u8);
+        helpers.set(HelperKind::GenericMul, otter_rt_generic_mul as *const u8);
+        helpers.set(HelperKind::GenericDiv, otter_rt_generic_div as *const u8);
+        helpers.set(HelperKind::GenericMod, otter_rt_generic_mod as *const u8);
+        helpers.set(HelperKind::GenericNeg, otter_rt_generic_neg as *const u8);
+        helpers.set(HelperKind::GenericInc, otter_rt_generic_inc as *const u8);
+        helpers.set(HelperKind::GenericDec, otter_rt_generic_dec as *const u8);
+        helpers.set(HelperKind::GenericLt, otter_rt_generic_lt as *const u8);
+        helpers.set(HelperKind::GenericLe, otter_rt_generic_le as *const u8);
+        helpers.set(HelperKind::GenericGt, otter_rt_generic_gt as *const u8);
+        helpers.set(HelperKind::GenericGe, otter_rt_generic_ge as *const u8);
+        helpers.set(HelperKind::GenericEq, otter_rt_generic_eq as *const u8);
+        helpers.set(HelperKind::GenericNeq, otter_rt_generic_neq as *const u8);
+        helpers.set(HelperKind::GenericBitOp, otter_rt_generic_bitop as *const u8);
+        helpers.set(HelperKind::GenericBitNot, otter_rt_generic_bitnot as *const u8);
+        helpers.set(HelperKind::GenericNot, otter_rt_generic_not as *const u8);
+        helpers.set(HelperKind::GetPropMono, otter_rt_get_prop_mono as *const u8);
 
         // Bail-out stubs: JIT can't suspend (Yield/Await)
         let stub = otter_rt_bailout_stub as *const u8;

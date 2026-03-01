@@ -503,6 +503,12 @@ pub struct Function {
     #[serde(skip)]
     pub jit_entry_ptr: AtomicUsize,
 
+    /// Back-edge counter for loop-heavy function detection.
+    /// Functions called only once may contain hot inner loops;
+    /// back-edge counting detects these independently of call count.
+    #[serde(skip)]
+    pub back_edge_count: AtomicU32,
+
     /// For derived constructors: index of an inner function that initializes
     /// instance fields. Called on `this` after `super()` returns.
     pub field_init_func: Option<u32>,
@@ -677,6 +683,46 @@ impl Function {
         self.jit_entry_ptr.store(0, Ordering::Release);
     }
 
+    /// Increment back-edge counter and check if function should be marked hot.
+    /// Returns `true` if this back-edge caused the function to become hot
+    /// (first time crossing threshold). Uses the same pattern as `record_call`.
+    #[inline]
+    pub fn record_back_edge(&self) -> bool {
+        self.record_back_edge_with_threshold(HOT_FUNCTION_THRESHOLD)
+    }
+
+    /// Increment back-edge counter using a caller-provided threshold.
+    /// Returns `true` if this back-edge caused the function to become hot.
+    #[inline]
+    pub fn record_back_edge_with_threshold(&self, threshold: u32) -> bool {
+        let threshold = threshold.max(1);
+
+        // Already hot — skip atomic RMW on subsequent back-edges.
+        if self.is_hot.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        let prev = self.back_edge_count.fetch_add(1, Ordering::Relaxed);
+        let new_count = prev.saturating_add(1);
+
+        if new_count >= threshold && prev < threshold {
+            if self
+                .is_hot
+                .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get the current back-edge count.
+    #[inline]
+    pub fn get_back_edge_count(&self) -> u32 {
+        self.back_edge_count.load(Ordering::Relaxed)
+    }
+
     /// Replace the instruction at `pc` with a quickened variant.
     /// Used by the interpreter to specialize hot instructions based on
     /// observed types (e.g., Add → AddInt32 when only int32s seen).
@@ -713,6 +759,7 @@ impl Clone for Function {
                 self.is_deoptimized.load(Ordering::Relaxed),
             ),
             jit_entry_ptr: AtomicUsize::new(0),
+            back_edge_count: AtomicU32::new(0),
             field_init_func: self.field_init_func,
         }
     }
@@ -874,6 +921,7 @@ impl FunctionBuilder {
             recompilation_count: AtomicU32::new(0),
             is_deoptimized: std::sync::atomic::AtomicBool::new(false),
             jit_entry_ptr: AtomicUsize::new(0),
+            back_edge_count: AtomicU32::new(0),
             field_init_func: None,
         }
     }
@@ -1010,6 +1058,42 @@ mod tests {
         // Once hot, no further call-count increments on fast path.
         assert!(!func.record_call_with_threshold(3));
         assert_eq!(func.get_call_count(), 3);
+    }
+
+    #[test]
+    fn record_back_edge_marks_hot_via_loop() {
+        let func = Function::builder().name("loop-hot").build();
+
+        for _ in 0..(HOT_FUNCTION_THRESHOLD - 1) {
+            assert!(!func.record_back_edge());
+        }
+        assert_eq!(func.get_back_edge_count(), HOT_FUNCTION_THRESHOLD - 1);
+        assert!(!func.is_hot_function());
+
+        assert!(func.record_back_edge());
+        assert!(func.is_hot_function());
+        assert_eq!(func.get_back_edge_count(), HOT_FUNCTION_THRESHOLD);
+
+        // After hot transition, no further counting.
+        for _ in 0..16 {
+            assert!(!func.record_back_edge());
+        }
+        assert_eq!(func.get_back_edge_count(), HOT_FUNCTION_THRESHOLD);
+    }
+
+    #[test]
+    fn back_edge_and_call_count_share_hot_flag() {
+        let func = Function::builder().name("shared-hot").build();
+
+        // Mark hot via call count
+        for _ in 0..HOT_FUNCTION_THRESHOLD {
+            func.record_call();
+        }
+        assert!(func.is_hot_function());
+
+        // Back-edge should return false (already hot)
+        assert!(!func.record_back_edge());
+        assert_eq!(func.get_back_edge_count(), 0);
     }
 
     #[test]

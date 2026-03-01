@@ -994,6 +994,17 @@ impl JsObject {
         self.shape.borrow().clone()
     }
 
+    /// Get the raw pointer value of the current shape (for IC comparison).
+    ///
+    /// Returns `Arc::as_ptr()` without cloning the Arc, avoiding the atomic
+    /// reference count increment/decrement overhead. The returned value is
+    /// only valid for pointer comparison (not for dereferencing).
+    #[inline]
+    pub(crate) fn shape_ptr_raw(&self) -> u64 {
+        let borrow = self.shape.borrow();
+        std::sync::Arc::as_ptr(&*borrow) as u64
+    }
+
     /// Check if object is in dictionary mode (IC-uncacheable).
     /// Objects in dictionary mode use HashMap storage instead of shape-based indexed storage.
     #[inline]

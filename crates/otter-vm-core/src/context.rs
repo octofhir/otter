@@ -1832,6 +1832,36 @@ impl VmContext {
         Ok(())
     }
 
+    /// Restore deopt state into the current frame for precise JIT resume.
+    ///
+    /// Overwrites the current frame's locals and registers with the captured
+    /// values from JIT deopt, and sets the program counter to `bailout_pc`.
+    /// The interpreter then resumes execution from that point.
+    pub fn restore_deopt_state(
+        &mut self,
+        bailout_pc: u32,
+        locals: &[Value],
+        registers: &[Value],
+    ) {
+        if let Some(frame) = self.call_stack.last_mut() {
+            frame.pc = bailout_pc as usize;
+            // Overwrite locals with deopt-captured values
+            for (i, value) in locals.iter().enumerate() {
+                if i < frame.locals.len() {
+                    frame.locals[i] = value.clone();
+                }
+            }
+            // Overwrite registers with deopt-captured values
+            let base = frame.register_base;
+            for (i, value) in registers.iter().enumerate() {
+                let idx = base + i;
+                if idx < self.registers.len() {
+                    self.registers[idx] = value.clone();
+                }
+            }
+        }
+    }
+
     /// Pop the current call frame
     pub fn pop_frame(&mut self) -> Option<CallFrame> {
         // Remove any try handlers associated with this frame.

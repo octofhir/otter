@@ -553,6 +553,15 @@ impl Function {
     /// Returns `true` if this call caused the function to become hot (first time crossing threshold).
     #[inline]
     pub fn record_call(&self) -> bool {
+        self.record_call_with_threshold(HOT_FUNCTION_THRESHOLD)
+    }
+
+    /// Increment call count using a caller-provided hot threshold.
+    /// Returns `true` if this call caused the function to become hot.
+    #[inline]
+    pub fn record_call_with_threshold(&self, hot_threshold: u32) -> bool {
+        let hot_threshold = hot_threshold.max(1);
+
         // Once hot, avoid atomic RMW on every subsequent call in hot loops.
         if self.is_hot.load(Ordering::Relaxed) {
             return false;
@@ -562,7 +571,7 @@ impl Function {
         let new_count = prev_count.saturating_add(1);
 
         // Check if we just crossed the hot threshold
-        if new_count >= HOT_FUNCTION_THRESHOLD && prev_count < HOT_FUNCTION_THRESHOLD {
+        if new_count >= hot_threshold && prev_count < hot_threshold {
             // Try to mark as hot (only succeeds once)
             if self
                 .is_hot
@@ -608,8 +617,7 @@ impl Function {
             let recomp = self.recompilation_count.fetch_add(1, Ordering::Relaxed) + 1;
             if recomp >= MAX_RECOMPILATIONS {
                 // Exhausted recompilation budget — permanent deoptimization
-                self.is_deoptimized
-                    .store(true, Ordering::Release);
+                self.is_deoptimized.store(true, Ordering::Release);
                 BailoutAction::PermanentDeopt
             } else {
                 // Reset bailout count for the next compilation cycle.
@@ -984,6 +992,24 @@ mod tests {
         }
 
         assert_eq!(func.get_call_count(), HOT_FUNCTION_THRESHOLD);
+    }
+
+    #[test]
+    fn record_call_with_custom_threshold_marks_hot_earlier() {
+        let func = Function::builder().name("hot-custom").build();
+
+        assert!(!func.record_call_with_threshold(3));
+        assert!(!func.record_call_with_threshold(3));
+        assert_eq!(func.get_call_count(), 2);
+        assert!(!func.is_hot_function());
+
+        assert!(func.record_call_with_threshold(3));
+        assert!(func.is_hot_function());
+        assert_eq!(func.get_call_count(), 3);
+
+        // Once hot, no further call-count increments on fast path.
+        assert!(!func.record_call_with_threshold(3));
+        assert_eq!(func.get_call_count(), 3);
     }
 
     #[test]

@@ -2414,6 +2414,7 @@ dependencies = [
  "otter-macros",
  "otter-profiler",
  "otter-vm-bytecode",
+ "otter-vm-exec",
  "otter-vm-gc",
  "otter-vm-jit",
  "parking_lot",
@@ -2425,6 +2426,14 @@ dependencies = [
  "thiserror 2.0.17",
  "unicode-normalization",
  "writeable",
+]
+
+[[package]]
+name = "otter-vm-exec"
+version = "0.1.0"
+dependencies = [
+ "otter-vm-bytecode",
+ "otter-vm-jit",
 ]
 
 [[package]]

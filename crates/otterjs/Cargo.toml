@@ -10,10 +10,6 @@ keywords = ["typescript", "javascript", "runtime", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 
-[features]
-default = ["jit"]
-jit = ["otter-engine/jit"]
-
 [[bin]]
 name = "otter"
 path = "src/main.rs"

@@ -11,8 +11,6 @@ categories = ["development-tools", "compilers"]
 readme = "README.md"
 
 [features]
-default = ["jit"]
-jit = ["otter-vm-core/jit"]
 profiling = ["otter-vm-runtime/profiling"]
 
 [dependencies]

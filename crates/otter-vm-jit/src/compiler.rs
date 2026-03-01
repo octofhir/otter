@@ -429,7 +429,9 @@ mod tests {
             .feedback_vector_size(1)
             .build();
         // Set feedback: f64 operands observed
-        function.feedback_vector.write()[0].type_observations.observe_number();
+        function.feedback_vector.write()[0]
+            .type_observations
+            .observe_number();
 
         let constants = [Constant::number(1.5), Constant::number(2.25)];
         let mut jit = JitCompiler::new().expect("jit initialization should succeed");
@@ -466,8 +468,12 @@ mod tests {
             .feedback_vector_size(1)
             .build();
         // Set feedback: mixed int32 + number observed
-        function.feedback_vector.write()[0].type_observations.observe_int32();
-        function.feedback_vector.write()[0].type_observations.observe_number();
+        function.feedback_vector.write()[0]
+            .type_observations
+            .observe_int32();
+        function.feedback_vector.write()[0]
+            .type_observations
+            .observe_number();
 
         let constants = [Constant::number(2.5)];
         let mut jit = JitCompiler::new().expect("jit initialization should succeed");
@@ -532,8 +538,12 @@ mod tests {
             .feedback_vector_size(1)
             .build();
         // Set feedback: both int32 and number observed (overflow produces f64)
-        function.feedback_vector.write()[0].type_observations.observe_int32();
-        function.feedback_vector.write()[0].type_observations.observe_number();
+        function.feedback_vector.write()[0]
+            .type_observations
+            .observe_int32();
+        function.feedback_vector.write()[0]
+            .type_observations
+            .observe_number();
 
         let mut jit = JitCompiler::new().expect("jit initialization should succeed");
         let artifact = jit

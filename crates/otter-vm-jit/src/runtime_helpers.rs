@@ -113,10 +113,112 @@ pub enum HelperKind {
     GenericBitNot = 34,
     /// `(ctx, val) -> value` — generic JS `!` (logical NOT)
     GenericNot = 35,
+    /// `(ctx, val) -> value` — JS `typeof val`
+    TypeOf = 36,
+    /// `(ctx, name_idx) -> value` — JS `typeof globalName` (no ReferenceError)
+    TypeOfName = 37,
+    /// `(ctx, lhs, rhs) -> value` — JS `**` exponentiation
+    Pow = 38,
+    /// `(ctx, local_idx) -> 0` — close an upvalue cell for a local variable
+    CloseUpvalue = 39,
+    /// `(ctx, callee, argc, argv_ptr) -> value` — JS `new Ctor(args)`
+    Construct = 40,
+    /// `(ctx, obj, method_name_idx, argc, argv_ptr, ic_idx) -> value`
+    CallMethod = 41,
+    /// `(ctx, callee, this_val, argc, argv_ptr) -> value`
+    CallWithReceiver = 42,
+    /// `(ctx, obj, key, argc, argv_ptr, ic_idx) -> value`
+    CallMethodComputed = 43,
+    /// `(ctx, val) -> value` — JS ToNumber
+    ToNumber = 44,
+    /// `(ctx, val) -> value` — JS ToString
+    JsToString = 45,
+    /// `(ctx, val) -> 0 or BAILOUT` — RequireObjectCoercible
+    RequireCoercible = 46,
+    /// `(ctx, lhs, rhs, ic_idx) -> value` — JS `instanceof`
+    InstanceOf = 47,
+    /// `(ctx, lhs, rhs, ic_idx) -> value` — JS `in` operator
+    InOp = 48,
+    /// `(ctx, name_idx, configurable) -> 0` — declare global var binding
+    DeclareGlobalVar = 49,
+    /// `(ctx, obj, key, func) -> 0` — define getter on object
+    DefineGetter = 50,
+    /// `(ctx, obj, key, func) -> 0` — define setter on object
+    DefineSetter = 51,
+    /// `(ctx, obj, key, val) -> 0` — define method (non-enumerable) on object
+    DefineMethod = 52,
+    /// `(ctx, dst_arr, src_arr) -> 0` — spread elements from src into dst array
+    SpreadArray = 53,
+    /// `(ctx, func_idx) -> value` — create closure from function index
+    ClosureCreate = 54,
+    /// `(ctx) -> value` — create arguments object for current function
+    CreateArguments = 55,
+    /// `(ctx, src) -> value` — get iterator (Symbol.iterator)
+    GetIterator = 56,
+    /// `(ctx, iter) -> value` — call iterator.next(), returns packed (value, done) pair
+    IteratorNext = 57,
+    /// `(ctx, iter) -> 0` — close iterator (call iterator.return())
+    IteratorClose = 58,
+    /// `(ctx, callee, argc, argv_ptr, spread) -> value` — call with spread args
+    CallSpread = 59,
+    /// `(ctx, callee, argc, argv_ptr, spread) -> value` — construct with spread args
+    ConstructSpread = 60,
+    /// `(ctx, obj, key, spread, ic_idx) -> value` — call method computed with spread
+    CallMethodComputedSpread = 61,
+    /// `(ctx, callee, argc, argv_ptr) -> value` — tail call (returns result directly)
+    TailCallHelper = 62,
+    /// `(ctx, catch_pc) -> 0` — TryStart (push try handler onto try_stack)
+    TryStart = 63,
+    /// `(ctx) -> 0` — TryEnd (pop try handler from try_stack)
+    TryEnd = 64,
+    /// `(ctx) -> value` — Catch (take pending exception value)
+    CatchOp = 65,
+    /// `(ctx, ctor, super_class, name_idx) -> value` — DefineClass
+    DefineClass = 66,
+    /// `(ctx) -> value` — GetSuper (reads home_object from ctx)
+    GetSuper = 67,
+    /// `(ctx, argc, argv_ptr) -> value` — CallSuper
+    CallSuper = 68,
+    /// `(ctx, name_idx) -> value` — GetSuperProp
+    GetSuperProp = 69,
+    /// `(ctx, func, obj) -> 0` — SetHomeObject
+    SetHomeObject = 70,
+    /// `(ctx) -> value` — CallSuperForward (forward all args to super constructor)
+    CallSuperForward = 71,
+    /// `(ctx, args_array) -> value` — CallSuperSpread
+    CallSuperSpread = 72,
+    /// `(ctx) -> BAILOUT` — Yield (suspension)
+    YieldOp = 73,
+    /// `(ctx) -> BAILOUT` — Await (suspension)
+    AwaitOp = 74,
+    /// `(ctx, func_idx) -> value` — AsyncClosure (create async function closure)
+    AsyncClosure = 75,
+    /// `(ctx, func_idx) -> value` — GeneratorClosure (create generator function closure)
+    GeneratorClosure = 76,
+    /// `(ctx, func_idx) -> value` — AsyncGeneratorClosure (create async generator closure)
+    AsyncGeneratorClosure = 77,
+    /// `(ctx, code_val) -> value` — CallEval
+    CallEval = 78,
+    /// `(ctx, module_name_idx) -> value` — Import via host hooks
+    ImportOp = 79,
+    /// `(ctx, export_name_idx, value) -> 0` — Export via host hooks
+    ExportOp = 80,
+    /// `(ctx, src) -> value` — GetAsyncIterator
+    GetAsyncIterator = 81,
+    /// `(ctx, target) -> value_or_undefined` — ForInNext via host hooks
+    ForInNext = 82,
 }
 
 /// Total number of helper kinds.
-pub const HELPER_COUNT: usize = 36;
+pub const HELPER_COUNT: usize = 83;
+
+/// Byte offset of `secondary_result` field in JitContext (`#[repr(C)]`).
+/// Used by IteratorNext to return both value and done flag.
+/// MUST match JitContext layout in otter-vm-core/src/jit_helpers.rs.
+/// Layout: function_ptr(0) proto_epoch(8) interpreter(16) vm_ctx(24)
+///         constants(32) upvalues_ptr(40) upvalue_count:u32(48) pad(52)
+///         this_raw(56) callee_raw(64) home_object_raw(72) secondary_result(80)
+pub const JIT_CTX_SECONDARY_RESULT_OFFSET: i32 = 80;
 
 impl HelperKind {
     /// Symbol name used for Cranelift import resolution.
@@ -158,23 +260,140 @@ impl HelperKind {
             Self::GenericBitOp => "otter_rt_generic_bitop",
             Self::GenericBitNot => "otter_rt_generic_bitnot",
             Self::GenericNot => "otter_rt_generic_not",
+            Self::TypeOf => "otter_rt_typeof",
+            Self::TypeOfName => "otter_rt_typeof_name",
+            Self::Pow => "otter_rt_pow",
+            Self::CloseUpvalue => "otter_rt_close_upvalue",
+            Self::Construct => "otter_rt_construct",
+            Self::CallMethod => "otter_rt_call_method",
+            Self::CallWithReceiver => "otter_rt_call_with_receiver",
+            Self::CallMethodComputed => "otter_rt_call_method_computed",
+            Self::ToNumber => "otter_rt_to_number",
+            Self::JsToString => "otter_rt_to_string",
+            Self::RequireCoercible => "otter_rt_require_coercible",
+            Self::InstanceOf => "otter_rt_instanceof",
+            Self::InOp => "otter_rt_in",
+            Self::DeclareGlobalVar => "otter_rt_declare_global_var",
+            Self::DefineGetter => "otter_rt_define_getter",
+            Self::DefineSetter => "otter_rt_define_setter",
+            Self::DefineMethod => "otter_rt_define_method",
+            Self::SpreadArray => "otter_rt_spread_array",
+            Self::ClosureCreate => "otter_rt_closure_create",
+            Self::CreateArguments => "otter_rt_create_arguments",
+            Self::GetIterator => "otter_rt_get_iterator",
+            Self::IteratorNext => "otter_rt_iterator_next",
+            Self::IteratorClose => "otter_rt_iterator_close",
+            Self::CallSpread => "otter_rt_call_spread",
+            Self::ConstructSpread => "otter_rt_construct_spread",
+            Self::CallMethodComputedSpread => "otter_rt_call_method_computed_spread",
+            Self::TailCallHelper => "otter_rt_tail_call",
+            Self::TryStart => "otter_rt_try_start",
+            Self::TryEnd => "otter_rt_try_end",
+            Self::CatchOp => "otter_rt_catch",
+            Self::DefineClass => "otter_rt_define_class",
+            Self::GetSuper => "otter_rt_get_super",
+            Self::CallSuper => "otter_rt_call_super",
+            Self::GetSuperProp => "otter_rt_get_super_prop",
+            Self::SetHomeObject => "otter_rt_set_home_object",
+            Self::CallSuperForward => "otter_rt_call_super_forward",
+            Self::CallSuperSpread => "otter_rt_call_super_spread",
+            Self::YieldOp => "otter_rt_yield",
+            Self::AwaitOp => "otter_rt_await",
+            Self::AsyncClosure => "otter_rt_async_closure",
+            Self::GeneratorClosure => "otter_rt_generator_closure",
+            Self::AsyncGeneratorClosure => "otter_rt_async_generator_closure",
+            Self::CallEval => "otter_rt_call_eval",
+            Self::ImportOp => "otter_rt_import",
+            Self::ExportOp => "otter_rt_export",
+            Self::GetAsyncIterator => "otter_rt_get_async_iterator",
+            Self::ForInNext => "otter_rt_for_in_next",
         }
     }
 
     /// Number of parameters (INCLUDING the ctx pointer).
     pub fn param_count(self) -> usize {
         match self {
-            Self::NewObject | Self::LoadThis => 1,
-            Self::LoadConst | Self::NewArray | Self::ThrowValue | Self::CreateClosure
-            | Self::GetUpvalue | Self::GenericNeg | Self::GenericInc | Self::GenericDec
-            | Self::GenericBitNot | Self::GenericNot => 2,
-            Self::GetGlobal | Self::DeleteProp | Self::SetUpvalue
-            | Self::GenericAdd | Self::GenericSub | Self::GenericMul | Self::GenericDiv
-            | Self::GenericMod | Self::GenericLt | Self::GenericLe | Self::GenericGt
-            | Self::GenericGe | Self::GenericEq | Self::GenericNeq => 3,
-            Self::GetPropConst | Self::GetProp | Self::CallFunction | Self::GetElem
-            | Self::DefineProperty | Self::GenericBitOp => 4,
-            Self::SetPropConst | Self::SetProp | Self::SetElem | Self::SetGlobal => 5,
+            Self::NewObject
+            | Self::LoadThis
+            | Self::CreateArguments
+            | Self::TryEnd
+            | Self::CatchOp
+            | Self::GetSuper
+            | Self::CallSuperForward
+            | Self::YieldOp
+            | Self::AwaitOp => 1,
+            Self::ImportOp | Self::ForInNext => 2,
+            Self::ExportOp => 3,
+            Self::LoadConst
+            | Self::NewArray
+            | Self::ThrowValue
+            | Self::CreateClosure
+            | Self::GetUpvalue
+            | Self::GenericNeg
+            | Self::GenericInc
+            | Self::GenericDec
+            | Self::GenericBitNot
+            | Self::GenericNot
+            | Self::TypeOf
+            | Self::TypeOfName
+            | Self::CloseUpvalue
+            | Self::ToNumber
+            | Self::JsToString
+            | Self::RequireCoercible
+            | Self::ClosureCreate
+            | Self::GetIterator
+            | Self::IteratorClose
+            | Self::IteratorNext
+            | Self::GetSuperProp
+            | Self::CallEval
+            | Self::GetAsyncIterator
+            | Self::CallSuperSpread
+            | Self::TryStart
+            | Self::AsyncClosure
+            | Self::GeneratorClosure
+            | Self::AsyncGeneratorClosure => 2,
+            Self::GetGlobal
+            | Self::DeleteProp
+            | Self::SetUpvalue
+            | Self::GenericAdd
+            | Self::GenericSub
+            | Self::GenericMul
+            | Self::GenericDiv
+            | Self::GenericMod
+            | Self::GenericLt
+            | Self::GenericLe
+            | Self::GenericGt
+            | Self::GenericGe
+            | Self::GenericEq
+            | Self::GenericNeq
+            | Self::Pow
+            | Self::DeclareGlobalVar
+            | Self::SpreadArray
+            | Self::SetHomeObject
+            | Self::CallSuper => 3,
+            Self::GetPropConst
+            | Self::GetProp
+            | Self::CallFunction
+            | Self::GetElem
+            | Self::DefineProperty
+            | Self::DefineGetter
+            | Self::DefineSetter
+            | Self::DefineMethod
+            | Self::GenericBitOp
+            | Self::Construct
+            | Self::InstanceOf
+            | Self::InOp
+            | Self::TailCallHelper
+            | Self::DefineClass => 4,
+            Self::SetPropConst
+            | Self::SetProp
+            | Self::SetElem
+            | Self::SetGlobal
+            | Self::CallWithReceiver
+            | Self::CallSpread
+            | Self::ConstructSpread
+            | Self::CallMethodComputedSpread => 5,
+            Self::CallMethod | Self::CallMethodComputed => 6,
         }
     }
 
@@ -277,8 +496,7 @@ impl HelperFuncIds {
             if ptr.is_some() {
                 let kind = unsafe { std::mem::transmute::<u8, HelperKind>(i as u8) };
                 let sig = kind.make_signature();
-                let func_id =
-                    module.declare_function(kind.symbol_name(), Linkage::Import, &sig)?;
+                let func_id = module.declare_function(kind.symbol_name(), Linkage::Import, &sig)?;
                 ids[i] = Some(func_id);
             }
         }
@@ -331,9 +549,10 @@ impl HelperRefs {
         pc: usize,
         opcode_name: &str,
     ) -> Result<ir::FuncRef, JitError> {
-        self.get(kind).ok_or_else(|| JitError::UnsupportedInstruction {
-            pc,
-            opcode: opcode_name.to_string(),
-        })
+        self.get(kind)
+            .ok_or_else(|| JitError::UnsupportedInstruction {
+                pc,
+                opcode: opcode_name.to_string(),
+            })
     }
 }

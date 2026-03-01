@@ -17,7 +17,7 @@ use crate::string::JsString;
 use crate::symbol_registry::SymbolRegistry;
 use crate::value::{UpvalueCell, Value};
 use num_bigint::BigInt as NumBigInt;
-use otter_vm_bytecode::Module;
+use otter_vm_bytecode::{Constant, ConstantPool, Module};
 
 #[cfg(feature = "profiling")]
 use otter_profiler::RuntimeStats;
@@ -529,6 +529,8 @@ pub struct VmContext {
     /// The boolean parameter indicates whether the caller is in strict mode context.
     eval_fn:
         Option<Arc<dyn Fn(&str, bool) -> Result<otter_vm_bytecode::Module, VmError> + Send + Sync>>,
+    /// Host callbacks for runtime-dependent bytecode operations.
+    host_hooks: Option<Arc<dyn VmHostHooks + Send + Sync>>,
     /// Script compiler callback: compiles source as a global script where `let`/`const`
     /// at top level behave as global var bindings (for $262.evalScript semantics).
     script_eval_fn:
@@ -582,6 +584,39 @@ pub trait JsJobQueueTrait {
 pub trait ExternalRootSet {
     /// Trace all GC roots in this external set
     fn trace_roots(&self, tracer: &mut dyn FnMut(*const crate::gc::GcHeader));
+}
+
+/// Host callbacks for bytecode operations requiring runtime-level services.
+pub trait VmHostHooks {
+    /// Resolve and execute import-like behavior for a UTF-16 module specifier.
+    fn import_module(&self, _ctx: &mut VmContext, _module_spec: &[u16]) -> VmResult<Value> {
+        Err(VmError::internal(
+            "Import opcode requires runtime host hooks",
+        ))
+    }
+
+    /// Publish an exported value for a UTF-16 export name.
+    fn export_value(
+        &self,
+        _ctx: &mut VmContext,
+        _export_name: &[u16],
+        _value: Value,
+    ) -> VmResult<()> {
+        Err(VmError::internal(
+            "Export opcode requires runtime host hooks",
+        ))
+    }
+
+    /// Advance host-managed for-in iteration.
+    ///
+    /// Returns:
+    /// - `Ok(Some(value))` for next key
+    /// - `Ok(None)` when iteration is complete
+    fn for_in_next(&self, _ctx: &mut VmContext, _target: Value) -> VmResult<Option<Value>> {
+        Err(VmError::internal(
+            "ForInNext opcode requires runtime host hooks",
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -706,6 +741,7 @@ impl VmContext {
             global_var_names: HashSet::new(),
             global_lex_names: HashSet::new(),
             eval_fn: None,
+            host_hooks: None,
             script_eval_fn: None,
             microtask_enqueue: None,
             next_tick_enqueue: None,
@@ -1125,7 +1161,8 @@ impl VmContext {
                 snapshot.function_name = func.name.clone();
                 snapshot.is_generator = Some(func.flags.is_generator);
                 if frame.pc < func.instructions.read().len() {
-                    snapshot.instruction = Some(format!("{:?}", func.instructions.read()[frame.pc]));
+                    snapshot.instruction =
+                        Some(format!("{:?}", func.instructions.read()[frame.pc]));
                 }
             }
 
@@ -1464,6 +1501,75 @@ impl VmContext {
             .as_ref()
             .ok_or_else(|| VmError::type_error("eval() is not available in this context"))?;
         eval_fn(code, strict_context)
+    }
+
+    /// Set runtime host hooks for runtime-dependent bytecode operations.
+    pub fn set_host_hooks(&mut self, hooks: Arc<dyn VmHostHooks + Send + Sync>) {
+        self.host_hooks = Some(hooks);
+    }
+
+    /// Execute the Import opcode via host hooks.
+    pub fn host_import_module(&mut self, module_spec: &[u16]) -> VmResult<Value> {
+        let hooks = self
+            .host_hooks
+            .clone()
+            .ok_or_else(|| VmError::internal("Import opcode requires runtime host hooks"))?;
+        hooks.import_module(self, module_spec)
+    }
+
+    fn constant_string_units<'a>(
+        constants: &'a ConstantPool,
+        idx: u32,
+        opcode: &str,
+    ) -> VmResult<&'a [u16]> {
+        let constant = constants
+            .get(idx)
+            .ok_or_else(|| VmError::internal(format!("{opcode}: invalid constant index {idx}")))?;
+        match constant {
+            Constant::String(units) => Ok(units.as_slice()),
+            _ => Err(VmError::internal(format!(
+                "{opcode}: constant at index {idx} is not a string"
+            ))),
+        }
+    }
+
+    /// Resolve a string constant from a pool and execute Import host hook.
+    pub fn host_import_from_constant_pool(
+        &mut self,
+        constants: &ConstantPool,
+        module_idx: u32,
+    ) -> VmResult<Value> {
+        let module_spec = Self::constant_string_units(constants, module_idx, "Import")?;
+        self.host_import_module(module_spec)
+    }
+
+    /// Execute the Export opcode via host hooks.
+    pub fn host_export_value(&mut self, export_name: &[u16], value: Value) -> VmResult<()> {
+        let hooks = self
+            .host_hooks
+            .clone()
+            .ok_or_else(|| VmError::internal("Export opcode requires runtime host hooks"))?;
+        hooks.export_value(self, export_name, value)
+    }
+
+    /// Resolve a string constant from a pool and execute Export host hook.
+    pub fn host_export_from_constant_pool(
+        &mut self,
+        constants: &ConstantPool,
+        export_idx: u32,
+        value: Value,
+    ) -> VmResult<()> {
+        let export_name = Self::constant_string_units(constants, export_idx, "Export")?;
+        self.host_export_value(export_name, value)
+    }
+
+    /// Execute the ForInNext opcode via host hooks.
+    pub fn host_for_in_next(&mut self, target: Value) -> VmResult<Option<Value>> {
+        let hooks = self
+            .host_hooks
+            .clone()
+            .ok_or_else(|| VmError::internal("ForInNext opcode requires runtime host hooks"))?;
+        hooks.for_in_next(self, target)
     }
 
     /// Set the script compiler callback for $262.evalScript semantics.
@@ -2131,6 +2237,14 @@ impl VmContext {
         self.pending_this.as_ref()
     }
 
+    pub fn pending_callee_to_trace(&self) -> Option<&Value> {
+        self.pending_callee_value.as_ref()
+    }
+
+    pub fn pending_home_object_to_trace(&self) -> Option<&GcRef<JsObject>> {
+        self.pending_home_object.as_ref()
+    }
+
     pub fn pending_upvalues_to_trace(&self) -> &[UpvalueCell] {
         &self.pending_upvalues
     }
@@ -2498,7 +2612,31 @@ impl SharedContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otter_vm_bytecode::{Function, Instruction, Module, Register};
+    use otter_vm_bytecode::{Constant, ConstantPool, Function, Instruction, Module, Register};
+    use parking_lot::Mutex;
+
+    #[derive(Default)]
+    struct RecordingHostHooks {
+        imports: Mutex<Vec<Vec<u16>>>,
+        exports: Mutex<Vec<(Vec<u16>, Value)>>,
+    }
+
+    impl VmHostHooks for RecordingHostHooks {
+        fn import_module(&self, _ctx: &mut VmContext, module_spec: &[u16]) -> VmResult<Value> {
+            self.imports.lock().push(module_spec.to_vec());
+            Ok(Value::int32(77))
+        }
+
+        fn export_value(
+            &self,
+            _ctx: &mut VmContext,
+            export_name: &[u16],
+            value: Value,
+        ) -> VmResult<()> {
+            self.exports.lock().push((export_name.to_vec(), value));
+            Ok(())
+        }
+    }
 
     fn dummy_module() -> Arc<Module> {
         let mut builder = Module::builder("test.js");
@@ -2601,5 +2739,45 @@ mod tests {
 
         ctx.jump(-3);
         assert_eq!(ctx.pc(), 3);
+    }
+
+    #[test]
+    fn test_host_import_from_constant_pool_uses_hooks() {
+        let runtime = crate::runtime::VmRuntime::new();
+        let mut ctx = runtime.create_context();
+        let hooks = Arc::new(RecordingHostHooks::default());
+        ctx.set_host_hooks(hooks.clone());
+
+        let mut constants = ConstantPool::new();
+        let idx = constants.add(Constant::string_from_str("dep:mod"));
+
+        let result = ctx
+            .host_import_from_constant_pool(&constants, idx)
+            .expect("import via pool should succeed");
+        assert_eq!(result.as_int32(), Some(77));
+
+        let expected = "dep:mod".encode_utf16().collect::<Vec<u16>>();
+        assert_eq!(hooks.imports.lock().as_slice(), [expected]);
+    }
+
+    #[test]
+    fn test_host_export_from_constant_pool_uses_hooks() {
+        let runtime = crate::runtime::VmRuntime::new();
+        let mut ctx = runtime.create_context();
+        let hooks = Arc::new(RecordingHostHooks::default());
+        ctx.set_host_hooks(hooks.clone());
+
+        let mut constants = ConstantPool::new();
+        let idx = constants.add(Constant::string_from_str("answer"));
+        let exported = Value::int32(42);
+
+        ctx.host_export_from_constant_pool(&constants, idx, exported.clone())
+            .expect("export via pool should succeed");
+
+        let expected_name = "answer".encode_utf16().collect::<Vec<u16>>();
+        let exports = hooks.exports.lock();
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].0, expected_name);
+        assert_eq!(exports[0].1, exported);
     }
 }

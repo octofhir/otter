@@ -6,15 +6,14 @@ description = "Core VM execution engine for Otter"
 license = "MIT"
 
 [features]
-default = ["jit"]
 profiling = ["dep:otter-profiler"]
-jit = ["dep:otter-vm-jit"]
 
 [dependencies]
 otter-vm-bytecode = { path = "../otter-vm-bytecode" }
 otter-vm-gc = { path = "../otter-vm-gc" }
 otter-macros = { path = "../otter-macros" }
-otter-vm-jit = { path = "../otter-vm-jit", optional = true }
+otter-vm-jit = { path = "../otter-vm-jit" }
+otter-vm-exec = { path = "../otter-vm-exec" }
 otter-profiler = { path = "../otter-profiler", optional = true }
 thiserror.workspace = true
 parking_lot = "0.12"

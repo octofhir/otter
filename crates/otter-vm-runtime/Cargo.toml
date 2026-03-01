@@ -6,9 +6,7 @@ description = "Runtime for Otter VM"
 license = "MIT"
 
 [features]
-default = ["jit"]
 profiling = ["dep:otter-profiler", "otter-vm-core/profiling"]
-jit = ["otter-vm-core/jit"]
 
 [dependencies]
 otter-vm-core = { path = "../otter-vm-core" }

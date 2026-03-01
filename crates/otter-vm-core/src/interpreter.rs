@@ -2,7 +2,7 @@
 //!
 //! Executes bytecode instructions.
 
-use otter_vm_bytecode::{Instruction, Module, Register, TypeFlags, UpvalueCapture};
+use otter_vm_bytecode::{Instruction, Module, TypeFlags, UpvalueCapture};
 
 use crate::async_context::{AsyncContext, VmExecutionResult};
 use crate::context::{TemplateCacheKey, VmContext};
@@ -57,7 +57,6 @@ pub(crate) enum PreferredType {
 /// Maximum recursion depth for abstract equality comparison.
 /// Prevents stack overflow from malicious valueOf/toString chains.
 const MAX_ABSTRACT_EQUAL_DEPTH: usize = 128;
-#[cfg(feature = "jit")]
 const JIT_LOOP_EAGER_CANDIDATE_BUDGET: usize = 8;
 
 fn trace_modified_register_indices(instruction: &Instruction) -> Vec<u16> {
@@ -261,34 +260,84 @@ impl Interpreter {
         observations: &otter_vm_bytecode::function::TypeFlags,
     ) {
         let quickened = match instruction {
-            Instruction::Add { dst, lhs, rhs, feedback_index } => {
+            Instruction::Add {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => {
                 if observations.is_int32_only() {
-                    Some(Instruction::AddInt32 { dst: *dst, lhs: *lhs, rhs: *rhs, feedback_index: *feedback_index })
+                    Some(Instruction::AddInt32 {
+                        dst: *dst,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        feedback_index: *feedback_index,
+                    })
                 } else if observations.is_numeric_only() {
-                    Some(Instruction::AddNumber { dst: *dst, lhs: *lhs, rhs: *rhs, feedback_index: *feedback_index })
+                    Some(Instruction::AddNumber {
+                        dst: *dst,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        feedback_index: *feedback_index,
+                    })
                 } else {
                     None
                 }
             }
-            Instruction::Sub { dst, lhs, rhs, feedback_index } => {
+            Instruction::Sub {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => {
                 if observations.is_int32_only() {
-                    Some(Instruction::SubInt32 { dst: *dst, lhs: *lhs, rhs: *rhs, feedback_index: *feedback_index })
+                    Some(Instruction::SubInt32 {
+                        dst: *dst,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        feedback_index: *feedback_index,
+                    })
                 } else if observations.is_numeric_only() {
-                    Some(Instruction::SubNumber { dst: *dst, lhs: *lhs, rhs: *rhs, feedback_index: *feedback_index })
+                    Some(Instruction::SubNumber {
+                        dst: *dst,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        feedback_index: *feedback_index,
+                    })
                 } else {
                     None
                 }
             }
-            Instruction::Mul { dst, lhs, rhs, feedback_index } => {
+            Instruction::Mul {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => {
                 if observations.is_int32_only() {
-                    Some(Instruction::MulInt32 { dst: *dst, lhs: *lhs, rhs: *rhs, feedback_index: *feedback_index })
+                    Some(Instruction::MulInt32 {
+                        dst: *dst,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        feedback_index: *feedback_index,
+                    })
                 } else {
                     None
                 }
             }
-            Instruction::Div { dst, lhs, rhs, feedback_index } => {
+            Instruction::Div {
+                dst,
+                lhs,
+                rhs,
+                feedback_index,
+            } => {
                 if observations.is_int32_only() {
-                    Some(Instruction::DivInt32 { dst: *dst, lhs: *lhs, rhs: *rhs, feedback_index: *feedback_index })
+                    Some(Instruction::DivInt32 {
+                        dst: *dst,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        feedback_index: *feedback_index,
+                    })
                 } else {
                     None
                 }
@@ -300,8 +349,6 @@ impl Interpreter {
             func.quicken_instruction(pc, new_instr);
         }
     }
-
-    #[cfg(feature = "jit")]
     #[inline]
     fn has_backward_jump(function: &otter_vm_bytecode::Function) -> bool {
         function
@@ -318,8 +365,6 @@ impl Interpreter {
                 _ => false,
             })
     }
-
-    #[cfg(feature = "jit")]
     #[inline]
     fn is_static_jit_candidate(function: &otter_vm_bytecode::Function) -> bool {
         !function.flags.is_async
@@ -327,25 +372,22 @@ impl Interpreter {
             && !function.flags.has_rest
             && !function.flags.uses_arguments
             && !function.flags.uses_eval
-            && function.upvalues.is_empty()
     }
-
-    #[cfg(feature = "jit")]
     fn precompile_module_jit_candidates(&self, module: &Arc<Module>) {
-        if !crate::jit_runtime::is_jit_enabled() {
+        if !otter_vm_exec::is_jit_enabled() {
             return;
         }
 
-        if crate::jit_runtime::is_jit_eager_enabled() {
+        if otter_vm_exec::is_jit_eager_enabled() {
             for idx in 0..module.function_count() {
                 let function_index = idx as u32;
                 if let Some(function) = module.function(function_index) {
                     function.mark_hot();
-                    crate::jit_queue::enqueue_hot_function(module, function_index, function);
+                    otter_vm_exec::enqueue_hot_function(module, function_index, function);
                 }
             }
             for _ in 0..module.function_count() {
-                crate::jit_runtime::compile_one_pending_request();
+                otter_vm_exec::compile_one_pending_request(crate::jit_runtime::runtime_helpers());
             }
             return;
         }
@@ -366,12 +408,12 @@ impl Interpreter {
                 continue;
             }
             function.mark_hot();
-            crate::jit_queue::enqueue_hot_function(module, function_index, function);
+            otter_vm_exec::enqueue_hot_function(module, function_index, function);
             enqueued += 1;
         }
 
         for _ in 0..enqueued {
-            crate::jit_runtime::compile_one_pending_request();
+            otter_vm_exec::compile_one_pending_request(crate::jit_runtime::runtime_helpers());
         }
     }
 
@@ -401,22 +443,19 @@ impl Interpreter {
         let entry_func = module
             .entry_function()
             .ok_or_else(|| VmError::internal("no entry function"))?;
-
-        #[cfg(feature = "jit")]
         self.precompile_module_jit_candidates(&module);
 
         // Record the function call for hot function detection
-        let became_hot = entry_func.record_call();
+        let became_hot = entry_func.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
         if became_hot {
-            #[cfg(feature = "jit")]
             {
-                if crate::jit_runtime::is_jit_enabled() {
-                    crate::jit_queue::enqueue_hot_function(&module, module.entry_point, entry_func);
-                    crate::jit_runtime::compile_one_pending_request();
+                if otter_vm_exec::is_jit_enabled() {
+                    otter_vm_exec::enqueue_hot_function(&module, module.entry_point, entry_func);
+                    otter_vm_exec::compile_one_pending_request(
+                        crate::jit_runtime::runtime_helpers(),
+                    );
                 }
             }
-            #[cfg(not(feature = "jit"))]
-            let _ = became_hot;
         }
 
         // Top-level scripts should have globalThis as `this`.
@@ -519,22 +558,19 @@ impl Interpreter {
             Some(f) => f,
             None => return VmExecutionResult::Error("no entry function".to_string()),
         };
-
-        #[cfg(feature = "jit")]
         self.precompile_module_jit_candidates(&module);
 
         // Record the function call for hot function detection
-        let became_hot = entry_func.record_call();
+        let became_hot = entry_func.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
         if became_hot {
-            #[cfg(feature = "jit")]
             {
-                if crate::jit_runtime::is_jit_enabled() {
-                    crate::jit_queue::enqueue_hot_function(&module, module.entry_point, entry_func);
-                    crate::jit_runtime::compile_one_pending_request();
+                if otter_vm_exec::is_jit_enabled() {
+                    otter_vm_exec::enqueue_hot_function(&module, module.entry_point, entry_func);
+                    otter_vm_exec::compile_one_pending_request(
+                        crate::jit_runtime::runtime_helpers(),
+                    );
                 }
             }
-            #[cfg(not(feature = "jit"))]
-            let _ = became_hot;
         }
 
         // Top-level scripts should have globalThis as `this`.
@@ -889,27 +925,24 @@ impl Interpreter {
                         .ok_or_else(|| VmError::internal("function not found"))?;
 
                     // Record the function call for hot function detection
-                    let became_hot = func.record_call();
+                    let became_hot =
+                        func.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
                     if became_hot {
-                        #[cfg(feature = "jit")]
                         {
-                            if crate::jit_runtime::is_jit_enabled() {
-                                crate::jit_queue::enqueue_hot_function(&module, func_index, func);
-                                crate::jit_runtime::compile_one_pending_request();
+                            if otter_vm_exec::is_jit_enabled() {
+                                otter_vm_exec::enqueue_hot_function(&module, func_index, func);
+                                otter_vm_exec::compile_one_pending_request(
+                                    crate::jit_runtime::runtime_helpers(),
+                                );
                             }
                         }
-                        #[cfg(not(feature = "jit"))]
-                        let _ = became_hot;
                     }
-
-                    #[cfg(feature = "jit")]
                     {
-                        let can_try_jit = crate::jit_runtime::is_jit_enabled()
+                        let can_try_jit = otter_vm_exec::is_jit_enabled()
                             && func.is_hot_function()
                             && !func.is_deoptimized()
                             && !is_construct
                             && !is_async
-                            && upvalues.is_empty()
                             && !func.flags.has_rest
                             && !func.flags.uses_arguments
                             && !func.flags.uses_eval
@@ -926,19 +959,22 @@ impl Interpreter {
                                 jit_interp,
                                 jit_ctx_ptr,
                                 &module.constants as *const _,
+                                &upvalues,
                             ) {
-                                crate::jit_runtime::JitExecResult::Ok(bits) => {
+                                otter_vm_exec::JitExecResult::Ok(bits) => {
                                     if let Some(value) = Value::from_jit_bits(bits as u64) {
                                         ctx.set_register(return_reg, value);
                                         continue;
                                     }
                                 }
-                                crate::jit_runtime::JitExecResult::NeedsRecompilation => {
-                                    crate::jit_queue::enqueue_hot_function(&module, func_index, func);
-                                    crate::jit_runtime::compile_one_pending_request();
+                                otter_vm_exec::JitExecResult::NeedsRecompilation => {
+                                    otter_vm_exec::enqueue_hot_function(&module, func_index, func);
+                                    otter_vm_exec::compile_one_pending_request(
+                                        crate::jit_runtime::runtime_helpers(),
+                                    );
                                 }
-                                crate::jit_runtime::JitExecResult::Bailout
-                                | crate::jit_runtime::JitExecResult::NotCompiled => {}
+                                otter_vm_exec::JitExecResult::Bailout
+                                | otter_vm_exec::JitExecResult::NotCompiled => {}
                             }
                         }
                     }
@@ -1314,31 +1350,28 @@ impl Interpreter {
                     };
 
                     // Record the function call for hot function detection
-                    let became_hot = callee.record_call();
+                    let became_hot =
+                        callee.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
                     if became_hot {
-                        #[cfg(feature = "jit")]
                         {
-                            if crate::jit_runtime::is_jit_enabled() {
-                                crate::jit_queue::enqueue_hot_function(
+                            if otter_vm_exec::is_jit_enabled() {
+                                otter_vm_exec::enqueue_hot_function(
                                     &call_module,
                                     func_index,
                                     callee,
                                 );
-                                crate::jit_runtime::compile_one_pending_request();
+                                otter_vm_exec::compile_one_pending_request(
+                                    crate::jit_runtime::runtime_helpers(),
+                                );
                             }
                         }
-                        #[cfg(not(feature = "jit"))]
-                        let _ = became_hot;
                     }
-
-                    #[cfg(feature = "jit")]
                     {
-                        let can_try_jit = crate::jit_runtime::is_jit_enabled()
+                        let can_try_jit = otter_vm_exec::is_jit_enabled()
                             && callee.is_hot_function()
                             && !callee.is_deoptimized()
                             && !is_construct
                             && !is_async
-                            && upvalues.is_empty()
                             && !callee.flags.has_rest
                             && !callee.flags.uses_arguments
                             && !callee.flags.uses_eval
@@ -1355,19 +1388,26 @@ impl Interpreter {
                                 jit_interp,
                                 jit_ctx_ptr,
                                 &call_module.constants as *const _,
+                                &upvalues,
                             ) {
-                                crate::jit_runtime::JitExecResult::Ok(bits) => {
+                                otter_vm_exec::JitExecResult::Ok(bits) => {
                                     if let Some(value) = Value::from_jit_bits(bits as u64) {
                                         ctx.set_register(return_reg, value);
                                         continue;
                                     }
                                 }
-                                crate::jit_runtime::JitExecResult::NeedsRecompilation => {
-                                    crate::jit_queue::enqueue_hot_function(&call_module, func_index, callee);
-                                    crate::jit_runtime::compile_one_pending_request();
+                                otter_vm_exec::JitExecResult::NeedsRecompilation => {
+                                    otter_vm_exec::enqueue_hot_function(
+                                        &call_module,
+                                        func_index,
+                                        callee,
+                                    );
+                                    otter_vm_exec::compile_one_pending_request(
+                                        crate::jit_runtime::runtime_helpers(),
+                                    );
                                 }
-                                crate::jit_runtime::JitExecResult::Bailout
-                                | crate::jit_runtime::JitExecResult::NotCompiled => {}
+                                otter_vm_exec::JitExecResult::Bailout
+                                | otter_vm_exec::JitExecResult::NotCompiled => {}
                             }
                         }
                     }
@@ -1766,31 +1806,28 @@ impl Interpreter {
                     })?;
 
                     // Record the function call for hot function detection
-                    let became_hot = callee.record_call();
+                    let became_hot =
+                        callee.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
                     if became_hot {
-                        #[cfg(feature = "jit")]
                         {
-                            if crate::jit_runtime::is_jit_enabled() {
-                                crate::jit_queue::enqueue_hot_function(
+                            if otter_vm_exec::is_jit_enabled() {
+                                otter_vm_exec::enqueue_hot_function(
                                     &call_module,
                                     func_index,
                                     callee,
                                 );
-                                crate::jit_runtime::compile_one_pending_request();
+                                otter_vm_exec::compile_one_pending_request(
+                                    crate::jit_runtime::runtime_helpers(),
+                                );
                             }
                         }
-                        #[cfg(not(feature = "jit"))]
-                        let _ = became_hot;
                     }
-
-                    #[cfg(feature = "jit")]
                     {
-                        let can_try_jit = crate::jit_runtime::is_jit_enabled()
+                        let can_try_jit = otter_vm_exec::is_jit_enabled()
                             && callee.is_hot_function()
                             && !callee.is_deoptimized()
                             && !is_construct
                             && !is_async
-                            && upvalues.is_empty()
                             && !callee.flags.has_rest
                             && !callee.flags.uses_arguments
                             && !callee.flags.uses_eval
@@ -1807,19 +1844,26 @@ impl Interpreter {
                                 jit_interp,
                                 jit_ctx_ptr,
                                 &call_module.constants as *const _,
+                                &upvalues,
                             ) {
-                                crate::jit_runtime::JitExecResult::Ok(bits) => {
+                                otter_vm_exec::JitExecResult::Ok(bits) => {
                                     if let Some(value) = Value::from_jit_bits(bits as u64) {
                                         ctx.set_register(return_reg, value);
                                         continue;
                                     }
                                 }
-                                crate::jit_runtime::JitExecResult::NeedsRecompilation => {
-                                    crate::jit_queue::enqueue_hot_function(&call_module, func_index, callee);
-                                    crate::jit_runtime::compile_one_pending_request();
+                                otter_vm_exec::JitExecResult::NeedsRecompilation => {
+                                    otter_vm_exec::enqueue_hot_function(
+                                        &call_module,
+                                        func_index,
+                                        callee,
+                                    );
+                                    otter_vm_exec::compile_one_pending_request(
+                                        crate::jit_runtime::runtime_helpers(),
+                                    );
                                 }
-                                crate::jit_runtime::JitExecResult::Bailout
-                                | crate::jit_runtime::JitExecResult::NotCompiled => {}
+                                otter_vm_exec::JitExecResult::Bailout
+                                | otter_vm_exec::JitExecResult::NotCompiled => {}
                             }
                         }
                     }
@@ -4808,6 +4852,32 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
+            Instruction::Import {
+                dst,
+                module: module_idx,
+            } => {
+                let value = ctx.host_import_from_constant_pool(&module.constants, module_idx.0)?;
+                ctx.set_register(dst.0, value);
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::Export { name, src } => {
+                let value = ctx.get_register(src.0).clone();
+                ctx.host_export_from_constant_pool(&module.constants, name.0, value)?;
+                Ok(InstructionResult::Continue)
+            }
+
+            Instruction::ForInNext { dst, obj, offset } => {
+                let target = ctx.get_register(obj.0).clone();
+                match ctx.host_for_in_next(target)? {
+                    Some(value) => {
+                        ctx.set_register(dst.0, value);
+                        Ok(InstructionResult::Continue)
+                    }
+                    None => Ok(InstructionResult::Jump(offset.offset())),
+                }
+            }
+
             Instruction::GetPropConst {
                 dst,
                 obj,
@@ -5019,12 +5089,24 @@ impl Interpreter {
                                         // Quickening: when IC is monomorphic with enough hits,
                                         // quicken to GetPropQuickened (skips proxy/string/array checks)
                                         ic.hit_count = ic.hit_count.saturating_add(1);
-                                        if ic.hit_count >= otter_vm_bytecode::function::QUICKENING_WARMUP {
-                                            if matches!(ic.ic_state, InlineCacheState::Monomorphic { .. } | InlineCacheState::Polymorphic { .. }) {
+                                        if ic.hit_count
+                                            >= otter_vm_bytecode::function::QUICKENING_WARMUP
+                                        {
+                                            if matches!(
+                                                ic.ic_state,
+                                                InlineCacheState::Monomorphic { .. }
+                                                    | InlineCacheState::Polymorphic { .. }
+                                            ) {
                                                 let pc = frame.pc;
-                                                func.quicken_instruction(pc, Instruction::GetPropQuickened {
-                                                    dst: *dst, obj: *obj, name: *name, ic_index: *ic_index,
-                                                });
+                                                func.quicken_instruction(
+                                                    pc,
+                                                    Instruction::GetPropQuickened {
+                                                        dst: *dst,
+                                                        obj: *obj,
+                                                        name: *name,
+                                                        ic_index: *ic_index,
+                                                    },
+                                                );
                                             }
                                         }
                                     }
@@ -5318,12 +5400,24 @@ impl Interpreter {
                                         // Quickening: when IC is monomorphic with enough hits,
                                         // quicken to SetPropQuickened
                                         ic.hit_count = ic.hit_count.saturating_add(1);
-                                        if ic.hit_count >= otter_vm_bytecode::function::QUICKENING_WARMUP {
-                                            if matches!(ic.ic_state, InlineCacheState::Monomorphic { .. } | InlineCacheState::Polymorphic { .. }) {
+                                        if ic.hit_count
+                                            >= otter_vm_bytecode::function::QUICKENING_WARMUP
+                                        {
+                                            if matches!(
+                                                ic.ic_state,
+                                                InlineCacheState::Monomorphic { .. }
+                                                    | InlineCacheState::Polymorphic { .. }
+                                            ) {
                                                 let pc = frame.pc;
-                                                func.quicken_instruction(pc, Instruction::SetPropQuickened {
-                                                    obj: obj_reg, name: *name, val: *val, ic_index: *ic_index,
-                                                });
+                                                func.quicken_instruction(
+                                                    pc,
+                                                    Instruction::SetPropQuickened {
+                                                        obj: obj_reg,
+                                                        name: *name,
+                                                        val: *val,
+                                                        ic_index: *ic_index,
+                                                    },
+                                                );
                                             }
                                         }
                                     }
@@ -6800,7 +6894,6 @@ impl Interpreter {
             // ==================== Quickened Instructions ====================
             // Specialized variants created by bytecode quickening.
             // Each handler has a fast path + de-quicken fallback.
-
             Instruction::AddInt32 {
                 dst,
                 lhs,
@@ -6818,9 +6911,15 @@ impl Interpreter {
                 // De-quicken: revert to generic Add and execute generic path
                 if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
-                        func.quicken_instruction(frame.pc, Instruction::Add {
-                            dst: *dst, lhs: *lhs, rhs: *rhs, feedback_index: *feedback_index,
-                        });
+                        func.quicken_instruction(
+                            frame.pc,
+                            Instruction::Add {
+                                dst: *dst,
+                                lhs: *lhs,
+                                rhs: *rhs,
+                                feedback_index: *feedback_index,
+                            },
+                        );
                     }
                 }
                 let result = self.op_add(ctx, &left, &right)?;
@@ -6846,9 +6945,15 @@ impl Interpreter {
                 // De-quicken: revert to generic Sub
                 if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
-                        func.quicken_instruction(frame.pc, Instruction::Sub {
-                            dst: *dst, lhs: *lhs, rhs: *rhs, feedback_index: *feedback_index,
-                        });
+                        func.quicken_instruction(
+                            frame.pc,
+                            Instruction::Sub {
+                                dst: *dst,
+                                lhs: *lhs,
+                                rhs: *rhs,
+                                feedback_index: *feedback_index,
+                            },
+                        );
                     }
                 }
                 let left_num = self.to_numeric(ctx, &left)?;
@@ -6883,9 +6988,15 @@ impl Interpreter {
                 // De-quicken: revert to generic Mul
                 if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
-                        func.quicken_instruction(frame.pc, Instruction::Mul {
-                            dst: *dst, lhs: *lhs, rhs: *rhs, feedback_index: *feedback_index,
-                        });
+                        func.quicken_instruction(
+                            frame.pc,
+                            Instruction::Mul {
+                                dst: *dst,
+                                lhs: *lhs,
+                                rhs: *rhs,
+                                feedback_index: *feedback_index,
+                            },
+                        );
                     }
                 }
                 let left_num = self.to_numeric(ctx, &left)?;
@@ -6925,9 +7036,15 @@ impl Interpreter {
                 // De-quicken: revert to generic Div
                 if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
-                        func.quicken_instruction(frame.pc, Instruction::Div {
-                            dst: *dst, lhs: *lhs, rhs: *rhs, feedback_index: *feedback_index,
-                        });
+                        func.quicken_instruction(
+                            frame.pc,
+                            Instruction::Div {
+                                dst: *dst,
+                                lhs: *lhs,
+                                rhs: *rhs,
+                                feedback_index: *feedback_index,
+                            },
+                        );
                     }
                 }
                 let left_num = self.to_numeric(ctx, &left)?;
@@ -6963,9 +7080,15 @@ impl Interpreter {
                 // De-quicken: revert to generic Add
                 if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
-                        func.quicken_instruction(frame.pc, Instruction::Add {
-                            dst: *dst, lhs: *lhs, rhs: *rhs, feedback_index: *feedback_index,
-                        });
+                        func.quicken_instruction(
+                            frame.pc,
+                            Instruction::Add {
+                                dst: *dst,
+                                lhs: *lhs,
+                                rhs: *rhs,
+                                feedback_index: *feedback_index,
+                            },
+                        );
                     }
                 }
                 let result = self.op_add(ctx, &left, &right)?;
@@ -6989,9 +7112,15 @@ impl Interpreter {
                 // De-quicken: revert to generic Sub
                 if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
-                        func.quicken_instruction(frame.pc, Instruction::Sub {
-                            dst: *dst, lhs: *lhs, rhs: *rhs, feedback_index: *feedback_index,
-                        });
+                        func.quicken_instruction(
+                            frame.pc,
+                            Instruction::Sub {
+                                dst: *dst,
+                                lhs: *lhs,
+                                rhs: *rhs,
+                                feedback_index: *feedback_index,
+                            },
+                        );
                     }
                 }
                 let left_num = self.to_numeric(ctx, &left)?;
@@ -7035,7 +7164,9 @@ impl Interpreter {
                                 match &mut ic.ic_state {
                                     InlineCacheState::Monomorphic { shape_id, offset } => {
                                         if obj_shape_ptr == *shape_id {
-                                            if let Some(val) = obj_ref.get_by_offset(*offset as usize) {
+                                            if let Some(val) =
+                                                obj_ref.get_by_offset(*offset as usize)
+                                            {
                                                 ctx.set_register(dst.0, val);
                                                 return Ok(InstructionResult::Continue);
                                             }
@@ -7044,7 +7175,9 @@ impl Interpreter {
                                     InlineCacheState::Polymorphic { count, entries } => {
                                         for i in 0..(*count as usize) {
                                             if obj_shape_ptr == entries[i].0 {
-                                                if let Some(val) = obj_ref.get_by_offset(entries[i].1 as usize) {
+                                                if let Some(val) =
+                                                    obj_ref.get_by_offset(entries[i].1 as usize)
+                                                {
                                                     // MRU: promote to front
                                                     if i > 0 {
                                                         entries.swap(0, i);
@@ -7066,14 +7199,23 @@ impl Interpreter {
                 // IC miss: de-quicken to generic GetPropConst
                 if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
-                        func.quicken_instruction(frame.pc, Instruction::GetPropConst {
-                            dst: *dst, obj: *obj, name: *name, ic_index: *ic_index,
-                        });
+                        func.quicken_instruction(
+                            frame.pc,
+                            Instruction::GetPropConst {
+                                dst: *dst,
+                                obj: *obj,
+                                name: *name,
+                                ic_index: *ic_index,
+                            },
+                        );
                     }
                 }
                 // Re-execute as generic GetPropConst (recursive call to handle all edge cases)
                 let generic = Instruction::GetPropConst {
-                    dst: *dst, obj: *obj, name: *name, ic_index: *ic_index,
+                    dst: *dst,
+                    obj: *obj,
+                    name: *name,
+                    ic_index: *ic_index,
                 };
                 return self.execute_instruction(&generic, module, ctx);
             }
@@ -7105,7 +7247,9 @@ impl Interpreter {
                                 match &mut ic.ic_state {
                                     InlineCacheState::Monomorphic { shape_id, offset } => {
                                         if obj_shape_ptr == *shape_id {
-                                            if let Some(val) = obj_ref.get_by_offset(*offset as usize) {
+                                            if let Some(val) =
+                                                obj_ref.get_by_offset(*offset as usize)
+                                            {
                                                 ctx.set_register(dst.0, val);
                                                 return Ok(InstructionResult::Continue);
                                             }
@@ -7114,7 +7258,9 @@ impl Interpreter {
                                     InlineCacheState::Polymorphic { count, entries } => {
                                         for i in 0..(*count as usize) {
                                             if obj_shape_ptr == entries[i].0 {
-                                                if let Some(val) = obj_ref.get_by_offset(entries[i].1 as usize) {
+                                                if let Some(val) =
+                                                    obj_ref.get_by_offset(entries[i].1 as usize)
+                                                {
                                                     // MRU: promote to front
                                                     if i > 0 {
                                                         entries.swap(0, i);
@@ -7136,7 +7282,10 @@ impl Interpreter {
                 // IC miss: store local into dst, then execute generic GetPropConst
                 ctx.set_register(dst.0, object);
                 let generic = Instruction::GetPropConst {
-                    dst: *dst, obj: *dst, name: *name, ic_index: *ic_index,
+                    dst: *dst,
+                    obj: *dst,
+                    name: *name,
+                    ic_index: *ic_index,
                 };
                 return self.execute_instruction(&generic, module, ctx);
             }
@@ -7168,7 +7317,10 @@ impl Interpreter {
                                 match &mut ic.ic_state {
                                     InlineCacheState::Monomorphic { shape_id, offset } => {
                                         if obj_shape_ptr == *shape_id {
-                                            if obj_ref.set_by_offset(*offset as usize, value.clone()).is_ok() {
+                                            if obj_ref
+                                                .set_by_offset(*offset as usize, value.clone())
+                                                .is_ok()
+                                            {
                                                 return Ok(InstructionResult::Continue);
                                             }
                                         }
@@ -7176,7 +7328,13 @@ impl Interpreter {
                                     InlineCacheState::Polymorphic { count, entries } => {
                                         for i in 0..(*count as usize) {
                                             if obj_shape_ptr == entries[i].0 {
-                                                if obj_ref.set_by_offset(entries[i].1 as usize, value.clone()).is_ok() {
+                                                if obj_ref
+                                                    .set_by_offset(
+                                                        entries[i].1 as usize,
+                                                        value.clone(),
+                                                    )
+                                                    .is_ok()
+                                                {
                                                     // MRU: promote to front
                                                     if i > 0 {
                                                         entries.swap(0, i);
@@ -7197,13 +7355,22 @@ impl Interpreter {
                 // IC miss: de-quicken to generic SetPropConst
                 if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
-                        func.quicken_instruction(frame.pc, Instruction::SetPropConst {
-                            obj: *obj, name: *name, val: *val, ic_index: *ic_index,
-                        });
+                        func.quicken_instruction(
+                            frame.pc,
+                            Instruction::SetPropConst {
+                                obj: *obj,
+                                name: *name,
+                                val: *val,
+                                ic_index: *ic_index,
+                            },
+                        );
                     }
                 }
                 let generic = Instruction::SetPropConst {
-                    obj: *obj, name: *name, val: *val, ic_index: *ic_index,
+                    obj: *obj,
+                    name: *name,
+                    val: *val,
+                    ic_index: *ic_index,
                 };
                 return self.execute_instruction(&generic, module, ctx);
             }
@@ -8827,27 +8994,24 @@ impl Interpreter {
                         .ok_or_else(|| VmError::internal("function not found"))?;
 
                     // Record the function call for hot function detection
-                    let became_hot = func.record_call();
+                    let became_hot =
+                        func.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
                     if became_hot {
-                        #[cfg(feature = "jit")]
                         {
-                            if crate::jit_runtime::is_jit_enabled() {
-                                crate::jit_queue::enqueue_hot_function(&module, func_index, func);
-                                crate::jit_runtime::compile_one_pending_request();
+                            if otter_vm_exec::is_jit_enabled() {
+                                otter_vm_exec::enqueue_hot_function(&module, func_index, func);
+                                otter_vm_exec::compile_one_pending_request(
+                                    crate::jit_runtime::runtime_helpers(),
+                                );
                             }
                         }
-                        #[cfg(not(feature = "jit"))]
-                        let _ = became_hot;
                     }
-
-                    #[cfg(feature = "jit")]
                     {
-                        let can_try_jit = crate::jit_runtime::is_jit_enabled()
+                        let can_try_jit = otter_vm_exec::is_jit_enabled()
                             && func.is_hot_function()
                             && !func.is_deoptimized()
                             && !is_construct
                             && !is_async
-                            && upvalues.is_empty()
                             && !func.flags.has_rest
                             && !func.flags.uses_arguments
                             && !func.flags.uses_eval
@@ -8864,19 +9028,22 @@ impl Interpreter {
                                 jit_interp,
                                 jit_ctx_ptr,
                                 &module.constants as *const _,
+                                &upvalues,
                             ) {
-                                crate::jit_runtime::JitExecResult::Ok(bits) => {
+                                otter_vm_exec::JitExecResult::Ok(bits) => {
                                     if let Some(value) = Value::from_jit_bits(bits as u64) {
                                         ctx.set_register(return_reg, value);
                                         continue;
                                     }
                                 }
-                                crate::jit_runtime::JitExecResult::NeedsRecompilation => {
-                                    crate::jit_queue::enqueue_hot_function(&module, func_index, func);
-                                    crate::jit_runtime::compile_one_pending_request();
+                                otter_vm_exec::JitExecResult::NeedsRecompilation => {
+                                    otter_vm_exec::enqueue_hot_function(&module, func_index, func);
+                                    otter_vm_exec::compile_one_pending_request(
+                                        crate::jit_runtime::runtime_helpers(),
+                                    );
                                 }
-                                crate::jit_runtime::JitExecResult::Bailout
-                                | crate::jit_runtime::JitExecResult::NotCompiled => {}
+                                otter_vm_exec::JitExecResult::Bailout
+                                | otter_vm_exec::JitExecResult::NotCompiled => {}
                             }
                         }
                     }
@@ -10391,7 +10558,7 @@ impl Interpreter {
     /// Run the field initializer function for derived constructors after super() returns.
     /// The field_init_func is compiled as an inner function of the constructor.
     /// It is called with `this` bound to the newly created instance.
-    fn run_field_initializers(&self, ctx: &mut VmContext, this_value: &Value) -> VmResult<()> {
+    pub fn run_field_initializers(&self, ctx: &mut VmContext, this_value: &Value) -> VmResult<()> {
         // Get the current frame's module and function index
         let (module, function_index) = {
             let frame = ctx
@@ -13381,8 +13548,6 @@ mod tests {
         assert!(func.get_call_count() >= HOT_FUNCTION_THRESHOLD);
         assert!(func.is_hot_function());
     }
-
-    #[cfg(feature = "jit")]
     #[test]
     fn test_jit_loop_candidate_detection() {
         let loop_func = Function::builder()
@@ -13470,6 +13635,7 @@ mod tests {
         // Main function calls inner function in a loop
         let main = Function::builder()
             .name("main")
+            .register_count(6)
             .instruction(Instruction::Closure {
                 dst: Register(0),
                 func: FunctionIndex(1),
@@ -13514,6 +13680,7 @@ mod tests {
         // Inner function just returns 1
         let inner = Function::builder()
             .name("inner")
+            .register_count(1)
             .instruction(Instruction::LoadInt32 {
                 dst: Register(0),
                 value: 1,
@@ -13533,10 +13700,10 @@ mod tests {
         // Execution should return 100 (counter after 100 loop iterations)
         assert_eq!(result.as_int32(), Some(100));
 
-        // When jit feature is enabled, precompile_module_jit_candidates may
-        // mark functions with backward jumps as hot before record_call runs,
-        // causing record_call to skip the increment (by design — hot functions
-        // avoid atomic RMW overhead). So we check call_count OR is_hot.
+        // precompile_module_jit_candidates may mark functions with backward
+        // jumps as hot before record_call runs, causing record_call to skip
+        // the increment (by design — hot functions avoid atomic RMW overhead).
+        // So we check call_count OR is_hot.
         let main_func = module.function(0).unwrap();
         assert!(
             main_func.get_call_count() >= 1 || main_func.is_hot_function(),

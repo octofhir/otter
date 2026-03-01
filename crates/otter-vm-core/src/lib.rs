@@ -33,11 +33,7 @@ pub mod interpreter;
 pub mod intrinsics;
 pub mod intrinsics_impl;
 pub mod isolate;
-#[cfg(feature = "jit")]
 mod jit_helpers;
-#[cfg(feature = "jit")]
-mod jit_queue;
-#[cfg(feature = "jit")]
 mod jit_runtime;
 pub mod map_data;
 pub mod memory;
@@ -78,10 +74,9 @@ pub use generator::{
 pub use interpreter::{GeneratorResult, Interpreter};
 pub use intrinsics::Intrinsics;
 pub use isolate::{Isolate, IsolateConfig, IsolateGuard, IsolateHandle};
-#[cfg(feature = "jit")]
-pub use jit_runtime::JitRuntimeStats;
 pub use memory::MemoryManager;
 pub use object::{JsObject, PropertyKey, SetPropertyError};
+pub use otter_vm_exec::JitRuntimeStats;
 pub use promise::{JsPromise, PromiseState, PromiseWithResolvers};
 pub use proxy::{JsProxy, RevocableProxy};
 pub use runtime::VmRuntime;
@@ -95,9 +90,7 @@ pub use typed_array::{JsTypedArray, TypedArrayKind};
 pub use value::{NativeFn, Symbol, Value};
 
 pub use convert::{FromValue, IntoValue};
-
-#[cfg(feature = "jit")]
 /// Return a snapshot of JIT runtime counters.
 pub fn jit_runtime_stats() -> JitRuntimeStats {
-    jit_runtime::stats_snapshot()
+    otter_vm_exec::stats_snapshot()
 }

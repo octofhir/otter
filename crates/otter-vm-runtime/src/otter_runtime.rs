@@ -7,7 +7,7 @@
 //! - Capabilities for permission checking
 //! - Environment store for secure env var access
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
@@ -17,7 +17,7 @@ use crate::env_store::IsolatedEnvStore;
 use otter_vm_bytecode::module::ImportBinding;
 use otter_vm_compiler::Compiler;
 use otter_vm_core::async_context::VmExecutionResult;
-use otter_vm_core::context::{VmContext, VmContextSnapshot};
+use otter_vm_core::context::{VmContext, VmContextSnapshot, VmHostHooks};
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
 use otter_vm_core::interpreter::Interpreter;
@@ -42,6 +42,341 @@ struct ResumeSignal {
     ready: AtomicBool,
     /// The resolved value (or error)
     value: parking_lot::Mutex<Option<Result<Value, Value>>>,
+}
+
+#[derive(Default)]
+struct ForInCursor {
+    keys: Vec<Value>,
+    index: usize,
+}
+
+struct RuntimeHostHooks {
+    loader: Arc<crate::module_loader::ModuleLoader>,
+    for_in_cursors: parking_lot::Mutex<HashMap<usize, ForInCursor>>,
+}
+
+impl RuntimeHostHooks {
+    fn new(loader: Arc<crate::module_loader::ModuleLoader>) -> Self {
+        Self {
+            loader,
+            for_in_cursors: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn resolve_import_locals(
+        &self,
+        bytecode: &otter_vm_bytecode::Module,
+        module_url: &str,
+        mm: Arc<otter_vm_core::memory::MemoryManager>,
+    ) -> Result<HashMap<u16, Value>, VmError> {
+        let mut initial_locals = HashMap::new();
+        let Some(entry_func) = bytecode.entry_function() else {
+            return Ok(initial_locals);
+        };
+
+        for import in &bytecode.imports {
+            let resolved = self
+                .loader
+                .resolve(&import.specifier, module_url)
+                .map_err(|e| VmError::type_error(format!("Import resolution failed: {}", e)))?;
+
+            let Some(module_arc) = self.loader.get(&resolved.url) else {
+                continue;
+            };
+            let module_lock = module_arc
+                .read()
+                .map_err(|_| VmError::internal("failed to read imported module"))?;
+
+            for binding in &import.bindings {
+                let (imported_name, local_name, is_namespace) = match binding {
+                    ImportBinding::Named { imported, local } => {
+                        (imported.as_str(), local.as_str(), false)
+                    }
+                    ImportBinding::Default { local } => ("default", local.as_str(), false),
+                    ImportBinding::Namespace { local } => ("*", local.as_str(), true),
+                };
+
+                let value = if is_namespace {
+                    crate::module_loader::namespace_to_object(
+                        &module_lock.namespace,
+                        Arc::clone(&mm),
+                    )
+                } else {
+                    match module_lock.get_export(imported_name) {
+                        Some(val) => val,
+                        None => continue,
+                    }
+                };
+
+                if let Some(idx) = entry_func.local_names.iter().position(|n| n == local_name) {
+                    initial_locals.insert(idx as u16, value);
+                }
+            }
+        }
+
+        Ok(initial_locals)
+    }
+
+    fn execute_module_graph_sync(
+        &self,
+        entry_url: &str,
+        ctx: &mut VmContext,
+    ) -> Result<(), VmError> {
+        let order = self
+            .loader
+            .build_graph(entry_url)
+            .map_err(|e| VmError::type_error(e.to_string()))?;
+        for url in &order {
+            self.loader
+                .link(url)
+                .map_err(|e| VmError::type_error(e.to_string()))?;
+        }
+
+        let mm = ctx.memory_manager().clone();
+        for url in &order {
+            let module = self
+                .loader
+                .get(url)
+                .ok_or_else(|| VmError::type_error(format!("module not found: {}", url)))?;
+
+            let (bytecode, state, has_tla) = {
+                let guard = module
+                    .read()
+                    .map_err(|_| VmError::internal("module lock poisoned"))?;
+                (
+                    Arc::clone(&guard.bytecode),
+                    guard.state,
+                    guard.bytecode.has_top_level_await && guard.bytecode.is_esm,
+                )
+            };
+
+            if state == crate::module_loader::ModuleState::Evaluated
+                || state == crate::module_loader::ModuleState::Evaluating
+            {
+                continue;
+            }
+
+            if has_tla {
+                return Err(VmError::type_error(format!(
+                    "synchronous import of '{}' with top-level await is not supported",
+                    url
+                )));
+            }
+
+            if let Ok(mut guard) = module.write() {
+                guard.state = crate::module_loader::ModuleState::Evaluating;
+            }
+
+            let initial_locals = self.resolve_import_locals(&bytecode, url, Arc::clone(&mm))?;
+            let interpreter = Interpreter::new();
+            let result = interpreter.execute_arc_with_locals(
+                Arc::clone(&bytecode),
+                ctx,
+                if initial_locals.is_empty() {
+                    None
+                } else {
+                    Some(initial_locals)
+                },
+            );
+
+            match result {
+                Ok(_) => {
+                    self.loader.update_namespace(url, ctx);
+                    if let Ok(mut guard) = module.write() {
+                        guard.state = crate::module_loader::ModuleState::Evaluated;
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut guard) = module.write() {
+                        guard.state = crate::module_loader::ModuleState::Error;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn for_in_target_id(target: &Value) -> Option<usize> {
+        if let Some(obj) = target.as_object() {
+            Some(obj.as_ptr() as usize)
+        } else {
+            target.as_proxy().map(|proxy| proxy.as_ptr() as usize)
+        }
+    }
+
+    fn property_key_to_string(key: &PropertyKey) -> Option<String> {
+        match key {
+            PropertyKey::String(s) => Some(s.as_str().to_string()),
+            PropertyKey::Index(i) => Some(i.to_string()),
+            PropertyKey::Symbol(_) => None,
+        }
+    }
+
+    fn collect_for_in_keys(&self, target: &Value) -> Vec<Value> {
+        let mut result = Vec::new();
+        let mut visited = HashSet::new();
+        let mut current = Some(target.clone());
+
+        while let Some(value) = current {
+            if let Some(obj) = value.as_object() {
+                for key in obj.own_keys() {
+                    let Some(name) = Self::property_key_to_string(&key) else {
+                        continue;
+                    };
+
+                    // Track all own string keys to avoid duplicates from prototypes.
+                    let is_new = visited.insert(name.clone());
+                    if !is_new {
+                        continue;
+                    }
+
+                    let is_enumerable = obj
+                        .get_own_property_descriptor(&key)
+                        .map(|d| d.enumerable())
+                        .unwrap_or(false);
+                    if is_enumerable {
+                        result.push(Value::string(JsString::intern(&name)));
+                    }
+                }
+
+                let proto = obj.prototype();
+                current = if proto.is_null() || proto.is_undefined() {
+                    None
+                } else {
+                    Some(proto)
+                };
+                continue;
+            }
+
+            if let Some(proxy) = value.as_proxy() {
+                current = proxy.target();
+                continue;
+            }
+
+            break;
+        }
+
+        result
+    }
+
+    fn take_next_for_in_key(&self, target_id: usize) -> Option<Value> {
+        let mut cursors = self.for_in_cursors.lock();
+        let cursor = cursors.get_mut(&target_id)?;
+        if cursor.index >= cursor.keys.len() {
+            cursors.remove(&target_id);
+            return None;
+        }
+
+        let out = cursor.keys[cursor.index].clone();
+        cursor.index += 1;
+        Some(out)
+    }
+}
+
+impl VmHostHooks for RuntimeHostHooks {
+    fn import_module(&self, ctx: &mut VmContext, module_spec: &[u16]) -> Result<Value, VmError> {
+        let specifier = String::from_utf16_lossy(module_spec);
+        let referrer = ctx
+            .current_frame()
+            .map(|frame| frame.module.source_url.clone())
+            .unwrap_or_else(|| "main.js".to_string());
+        let resolution = self
+            .loader
+            .resolve(&specifier, &referrer)
+            .map_err(|e| VmError::type_error(format!("Import resolution failed: {}", e)))?;
+
+        self.loader
+            .load(&resolution.url, resolution.module_type)
+            .map_err(|e| VmError::type_error(e.to_string()))?;
+
+        // Preserve caller's captured exports while imported modules execute.
+        let saved_exports = ctx.take_captured_exports();
+        let import_result = (|| -> Result<Value, VmError> {
+            self.execute_module_graph_sync(&resolution.url, ctx)?;
+
+            let imported = self.loader.get(&resolution.url).ok_or_else(|| {
+                VmError::type_error(format!("module not found: {}", resolution.url))
+            })?;
+            let guard = imported
+                .read()
+                .map_err(|_| VmError::internal("module lock poisoned"))?;
+
+            if guard.is_esm() {
+                Ok(crate::module_loader::namespace_to_object(
+                    &guard.namespace,
+                    ctx.memory_manager().clone(),
+                ))
+            } else {
+                Ok(guard
+                    .namespace
+                    .get("module.exports")
+                    .or_else(|| guard.namespace.get("default"))
+                    .unwrap_or_else(|| {
+                        crate::module_loader::namespace_to_object(
+                            &guard.namespace,
+                            ctx.memory_manager().clone(),
+                        )
+                    }))
+            }
+        })();
+        match saved_exports {
+            Some(exports) => ctx.set_captured_exports(exports),
+            None => {
+                let _ = ctx.take_captured_exports();
+            }
+        }
+        import_result
+    }
+
+    fn export_value(
+        &self,
+        ctx: &mut VmContext,
+        export_name: &[u16],
+        value: Value,
+    ) -> Result<(), VmError> {
+        let mut exports = ctx.take_captured_exports().unwrap_or_default();
+        exports.insert(String::from_utf16_lossy(export_name), value);
+        ctx.set_captured_exports(exports);
+        Ok(())
+    }
+
+    fn for_in_next(&self, _ctx: &mut VmContext, target: Value) -> Result<Option<Value>, VmError> {
+        if target.is_null() || target.is_undefined() {
+            return Err(VmError::type_error(
+                "for-in cannot iterate over null or undefined",
+            ));
+        }
+
+        let Some(target_id) = Self::for_in_target_id(&target) else {
+            return Ok(None);
+        };
+
+        let had_cursor = {
+            let cursors = self.for_in_cursors.lock();
+            cursors.contains_key(&target_id)
+        };
+
+        if let Some(next) = self.take_next_for_in_key(target_id) {
+            return Ok(Some(next));
+        }
+        if had_cursor {
+            return Ok(None);
+        }
+
+        let keys = self.collect_for_in_keys(&target);
+        if keys.is_empty() {
+            return Ok(None);
+        }
+
+        {
+            let mut cursors = self.for_in_cursors.lock();
+            cursors.insert(target_id, ForInCursor { keys, index: 0 });
+        }
+
+        Ok(self.take_next_for_in_key(target_id))
+    }
 }
 
 impl ResumeSignal {
@@ -444,7 +779,7 @@ impl Otter {
             ctx.set_trace_config(trace_config.clone());
         }
 
-        Self::configure_eval(&mut ctx);
+        self.configure_eval(&mut ctx);
         Self::configure_js_job_queue(&mut ctx, &self.event_loop);
         Self::configure_next_tick_queue(&mut ctx, &self.event_loop);
         Self::configure_pending_async_ops(&mut ctx, &self.event_loop);
@@ -883,7 +1218,7 @@ impl Otter {
             ctx.set_trace_config(trace_config.clone());
         }
 
-        Self::configure_eval(&mut ctx);
+        self.configure_eval(&mut ctx);
         Self::configure_js_job_queue(&mut ctx, &self.event_loop);
         Self::configure_next_tick_queue(&mut ctx, &self.event_loop);
         Self::configure_pending_async_ops(&mut ctx, &self.event_loop);
@@ -1782,7 +2117,7 @@ impl Otter {
     fn setup_context(&self, ctx: &mut VmContext) -> Result<(), OtterError> {
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
         ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
-        Self::configure_eval(ctx);
+        self.configure_eval(ctx);
         Self::configure_js_job_queue(ctx, &self.event_loop);
         Self::configure_next_tick_queue(ctx, &self.event_loop);
         Self::configure_pending_async_ops(ctx, &self.event_loop);
@@ -2542,7 +2877,8 @@ impl Otter {
     /// Configure the eval compiler callback on a VmContext so that `eval()`
     /// and `CallEval` bytecode can compile code at runtime.
     /// The interpreter handles execution with proper stack depth tracking.
-    fn configure_eval(ctx: &mut VmContext) {
+    fn configure_eval(&self, ctx: &mut VmContext) {
+        ctx.set_host_hooks(Arc::new(RuntimeHostHooks::new(Arc::clone(&self.loader))));
         ctx.set_eval_fn(Arc::new(|code: &str, strict_context: bool| {
             let compiler = Compiler::new();
             compiler
@@ -2996,6 +3332,30 @@ mod tests {
         assert!(result.is_ok());
         // Note: Each eval_sync creates a new context, so globals don't persist
         // This tests that the runtime can execute code that modifies globals
+    }
+
+    #[test]
+    fn test_eval_sync_for_in_includes_inherited_enumerables() {
+        let mut runtime = Otter::new();
+        let result = runtime.eval_sync(
+            r#"
+            const proto = { a: 1 };
+            const obj = Object.create(proto);
+            obj.b = 2;
+            let count = 0;
+            let sawA = false;
+            let sawB = false;
+            for (const k in obj) {
+                if (k === "a") sawA = true;
+                if (k === "b") sawB = true;
+                count++;
+            }
+            if (!sawA || !sawB || count !== 2) {
+                throw new Error("for-in mismatch");
+            }
+            "#,
+        );
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[cfg(feature = "profiling")]

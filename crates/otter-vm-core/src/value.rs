@@ -439,7 +439,6 @@ impl Value {
     /// - The raw pointer in `bits` must point to a live GC object
     /// - No GC must occur while the returned Value is in use
     /// - Intended for JIT runtime helpers during no-GC JIT execution scope
-    #[cfg(feature = "jit")]
     #[allow(unsafe_code)]
     pub(crate) unsafe fn from_raw_bits_unchecked(bits: u64) -> Option<Self> {
         use otter_vm_gc::object::{GcHeader, tags as gc_tags};

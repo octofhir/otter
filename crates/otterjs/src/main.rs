@@ -441,16 +441,12 @@ fn build_process_argv_override(source_url: &str, script_args: &[String]) -> Opti
     argv.extend(script_args.iter().cloned());
     Some(argv)
 }
-
-#[cfg(feature = "jit")]
 fn parse_env_truthy(value: &str) -> bool {
     !matches!(value.trim(), "" | "0")
         && !value.trim().eq_ignore_ascii_case("false")
         && !value.trim().eq_ignore_ascii_case("off")
         && !value.trim().eq_ignore_ascii_case("no")
 }
-
-#[cfg(feature = "jit")]
 fn maybe_print_jit_stats() {
     let enabled = std::env::var("OTTER_JIT_STATS")
         .ok()
@@ -480,9 +476,6 @@ fn maybe_print_jit_stats() {
         stats.compiled_functions
     );
 }
-
-#[cfg(not(feature = "jit"))]
-fn maybe_print_jit_stats() {}
 
 struct CpuSamplingSession {
     profiler: std::sync::Arc<otter_profiler::CpuProfiler>,

@@ -3847,60 +3847,10 @@ impl Compiler {
             }
         }
 
-        // Compile the target expression.
+        // Compile the target expression. Runtime host hooks behind ForInNext
+        // handle key enumeration and cursor progression.
         let target = self.compile_expression(&for_in_stmt.right)?;
-
-        // Call Object.keys(target) to get enumerable own string keys.
-        let object_name = self.codegen.add_string("Object");
-        let object_ctor = self.codegen.alloc_reg();
-        let ic_index = self.codegen.alloc_ic();
-        self.codegen.emit(Instruction::GetGlobal {
-            dst: object_ctor,
-            name: object_name,
-            ic_index,
-        });
-
-        let keys_name = self.codegen.add_string("keys");
-        let frame = self.codegen.alloc_fresh_block(2);
-        self.codegen.emit(Instruction::Move {
-            dst: frame,
-            src: object_ctor,
-        });
-        self.codegen.emit(Instruction::Move {
-            dst: Register(frame.0 + 1),
-            src: target,
-        });
-
-        let keys_reg = self.codegen.alloc_reg();
-        let ic_index = self.codegen.alloc_ic();
-        self.codegen.emit(Instruction::CallMethod {
-            dst: keys_reg,
-            obj: frame,
-            method: keys_name,
-            argc: 1,
-            ic_index,
-        });
-
-        self.codegen.free_reg(object_ctor);
-        self.codegen.free_reg(target);
-        self.codegen.free_reg(frame);
-        self.codegen.free_reg(Register(frame.0 + 1));
-
-        // Iterate over keys using for-of lowering.
-        let iterator = self.codegen.alloc_reg();
-        self.codegen.emit(Instruction::GetIterator {
-            dst: iterator,
-            src: keys_reg,
-        });
-        self.codegen.free_reg(keys_reg);
-
         let value_reg = self.codegen.alloc_reg();
-        let done_reg = self.codegen.alloc_reg();
-        let result_reg = self.codegen.alloc_reg();
-
-        let next_name = self.codegen.add_string("next");
-        let done_name = self.codegen.add_string("done");
-        let value_name = self.codegen.add_string("value");
 
         let loop_start = self.codegen.current_index();
         self.loop_stack.push(ControlScope {
@@ -3913,37 +3863,13 @@ impl Compiler {
             iterator_reg: None,
         });
 
-        let iter_frame = self.codegen.alloc_fresh_block(1);
-        self.codegen.emit(Instruction::Move {
-            dst: iter_frame,
-            src: iterator,
-        });
-        let ic_index_next = self.codegen.alloc_ic();
-        self.codegen.emit(Instruction::CallMethod {
-            dst: result_reg,
-            obj: iter_frame,
-            method: next_name,
-            argc: 0,
-            ic_index: ic_index_next,
-        });
-        self.codegen.free_reg(iter_frame);
-
-        let ic_index_done = self.codegen.alloc_ic();
-        self.codegen.emit(Instruction::GetPropConst {
-            dst: done_reg,
-            obj: result_reg,
-            name: done_name,
-            ic_index: ic_index_done,
-        });
-        let ic_index_value = self.codegen.alloc_ic();
-        self.codegen.emit(Instruction::GetPropConst {
+        // Placeholder offset; patched after loop body.
+        let jump_end = self.codegen.current_index();
+        self.codegen.emit(Instruction::ForInNext {
             dst: value_reg,
-            obj: result_reg,
-            name: value_name,
-            ic_index: ic_index_value,
+            obj: target,
+            offset: JumpOffset(0),
         });
-
-        let jump_end = self.codegen.emit_jump_if_true(done_reg);
 
         match &for_in_stmt.left {
             ForStatementLeft::VariableDeclaration(decl) => {
@@ -4007,10 +3933,8 @@ impl Compiler {
             }
         }
 
-        self.codegen.free_reg(iterator);
+        self.codegen.free_reg(target);
         self.codegen.free_reg(value_reg);
-        self.codegen.free_reg(done_reg);
-        self.codegen.free_reg(result_reg);
         self.codegen.exit_scope();
         Ok(())
     }
@@ -9818,6 +9742,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(module.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_for_in_uses_for_in_next_opcode() {
+        let compiler = Compiler::new();
+        let module = compiler
+            .compile("for (const key in obj) { key; }", "test.js", false)
+            .unwrap();
+
+        let main = &module.functions[module.entry_point as usize];
+        let instructions = main.instructions.read();
+
+        let for_in_offset = instructions.iter().find_map(|instr| {
+            if let otter_vm_bytecode::Instruction::ForInNext { offset, .. } = instr {
+                Some(offset.offset())
+            } else {
+                None
+            }
+        });
+
+        assert!(
+            instructions
+                .iter()
+                .any(|instr| matches!(instr, otter_vm_bytecode::Instruction::ForInNext { .. }))
+        );
+        assert!(for_in_offset.is_some_and(|offset| offset > 0));
+        assert!(
+            !instructions
+                .iter()
+                .any(|instr| matches!(instr, otter_vm_bytecode::Instruction::GetIterator { .. }))
+        );
     }
 
     #[test]

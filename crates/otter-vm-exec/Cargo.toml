@@ -1,0 +1,10 @@
+[package]
+name = "otter-vm-exec"
+version = "0.1.0"
+edition = "2024"
+description = "JIT execution coordination for Otter VM"
+license = "MIT"
+
+[dependencies]
+otter-vm-bytecode = { path = "../otter-vm-bytecode" }
+otter-vm-jit = { path = "../otter-vm-jit" }

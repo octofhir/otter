@@ -1101,7 +1101,6 @@ pub enum Instruction {
     // ==================== Quickened Instructions ====================
     // Runtime-specialized variants, never emitted by the compiler.
     // Created by bytecode quickening when IC observations stabilize.
-
     /// Quickened Add: both operands observed as Int32.
     /// Fast path: unbox i32, checked_add, rebox. On fail → de-quicken to Add.
     AddInt32 {
@@ -1165,7 +1164,6 @@ pub enum Instruction {
     },
 
     // ── Superinstructions (fused pairs) ─────────────────────────
-
     /// Fused GetLocal + GetPropConst: loads a local variable and immediately
     /// performs IC-guided property access on it. Reduces dispatch overhead
     /// for the extremely common `localObj.prop` pattern.
